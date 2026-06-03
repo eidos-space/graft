@@ -44,4 +44,7 @@ pub enum LogicalErr {
         expected: LogId,
         actual: LogId,
     },
+
+    #[error("{0}")]
+    Other(String),
 }

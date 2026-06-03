@@ -8,3 +8,7 @@
 /.kosho**
 /.graft
 /.claude/plans
+.tests/
+
+# Local SQL test files (non-deterministic Volume IDs)
+.tests/

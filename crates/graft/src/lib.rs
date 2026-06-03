@@ -26,6 +26,7 @@ pub mod testutil;
 pub mod fault;
 
 pub use err::{GraftErr, LogicalErr};
+pub use rt::runtime::{CommitInfo, DiffResult as PageDiffResult};
 
 // re-export static_assertions for macros
 #[doc(hidden)]

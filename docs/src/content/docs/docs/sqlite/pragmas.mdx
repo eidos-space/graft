@@ -168,6 +168,88 @@ pragma graft_hydrate;
 
 ## Data Import/Export
 
+## Version Control
+
+Graft provides Git-like version control commands through pragmas. These allow you to view commit history, examine specific versions, compare differences, and time-travel to any point in your database's history.
+
+### `pragma graft_log`
+
+Displays the commit history for the current Volume.
+
+```sql
+pragma graft_log;
+```
+
+Shows a table with columns:
+- **LSN**: Log Sequence Number (commit identifier)
+- **PAGES**: Total page count at this commit
+- **CHANGED**: Number of pages changed in this commit
+- **CHECKPOINT**: Whether this was a checkpoint commit (✓)
+- **SEGMENT**: Segment ID (if applicable)
+
+Commits are listed from newest to oldest.
+
+### `pragma graft_show = "LSN"`
+
+Displays detailed information about a specific commit.
+
+```sql
+pragma graft_show = "3";
+```
+
+Shows:
+- Commit metadata (Log ID, LSN, page count, checkpoint status)
+- Segment information (if applicable)
+- Table schema at that point in time, including row counts for user tables
+
+### `pragma graft_diff = "from_lsn,to_lsn"`
+
+Compares two commits and shows what changed. Supports two modes:
+
+**Default mode** (table-level summary):
+```sql
+pragma graft_diff = "1,3";
+```
+
+Shows a summary of changed tables with counts of inserts, deletes, and updates.
+
+**Row-level mode** (detailed):
+```sql
+pragma graft_diff = "1,3,rows";
+```
+
+Shows detailed row-level changes including the actual data for each modified row, and generates executable SQL to recreate the diff.
+
+### `pragma graft_checkout_lsn = "LSN"`
+
+Time-travel to a specific historical commit. Creates a new Volume at the given checkpoint while preserving the original:
+
+```sql
+-- Checkout to commit at LSN 2
+pragma graft_checkout_lsn = "2";
+```
+
+After checkout:
+- A new Volume is created containing commits up to the specified LSN
+- The current database connection switches to the new Volume
+- The original Volume is unchanged and can still be accessed
+
+### `pragma graft_reset_to = "LSN"`
+
+Resets the current tag to point at a historical version.
+
+```sql
+pragma graft_reset_to = "2";
+```
+
+This is similar to checkout but also updates the current tag. The previous Volume data is preserved.
+
+<Aside type="caution">
+  `pragma graft_reset_to` changes which Volume the tag points to.
+  The previous Volume is not deleted, but is no longer accessible via the tag.
+  Use `pragma graft_tags` to see all tags and their Volumes.
+</Aside>
+
 ### `pragma graft_import = "PATH"`
 
 <Aside type="caution">

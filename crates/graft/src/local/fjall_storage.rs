@@ -190,7 +190,7 @@ impl FjallStorage {
 
     pub fn volume_from_snapshot(&self, snapshot: &Snapshot) -> Result<Volume, FjallStorageErr> {
         let volume = Volume::new_random();
-        let commits = self
+        let commits: Vec<_> = self
             .read()
             .commits(snapshot)
             .collect::<Result<Vec<_>, _>>()?;

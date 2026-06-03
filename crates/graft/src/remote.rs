@@ -129,7 +129,7 @@ impl Remote {
                     // enable hickory DNS resolver for DNS caching
                     .hickory_dns(true)
                     .connect_timeout(Duration::from_secs(5))
-                    .tcp_user_timeout(Duration::from_secs(60))
+                    // .tcp_user_timeout(Duration::from_secs(60))
                     .build()?;
 
                 Operator::new(builder)?
