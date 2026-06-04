@@ -27,7 +27,7 @@ clap = "4.5.49"
 config = { version = "0.15.18", features = ["toml"] }
 enum_dispatch = "0.3.13"
 file-lock = "2.1.11"
-fjall = { version = "3.0.0-rc.6", features = ["bytes_1", "lz4"] }
+fjall = { version = "3.0.1", features = ["bytes_1", "lz4"] }
 foldhash = "0.2.0"
 futures = "0.3.31"
 hashbrown = "0.16.0"

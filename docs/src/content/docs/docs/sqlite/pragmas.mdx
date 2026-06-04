@@ -192,7 +192,7 @@ Commits are listed from newest to oldest.
 
 ### `pragma graft_json_log`
 
-Returns commit history as a JSON array. Each entry includes `lsn`, `page_count`, `segment`, `is_checkpoint`, `changed_pages`, and `timestamp_ms` (unix milliseconds).
+Returns commit history as a JSON array. Each entry includes `lsn`, `page_count`, `segment`, `is_checkpoint`, `changed_pages`, `timestamp_ms` (unix milliseconds), and `message` (when set via `graft_set_message`).
 
 ```sql
 pragma graft_json_log;
@@ -200,10 +200,16 @@ pragma graft_json_log;
 
 ```json
 [
-  {"lsn":3,"page_count":2,"segment":"2vt5fF...","is_checkpoint":false,"changed_pages":1,"timestamp_ms":1717482202003},
-  {"lsn":2,"page_count":2,"segment":"3GMtDE...","is_checkpoint":false,"changed_pages":1,"timestamp_ms":1717482202002}
+  {"lsn":3,"page_count":2,"segment":"2vt5fF...","is_checkpoint":false,"changed_pages":1,
+   "timestamp_ms":1717482202003,"message":"add Bob"},
+  {"lsn":2,"page_count":2,"segment":"3GMtDE...","is_checkpoint":false,"changed_pages":1,
+   "timestamp_ms":1717482202002,"message":"initial schema"}
 ]
 ```
+
+<Aside type="note">
+  The `message` field is omitted when no message was set for that commit.
+</Aside>
 
 ### `pragma graft_show = "LSN"`
 
@@ -265,6 +271,43 @@ This is similar to checkout but also updates the current tag. The previous Volum
   The previous Volume is not deleted, but is no longer accessible via the tag.
   Use `pragma graft_tags` to see all tags and their Volumes.
 </Aside>
+
+### `pragma graft_set_message = 'message'`
+
+Sets a human-readable message for the next commit (similar to `git commit -m`). The message is consumed when the next write transaction commits, and does not persist beyond that single commit.
+
+```sql
+pragma graft_set_message = 'add user email index';
+CREATE INDEX idx_email ON users(email);
+-- This commit carries the message "add user email index"
+```
+
+The message appears in `graft_log` (MESSAGE column) and `graft_json_log` (`message` field). Subsequent commits without a `set_message` call will have no message.
+
+### `pragma graft_table_log = 'table_name'`
+
+Lists commits that modified a specific table.
+
+```sql
+pragma graft_table_log = 'users';
+```
+
+Shows each commit that touched the table, with LSN, timestamp, and change summary (+N inserts, -N deletes, ~N updates).
+
+### `pragma graft_json_table_log = 'table_name'`
+
+Same as above, returns JSON array.
+
+```sql
+pragma graft_json_table_log = 'users';
+```
+
+```json
+[
+  {"lsn":3, "timestamp_ms":1717482202000, "summary":"+1", "detail":"1 inserts, 0 deletes, 0 updates"},
+  {"lsn":6, "timestamp_ms":1717482202003, "summary":"~1", "detail":"0 inserts, 0 deletes, 1 updates"}
+]
+```
 
 ### `pragma graft_json_diff = "from,to"`
 

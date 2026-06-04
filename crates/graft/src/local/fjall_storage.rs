@@ -680,6 +680,7 @@ impl<'a> ReadWriteGuard<'a> {
         snapshot: Snapshot,
         page_count: PageCount,
         pages: BTreeMap<PageIdx, Page>,
+        message: Option<String>,
     ) -> Result<Snapshot, FjallStorageErr> {
         // Verify that the commit was constructed using the latest snapshot for
         // the volume.
@@ -716,7 +717,8 @@ impl<'a> ReadWriteGuard<'a> {
         let commit = Commit::new(volume.local.clone(), commit_lsn, page_count)
             .with_checkpoints(maybe_checkpoint)
             .with_segment_idx(Some(segment))
-            .with_timestamp(now);
+            .with_timestamp(now)
+            .with_message(message);
 
         // write out the segment and commit to storage
         let mut batch = self.read.storage.batch();

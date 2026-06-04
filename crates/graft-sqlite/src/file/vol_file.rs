@@ -70,6 +70,8 @@ pub struct VolFile {
 
     reserved: Arc<Mutex<()>>,
     state: VolFileState,
+    /// Message to attach to the next commit (consumed on commit).
+    pub pending_message: Option<String>,
 }
 
 impl Debug for VolFile {
@@ -97,6 +99,7 @@ impl VolFile {
             opts,
             reserved,
             state: VolFileState::Idle,
+            pending_message: None,
         }
     }
 
@@ -241,12 +244,15 @@ impl VfsFile for VolFile {
                 }
             },
             LockLevel::Shared => {
-                if let VolFileState::Reserved { writer } =
+                if let VolFileState::Reserved { mut writer } =
                     mem::replace(&mut self.state, VolFileState::Committing)
                 {
                     // Transition Reserved -> Shared through the Committing state
                     // If we fail the commit, SQLite will subsequently issue an
                     // Unlocked request after handling the error
+
+                    // Attach any pending message before committing
+                    writer.set_message(self.pending_message.take());
 
                     // Commit the writer, downgrading to a reader
                     let reader = writer.commit()?;

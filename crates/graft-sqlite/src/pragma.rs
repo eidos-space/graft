@@ -163,6 +163,18 @@ pub enum GraftPragma {
     /// `pragma graft_json_info;`
     /// Volume info as JSON
     JsonInfo,
+
+    /// `pragma graft_table_log = 'table_name';`
+    /// Show commits that modified the given table
+    TableLog { table: String },
+
+    /// `pragma graft_json_table_log = 'table_name';`
+    /// Show commits that modified the given table, as JSON
+    JsonTableLog { table: String },
+
+    /// `pragma graft_set_message = 'message';`
+    /// Set a human-readable message for the next commit
+    SetMessage { message: String },
 }
 
 impl TryFrom<&Pragma<'_>> for GraftPragma {
@@ -269,6 +281,15 @@ impl TryFrom<&Pragma<'_>> for GraftPragma {
                     Ok(GraftPragma::JsonShow { lsn: parse_or_fail(p.require_arg()?)? })
                 }
                 "json_info" => Ok(GraftPragma::JsonInfo),
+                "table_log" => {
+                    Ok(GraftPragma::TableLog { table: p.require_arg()?.to_string() })
+                }
+                "json_table_log" => {
+                    Ok(GraftPragma::JsonTableLog { table: p.require_arg()?.to_string() })
+                }
+                "set_message" => {
+                    Ok(GraftPragma::SetMessage { message: p.require_arg()?.to_string() })
+                }
                 _ => Err(pragma_fail(format!("invalid graft pragma `{}`", p.name))),
             };
         }
@@ -598,6 +619,43 @@ impl GraftPragma {
                     ErrCtx::PragmaErr(format!("JSON error: {e}").into())
                 })?))
             }
+
+            GraftPragma::TableLog { table } => {
+                let entries = table_log_entries(runtime, &file.vid, &table)?;
+                if entries.is_empty() {
+                    return Ok(Some(format!("No changes found for table '{table}'.")));
+                }
+                let mut f = String::new();
+                writeln!(&mut f, "Changes for table '{table}':")?;
+                writeln!(&mut f, "{:<6} {:<20} {:<10} DETAIL", "LSN", "WHEN", "CHANGES")?;
+                writeln!(&mut f, "{}", "-".repeat(75))?;
+                for e in entries {
+                    writeln!(&mut f, "{:<6} {:<20} {:<10} {}",
+                        e.lsn, e.when, e.summary, e.detail)?;
+                }
+                Ok(Some(f))
+            }
+
+            GraftPragma::JsonTableLog { table } => {
+                let entries = table_log_entries(runtime, &file.vid, &table)?;
+                let json_entries: Vec<crate::json::JsonTableLogEntry> = entries
+                    .iter()
+                    .map(|e| crate::json::JsonTableLogEntry {
+                        lsn: e.lsn,
+                        timestamp_ms: e.timestamp_ms,
+                        summary: e.summary.clone(),
+                        detail: e.detail.clone(),
+                    })
+                    .collect();
+                Ok(Some(serde_json::to_string(&json_entries).map_err(|e| {
+                    ErrCtx::PragmaErr(format!("JSON error: {e}").into())
+                })?))
+            }
+
+            GraftPragma::SetMessage { message } => {
+                file.pending_message = Some(message.clone());
+                Ok(Some(format!("Commit message set: '{message}'")))
+            }
         }
     }
 }
@@ -853,10 +911,16 @@ fn format_volume_log(runtime: &Runtime, file: &VolFile) -> Result<String, ErrCtx
         return Ok("No commits in this Volume.".to_string());
     }
 
+    let has_any_msg = commits.iter().any(|c| c.message.is_some());
     let mut f = String::new();
     writeln!(&mut f, "Commit history for Volume {}:", file.vid)?;
-    writeln!(&mut f, "{:<6} {:<12} {:<10} {:<12} {:<20} SEGMENT", "LSN", "PAGES", "CHANGED", "CHECKPOINT", "WHEN")?;
-    writeln!(&mut f, "{}", "-".repeat(85))?;
+    if has_any_msg {
+        writeln!(&mut f, "{:<6} {:<12} {:<10} {:<12} {:<20} MESSAGE", "LSN", "PAGES", "CHANGED", "CHECKPOINT", "WHEN")?;
+        writeln!(&mut f, "{}", "-".repeat(105))?;
+    } else {
+        writeln!(&mut f, "{:<6} {:<12} {:<10} {:<12} {:<20} SEGMENT", "LSN", "PAGES", "CHANGED", "CHECKPOINT", "WHEN")?;
+        writeln!(&mut f, "{}", "-".repeat(85))?;
+    }
 
     for commit in commits {
         let checkpoint_mark = if commit.is_checkpoint { "✓" } else { "" };
@@ -865,16 +929,22 @@ fn format_volume_log(runtime: &Runtime, file: &VolFile) -> Result<String, ErrCtx
         let when = commit.timestamp.map_or_else(|| "-".to_string(), |ts| {
             format_unix_millis(ts)
         });
-        writeln!(
-            &mut f,
-            "{:<6} {:<12} {:<10} {:<12} {:<20} {}",
-            commit.lsn,
-            commit.page_count,
-            commit.changed_pages,
-            checkpoint_mark,
-            when,
-            segment_short
-        )?;
+        let msg = commit.message.as_deref().unwrap_or("-");
+        if has_any_msg {
+            writeln!(
+                &mut f,
+                "{:<6} {:<12} {:<10} {:<12} {:<20} {}",
+                commit.lsn, commit.page_count, commit.changed_pages,
+                checkpoint_mark, when, msg
+            )?;
+        } else {
+            writeln!(
+                &mut f,
+                "{:<6} {:<12} {:<10} {:<12} {:<20} {}",
+                commit.lsn, commit.page_count, commit.changed_pages,
+                checkpoint_mark, when, segment_short
+            )?;
+        }
     }
 
     Ok(f)
@@ -1188,4 +1258,175 @@ fn json_volume_info(runtime: &Runtime, file: &VolFile) -> Result<crate::json::Js
         snapshot_size_bytes,
         snapshot_pages: page_count.to_u32(),
     })
+}
+
+/// Local struct for table log entries (text and JSON output)
+struct TableLogEntry {
+    lsn: u64,
+    timestamp_ms: Option<u64>,
+    when: String,
+    summary: String,
+    detail: String,
+}
+
+/// Find all commits that modified a specific table by diffing adjacent LSN pairs.
+fn table_log_entries(
+    runtime: &Runtime,
+    vid: &VolumeId,
+    table: &str,
+) -> Result<Vec<TableLogEntry>, ErrCtx> {
+    let commits = runtime.volume_log(vid)?;
+    if commits.len() < 2 {
+        return Ok(vec![]);
+    }
+
+    // Parse schema once to find the table's pages.
+    // We do one checkout to read the schema, then reuse for page-level checks.
+    let table_pages = get_table_page_set(runtime, vid, table)?;
+
+    let volume = runtime
+        .volume_get(vid)
+        .map_err(|e| ErrCtx::PragmaErr(format!("Volume error: {e:?}").into()))?;
+    let log_id = volume.local;
+
+    // Commits come newest-first; iterate adjacent pairs ascending.
+    let mut results: Vec<(usize, &graft::CommitInfo)> = Vec::new();
+    for i in (1..commits.len()).rev() {
+        let from = &commits[i];
+        let to = &commits[i - 1];
+
+        // Fast page-level check: did *any* of the table's pages change?
+        let diff = runtime
+            .diff_commits(&log_id, from.lsn, to.lsn)
+            .map_err(|e| ErrCtx::PragmaErr(format!("Diff error: {e:?}").into()))?;
+
+        let changed = table_pages.iter().any(|&page_num| {
+            graft::core::PageIdx::try_new(page_num)
+                .is_some_and(|pi| diff.added_or_modified_pages.contains(pi))
+        });
+        if changed {
+            results.push((i, to));
+        }
+    }
+
+    // If nothing changed, return early — no expensive diff needed.
+    if results.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Now do row-level diffs ONLY for the detected commit pairs.
+    let mut entries = Vec::new();
+    for (i, to) in results {
+        let from = &commits[i];
+        let diff =
+            crate::row_level_diff::row_level_diff(runtime, vid, from.lsn, to.lsn)
+                .map_err(|e| ErrCtx::PragmaErr(format!("Diff error: {e:?}").into()))?;
+
+        if let Some(tc) = diff.table_changes.iter().find(|t| t.table_name == table)
+            && !tc.is_empty()
+        {
+            let (inserts, deletes, updates) = count_changes_json(&tc.changes);
+            let mut parts = Vec::new();
+            if inserts > 0 {
+                parts.push(format!("+{inserts}"));
+            }
+            if deletes > 0 {
+                parts.push(format!("-{deletes}"));
+            }
+            if updates > 0 {
+                parts.push(format!("~{updates}"));
+            }
+            let detail = format!("{inserts} inserts, {deletes} deletes, {updates} updates");
+            entries.push(TableLogEntry {
+                lsn: to.lsn.to_u64(),
+                timestamp_ms: to.timestamp,
+                when: to.timestamp.map_or_else(|| "-".to_string(), format_unix_millis),
+                summary: parts.join(" "),
+                detail,
+            });
+        }
+    }
+
+    Ok(entries)
+}
+
+/// Get the set of page indices that belong to a table's B-tree.
+fn get_table_page_set(
+    runtime: &Runtime,
+    vid: &VolumeId,
+    table: &str,
+) -> Result<Vec<u32>, ErrCtx> {
+    // Get latest LSN from commit history
+    let commits = runtime
+        .volume_log(vid)
+        .map_err(|e| ErrCtx::PragmaErr(format!("Volume error: {e:?}").into()))?;
+    let latest_lsn = commits
+        .first()
+        .map(|c| c.lsn)
+        .ok_or_else(|| ErrCtx::PragmaErr("No commits".into()))?;
+
+    let co = runtime
+        .volume_checkout(vid, latest_lsn)
+        .map_err(|e| ErrCtx::PragmaErr(format!("Checkout error: {e:?}").into()))?;
+    let co_vid = co.vid;
+    let reader = runtime.volume_reader(co_vid.clone()).map_err(|e| {
+        ErrCtx::PragmaErr(format!("Reader error: {e:?}").into())
+    })?;
+
+    let scanner = crate::sqlite_parse::TableScanner::new(&reader).map_err(|e| {
+        ErrCtx::PragmaErr(format!("Parse error: {e:?}").into())
+    })?;
+    let master = scanner.read_master_table().map_err(|e| {
+        ErrCtx::PragmaErr(format!("Schema error: {e:?}").into())
+    })?;
+
+    let root_page = master
+        .iter()
+        .find(|e| e.name == table)
+        .map_or(0, |e| e.root_page);
+
+    let mut pages = Vec::new();
+    if root_page > 0 {
+        collect_btree_pages(&reader, root_page, &mut pages);
+    }
+
+    let _ = runtime.volume_delete(&co_vid);
+    Ok(pages)
+}
+
+/// Recursively collect all page numbers in a table B-tree.
+fn collect_btree_pages(reader: &graft::volume_reader::VolumeReader, page_num: u32, pages: &mut Vec<u32>) {
+    if page_num == 0 || pages.contains(&page_num) {
+        return;
+    }
+    pages.push(page_num);
+
+    let page_idx = match graft::core::PageIdx::try_new(page_num) {
+        Some(p) => p,
+        None => return,
+    };
+    let Ok(page) = reader.read_page(page_idx) else { return };
+    let data = page.as_ref();
+
+    if data.len() < 12 {
+        return;
+    }
+    let page_type = data[0];
+    let num_cells = u16::from_be_bytes([data[3], data[4]]) as usize;
+
+    if page_type == 5 {
+        // Interior table page: recurse into children
+        let right_child = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
+        collect_btree_pages(reader, right_child, pages);
+        for i in 0..num_cells {
+            let ptr = 12 + i * 2;
+            if ptr + 2 > data.len() { break; }
+            let cell_off = u16::from_be_bytes([data[ptr], data[ptr + 1]]) as usize;
+            if cell_off + 4 <= data.len() {
+                let left = u32::from_be_bytes([data[cell_off], data[cell_off+1], data[cell_off+2], data[cell_off+3]]);
+                collect_btree_pages(reader, left, pages);
+            }
+        }
+    }
+    // Leaf pages (13) have no children — nothing to recurse.
 }

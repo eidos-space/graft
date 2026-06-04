@@ -32,6 +32,7 @@ pub struct VolumeWriter {
     vid: VolumeId,
     snapshot: Snapshot,
     pages: BTreeMap<PageIdx, Page>,
+    pending_message: Option<String>,
 }
 
 impl VolumeWriter {
@@ -41,7 +42,13 @@ impl VolumeWriter {
             vid,
             snapshot,
             pages: Default::default(),
+            pending_message: None,
         }
+    }
+
+    /// Set a message to be attached to this commit (consumed on commit).
+    pub fn set_message(&mut self, msg: Option<String>) {
+        self.pending_message = msg;
     }
 }
 
@@ -87,6 +94,7 @@ impl VolumeWrite for VolumeWriter {
             self.snapshot,
             page_count,
             self.pages,
+            self.pending_message,
         )?;
         Ok(VolumeReader::new(self.runtime, self.vid, snapshot))
     }

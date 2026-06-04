@@ -36,6 +36,8 @@ pub struct CommitInfo {
     pub changed_pages: usize,
     /// Unix timestamp in milliseconds when this commit was created
     pub timestamp: Option<u64>,
+    /// Optional human-readable message (like git commit -m)
+    pub message: Option<String>,
 }
 
 /// Page-level diff result
@@ -313,6 +315,7 @@ impl Runtime {
                             .segment_idx()
                             .map_or(0, |idx| idx.pageset.cardinality().to_usize()),
                         timestamp: commit.timestamp,
+                        message: commit.message.clone(),
                     });
                 }
             }

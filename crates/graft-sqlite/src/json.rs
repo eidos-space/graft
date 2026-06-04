@@ -15,6 +15,8 @@ pub struct JsonCommit {
     pub changed_pages: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timestamp_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 /// Table summary in a diff (for `graft_json_diff`)
@@ -93,6 +95,16 @@ pub struct JsonVolumeInfo {
     pub snapshot_pages: u32,
 }
 
+/// Table log entry (for `graft_json_table_log`)
+#[derive(Debug, Clone, Serialize)]
+pub struct JsonTableLogEntry {
+    pub lsn: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp_ms: Option<u64>,
+    pub summary: String,
+    pub detail: String,
+}
+
 // ============================================================
 // Conversion helpers
 // ============================================================
@@ -106,6 +118,7 @@ impl JsonCommit {
             is_checkpoint: ci.is_checkpoint,
             changed_pages: ci.changed_pages,
             timestamp_ms: ci.timestamp,
+            message: ci.message.clone(),
         }
     }
 }

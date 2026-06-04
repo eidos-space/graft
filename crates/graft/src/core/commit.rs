@@ -49,6 +49,10 @@ pub struct Commit {
     /// Unix timestamp in milliseconds when this commit was created.
     #[bilrost(8)]
     pub timestamp: Option<u64>,
+
+    /// Optional human-readable message describing this commit (like git commit -m).
+    #[bilrost(9)]
+    pub message: Option<String>,
 }
 
 impl Commit {
@@ -62,6 +66,7 @@ impl Commit {
             segment_idx: None,
             checkpoints: Default::default(),
             timestamp: None,
+            message: None,
         }
     }
 
@@ -93,6 +98,11 @@ impl Commit {
     /// Sets the creation timestamp for this commit (unix millis).
     pub fn with_timestamp(self, timestamp: u64) -> Self {
         Self { timestamp: Some(timestamp), ..self }
+    }
+
+    /// Sets an optional human-readable message for this commit.
+    pub fn with_message(self, message: Option<String>) -> Self {
+        Self { message, ..self }
     }
 
     pub fn log(&self) -> &LogId {
