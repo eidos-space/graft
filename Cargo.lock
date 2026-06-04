@@ -1063,6 +1063,8 @@ dependencies = [
  "indoc",
  "itertools 0.14.0",
  "parking_lot",
+ "serde",
+ "serde_json",
  "sqlite-plugin",
  "thiserror 2.0.17",
  "tracing",

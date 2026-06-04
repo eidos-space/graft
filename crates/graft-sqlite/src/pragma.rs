@@ -145,6 +145,24 @@ pub enum GraftPragma {
     /// `pragma graft_show = "lsn";`
     /// Display detailed info for specified LSN (includes summary of all table data)
     Show { lsn: LSN },
+
+    // JSON output variants (non-breaking additions)
+
+    /// `pragma graft_json_log;`
+    /// Commit history as JSON array
+    JsonLog,
+
+    /// `pragma graft_json_diff = "from_lsn,to_lsn[,mode]";`
+    /// Diff as JSON. mode: omitted=summary, "rows"=row-level detail
+    JsonDiff { from: LSN, to: LSN, mode: DiffMode },
+
+    /// `pragma graft_json_show = "lsn";`
+    /// Commit details as JSON
+    JsonShow { lsn: LSN },
+
+    /// `pragma graft_json_info;`
+    /// Volume info as JSON
+    JsonInfo,
 }
 
 impl TryFrom<&Pragma<'_>> for GraftPragma {
@@ -227,6 +245,30 @@ impl TryFrom<&Pragma<'_>> for GraftPragma {
                 "show" => {
                     Ok(GraftPragma::Show { lsn: parse_or_fail(p.require_arg()?)? })
                 }
+                "json_log" => Ok(GraftPragma::JsonLog),
+                "json_diff" => {
+                    let parts: Vec<&str> = p.require_arg()?.split(',').collect();
+                    if parts.len() < 2 || parts.len() > 3 {
+                        return Err(pragma_fail("argument must be in the form: `from_lsn,to_lsn[,mode]`"));
+                    }
+                    let mode = if parts.len() == 3 {
+                        match parts[2] {
+                            "rows" => DiffMode::Rows,
+                            _ => return Err(pragma_fail("mode must be 'rows' or omitted")),
+                        }
+                    } else {
+                        DiffMode::Default
+                    };
+                    Ok(GraftPragma::JsonDiff {
+                        from: parse_or_fail(parts[0])?,
+                        to: parse_or_fail(parts[1])?,
+                        mode,
+                    })
+                }
+                "json_show" => {
+                    Ok(GraftPragma::JsonShow { lsn: parse_or_fail(p.require_arg()?)? })
+                }
+                "json_info" => Ok(GraftPragma::JsonInfo),
                 _ => Err(pragma_fail(format!("invalid graft pragma `{}`", p.name))),
             };
         }
@@ -439,6 +481,121 @@ impl GraftPragma {
                 }
                 let result = show_lsn(runtime, file, lsn)?;
                 Ok(Some(result))
+            }
+
+            GraftPragma::JsonLog => {
+                let commits = runtime.volume_log(&file.vid)?;
+                let entries: Vec<crate::json::JsonCommit> = commits
+                    .iter()
+                    .map(crate::json::JsonCommit::from_commit_info)
+                    .collect();
+                Ok(Some(serde_json::to_string(&entries).map_err(|e| {
+                    ErrCtx::PragmaErr(format!("JSON error: {e}").into())
+                })?))
+            }
+
+            GraftPragma::JsonDiff { from, to, mode } => {
+                if !file.is_idle() {
+                    return pragma_err!("cannot diff while there is an open transaction");
+                }
+                match mode {
+                    DiffMode::Default => {
+                        let diff = crate::row_level_diff::row_level_diff(runtime, &file.vid, from, to)
+                            .map_err(|e| {
+                                ErrCtx::PragmaErr(format!("Diff error: {e:?}").into())
+                            })?;
+                        let tables: Vec<crate::json::JsonTableSummary> = diff
+                            .table_changes
+                            .iter()
+                            .map(|t| {
+                                let (inserts, deletes, updates) = count_changes_json(&t.changes);
+                                crate::json::JsonTableSummary {
+                                    name: t.table_name.clone(),
+                                    inserts,
+                                    deletes,
+                                    updates,
+                                }
+                            })
+                            .collect();
+                        let result = crate::json::JsonDiffResult {
+                            from_lsn: from.to_u64(),
+                            to_lsn: to.to_u64(),
+                            tables,
+                        };
+                        Ok(Some(serde_json::to_string(&result).map_err(|e| {
+                            ErrCtx::PragmaErr(format!("JSON error: {e}").into())
+                        })?))
+                    }
+                    DiffMode::Rows => {
+                        let diff = crate::row_level_diff::row_level_diff(runtime, &file.vid, from, to)
+                            .map_err(|e| {
+                                ErrCtx::PragmaErr(format!("Diff error: {e:?}").into())
+                            })?;
+                        let tables: Vec<crate::json::JsonTableChanges> = diff
+                            .table_changes
+                            .iter()
+                            .map(|t| {
+                                let changes: Vec<crate::json::JsonRowChange> = t
+                                    .changes
+                                    .iter()
+                                    .map(|c| match c {
+                                        crate::row_level_diff::RowChange::Insert { rowid, row } => {
+                                            crate::json::JsonRowChange {
+                                                op: "insert".into(),
+                                                rowid: *rowid,
+                                                values: row.values.iter().map(crate::json::JsonRowChange::value_to_json).collect(),
+                                            }
+                                        }
+                                        crate::row_level_diff::RowChange::Delete { rowid, row } => {
+                                            crate::json::JsonRowChange {
+                                                op: "delete".into(),
+                                                rowid: *rowid,
+                                                values: row.values.iter().map(crate::json::JsonRowChange::value_to_json).collect(),
+                                            }
+                                        }
+                                        crate::row_level_diff::RowChange::Update { rowid, new_row, .. } => {
+                                            crate::json::JsonRowChange {
+                                                op: "update".into(),
+                                                rowid: *rowid,
+                                                values: new_row.values.iter().map(crate::json::JsonRowChange::value_to_json).collect(),
+                                            }
+                                        }
+                                    })
+                                    .collect();
+                                crate::json::JsonTableChanges {
+                                    name: t.table_name.clone(),
+                                    columns: t.columns.clone(),
+                                    changes,
+                                }
+                            })
+                            .collect();
+                        let result = crate::json::JsonRowDiffResult {
+                            from_lsn: from.to_u64(),
+                            to_lsn: to.to_u64(),
+                            tables,
+                        };
+                        Ok(Some(serde_json::to_string(&result).map_err(|e| {
+                            ErrCtx::PragmaErr(format!("JSON error: {e}").into())
+                        })?))
+                    }
+                }
+            }
+
+            GraftPragma::JsonShow { lsn } => {
+                if !file.is_idle() {
+                    return pragma_err!("cannot show while there is an open transaction");
+                }
+                let result = json_show_lsn(runtime, file, lsn)?;
+                Ok(Some(serde_json::to_string(&result).map_err(|e| {
+                    ErrCtx::PragmaErr(format!("JSON error: {e}").into())
+                })?))
+            }
+
+            GraftPragma::JsonInfo => {
+                let result = json_volume_info(runtime, file)?;
+                Ok(Some(serde_json::to_string(&result).map_err(|e| {
+                    ErrCtx::PragmaErr(format!("JSON error: {e}").into())
+                })?))
             }
         }
     }
@@ -918,4 +1075,89 @@ fn row_diff_impl(
     }
     
     Ok(Some(output))
+}
+
+/// Count changes for JSON summary
+fn count_changes_json(
+    changes: &[crate::row_level_diff::RowChange],
+) -> (usize, usize, usize) {
+    let mut inserts = 0;
+    let mut deletes = 0;
+    let mut updates = 0;
+    for change in changes {
+        match change {
+            crate::row_level_diff::RowChange::Insert { .. } => inserts += 1,
+            crate::row_level_diff::RowChange::Delete { .. } => deletes += 1,
+            crate::row_level_diff::RowChange::Update { .. } => updates += 1,
+        }
+    }
+    (inserts, deletes, updates)
+}
+
+/// Generate JSON show output
+fn json_show_lsn(runtime: &Runtime, file: &VolFile, lsn: LSN) -> Result<crate::json::JsonShowResult, ErrCtx> {
+    let volume = runtime.volume_get(&file.vid)?;
+    let commit = runtime
+        .get_commit(&volume.local, lsn)?
+        .ok_or_else(|| ErrCtx::PragmaErr(format!("LSN {lsn} not found").into()))?;
+
+    let checkout_vol = runtime
+        .volume_checkout(&file.vid, lsn)
+        .map_err(|e| ErrCtx::PragmaErr(format!("Failed to checkout LSN {lsn}: {e:?}").into()))?;
+    let vid = checkout_vol.vid;
+    let reader = runtime.volume_reader(vid.clone()).map_err(|e| {
+        ErrCtx::PragmaErr(format!("Failed to create reader: {e:?}").into())
+    })?;
+
+    let tables = match crate::sqlite_parse::TableScanner::new(&reader) {
+        Ok(scanner) => match scanner.read_master_table() {
+            Ok(entries) => entries
+                .iter()
+                .map(|e| {
+                    let rows = if e.entry_type == "table" && !e.name.starts_with("sqlite_") {
+                        crate::sqlite_parse::read_all_rows(&reader, e.root_page)
+                            .ok()
+                            .map(|r| r.len())
+                    } else {
+                        None
+                    };
+                    crate::json::JsonTableEntry {
+                        entry_type: e.entry_type.clone(),
+                        name: e.name.clone(),
+                        root_page: e.root_page,
+                        rows,
+                    }
+                })
+                .collect(),
+            Err(_) => vec![],
+        },
+        Err(_) => vec![],
+    };
+
+    let _ = runtime.volume_delete(&vid);
+
+    Ok(crate::json::JsonShowResult {
+        lsn: lsn.to_u64(),
+        page_count: commit.page_count.to_u32(),
+        is_checkpoint: commit.is_checkpoint(),
+        segment: commit.segment_id().map(|s| s.short()),
+        changed_pages: commit.segment_idx().map_or(0, |idx| idx.pageset.cardinality().to_usize()),
+        tables,
+    })
+}
+
+/// Generate JSON volume info
+fn json_volume_info(runtime: &Runtime, file: &VolFile) -> Result<crate::json::JsonVolumeInfo, ErrCtx> {
+    let state = runtime.volume_get(&file.vid)?;
+    let page_count = file.page_count()?;
+    let snapshot_size_bytes = (graft::core::page::PAGESIZE.as_usize() as u64) * (page_count.to_usize() as u64);
+
+    Ok(crate::json::JsonVolumeInfo {
+        vid: state.vid.to_string(),
+        local: state.local.to_string(),
+        remote: state.remote.to_string(),
+        page_count: page_count.to_u32(),
+        snapshot_size_bytes,
+        snapshot_pages: page_count.to_u32(),
+    })
 }

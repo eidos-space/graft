@@ -1,4 +1,5 @@
 pub mod file;
+pub mod json;
 pub mod pragma;
 pub mod row_level_diff;
 pub mod sql_diff;
