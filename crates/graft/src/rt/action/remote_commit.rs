@@ -86,6 +86,10 @@ impl Action for RemoteCommit {
             thin_vec![]
         };
 
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
         let commit = Commit::new(
             plan.commit_ref.log().clone(),
             plan.commit_ref.lsn(),
@@ -93,7 +97,8 @@ impl Action for RemoteCommit {
         )
         .with_commit_hash(Some(commit_hash.clone()))
         .with_segment_idx(Some(segment_idx))
-        .with_checkpoints(maybe_checkpoint);
+        .with_checkpoints(maybe_checkpoint)
+        .with_timestamp(now);
 
         #[cfg(feature = "precept")]
         precept::sometimes_fault!(

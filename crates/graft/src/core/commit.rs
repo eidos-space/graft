@@ -45,6 +45,10 @@ pub struct Commit {
     /// If this commit is a checkpoint, it will store its own LSN in this field.
     #[bilrost(7)]
     pub checkpoints: ThinVec<LSN>,
+
+    /// Unix timestamp in milliseconds when this commit was created.
+    #[bilrost(8)]
+    pub timestamp: Option<u64>,
 }
 
 impl Commit {
@@ -57,6 +61,7 @@ impl Commit {
             commit_hash: None,
             segment_idx: None,
             checkpoints: Default::default(),
+            timestamp: None,
         }
     }
 
@@ -83,6 +88,11 @@ impl Commit {
     /// commit's LSN in the list.
     pub fn with_checkpoints(self, checkpoints: ThinVec<LSN>) -> Self {
         Self { checkpoints, ..self }
+    }
+
+    /// Sets the creation timestamp for this commit (unix millis).
+    pub fn with_timestamp(self, timestamp: u64) -> Self {
+        Self { timestamp: Some(timestamp), ..self }
     }
 
     pub fn log(&self) -> &LogId {

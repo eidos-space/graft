@@ -185,9 +185,25 @@ Shows a table with columns:
 - **PAGES**: Total page count at this commit
 - **CHANGED**: Number of pages changed in this commit
 - **CHECKPOINT**: Whether this was a checkpoint commit (✓)
+- **WHEN**: Human-readable creation timestamp (e.g. `2026-06-04 07:23:22`)
 - **SEGMENT**: Segment ID (if applicable)
 
 Commits are listed from newest to oldest.
+
+### `pragma graft_json_log`
+
+Returns commit history as a JSON array. Each entry includes `lsn`, `page_count`, `segment`, `is_checkpoint`, `changed_pages`, and `timestamp_ms` (unix milliseconds).
+
+```sql
+pragma graft_json_log;
+```
+
+```json
+[
+  {"lsn":3,"page_count":2,"segment":"2vt5fF...","is_checkpoint":false,"changed_pages":1,"timestamp_ms":1717482202003},
+  {"lsn":2,"page_count":2,"segment":"3GMtDE...","is_checkpoint":false,"changed_pages":1,"timestamp_ms":1717482202002}
+]
+```
 
 ### `pragma graft_show = "LSN"`
 
@@ -249,22 +265,6 @@ This is similar to checkout but also updates the current tag. The previous Volum
   The previous Volume is not deleted, but is no longer accessible via the tag.
   Use `pragma graft_tags` to see all tags and their Volumes.
 </Aside>
-
-### `pragma graft_json_log`
-
-Returns commit history as a JSON array. Each entry includes `lsn`, `page_count`, `segment`, `is_checkpoint`, and `changed_pages`.
-
-```sql
-pragma graft_json_log;
-```
-
-```json
-[
-  {"lsn":3,"page_count":2,"segment":"2vt5fF...","is_checkpoint":false,"changed_pages":1},
-  {"lsn":2,"page_count":2,"segment":"3GMtDE...","is_checkpoint":false,"changed_pages":1},
-  {"lsn":1,"page_count":2,"segment":"3Tn3QB...","is_checkpoint":true,"changed_pages":2}
-]
-```
 
 ### `pragma graft_json_diff = "from,to"`
 

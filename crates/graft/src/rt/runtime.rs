@@ -34,6 +34,8 @@ pub struct CommitInfo {
     pub is_checkpoint: bool,
     /// Number of pages changed in this commit
     pub changed_pages: usize,
+    /// Unix timestamp in milliseconds when this commit was created
+    pub timestamp: Option<u64>,
 }
 
 /// Page-level diff result
@@ -310,6 +312,7 @@ impl Runtime {
                         changed_pages: commit
                             .segment_idx()
                             .map_or(0, |idx| idx.pageset.cardinality().to_usize()),
+                        timestamp: commit.timestamp,
                     });
                 }
             }

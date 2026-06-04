@@ -709,9 +709,14 @@ impl<'a> ReadWriteGuard<'a> {
         let segment = SegmentIdx::new(sid.clone(), pageset);
 
         // build the commit
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
         let commit = Commit::new(volume.local.clone(), commit_lsn, page_count)
             .with_checkpoints(maybe_checkpoint)
-            .with_segment_idx(Some(segment));
+            .with_segment_idx(Some(segment))
+            .with_timestamp(now);
 
         // write out the segment and commit to storage
         let mut batch = self.read.storage.batch();

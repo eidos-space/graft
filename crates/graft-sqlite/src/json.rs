@@ -13,6 +13,8 @@ pub struct JsonCommit {
     pub segment: Option<String>,
     pub is_checkpoint: bool,
     pub changed_pages: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp_ms: Option<u64>,
 }
 
 /// Table summary in a diff (for `graft_json_diff`)
@@ -103,6 +105,7 @@ impl JsonCommit {
             segment: ci.segment_id.as_ref().map(|s| s.short()),
             is_checkpoint: ci.is_checkpoint,
             changed_pages: ci.changed_pages,
+            timestamp_ms: ci.timestamp,
         }
     }
 }
