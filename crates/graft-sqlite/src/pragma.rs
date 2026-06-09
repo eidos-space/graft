@@ -566,6 +566,7 @@ impl GraftPragma {
                                                 op: "insert".into(),
                                                 rowid: *rowid,
                                                 values: row.values.iter().map(crate::json::JsonRowChange::value_to_json).collect(),
+                                                old_values: None,
                                             }
                                         }
                                         crate::row_level_diff::RowChange::Delete { rowid, row } => {
@@ -573,13 +574,15 @@ impl GraftPragma {
                                                 op: "delete".into(),
                                                 rowid: *rowid,
                                                 values: row.values.iter().map(crate::json::JsonRowChange::value_to_json).collect(),
+                                                old_values: None,
                                             }
                                         }
-                                        crate::row_level_diff::RowChange::Update { rowid, new_row, .. } => {
+                                        crate::row_level_diff::RowChange::Update { rowid, old_row, new_row } => {
                                             crate::json::JsonRowChange {
                                                 op: "update".into(),
                                                 rowid: *rowid,
                                                 values: new_row.values.iter().map(crate::json::JsonRowChange::value_to_json).collect(),
+                                                old_values: Some(old_row.values.iter().map(crate::json::JsonRowChange::value_to_json).collect()),
                                             }
                                         }
                                     })

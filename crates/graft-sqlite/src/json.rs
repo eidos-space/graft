@@ -42,6 +42,9 @@ pub struct JsonRowChange {
     pub op: String, // "insert", "delete", "update"
     pub rowid: i64,
     pub values: Vec<serde_json::Value>,
+    /// Old values (only present for "update" operations)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_values: Option<Vec<serde_json::Value>>,
 }
 
 /// Table changes with row details (for `graft_json_diff`, rows mode)
