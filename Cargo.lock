@@ -1086,6 +1086,7 @@ dependencies = [
  "precept",
  "rand 0.10.0",
  "rusqlite",
+ "serde_json",
  "sqlite-plugin",
  "tempfile",
  "thiserror 2.0.17",

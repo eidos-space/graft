@@ -1,6 +1,7 @@
 use graft::core::{LogId, PageCount};
 use graft_test::GraftTestRuntime;
-use rusqlite::Connection;
+use rusqlite::{Connection, ToSql};
+use serde_json::Value;
 
 #[test]
 fn test_sync_and_reset() {
@@ -129,6 +130,83 @@ fn test_export() {
     assert_eq!(name, "Bob");
 
     // Cleanup
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_json_row_diff_handles_overflow_pages() {
+    graft_test::ensure_test_env();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite("main", None);
+
+    sqlite
+        .execute(
+            "CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
+            [],
+        )
+        .unwrap();
+
+    let old_body = "a".repeat(10_000);
+    let new_body = format!("{}b", "a".repeat(9_999));
+
+    sqlite
+        .execute("INSERT INTO docs (id, body) VALUES (1, ?1)", [&old_body])
+        .unwrap();
+    sqlite
+        .execute("UPDATE docs SET body = ?1 WHERE id = 1", [&new_body])
+        .unwrap();
+
+    let log: Vec<Value> = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_log"))
+        .expect("graft_json_log should return valid JSON");
+    let mut lsns: Vec<u64> = log
+        .iter()
+        .map(|commit| commit["lsn"].as_u64().expect("commit has an LSN"))
+        .collect();
+    lsns.sort_unstable();
+    assert!(
+        lsns.len() >= 2,
+        "expected at least insert and update commits"
+    );
+    let from_lsn = lsns[lsns.len() - 2];
+    let to_lsn = lsns[lsns.len() - 1];
+
+    let show: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_show",
+        to_lsn.to_string(),
+    ))
+    .expect("graft_json_show should return valid JSON");
+    let docs_table = show["tables"]
+        .as_array()
+        .expect("show tables should be an array")
+        .iter()
+        .find(|table| table["name"] == "docs")
+        .expect("docs table should be present in show output");
+    assert_eq!(docs_table["rows"].as_u64(), Some(1));
+
+    let diff: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_diff",
+        format!("{from_lsn},{to_lsn},rows"),
+    ))
+    .expect("graft_json_diff should return valid JSON");
+    let docs_diff = diff["tables"]
+        .as_array()
+        .expect("diff tables should be an array")
+        .iter()
+        .find(|table| table["name"] == "docs")
+        .expect("docs table should be present in diff output");
+    let changes = docs_diff["changes"]
+        .as_array()
+        .expect("docs changes should be an array");
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0]["op"], "update");
+    assert_eq!(changes[0]["rowid"].as_i64(), Some(1));
+
+    assert!(row_values_contain(&changes[0]["old_values"], &old_body));
+    assert!(row_values_contain(&changes[0]["values"], &new_body));
+
     runtime.shutdown().unwrap();
 }
 
@@ -293,4 +371,35 @@ fn test_sqlite_query_only_fetches_needed_pages() {
             .to_usize(),
         0
     );
+}
+
+fn pragma_query_string(conn: &Connection, name: &str) -> String {
+    let mut output = None;
+    conn.pragma_query(None, name, |row| {
+        output = Some(row.get::<_, String>(0)?);
+        Ok(())
+    })
+    .unwrap();
+    output.unwrap()
+}
+
+fn pragma_arg_string<T: ToSql>(conn: &Connection, name: &str, arg: T) -> String {
+    let mut output = None;
+    conn.pragma(None, name, arg, |row| {
+        output = Some(row.get::<_, String>(0)?);
+        Ok(())
+    })
+    .unwrap();
+    output.unwrap()
+}
+
+fn row_values_contain(values: &Value, expected: &str) -> bool {
+    values
+        .as_array()
+        .map(|values| {
+            values
+                .iter()
+                .any(|value| value.as_str().is_some_and(|value| value == expected))
+        })
+        .unwrap_or(false)
 }

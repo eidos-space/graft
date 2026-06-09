@@ -2,17 +2,27 @@
 //!
 //! Parses `SQLite` B-tree directly to compare row data between versions
 
+use crate::sqlite_parse::{MasterEntry, ParseError, Record, TableScanner, read_all_rows};
 use graft::core::{VolumeId, lsn::LSN};
 use graft::rt::runtime::Runtime;
 use graft::volume_reader::VolumeReader;
-use crate::sqlite_parse::{MasterEntry, Record, TableScanner, read_all_rows};
 
 /// Type of row change
 #[derive(Debug, Clone)]
 pub enum RowChange {
-    Insert { rowid: i64, row: Record },
-    Delete { rowid: i64, row: Record },
-    Update { rowid: i64, old_row: Record, new_row: Record },
+    Insert {
+        rowid: i64,
+        row: Record,
+    },
+    Delete {
+        rowid: i64,
+        row: Record,
+    },
+    Update {
+        rowid: i64,
+        old_row: Record,
+        new_row: Record,
+    },
 }
 
 /// Changes for a single table
@@ -47,9 +57,7 @@ impl TableChanges {
                     sql.push_str(&format_sql_delete(&self.table_name, *rowid));
                     sql.push('\n');
                 }
-                RowChange::Update {
-                    rowid, new_row, ..
-                } => {
+                RowChange::Update { rowid, new_row, .. } => {
                     sql.push_str(&format_sql_update(
                         &self.table_name,
                         &self.columns,
@@ -76,9 +84,12 @@ pub struct RowLevelDiff {
 impl RowLevelDiff {
     /// Generate complete SQL diff
     pub fn to_sql(&self) -> String {
-        let mut sql = format!("-- Row-level Diff: LSN {} -> {}\n", self.from_lsn, self.to_lsn);
+        let mut sql = format!(
+            "-- Row-level Diff: LSN {} -> {}\n",
+            self.from_lsn, self.to_lsn
+        );
         sql.push_str("BEGIN TRANSACTION;\n\n");
-        
+
         for table in &self.table_changes {
             if !table.is_empty() {
                 sql.push_str(&format!("-- Table: {}\n", table.table_name));
@@ -86,23 +97,23 @@ impl RowLevelDiff {
                 sql.push('\n');
             }
         }
-        
+
         sql.push_str("COMMIT;\n");
         sql
     }
-    
+
     /// Generate human-readable report
     pub fn to_report(&self) -> String {
         let mut report = format!("Diff LSN {} -> {}\n", self.from_lsn, self.to_lsn);
         report.push_str("============================\n\n");
-        
+
         for table in &self.table_changes {
             if table.is_empty() {
                 continue;
             }
-            
+
             let (inserts, deletes, updates) = count_changes(&table.changes);
-            
+
             report.push_str(&format!("Table '{}': ", table.table_name));
             if inserts > 0 {
                 report.push_str(&format!("+{inserts} inserts "));
@@ -114,7 +125,7 @@ impl RowLevelDiff {
                 report.push_str(&format!("~{updates} updates"));
             }
             report.push('\n');
-            
+
             // Show detailed changes
             for change in &table.changes {
                 match change {
@@ -133,7 +144,7 @@ impl RowLevelDiff {
             }
             report.push('\n');
         }
-        
+
         report
     }
 }
@@ -143,7 +154,7 @@ fn count_changes(changes: &[RowChange]) -> (usize, usize, usize) {
     let mut inserts = 0;
     let mut deletes = 0;
     let mut updates = 0;
-    
+
     for change in changes {
         match change {
             RowChange::Insert { .. } => inserts += 1,
@@ -151,7 +162,7 @@ fn count_changes(changes: &[RowChange]) -> (usize, usize, usize) {
             RowChange::Update { .. } => updates += 1,
         }
     }
-    
+
     (inserts, deletes, updates)
 }
 
@@ -164,57 +175,65 @@ pub fn row_level_diff(
 ) -> Result<RowLevelDiff, graft::err::GraftErr> {
     // Checkout both versions
     let from_vol = runtime.volume_checkout(vid, from_lsn)?;
-    let to_vol = runtime.volume_checkout(vid, to_lsn)?;
-    
+    let to_vol = match runtime.volume_checkout(vid, to_lsn) {
+        Ok(to_vol) => to_vol,
+        Err(err) => {
+            let _ = runtime.volume_delete(&from_vol.vid);
+            return Err(err);
+        }
+    };
+
     let from_vid = from_vol.vid.clone();
     let to_vid = to_vol.vid.clone();
-    
+
     tracing::debug!("row_level_diff: from_vid={}, to_vid={}", from_vid, to_vid);
-    
+
+    let result = row_level_diff_checked_out(runtime, &from_vid, &to_vid, from_lsn, to_lsn);
+    let _ = runtime.volume_delete(&from_vol.vid);
+    let _ = runtime.volume_delete(&to_vol.vid);
+
+    result
+}
+
+fn row_level_diff_checked_out(
+    runtime: &Runtime,
+    from_vid: &VolumeId,
+    to_vid: &VolumeId,
+    from_lsn: LSN,
+    to_lsn: LSN,
+) -> Result<RowLevelDiff, graft::err::GraftErr> {
     // Get readers
-    let from_reader = runtime.volume_reader(from_vid.clone())
-        .map_err(|e| {
-            tracing::error!("Failed to create from_reader for {}: {:?}", from_vid, e);
-            graft::err::LogicalErr::Other(format!("Failed to create reader for {from_vid}: {e:?}"))
-        })?;
-    let to_reader = runtime.volume_reader(to_vid.clone())
-        .map_err(|e| {
-            tracing::error!("Failed to create to_reader for {}: {:?}", to_vid, e);
-            graft::err::LogicalErr::Other(format!("Failed to create reader for {to_vid}: {e:?}"))
-        })?;
-    
+    let from_reader = runtime.volume_reader(from_vid.clone()).map_err(|e| {
+        tracing::error!("Failed to create from_reader for {}: {:?}", from_vid, e);
+        graft::err::LogicalErr::Other(format!("Failed to create reader for {from_vid}: {e:?}"))
+    })?;
+    let to_reader = runtime.volume_reader(to_vid.clone()).map_err(|e| {
+        tracing::error!("Failed to create to_reader for {}: {:?}", to_vid, e);
+        graft::err::LogicalErr::Other(format!("Failed to create reader for {to_vid}: {e:?}"))
+    })?;
+
     // Read master table for both versions
-    let from_scanner = TableScanner::new(&from_reader)
-        .map_err(|e| {
-            tracing::error!("Failed to create from_scanner for {}: {:?}", from_vid, e);
-            graft::err::LogicalErr::Other(format!(
-                "Failed to parse B-tree for {from_vid}: {e:?}"
-            ))
-        })?;
-    let to_scanner = TableScanner::new(&to_reader)
-        .map_err(|e| {
-            tracing::error!("Failed to create to_scanner for {}: {:?}", to_vid, e);
-            graft::err::LogicalErr::Other(format!(
-                "Failed to parse B-tree for {to_vid}: {e:?}"
-            ))
-        })?;
+    let from_scanner = TableScanner::new(&from_reader).map_err(|e| {
+        tracing::error!("Failed to create from_scanner for {}: {:?}", from_vid, e);
+        graft::err::LogicalErr::Other(format!("Failed to parse B-tree for {from_vid}: {e:?}"))
+    })?;
+    let to_scanner = TableScanner::new(&to_reader).map_err(|e| {
+        tracing::error!("Failed to create to_scanner for {}: {:?}", to_vid, e);
+        graft::err::LogicalErr::Other(format!("Failed to parse B-tree for {to_vid}: {e:?}"))
+    })?;
 
     let from_master = from_scanner.read_master_table().map_err(|e| {
         tracing::error!("Failed to read from_master_table for {}: {:?}", from_vid, e);
-        graft::err::LogicalErr::Other(format!(
-            "Failed to read schema for {from_vid}: {e:?}"
-        ))
+        graft::err::LogicalErr::Other(format!("Failed to read schema for {from_vid}: {e:?}"))
     })?;
     let to_master = to_scanner.read_master_table().map_err(|e| {
         tracing::error!("Failed to read to_master_table for {}: {:?}", to_vid, e);
-        graft::err::LogicalErr::Other(format!(
-            "Failed to read schema for {to_vid}: {e:?}"
-        ))
+        graft::err::LogicalErr::Other(format!("Failed to read schema for {to_vid}: {e:?}"))
     })?;
-    
+
     // Compare tables
     let mut table_changes = Vec::new();
-    
+
     // Collect all table names
     let mut all_tables: std::collections::HashSet<String> = std::collections::HashSet::new();
     for entry in &from_master {
@@ -227,7 +246,7 @@ pub fn row_level_diff(
             all_tables.insert(entry.name.clone());
         }
     }
-    
+
     // Compare each table
     for table_name in all_tables {
         let from_entry = from_master.iter().find(|e| e.name == table_name);
@@ -236,12 +255,7 @@ pub fn row_level_diff(
         // Get columns from schema (prefer to-entry, fallback to from-entry)
         let columns: Vec<String> = to_entry
             .or(from_entry)
-            .map(|e| {
-                e.parse_columns()
-                    .into_iter()
-                    .map(|c| c.name)
-                    .collect()
-            })
+            .map(|e| e.parse_columns().into_iter().map(|c| c.name).collect())
             .unwrap_or_default();
 
         let changes = match (from_entry, to_entry) {
@@ -252,7 +266,7 @@ pub fn row_level_diff(
             (Some(from), None) => {
                 // Table deleted, all rows are DELETE
                 let rows = read_all_rows(&from_reader, from.root_page)
-                    .map_err(|_| graft::err::LogicalErr::VolumeNotFound(VolumeId::EMPTY))?;
+                    .map_err(|e| table_read_err("from", from, e))?;
                 rows.into_iter()
                     .map(|(rowid, row)| RowChange::Delete { rowid, row })
                     .collect()
@@ -260,7 +274,7 @@ pub fn row_level_diff(
             (None, Some(to)) => {
                 // New table, all rows are INSERT
                 let rows = read_all_rows(&to_reader, to.root_page)
-                    .map_err(|_| graft::err::LogicalErr::VolumeNotFound(VolumeId::EMPTY))?;
+                    .map_err(|e| table_read_err("to", to, e))?;
                 rows.into_iter()
                     .map(|(rowid, row)| RowChange::Insert { rowid, row })
                     .collect()
@@ -269,23 +283,11 @@ pub fn row_level_diff(
         };
 
         if !changes.is_empty() {
-            table_changes.push(TableChanges {
-                table_name,
-                columns,
-                changes,
-            });
+            table_changes.push(TableChanges { table_name, columns, changes });
         }
     }
-    
-    // Cleanup temporary volumes
-    let _ = runtime.volume_delete(&from_vol.vid);
-    let _ = runtime.volume_delete(&to_vol.vid);
-    
-    Ok(RowLevelDiff {
-        from_lsn,
-        to_lsn,
-        table_changes,
-    })
+
+    Ok(RowLevelDiff { from_lsn, to_lsn, table_changes })
 }
 
 /// Diff rows for a single table
@@ -297,17 +299,17 @@ fn diff_table_rows(
 ) -> Result<Vec<RowChange>, graft::err::LogicalErr> {
     // Read rows from both versions
     let from_rows = read_all_rows(from_reader, from_entry.root_page)
-        .map_err(|_| graft::err::LogicalErr::VolumeNotFound(VolumeId::EMPTY))?;
+        .map_err(|e| table_read_err("from", from_entry, e))?;
     let to_rows = read_all_rows(to_reader, to_entry.root_page)
-        .map_err(|_| graft::err::LogicalErr::VolumeNotFound(VolumeId::EMPTY))?;
-    
+        .map_err(|e| table_read_err("to", to_entry, e))?;
+
     let mut changes = Vec::new();
-    
+
     // Find all rowids
     let mut all_rowids: std::collections::HashSet<i64> = std::collections::HashSet::new();
     all_rowids.extend(from_rows.keys());
     all_rowids.extend(to_rows.keys());
-    
+
     for rowid in all_rowids {
         match (from_rows.get(&rowid), to_rows.get(&rowid)) {
             (Some(old_row), Some(new_row)) => {
@@ -322,23 +324,24 @@ fn diff_table_rows(
             }
             (Some(row), None) => {
                 // Row deleted
-                changes.push(RowChange::Delete {
-                    rowid,
-                    row: row.clone(),
-                });
+                changes.push(RowChange::Delete { rowid, row: row.clone() });
             }
             (None, Some(row)) => {
                 // New row
-                changes.push(RowChange::Insert {
-                    rowid,
-                    row: row.clone(),
-                });
+                changes.push(RowChange::Insert { rowid, row: row.clone() });
             }
             (None, None) => {}
         }
     }
-    
+
     Ok(changes)
+}
+
+fn table_read_err(side: &str, entry: &MasterEntry, err: ParseError) -> graft::err::LogicalErr {
+    graft::err::LogicalErr::Other(format!(
+        "Failed to read {side} table '{}' at root page {}: {err}",
+        entry.name, entry.root_page
+    ))
 }
 
 /// Format SQL INSERT (values only, `SQLite` auto-assigns rowid)
@@ -557,18 +560,9 @@ mod tests {
     #[test]
     fn test_count_changes() {
         let changes = vec![
-            RowChange::Insert {
-                rowid: 1,
-                row: make_record(vec![]),
-            },
-            RowChange::Insert {
-                rowid: 2,
-                row: make_record(vec![]),
-            },
-            RowChange::Delete {
-                rowid: 3,
-                row: make_record(vec![]),
-            },
+            RowChange::Insert { rowid: 1, row: make_record(vec![]) },
+            RowChange::Insert { rowid: 2, row: make_record(vec![]) },
+            RowChange::Delete { rowid: 3, row: make_record(vec![]) },
             RowChange::Update {
                 rowid: 4,
                 old_row: make_record(vec![]),
