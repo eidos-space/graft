@@ -1006,7 +1006,7 @@ mod tests {
         assert_eq!(Value::Integer(42).to_sql(), "42");
         assert_eq!(Value::Text("hello".into()).to_sql(), "'hello'");
         assert_eq!(Value::Text("it's".into()).to_sql(), "'it''s'");
-        assert_eq!(Value::Real(3.14).to_sql().len() > 0, true);
+        assert!(!Value::Real(2.5).to_sql().is_empty());
         assert_eq!(Value::Blob(vec![0xFF, 0x00]).to_sql(), "X'FF00'");
     }
 

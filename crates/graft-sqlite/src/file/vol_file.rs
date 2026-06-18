@@ -13,6 +13,7 @@ use graft::core::{
     page_count::PageCount,
 };
 use graft::{
+    repo::Repository,
     rt::runtime::Runtime,
     snapshot::Snapshot,
     volume_reader::{VolumeRead, VolumeReadRef, VolumeReader},
@@ -21,7 +22,7 @@ use graft::{
 use parking_lot::{Mutex, MutexGuard};
 use sqlite_plugin::flags::{LockLevel, OpenOpts};
 
-use crate::vfs::ErrCtx;
+use crate::vfs::{ErrCtx, RepoRuntimeRegistry};
 
 use super::VfsFile;
 
@@ -67,6 +68,8 @@ pub struct VolFile {
     pub tag: String,
     pub vid: VolumeId,
     opts: OpenOpts,
+    pub repo: Option<Repository>,
+    repo_runtimes: Arc<RepoRuntimeRegistry>,
 
     reserved: Arc<Mutex<()>>,
     state: VolFileState,
@@ -91,16 +94,83 @@ impl VolFile {
         vid: VolumeId,
         opts: OpenOpts,
         reserved: Arc<Mutex<()>>,
+        repo: Option<Repository>,
+        repo_runtimes: Arc<RepoRuntimeRegistry>,
     ) -> Self {
         Self {
             runtime,
             tag,
             vid,
             opts,
+            repo,
+            repo_runtimes,
             reserved,
             state: VolFileState::Idle,
             pending_message: None,
         }
+    }
+
+    pub fn runtime(&self) -> &Runtime {
+        &self.runtime
+    }
+
+    pub fn attach_repo(&mut self, repo: Repository) -> Result<(), ErrCtx> {
+        if !self.is_idle() {
+            return Err(ErrCtx::InvalidVolumeState);
+        }
+
+        let runtime = self.repo_runtimes.runtime_for(&repo)?;
+        self.switch_runtime(runtime)?;
+        self.repo = Some(repo);
+        Ok(())
+    }
+
+    pub fn attach_repo_preserving_contents(&mut self, repo: Repository) -> Result<bool, ErrCtx> {
+        if !self.is_idle() {
+            return Err(ErrCtx::InvalidVolumeState);
+        }
+
+        let runtime = self.repo_runtimes.runtime_for(&repo)?;
+        if runtime.tag_get(&self.tag)?.is_some() {
+            self.switch_runtime(runtime)?;
+            self.repo = Some(repo);
+            return Ok(false);
+        }
+
+        let source_reader = self.runtime.volume_reader(self.vid.clone())?;
+        let source_page_count = source_reader.page_count();
+        self.switch_runtime(runtime.clone())?;
+
+        if source_page_count.to_u32() == 0 {
+            self.repo = Some(repo);
+            return Ok(false);
+        }
+
+        let mut writer = runtime.volume_writer(self.vid.clone())?;
+        for page_number in 1..=source_page_count.to_u32() {
+            let pageidx = PageIdx::try_from(page_number).map_err(|err| {
+                ErrCtx::PragmaErr(format!("invalid SQLite page index {page_number}: {err}").into())
+            })?;
+            writer.write_page(pageidx, source_reader.read_page(pageidx)?)?;
+        }
+        writer.commit()?;
+
+        self.repo = Some(repo);
+        Ok(true)
+    }
+
+    fn switch_runtime(&mut self, runtime: Runtime) -> Result<(), ErrCtx> {
+        let vid = if let Some(vid) = runtime.tag_get(&self.tag)? {
+            vid
+        } else {
+            let volume = runtime.volume_open(None, None, None)?;
+            runtime.tag_replace(&self.tag, volume.vid.clone())?;
+            volume.vid
+        };
+
+        self.runtime = runtime;
+        self.vid = vid;
+        Ok(())
     }
 
     pub fn snapshot_or_latest(&self) -> Result<Snapshot, ErrCtx> {
@@ -152,7 +222,7 @@ impl VolFile {
 
 impl VfsFile for VolFile {
     fn readonly(&self) -> bool {
-        false
+        self.opts.mode().is_readonly()
     }
 
     fn in_memory(&self) -> bool {
@@ -257,6 +327,9 @@ impl VfsFile for VolFile {
                     // Commit the writer, downgrading to a reader
                     let reader = writer.commit()?;
                     self.state = VolFileState::Shared { reader };
+                    if let Some(repo) = &self.repo {
+                        repo.mark_dirty_path(&self.tag)?;
+                    }
 
                     // release the reserved lock
                     // between threads while holding the lock

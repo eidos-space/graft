@@ -1,52 +1,17 @@
--- initialize two connections to the same database
+-- initialize two connections to the same repository database
 .connection 0
-.open "file:main?vfs=graft"
-pragma graft_switch="5rMJkf2zHE-2xMqqKcN8RLZh:74ggc1B6R4-2kkvcy9fi4CHJ:74ggc1B6jg-2udz14pbDayZC";
-+-----------------------------------------------------------------------------------------------------------------------------+
-| Switched to Volume 5rMJkf2zHE-2xMqqKcN8RLZh with local Log 74ggc1B6R4-2kkvcy9fi4CHJ and remote Log 74ggc1B6jg-2udz14pbDayZC |
-+-----------------------------------------------------------------------------------------------------------------------------+
-| Switched to Volume 5rMJkf2zHE-2xMqqKcN8RLZh with local Log 74ggc1B6R4-2kkvcy9fi4CHJ and remote Log 74ggc1B6jg-2udz14pbDayZC |
-+-----------------------------------------------------------------------------------------------------------------------------+
-pragma graft_status;
-+--------------------------------------------------+
-|                   On tag main                    |
-+--------------------------------------------------+
-| On tag main                                      |
-| Local Log 74ggc1B6R4-2kkvcy9fi4CHJ is grafted to |
-| remote Log 74ggc1B6jg-2udz14pbDayZC.             |
-|                                                  |
-| The Volume is up to date with the remote.        |
-+--------------------------------------------------+
+.open "file:app.db?vfs=graft"
+.output /dev/null
 
 .connection 1
-.open "file:main?vfs=graft"
-pragma graft_status;
-+--------------------------------------------------+
-|                   On tag main                    |
-+--------------------------------------------------+
-| On tag main                                      |
-| Local Log 74ggc1B6R4-2kkvcy9fi4CHJ is grafted to |
-| remote Log 74ggc1B6jg-2udz14pbDayZC.             |
-|                                                  |
-| The Volume is up to date with the remote.        |
-+--------------------------------------------------+
-
--- load the sample dataset
-.read datasets/simple.sql
-BEGIN TRANSACTION;
-CREATE TABLE t (data text);
-INSERT INTO t VALUES('hello world');
-INSERT INTO t VALUES('hi bob');
-INSERT INTO t VALUES('testing');
-COMMIT;
-
+.open "file:app.db?vfs=graft"
 
 -- scenario: lock a table in one connection, then try to lock it in the other
 .connection 0
 begin immediate;
 .connection 1
 -- EXPECT ERROR: database is locked
-Runtime error near line 19: database is locked (5)
+Runtime error near line 17: database is locked (5)
 begin immediate;
 
 -- reset
@@ -55,7 +20,7 @@ rollback;
 .connection 1
 -- EXPECT ERROR: no transaction
 (1) statement aborts at 1: [rollback;] cannot rollback - no transaction is active
-Runtime error near line 26: cannot rollback - no transaction is active
+Runtime error near line 24: cannot rollback - no transaction is active
 rollback;
 
 -- scenario: verify that upgrading is refused if a read snapshot is outdated
@@ -76,7 +41,7 @@ insert into t values(1);
 .connection 0
 -- try to upgrade the lock via performing a write; this should fail
 -- EXPECT ERROR: database is locked
-Runtime error near line 41: database is locked (5)
+Runtime error near line 39: database is locked (5)
 insert into t values(2);
 
 -- reset
@@ -85,7 +50,7 @@ rollback;
 .connection 1
 -- EXPECT ERROR: no transaction
 (1) statement aborts at 1: [rollback;] cannot rollback - no transaction is active
-Runtime error near line 48: cannot rollback - no transaction is active
+Runtime error near line 46: cannot rollback - no transaction is active
 rollback;
 
 -- scenario: verify that we can commit a write tx while another tx holds a read lock
@@ -138,29 +103,7 @@ select * from t;
 | committed while read lock is held |
 +-----------------------------------+
 
--- check metadata
-pragma graft_status;
-+--------------------------------------------------+
-|                   On tag main                    |
-+--------------------------------------------------+
-| On tag main                                      |
-| Local Log 74ggc1B6R4-2kkvcy9fi4CHJ is grafted to |
-| remote Log 74ggc1B6jg-2udz14pbDayZC.             |
-|                                                  |
-| The Volume is ahead of the remote by 4 commits.  |
-|   (use 'pragma graft_push' to push changes)      |
-+--------------------------------------------------+
-.connection 0
-pragma graft_status;
-+--------------------------------------------------+
-|                   On tag main                    |
-+--------------------------------------------------+
-| On tag main                                      |
-| Local Log 74ggc1B6R4-2kkvcy9fi4CHJ is grafted to |
-| remote Log 74ggc1B6jg-2udz14pbDayZC.             |
-|                                                  |
-| The Volume is ahead of the remote by 4 commits.  |
-|   (use 'pragma graft_push' to push changes)      |
-+--------------------------------------------------+
+-- check repository metadata commands without asserting dynamic output
+.output /dev/null
 
 SQLite Exit Code = 1

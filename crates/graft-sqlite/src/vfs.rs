@@ -1,6 +1,23 @@
-use std::{borrow::Cow, collections::HashMap, fmt::Debug, sync::Arc};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    fmt::Debug,
+    fs::File,
+    io::Read,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
-use graft::{GraftErr, LogicalErr, rt::runtime::Runtime};
+use graft::{
+    GraftErr, LogicalErr,
+    core::{
+        PageIdx,
+        page::{PAGESIZE, Page},
+    },
+    repo::RepoErr,
+    rt::runtime::Runtime,
+    volume_writer::VolumeWrite,
+};
 use parking_lot::Mutex;
 use sqlite_plugin::{
     flags::{AccessFlags, CreateMode, LockLevel, OpenKind, OpenMode, OpenOpts},
@@ -16,6 +33,8 @@ use crate::{
     file::{FileHandle, VfsFile, mem_file::MemFile, vol_file::VolFile},
     pragma::GraftPragma,
 };
+
+const SQLITE_DATABASE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
 
 #[derive(Debug, Error)]
 pub enum ErrCtx {
@@ -42,6 +61,9 @@ pub enum ErrCtx {
 
     #[error("Invalid volume state")]
     InvalidVolumeState,
+
+    #[error("Graft repository error: {0}")]
+    Repo(#[from] RepoErr),
 
     #[error(transparent)]
     IoErr(#[from] std::io::Error),
@@ -88,13 +110,61 @@ impl ErrCtx {
 
 pub struct GraftVfs {
     runtime: Runtime,
+    repo_runtimes: Arc<RepoRuntimeRegistry>,
     // VolFile locks keyed by tag
     locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
+#[derive(Debug)]
+pub struct RepoRuntimeRegistry {
+    base: Runtime,
+    runtimes: Mutex<HashMap<PathBuf, Runtime>>,
+}
+
+impl RepoRuntimeRegistry {
+    fn new(base: Runtime) -> Self {
+        Self { base, runtimes: Default::default() }
+    }
+
+    pub fn runtime_for(&self, repo: &graft::repo::Repository) -> Result<Runtime, ErrCtx> {
+        let key = repo.graft_dir().to_path_buf();
+        if let Some(runtime) = self.runtimes.lock().get(&key) {
+            return Ok(runtime.clone());
+        }
+
+        let runtime = self
+            .base
+            .fork_with_storage_path(repo.store_dir())
+            .map_err(GraftErr::from)?;
+        self.runtimes.lock().insert(key, runtime.clone());
+        Ok(runtime)
+    }
+}
+
 impl GraftVfs {
     pub fn new(runtime: Runtime) -> Self {
-        Self { runtime, locks: Default::default() }
+        Self {
+            repo_runtimes: Arc::new(RepoRuntimeRegistry::new(runtime.clone())),
+            runtime,
+            locks: Default::default(),
+        }
+    }
+
+    fn runtime_for_tag(
+        &self,
+        tag: &str,
+    ) -> Result<(Runtime, Option<graft::repo::Repository>), ErrCtx> {
+        let repo = if should_discover_repo(tag) {
+            graft::repo::Repository::discover_for_file(tag).ok()
+        } else {
+            None
+        };
+        let runtime = if let Some(repo) = &repo {
+            self.repo_runtimes.runtime_for(repo)?
+        } else {
+            self.runtime.clone()
+        };
+        Ok((runtime, repo))
     }
 }
 
@@ -122,7 +192,11 @@ impl Vfs for GraftVfs {
 
     fn access(&self, path: &str, flags: AccessFlags) -> VfsResult<bool> {
         tracing::trace!("access: path={path:?}; flags={flags:?}");
-        ErrCtx::wrap(move || Ok(self.runtime.tag_exists(path)?))
+        ErrCtx::wrap(move || {
+            let tag = normalize_tag(path)?;
+            let (runtime, _) = self.runtime_for_tag(&tag)?;
+            Ok(runtime.tag_exists(&tag)? || physical_sqlite_file_exists(&tag)?)
+        })
     }
 
     fn open(&self, path: Option<&str>, opts: OpenOpts) -> VfsResult<Self::Handle> {
@@ -132,6 +206,7 @@ impl Vfs for GraftVfs {
             if opts.kind() == OpenKind::MainDb
                 && let Some(tag) = path
             {
+                let tag = normalize_tag(tag)?;
                 let can_create = matches!(
                     opts.mode(),
                     OpenMode::ReadWrite {
@@ -139,29 +214,31 @@ impl Vfs for GraftVfs {
                     }
                 );
 
-                let vid = if can_create {
-                    // create the volume if needed
-                    if let Some(vid) = self.runtime.tag_get(tag)? {
-                        vid
-                    } else {
-                        let volume = self.runtime.volume_open(None, None, None)?;
-                        self.runtime.tag_replace(tag, volume.vid.clone())?;
-                        volume.vid
-                    }
+                let (runtime, repo) = self.runtime_for_tag(&tag)?;
+
+                let vid = if let Some(vid) = runtime.tag_get(&tag)? {
+                    vid
+                } else if let Some(vid) = import_physical_sqlite_file_as_volume(&runtime, &tag)? {
+                    vid
+                } else if can_create {
+                    let volume = runtime.volume_open(None, None, None)?;
+                    runtime.tag_replace(&tag, volume.vid.clone())?;
+                    volume.vid
                 } else {
-                    // just get the existing volume
-                    self.runtime.tag_get(tag)?.ok_or(ErrCtx::TagNotFound)?
+                    return Err(ErrCtx::TagNotFound);
                 };
 
                 // get or create a reserved lock for this Volume
-                let reserved_lock = self.locks.lock().entry(tag.to_owned()).or_default().clone();
+                let reserved_lock = self.locks.lock().entry(tag.clone()).or_default().clone();
 
                 return Ok(VolFile::new(
-                    self.runtime.clone(),
-                    tag.to_owned(),
+                    runtime,
+                    tag,
                     vid,
                     opts,
                     reserved_lock,
+                    repo,
+                    self.repo_runtimes.clone(),
                 )
                 .into());
             }
@@ -265,4 +342,122 @@ impl Vfs for GraftVfs {
         );
         ErrCtx::wrap(move || handle.read(offset, data))
     }
+}
+
+fn import_physical_sqlite_file_as_volume(
+    runtime: &Runtime,
+    tag: &str,
+) -> Result<Option<graft::core::VolumeId>, ErrCtx> {
+    let path = Path::new(tag);
+    let Some(header) = physical_sqlite_header(path)? else {
+        return Ok(None);
+    };
+
+    let sqlite_page_size = sqlite_page_size_from_header(&header);
+    let graft_page_size = PAGESIZE.as_u32();
+    if sqlite_page_size != graft_page_size {
+        return Err(ErrCtx::PragmaErr(
+            format!(
+                "SQLite database `{}` uses page size {sqlite_page_size}, but Graft requires {graft_page_size}",
+                path.display()
+            )
+            .into(),
+        ));
+    }
+
+    let metadata = std::fs::metadata(path)?;
+    if metadata.len() % graft_page_size as u64 != 0 {
+        return Err(ErrCtx::PragmaErr(
+            format!(
+                "SQLite database `{}` is not an even multiple of {graft_page_size} bytes",
+                path.display()
+            )
+            .into(),
+        ));
+    }
+
+    let page_count = metadata.len() / graft_page_size as u64;
+    let page_count_u32 = u32::try_from(page_count).map_err(|_| {
+        ErrCtx::PragmaErr(
+            format!(
+                "SQLite database `{}` has too many pages to import",
+                path.display()
+            )
+            .into(),
+        )
+    })?;
+
+    let volume = runtime.volume_open(None, None, None)?;
+    let vid = volume.vid;
+    let mut writer = runtime.volume_writer(vid.clone())?;
+    let mut input = File::open(path)?;
+    let mut page_bytes = vec![0_u8; graft_page_size as usize];
+    for page_number in 1..=page_count_u32 {
+        input.read_exact(&mut page_bytes)?;
+        let page = Page::try_from(page_bytes.as_slice()).map_err(|err| {
+            ErrCtx::PragmaErr(format!("invalid SQLite page in `{}`: {err}", path.display()).into())
+        })?;
+        let pageidx = PageIdx::try_from(page_number).map_err(|err| {
+            ErrCtx::PragmaErr(
+                format!("invalid SQLite page index in `{}`: {err}", path.display()).into(),
+            )
+        })?;
+        writer.write_page(pageidx, page)?;
+    }
+    writer.commit()?;
+    runtime.tag_replace(tag, vid.clone())?;
+    Ok(Some(vid))
+}
+
+fn physical_sqlite_file_exists(tag: &str) -> Result<bool, ErrCtx> {
+    Ok(physical_sqlite_header(Path::new(tag))?.is_some())
+}
+
+fn physical_sqlite_header(path: &Path) -> Result<Option<[u8; 100]>, ErrCtx> {
+    let mut header = [0_u8; 100];
+    let mut input = match File::open(path) {
+        Ok(input) => input,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+
+    match input.read_exact(&mut header) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(err) => return Err(err.into()),
+    }
+    if &header[..SQLITE_DATABASE_MAGIC.len()] != SQLITE_DATABASE_MAGIC {
+        return Ok(None);
+    }
+    Ok(Some(header))
+}
+
+fn sqlite_page_size_from_header(header: &[u8; 100]) -> u32 {
+    let raw = u16::from_be_bytes([header[16], header[17]]);
+    if raw == 1 { 65_536 } else { raw as u32 }
+}
+
+pub(crate) fn should_discover_repo(tag: &str) -> bool {
+    let path = std::path::Path::new(tag);
+    path.is_absolute() || tag.contains('/') || tag.contains('\\') || path.extension().is_some()
+}
+
+fn normalize_tag(tag: &str) -> Result<String, ErrCtx> {
+    if !should_discover_repo(tag) {
+        return Ok(tag.to_string());
+    }
+
+    let path = Path::new(tag);
+    let Some(file_name) = path.file_name() else {
+        return Ok(tag.to_string());
+    };
+
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let Ok(parent) = std::fs::canonicalize(parent) else {
+        return Ok(tag.to_string());
+    };
+    Ok(parent.join(file_name).to_string_lossy().into_owned())
 }

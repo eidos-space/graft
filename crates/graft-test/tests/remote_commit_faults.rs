@@ -49,7 +49,7 @@ fn test_skip_segment_cache() {
     let vid2 = peer.volume_open(None, None, Some(remote)).unwrap().vid;
     peer.volume_pull(vid2.clone()).unwrap();
 
-    let reader = peer.volume_reader(vid2.clone()).unwrap();
+    let reader = peer.volume_reader(vid2).unwrap();
     let page = reader.read_page(PageIdx::FIRST).unwrap();
     assert_eq!(page, Page::test_filled(123));
 }
@@ -107,8 +107,8 @@ fn test_crash_after_commit_recovery() {
         cid: "client".to_string(),
         rng,
         runtime: runtime.clone(),
-        vid: volume.vid.clone(),
-        log: log.clone(),
+        vid: volume.vid,
+        log,
         sqlite,
     };
 

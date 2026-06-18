@@ -1,0 +1,9 @@
+.echo on
+.open "file:app.db?vfs=graft"
+.output /dev/null
+-- Legacy pre-repository Volume pragmas are not part of the public SQLite API.
+(1) invalid graft pragma `graft_volume_push` in "pragma graft_volume_push;"
+Parse error near line 7: invalid graft pragma `graft_volume_push`
+pragma graft_volume_push;
+
+SQLite Exit Code = 1

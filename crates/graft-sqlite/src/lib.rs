@@ -2,6 +2,7 @@ pub mod file;
 pub mod json;
 pub mod pragma;
 pub mod row_level_diff;
+pub mod row_merge;
 pub mod sql_diff;
 pub mod sqlite_parse;
 pub mod vfs;

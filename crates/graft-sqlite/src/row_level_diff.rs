@@ -5,10 +5,11 @@
 use crate::sqlite_parse::{MasterEntry, ParseError, Record, TableScanner, read_all_rows};
 use graft::core::{VolumeId, lsn::LSN};
 use graft::rt::runtime::Runtime;
+use graft::snapshot::Snapshot;
 use graft::volume_reader::VolumeReader;
 
 /// Type of row change
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum RowChange {
     Insert {
         rowid: i64,
@@ -26,7 +27,7 @@ pub enum RowChange {
 }
 
 /// Changes for a single table
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TableChanges {
     pub table_name: String,
     pub columns: Vec<String>,
@@ -187,6 +188,32 @@ pub fn row_level_diff(
     let to_vid = to_vol.vid.clone();
 
     tracing::debug!("row_level_diff: from_vid={}, to_vid={}", from_vid, to_vid);
+
+    let result = row_level_diff_checked_out(runtime, &from_vid, &to_vid, from_lsn, to_lsn);
+    let _ = runtime.volume_delete(&from_vol.vid);
+    let _ = runtime.volume_delete(&to_vol.vid);
+
+    result
+}
+
+pub fn row_level_diff_snapshots(
+    runtime: &Runtime,
+    from_snapshot: &Snapshot,
+    to_snapshot: &Snapshot,
+) -> Result<RowLevelDiff, graft::err::GraftErr> {
+    let from_vol = runtime.volume_from_snapshot(from_snapshot)?;
+    let to_vol = match runtime.volume_from_snapshot(to_snapshot) {
+        Ok(to_vol) => to_vol,
+        Err(err) => {
+            let _ = runtime.volume_delete(&from_vol.vid);
+            return Err(err);
+        }
+    };
+
+    let from_vid = from_vol.vid.clone();
+    let to_vid = to_vol.vid.clone();
+    let from_lsn = from_snapshot.head().map_or(LSN::FIRST, |(_, lsn)| lsn);
+    let to_lsn = to_snapshot.head().map_or(LSN::FIRST, |(_, lsn)| lsn);
 
     let result = row_level_diff_checked_out(runtime, &from_vid, &to_vid, from_lsn, to_lsn);
     let _ = runtime.volume_delete(&from_vol.vid);

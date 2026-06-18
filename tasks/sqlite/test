@@ -3,7 +3,7 @@ set -euo pipefail
 
 GIT_ROOT="$(git rev-parse --show-toplevel)"
 
-# set the PWD to the git root directory - sql tests expect this
+# set the PWD to the git root directory for build/setup steps
 cd "${GIT_ROOT}"
 
 # invert diff colors so that expected lines are green
@@ -36,9 +36,10 @@ export SQLITE_TEST=1
 
 # run sqlite3.sh to ensure it's installed and print the version
 just run sqlite bin --version
+SQLITE_BIN="${GIT_ROOT}/target/sqlite-3430000/sqlite3"
 
-# select tests from *.sql files in GIT_ROOT, filtered by the first argument (substring)
-declare TESTS=$(find "${GIT_ROOT}" -name "test_*.sql" | grep "${FILTER}")
+# select tests from tests/sql/*.sql files, filtered by the first argument (substring)
+declare TESTS=$(find "${GIT_ROOT}/tests/sql" -name "test_*.sql" | grep "${FILTER}")
 
 if [ -z "${TESTS}" ]; then
     echo "No tests found using filter: ${FILTER}"
@@ -62,20 +63,28 @@ for TEST in ${TESTS}; do
     echo "Running test: ${TEST}"
     EXPECTED="${TEST}.expected"
 
-    export GRAFT_DATA_DIR="$(mktemp -d)"
-    export GRAFT_REMOTE__TYPE="memory"
+    TEST_WORKDIR="$(mktemp -d)"
+    TEST_DATA_DIR="${TEST_WORKDIR}/data"
+    mkdir -p "${TEST_DATA_DIR}"
+    ln -s "${GIT_ROOT}/datasets" "${TEST_WORKDIR}/datasets"
+    cat >"${TEST_WORKDIR}/graft.toml" <<EOF
+data_dir = "${TEST_DATA_DIR}"
+
+[remote]
+type = "memory"
+EOF
 
     # We add the exit code to the output since SQLite returns the number of
     # errors encountered while executing, and some of the tests want to trigger
     # errors on purpose (thus we can't just fail on non-zero exit code).
     set +e
-    OUTPUT=$(just run sqlite bin "${SQLITE_ARGS[@]}" 2>&1 <"${TEST}")
+    OUTPUT=$(cd "${TEST_WORKDIR}" && "${SQLITE_BIN}" "${SQLITE_ARGS[@]}" 2>&1 <"${TEST}")
     EXIT_CODE=$?
     OUTPUT=$(printf "%s\n\n%s\n" "${OUTPUT}" "SQLite Exit Code = ${EXIT_CODE}")
     set -e
 
-    if [ -n "${GRAFT_DATA_DIR}" ] && [ -z "${SKIP_CLEANUP:-}" ]; then
-        rm -rf "${GRAFT_DATA_DIR}"
+    if [ -n "${TEST_WORKDIR}" ] && [ -z "${SKIP_CLEANUP:-}" ]; then
+        rm -rf "${TEST_WORKDIR}"
     fi
 
     # if UPDATE_EXPECTED is set in the env, then write out expected files
@@ -83,8 +92,15 @@ for TEST in ${TESTS}; do
         echo "Updating expected output for: ${TEST}"
         echo "${OUTPUT}" >"${EXPECTED}"
     elif [ -f "${EXPECTED}" ]; then
+        DIFF_ARGS=(-u --label "Expected Output" "${EXPECTED}" --label "Actual output" -)
+        if diff --help 2>&1 | grep -q -- "--color"; then
+            DIFF_ARGS=(--color=always "${DIFF_ARGS[@]}")
+        fi
+        if diff --help 2>&1 | grep -q -- "--palette"; then
+            DIFF_ARGS=(--palette="${DIFF_PALETTE}" "${DIFF_ARGS[@]}")
+        fi
         set +e
-        DIFF=$(echo "${OUTPUT}" | diff --color=always --palette="${DIFF_PALETTE}" -u --label "Expected Output" "${EXPECTED}" --label "Actual output" -)
+        DIFF=$(echo "${OUTPUT}" | diff "${DIFF_ARGS[@]}")
         set -e
         if [ -n "${DIFF}" ]; then
             echo "TEST FAILURE: Diff between actual and expected output for: ${TEST}"

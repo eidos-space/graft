@@ -2,10 +2,10 @@ use std::ffi::CString;
 
 use graft::setup::{GraftConfig, InitErr, setup_graft};
 
-/// Statically register the Graft SQLite extension with `SQLite`.
+/// Statically register the Graft `SQLite` extension with `SQLite`.
 ///
-/// `vfs_name`: The name of the VFS to register with SQLite. Use `graft` if you're not sure.
-/// `make_default`: If true, will set the Graft VFS to be used by default in SQLite.
+/// `vfs_name`: The name of the VFS to register with `SQLite`. Use `graft` if you're not sure.
+/// `make_default`: If true, will set the Graft VFS to be used by default in `SQLite`.
 /// `config`: Graft configuration.
 pub fn register_static(
     vfs_name: &str,

@@ -12,7 +12,7 @@ Options:
   --log PATH    Output logs to a file
   --gdb         Run sqlite3 under gdb debugger.
   --autosync    Enable automatic background sync.
-  --s3 BUCKET   Connect to the provided S3 bucket.
+  --s3 BUCKET   Connect the loader default remote to the provided S3 bucket.
 EOF
 )
 
@@ -25,10 +25,12 @@ GDB=${GDB:-0}
 export RUST_LOG=${RUST_LOG:-warn}
 
 CLIENT_ID="default"
-DATA_ROOT="${GIT_ROOT}/.graft"
-
-export GRAFT_REMOTE__TYPE="fs"
-export GRAFT_REMOTE__ROOT="${DATA_ROOT}/remote"
+DATA_ROOT="${GIT_ROOT}/target/graft-sqlite-shell"
+REMOTE_TYPE="fs"
+REMOTE_ROOT="${DATA_ROOT}/remote"
+REMOTE_BUCKET=""
+LOG_FILE=""
+AUTOSYNC=""
 
 # parse flags
 while [[ $# -gt 0 ]]; do
@@ -49,7 +51,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --log)
             shift
-            export GRAFT_LOG_FILE="$1"
+            LOG_FILE="$1"
             export NO_COLOR=1
             shift
             ;;
@@ -59,12 +61,12 @@ while [[ $# -gt 0 ]]; do
             ;;
         --autosync)
             shift
-            export GRAFT_AUTOSYNC=1
+            AUTOSYNC=60
             ;;
         --s3)
             shift
-            export GRAFT_REMOTE__TYPE="s3_compatible"
-            export GRAFT_REMOTE__BUCKET="${1}"
+            REMOTE_TYPE="s3_compatible"
+            REMOTE_BUCKET="${1}"
             shift
             ;;
         *)
@@ -75,11 +77,52 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-export GRAFT_DATA_DIR="${DATA_ROOT}/clients/${CLIENT_ID}"
+CLIENT_ROOT="${DATA_ROOT}/clients/${CLIENT_ID}"
+DATA_DIR="${CLIENT_ROOT}/data"
+CONFIG_PATH="${CLIENT_ROOT}/graft.toml"
 
-mkdir -p "${GRAFT_REMOTE__ROOT}" "${GRAFT_DATA_DIR}"
+mkdir -p "${REMOTE_ROOT}" "${DATA_DIR}"
+cat >"${CONFIG_PATH}" <<EOF
+data_dir = "${DATA_DIR}"
+EOF
+
+if [ -n "${LOG_FILE}" ]; then
+    cat >>"${CONFIG_PATH}" <<EOF
+log_file = "${LOG_FILE}"
+EOF
+fi
+
+if [ -n "${AUTOSYNC}" ]; then
+    cat >>"${CONFIG_PATH}" <<EOF
+autosync = ${AUTOSYNC}
+EOF
+fi
+
+case "${REMOTE_TYPE}" in
+    fs)
+        cat >>"${CONFIG_PATH}" <<EOF
+
+[remote]
+type = "fs"
+root = "${REMOTE_ROOT}"
+EOF
+        ;;
+    s3_compatible)
+        cat >>"${CONFIG_PATH}" <<EOF
+
+[remote]
+type = "s3_compatible"
+bucket = "${REMOTE_BUCKET}"
+EOF
+        ;;
+    *)
+        echo "unsupported remote type: ${REMOTE_TYPE}" >&2
+        exit 1
+        ;;
+esac
 
 cargo build ${BUILD_FLAGS} --package graft-ext
+just run sqlite bin --version >/dev/null
 
 # Discover the path to the VFS depending on platform
 LIB_PATH="${GIT_ROOT}/target/${TARGET}"
@@ -99,4 +142,5 @@ ARGS=(
     -cmd ".open 'file:main?vfs=graft'"
 )
 
-exec just run sqlite bin "${ARGS[@]}"
+cd "${CLIENT_ROOT}"
+exec "${GIT_ROOT}/tasks/sqlite/bin" "${ARGS[@]}"

@@ -101,7 +101,8 @@ impl GraftTestRuntime {
         let conn = Connection::open(format!("file:{dbname}?vfs={vfs_id}")).unwrap();
         let conn = GraftSqliteConn { conn };
         if let Some(remote) = remote {
-            conn.graft_pragma_arg("clone", remote.serialize()).unwrap();
+            conn.graft_pragma_arg("debug_volume_clone", remote.serialize())
+                .unwrap();
         }
         conn
     }

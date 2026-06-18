@@ -1,6 +1,6 @@
 use graft::core::{LogId, PageCount};
 use graft_test::GraftTestRuntime;
-use rusqlite::{Connection, ToSql};
+use rusqlite::{Connection, OpenFlags, ToSql};
 use serde_json::Value;
 
 #[test]
@@ -12,7 +12,7 @@ fn test_sync_and_reset() {
     let mut runtime1 = GraftTestRuntime::with_memory_remote();
     let sqlite1 = runtime1.open_sqlite("main", Some(remote.clone()));
     let mut runtime2 = runtime1.spawn_peer();
-    let sqlite2 = runtime2.open_sqlite("main", Some(remote.clone()));
+    let sqlite2 = runtime2.open_sqlite("main", Some(remote));
 
     // create two counter tables
     sqlite1
@@ -27,23 +27,23 @@ fn test_sync_and_reset() {
         .unwrap();
 
     // sync the changes from node 1 to node 2
-    sqlite1.graft_pragma("push").unwrap();
-    sqlite2.graft_pragma("pull").unwrap();
+    sqlite1.graft_pragma("debug_volume_push").unwrap();
+    sqlite2.graft_pragma("debug_volume_pull").unwrap();
 
     // write to both nodes, creating a conflict
     sqlite1.execute("update t1 set counter = 1", []).unwrap();
     sqlite2.execute("update t2 set counter = 1", []).unwrap();
 
     // sync the changes from node 1
-    sqlite1.graft_pragma("push").unwrap();
+    sqlite1.graft_pragma("debug_volume_push").unwrap();
 
     // attempt to push from node 2, which should detect the conflict
-    let result = sqlite2.pragma_query(None, "graft_push", |_| Ok(()));
+    let result = sqlite2.pragma_query(None, "graft_debug_volume_push", |_| Ok(()));
     assert!(result.is_err(), "push should fail due to divergence");
 
     // force reset node 2 to the latest remote
-    sqlite2.graft_pragma("fetch").unwrap();
-    sqlite2.graft_pragma("clone").unwrap();
+    sqlite2.graft_pragma("debug_volume_fetch").unwrap();
+    sqlite2.graft_pragma("debug_volume_clone").unwrap();
 
     // verify both nodes are now pointing at the same remote LSN
     // and they have no outstanding local changes
@@ -107,7 +107,9 @@ fn test_export() {
     let export_path_str = export_path.to_str().unwrap();
 
     // Export the database
-    sqlite.graft_pragma_arg("export", export_path_str).unwrap();
+    sqlite
+        .graft_pragma_arg("debug_volume_export", export_path_str)
+        .unwrap();
 
     // Verify the exported file exists
     assert!(export_path.exists());
@@ -130,6 +132,3135 @@ fn test_export() {
     assert_eq!(name, "Bob");
 
     // Cleanup
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_history_pragmas_require_repository() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_path.to_str().unwrap(), None);
+
+    for err in [
+        pragma_query_error(&sqlite, "graft_log"),
+        pragma_query_error(&sqlite, "graft_json_log"),
+        pragma_query_error(&sqlite, "graft_status"),
+        pragma_query_error(&sqlite, "graft_tags"),
+        pragma_query_error(&sqlite, "graft_diff"),
+        pragma_query_error(&sqlite, "graft_json_diff"),
+        pragma_arg_error(&sqlite, "graft_diff", "1,3"),
+        pragma_arg_error(&sqlite, "graft_json_diff", "1,3"),
+        pragma_arg_error(&sqlite, "graft_show", "HEAD"),
+        pragma_arg_error(&sqlite, "graft_json_show", "HEAD"),
+        pragma_arg_error(&sqlite, "graft_fetch", "origin main"),
+        pragma_arg_error(&sqlite, "graft_pull", "origin main"),
+        pragma_arg_error(&sqlite, "graft_push", "origin main"),
+    ] {
+        assert!(
+            err.contains("no .graft repository"),
+            "expected repo-not-found error, got: {err}"
+        );
+    }
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_debug_lsn_pragmas_expose_storage_coordinates_without_repo() {
+    graft_test::ensure_test_env();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite("main", None);
+
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE debug_lsn (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+            INSERT INTO debug_lsn (name) VALUES ('Alice');
+            UPDATE debug_lsn SET name = 'Alicia' WHERE id = 1;
+            "#,
+        )
+        .unwrap();
+
+    let vid = runtime.tag_get("main").unwrap().unwrap();
+    let volume = runtime.volume_get(&vid).unwrap();
+    let log = pragma_query_string(&sqlite, "graft_debug_log_lsn");
+    assert!(log.contains(&format!("log {}", volume.local)));
+    assert!(log.contains(&format!("commit {}:2", volume.local)));
+    assert!(log.contains(&format!("commit {}:3", volume.local)));
+
+    let show = pragma_arg_string(
+        &sqlite,
+        "graft_debug_show_lsn",
+        format!("{}:3", volume.local),
+    );
+    assert!(show.contains(&format!("Commit @ {}:3", volume.local)));
+    assert!(show.contains("commit_hash:"));
+
+    let diff = pragma_arg_string(
+        &sqlite,
+        "graft_debug_diff_lsn",
+        format!("{}:2 {}:3", volume.local, volume.local),
+    );
+    assert!(diff.contains("Diff between LSN 2 and LSN 3"));
+    assert!(diff.contains("Changed pages:"));
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_pragmas_on_physical_database_path() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+    let remote_dir = temp_dir.path().join("remote");
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+
+    let init = pragma_query_string(&sqlite, "graft_init");
+    assert!(init.contains(".graft"));
+    let source_repo = graft::repo::Repository::discover_for_file(&db_path).unwrap();
+    assert!(
+        source_repo.store_dir().read_dir().unwrap().next().is_some(),
+        "graft_init should switch the connection to repo-local storage"
+    );
+
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["head"]["type"], "branch");
+    assert_eq!(status["head"]["name"], "main");
+    assert_eq!(status["head_target"], Value::Null);
+    assert_eq!(status["dirty"], false);
+
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE repo_test (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+            INSERT INTO repo_test (name) VALUES ('Alice');
+            "#,
+        )
+        .unwrap();
+
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["dirty"], true);
+    assert_eq!(status["unstaged"][0], "app.db");
+    assert_eq!(status["unstaged_changes"][0]["path"], "app.db");
+    assert_eq!(status["unstaged_changes"][0]["change"], "untracked");
+    let text_status = pragma_query_string(&sqlite, "graft_status");
+    assert!(text_status.contains("Changes not staged for commit."));
+    assert!(text_status.contains("untracked: app.db"));
+
+    let add = pragma_query_string(&sqlite, "graft_add");
+    assert!(add.contains("app.db"));
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["dirty"], false);
+    assert_eq!(status["unstaged"].as_array().unwrap().len(), 0);
+    assert_eq!(status["staged"][0], "app.db");
+
+    let commit = pragma_arg_string(&sqlite, "graft_commit", "initial schema");
+    assert!(commit.contains("initial schema"));
+
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["dirty"], false);
+    assert_eq!(status["staged"].as_array().unwrap().len(), 0);
+    assert!(status["head_target"].as_str().is_some());
+
+    let vfs_id = runtime.ensure_vfs().to_string();
+    let readonly_uri = format!("file:{db_name}?vfs={vfs_id}");
+    let readonly = Connection::open_with_flags(
+        readonly_uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .expect("repo-local database should reopen read-only through the same VFS");
+    let readonly_count: i64 = readonly
+        .query_row("SELECT COUNT(*) FROM repo_test", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(readonly_count, 1);
+    drop(readonly);
+
+    let branch = pragma_arg_string(&sqlite, "graft_branch_create", "feature/search");
+    assert!(branch.contains("feature/search"));
+    let branch_conflict = pragma_arg_error(&sqlite, "graft_branch_create", "feature");
+    assert!(branch_conflict.contains("cannot create ref `refs/heads/feature`"));
+    let switched = pragma_arg_string(&sqlite, "graft_switch_branch", "feature/search");
+    assert!(switched.contains("feature/search"));
+
+    sqlite
+        .execute("INSERT INTO repo_test (name) VALUES ('Bob')", [])
+        .unwrap();
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["dirty"], true);
+    assert_eq!(status["unstaged_changes"][0]["path"], "app.db");
+    assert_eq!(status["unstaged_changes"][0]["change"], "modified");
+    let text_status = pragma_query_string(&sqlite, "graft_status");
+    assert!(text_status.contains("modified: app.db"));
+
+    let add = pragma_query_string(&sqlite, "graft_add");
+    assert!(add.contains("app.db"));
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["dirty"], false);
+    assert_eq!(status["staged"][0], "app.db");
+
+    let commit = pragma_arg_string(&sqlite, "graft_commit", "feature row");
+    assert!(commit.contains("feature row"));
+
+    let diff = pragma_arg_string(&sqlite, "graft_diff", "HEAD~1 HEAD -- app.db");
+    assert!(diff.contains("modified: app.db"));
+
+    let json_diff: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_diff",
+        "HEAD~1 HEAD -- app.db",
+    ))
+    .expect("graft_json_diff should return repo diff JSON");
+    assert_eq!(json_diff["files"][0]["path"], "app.db");
+    assert_eq!(json_diff["files"][0]["change"], "modified");
+
+    let show = pragma_arg_string(&sqlite, "graft_show", "HEAD");
+    assert!(show.contains("feature row"));
+    assert!(show.contains("app.db"));
+
+    let json_show: Value =
+        serde_json::from_str(&pragma_arg_string(&sqlite, "graft_json_show", "HEAD"))
+            .expect("graft_json_show should return repo commit JSON");
+    assert_eq!(json_show["message"], "feature row");
+    assert!(json_show["files"]["app.db"].is_object());
+    let app_ranges = json_show["files"]["app.db"]["snapshot"]["ranges"]
+        .as_array()
+        .expect("app.db should expose snapshot ranges");
+    let app_commits = app_ranges[0]["commits"]
+        .as_array()
+        .expect("repo snapshot ranges should record storage commit hashes");
+    assert!(!app_commits.is_empty());
+    let app_commit_hash = app_commits[0]["commit_hash"]
+        .as_str()
+        .expect("repo snapshot commit entries should include commit hashes");
+    assert_eq!(app_commit_hash.len(), 44);
+
+    let json_log: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_log"))
+        .expect("graft_json_log should return repo commit JSON");
+    assert_eq!(json_log[0]["message"], "feature row");
+    assert_eq!(json_log[0]["changed_tables"], 1);
+    assert_eq!(json_log[0]["tables"][0]["name"], "repo_test");
+    assert_eq!(json_log[0]["tables"][0]["inserts"], 1);
+    assert_eq!(json_log[0]["tables"][0]["deletes"], 0);
+    assert_eq!(json_log[0]["tables"][0]["updates"], 0);
+
+    let tag = pragma_arg_string(&sqlite, "graft_tag_create", "v-feature HEAD");
+    assert!(tag.contains("Created tag 'v-feature'"));
+    let namespaced_tag = pragma_arg_string(&sqlite, "graft_tag_create", "v-test/feature HEAD");
+    assert!(namespaced_tag.contains("Created tag 'v-test/feature'"));
+    let tag_conflict = pragma_arg_error(&sqlite, "graft_tag_create", "v-test HEAD");
+    assert!(tag_conflict.contains("cannot create ref `refs/tags/v-test`"));
+    let deleted_tag = pragma_arg_string(&sqlite, "graft_tag_delete", "v-test/feature");
+    assert!(deleted_tag.contains("Deleted tag 'v-test/feature'"));
+    let tags = pragma_query_string(&sqlite, "graft_tags");
+    assert!(tags.contains("v-feature"));
+    let show_tag = pragma_arg_string(&sqlite, "graft_show", "v-feature");
+    assert!(show_tag.contains("feature row"));
+    let annotated_tag = pragma_arg_string(
+        &sqlite,
+        "graft_tag_create",
+        "--annotated v-annotated HEAD -- release feature row",
+    );
+    assert!(annotated_tag.contains("Created annotated tag 'v-annotated'"));
+    let tags = pragma_query_string(&sqlite, "graft_tags");
+    assert!(tags.contains("v-annotated"));
+    assert!(tags.contains("annotated"));
+    let show_annotated_tag = pragma_arg_string(&sqlite, "graft_show", "v-annotated");
+    assert!(show_annotated_tag.contains("feature row"));
+    let deleted_tag = pragma_arg_string(&sqlite, "graft_tag_delete", "v-annotated");
+    assert!(deleted_tag.contains("Deleted annotated tag 'v-annotated'"));
+    let deleted_tag = pragma_arg_string(&sqlite, "graft_tag_delete", "v-feature");
+    assert!(deleted_tag.contains("Deleted tag 'v-feature'"));
+    let tags = pragma_query_string(&sqlite, "graft_tags");
+    assert!(!tags.contains("v-feature"));
+
+    let release_branch =
+        pragma_arg_string(&sqlite, "graft_branch_create", "release/initial HEAD~1");
+    assert!(release_branch.contains("release/initial"));
+    let switched = pragma_arg_string(&sqlite, "graft_switch_branch", "release/initial");
+    assert!(switched.contains("release/initial"));
+    let release_count: i64 = sqlite
+        .query_row("SELECT COUNT(*) FROM repo_test", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(release_count, 1);
+
+    let switched = pragma_arg_string(&sqlite, "graft_switch_branch", "feature/search");
+    assert!(switched.contains("feature/search"));
+    let deleted = pragma_arg_string(&sqlite, "graft_branch_delete", "release/initial");
+    assert!(deleted.contains("Deleted branch 'release/initial'"));
+
+    let feature_count: i64 = sqlite
+        .query_row("SELECT COUNT(*) FROM repo_test", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(feature_count, 2);
+
+    let reset_branch = pragma_arg_string(&sqlite, "graft_branch_create", "tmp/reset");
+    assert!(reset_branch.contains("tmp/reset"));
+    let switched = pragma_arg_string(&sqlite, "graft_switch_branch", "tmp/reset");
+    assert!(switched.contains("tmp/reset"));
+    let reset = pragma_arg_string(&sqlite, "graft_reset", "--hard HEAD~1");
+    assert!(reset.contains("hard"));
+    let reset_status: Value =
+        serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+            .expect("graft_json_status should return repo status JSON");
+    assert_eq!(reset_status["head"]["type"], "branch");
+    assert_eq!(reset_status["head"]["name"], "tmp/reset");
+    assert_eq!(reset_status["dirty"], false);
+    assert_eq!(reset_status["staged"].as_array().unwrap().len(), 0);
+    let reset_count: i64 = sqlite
+        .query_row("SELECT COUNT(*) FROM repo_test", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(reset_count, 1);
+
+    let switched = pragma_arg_string(&sqlite, "graft_switch_branch", "feature/search");
+    assert!(switched.contains("feature/search"));
+    let feature_count: i64 = sqlite
+        .query_row("SELECT COUNT(*) FROM repo_test", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(feature_count, 2);
+
+    let checkout = pragma_arg_string(&sqlite, "graft_checkout", "HEAD~1");
+    assert!(checkout.contains("HEAD detached"));
+    let detached_status: Value =
+        serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+            .expect("graft_json_status should return repo status JSON");
+    assert_eq!(detached_status["head"]["type"], "detached");
+    let detached_count: i64 = sqlite
+        .query_row("SELECT COUNT(*) FROM repo_test", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(detached_count, 1);
+
+    let switched = pragma_arg_string(&sqlite, "graft_switch_branch", "main");
+    assert!(switched.contains("main"));
+    let main_count: i64 = sqlite
+        .query_row("SELECT COUNT(*) FROM repo_test", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(main_count, 1);
+
+    let switched = pragma_arg_string(&sqlite, "graft_switch_branch", "feature/search");
+    assert!(switched.contains("feature/search"));
+    let feature_count: i64 = sqlite
+        .query_row("SELECT COUNT(*) FROM repo_test", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(feature_count, 2);
+
+    let branches = pragma_query_string(&sqlite, "graft_branch");
+    assert!(branches.contains("* feature/search"));
+    assert!(branches.contains("main"));
+    assert!(branches.contains("tmp/reset"));
+
+    let deleted = pragma_arg_string(&sqlite, "graft_branch_delete", "tmp/reset");
+    assert!(deleted.contains("Deleted branch 'tmp/reset'"));
+    let branches = pragma_query_string(&sqlite, "graft_branch");
+    assert!(!branches.contains("tmp/reset"));
+
+    let remote = pragma_arg_string(
+        &sqlite,
+        "graft_remote_add",
+        format!("origin fs://{}", remote_dir.display()),
+    );
+    assert!(remote.contains("origin"));
+    let upstream = pragma_arg_string(&sqlite, "graft_branch_upstream", "origin/feature/search");
+    assert!(upstream.contains("feature/search"));
+    assert!(upstream.contains("origin/feature/search"));
+    let status = pragma_query_string(&sqlite, "graft_status");
+    assert!(status.contains("Tracking: origin/feature/search"));
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["upstream"]["remote"], "origin");
+    assert_eq!(status["upstream"]["branch"], "feature/search");
+    let branches = pragma_query_string(&sqlite, "graft_branch");
+    assert!(branches.contains("[origin/feature/search]"));
+
+    let renamed = pragma_arg_string(&sqlite, "graft_branch_rename", "feature/query");
+    assert!(renamed.contains("Renamed branch 'feature/search' to 'feature/query'"));
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["head"]["type"], "branch");
+    assert_eq!(status["head"]["name"], "feature/query");
+    assert_eq!(status["upstream"]["remote"], "origin");
+    assert_eq!(status["upstream"]["branch"], "feature/search");
+    let branches = pragma_query_string(&sqlite, "graft_branch");
+    assert!(branches.contains("* feature/query"));
+    assert!(branches.contains("[origin/feature/search]"));
+
+    let remotes = pragma_query_string(&sqlite, "graft_remotes");
+    assert!(remotes.contains("origin"));
+    assert!(remotes.contains("fs://"));
+
+    let backup = pragma_arg_string(&sqlite, "graft_remote_add", "backup memory");
+    assert!(backup.contains("backup"));
+    let remotes = pragma_query_string(&sqlite, "graft_remotes");
+    assert!(remotes.contains("backup"));
+    let removed = pragma_arg_string(&sqlite, "graft_remote_remove", "backup");
+    assert!(removed.contains("Removed remote 'backup'"));
+    let minio = pragma_arg_string(
+        &sqlite,
+        "graft_remote_add",
+        "minio s3_compatible://repo-bucket/prod?endpoint=http://localhost:9000",
+    );
+    assert!(minio.contains("minio"));
+    let remotes = pragma_query_string(&sqlite, "graft_remotes");
+    assert!(remotes.contains("origin"));
+    assert!(remotes.contains("minio"));
+    assert!(remotes.contains("endpoint=http://localhost:9000"));
+    assert!(!remotes.contains("backup"));
+    let removed = pragma_arg_string(&sqlite, "graft_remote_remove", "minio");
+    assert!(removed.contains("Removed remote 'minio'"));
+
+    let pushed = pragma_query_string(&sqlite, "graft_push");
+    assert!(pushed.contains("origin/feature/search"));
+
+    let clone_dir = tempfile::tempdir().unwrap();
+    let clone_db = clone_dir.path().join("app.db");
+    let clone_db_name = clone_db.to_str().unwrap();
+    let mut clone_runtime = GraftTestRuntime::with_memory_remote();
+    let clone = clone_runtime.open_sqlite(clone_db_name, None);
+    let init = pragma_query_string(&clone, "graft_init");
+    assert!(init.contains(".graft"));
+    let clone_repo = graft::repo::Repository::discover_for_file(&clone_db).unwrap();
+    assert!(
+        clone_repo.store_dir().read_dir().unwrap().next().is_some(),
+        "clone repo should use its own repo-local storage"
+    );
+    let remote = pragma_arg_string(
+        &clone,
+        "graft_remote_add",
+        format!("origin fs://{}", remote_dir.display()),
+    );
+    assert!(remote.contains("origin"));
+    let upstream = pragma_arg_string(&clone, "graft_branch_upstream", "origin/feature/search");
+    assert!(upstream.contains("main"));
+    assert!(upstream.contains("origin/feature/search"));
+    let fetched = pragma_query_string(&clone, "graft_fetch");
+    assert!(fetched.contains("origin/feature/search"));
+
+    assert!(
+        clone_repo
+            .remote_tracking_ref("origin", "feature/search")
+            .unwrap()
+            .is_some()
+    );
+    let pulled = pragma_query_string(&clone, "graft_pull");
+    assert!(pulled.contains("origin/feature/search"));
+    let clone_count: i64 = clone
+        .query_row("SELECT COUNT(*) FROM repo_test", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(clone_count, 2);
+
+    let log = pragma_query_string(&sqlite, "graft_log");
+    assert!(log.contains("initial schema"));
+
+    runtime.shutdown().unwrap();
+    clone_runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_init_preserves_existing_vfs_database_contents() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE preinit_data (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+            INSERT INTO preinit_data (name) VALUES ('Alice'), ('Bob');
+            "#,
+        )
+        .unwrap();
+
+    let init = pragma_query_string(&sqlite, "graft_init");
+    assert!(init.contains(".graft"));
+    let source_repo = graft::repo::Repository::discover_for_file(&db_path).unwrap();
+    assert!(
+        source_repo.store_dir().read_dir().unwrap().next().is_some(),
+        "graft_init should move pre-existing VFS contents into repo-local storage"
+    );
+
+    let count: u32 = sqlite
+        .query_row("SELECT COUNT(*) FROM preinit_data", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 2);
+    let name: String = sqlite
+        .query_row("SELECT name FROM preinit_data WHERE id = 2", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(name, "Bob");
+
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["dirty"], true);
+    assert_eq!(status["unstaged"][0], "app.db");
+
+    pragma_query_string(&sqlite, "graft_add");
+    let commit = pragma_arg_string(&sqlite, "graft_commit", "import existing database");
+    assert!(commit.contains("import existing database"));
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_json_status_ignores_untracked_auxiliary_sqlite_files() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let eidos_dir = temp_dir.path().join(".eidos");
+    std::fs::create_dir_all(&eidos_dir).unwrap();
+
+    let raw_path = eidos_dir.join("raw.sqlite3");
+    {
+        let raw = Connection::open(&raw_path).unwrap();
+        raw.execute_batch(
+            r#"
+            CREATE TABLE raw_data (id INTEGER PRIMARY KEY);
+            INSERT INTO raw_data DEFAULT VALUES;
+            "#,
+        )
+        .unwrap();
+    }
+
+    let db_path = eidos_dir.join("db.sqlite3");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE main_data (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+            INSERT INTO main_data (name) VALUES ('Alice');
+            "#,
+        )
+        .unwrap();
+
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["dirty"], true);
+    assert_eq!(status["unstaged"], serde_json::json!(["db.sqlite3"]));
+
+    pragma_query_string(&sqlite, "graft_add");
+    let commit = pragma_arg_string(&sqlite, "graft_commit", "commit main database");
+    assert!(commit.contains("commit main database"));
+
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["dirty"], false);
+    assert_eq!(status["unstaged"].as_array().unwrap().len(), 0);
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_vfs_open_imports_existing_physical_sqlite_database() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+    {
+        let physical = Connection::open(&db_path).unwrap();
+        physical
+            .execute_batch(
+                r#"
+                PRAGMA page_size=4096;
+                CREATE TABLE physical_data (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+                INSERT INTO physical_data (name) VALUES ('Alice'), ('Bob');
+                "#,
+            )
+            .unwrap();
+    }
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+
+    let count: u32 = sqlite
+        .query_row("SELECT COUNT(*) FROM physical_data", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 2);
+
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+    let name: String = sqlite
+        .query_row("SELECT name FROM physical_data WHERE id = 2", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(name, "Bob");
+
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(
+        pragma_arg_string(&sqlite, "graft_commit", "import physical database")
+            .contains("import physical database")
+    );
+    let show: Value = serde_json::from_str(&pragma_arg_string(&sqlite, "graft_json_show", "HEAD"))
+        .expect("graft_json_show should return repo commit JSON");
+    assert!(
+        show["files"]["app.db"]["snapshot"]["page_count"]
+            .as_u64()
+            .is_some_and(|page_count| page_count > 0)
+    );
+    assert!(
+        !show["files"]["app.db"]["snapshot"]["ranges"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_vfs_readonly_open_imports_existing_physical_sqlite_database() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+    {
+        let physical = Connection::open(&db_path).unwrap();
+        physical
+            .execute_batch(
+                r#"
+                PRAGMA page_size=4096;
+                CREATE TABLE readonly_data (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+                INSERT INTO readonly_data (name) VALUES ('Alice'), ('Bob');
+                "#,
+            )
+            .unwrap();
+    }
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let vfs_id = runtime.ensure_vfs().to_string();
+    let uri = format!("file:{db_name}?vfs={vfs_id}");
+    let sqlite = Connection::open_with_flags(
+        uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .expect("existing physical SQLite database should open read-only through Graft VFS");
+
+    let count: u32 = sqlite
+        .query_row("SELECT COUNT(*) FROM readonly_data", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 2);
+    let err = sqlite
+        .execute("INSERT INTO readonly_data (name) VALUES ('Carol')", [])
+        .expect_err("read-only VFS handle should reject writes");
+    assert!(
+        err.to_string().contains("readonly") || err.to_string().contains("locked"),
+        "unexpected read-only write error: {err}"
+    );
+
+    drop(sqlite);
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_mode_isolates_same_database_name_by_project_directory() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let project_a = temp_dir.path().join("project-a");
+    let project_b = temp_dir.path().join("project-b");
+    std::fs::create_dir_all(&project_a).unwrap();
+    std::fs::create_dir_all(&project_b).unwrap();
+    let db_a = project_a.join("app.db");
+    let db_b = project_b.join("app.db");
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite_a = runtime.open_sqlite(db_a.to_str().unwrap(), None);
+    let sqlite_b = runtime.open_sqlite(db_b.to_str().unwrap(), None);
+
+    assert!(pragma_query_string(&sqlite_a, "graft_init").contains(".graft"));
+    assert!(pragma_query_string(&sqlite_b, "graft_init").contains(".graft"));
+
+    sqlite_a
+        .execute_batch(
+            r#"
+            CREATE TABLE project_data (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+            INSERT INTO project_data (name) VALUES ('alpha');
+            "#,
+        )
+        .unwrap();
+    pragma_query_string(&sqlite_a, "graft_add");
+    assert!(pragma_arg_string(&sqlite_a, "graft_commit", "commit alpha").contains("commit alpha"));
+
+    sqlite_b
+        .execute_batch(
+            r#"
+            CREATE TABLE project_data (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+            INSERT INTO project_data (name) VALUES ('beta');
+            "#,
+        )
+        .unwrap();
+    pragma_query_string(&sqlite_b, "graft_add");
+    assert!(pragma_arg_string(&sqlite_b, "graft_commit", "commit beta").contains("commit beta"));
+
+    let repo_a = graft::repo::Repository::discover_for_file(&db_a).unwrap();
+    let repo_b = graft::repo::Repository::discover_for_file(&db_b).unwrap();
+    assert_ne!(repo_a.graft_dir(), repo_b.graft_dir());
+    assert_ne!(repo_a.store_dir(), repo_b.store_dir());
+
+    let value_a: String = sqlite_a
+        .query_row("SELECT name FROM project_data WHERE id = 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let value_b: String = sqlite_b
+        .query_row("SELECT name FROM project_data WHERE id = 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(value_a, "alpha");
+    assert_eq!(value_b, "beta");
+
+    let show_a: Value =
+        serde_json::from_str(&pragma_arg_string(&sqlite_a, "graft_json_show", "HEAD"))
+            .expect("project A should expose its own HEAD commit");
+    let show_b: Value =
+        serde_json::from_str(&pragma_arg_string(&sqlite_b, "graft_json_show", "HEAD"))
+            .expect("project B should expose its own HEAD commit");
+    assert_eq!(show_a["message"], "commit alpha");
+    assert_eq!(show_b["message"], "commit beta");
+
+    drop(sqlite_a);
+    drop(sqlite_b);
+
+    let sqlite_a = runtime.open_sqlite(db_a.to_str().unwrap(), None);
+    let sqlite_b = runtime.open_sqlite(db_b.to_str().unwrap(), None);
+    let reopened_a: String = sqlite_a
+        .query_row("SELECT name FROM project_data WHERE id = 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let reopened_b: String = sqlite_b
+        .query_row("SELECT name FROM project_data WHERE id = 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(reopened_a, "alpha");
+    assert_eq!(reopened_b, "beta");
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+#[cfg(unix)]
+fn test_repo_mode_canonicalizes_symlinked_database_path_tags() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let project = temp_dir.path().join("project");
+    let alias = temp_dir.path().join("alias");
+    std::fs::create_dir_all(&project).unwrap();
+    std::os::unix::fs::symlink(&project, &alias).unwrap();
+
+    let canonical_db = std::fs::canonicalize(&project).unwrap().join("app.db");
+    let alias_db = alias.join("app.db");
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let vfs_id = runtime.ensure_vfs().to_string();
+    let alias_uri = format!("file:{}?vfs={vfs_id}", alias_db.display());
+    let canonical_uri = format!("file:{}?vfs={vfs_id}", canonical_db.display());
+
+    {
+        let alias_sqlite = Connection::open(&alias_uri).unwrap();
+        assert!(pragma_query_string(&alias_sqlite, "graft_init").contains(".graft"));
+        alias_sqlite
+            .execute_batch(
+                r#"
+                CREATE TABLE path_alias_data (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+                INSERT INTO path_alias_data (name) VALUES ('Alice');
+                "#,
+            )
+            .unwrap();
+    }
+
+    {
+        let canonical_sqlite = Connection::open(&canonical_uri).unwrap();
+        let status = pragma_query_string(&canonical_sqlite, "graft_status");
+        assert!(
+            status.contains("untracked: app.db"),
+            "canonical path should see writes made through symlink path: {status}"
+        );
+        assert_eq!(
+            pragma_query_string(&canonical_sqlite, "graft_add"),
+            "Added app.db"
+        );
+        assert!(
+            pragma_arg_string(&canonical_sqlite, "graft_commit", "initial alias row")
+                .contains("initial alias row")
+        );
+        let show: Value = serde_json::from_str(&pragma_arg_string(
+            &canonical_sqlite,
+            "graft_json_show",
+            "HEAD",
+        ))
+        .unwrap();
+        assert_eq!(show["files"]["app.db"]["snapshot"]["page_count"], 2);
+    }
+
+    {
+        let alias_sqlite = Connection::open(&alias_uri).unwrap();
+        alias_sqlite
+            .execute("INSERT INTO path_alias_data (name) VALUES ('Bob')", [])
+            .unwrap();
+    }
+
+    {
+        let canonical_sqlite = Connection::open(&canonical_uri).unwrap();
+        let status = pragma_query_string(&canonical_sqlite, "graft_status");
+        assert!(
+            status.contains("modified: app.db"),
+            "canonical path should see dirty state from symlink path: {status}"
+        );
+        assert_eq!(
+            pragma_query_string(&canonical_sqlite, "graft_add"),
+            "Added app.db"
+        );
+        assert!(
+            pragma_arg_string(&canonical_sqlite, "graft_commit", "add bob through alias")
+                .contains("add bob through alias")
+        );
+        let diff = pragma_arg_string(&canonical_sqlite, "graft_diff", "HEAD~1 HEAD -- app.db");
+        assert!(
+            diff.contains("modified: app.db"),
+            "diff should compare snapshots written through symlink and canonical paths: {diff}"
+        );
+    }
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_clone_pragma_fetches_branch_and_materializes_worktree() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let remote_dir = temp_dir.path().join("remote");
+    let source_db = temp_dir.path().join("source/app.db");
+    let clone_db = temp_dir.path().join("clone/app.db");
+    std::fs::create_dir_all(source_db.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(clone_db.parent().unwrap()).unwrap();
+
+    let mut source_runtime = GraftTestRuntime::with_memory_remote();
+    let source = source_runtime.open_sqlite(source_db.to_str().unwrap(), None);
+
+    assert!(pragma_query_string(&source, "graft_init").contains(".graft"));
+    assert!(
+        pragma_arg_string(
+            &source,
+            "graft_remote_add",
+            format!("origin fs://{}", remote_dir.display()),
+        )
+        .contains("origin")
+    );
+    source
+        .execute_batch(
+            r#"
+            CREATE TABLE repo_clone (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+            INSERT INTO repo_clone (name) VALUES ('Alice');
+            "#,
+        )
+        .unwrap();
+    assert_eq!(pragma_query_string(&source, "graft_add"), "Added app.db");
+    assert!(
+        pragma_arg_string(&source, "graft_commit", "base clone data").contains("base clone data")
+    );
+
+    let branch = pragma_arg_string(&source, "graft_branch_create", "feature/search");
+    assert!(branch.contains("feature/search"));
+    let switched = pragma_arg_string(&source, "graft_switch_branch", "feature/search");
+    assert!(switched.contains("feature/search"));
+    source
+        .execute("INSERT INTO repo_clone (name) VALUES ('Bob')", [])
+        .unwrap();
+    assert_eq!(pragma_query_string(&source, "graft_add"), "Added app.db");
+    assert!(
+        pragma_arg_string(&source, "graft_commit", "feature clone data")
+            .contains("feature clone data")
+    );
+    let pushed = pragma_arg_string(&source, "graft_push", "origin feature/search");
+    assert!(pushed.contains("origin/feature/search"));
+
+    let mut clone_runtime = GraftTestRuntime::with_memory_remote();
+    let clone = clone_runtime.open_sqlite(clone_db.to_str().unwrap(), None);
+    let cloned = pragma_arg_string(
+        &clone,
+        "graft_clone",
+        format!("fs://{} feature/search", remote_dir.display()),
+    );
+    assert!(cloned.contains("Cloned origin/feature/search"));
+
+    let names: Vec<String> = clone
+        .prepare("SELECT name FROM repo_clone ORDER BY id")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(names, vec!["Alice".to_string(), "Bob".to_string()]);
+
+    let clone_repo = graft::repo::Repository::discover_for_file(&clone_db).unwrap();
+    assert_eq!(
+        clone_repo.current_branch().unwrap().as_deref(),
+        Some("feature/search")
+    );
+    assert!(
+        clone_repo
+            .branch_target("feature/search")
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        clone_repo
+            .remote_tracking_ref("origin", "feature/search")
+            .unwrap()
+            .is_some()
+    );
+    let upstream = clone_repo
+        .branch_upstream("feature/search")
+        .unwrap()
+        .expect("clone should configure branch upstream");
+    assert_eq!(upstream.remote, "origin");
+    assert_eq!(upstream.branch, "feature/search");
+    assert!(
+        clone_repo.store_dir().read_dir().unwrap().next().is_some(),
+        "clone repo should use its own repo-local storage"
+    );
+
+    source_runtime.shutdown().unwrap();
+    clone_runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_remote_rename_pragma_updates_upstreams_and_tracking_refs() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let remote_dir = temp_dir.path().join("remote");
+    let db_path = temp_dir.path().join("project/app.db");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_path.to_str().unwrap(), None);
+
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE remote_rename (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+            INSERT INTO remote_rename (name) VALUES ('Alice');
+            "#,
+        )
+        .unwrap();
+    assert_eq!(pragma_query_string(&sqlite, "graft_add"), "Added app.db");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "base").contains("base"));
+    assert!(
+        pragma_arg_string(
+            &sqlite,
+            "graft_remote_add",
+            format!("origin fs://{}", remote_dir.display()),
+        )
+        .contains("origin")
+    );
+    assert!(
+        pragma_arg_string(&sqlite, "graft_branch_upstream", "origin/main").contains("origin/main")
+    );
+    assert!(pragma_query_string(&sqlite, "graft_push").contains("origin/main"));
+
+    let renamed = pragma_arg_string(&sqlite, "graft_remote_rename", "origin upstream");
+    assert!(renamed.contains("Renamed remote 'origin' to 'upstream'"));
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["upstream"]["remote"], "upstream");
+    assert_eq!(status["upstream"]["branch"], "main");
+    let remotes = pragma_query_string(&sqlite, "graft_remotes");
+    assert!(remotes.contains("upstream"));
+    assert!(!remotes.contains("origin"));
+
+    let repo = graft::repo::Repository::discover_for_file(&db_path).unwrap();
+    assert!(
+        repo.remote_tracking_ref("upstream", "main")
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(repo.remote_tracking_ref("origin", "main").unwrap(), None);
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_remote_set_url_and_get_url_pragmas_update_config_only() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let remote_a = temp_dir.path().join("remote-a");
+    let remote_b = temp_dir.path().join("remote-b");
+    let db_path = temp_dir.path().join("project/app.db");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_path.to_str().unwrap(), None);
+
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE remote_set_url (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+            INSERT INTO remote_set_url (name) VALUES ('Alice');
+            "#,
+        )
+        .unwrap();
+    assert_eq!(pragma_query_string(&sqlite, "graft_add"), "Added app.db");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "base").contains("base"));
+    assert!(
+        pragma_arg_string(
+            &sqlite,
+            "graft_remote_add",
+            format!("origin fs://{}", remote_a.display()),
+        )
+        .contains("origin")
+    );
+    assert!(
+        pragma_arg_string(&sqlite, "graft_branch_upstream", "origin/main").contains("origin/main")
+    );
+    assert!(pragma_query_string(&sqlite, "graft_push").contains("origin/main"));
+
+    let initial_url = pragma_arg_string(&sqlite, "graft_remote_get_url", "origin");
+    assert_eq!(initial_url, format!("fs://{}", remote_a.display()));
+    let updated = pragma_arg_string(
+        &sqlite,
+        "graft_remote_set_url",
+        format!("origin fs://{}", remote_b.display()),
+    );
+    assert!(updated.contains("Updated remote 'origin'"));
+    let updated_url = pragma_arg_string(&sqlite, "graft_remote_get_url", "origin");
+    assert_eq!(updated_url, format!("fs://{}", remote_b.display()));
+
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["upstream"]["remote"], "origin");
+    assert_eq!(status["upstream"]["branch"], "main");
+    let repo = graft::repo::Repository::discover_for_file(&db_path).unwrap();
+    assert!(
+        repo.remote_tracking_ref("origin", "main")
+            .unwrap()
+            .is_some()
+    );
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_clone_pragma_cleans_new_repo_after_fetch_failure() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let remote_dir = temp_dir.path().join("remote");
+    let source_db = temp_dir.path().join("source/app.db");
+    let clone_db = temp_dir.path().join("clone/app.db");
+    std::fs::create_dir_all(source_db.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(clone_db.parent().unwrap()).unwrap();
+
+    let mut source_runtime = GraftTestRuntime::with_memory_remote();
+    let source = source_runtime.open_sqlite(source_db.to_str().unwrap(), None);
+
+    assert!(pragma_query_string(&source, "graft_init").contains(".graft"));
+    assert!(
+        pragma_arg_string(
+            &source,
+            "graft_remote_add",
+            format!("origin fs://{}", remote_dir.display()),
+        )
+        .contains("origin")
+    );
+    source
+        .execute_batch(
+            r#"
+            CREATE TABLE repo_clone_retry (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+            INSERT INTO repo_clone_retry (name) VALUES ('Alice');
+            "#,
+        )
+        .unwrap();
+    assert_eq!(pragma_query_string(&source, "graft_add"), "Added app.db");
+    assert!(
+        pragma_arg_string(&source, "graft_commit", "clone retry data").contains("clone retry data")
+    );
+    let pushed = pragma_arg_string(&source, "graft_push", "origin main");
+    assert!(pushed.contains("origin/main"));
+
+    let mut clone_runtime = GraftTestRuntime::with_memory_remote();
+    let clone = clone_runtime.open_sqlite(clone_db.to_str().unwrap(), None);
+    let err = pragma_arg_error(
+        &clone,
+        "graft_clone",
+        format!("fs://{} missing/branch", remote_dir.display()),
+    );
+    assert!(
+        err.contains("missing/branch"),
+        "unexpected clone error: {err}"
+    );
+    assert!(
+        !clone_db.parent().unwrap().join(".graft").exists(),
+        "failed clone should remove the repo it created"
+    );
+
+    let cloned = pragma_arg_string(
+        &clone,
+        "graft_clone",
+        format!("fs://{} main", remote_dir.display()),
+    );
+    assert!(cloned.contains("Cloned origin/main"));
+    let count: i64 = clone
+        .query_row("SELECT COUNT(*) FROM repo_clone_retry", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 1);
+
+    source_runtime.shutdown().unwrap();
+    clone_runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_clone_pragma_without_branch_uses_remote_head() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let remote_dir = temp_dir.path().join("remote");
+    let source_db = temp_dir.path().join("source/app.db");
+    let clone_db = temp_dir.path().join("clone/app.db");
+    std::fs::create_dir_all(source_db.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(clone_db.parent().unwrap()).unwrap();
+
+    let mut source_runtime = GraftTestRuntime::with_memory_remote();
+    let source = source_runtime.open_sqlite(source_db.to_str().unwrap(), None);
+
+    assert!(pragma_query_string(&source, "graft_init").contains(".graft"));
+    let source_repo = graft::repo::Repository::discover_for_file(&source_db).unwrap();
+    let mut config = source_repo.config().unwrap();
+    config.core.default_branch = "trunk".to_string();
+    source_repo.write_config(&config).unwrap();
+
+    assert!(
+        pragma_arg_string(
+            &source,
+            "graft_remote_add",
+            format!("origin fs://{}", remote_dir.display()),
+        )
+        .contains("origin")
+    );
+    source
+        .execute_batch(
+            r#"
+            CREATE TABLE repo_clone_head (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+            INSERT INTO repo_clone_head (name) VALUES ('Alice');
+            "#,
+        )
+        .unwrap();
+    assert_eq!(pragma_query_string(&source, "graft_add"), "Added app.db");
+    assert!(
+        pragma_arg_string(&source, "graft_commit", "base clone head").contains("base clone head")
+    );
+    assert!(pragma_arg_string(&source, "graft_branch_create", "trunk").contains("trunk"));
+    assert!(pragma_arg_string(&source, "graft_switch_branch", "trunk").contains("trunk"));
+    source
+        .execute("INSERT INTO repo_clone_head (name) VALUES ('Bob')", [])
+        .unwrap();
+    assert_eq!(pragma_query_string(&source, "graft_add"), "Added app.db");
+    assert!(
+        pragma_arg_string(&source, "graft_commit", "trunk clone head").contains("trunk clone head")
+    );
+    assert!(pragma_arg_string(&source, "graft_push", "origin trunk").contains("origin/trunk"));
+    assert_eq!(
+        std::fs::read_to_string(remote_dir.join("HEAD")).unwrap(),
+        "ref: refs/heads/trunk\n"
+    );
+
+    let mut clone_runtime = GraftTestRuntime::with_memory_remote();
+    let clone = clone_runtime.open_sqlite(clone_db.to_str().unwrap(), None);
+    let cloned = pragma_arg_string(
+        &clone,
+        "graft_clone",
+        format!("fs://{}", remote_dir.display()),
+    );
+    assert!(cloned.contains("Cloned origin/trunk"));
+
+    let clone_repo = graft::repo::Repository::discover_for_file(&clone_db).unwrap();
+    assert_eq!(
+        clone_repo.current_branch().unwrap().as_deref(),
+        Some("trunk")
+    );
+    let count: i64 = clone
+        .query_row("SELECT COUNT(*) FROM repo_clone_head", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 2);
+
+    source_runtime.shutdown().unwrap();
+    clone_runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_force_checkout_and_switch_discard_worktree_changes() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE force_test (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+            INSERT INTO force_test (name) VALUES ('base');
+            "#,
+        )
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "base").contains("base"));
+
+    assert!(
+        pragma_arg_string(&sqlite, "graft_switch_create", "feature/search")
+            .contains("feature/search")
+    );
+    sqlite
+        .execute("INSERT INTO force_test (name) VALUES ('feature')", [])
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "feature").contains("feature"));
+
+    sqlite
+        .execute("INSERT INTO force_test (name) VALUES ('dirty feature')", [])
+        .unwrap();
+    let err = pragma_arg_error(&sqlite, "graft_switch_branch", "--force missing/branch");
+    assert!(err.contains("branch `missing/branch` does not exist"));
+    let err = pragma_arg_error(&sqlite, "graft_switch_create", "--force feature HEAD");
+    assert!(err.contains("cannot create ref `refs/heads/feature`"));
+    let count: i64 = sqlite
+        .query_row("SELECT COUNT(*) FROM force_test", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 3);
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["dirty"], true);
+
+    let err = pragma_arg_error(&sqlite, "graft_switch_branch", "main");
+    assert!(err.contains("staged or unstaged"));
+    let switched = pragma_arg_string(&sqlite, "graft_switch_branch", "--force main");
+    assert!(switched.contains("main"));
+    let count: i64 = sqlite
+        .query_row("SELECT COUNT(*) FROM force_test", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 1);
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["dirty"], false);
+    assert_eq!(status["staged"].as_array().unwrap().len(), 0);
+
+    sqlite
+        .execute("INSERT INTO force_test (name) VALUES ('dirty main')", [])
+        .unwrap();
+    let err = pragma_arg_error(&sqlite, "graft_checkout", "feature/search");
+    assert!(err.contains("staged or unstaged"));
+    let checkout = pragma_arg_string(&sqlite, "graft_checkout", "--force feature/search");
+    assert!(checkout.contains("HEAD detached"));
+    let count: i64 = sqlite
+        .query_row("SELECT COUNT(*) FROM force_test", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 2);
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["head"]["type"], "detached");
+    assert_eq!(status["dirty"], false);
+    assert_eq!(status["staged"].as_array().unwrap().len(), 0);
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_status_scans_physical_untracked_sqlite_files() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+
+    let external_db = temp_dir.path().join("external.db");
+    {
+        let external = Connection::open(&external_db).unwrap();
+        external
+            .execute_batch("CREATE TABLE external_data (id INTEGER PRIMARY KEY);")
+            .unwrap();
+    }
+
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["dirty"], true);
+    assert_eq!(status["unstaged_changes"][0]["path"], "external.db");
+    assert_eq!(status["unstaged_changes"][0]["change"], "untracked");
+
+    let text_status = pragma_query_string(&sqlite, "graft_status");
+    assert!(text_status.contains("untracked: external.db"));
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_status_classifies_tracked_physical_sqlite_files() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+
+    let external_db = temp_dir.path().join("external.db");
+    {
+        let external = Connection::open(&external_db).unwrap();
+        external
+            .execute_batch(
+                r#"
+                PRAGMA page_size=4096;
+                CREATE TABLE external_data (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+                INSERT INTO external_data (name) VALUES ('v1');
+                "#,
+            )
+            .unwrap();
+    }
+
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_add", "external.db"),
+        "Added external.db"
+    );
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "external v1").contains("external v1"));
+
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["dirty"], false);
+    assert!(
+        status["unstaged_changes"].as_array().is_none_or(|changes| {
+            !changes.iter().any(|change| change["path"] == "external.db")
+        })
+    );
+    let clean_diff = pragma_arg_string(&sqlite, "graft_diff", "-- external.db");
+    assert!(clean_diff.contains("No changes."));
+
+    {
+        let external = Connection::open(&external_db).unwrap();
+        external
+            .execute("UPDATE external_data SET name = 'v2' WHERE id = 1", [])
+            .unwrap();
+    }
+
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["dirty"], true);
+    assert!(
+        status["unstaged_changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|change| { change["path"] == "external.db" && change["change"] == "modified" })
+    );
+    let text_status = pragma_query_string(&sqlite, "graft_status");
+    assert!(text_status.contains("modified: external.db"));
+
+    std::fs::remove_file(&external_db).unwrap();
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert!(
+        status["unstaged_changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|change| { change["path"] == "external.db" && change["change"] == "deleted" })
+    );
+    let text_status = pragma_query_string(&sqlite, "graft_status");
+    assert!(text_status.contains("deleted: external.db"));
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_add_stages_physical_untracked_sqlite_file() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+
+    let external_db = temp_dir.path().join("external.db");
+    {
+        let external = Connection::open(&external_db).unwrap();
+        external
+            .execute_batch(
+                r#"
+                PRAGMA page_size=4096;
+                CREATE TABLE external_data (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+                INSERT INTO external_data (name) VALUES ('physical file');
+                "#,
+            )
+            .unwrap();
+    }
+
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["unstaged_changes"][0]["path"], "external.db");
+    assert_eq!(status["unstaged_changes"][0]["change"], "untracked");
+
+    let added = pragma_arg_string(&sqlite, "graft_add", "external.db");
+    assert_eq!(added, "Added external.db");
+
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["staged"][0], "external.db");
+    assert!(
+        status["unstaged_changes"].as_array().is_none_or(|changes| {
+            !changes.iter().any(|change| change["path"] == "external.db")
+        })
+    );
+
+    let commit = pragma_arg_string(&sqlite, "graft_commit", "add external database");
+    assert!(commit.contains("add external database"));
+    let show = pragma_arg_string(&sqlite, "graft_show", "HEAD");
+    assert!(show.contains("external.db"));
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_add_physical_sqlite_file_rejects_non_graft_page_size() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+
+    let external_db = temp_dir.path().join("external.db");
+    {
+        let external = Connection::open(&external_db).unwrap();
+        external
+            .execute_batch(
+                r#"
+                PRAGMA page_size=8192;
+                CREATE TABLE external_data (id INTEGER PRIMARY KEY);
+                "#,
+            )
+            .unwrap();
+    }
+
+    let err = pragma_arg_error(&sqlite, "graft_add", "external.db");
+    assert!(err.contains("4096-byte pages"));
+    assert!(err.contains("8192-byte pages"));
+    assert!(err.contains("VACUUM INTO"));
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_diff_physical_sqlite_worktree_path() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+
+    let external_db = temp_dir.path().join("external.db");
+    {
+        let external = Connection::open(&external_db).unwrap();
+        external
+            .execute_batch(
+                r#"
+                PRAGMA page_size=4096;
+                CREATE TABLE external_data (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+                INSERT INTO external_data (name) VALUES ('v1');
+                "#,
+            )
+            .unwrap();
+    }
+
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_add", "external.db"),
+        "Added external.db"
+    );
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "external v1").contains("external v1"));
+
+    {
+        let external = Connection::open(&external_db).unwrap();
+        external
+            .execute("UPDATE external_data SET name = 'v2' WHERE id = 1", [])
+            .unwrap();
+    }
+
+    let worktree_diff = pragma_arg_string(&sqlite, "graft_diff", "-- external.db");
+    assert!(worktree_diff.contains("modified: external.db"));
+
+    let rev_worktree_diff = pragma_arg_string(&sqlite, "graft_diff", "HEAD -- external.db");
+    assert!(rev_worktree_diff.contains("modified: external.db"));
+
+    let json_diff: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_diff",
+        "HEAD -- external.db",
+    ))
+    .expect("graft_json_diff should return repo diff JSON");
+    assert_eq!(json_diff["files"][0]["path"], "external.db");
+    assert_eq!(json_diff["files"][0]["change"], "modified");
+
+    std::fs::remove_file(&external_db).unwrap();
+    let deleted_diff = pragma_arg_string(&sqlite, "graft_diff", "-- external.db");
+    assert!(deleted_diff.contains("deleted: external.db"));
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_rm_removes_and_stages_physical_sqlite_file() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+
+    let external_db = temp_dir.path().join("external.db");
+    {
+        let external = Connection::open(&external_db).unwrap();
+        external
+            .execute_batch(
+                r#"
+                PRAGMA page_size=4096;
+                CREATE TABLE external_data (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+                INSERT INTO external_data (name) VALUES ('physical file');
+                "#,
+            )
+            .unwrap();
+    }
+
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_add", "external.db"),
+        "Added external.db"
+    );
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "add external").contains("add external"));
+
+    let removed = pragma_arg_string(&sqlite, "graft_rm", "external.db");
+    assert_eq!(removed, "Removed external.db");
+    assert!(!external_db.exists());
+
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["staged"][0], "external.db");
+    assert!(
+        status["unstaged_changes"].as_array().is_none_or(|changes| {
+            !changes.iter().any(|change| change["path"] == "external.db")
+        })
+    );
+
+    let diff = pragma_arg_string(&sqlite, "graft_diff", "--staged");
+    assert!(diff.contains("deleted: external.db"));
+
+    assert!(
+        pragma_arg_string(&sqlite, "graft_commit", "remove external").contains("remove external")
+    );
+    let repo = graft::repo::Repository::discover_for_file(&db_path).unwrap();
+    assert!(repo.head_file(&external_db).unwrap().is_none());
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_checkout_path_materializes_physical_sqlite_file() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+
+    let external_db = temp_dir.path().join("external.db");
+    {
+        let external = Connection::open(&external_db).unwrap();
+        external
+            .execute_batch(
+                r#"
+                PRAGMA page_size=4096;
+                CREATE TABLE external_data (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+                INSERT INTO external_data (name) VALUES ('v1');
+                "#,
+            )
+            .unwrap();
+    }
+
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_add", "external.db"),
+        "Added external.db"
+    );
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "external v1").contains("external v1"));
+
+    {
+        let external = Connection::open(&external_db).unwrap();
+        external
+            .execute("UPDATE external_data SET name = 'v2' WHERE id = 1", [])
+            .unwrap();
+    }
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_add", "external.db"),
+        "Added external.db"
+    );
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "external v2").contains("external v2"));
+
+    std::fs::remove_file(&external_db).unwrap();
+    assert!(!external_db.exists());
+
+    let checkout = pragma_arg_string(&sqlite, "graft_checkout", "HEAD~1 -- external.db");
+    assert!(checkout.contains("Checked out external.db"));
+    assert!(external_db.exists());
+
+    let restored = Connection::open(&external_db).unwrap();
+    let name: String = restored
+        .query_row("SELECT name FROM external_data WHERE id = 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(name, "v1");
+
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["staged"][0], "external.db");
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_checkout_rejects_snapshot_commit_hash_mismatch() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE repo_hash_test (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+            INSERT INTO repo_hash_test (name) VALUES ('Alice');
+            "#,
+        )
+        .unwrap();
+    assert_eq!(pragma_query_string(&sqlite, "graft_add"), "Added app.db");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "hash checked").contains("hash checked"));
+
+    let repo = graft::repo::Repository::discover_for_file(&db_path).unwrap();
+    let head = repo.resolve_revision("HEAD").unwrap();
+    let tampered = tamper_sqlite_snapshot_range_hash(&repo, &head, "app.db");
+    std::fs::write(
+        repo.graft_dir().join("refs/heads/main"),
+        format!("{tampered}\n"),
+    )
+    .unwrap();
+
+    let err = pragma_arg_error(&sqlite, "graft_checkout", "HEAD -- app.db");
+    assert!(
+        err.contains("snapshot storage commit hash mismatch"),
+        "expected snapshot hash mismatch, got: {err}"
+    );
+    assert!(
+        !repo.has_staged_changes().unwrap(),
+        "hash mismatch should fail before staging checkout results"
+    );
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_checkout_rejects_snapshot_missing_commit_hash() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE repo_missing_hash_test (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+            INSERT INTO repo_missing_hash_test (name) VALUES ('Alice');
+            "#,
+        )
+        .unwrap();
+    assert_eq!(pragma_query_string(&sqlite, "graft_add"), "Added app.db");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "hash required").contains("hash required"));
+
+    let repo = graft::repo::Repository::discover_for_file(&db_path).unwrap();
+    let head = repo.resolve_revision("HEAD").unwrap();
+    let tampered = remove_sqlite_snapshot_range_hash(&repo, &head, "app.db");
+    std::fs::write(
+        repo.graft_dir().join("refs/heads/main"),
+        format!("{tampered}\n"),
+    )
+    .unwrap();
+
+    let err = pragma_arg_error(&sqlite, "graft_checkout", "HEAD -- app.db");
+    assert!(
+        err.contains("invalid blob object")
+            && err.contains("storage commit hashes")
+            && err.contains("expected"),
+        "expected invalid snapshot hash object error, got: {err}"
+    );
+    assert!(
+        !repo.has_staged_changes().unwrap(),
+        "missing hash should fail before staging checkout results"
+    );
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_push_rejects_snapshot_commit_hash_mismatch_before_remote_ref_update() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let remote_dir = temp_dir.path().join("remote");
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+    assert!(
+        pragma_arg_string(
+            &sqlite,
+            "graft_remote_add",
+            format!("origin fs://{}", remote_dir.display()),
+        )
+        .contains("origin")
+    );
+
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE repo_push_hash_test (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+            INSERT INTO repo_push_hash_test (name) VALUES ('Alice');
+            "#,
+        )
+        .unwrap();
+    assert_eq!(pragma_query_string(&sqlite, "graft_add"), "Added app.db");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "hash checked").contains("hash checked"));
+
+    let repo = graft::repo::Repository::discover_for_file(&db_path).unwrap();
+    let head = repo.resolve_revision("HEAD").unwrap();
+    let tampered = tamper_sqlite_snapshot_range_hash(&repo, &head, "app.db");
+    std::fs::write(
+        repo.graft_dir().join("refs/heads/main"),
+        format!("{tampered}\n"),
+    )
+    .unwrap();
+
+    let err = pragma_arg_error(&sqlite, "graft_push", "origin main");
+    assert!(
+        err.contains("snapshot storage commit hash mismatch"),
+        "expected snapshot hash mismatch, got: {err}"
+    );
+    assert!(
+        !remote_dir.join("refs/heads/main").exists(),
+        "hash mismatch should fail before updating the remote branch ref"
+    );
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_switch_materializes_physical_sqlite_worktree_files() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE base_app (id INTEGER PRIMARY KEY);
+            INSERT INTO base_app DEFAULT VALUES;
+            "#,
+        )
+        .unwrap();
+    assert_eq!(pragma_query_string(&sqlite, "graft_add"), "Added app.db");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "base").contains("base"));
+    assert!(
+        pragma_arg_string(&sqlite, "graft_branch_create", "without-external")
+            .contains("without-external")
+    );
+
+    let external_db = temp_dir.path().join("external.db");
+    {
+        let external = Connection::open(&external_db).unwrap();
+        external
+            .execute_batch(
+                r#"
+                PRAGMA page_size=4096;
+                CREATE TABLE external_data (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+                INSERT INTO external_data (name) VALUES ('v1');
+                "#,
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_add", "external.db"),
+        "Added external.db"
+    );
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "external v1").contains("external v1"));
+
+    assert!(
+        pragma_arg_string(&sqlite, "graft_switch_create", "feature/external")
+            .contains("feature/external")
+    );
+    {
+        let external = Connection::open(&external_db).unwrap();
+        external
+            .execute("UPDATE external_data SET name = 'v2' WHERE id = 1", [])
+            .unwrap();
+    }
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_add", "external.db"),
+        "Added external.db"
+    );
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "external v2").contains("external v2"));
+
+    assert!(pragma_arg_string(&sqlite, "graft_switch_branch", "main").contains("main"));
+    assert_eq!(external_value(&external_db), "v1");
+
+    assert!(
+        pragma_arg_string(&sqlite, "graft_switch_branch", "without-external")
+            .contains("without-external")
+    );
+    assert!(!external_db.exists());
+
+    assert!(
+        pragma_arg_string(&sqlite, "graft_switch_branch", "feature/external")
+            .contains("feature/external")
+    );
+    assert_eq!(external_value(&external_db), "v2");
+
+    {
+        let external = Connection::open(&external_db).unwrap();
+        external
+            .execute("UPDATE external_data SET name = 'dirty' WHERE id = 1", [])
+            .unwrap();
+    }
+    let err = pragma_arg_error(&sqlite, "graft_switch_branch", "without-external");
+    assert!(err.contains("staged or unstaged"));
+    assert_eq!(external_value(&external_db), "dirty");
+
+    assert!(
+        pragma_arg_string(&sqlite, "graft_switch_branch", "--force without-external")
+            .contains("without-external")
+    );
+    assert!(!external_db.exists());
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_restore_physical_sqlite_worktree_file_from_index_and_revision() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE base_app (id INTEGER PRIMARY KEY);
+            INSERT INTO base_app DEFAULT VALUES;
+            "#,
+        )
+        .unwrap();
+    assert_eq!(pragma_query_string(&sqlite, "graft_add"), "Added app.db");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "base").contains("base"));
+
+    let external_db = temp_dir.path().join("external.db");
+    {
+        let external = Connection::open(&external_db).unwrap();
+        external
+            .execute_batch(
+                r#"
+                PRAGMA page_size=4096;
+                CREATE TABLE external_data (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+                INSERT INTO external_data (name) VALUES ('v1');
+                "#,
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_add", "external.db"),
+        "Added external.db"
+    );
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "external v1").contains("external v1"));
+
+    assert!(
+        pragma_arg_string(&sqlite, "graft_switch_create", "feature/external")
+            .contains("feature/external")
+    );
+    {
+        let external = Connection::open(&external_db).unwrap();
+        external
+            .execute("UPDATE external_data SET name = 'v2' WHERE id = 1", [])
+            .unwrap();
+    }
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_add", "external.db"),
+        "Added external.db"
+    );
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "external v2").contains("external v2"));
+
+    assert!(pragma_arg_string(&sqlite, "graft_switch_branch", "main").contains("main"));
+    assert_eq!(external_value(&external_db), "v1");
+
+    let restored = pragma_arg_string(
+        &sqlite,
+        "graft_restore",
+        "--staged --source feature/external -- external.db",
+    );
+    assert_eq!(restored, "Restored external.db");
+    assert_eq!(external_value(&external_db), "v1");
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["dirty"], true);
+    assert_eq!(status["unstaged"][0], "external.db");
+    assert_eq!(status["staged"][0], "external.db");
+
+    let restored = pragma_arg_string(&sqlite, "graft_restore", "--staged external.db");
+    assert_eq!(restored, "Restored external.db");
+    assert_eq!(external_value(&external_db), "v1");
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["dirty"], false);
+    assert_eq!(status["unstaged"].as_array().unwrap().len(), 0);
+    assert_eq!(status["staged"].as_array().unwrap().len(), 0);
+
+    let restored = pragma_arg_string(
+        &sqlite,
+        "graft_restore",
+        "--source feature/external -- external.db",
+    );
+    assert_eq!(restored, "Restored external.db");
+    assert_eq!(external_value(&external_db), "v2");
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["dirty"], true);
+    assert_eq!(status["unstaged"][0], "external.db");
+    assert_eq!(status["staged"].as_array().unwrap().len(), 0);
+
+    let restored = pragma_arg_string(&sqlite, "graft_restore", "external.db");
+    assert_eq!(restored, "Restored external.db");
+    assert_eq!(external_value(&external_db), "v1");
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["dirty"], false);
+    assert_eq!(status["unstaged"].as_array().unwrap().len(), 0);
+    assert_eq!(status["staged"].as_array().unwrap().len(), 0);
+
+    {
+        let external = Connection::open(&external_db).unwrap();
+        external
+            .execute("UPDATE external_data SET name = 'staged' WHERE id = 1", [])
+            .unwrap();
+    }
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_add", "external.db"),
+        "Added external.db"
+    );
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["dirty"], false);
+    assert_eq!(status["staged"][0], "external.db");
+
+    let restored = pragma_arg_string(&sqlite, "graft_restore", "--staged external.db");
+    assert_eq!(restored, "Restored external.db");
+    assert_eq!(external_value(&external_db), "staged");
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["dirty"], true);
+    assert_eq!(status["unstaged"][0], "external.db");
+    assert_eq!(status["staged"].as_array().unwrap().len(), 0);
+
+    let restored = pragma_arg_string(&sqlite, "graft_restore", "external.db");
+    assert_eq!(restored, "Restored external.db");
+    assert_eq!(external_value(&external_db), "v1");
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["dirty"], false);
+    assert_eq!(status["unstaged"].as_array().unwrap().len(), 0);
+    assert_eq!(status["staged"].as_array().unwrap().len(), 0);
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_merge_materializes_clean_physical_sqlite_worktree_files() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE base_app (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+            INSERT INTO base_app (name) VALUES ('base');
+            "#,
+        )
+        .unwrap();
+    let external_db = temp_dir.path().join("external.db");
+    {
+        let external = Connection::open(&external_db).unwrap();
+        external
+            .execute_batch(
+                r#"
+                PRAGMA page_size=4096;
+                CREATE TABLE external_data (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+                INSERT INTO external_data (name) VALUES ('v1');
+                "#,
+            )
+            .unwrap();
+    }
+    assert_eq!(pragma_query_string(&sqlite, "graft_add"), "Added app.db");
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_add", "external.db"),
+        "Added external.db"
+    );
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "base").contains("base"));
+
+    assert!(
+        pragma_arg_string(&sqlite, "graft_switch_create", "feature/external")
+            .contains("feature/external")
+    );
+    {
+        let external = Connection::open(&external_db).unwrap();
+        external
+            .execute("UPDATE external_data SET name = 'v2' WHERE id = 1", [])
+            .unwrap();
+    }
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_add", "external.db"),
+        "Added external.db"
+    );
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "external v2").contains("external v2"));
+
+    assert!(pragma_arg_string(&sqlite, "graft_switch_branch", "main").contains("main"));
+    assert_eq!(external_value(&external_db), "v1");
+    sqlite
+        .execute("UPDATE base_app SET name = 'main' WHERE id = 1", [])
+        .unwrap();
+    assert_eq!(pragma_query_string(&sqlite, "graft_add"), "Added app.db");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "main app").contains("main app"));
+
+    let merge = pragma_arg_string(&sqlite, "graft_merge", "feature/external");
+    assert!(merge.contains("Merged"));
+    assert_eq!(external_value(&external_db), "v2");
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["staged"][0], "external.db");
+    assert!(status["merge_head"].as_str().is_some());
+
+    let abort = pragma_query_string(&sqlite, "graft_merge_abort");
+    assert!(abort.contains("Aborted merge"));
+    assert_eq!(external_value(&external_db), "v1");
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_pull_non_fast_forward_enters_merge_state() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let remote_dir = temp_dir.path().join("remote");
+    let source_db = temp_dir.path().join("source/app.db");
+    let clone_db = temp_dir.path().join("clone/app.db");
+    std::fs::create_dir_all(source_db.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(clone_db.parent().unwrap()).unwrap();
+
+    let mut source_runtime = GraftTestRuntime::with_memory_remote();
+    let source = source_runtime.open_sqlite(source_db.to_str().unwrap(), None);
+    let mut clone_runtime = GraftTestRuntime::with_memory_remote();
+    let clone = clone_runtime.open_sqlite(clone_db.to_str().unwrap(), None);
+
+    assert!(pragma_query_string(&source, "graft_init").contains(".graft"));
+    assert!(pragma_query_string(&clone, "graft_init").contains(".graft"));
+    assert!(
+        pragma_arg_string(
+            &source,
+            "graft_remote_add",
+            format!("origin fs://{}", remote_dir.display()),
+        )
+        .contains("origin")
+    );
+    assert!(
+        pragma_arg_string(
+            &clone,
+            "graft_remote_add",
+            format!("origin fs://{}", remote_dir.display()),
+        )
+        .contains("origin")
+    );
+
+    source
+        .execute_batch(
+            r#"
+            CREATE TABLE repo_pull (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+            INSERT INTO repo_pull (name) VALUES ('Alice');
+            "#,
+        )
+        .unwrap();
+    pragma_query_string(&source, "graft_add");
+    assert!(pragma_arg_string(&source, "graft_commit", "base row").contains("base row"));
+    assert!(pragma_arg_string(&source, "graft_push", "origin main").contains("origin/main"));
+
+    let first_pull = pragma_arg_string(&clone, "graft_pull", "origin main");
+    assert!(first_pull.contains("Fast-forwarded main"));
+    let clone_count: i64 = clone
+        .query_row("SELECT COUNT(*) FROM repo_pull", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(clone_count, 1);
+
+    source
+        .execute("INSERT INTO repo_pull (name) VALUES ('Bob')", [])
+        .unwrap();
+    pragma_query_string(&source, "graft_add");
+    assert!(pragma_arg_string(&source, "graft_commit", "remote row").contains("remote row"));
+    assert!(pragma_arg_string(&source, "graft_push", "origin main").contains("origin/main"));
+
+    clone
+        .execute("INSERT INTO repo_pull (name) VALUES ('Carol')", [])
+        .unwrap();
+    pragma_query_string(&clone, "graft_add");
+    assert!(pragma_arg_string(&clone, "graft_commit", "local row").contains("local row"));
+
+    let pull = pragma_arg_string(&clone, "graft_pull", "origin main");
+    assert!(pull.contains("Fetched origin/main"));
+    assert!(pull.contains("Unmerged paths:"));
+    assert!(pull.contains("app.db"));
+
+    let status: Value = serde_json::from_str(&pragma_query_string(&clone, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert!(status["merge_head"].as_str().is_some());
+    assert_eq!(status["conflicted"][0], "app.db");
+    let clone_count: i64 = clone
+        .query_row("SELECT COUNT(*) FROM repo_pull", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(clone_count, 2);
+
+    let abort = pragma_query_string(&clone, "graft_merge_abort");
+    assert!(abort.contains("Aborted merge"));
+    let status: Value = serde_json::from_str(&pragma_query_string(&clone, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert!(status["merge_head"].is_null());
+    assert_eq!(status["conflicted"].as_array().unwrap().len(), 0);
+
+    source_runtime.shutdown().unwrap();
+    clone_runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_fetch_and_push_all_pragmas_sync_remote_branches() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let remote_dir = temp_dir.path().join("remote");
+    let source_db = temp_dir.path().join("source/app.db");
+    let clone_db = temp_dir.path().join("clone/app.db");
+    std::fs::create_dir_all(source_db.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(clone_db.parent().unwrap()).unwrap();
+
+    let mut source_runtime = GraftTestRuntime::with_memory_remote();
+    let source = source_runtime.open_sqlite(source_db.to_str().unwrap(), None);
+    let mut clone_runtime = GraftTestRuntime::with_memory_remote();
+    let clone = clone_runtime.open_sqlite(clone_db.to_str().unwrap(), None);
+
+    assert!(pragma_query_string(&source, "graft_init").contains(".graft"));
+    assert!(
+        pragma_arg_string(
+            &source,
+            "graft_remote_add",
+            format!("origin fs://{}", remote_dir.display()),
+        )
+        .contains("origin")
+    );
+
+    source
+        .execute_batch(
+            r#"
+            CREATE TABLE repo_all (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+            INSERT INTO repo_all (name) VALUES ('base');
+            "#,
+        )
+        .unwrap();
+    pragma_query_string(&source, "graft_add");
+    assert!(pragma_arg_string(&source, "graft_commit", "base").contains("base"));
+
+    assert!(
+        pragma_arg_string(&source, "graft_switch_create", "feature/search")
+            .contains("feature/search")
+    );
+    source
+        .execute("INSERT INTO repo_all (name) VALUES ('feature')", [])
+        .unwrap();
+    pragma_query_string(&source, "graft_add");
+    assert!(pragma_arg_string(&source, "graft_commit", "feature").contains("feature"));
+
+    assert!(pragma_arg_string(&source, "graft_switch_branch", "main").contains("main"));
+    source
+        .execute("INSERT INTO repo_all (name) VALUES ('main')", [])
+        .unwrap();
+    pragma_query_string(&source, "graft_add");
+    assert!(pragma_arg_string(&source, "graft_commit", "main").contains("main"));
+
+    let pushed = pragma_arg_string(&source, "graft_push", "--all origin");
+    assert!(pushed.contains("Pushed origin"));
+    assert!(pushed.contains("origin/feature/search"));
+    assert!(pushed.contains("origin/main"));
+
+    assert!(pragma_query_string(&clone, "graft_init").contains(".graft"));
+    assert!(
+        pragma_arg_string(
+            &clone,
+            "graft_remote_add",
+            format!("origin fs://{}", remote_dir.display()),
+        )
+        .contains("origin")
+    );
+    let fetched = pragma_arg_string(&clone, "graft_fetch", "--all origin");
+    assert!(fetched.contains("Fetched origin"));
+    assert!(fetched.contains("origin/feature/search"));
+    assert!(fetched.contains("origin/main"));
+
+    let clone_repo = graft::repo::Repository::discover_for_file(&clone_db).unwrap();
+    assert!(
+        clone_repo
+            .remote_tracking_ref("origin", "feature/search")
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        clone_repo
+            .remote_tracking_ref("origin", "main")
+            .unwrap()
+            .is_some()
+    );
+    let remote_branches = pragma_arg_string(&clone, "graft_branch", "--remote");
+    assert!(remote_branches.contains("origin/feature/search"));
+    assert!(remote_branches.contains("origin/main"));
+    assert!(!remote_branches.contains("remotes/origin/main"));
+
+    let all_branches = pragma_arg_string(&clone, "graft_branch", "--all");
+    assert!(all_branches.contains("* main"));
+    assert!(all_branches.contains("remotes/origin/feature/search"));
+    assert!(all_branches.contains("remotes/origin/main"));
+
+    source_runtime.shutdown().unwrap();
+    clone_runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_fetch_and_push_refspec_pragmas_map_branches() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let remote_dir = temp_dir.path().join("remote");
+    let source_db = temp_dir.path().join("source/app.db");
+    let clone_db = temp_dir.path().join("clone/app.db");
+    std::fs::create_dir_all(source_db.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(clone_db.parent().unwrap()).unwrap();
+
+    let mut source_runtime = GraftTestRuntime::with_memory_remote();
+    let source = source_runtime.open_sqlite(source_db.to_str().unwrap(), None);
+    let mut clone_runtime = GraftTestRuntime::with_memory_remote();
+    let clone = clone_runtime.open_sqlite(clone_db.to_str().unwrap(), None);
+
+    assert!(pragma_query_string(&source, "graft_init").contains(".graft"));
+    assert!(
+        pragma_arg_string(
+            &source,
+            "graft_remote_add",
+            format!("origin fs://{}", remote_dir.display()),
+        )
+        .contains("origin")
+    );
+
+    source
+        .execute_batch(
+            r#"
+            CREATE TABLE repo_refspec (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+            INSERT INTO repo_refspec (name) VALUES ('base');
+            "#,
+        )
+        .unwrap();
+    pragma_query_string(&source, "graft_add");
+    assert!(pragma_arg_string(&source, "graft_commit", "base").contains("base"));
+    assert!(
+        pragma_arg_string(&source, "graft_switch_create", "feature/search")
+            .contains("feature/search")
+    );
+    source
+        .execute("INSERT INTO repo_refspec (name) VALUES ('feature')", [])
+        .unwrap();
+    pragma_query_string(&source, "graft_add");
+    assert!(pragma_arg_string(&source, "graft_commit", "feature").contains("feature"));
+
+    let pushed = pragma_arg_string(
+        &source,
+        "graft_push",
+        "origin refs/heads/feature/search:refs/heads/review/search",
+    );
+    assert!(pushed.contains("Pushed origin"));
+    assert!(pushed.contains("origin/review/search"));
+
+    assert!(pragma_query_string(&clone, "graft_init").contains(".graft"));
+    assert!(
+        pragma_arg_string(
+            &clone,
+            "graft_remote_add",
+            format!("origin fs://{}", remote_dir.display()),
+        )
+        .contains("origin")
+    );
+    let fetched = pragma_arg_string(
+        &clone,
+        "graft_fetch",
+        "origin refs/heads/review/search:refs/remotes/origin/local/search",
+    );
+    assert!(fetched.contains("Fetched origin"));
+    assert!(fetched.contains("origin/local/search"));
+
+    let clone_repo = graft::repo::Repository::discover_for_file(&clone_db).unwrap();
+    assert!(
+        clone_repo
+            .remote_tracking_ref("origin", "local/search")
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        clone_repo
+            .remote_tracking_ref("origin", "review/search")
+            .unwrap(),
+        None
+    );
+
+    let deleted = pragma_arg_string(&source, "graft_push", "origin :review/search");
+    assert!(deleted.contains("Deleted origin/review/search"));
+    let fetched = pragma_arg_error(&clone, "graft_fetch", "origin review/search");
+    assert!(fetched.contains("remote `origin` has no branch `review/search`"));
+
+    source_runtime.shutdown().unwrap();
+    clone_runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_remote_prune_pragma_removes_stale_tracking_refs() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let remote_dir = temp_dir.path().join("remote");
+    let source_db = temp_dir.path().join("source/app.db");
+    let clone_db = temp_dir.path().join("clone/app.db");
+    std::fs::create_dir_all(source_db.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(clone_db.parent().unwrap()).unwrap();
+
+    let mut source_runtime = GraftTestRuntime::with_memory_remote();
+    let source = source_runtime.open_sqlite(source_db.to_str().unwrap(), None);
+    let mut clone_runtime = GraftTestRuntime::with_memory_remote();
+    let clone = clone_runtime.open_sqlite(clone_db.to_str().unwrap(), None);
+
+    assert!(pragma_query_string(&source, "graft_init").contains(".graft"));
+    assert!(
+        pragma_arg_string(
+            &source,
+            "graft_remote_add",
+            format!("origin fs://{}", remote_dir.display()),
+        )
+        .contains("origin")
+    );
+
+    source
+        .execute_batch(
+            r#"
+            CREATE TABLE repo_prune (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+            INSERT INTO repo_prune (name) VALUES ('base');
+            "#,
+        )
+        .unwrap();
+    pragma_query_string(&source, "graft_add");
+    assert!(pragma_arg_string(&source, "graft_commit", "base").contains("base"));
+    assert!(
+        pragma_arg_string(&source, "graft_switch_create", "feature/prune")
+            .contains("feature/prune")
+    );
+    source
+        .execute("INSERT INTO repo_prune (name) VALUES ('feature')", [])
+        .unwrap();
+    pragma_query_string(&source, "graft_add");
+    assert!(pragma_arg_string(&source, "graft_commit", "feature").contains("feature"));
+    assert!(pragma_arg_string(&source, "graft_switch_branch", "main").contains("main"));
+    source
+        .execute("INSERT INTO repo_prune (name) VALUES ('main')", [])
+        .unwrap();
+    pragma_query_string(&source, "graft_add");
+    assert!(pragma_arg_string(&source, "graft_commit", "main").contains("main"));
+    assert!(pragma_arg_string(&source, "graft_push", "--all origin").contains("origin/main"));
+    let remote_refs = pragma_arg_string(&source, "graft_ls_remote", "origin");
+    assert!(remote_refs.contains("\tHEAD"));
+    assert!(remote_refs.contains("refs/heads/feature/prune"));
+    assert!(remote_refs.contains("refs/heads/main"));
+
+    assert!(pragma_query_string(&clone, "graft_init").contains(".graft"));
+    assert!(
+        pragma_arg_string(
+            &clone,
+            "graft_remote_add",
+            format!("origin fs://{}", remote_dir.display()),
+        )
+        .contains("origin")
+    );
+    assert!(
+        pragma_arg_string(&clone, "graft_fetch", "--all origin").contains("origin/feature/prune")
+    );
+
+    let clone_repo = graft::repo::Repository::discover_for_file(&clone_db).unwrap();
+    assert!(
+        clone_repo
+            .remote_tracking_ref("origin", "feature/prune")
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        clone_repo
+            .remote_tracking_ref("origin", "main")
+            .unwrap()
+            .is_some()
+    );
+
+    let deleted = pragma_arg_string(&source, "graft_push", "origin :feature/prune");
+    assert!(deleted.contains("Deleted origin/feature/prune"));
+    let remote_refs = pragma_arg_string(&source, "graft_ls_remote", "origin");
+    assert!(!remote_refs.contains("refs/heads/feature/prune"));
+    assert!(remote_refs.contains("refs/heads/main"));
+    assert!(
+        clone_repo
+            .remote_tracking_ref("origin", "feature/prune")
+            .unwrap()
+            .is_some()
+    );
+
+    let pruned = pragma_arg_string(&clone, "graft_remote_prune", "origin");
+    assert!(pruned.contains("Pruned origin"));
+    assert!(pruned.contains("origin/feature/prune"));
+    assert_eq!(
+        clone_repo
+            .remote_tracking_ref("origin", "feature/prune")
+            .unwrap(),
+        None
+    );
+    assert!(
+        clone_repo
+            .remote_tracking_ref("origin", "main")
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        pragma_arg_string(&clone, "graft_remote_prune", "origin")
+            .contains("no stale remote-tracking branches")
+    );
+
+    source_runtime.shutdown().unwrap();
+    clone_runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_force_push_pragma_overwrites_non_fast_forward_remote() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let remote_dir = temp_dir.path().join("remote");
+    let source_db = temp_dir.path().join("source/app.db");
+    let other_repo_dir = temp_dir.path().join("other");
+    std::fs::create_dir_all(source_db.parent().unwrap()).unwrap();
+
+    let mut source_runtime = GraftTestRuntime::with_memory_remote();
+    let source = source_runtime.open_sqlite(source_db.to_str().unwrap(), None);
+
+    assert!(pragma_query_string(&source, "graft_init").contains(".graft"));
+    assert!(
+        pragma_arg_string(
+            &source,
+            "graft_remote_add",
+            format!("origin fs://{}", remote_dir.display()),
+        )
+        .contains("origin")
+    );
+
+    source
+        .execute_batch(
+            r#"
+            CREATE TABLE repo_force_push (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+            INSERT INTO repo_force_push (name) VALUES ('base');
+            "#,
+        )
+        .unwrap();
+    pragma_query_string(&source, "graft_add");
+    assert!(pragma_arg_string(&source, "graft_commit", "base").contains("base"));
+    assert!(pragma_arg_string(&source, "graft_push", "origin main").contains("origin/main"));
+
+    let other = graft::repo::Repository::init(&other_repo_dir).unwrap();
+    other
+        .remote_add(
+            "origin",
+            graft::remote::RemoteConfig::Fs {
+                root: remote_dir.to_string_lossy().into_owned(),
+            },
+        )
+        .unwrap();
+    other.fetch("origin", "main").unwrap();
+    other
+        .reset("origin/main", graft::repo::ResetMode::Hard)
+        .unwrap();
+    let remote_tip = other.commit("remote rewrite").unwrap();
+    other.push("origin", "main").unwrap();
+
+    source
+        .execute("INSERT INTO repo_force_push (name) VALUES ('local')", [])
+        .unwrap();
+    pragma_query_string(&source, "graft_add");
+    assert!(pragma_arg_string(&source, "graft_commit", "local rewrite").contains("local rewrite"));
+
+    let rejected = pragma_arg_error(&source, "graft_push", "origin main");
+    assert!(rejected.contains("not an ancestor"));
+
+    let forced = pragma_arg_string(&source, "graft_push", "--force origin main");
+    assert!(forced.contains("Force-pushed origin/main"));
+
+    let source_repo = graft::repo::Repository::discover_for_file(&source_db).unwrap();
+    let local_tip = source_repo
+        .branch_target("main")
+        .unwrap()
+        .expect("main should point at forced commit");
+    assert_ne!(remote_tip.id, local_tip);
+    assert_eq!(
+        std::fs::read_to_string(remote_dir.join("refs/heads/main"))
+            .unwrap()
+            .trim(),
+        local_tip
+    );
+
+    source_runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_diff_matrix_on_physical_database_path() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+
+    let init = pragma_query_string(&sqlite, "graft_init");
+    assert!(init.contains(".graft"));
+
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE repo_diff (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+            INSERT INTO repo_diff (name) VALUES ('Alice');
+            "#,
+        )
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    let commit = pragma_arg_string(&sqlite, "graft_commit", "initial row");
+    assert!(commit.contains("initial row"));
+
+    sqlite
+        .execute("INSERT INTO repo_diff (name) VALUES ('Bob')", [])
+        .unwrap();
+
+    let worktree_diff = pragma_query_string(&sqlite, "graft_diff");
+    assert!(worktree_diff.contains("Diff index..worktree"));
+    assert!(worktree_diff.contains("modified: app.db"));
+
+    let rev_worktree_diff = pragma_arg_string(&sqlite, "graft_diff", "HEAD");
+    assert!(rev_worktree_diff.contains("Diff "));
+    assert!(rev_worktree_diff.contains("..worktree"));
+    assert!(rev_worktree_diff.contains("modified: app.db"));
+
+    let json_worktree_diff: Value =
+        serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_diff"))
+            .expect("graft_json_diff should return repo worktree diff JSON");
+    assert_eq!(json_worktree_diff["from"], "index");
+    assert_eq!(json_worktree_diff["to"], "worktree");
+    assert_eq!(json_worktree_diff["files"][0]["path"], "app.db");
+    assert_eq!(json_worktree_diff["files"][0]["change"], "modified");
+
+    pragma_query_string(&sqlite, "graft_add");
+
+    let unstaged_diff = pragma_query_string(&sqlite, "graft_diff");
+    assert!(unstaged_diff.contains("No changes."));
+
+    let staged_diff = pragma_arg_string(&sqlite, "graft_diff", "--staged");
+    assert!(staged_diff.contains("..index"));
+    assert!(staged_diff.contains("modified: app.db"));
+
+    let json_staged_diff: Value =
+        serde_json::from_str(&pragma_arg_string(&sqlite, "graft_json_diff", "--staged"))
+            .expect("graft_json_diff should return repo staged diff JSON");
+    assert_eq!(json_staged_diff["to"], "index");
+    assert_eq!(json_staged_diff["files"][0]["path"], "app.db");
+    assert_eq!(json_staged_diff["files"][0]["change"], "modified");
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_rm_stages_and_commits_deleted_database_path() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE repo_rm (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+            INSERT INTO repo_rm (name) VALUES ('Alice');
+            "#,
+        )
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "initial row").contains("initial row"));
+
+    let removed = pragma_query_string(&sqlite, "graft_rm");
+    assert!(removed.contains("Removed app.db"));
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["staged"][0], "app.db");
+
+    let diff = pragma_arg_string(&sqlite, "graft_diff", "--staged");
+    assert!(diff.contains("deleted: app.db"));
+
+    let commit = pragma_arg_string(&sqlite, "graft_commit", "remove database");
+    assert!(commit.contains("remove database"));
+    let repo = graft::repo::Repository::discover_for_file(&db_path).unwrap();
+    assert!(repo.head_file(&db_path).unwrap().is_none());
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_checkout_path_restores_database_and_stages_it() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+
+    let init = pragma_query_string(&sqlite, "graft_init");
+    assert!(init.contains(".graft"));
+
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE repo_checkout (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+            INSERT INTO repo_checkout (name) VALUES ('Alice');
+            "#,
+        )
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    let commit = pragma_arg_string(&sqlite, "graft_commit", "initial row");
+    assert!(commit.contains("initial row"));
+
+    sqlite
+        .execute("INSERT INTO repo_checkout (name) VALUES ('Bob')", [])
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    let commit = pragma_arg_string(&sqlite, "graft_commit", "feature row");
+    assert!(commit.contains("feature row"));
+
+    let checkout = pragma_arg_string(&sqlite, "graft_checkout", "HEAD~1 -- app.db");
+    assert!(checkout.contains("Checked out app.db from"));
+
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["head"]["type"], "branch");
+    assert_eq!(status["head"]["name"], "main");
+    assert_eq!(status["dirty"], false);
+    assert_eq!(status["staged"][0], "app.db");
+
+    let count: i64 = sqlite
+        .query_row("SELECT COUNT(*) FROM repo_checkout", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 1);
+
+    let staged_diff = pragma_arg_string(&sqlite, "graft_diff", "--staged");
+    assert!(staged_diff.contains("modified: app.db"));
+
+    let restored = pragma_arg_string(&sqlite, "graft_restore", "--staged --source HEAD app.db");
+    assert_eq!(restored, "Restored app.db");
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["dirty"], true);
+    assert_eq!(status["unstaged"][0], "app.db");
+    assert_eq!(status["staged"].as_array().unwrap().len(), 0);
+    let count: i64 = sqlite
+        .query_row("SELECT COUNT(*) FROM repo_checkout", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 1);
+
+    let restored = pragma_arg_string(&sqlite, "graft_restore", "app.db");
+    assert_eq!(restored, "Restored app.db");
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["dirty"], false);
+    assert_eq!(status["staged"].as_array().unwrap().len(), 0);
+    let count: i64 = sqlite
+        .query_row("SELECT COUNT(*) FROM repo_checkout", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 2);
+
+    let checkout = pragma_arg_string(&sqlite, "graft_checkout", "HEAD~1 -- app.db");
+    assert!(checkout.contains("Checked out app.db from"));
+
+    let restored = pragma_arg_string(&sqlite, "graft_restore", "--staged app.db");
+    assert_eq!(restored, "Restored app.db");
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["dirty"], true);
+    assert_eq!(status["unstaged"][0], "app.db");
+    assert_eq!(status["staged"].as_array().unwrap().len(), 0);
+
+    let restored = pragma_arg_string(&sqlite, "graft_restore", "app.db");
+    assert_eq!(restored, "Restored app.db");
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["dirty"], false);
+    assert_eq!(status["staged"].as_array().unwrap().len(), 0);
+    let count: i64 = sqlite
+        .query_row("SELECT COUNT(*) FROM repo_checkout", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 2);
+
+    let checkout = pragma_arg_string(&sqlite, "graft_checkout", "HEAD~1 -- app.db");
+    assert!(checkout.contains("Checked out app.db from"));
+
+    let commit = pragma_arg_string(&sqlite, "graft_commit", "restore initial row");
+    assert!(commit.contains("restore initial row"));
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["staged"].as_array().unwrap().len(), 0);
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_merge_conflict_records_index_stages() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+
+    let init = pragma_query_string(&sqlite, "graft_init");
+    assert!(init.contains(".graft"));
+
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE repo_merge (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+            INSERT INTO repo_merge (name) VALUES ('Alice');
+            "#,
+        )
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    let commit = pragma_arg_string(&sqlite, "graft_commit", "base row");
+    assert!(commit.contains("base row"));
+
+    let branch = pragma_arg_string(&sqlite, "graft_branch_create", "feature/search");
+    assert!(branch.contains("feature/search"));
+    let switched = pragma_arg_string(&sqlite, "graft_switch_branch", "feature/search");
+    assert!(switched.contains("feature/search"));
+    sqlite
+        .execute("INSERT INTO repo_merge (name) VALUES ('Bob')", [])
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    let commit = pragma_arg_string(&sqlite, "graft_commit", "feature row");
+    assert!(commit.contains("feature row"));
+
+    let switched = pragma_arg_string(&sqlite, "graft_switch_branch", "main");
+    assert!(switched.contains("main"));
+    sqlite
+        .execute("INSERT INTO repo_merge (name) VALUES ('Carol')", [])
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    let commit = pragma_arg_string(&sqlite, "graft_commit", "main row");
+    assert!(commit.contains("main row"));
+
+    let merge = pragma_arg_string(&sqlite, "graft_merge", "feature/search");
+    assert!(merge.contains("Unmerged paths:"));
+    assert!(merge.contains("app.db"));
+
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["conflicted"][0], "app.db");
+
+    let mut output = None;
+    let result = sqlite.pragma(None, "graft_commit", "merge feature", |row| {
+        output = Some(row.get::<_, String>(0)?);
+        Ok(())
+    });
+    assert!(
+        result.is_err(),
+        "commit should fail with unresolved conflicts"
+    );
+    assert!(output.is_none());
+
+    let abort = pragma_query_string(&sqlite, "graft_merge_abort");
+    assert!(abort.contains("Aborted merge"));
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["conflicted"].as_array().unwrap().len(), 0);
+    assert_eq!(status["staged"].as_array().unwrap().len(), 0);
+    let count: i64 = sqlite
+        .query_row("SELECT COUNT(*) FROM repo_merge", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 2);
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_merge_continue_creates_merge_commit_after_resolution() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE repo_merge_continue (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+            INSERT INTO repo_merge_continue (name) VALUES ('Alice');
+            "#,
+        )
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "base row").contains("base row"));
+
+    assert!(
+        pragma_arg_string(&sqlite, "graft_branch_create", "feature/continue")
+            .contains("feature/continue")
+    );
+    assert!(
+        pragma_arg_string(&sqlite, "graft_switch_branch", "feature/continue")
+            .contains("feature/continue")
+    );
+    sqlite
+        .execute("INSERT INTO repo_merge_continue (name) VALUES ('Bob')", [])
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "feature row").contains("feature row"));
+
+    assert!(pragma_arg_string(&sqlite, "graft_switch_branch", "main").contains("main"));
+    sqlite
+        .execute(
+            "INSERT INTO repo_merge_continue (name) VALUES ('Carol')",
+            [],
+        )
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "main row").contains("main row"));
+
+    let merge = pragma_arg_string(&sqlite, "graft_merge", "feature/continue");
+    assert!(merge.contains("Unmerged paths:"));
+
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert!(status["merge_head"].as_str().is_some());
+    assert_eq!(status["conflicted"][0], "app.db");
+
+    let conflicts = pragma_query_string(&sqlite, "graft_conflicts");
+    assert!(conflicts.contains("Unmerged paths:"));
+    assert!(conflicts.contains("app.db"));
+
+    let resolved = pragma_arg_string(&sqlite, "graft_resolve", "--theirs");
+    assert!(resolved.contains("Resolved app.db using theirs"));
+    let continued = pragma_arg_string(&sqlite, "graft_merge_continue", "merge feature");
+    assert!(continued.contains("Merge commit"));
+    assert!(continued.contains("merge feature"));
+
+    let show: Value = serde_json::from_str(&pragma_arg_string(&sqlite, "graft_json_show", "HEAD"))
+        .expect("graft_json_show should return repo commit JSON");
+    assert_eq!(show["message"], "merge feature");
+    assert_eq!(show["parents"].as_array().unwrap().len(), 2);
+
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["merge_head"], Value::Null);
+    assert_eq!(status["conflicted"].as_array().unwrap().len(), 0);
+    assert_eq!(status["staged"].as_array().unwrap().len(), 0);
+
+    let names: Vec<String> = {
+        let mut stmt = sqlite
+            .prepare("SELECT name FROM repo_merge_continue ORDER BY id")
+            .unwrap();
+        stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    assert_eq!(names, vec!["Alice".to_string(), "Bob".to_string()]);
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_resolve_materializes_physical_sqlite_conflict_side() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE base_app (id INTEGER PRIMARY KEY);
+            INSERT INTO base_app DEFAULT VALUES;
+            "#,
+        )
+        .unwrap();
+    let external_db = temp_dir.path().join("external.db");
+    {
+        let external = Connection::open(&external_db).unwrap();
+        external
+            .execute_batch(
+                r#"
+                PRAGMA page_size=4096;
+                CREATE TABLE external_data (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+                INSERT INTO external_data (name) VALUES ('base');
+                "#,
+            )
+            .unwrap();
+    }
+    assert_eq!(pragma_query_string(&sqlite, "graft_add"), "Added app.db");
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_add", "external.db"),
+        "Added external.db"
+    );
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "base").contains("base"));
+
+    assert!(
+        pragma_arg_string(&sqlite, "graft_switch_create", "feature/external")
+            .contains("feature/external")
+    );
+    {
+        let external = Connection::open(&external_db).unwrap();
+        external
+            .execute("UPDATE external_data SET name = 'theirs' WHERE id = 1", [])
+            .unwrap();
+    }
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_add", "external.db"),
+        "Added external.db"
+    );
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "theirs external").contains("theirs"));
+
+    assert!(pragma_arg_string(&sqlite, "graft_switch_branch", "main").contains("main"));
+    assert_eq!(external_value(&external_db), "base");
+    {
+        let external = Connection::open(&external_db).unwrap();
+        external
+            .execute("UPDATE external_data SET name = 'ours' WHERE id = 1", [])
+            .unwrap();
+    }
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_add", "external.db"),
+        "Added external.db"
+    );
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "ours external").contains("ours"));
+
+    let merge = pragma_arg_string(&sqlite, "graft_merge", "feature/external");
+    assert!(merge.contains("Unmerged paths:"));
+    assert!(merge.contains("external.db"));
+    assert_eq!(external_value(&external_db), "ours");
+
+    let conflicts = pragma_query_string(&sqlite, "graft_conflicts");
+    assert!(conflicts.contains("external.db"));
+    assert!(conflicts.contains("--theirs [path]"));
+
+    let resolved = pragma_arg_string(&sqlite, "graft_resolve", "--theirs external.db");
+    assert_eq!(resolved, "Resolved external.db using theirs");
+    assert_eq!(external_value(&external_db), "theirs");
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["conflicted"].as_array().unwrap().len(), 0);
+    assert_eq!(status["staged"][0], "external.db");
+
+    let continued = pragma_arg_string(&sqlite, "graft_merge_continue", "merge external");
+    assert!(continued.contains("Merge commit"));
+    assert_eq!(external_value(&external_db), "theirs");
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["merge_head"], Value::Null);
+    assert_eq!(status["staged"].as_array().unwrap().len(), 0);
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_merge_reports_row_level_analysis_for_disjoint_rows() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE repo_row_merge (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+            INSERT INTO repo_row_merge (id, name) VALUES (1, 'Alice');
+            "#,
+        )
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "base row").contains("base row"));
+
+    assert!(pragma_arg_string(&sqlite, "graft_branch_create", "feature/rows").contains("feature"));
+    assert!(pragma_arg_string(&sqlite, "graft_switch_branch", "feature/rows").contains("feature"));
+    sqlite
+        .execute("UPDATE repo_row_merge SET name = 'Alicia' WHERE id = 1", [])
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "feature update").contains("feature"));
+
+    assert!(pragma_arg_string(&sqlite, "graft_switch_branch", "main").contains("main"));
+    sqlite
+        .execute(
+            "INSERT INTO repo_row_merge (id, name) VALUES (2, 'Bob')",
+            [],
+        )
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "main insert").contains("main"));
+
+    let merge = pragma_arg_string(&sqlite, "graft_merge", "feature/rows");
+
+    assert!(merge.contains("Unmerged paths:"));
+    assert!(merge.contains("Row-level analysis for app.db:"));
+    assert!(merge.contains("ours: 1 row change(s)"));
+    assert!(merge.contains("theirs: 1 row change(s)"));
+    assert!(merge.contains("No row conflicts detected"));
+
+    let abort = pragma_query_string(&sqlite, "graft_merge_abort");
+    assert!(abort.contains("Aborted merge"));
+
     runtime.shutdown().unwrap();
 }
 
@@ -157,40 +3288,15 @@ fn test_json_row_diff_handles_overflow_pages() {
         .execute("UPDATE docs SET body = ?1 WHERE id = 1", [&new_body])
         .unwrap();
 
-    let log: Vec<Value> = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_log"))
-        .expect("graft_json_log should return valid JSON");
-    let mut lsns: Vec<u64> = log
-        .iter()
-        .map(|commit| commit["lsn"].as_u64().expect("commit has an LSN"))
-        .collect();
-    lsns.sort_unstable();
-    assert!(
-        lsns.len() >= 2,
-        "expected at least insert and update commits"
-    );
-    let from_lsn = lsns[lsns.len() - 2];
-    let to_lsn = lsns[lsns.len() - 1];
-
-    let show: Value = serde_json::from_str(&pragma_arg_string(
-        &sqlite,
-        "graft_json_show",
-        to_lsn.to_string(),
-    ))
-    .expect("graft_json_show should return valid JSON");
-    let docs_table = show["tables"]
-        .as_array()
-        .expect("show tables should be an array")
-        .iter()
-        .find(|table| table["name"] == "docs")
-        .expect("docs table should be present in show output");
-    assert_eq!(docs_table["rows"].as_u64(), Some(1));
+    let from_lsn = 2;
+    let to_lsn = 3;
 
     let diff: Value = serde_json::from_str(&pragma_arg_string(
         &sqlite,
-        "graft_json_diff",
+        "graft_debug_volume_json_diff",
         format!("{from_lsn},{to_lsn},rows"),
     ))
-    .expect("graft_json_diff should return valid JSON");
+    .expect("graft_debug_volume_json_diff should return valid JSON");
     let docs_diff = diff["tables"]
         .as_array()
         .expect("diff tables should be an array")
@@ -210,9 +3316,9 @@ fn test_json_row_diff_handles_overflow_pages() {
     runtime.shutdown().unwrap();
 }
 
-/// Test that VACUUM INTO can be used to import a non-graft SQLite database into Graft.
+/// Test that VACUUM INTO can be used to import a non-graft `SQLite` database into Graft.
 /// This is the recommended way to import existing databases as documented at:
-/// https://graft.rs/r/graft_import
+/// <https://graft.rs/r/graft_import>
 #[test]
 fn test_vacuum_into_import() {
     graft_test::ensure_test_env();
@@ -307,7 +3413,7 @@ fn test_sqlite_query_only_fetches_needed_pages() {
 
     // create a reader
     let mut reader = writer.spawn_peer();
-    let reader_sql = reader.open_sqlite("main", Some(log.clone()));
+    let reader_sql = reader.open_sqlite("main", Some(log));
     let reader_vid = reader.tag_get("main").unwrap().unwrap();
 
     // create a table and then insert 10 rows, which each consume just over a page. then push each segment to the remote
@@ -317,7 +3423,7 @@ fn test_sqlite_query_only_fetches_needed_pages() {
         writer_sql
             .execute("insert into t values (printf('%0*d', 4096, 0))", [])
             .unwrap();
-        writer_sql.graft_pragma("push").unwrap();
+        writer_sql.graft_pragma("debug_volume_push").unwrap();
     }
 
     let snapshot = writer.volume_snapshot(&writer_vid).unwrap();
@@ -327,7 +3433,7 @@ fn test_sqlite_query_only_fetches_needed_pages() {
     );
 
     // pull changes into the reader
-    reader_sql.graft_pragma("pull").unwrap();
+    reader_sql.graft_pragma("debug_volume_pull").unwrap();
 
     // all pages missing
     let snapshot = reader.volume_snapshot(&reader_vid).unwrap();
@@ -383,6 +3489,18 @@ fn pragma_query_string(conn: &Connection, name: &str) -> String {
     output.unwrap()
 }
 
+fn pragma_query_error(conn: &Connection, name: &str) -> String {
+    let mut output = None;
+    let err = conn
+        .pragma_query(None, name, |row| {
+            output = Some(row.get::<_, String>(0)?);
+            Ok(())
+        })
+        .expect_err("pragma should fail");
+    assert!(output.is_none());
+    err.to_string()
+}
+
 fn pragma_arg_string<T: ToSql>(conn: &Connection, name: &str, arg: T) -> String {
     let mut output = None;
     conn.pragma(None, name, arg, |row| {
@@ -393,13 +3511,119 @@ fn pragma_arg_string<T: ToSql>(conn: &Connection, name: &str, arg: T) -> String 
     output.unwrap()
 }
 
-fn row_values_contain(values: &Value, expected: &str) -> bool {
-    values
-        .as_array()
-        .map(|values| {
-            values
-                .iter()
-                .any(|value| value.as_str().is_some_and(|value| value == expected))
+fn pragma_arg_error<T: ToSql>(conn: &Connection, name: &str, arg: T) -> String {
+    let mut output = None;
+    let err = conn
+        .pragma(None, name, arg, |row| {
+            output = Some(row.get::<_, String>(0)?);
+            Ok(())
         })
-        .unwrap_or(false)
+        .expect_err("pragma should fail");
+    assert!(output.is_none());
+    err.to_string()
+}
+
+fn external_value(path: &std::path::Path) -> String {
+    let conn = Connection::open(path).unwrap();
+    conn.query_row("SELECT name FROM external_data WHERE id = 1", [], |row| {
+        row.get(0)
+    })
+    .unwrap()
+}
+
+fn tamper_sqlite_snapshot_range_hash(
+    repo: &graft::repo::Repository,
+    commit_id: &str,
+    path: &str,
+) -> String {
+    rewrite_sqlite_snapshot_range_hash(
+        repo,
+        commit_id,
+        path,
+        Some(graft::core::commit_hash::CommitHash::ZERO),
+    )
+}
+
+fn remove_sqlite_snapshot_range_hash(
+    repo: &graft::repo::Repository,
+    commit_id: &str,
+    path: &str,
+) -> String {
+    rewrite_sqlite_snapshot_range_hash(repo, commit_id, path, None)
+}
+
+fn rewrite_sqlite_snapshot_range_hash(
+    repo: &graft::repo::Repository,
+    commit_id: &str,
+    path: &str,
+    commit_hash: Option<graft::core::commit_hash::CommitHash>,
+) -> String {
+    use graft::repo::object::{BlobObject, Object, TreeObject};
+
+    let Object::Commit(mut commit) = repo.read_object(commit_id).unwrap() else {
+        panic!("HEAD should point at a commit object");
+    };
+    let Object::Tree(tree) = repo.read_object(commit.tree.as_str()).unwrap() else {
+        panic!("commit should point at a tree object");
+    };
+    let mut entries = tree.entries;
+    let entry = entries
+        .iter_mut()
+        .find(|entry| entry.path == path)
+        .expect("tree should contain sqlite database path");
+    let Object::Blob(BlobObject::SqliteSnapshot(mut blob)) =
+        repo.read_object(entry.oid.as_str()).unwrap()
+    else {
+        panic!("tree entry should point at a sqlite snapshot blob");
+    };
+    assert!(
+        !blob.ranges[0].commits.is_empty(),
+        "snapshot range should contain storage commit hashes"
+    );
+    assert_ne!(
+        blob.ranges[0].commits[0].commit_hash,
+        graft::core::commit_hash::CommitHash::ZERO
+    );
+    let missing_commit_hash = commit_hash.is_none();
+    match commit_hash {
+        Some(commit_hash) => blob.ranges[0].commits[0].commit_hash = commit_hash,
+        None => {
+            blob.ranges[0].commits.remove(0);
+        }
+    }
+
+    let object_store = repo.object_store();
+    let blob_object = Object::Blob(BlobObject::SqliteSnapshot(blob));
+    entry.oid = if missing_commit_hash {
+        write_raw_test_object_unchecked(&object_store, &blob_object)
+    } else {
+        object_store.write(&blob_object).unwrap()
+    };
+    commit.tree = object_store
+        .write(&Object::Tree(TreeObject::new(entries).unwrap()))
+        .unwrap();
+    object_store
+        .write(&Object::Commit(commit))
+        .unwrap()
+        .to_string()
+}
+
+fn write_raw_test_object_unchecked(
+    object_store: &graft::repo::object::LooseObjectStore,
+    object: &graft::repo::object::Object,
+) -> graft::repo::object::ObjectId {
+    let bytes = object.canonical_bytes();
+    let oid = graft::repo::object::ObjectId::for_bytes(&bytes);
+    let path = object_store.path_for(&oid);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, bytes).unwrap();
+    oid
+}
+
+fn row_values_contain(values: &Value, expected: &str) -> bool {
+    values.as_array().is_some_and(|values| {
+        values
+            .iter()
+            .any(|value| value.as_str().is_some_and(|value| value == expected))
+    })
 }

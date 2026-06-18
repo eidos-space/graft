@@ -87,7 +87,7 @@ pub struct JsonShowResult {
     pub tables: Vec<JsonTableEntry>,
 }
 
-/// Volume info (for `graft_json_info`)
+/// Debug Volume info (for `graft_debug_volume_json_info`)
 #[derive(Debug, Clone, Serialize)]
 pub struct JsonVolumeInfo {
     pub vid: String,
@@ -98,7 +98,7 @@ pub struct JsonVolumeInfo {
     pub snapshot_pages: u32,
 }
 
-/// Table log entry (for `graft_json_table_log`)
+/// Debug table log entry (for `graft_debug_volume_json_table_log`)
 #[derive(Debug, Clone, Serialize)]
 pub struct JsonTableLogEntry {
     pub lsn: u64,

@@ -137,7 +137,8 @@ pub fn bank_tx<R: Rng>(env: &mut Env<R>) -> Result<(), WorkloadErr> {
         let tx = sqlite.transaction()?;
 
         // get the transaction snapshot
-        let tx_snapshot: String = tx.query_row("pragma graft_snapshot", [], |row| row.get(0))?;
+        let tx_snapshot: String =
+            tx.query_row("pragma graft_debug_volume_snapshot", [], |row| row.get(0))?;
 
         // check both account balances
         let balance_a: i64 =

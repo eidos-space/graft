@@ -163,6 +163,7 @@ fn main_inner() -> Result<(), TestErr> {
         RemoteType::S3Compatible => RemoteConfig::S3Compatible {
             bucket: "primary".to_string(),
             prefix: None,
+            endpoint: None,
         },
     };
 

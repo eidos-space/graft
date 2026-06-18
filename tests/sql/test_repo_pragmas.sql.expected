@@ -1,0 +1,27 @@
+.echo off
+
+SELECT COUNT(*) AS main_count FROM accounts;
++------------+
+| main_count |
++------------+
+| 2          |
++------------+
+
+.echo off
+
+SELECT COUNT(*) AS feature_count FROM accounts;
++---------------+
+| feature_count |
++---------------+
+| 3             |
++---------------+
+SELECT name FROM accounts ORDER BY id;
++-------+
+| name  |
++-------+
+| Alice |
+| Bob   |
+| Carol |
++-------+
+
+SQLite Exit Code = 0

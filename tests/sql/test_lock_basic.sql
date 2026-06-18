@@ -1,15 +1,13 @@
--- initialize two connections to the same database
+-- initialize two connections to the same repository database
 .connection 0
-.open "file:main?vfs=graft"
-pragma graft_switch="5rMJkf2zHE-2xMqqKcN8RLZh:74ggc1B6R4-2kkvcy9fi4CHJ:74ggc1B6jg-2udz14pbDayZC";
-pragma graft_status;
+.open "file:app.db?vfs=graft"
+.output /dev/null
+pragma graft_init;
+.read datasets/simple.sql
+.output stdout
 
 .connection 1
-.open "file:main?vfs=graft"
-pragma graft_status;
-
--- load the sample dataset
-.read datasets/simple.sql
+.open "file:app.db?vfs=graft"
 
 -- scenario: lock a table in one connection, then try to lock it in the other
 .connection 0
@@ -75,7 +73,10 @@ commit;
 -- verify that we now see the new row
 select * from t;
 
--- check metadata
+-- check repository metadata commands without asserting dynamic output
+.output /dev/null
 pragma graft_status;
-.connection 0
-pragma graft_status;
+pragma graft_add;
+pragma graft_commit = 'lock smoke final state';
+pragma graft_log;
+.output stdout

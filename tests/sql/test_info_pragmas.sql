@@ -1,53 +1,41 @@
--- initialize two connections to the same database
+-- exercise repository metadata pragmas through the SQLite extension
 .connection 0
-.open "file:main?vfs=graft"
-pragma graft_switch="5rMJkf2zHE-2xMqqKcN8RLZh:74ggc1B6R4-2kkvcy9fi4CHJ:74ggc1B6jg-2udz14pbDayZC";
+.open "file:app.db?vfs=graft"
+.output /dev/null
+pragma graft_init;
 pragma graft_status;
-pragma graft_info;
+pragma graft_json_status;
+pragma graft_branch;
+pragma graft_tags;
+pragma graft_remotes;
 
-.connection 1
-.open "file:main?vfs=graft"
-pragma graft_status;
-pragma graft_info;
-
--- initialize the db on connection 0
-.connection 0
-.echo off
 .read datasets/bank.sql
+pragma graft_status;
+pragma graft_add;
+pragma graft_commit = 'import bank dataset';
+pragma graft_log;
+pragma graft_json_log;
+pragma graft_show = 'HEAD';
+pragma graft_json_show = 'HEAD';
+
+INSERT INTO ledger (account_id, amount) VALUES (1, -10), (2, 10);
+pragma graft_status;
+pragma graft_diff = 'HEAD';
+pragma graft_json_diff = 'HEAD';
+pragma graft_add;
+pragma graft_commit = 'transfer between accounts';
+pragma graft_log;
+
+.output stdout
 .echo on
 
--- check pragmas
+SELECT COUNT(*) AS account_count FROM accounts;
+SELECT COUNT(*) AS ledger_count FROM ledger;
+
+.echo off
+.output /dev/null
+pragma graft_branch_create = 'reports';
+pragma graft_switch_branch = 'reports';
 pragma graft_status;
-pragma graft_snapshot;
-pragma graft_audit;
-pragma graft_info;
-
--- check pragmas on connection 1
-.connection 1
-pragma graft_status;
-pragma graft_snapshot;
-pragma graft_audit;
-pragma graft_info;
-
--- open a snapshot on connection 1
-begin;
-select count(*) from ledger;
-pragma graft_snapshot;
-
--- switch to connection 0, write something, check snapshot, switch back
-.connection 0
-INSERT INTO ledger (account_id, amount) VALUES (1, -10), (2, 10);
-pragma graft_snapshot;
-.connection 1
-
--- check that connection 1 pragmas can't see the new snapshot
-pragma graft_snapshot;
-pragma graft_audit;
-pragma graft_info;
-
--- close the snapshot and check that we can see the latest snapshot
-commit;
-
-pragma graft_snapshot;
-pragma graft_audit;
-pragma graft_info;
+pragma graft_switch_branch = 'main';
+pragma graft_branch;

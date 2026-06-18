@@ -1,16 +1,30 @@
 use std::{
+    collections::BTreeMap,
     fmt::{Display, Write},
     fs::File,
-    io::Write as IoWrite,
-    path::PathBuf,
+    io::{Read, Write as IoWrite},
+    path::{Path, PathBuf},
     str::FromStr,
+    sync::Arc,
 };
 
 use graft::core::{
-    LogId, PageIdx, VolumeId, commit::Commit, logref::LogRef, lsn::{LSN, LSNRangeExt},
-    page::PAGESIZE,
+    LogId, PageIdx, VolumeId,
+    logref::LogRef,
+    lsn::{LSN, LSNRangeExt},
+    page::{PAGESIZE, Page},
 };
-use graft::{rt::runtime::Runtime, volume::AheadStatus, volume_reader::VolumeRead};
+use graft::remote::{Remote, RemoteConfig};
+use graft::repo::{
+    BranchInfo, BranchUpstream, CheckoutPlan, CommitFileState, CommitTableSummary, FetchAllOutcome,
+    Head, MergeOutcome, MergePlan, PullOutcome, PushAllOutcome, RemoteBranchRef, RemoteInfo,
+    RemotePruneOutcome, RepoDiff, RepoFileChange, RepoLogRange, RepoSnapshot, RepoStatus,
+    RepoStorageCommit, RepoWorktreeChangeKind, Repository, ResetMode, TagInfo,
+};
+use graft::{
+    rt::runtime::Runtime, volume::AheadStatus, volume_reader::VolumeRead,
+    volume_writer::VolumeWrite,
+};
 use indoc::{formatdoc, indoc, writedoc};
 use sqlite_plugin::{
     vars::SQLITE_ERROR,
@@ -19,7 +33,13 @@ use sqlite_plugin::{
 use tryiter::TryIteratorExt;
 use zerocopy::FromBytes;
 
-use crate::{dbg::SqliteHeader, file::vol_file::VolFile, vfs::ErrCtx};
+use crate::{
+    dbg::SqliteHeader,
+    file::vol_file::VolFile,
+    vfs::{ErrCtx, should_discover_repo},
+};
+
+const SQLITE_DATABASE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
 
 /// Helper to create pragma errors concisely
 fn pragma_fail(msg: impl Display) -> PragmaErr {
@@ -63,118 +83,371 @@ pub enum DiffMode {
     Rows,
 }
 
-pub enum GraftPragma {
-    /// `pragma graft_volumes;`
-    Volumes,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RepoDiffSpec {
+    Worktree {
+        path: Option<String>,
+    },
+    Staged {
+        path: Option<String>,
+    },
+    RevisionToWorktree {
+        rev: String,
+        path: Option<String>,
+    },
+    Revisions {
+        from: String,
+        to: String,
+        path: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RepoCheckoutSpec {
+    Detach { rev: String, force: bool },
+    Path { rev: String, path: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RepoRestoreSpec {
+    source: Option<String>,
+    staged: bool,
+    path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RepoExportSpec {
+    source: Option<String>,
+    path: Option<PathBuf>,
+    output: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RepoCloneSpec {
+    config: RemoteConfig,
+    branch: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResolveSide {
+    Ours,
+    Theirs,
+}
+
+impl ResolveSide {
+    fn index_stage(self) -> graft::repo::index::IndexStage {
+        match self {
+            Self::Ours => graft::repo::index::IndexStage::Ours,
+            Self::Theirs => graft::repo::index::IndexStage::Theirs,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ours => "ours",
+            Self::Theirs => "theirs",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RepoResolveSpec {
+    side: ResolveSide,
+    path: Option<PathBuf>,
+}
+
+pub(crate) enum GraftPragma {
+    /// `pragma graft_debug_volume_list;`
+    VolumeList,
 
     /// `pragma graft_tags;`
     Tags,
 
-    /// `pragma graft_switch = "local_vid[:local[:remote]]";`
-    Switch {
+    /// `pragma graft_debug_volume_tags;`
+    VolumeTags,
+
+    /// `pragma graft_debug_volume_switch = "local_vid[:local[:remote]]";`
+    VolumeSwitch {
         vid: VolumeId,
         local: Option<LogId>,
         remote: Option<LogId>,
     },
 
-    /// `pragma graft_clone [= "remote"];`
-    Clone { remote: Option<LogId> },
+    /// `pragma graft_debug_volume_clone [= "remote"];`
+    VolumeClone { remote: Option<LogId> },
 
-    /// `pragma graft_fork;`
-    Fork,
+    /// `pragma graft_debug_volume_fork;`
+    VolumeFork,
 
-    /// `pragma graft_checkout = "remote:LSN";`
-    Checkout { logref: LogRef },
+    /// `pragma graft_checkout = "[--force] rev [-- path]";`
+    RepoCheckout { spec: RepoCheckoutSpec },
 
-    /// `pragma graft_info;`
-    Info,
+    /// `pragma graft_restore = "[--source rev] path";`
+    Restore { spec: RepoRestoreSpec },
+
+    /// `pragma graft_export = "[--source rev] --output output.db [-- path]";`
+    Export { spec: RepoExportSpec },
+
+    /// `pragma graft_debug_volume_info;`
+    VolumeInfo,
 
     /// `pragma graft_status;`
     Status,
 
-    /// `pragma graft_snapshot;`
-    Snapshot,
+    /// `pragma graft_debug_volume_status;`
+    VolumeStatus,
+
+    /// `pragma graft_init;`
+    RepoInit,
+
+    /// `pragma graft_clone = "remote-uri [branch]";`
+    RepoClone { spec: RepoCloneSpec },
+
+    /// `pragma graft_json_status;`
+    JsonStatus,
+
+    /// `pragma graft_add;`
+    Add { path: Option<PathBuf> },
+
+    /// `pragma graft_rm;`
+    Remove { path: Option<PathBuf> },
+
+    /// `pragma graft_commit = "message";`
+    Commit { message: String },
+
+    /// `pragma graft_branch [= "-r|--remote|-a|--all"];`
+    Branch { mode: BranchListMode },
+
+    /// `pragma graft_branch_create = "name [start-point]";`
+    BranchCreate {
+        name: String,
+        start_point: Option<String>,
+    },
+
+    /// `pragma graft_branch_delete = "[--force] name";`
+    BranchDelete { name: String, force: bool },
+
+    /// `pragma graft_branch_rename = "[--force] [old] new";`
+    BranchRename {
+        old: Option<String>,
+        new: String,
+        force: bool,
+    },
+
+    /// `pragma graft_branch_upstream = "[branch] remote/branch";`
+    BranchUpstream {
+        branch: Option<String>,
+        remote: String,
+        remote_branch: String,
+    },
+
+    /// `pragma graft_branch_unset_upstream [= "branch"];`
+    BranchUnsetUpstream { branch: Option<String> },
+
+    /// `pragma graft_tag_create = "name [rev]";`
+    /// `pragma graft_tag_create = "--annotated name [rev] -- message";`
+    TagCreate {
+        name: String,
+        target: Option<String>,
+        message: Option<String>,
+    },
+
+    /// `pragma graft_tag_delete = "name";`
+    TagDelete { name: String },
+
+    /// `pragma graft_switch_branch = "[--force] name";`
+    SwitchBranch { name: String, force: bool },
+
+    /// `pragma graft_switch_create = "[--force] name [start-point]";`
+    SwitchCreate {
+        name: String,
+        start_point: Option<String>,
+        force: bool,
+    },
+
+    /// `pragma graft_merge = "rev";`
+    Merge { rev: String },
+
+    /// `pragma graft_merge_abort;`
+    MergeAbort,
+
+    /// `pragma graft_merge_continue = "message";`
+    MergeContinue { message: String },
+
+    /// `pragma graft_conflicts;`
+    Conflicts,
+
+    /// `pragma graft_resolve = "--ours|--theirs [path]";`
+    Resolve { spec: RepoResolveSpec },
+
+    /// `pragma graft_remote_add = "name remote-uri";`
+    RemoteAdd { name: String, config: RemoteConfig },
+
+    /// `pragma graft_remote_remove = "name";`
+    RemoteRemove { name: String },
+
+    /// `pragma graft_remote_rename = "old new";`
+    RemoteRename { old: String, new: String },
+
+    /// `pragma graft_remote_get_url = "name";`
+    RemoteGetUrl { name: String },
+
+    /// `pragma graft_remote_set_url = "name remote-uri";`
+    RemoteSetUrl { name: String, config: RemoteConfig },
+
+    /// `pragma graft_remote_prune = "name";`
+    RemotePrune { name: String },
+
+    /// `pragma graft_ls_remote = "name";`
+    LsRemote { name: String },
+
+    /// `pragma graft_remotes;`
+    Remotes,
+
+    /// `pragma graft_debug_volume_snapshot;`
+    VolumeSnapshot,
 
     /// `pragma graft_fetch;`
-    Fetch,
+    Fetch {
+        remote: Option<String>,
+        branch: Option<String>,
+        refspec: Option<String>,
+        all: bool,
+    },
 
     /// `pragma graft_pull;`
-    Pull,
+    Pull {
+        remote: Option<String>,
+        branch: Option<String>,
+        refspec: Option<String>,
+        all: bool,
+    },
 
     /// `pragma graft_push;`
-    Push,
+    Push {
+        remote: Option<String>,
+        branch: Option<String>,
+        refspec: Option<String>,
+        all: bool,
+        force: bool,
+    },
 
-    /// `pragma graft_audit;`
-    Audit,
+    /// `pragma graft_debug_volume_fetch;`
+    VolumeFetch,
 
-    /// `pragma graft_hydrate;`
-    Hydrate,
+    /// `pragma graft_debug_volume_pull;`
+    VolumePull,
+
+    /// `pragma graft_debug_volume_push;`
+    VolumePush,
+
+    /// `pragma graft_debug_volume_audit;`
+    VolumeAudit,
+
+    /// `pragma graft_debug_volume_hydrate;`
+    VolumeHydrate,
 
     /// `pragma graft_version;`
     Version,
 
-    /// `pragma graft_import = "PATH";`
-    Import(PathBuf),
+    /// `pragma graft_debug_volume_import = "PATH";`
+    VolumeImport,
 
-    /// `pragma graft_export = "PATH";`
-    Export(PathBuf),
+    /// `pragma graft_debug_volume_export = "PATH";`
+    VolumeExport(PathBuf),
 
-    /// `pragma graft_dump_header;`
-    DumpSqliteHeader,
+    /// `pragma graft_debug_volume_dump_header;`
+    VolumeDumpSqliteHeader,
 
-    /// `pragma graft_dump_commit = "logid:LSN";`
-    DumpCommit { logref: LogRef },
+    /// `pragma graft_debug_volume_dump_commit = "logid:LSN";`
+    VolumeDumpCommit { logref: LogRef },
+
+    /// `pragma graft_debug_log_lsn;`
+    /// Display storage commit history for the current Volume by LSN.
+    DebugLogLsn,
+
+    /// `pragma graft_debug_show_lsn = "logid:LSN";`
+    /// Display storage commit details for an internal Log/LSN coordinate.
+    DebugShowLsn { logref: LogRef },
+
+    /// `pragma graft_debug_diff_lsn = "logid:from logid:to";`
+    /// Compare storage commits by internal Log/LSN coordinates.
+    DebugDiffLsn { from: LogRef, to: LogRef },
 
     /// `pragma graft_log;`
-    /// Display commit history for current Volume
+    /// Display repository commit history
     Log,
 
-    /// `pragma graft_checkout_lsn = "LSN";`
+    /// `pragma graft_debug_volume_checkout_lsn = "LSN";`
     /// Checkout to specified local LSN (creates new Volume)
-    CheckoutLsn { lsn: LSN },
+    VolumeCheckoutLsn { lsn: LSN },
 
-    /// `pragma graft_reset_to = "LSN";`
+    /// `pragma graft_debug_volume_reset_to = "LSN";`
     /// Reset current tag to specified LSN
-    ResetTo { lsn: LSN },
+    VolumeResetTo { lsn: LSN },
 
-    /// `pragma graft_diff = "from_lsn,to_lsn[,mode]";`
-    /// Compare differences between two commits
+    /// `pragma graft_reset = "[--soft|--mixed|--hard] rev";`
+    /// Reset the current repository branch to a revision
+    Reset { rev: String, mode: ResetMode },
+
+    /// `pragma graft_debug_volume_diff = "from_lsn,to_lsn[,mode]";`
+    /// Compare legacy Volume commits by LSN
     /// mode: omitted=default (page + table level), "rows"=row-level detailed comparison
-    Diff { from: LSN, to: LSN, mode: DiffMode },
+    VolumeDiff { from: LSN, to: LSN, mode: DiffMode },
 
-    /// `pragma graft_show = "lsn";`
-    /// Display detailed info for specified LSN (includes summary of all table data)
-    Show { lsn: LSN },
+    /// `pragma graft_diff = "[--staged] [rev] [rev] [-- path]";`
+    /// Compare repository commits by revision syntax
+    RepoDiff { spec: RepoDiffSpec },
+
+    /// `pragma graft_show = "rev";`
+    /// Display detailed info for specified revision
+    Show { target: String },
 
     // JSON output variants (non-breaking additions)
-
     /// `pragma graft_json_log;`
-    /// Commit history as JSON array
+    /// Repository commit history as JSON array
     JsonLog,
 
-    /// `pragma graft_json_diff = "from_lsn,to_lsn[,mode]";`
-    /// Diff as JSON. mode: omitted=summary, "rows"=row-level detail
-    JsonDiff { from: LSN, to: LSN, mode: DiffMode },
+    /// `pragma graft_debug_volume_json_diff = "from_lsn,to_lsn[,mode]";`
+    /// Legacy Volume diff as JSON. mode: omitted=summary, "rows"=row-level detail
+    VolumeJsonDiff { from: LSN, to: LSN, mode: DiffMode },
 
-    /// `pragma graft_json_show = "lsn";`
+    /// `pragma graft_json_diff = "[--staged] [rev] [rev] [-- path]";`
+    /// Repository diff as JSON
+    JsonRepoDiff { spec: RepoDiffSpec },
+
+    /// `pragma graft_json_show = "rev";`
     /// Commit details as JSON
-    JsonShow { lsn: LSN },
+    JsonShow { target: String },
 
-    /// `pragma graft_json_info;`
+    /// `pragma graft_debug_volume_json_info;`
     /// Volume info as JSON
-    JsonInfo,
+    VolumeJsonInfo,
 
-    /// `pragma graft_table_log = 'table_name';`
+    /// `pragma graft_debug_volume_table_log = 'table_name';`
     /// Show commits that modified the given table
-    TableLog { table: String },
+    VolumeTableLog { table: String },
 
-    /// `pragma graft_json_table_log = 'table_name';`
+    /// `pragma graft_debug_volume_json_table_log = 'table_name';`
     /// Show commits that modified the given table, as JSON
-    JsonTableLog { table: String },
+    VolumeJsonTableLog { table: String },
 
-    /// `pragma graft_set_message = 'message';`
+    /// `pragma graft_debug_volume_set_message = 'message';`
     /// Set a human-readable message for the next commit
-    SetMessage { message: String },
+    VolumeSetMessage { message: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BranchListMode {
+    Local,
+    Remote,
+    All,
+}
+
+impl BranchListMode {
+    fn includes_remote(self) -> bool {
+        matches!(self, Self::Remote | Self::All)
+    }
 }
 
 impl TryFrom<&Pragma<'_>> for GraftPragma {
@@ -185,110 +458,211 @@ impl TryFrom<&Pragma<'_>> for GraftPragma {
             && prefix == "graft"
         {
             return match suffix {
-                "volumes" => Ok(GraftPragma::Volumes),
+                "debug_volume_list" => Ok(GraftPragma::VolumeList),
                 "tags" => Ok(GraftPragma::Tags),
-                "clone" => {
+                "debug_volume_tags" => Ok(GraftPragma::VolumeTags),
+                "debug_volume_clone" => {
                     let remote = p.arg.map(parse_or_fail).transpose()?;
-                    Ok(GraftPragma::Clone { remote })
+                    Ok(GraftPragma::VolumeClone { remote })
                 }
-                "fork" => Ok(GraftPragma::Fork),
+                "debug_volume_fork" => Ok(GraftPragma::VolumeFork),
                 "checkout" => {
-                    Ok(GraftPragma::Checkout { logref: parse_or_fail(p.require_arg()?)? })
+                    let arg = p.require_arg()?;
+                    let spec = parse_repo_checkout_arg(arg)?;
+                    Ok(GraftPragma::RepoCheckout { spec })
                 }
-                "new" => Ok(GraftPragma::Switch {
+                "restore" => {
+                    let arg = p.require_arg()?;
+                    let spec = parse_repo_restore_arg(arg)?;
+                    Ok(GraftPragma::Restore { spec })
+                }
+                "export" => {
+                    let arg = p.require_arg()?;
+                    let spec = parse_repo_export_arg(arg)?;
+                    Ok(GraftPragma::Export { spec })
+                }
+                "debug_volume_new" => Ok(GraftPragma::VolumeSwitch {
                     vid: VolumeId::random(),
                     local: None,
                     remote: None,
                 }),
-                "switch" => {
+                "debug_volume_switch" => {
                     let parts: Vec<&str> = p.require_arg()?.split(':').collect();
                     if parts.is_empty() || parts.len() > 3 {
                         return Err(pragma_fail(
                             "argument must be in the form: `local_vid[:local[:remote]]`",
                         ));
                     }
-                    Ok(GraftPragma::Switch {
+                    Ok(GraftPragma::VolumeSwitch {
                         vid: parse_or_fail(parts[0])?,
                         local: parse_optional(parts.get(1))?,
                         remote: parse_optional(parts.get(2))?,
                     })
                 }
-                "info" => Ok(GraftPragma::Info),
+                "debug_volume_info" => Ok(GraftPragma::VolumeInfo),
                 "status" => Ok(GraftPragma::Status),
-                "snapshot" => Ok(GraftPragma::Snapshot),
-                "fetch" => Ok(GraftPragma::Fetch),
-                "pull" => Ok(GraftPragma::Pull),
-                "push" => Ok(GraftPragma::Push),
-                "audit" => Ok(GraftPragma::Audit),
-                "hydrate" => Ok(GraftPragma::Hydrate),
+                "debug_volume_status" => Ok(GraftPragma::VolumeStatus),
+                "init" => Ok(GraftPragma::RepoInit),
+                "clone" => {
+                    let spec = parse_repo_clone_arg(p.require_arg()?)?;
+                    Ok(GraftPragma::RepoClone { spec })
+                }
+                "json_status" => Ok(GraftPragma::JsonStatus),
+                "add" => Ok(GraftPragma::Add { path: p.arg.map(PathBuf::from) }),
+                "rm" => Ok(GraftPragma::Remove { path: p.arg.map(PathBuf::from) }),
+                "commit" => Ok(GraftPragma::Commit { message: p.require_arg()?.to_string() }),
+                "branch" => Ok(GraftPragma::Branch { mode: parse_branch_list_mode(p.arg)? }),
+                "branch_create" => {
+                    let (name, start_point) = parse_branch_create_arg(p.require_arg()?)?;
+                    Ok(GraftPragma::BranchCreate { name, start_point })
+                }
+                "branch_delete" => {
+                    let (name, force) = parse_branch_delete_arg(p.require_arg()?)?;
+                    Ok(GraftPragma::BranchDelete { name, force })
+                }
+                "branch_rename" => {
+                    let (old, new, force) = parse_branch_rename_arg(p.require_arg()?)?;
+                    Ok(GraftPragma::BranchRename { old, new, force })
+                }
+                "branch_upstream" => {
+                    let (branch, remote, remote_branch) =
+                        parse_branch_upstream_arg(p.require_arg()?)?;
+                    Ok(GraftPragma::BranchUpstream { branch, remote, remote_branch })
+                }
+                "branch_unset_upstream" => {
+                    Ok(GraftPragma::BranchUnsetUpstream { branch: p.arg.map(str::to_string) })
+                }
+                "tag_create" => {
+                    let (name, target, message) = parse_tag_create_arg(p.require_arg()?)?;
+                    Ok(GraftPragma::TagCreate { name, target, message })
+                }
+                "tag_delete" => Ok(GraftPragma::TagDelete { name: p.require_arg()?.to_string() }),
+                "switch_branch" => {
+                    let (name, force) = parse_switch_branch_arg(p.require_arg()?)?;
+                    Ok(GraftPragma::SwitchBranch { name, force })
+                }
+                "switch_create" => {
+                    let (name, start_point, force) = parse_switch_create_arg(p.require_arg()?)?;
+                    Ok(GraftPragma::SwitchCreate { name, start_point, force })
+                }
+                "merge" => Ok(GraftPragma::Merge { rev: p.require_arg()?.to_string() }),
+                "merge_abort" => Ok(GraftPragma::MergeAbort),
+                "merge_continue" => {
+                    Ok(GraftPragma::MergeContinue { message: p.require_arg()?.to_string() })
+                }
+                "conflicts" => Ok(GraftPragma::Conflicts),
+                "resolve" => Ok(GraftPragma::Resolve {
+                    spec: parse_repo_resolve_arg(p.require_arg()?)?,
+                }),
+                "remote_add" => {
+                    let (name, config) = parse_remote_add(p.require_arg()?)?;
+                    Ok(GraftPragma::RemoteAdd { name, config })
+                }
+                "remote_remove" => {
+                    Ok(GraftPragma::RemoteRemove { name: p.require_arg()?.to_string() })
+                }
+                "remote_rename" => {
+                    let (old, new) = parse_remote_rename(p.require_arg()?)?;
+                    Ok(GraftPragma::RemoteRename { old, new })
+                }
+                "remote_get_url" => {
+                    Ok(GraftPragma::RemoteGetUrl { name: p.require_arg()?.to_string() })
+                }
+                "remote_set_url" => {
+                    let (name, config) = parse_remote_add(p.require_arg()?)?;
+                    Ok(GraftPragma::RemoteSetUrl { name, config })
+                }
+                "remote_prune" => {
+                    Ok(GraftPragma::RemotePrune { name: p.require_arg()?.to_string() })
+                }
+                "ls_remote" => Ok(GraftPragma::LsRemote { name: p.require_arg()?.to_string() }),
+                "remotes" => Ok(GraftPragma::Remotes),
+                "debug_volume_snapshot" => Ok(GraftPragma::VolumeSnapshot),
+                "fetch" => {
+                    let arg = parse_remote_branch_arg(p.arg)?;
+                    if arg.force {
+                        return Err(pragma_fail("fetch does not support --force"));
+                    }
+                    let RemoteBranchArg { remote, branch, refspec, all, .. } = arg;
+                    Ok(GraftPragma::Fetch { remote, branch, refspec, all })
+                }
+                "pull" => {
+                    let arg = parse_remote_branch_arg(p.arg)?;
+                    if arg.force {
+                        return Err(pragma_fail("pull does not support --force"));
+                    }
+                    let RemoteBranchArg { remote, branch, refspec, all, .. } = arg;
+                    Ok(GraftPragma::Pull { remote, branch, refspec, all })
+                }
+                "push" => {
+                    let RemoteBranchArg { remote, branch, refspec, all, force } =
+                        parse_remote_branch_arg(p.arg)?;
+                    Ok(GraftPragma::Push { remote, branch, refspec, all, force })
+                }
+                "debug_volume_fetch" => Ok(GraftPragma::VolumeFetch),
+                "debug_volume_pull" => Ok(GraftPragma::VolumePull),
+                "debug_volume_push" => Ok(GraftPragma::VolumePush),
+                "debug_volume_audit" => Ok(GraftPragma::VolumeAudit),
+                "debug_volume_hydrate" => Ok(GraftPragma::VolumeHydrate),
                 "version" => Ok(GraftPragma::Version),
-                "import" => Ok(GraftPragma::Import(PathBuf::from(p.require_arg()?))),
-                "export" => Ok(GraftPragma::Export(PathBuf::from(p.require_arg()?))),
-                "dump_header" => Ok(GraftPragma::DumpSqliteHeader),
-                "dump_commit" => {
-                    Ok(GraftPragma::DumpCommit { logref: parse_or_fail(p.require_arg()?)? })
+                "debug_volume_import" => {
+                    let _ = p.require_arg()?;
+                    Ok(GraftPragma::VolumeImport)
+                }
+                "debug_volume_export" => {
+                    Ok(GraftPragma::VolumeExport(PathBuf::from(p.require_arg()?)))
+                }
+                "debug_volume_dump_header" => Ok(GraftPragma::VolumeDumpSqliteHeader),
+                "debug_volume_dump_commit" => {
+                    Ok(GraftPragma::VolumeDumpCommit { logref: parse_or_fail(p.require_arg()?)? })
+                }
+                "debug_log_lsn" => Ok(GraftPragma::DebugLogLsn),
+                "debug_show_lsn" => {
+                    Ok(GraftPragma::DebugShowLsn { logref: parse_or_fail(p.require_arg()?)? })
+                }
+                "debug_diff_lsn" => {
+                    let (from, to) = parse_debug_diff_lsn_arg(p.require_arg()?)?;
+                    Ok(GraftPragma::DebugDiffLsn { from, to })
                 }
                 "log" => Ok(GraftPragma::Log),
-                "checkout_lsn" => {
-                    Ok(GraftPragma::CheckoutLsn { lsn: parse_or_fail(p.require_arg()?)? })
+                "debug_volume_checkout_lsn" => {
+                    Ok(GraftPragma::VolumeCheckoutLsn { lsn: parse_or_fail(p.require_arg()?)? })
                 }
-                "reset_to" => {
-                    Ok(GraftPragma::ResetTo { lsn: parse_or_fail(p.require_arg()?)? })
+                "debug_volume_reset_to" => {
+                    Ok(GraftPragma::VolumeResetTo { lsn: parse_or_fail(p.require_arg()?)? })
+                }
+                "reset" => {
+                    let (mode, rev) = parse_repo_reset_arg(p.require_arg()?)?;
+                    Ok(GraftPragma::Reset { rev, mode })
                 }
                 "diff" => {
-                    let parts: Vec<&str> = p.require_arg()?.split(',').collect();
-                    if parts.len() < 2 || parts.len() > 3 {
-                        return Err(pragma_fail("argument must be in the form: `from_lsn,to_lsn[,mode]`"));
-                    }
-                    let mode = if parts.len() == 3 {
-                        match parts[2] {
-                            "rows" => DiffMode::Rows,
-                            _ => return Err(pragma_fail("mode must be 'rows' or omitted")),
-                        }
-                    } else {
-                        DiffMode::Default
-                    };
-                    Ok(GraftPragma::Diff {
-                        from: parse_or_fail(parts[0])?,
-                        to: parse_or_fail(parts[1])?,
-                        mode,
-                    })
+                    let spec = parse_repo_diff_arg(p.arg)?;
+                    Ok(GraftPragma::RepoDiff { spec })
                 }
-                "show" => {
-                    Ok(GraftPragma::Show { lsn: parse_or_fail(p.require_arg()?)? })
+                "debug_volume_diff" => {
+                    let (from, to, mode) = parse_volume_diff_arg(p.require_arg()?)?;
+                    Ok(GraftPragma::VolumeDiff { from, to, mode })
                 }
+                "show" => Ok(GraftPragma::Show { target: p.require_arg()?.to_string() }),
                 "json_log" => Ok(GraftPragma::JsonLog),
                 "json_diff" => {
-                    let parts: Vec<&str> = p.require_arg()?.split(',').collect();
-                    if parts.len() < 2 || parts.len() > 3 {
-                        return Err(pragma_fail("argument must be in the form: `from_lsn,to_lsn[,mode]`"));
-                    }
-                    let mode = if parts.len() == 3 {
-                        match parts[2] {
-                            "rows" => DiffMode::Rows,
-                            _ => return Err(pragma_fail("mode must be 'rows' or omitted")),
-                        }
-                    } else {
-                        DiffMode::Default
-                    };
-                    Ok(GraftPragma::JsonDiff {
-                        from: parse_or_fail(parts[0])?,
-                        to: parse_or_fail(parts[1])?,
-                        mode,
-                    })
+                    let spec = parse_repo_diff_arg(p.arg)?;
+                    Ok(GraftPragma::JsonRepoDiff { spec })
                 }
-                "json_show" => {
-                    Ok(GraftPragma::JsonShow { lsn: parse_or_fail(p.require_arg()?)? })
+                "debug_volume_json_diff" => {
+                    let (from, to, mode) = parse_volume_diff_arg(p.require_arg()?)?;
+                    Ok(GraftPragma::VolumeJsonDiff { from, to, mode })
                 }
-                "json_info" => Ok(GraftPragma::JsonInfo),
-                "table_log" => {
-                    Ok(GraftPragma::TableLog { table: p.require_arg()?.to_string() })
+                "json_show" => Ok(GraftPragma::JsonShow { target: p.require_arg()?.to_string() }),
+                "debug_volume_json_info" => Ok(GraftPragma::VolumeJsonInfo),
+                "debug_volume_table_log" => {
+                    Ok(GraftPragma::VolumeTableLog { table: p.require_arg()?.to_string() })
                 }
-                "json_table_log" => {
-                    Ok(GraftPragma::JsonTableLog { table: p.require_arg()?.to_string() })
+                "debug_volume_json_table_log" => {
+                    Ok(GraftPragma::VolumeJsonTableLog { table: p.require_arg()?.to_string() })
                 }
-                "set_message" => {
-                    Ok(GraftPragma::SetMessage { message: p.require_arg()?.to_string() })
+                "debug_volume_set_message" => {
+                    Ok(GraftPragma::VolumeSetMessage { message: p.require_arg()?.to_string() })
                 }
                 _ => Err(pragma_fail(format!("invalid graft pragma `{}`", p.name))),
             };
@@ -304,12 +678,17 @@ macro_rules! pragma_err {
 }
 
 impl GraftPragma {
-    pub fn eval(self, runtime: &Runtime, file: &mut VolFile) -> Result<Option<String>, ErrCtx> {
+    pub fn eval(self, _runtime: &Runtime, file: &mut VolFile) -> Result<Option<String>, ErrCtx> {
+        let runtime = file.runtime().clone();
         match self {
-            GraftPragma::Volumes => Ok(Some(format_volumes(runtime, file)?)),
-            GraftPragma::Tags => Ok(Some(format_tags(runtime, file)?)),
+            GraftPragma::VolumeList => Ok(Some(format_volumes(&runtime, file)?)),
+            GraftPragma::Tags => {
+                let repo = repo_for_file(file)?;
+                Ok(Some(format_repo_tags(&repo.tags()?)?))
+            }
+            GraftPragma::VolumeTags => Ok(Some(format_tags(&runtime, file)?)),
 
-            GraftPragma::Clone { remote } => {
+            GraftPragma::VolumeClone { remote } => {
                 if !file.is_idle() {
                     return pragma_err!("cannot clone while there is an open transaction");
                 }
@@ -327,7 +706,7 @@ impl GraftPragma {
                 )))
             }
 
-            GraftPragma::Fork => {
+            GraftPragma::VolumeFork => {
                 if !file.is_idle() {
                     return pragma_err!("cannot fork while there is an open transaction");
                 }
@@ -347,23 +726,78 @@ impl GraftPragma {
                 }
             }
 
-            GraftPragma::Checkout { logref } => {
+            GraftPragma::RepoCheckout { spec } => {
                 if !file.is_idle() {
                     return pragma_err!("cannot checkout while there is an open transaction");
                 }
+                let repo = repo_for_file(file)?;
+                match spec {
+                    RepoCheckoutSpec::Detach { rev, force } => {
+                        let plan = repo.plan_detach(&rev)?;
+                        if repo_has_work_in_progress_for_file(&runtime, file, &repo)? {
+                            if force {
+                                repo.discard_work_in_progress()?;
+                            } else {
+                                return pragma_err!(
+                                    "cannot checkout with staged or unstaged changes"
+                                );
+                            }
+                        }
+                        verify_repo_checkout_plan(&runtime, &plan, None)?;
+                        let previous_files = current_repo_files_for_checkout(&repo)?;
+                        let id = repo.apply_detach_plan(&rev, &plan)?;
+                        checkout_repo_plan(&runtime, file, &repo, &plan, &previous_files, None)?;
+                        Ok(Some(format!("HEAD detached at {}", &id[..12])))
+                    }
+                    RepoCheckoutSpec::Path { rev, path } => {
+                        let path = repo_path_arg(&repo, &path)?;
+                        let current_key = repo.file_key(&file.tag)?;
+                        let physical_path = repo.worktree().join(&path);
+                        let plan = repo.plan_checkout_file_key_from_revision(&rev, path)?;
+                        hydrate_repo_file_state(&runtime, &plan.state, None)?;
+                        let outcome = repo.apply_checkout_file_plan(&plan)?;
+                        if outcome.path == current_key {
+                            checkout_repo_file_state(&runtime, file, &outcome.state, None)?;
+                        } else {
+                            checkout_repo_file_state_to_path(
+                                &runtime,
+                                &repo,
+                                &outcome.state,
+                                &physical_path,
+                                None,
+                            )?;
+                        }
+                        Ok(Some(format!(
+                            "Checked out {} from {}",
+                            outcome.path,
+                            &outcome.target[..outcome.target.len().min(12)]
+                        )))
+                    }
+                }
+            }
 
-                let Some(volume) = runtime.volume_from_logref(logref.clone())? else {
-                    return pragma_err!("logref not found");
-                };
-                file.switch_volume(&volume.vid)?;
+            GraftPragma::Restore { spec } => {
+                if !file.is_idle() {
+                    return pragma_err!("cannot restore while there is an open transaction");
+                }
+                let repo = repo_for_file(file)?;
+                let restored = restore_repo_path(&runtime, file, &repo, &spec)?;
+                Ok(Some(format!("Restored {restored}")))
+            }
 
+            GraftPragma::Export { spec } => {
+                if !file.is_idle() {
+                    return pragma_err!("cannot export while there is an open transaction");
+                }
+                let repo = repo_for_file(file)?;
+                let exported = export_repo_path(&runtime, file, &repo, &spec)?;
                 Ok(Some(format!(
-                    "Checked out Volume {} at Log {} LSN {}",
-                    file.vid, logref.log, logref.lsn,
+                    "Exported {exported} to {}",
+                    spec.output.display()
                 )))
             }
 
-            GraftPragma::Switch { vid, local, remote } => {
+            GraftPragma::VolumeSwitch { vid, local, remote } => {
                 if !file.is_idle() {
                     return pragma_err!("cannot switch while there is an open transaction");
                 }
@@ -377,22 +811,540 @@ impl GraftPragma {
                 )))
             }
 
-            GraftPragma::Info => Ok(Some(format_volume_info(runtime, file)?)),
-            GraftPragma::Status => Ok(Some(format_volume_status(runtime, file)?)),
+            GraftPragma::VolumeInfo => Ok(Some(format_volume_info(&runtime, file)?)),
+            GraftPragma::Status => {
+                let repo = repo_for_file(file)?;
+                let status = repo_status_for_file(&runtime, file, &repo)?;
+                Ok(Some(format_repo_status(&status)?))
+            }
+            GraftPragma::VolumeStatus => Ok(Some(format_volume_status(&runtime, file)?)),
 
-            GraftPragma::Snapshot => {
+            GraftPragma::RepoInit => {
+                if !file.is_idle() {
+                    return pragma_err!(
+                        "cannot initialize a repository while there is an open transaction"
+                    );
+                }
+                let repo = Repository::init_for_file(&file.tag)?;
+                let preserved_contents = file.attach_repo_preserving_contents(repo.clone())?;
+                if preserved_contents {
+                    repo.mark_dirty_path(&file.tag)?;
+                }
+                Ok(Some(format!(
+                    "Initialized empty Graft repository in {}",
+                    repo.graft_dir().display()
+                )))
+            }
+
+            GraftPragma::RepoClone { spec } => {
+                if !file.is_idle() {
+                    return pragma_err!("cannot clone while there is an open transaction");
+                }
+                if file.repo.is_some() || Repository::discover_for_file(&file.tag).is_ok() {
+                    return pragma_err!("cannot clone into an existing .graft repository");
+                }
+
+                let repo = Repository::init_for_file(&file.tag)?;
+                let graft_dir = repo.graft_dir().to_path_buf();
+                let mut attached = false;
+                let result = (|| {
+                    repo.remote_add("origin", spec.config)?;
+                    let branch = match spec.branch {
+                        Some(branch) => branch,
+                        None => repo
+                            .remote_default_branch("origin")?
+                            .unwrap_or(repo.default_branch()?),
+                    };
+                    let fetch = repo.fetch("origin", &branch)?;
+                    repo.branch_create(&branch, Some(&format!("refs/remotes/origin/{branch}")))?;
+                    repo.set_branch_upstream(&branch, "origin", &branch)?;
+                    let plan = repo.plan_switch_branch(&branch)?;
+                    file.attach_repo(repo.clone())?;
+                    attached = true;
+                    let runtime = file.runtime().clone();
+                    let remote = Arc::new(repo.remote_store("origin")?);
+                    verify_repo_checkout_plan(&runtime, &plan, Some(remote.clone()))?;
+                    let previous_files = BTreeMap::new();
+                    repo.apply_switch_branch_plan(&branch, &plan)?;
+                    checkout_repo_plan(
+                        &runtime,
+                        file,
+                        &repo,
+                        &plan,
+                        &previous_files,
+                        Some(remote),
+                    )?;
+                    Ok(Some(format!(
+                        "Cloned origin/{} at {} into {}",
+                        fetch.branch,
+                        &fetch.head[..fetch.head.len().min(12)],
+                        repo.graft_dir().display()
+                    )))
+                })();
+                if result.is_err() && !attached {
+                    let _ = std::fs::remove_dir_all(graft_dir);
+                }
+                result
+            }
+
+            GraftPragma::JsonStatus => {
+                let repo = repo_for_file(file)?;
+                let status = repo_status_for_file(&runtime, file, &repo)?;
+                Ok(Some(serde_json::to_string(&status).map_err(|e| {
+                    ErrCtx::PragmaErr(format!("JSON error: {e}").into())
+                })?))
+            }
+
+            GraftPragma::Add { path } => {
+                if !file.is_idle() {
+                    return pragma_err!("cannot add while there is an open transaction");
+                }
+                let repo = repo_for_file(file)?;
+                let entry = if let Some(path) = path.as_deref() {
+                    let (key, physical_path) = repo_physical_path_arg(&repo, path)?;
+                    if key == repo.file_key(&file.tag)? {
+                        let state = current_repo_file_state(&runtime, file)?;
+                        repo.stage_file_state_path(&file.tag, state)?
+                    } else {
+                        stage_physical_sqlite_file(&runtime, &repo, &key, &physical_path)?
+                    }
+                } else {
+                    let state = current_repo_file_state(&runtime, file)?;
+                    repo.stage_file_state_path(&file.tag, state)?
+                };
+                Ok(Some(format!("Added {}", entry.path)))
+            }
+
+            GraftPragma::Remove { path } => {
+                if !file.is_idle() {
+                    return pragma_err!("cannot remove while there is an open transaction");
+                }
+                let repo = repo_for_file(file)?;
+                let current_key = repo.file_key(&file.tag)?;
+                let entry = if let Some(path) = path.as_deref() {
+                    let (key, physical_path) = repo_physical_path_arg(&repo, path)?;
+                    if key == current_key {
+                        let entry = repo.stage_file_removal(&file.tag)?;
+                        let volume = runtime.volume_open(None, None, None)?;
+                        file.switch_volume(&volume.vid)?;
+                        entry
+                    } else {
+                        remove_physical_sqlite_file(&repo, &key, &physical_path)?;
+                        repo.stage_file_removal(&physical_path)?
+                    }
+                } else {
+                    let entry = repo.stage_file_removal(&file.tag)?;
+                    let volume = runtime.volume_open(None, None, None)?;
+                    file.switch_volume(&volume.vid)?;
+                    entry
+                };
+                Ok(Some(format!("Removed {}", entry.path)))
+            }
+
+            GraftPragma::Commit { message } => {
+                if !file.is_idle() {
+                    return pragma_err!("cannot commit while there is an open transaction");
+                }
+                let repo = repo_for_file(file)?;
+                let tables = staged_commit_table_summary(&runtime, &repo)?;
+                let commit = repo.commit_staged_with_table_summary(message, tables)?;
+                Ok(Some(format!("[{}] {}", &commit.id[..12], commit.message)))
+            }
+
+            GraftPragma::Branch { mode } => {
+                let repo = repo_for_file(file)?;
+                let branches = repo.branches()?;
+                let remote_branches = if mode.includes_remote() {
+                    repo.remote_tracking_branches()?
+                } else {
+                    Vec::new()
+                };
+                Ok(Some(format_branches(&branches, &remote_branches, mode)?))
+            }
+
+            GraftPragma::BranchCreate { name, start_point } => {
+                let repo = repo_for_file(file)?;
+                let branch = if start_point.is_some() || repo.status()?.head_target.is_some() {
+                    repo.branch_create(&name, start_point.as_deref())?
+                } else {
+                    repo.branch_create_unborn(&name)?
+                };
+                Ok(Some(format_branch_created(&branch)))
+            }
+
+            GraftPragma::BranchDelete { name, force } => {
+                let repo = repo_for_file(file)?;
+                let branch = repo.branch_delete(&name, force)?;
+                Ok(Some(format_branch_deleted(&branch, force)))
+            }
+
+            GraftPragma::BranchRename { old, new, force } => {
+                let repo = repo_for_file(file)?;
+                let old = match old {
+                    Some(old) => old,
+                    None => repo.current_branch()?.ok_or_else(|| {
+                        ErrCtx::PragmaErr("cannot rename current branch in detached HEAD".into())
+                    })?,
+                };
+                let branch = repo.branch_rename(&old, &new, force)?;
+                Ok(Some(format_branch_renamed(&old, &branch, force)))
+            }
+
+            GraftPragma::BranchUpstream { branch, remote, remote_branch } => {
+                let repo = repo_for_file(file)?;
+                let branch = match branch {
+                    Some(branch) => branch,
+                    None => repo.current_branch()?.ok_or_else(|| {
+                        ErrCtx::PragmaErr("cannot set upstream in detached HEAD".into())
+                    })?,
+                };
+                let branch = repo.set_branch_upstream(&branch, &remote, &remote_branch)?;
+                Ok(Some(format_branch_upstream(&branch)))
+            }
+
+            GraftPragma::BranchUnsetUpstream { branch } => {
+                let repo = repo_for_file(file)?;
+                let branch = match branch {
+                    Some(branch) => branch,
+                    None => repo.current_branch()?.ok_or_else(|| {
+                        ErrCtx::PragmaErr("cannot unset upstream in detached HEAD".into())
+                    })?,
+                };
+                let branch = repo.unset_branch_upstream(&branch)?;
+                Ok(Some(format_branch_upstream_unset(&branch)))
+            }
+
+            GraftPragma::TagCreate { name, target, message } => {
+                let repo = repo_for_file(file)?;
+                let tag = match message {
+                    Some(message) => {
+                        repo.tag_create_annotated(&name, target.as_deref(), message)?
+                    }
+                    None => repo.tag_create(&name, target.as_deref())?,
+                };
+                Ok(Some(format_tag_created(&tag)))
+            }
+
+            GraftPragma::TagDelete { name } => {
+                let repo = repo_for_file(file)?;
+                let tag = repo.tag_delete(&name)?;
+                Ok(Some(format_tag_deleted(&tag)))
+            }
+
+            GraftPragma::SwitchBranch { name, force } => {
+                if !file.is_idle() {
+                    return pragma_err!(
+                        "cannot switch branches while there is an open transaction"
+                    );
+                }
+                let repo = repo_for_file(file)?;
+                let plan = repo.plan_switch_branch(&name)?;
+                if repo_has_work_in_progress_for_file(&runtime, file, &repo)? {
+                    if force {
+                        repo.discard_work_in_progress()?;
+                    } else {
+                        return pragma_err!(
+                            "cannot switch branches with staged or unstaged changes"
+                        );
+                    }
+                }
+                verify_repo_checkout_plan(&runtime, &plan, None)?;
+                let previous_files = current_repo_files_for_checkout(&repo)?;
+                repo.apply_switch_branch_plan(&name, &plan)?;
+                checkout_repo_plan(&runtime, file, &repo, &plan, &previous_files, None)?;
+                Ok(Some(format!("Switched to branch '{name}'")))
+            }
+
+            GraftPragma::SwitchCreate { name, start_point, force } => {
+                if !file.is_idle() {
+                    return pragma_err!(
+                        "cannot switch branches while there is an open transaction"
+                    );
+                }
+                let repo = repo_for_file(file)?;
+                let plan = repo.plan_switch_new_branch(&name, start_point.as_deref())?;
+                if repo_has_work_in_progress_for_file(&runtime, file, &repo)? {
+                    if force {
+                        repo.discard_work_in_progress()?;
+                    } else {
+                        return pragma_err!(
+                            "cannot switch branches with staged or unstaged changes"
+                        );
+                    }
+                }
+                verify_repo_checkout_plan(&runtime, &plan.checkout, None)?;
+                let previous_files = current_repo_files_for_checkout(&repo)?;
+                let branch = repo.apply_switch_new_branch_plan(&plan)?;
+                checkout_repo_plan(&runtime, file, &repo, &plan.checkout, &previous_files, None)?;
+                Ok(Some(format_branch_created(&branch)))
+            }
+
+            GraftPragma::Merge { rev } => {
+                if !file.is_idle() {
+                    return pragma_err!("cannot merge while there is an open transaction");
+                }
+                let repo = repo_for_file(file)?;
+                if repo_has_work_in_progress_for_file(&runtime, file, &repo)? {
+                    return pragma_err!("cannot merge with staged or unstaged changes");
+                }
+                let plan = repo.plan_merge_revision(&rev)?;
+                verify_repo_merge_plan(&runtime, &plan, None)?;
+                let previous_files = current_repo_files_for_checkout(&repo)?;
+                let outcome = repo.apply_merge_plan(&plan)?;
+                checkout_merge_outcome(
+                    &runtime,
+                    file,
+                    &repo,
+                    &outcome,
+                    Some(&plan.checkout),
+                    &previous_files,
+                    None,
+                )?;
+                Ok(Some(format_merge_outcome_with_row_analysis(
+                    &runtime, file, &repo, &outcome, None,
+                )?))
+            }
+
+            GraftPragma::MergeAbort => {
+                if !file.is_idle() {
+                    return pragma_err!("cannot abort merge while there is an open transaction");
+                }
+                let repo = repo_for_file(file)?;
+                let plan = repo.plan_merge_abort()?;
+                let previous_files = current_repo_files_for_checkout(&repo)?;
+                let target = repo.apply_merge_abort_plan(&plan)?;
+                checkout_repo_plan(&runtime, file, &repo, &plan.checkout, &previous_files, None)?;
+                Ok(Some(format!(
+                    "Aborted merge; reset HEAD to {}",
+                    &target[..target.len().min(12)]
+                )))
+            }
+
+            GraftPragma::MergeContinue { message } => {
+                if !file.is_idle() {
+                    return pragma_err!("cannot continue merge while there is an open transaction");
+                }
+                let repo = repo_for_file(file)?;
+                if repo.status()?.merge_head.is_none() {
+                    return pragma_err!("no merge in progress");
+                }
+                let tables = staged_commit_table_summary(&runtime, &repo)?;
+                let commit = repo.commit_staged_with_table_summary(message, tables)?;
+                Ok(Some(format!(
+                    "Merge commit [{}] {}",
+                    &commit.id[..commit.id.len().min(12)],
+                    commit.message
+                )))
+            }
+
+            GraftPragma::Conflicts => {
+                let repo = repo_for_file(file)?;
+                Ok(Some(format_conflicts(&repo.status()?)?))
+            }
+
+            GraftPragma::Resolve { spec } => {
+                if !file.is_idle() {
+                    return pragma_err!("cannot resolve while there is an open transaction");
+                }
+                let repo = repo_for_file(file)?;
+                let path = spec.path.unwrap_or_else(|| PathBuf::from(&file.tag));
+                let (key, physical_path) = repo_physical_path_arg(&repo, &path)?;
+                let current_key = repo.file_key(&file.tag)?;
+                let state = conflict_file_state(&repo, &physical_path, spec.side)?;
+                if key == current_key {
+                    if let Some(state) = &state {
+                        checkout_repo_file_state(&runtime, file, state, None)?;
+                    } else {
+                        let volume = runtime.volume_open(None, None, None)?;
+                        file.switch_volume(&volume.vid)?;
+                    }
+                } else if let Some(state) = &state {
+                    checkout_repo_file_state_to_path(&runtime, &repo, state, &physical_path, None)?;
+                } else {
+                    remove_materialized_repo_file(&repo, &key)?;
+                }
+                let entry = repo.resolve_file_conflict(&physical_path, state)?;
+                Ok(Some(format!(
+                    "Resolved {} using {}",
+                    entry.path,
+                    spec.side.label()
+                )))
+            }
+
+            GraftPragma::RemoteAdd { name, config } => {
+                let repo = repo_for_file(file)?;
+                let remote = repo.remote_add(&name, config)?;
+                Ok(Some(format_remote(&remote)))
+            }
+
+            GraftPragma::RemoteRemove { name } => {
+                let repo = repo_for_file(file)?;
+                let remote = repo.remote_remove(&name)?;
+                Ok(Some(format!("Removed remote '{}'", remote.name)))
+            }
+
+            GraftPragma::RemoteRename { old, new } => {
+                let repo = repo_for_file(file)?;
+                let remote = repo.remote_rename(&old, &new)?;
+                Ok(Some(format!(
+                    "Renamed remote '{}' to '{}': {}",
+                    old,
+                    remote.name,
+                    remote_config_uri(&remote.config)
+                )))
+            }
+
+            GraftPragma::RemoteGetUrl { name } => {
+                let repo = repo_for_file(file)?;
+                let remote = repo.remote_get_url(&name)?;
+                Ok(Some(remote_config_uri(&remote.config)))
+            }
+
+            GraftPragma::RemoteSetUrl { name, config } => {
+                let repo = repo_for_file(file)?;
+                let remote = repo.remote_set_url(&name, config)?;
+                Ok(Some(format!(
+                    "Updated remote '{}': {}",
+                    remote.name,
+                    remote_config_uri(&remote.config)
+                )))
+            }
+
+            GraftPragma::RemotePrune { name } => {
+                let repo = repo_for_file(file)?;
+                let outcome = repo.remote_prune(&name)?;
+                Ok(Some(format_remote_prune_outcome(&outcome)?))
+            }
+
+            GraftPragma::LsRemote { name } => {
+                let repo = repo_for_file(file)?;
+                let default_branch = repo.remote_default_branch(&name)?;
+                let refs = repo.remote_branch_refs(&name)?;
+                Ok(Some(format_ls_remote(
+                    &name,
+                    default_branch.as_deref(),
+                    &refs,
+                )?))
+            }
+
+            GraftPragma::Remotes => {
+                let repo = repo_for_file(file)?;
+                Ok(Some(format_remotes(&repo.remotes()?)?))
+            }
+
+            GraftPragma::VolumeSnapshot => {
                 let snapshot = file.snapshot_or_latest()?;
                 Ok(Some(format!("{snapshot:?}")))
             }
 
-            GraftPragma::Fetch => Ok(Some(fetch_or_pull(runtime, file, false)?)),
-            GraftPragma::Pull => Ok(Some(fetch_or_pull(runtime, file, true)?)),
+            GraftPragma::Fetch { remote, branch, refspec, all } => {
+                let repo = repo_for_file(file)?;
+                if let Some(refspec) = refspec {
+                    let remote = repo_default_remote(&repo, remote)?;
+                    let outcome = repo.fetch_refspec(&remote, &refspec)?;
+                    Ok(Some(format_fetch_all_outcome(&outcome)?))
+                } else if all {
+                    let remote = repo_default_remote(&repo, remote)?;
+                    let outcome = repo.fetch_all(&remote)?;
+                    Ok(Some(format_fetch_all_outcome(&outcome)?))
+                } else {
+                    let upstream = repo_remote_branch(&repo, remote, branch)?;
+                    let outcome = repo.fetch(&upstream.remote, &upstream.branch)?;
+                    Ok(Some(format!(
+                        "Fetched {}/{} at {} ({} new commits)",
+                        outcome.remote,
+                        outcome.branch,
+                        &outcome.head[..12],
+                        outcome.commits
+                    )))
+                }
+            }
+            GraftPragma::Pull { remote, branch, refspec, all } => {
+                let repo = repo_for_file(file)?;
+                if all {
+                    return pragma_err!(
+                        "pull does not support --all; fetch --all first, then pull one branch"
+                    );
+                }
+                if !file.is_idle() {
+                    return pragma_err!("cannot pull while there is an open transaction");
+                }
+                if repo_has_work_in_progress_for_file(&runtime, file, &repo)? {
+                    return pragma_err!("cannot pull with staged or unstaged changes");
+                }
+                let local_branch = repo
+                    .current_branch()?
+                    .ok_or_else(|| ErrCtx::PragmaErr("cannot pull in detached HEAD".into()))?;
+                let (remote, plan) = if let Some(refspec) = refspec {
+                    let remote = repo_default_remote(&repo, remote)?;
+                    let plan = repo.plan_pull_refspec(&remote, &refspec, &local_branch)?;
+                    (remote, plan)
+                } else {
+                    let upstream = repo_remote_branch(&repo, remote, branch)?;
+                    let plan = repo.plan_pull(&upstream.remote, &upstream.branch, &local_branch)?;
+                    (upstream.remote, plan)
+                };
+                let checkout_remote = Arc::new(repo.remote_store(&remote)?);
+                verify_repo_merge_plan(&runtime, &plan.merge, Some(checkout_remote.clone()))?;
+                let previous_files = current_repo_files_for_checkout(&repo)?;
+                let outcome = repo.apply_pull_plan(&plan)?;
+                checkout_merge_outcome(
+                    &runtime,
+                    file,
+                    &repo,
+                    &outcome.merge,
+                    Some(&plan.merge.checkout),
+                    &previous_files,
+                    Some(checkout_remote.clone()),
+                )?;
+                Ok(Some(format_pull_outcome_with_row_analysis(
+                    &runtime,
+                    file,
+                    &repo,
+                    &outcome,
+                    Some(checkout_remote),
+                )?))
+            }
 
-            GraftPragma::Push => Ok(Some(push(runtime, file)?)),
+            GraftPragma::Push { remote, branch, refspec, all, force } => {
+                let repo = repo_for_file(file)?;
+                if let Some(refspec) = refspec {
+                    let remote = repo_default_remote(&repo, remote)?;
+                    publish_repo_all_branch_snapshots(&runtime, &repo, &remote)?;
+                    let outcome = repo.push_refspec_with_force(&remote, &refspec, force)?;
+                    Ok(Some(format_push_all_outcome(&outcome)?))
+                } else if all {
+                    let remote = repo_default_remote(&repo, remote)?;
+                    publish_repo_all_branch_snapshots(&runtime, &repo, &remote)?;
+                    let outcome = repo.push_all_with_force(&remote, force)?;
+                    Ok(Some(format_push_all_outcome(&outcome)?))
+                } else {
+                    let (remote, local_branch, remote_branch) =
+                        repo_push_branches(&repo, remote, branch)?;
+                    publish_repo_branch_snapshots(&runtime, &repo, &remote, &local_branch)?;
+                    let outcome =
+                        repo.push_branch_with_force(&remote, &local_branch, &remote_branch, force)?;
+                    Ok(Some(format!(
+                        "{} {}/{} to {} ({} commits)",
+                        if outcome.forced {
+                            "Force-pushed"
+                        } else {
+                            "Pushed"
+                        },
+                        outcome.remote,
+                        outcome.remote_branch,
+                        &outcome.head[..12],
+                        outcome.commits
+                    )))
+                }
+            }
+            GraftPragma::VolumeFetch => Ok(Some(fetch_or_pull(&runtime, file, false)?)),
+            GraftPragma::VolumePull => Ok(Some(fetch_or_pull(&runtime, file, true)?)),
+            GraftPragma::VolumePush => Ok(Some(push(&runtime, file)?)),
 
-            GraftPragma::Audit => Ok(Some(format_volume_audit(runtime, file)?)),
+            GraftPragma::VolumeAudit => Ok(Some(format_volume_audit(&runtime, file)?)),
 
-            GraftPragma::Hydrate => {
+            GraftPragma::VolumeHydrate => {
                 let snapshot = file.snapshot_or_latest()?;
                 runtime.snapshot_hydrate(snapshot)?;
                 Ok(None)
@@ -408,15 +1360,15 @@ impl GraftPragma {
                 Ok(Some(out))
             }
 
-            GraftPragma::Import(_) => {
+            GraftPragma::VolumeImport => {
                 pragma_err!(
                     "deprecated: use `vacuum into` instead: https://graft.rs/r/graft_import"
                 )
             }
 
-            GraftPragma::Export(path) => volume_export(runtime, file, path).map(Some),
+            GraftPragma::VolumeExport(path) => volume_export(&runtime, file, path).map(Some),
 
-            GraftPragma::DumpSqliteHeader => {
+            GraftPragma::VolumeDumpSqliteHeader => {
                 let reader = runtime.volume_reader(file.vid.clone())?;
                 let page = reader.read_page(PageIdx::FIRST)?;
                 let header = SqliteHeader::read_from_bytes(&page[..100])
@@ -424,34 +1376,30 @@ impl GraftPragma {
                 Ok(Some(format!("{header:#?}")))
             }
 
-            GraftPragma::DumpCommit { logref } => {
-                if let Some(commit) = runtime.get_commit(&logref.log, logref.lsn)? {
-                    let Commit {
-                        log,
-                        lsn,
-                        page_count,
-                        commit_hash,
-                        segment_idx,
-                        checkpoints,
-                        ..
-                    } = commit;
-                    Ok(Some(formatdoc!(
-                        "
-                            Commit @ {log}:{lsn}
-                            page_count: {page_count}
-                            commit_hash: {commit_hash:?}
-                            segment_idx: {segment_idx:#?}
-                            checkpoints: {checkpoints:?}
-                        "
-                    )))
-                } else {
-                    pragma_err!("commit not found")
-                }
+            GraftPragma::VolumeDumpCommit { logref } => {
+                format_debug_show_lsn(&runtime, &logref).map(Some)
             }
 
-            GraftPragma::Log => Ok(Some(format_volume_log(runtime, file)?)),
+            GraftPragma::DebugLogLsn => format_debug_log_lsn(&runtime, file).map(Some),
 
-            GraftPragma::CheckoutLsn { lsn } => {
+            GraftPragma::DebugShowLsn { logref } => {
+                format_debug_show_lsn(&runtime, &logref).map(Some)
+            }
+
+            GraftPragma::DebugDiffLsn { from, to } => {
+                if from.log != to.log {
+                    return pragma_err!("debug LSN diff requires both refs to use the same log");
+                }
+                let diff = runtime.diff_commits(&from.log, from.lsn, to.lsn)?;
+                Ok(Some(format_debug_page_diff(&diff)))
+            }
+
+            GraftPragma::Log => {
+                let repo = repo_for_file(file)?;
+                Ok(Some(format_repo_log(&repo)?))
+            }
+
+            GraftPragma::VolumeCheckoutLsn { lsn } => {
                 if !file.is_idle() {
                     return pragma_err!("cannot checkout while there is an open transaction");
                 }
@@ -465,7 +1413,7 @@ impl GraftPragma {
                 )))
             }
 
-            GraftPragma::ResetTo { lsn } => {
+            GraftPragma::VolumeResetTo { lsn } => {
                 if !file.is_idle() {
                     return pragma_err!("cannot reset while there is an open transaction");
                 }
@@ -480,52 +1428,123 @@ impl GraftPragma {
                 )))
             }
 
-            GraftPragma::Diff { from, to, mode } => {
+            GraftPragma::Reset { rev, mode } => {
+                if !file.is_idle() {
+                    return pragma_err!("cannot reset while there is an open transaction");
+                }
+
+                let repo = repo_for_file(file)?;
+                let current_state = current_repo_file_state(&runtime, file)?;
+                let old_head_state = repo.head_file(&file.tag)?;
+                let had_staged_changes = repo.has_staged_changes()?;
+                let plan = repo.plan_reset(&rev, mode)?;
+                if matches!(mode, ResetMode::Hard) {
+                    verify_repo_checkout_plan(&runtime, &plan.checkout, None)?;
+                }
+                let previous_files = if matches!(mode, ResetMode::Hard) {
+                    current_repo_files_for_checkout(&repo)?
+                } else {
+                    BTreeMap::new()
+                };
+                let outcome = repo.apply_reset_plan(&plan)?;
+
+                match mode {
+                    ResetMode::Soft => {
+                        if !had_staged_changes && let Some(old_head_state) = &old_head_state {
+                            let target_state = repo.head_file(&file.tag)?;
+                            if target_state.as_ref() != Some(old_head_state) {
+                                repo.stage_file_state_path(&file.tag, old_head_state.clone())?;
+                            }
+                        }
+                        if !had_staged_changes
+                            && old_head_state
+                                .as_ref()
+                                .is_some_and(|old_head_state| &current_state != old_head_state)
+                        {
+                            repo.mark_dirty_path(&file.tag)?;
+                        }
+                    }
+                    ResetMode::Mixed => {
+                        let target_state = repo.head_file(&file.tag)?;
+                        if target_state.as_ref() == Some(&current_state) {
+                            repo.clear_dirty_path(&file.tag)?;
+                        } else {
+                            repo.mark_dirty_path(&file.tag)?;
+                        }
+                    }
+                    ResetMode::Hard => {
+                        checkout_repo_plan(
+                            &runtime,
+                            file,
+                            &repo,
+                            &plan.checkout,
+                            &previous_files,
+                            None,
+                        )?;
+                    }
+                }
+
+                Ok(Some(format!(
+                    "Reset HEAD to {} ({})",
+                    &outcome.target[..outcome.target.len().min(12)],
+                    reset_mode_label(mode)
+                )))
+            }
+
+            GraftPragma::VolumeDiff { from, to, mode } => {
                 if !file.is_idle() {
                     return pragma_err!("cannot diff while there is an open transaction");
                 }
                 match mode {
                     DiffMode::Default => {
                         // Built-in table-level diff using our B-tree parser
-                        let report = crate::sql_diff::generate_diff_report(runtime, file, from, to)?;
+                        let report =
+                            crate::sql_diff::generate_diff_report(&runtime, file, from, to)?;
                         Ok(Some(report))
                     }
                     DiffMode::Rows => {
                         // Row-level detailed diff
-                        row_diff_impl(runtime, file, from, to)
+                        row_diff_impl(&runtime, file, from, to)
                     }
                 }
             }
 
-            GraftPragma::Show { lsn } => {
+            GraftPragma::RepoDiff { spec } => {
+                if !file.is_idle() {
+                    return pragma_err!("cannot diff while there is an open transaction");
+                }
+                let repo = repo_for_file(file)?;
+                let diff = repo_diff_for_spec(&runtime, file, &repo, spec)?;
+                Ok(Some(format_repo_diff(&diff)?))
+            }
+
+            GraftPragma::Show { target } => {
                 if !file.is_idle() {
                     return pragma_err!("cannot show while there is an open transaction");
                 }
-                let result = show_lsn(runtime, file, lsn)?;
-                Ok(Some(result))
+                let repo = repo_for_file(file)?;
+                let commit = repo.show_revision(&target)?;
+                Ok(Some(format_repo_show(&commit)?))
             }
 
             GraftPragma::JsonLog => {
-                let commits = runtime.volume_log(&file.vid)?;
-                let entries: Vec<crate::json::JsonCommit> = commits
-                    .iter()
-                    .map(crate::json::JsonCommit::from_commit_info)
-                    .collect();
-                Ok(Some(serde_json::to_string(&entries).map_err(|e| {
+                let repo = repo_for_file(file)?;
+                Ok(Some(serde_json::to_string(&repo.log()?).map_err(|e| {
                     ErrCtx::PragmaErr(format!("JSON error: {e}").into())
                 })?))
             }
 
-            GraftPragma::JsonDiff { from, to, mode } => {
+            GraftPragma::VolumeJsonDiff { from, to, mode } => {
                 if !file.is_idle() {
                     return pragma_err!("cannot diff while there is an open transaction");
                 }
                 match mode {
                     DiffMode::Default => {
-                        let diff = crate::row_level_diff::row_level_diff(runtime, &file.vid, from, to)
-                            .map_err(|e| {
-                                ErrCtx::PragmaErr(format!("Diff error: {e:?}").into())
-                            })?;
+                        let diff =
+                            crate::row_level_diff::row_level_diff(&runtime, &file.vid, from, to)
+                                .map_err(|e| {
+                                    ErrCtx::PragmaErr(format!("Diff error: {e:?}").into())
+                                })?;
                         let tables: Vec<crate::json::JsonTableSummary> = diff
                             .table_changes
                             .iter()
@@ -549,10 +1568,11 @@ impl GraftPragma {
                         })?))
                     }
                     DiffMode::Rows => {
-                        let diff = crate::row_level_diff::row_level_diff(runtime, &file.vid, from, to)
-                            .map_err(|e| {
-                                ErrCtx::PragmaErr(format!("Diff error: {e:?}").into())
-                            })?;
+                        let diff =
+                            crate::row_level_diff::row_level_diff(&runtime, &file.vid, from, to)
+                                .map_err(|e| {
+                                    ErrCtx::PragmaErr(format!("Diff error: {e:?}").into())
+                                })?;
                         let tables: Vec<crate::json::JsonTableChanges> = diff
                             .table_changes
                             .iter()
@@ -565,7 +1585,11 @@ impl GraftPragma {
                                             crate::json::JsonRowChange {
                                                 op: "insert".into(),
                                                 rowid: *rowid,
-                                                values: row.values.iter().map(crate::json::JsonRowChange::value_to_json).collect(),
+                                                values: row
+                                                    .values
+                                                    .iter()
+                                                    .map(crate::json::JsonRowChange::value_to_json)
+                                                    .collect(),
                                                 old_values: None,
                                             }
                                         }
@@ -573,18 +1597,34 @@ impl GraftPragma {
                                             crate::json::JsonRowChange {
                                                 op: "delete".into(),
                                                 rowid: *rowid,
-                                                values: row.values.iter().map(crate::json::JsonRowChange::value_to_json).collect(),
+                                                values: row
+                                                    .values
+                                                    .iter()
+                                                    .map(crate::json::JsonRowChange::value_to_json)
+                                                    .collect(),
                                                 old_values: None,
                                             }
                                         }
-                                        crate::row_level_diff::RowChange::Update { rowid, old_row, new_row } => {
-                                            crate::json::JsonRowChange {
-                                                op: "update".into(),
-                                                rowid: *rowid,
-                                                values: new_row.values.iter().map(crate::json::JsonRowChange::value_to_json).collect(),
-                                                old_values: Some(old_row.values.iter().map(crate::json::JsonRowChange::value_to_json).collect()),
-                                            }
-                                        }
+                                        crate::row_level_diff::RowChange::Update {
+                                            rowid,
+                                            old_row,
+                                            new_row,
+                                        } => crate::json::JsonRowChange {
+                                            op: "update".into(),
+                                            rowid: *rowid,
+                                            values: new_row
+                                                .values
+                                                .iter()
+                                                .map(crate::json::JsonRowChange::value_to_json)
+                                                .collect(),
+                                            old_values: Some(
+                                                old_row
+                                                    .values
+                                                    .iter()
+                                                    .map(crate::json::JsonRowChange::value_to_json)
+                                                    .collect(),
+                                            ),
+                                        },
                                     })
                                     .collect();
                                 crate::json::JsonTableChanges {
@@ -606,41 +1646,60 @@ impl GraftPragma {
                 }
             }
 
-            GraftPragma::JsonShow { lsn } => {
+            GraftPragma::JsonRepoDiff { spec } => {
+                if !file.is_idle() {
+                    return pragma_err!("cannot diff while there is an open transaction");
+                }
+                let repo = repo_for_file(file)?;
+                let diff = repo_diff_for_spec(&runtime, file, &repo, spec)?;
+                Ok(Some(serde_json::to_string(&diff).map_err(|e| {
+                    ErrCtx::PragmaErr(format!("JSON error: {e}").into())
+                })?))
+            }
+
+            GraftPragma::JsonShow { target } => {
                 if !file.is_idle() {
                     return pragma_err!("cannot show while there is an open transaction");
                 }
-                let result = json_show_lsn(runtime, file, lsn)?;
+                let repo = repo_for_file(file)?;
+                let commit = repo.show_revision(&target)?;
+                Ok(Some(serde_json::to_string(&commit).map_err(|e| {
+                    ErrCtx::PragmaErr(format!("JSON error: {e}").into())
+                })?))
+            }
+
+            GraftPragma::VolumeJsonInfo => {
+                let result = json_volume_info(&runtime, file)?;
                 Ok(Some(serde_json::to_string(&result).map_err(|e| {
                     ErrCtx::PragmaErr(format!("JSON error: {e}").into())
                 })?))
             }
 
-            GraftPragma::JsonInfo => {
-                let result = json_volume_info(runtime, file)?;
-                Ok(Some(serde_json::to_string(&result).map_err(|e| {
-                    ErrCtx::PragmaErr(format!("JSON error: {e}").into())
-                })?))
-            }
-
-            GraftPragma::TableLog { table } => {
-                let entries = table_log_entries(runtime, &file.vid, &table)?;
+            GraftPragma::VolumeTableLog { table } => {
+                let entries = table_log_entries(&runtime, &file.vid, &table)?;
                 if entries.is_empty() {
                     return Ok(Some(format!("No changes found for table '{table}'.")));
                 }
                 let mut f = String::new();
                 writeln!(&mut f, "Changes for table '{table}':")?;
-                writeln!(&mut f, "{:<6} {:<20} {:<10} DETAIL", "LSN", "WHEN", "CHANGES")?;
+                writeln!(
+                    &mut f,
+                    "{:<6} {:<20} {:<10} DETAIL",
+                    "LSN", "WHEN", "CHANGES"
+                )?;
                 writeln!(&mut f, "{}", "-".repeat(75))?;
                 for e in entries {
-                    writeln!(&mut f, "{:<6} {:<20} {:<10} {}",
-                        e.lsn, e.when, e.summary, e.detail)?;
+                    writeln!(
+                        &mut f,
+                        "{:<6} {:<20} {:<10} {}",
+                        e.lsn, e.when, e.summary, e.detail
+                    )?;
                 }
                 Ok(Some(f))
             }
 
-            GraftPragma::JsonTableLog { table } => {
-                let entries = table_log_entries(runtime, &file.vid, &table)?;
+            GraftPragma::VolumeJsonTableLog { table } => {
+                let entries = table_log_entries(&runtime, &file.vid, &table)?;
                 let json_entries: Vec<crate::json::JsonTableLogEntry> = entries
                     .iter()
                     .map(|e| crate::json::JsonTableLogEntry {
@@ -655,7 +1714,7 @@ impl GraftPragma {
                 })?))
             }
 
-            GraftPragma::SetMessage { message } => {
+            GraftPragma::VolumeSetMessage { message } => {
                 file.pending_message = Some(message.clone());
                 Ok(Some(format!("Commit message set: '{message}'")))
             }
@@ -667,6 +1726,2661 @@ macro_rules! pluralize {
     ($n:expr, $s:literal) => {
         if $n == 1 { $s } else { concat!($s, "s") }
     };
+}
+
+fn repo_for_file(file: &mut VolFile) -> Result<Repository, ErrCtx> {
+    if let Some(repo) = &file.repo {
+        return Ok(repo.clone());
+    }
+
+    if !should_discover_repo(&file.tag) {
+        return Err(ErrCtx::Repo(graft::repo::RepoErr::NotFound(PathBuf::from(
+            &file.tag,
+        ))));
+    }
+    let repo = Repository::discover_for_file(&file.tag)?;
+    file.repo = Some(repo.clone());
+    Ok(repo)
+}
+
+fn checkout_repo_head(
+    runtime: &Runtime,
+    file: &mut VolFile,
+    repo: &Repository,
+    remote: Option<Arc<Remote>>,
+) -> Result<(), ErrCtx> {
+    if let Some(state) = repo.head_file(&file.tag)? {
+        checkout_repo_file_state(runtime, file, &state, remote)?;
+    } else {
+        let volume = runtime.volume_open(None, None, None)?;
+        file.switch_volume(&volume.vid)?;
+    }
+    Ok(())
+}
+
+fn checkout_repo_plan(
+    runtime: &Runtime,
+    file: &mut VolFile,
+    repo: &Repository,
+    plan: &CheckoutPlan,
+    previous_files: &BTreeMap<String, CommitFileState>,
+    remote: Option<Arc<Remote>>,
+) -> Result<(), ErrCtx> {
+    let key = repo.file_key(&file.tag)?;
+    if let Some(state) = plan.files.get(&key) {
+        checkout_repo_file_state(runtime, file, state, remote.clone())?;
+    } else {
+        let volume = runtime.volume_open(None, None, None)?;
+        file.switch_volume(&volume.vid)?;
+    }
+    for (path, state) in &plan.files {
+        if path == &key {
+            continue;
+        }
+        checkout_repo_file_state_to_path(
+            runtime,
+            repo,
+            state,
+            &repo.worktree().join(path),
+            remote.clone(),
+        )?;
+    }
+    for path in previous_files.keys() {
+        if path == &key || plan.files.contains_key(path) {
+            continue;
+        }
+        remove_materialized_repo_file(repo, path)?;
+    }
+    Ok(())
+}
+
+fn current_repo_files_for_checkout(
+    repo: &Repository,
+) -> Result<BTreeMap<String, CommitFileState>, ErrCtx> {
+    match repo.index_files() {
+        Ok(files) => Ok(files),
+        Err(graft::repo::RepoErr::UnresolvedConflicts) => Ok(BTreeMap::new()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn remove_materialized_repo_file(repo: &Repository, key: &str) -> Result<(), ErrCtx> {
+    let path = repo.worktree().join(key);
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() {
+                return Err(ErrCtx::PragmaErr(
+                    format!(
+                        "path `{}` is not a regular SQLite database file",
+                        path.display()
+                    )
+                    .into(),
+                ));
+            }
+            std::fs::remove_file(path)?;
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+    Ok(())
+}
+
+fn restore_repo_path(
+    runtime: &Runtime,
+    file: &mut VolFile,
+    repo: &Repository,
+    spec: &RepoRestoreSpec,
+) -> Result<String, ErrCtx> {
+    let (key, physical_path) = repo_physical_path_arg(repo, &spec.path)?;
+    if spec.staged {
+        if let Some(source) = &spec.source {
+            repo.restore_index_path_from_revision(source, &physical_path)?;
+        } else {
+            repo.restore_index_path_from_head(&physical_path)?;
+        }
+        update_worktree_state_after_index_restore(runtime, file, repo, &physical_path)?;
+        return Ok(key);
+    }
+
+    let restored = if let Some(source) = &spec.source {
+        repo.file_from_revision(source, &physical_path)?
+    } else {
+        repo.index_file(&physical_path)?
+    };
+
+    if restored.is_none() {
+        let can_restore_deletion = if spec.source.is_some() {
+            repo.index_file(&physical_path)?.is_some()
+                || repo.index_has_entry(&physical_path)?
+                || repo.head_file(&physical_path)?.is_some()
+        } else {
+            repo.index_has_entry(&physical_path)?
+        };
+        if !can_restore_deletion {
+            return Err(ErrCtx::PragmaErr(
+                format!("path `{key}` is not tracked").into(),
+            ));
+        }
+    }
+
+    let current_key = repo.file_key(&file.tag)?;
+    if key == current_key {
+        if let Some(state) = &restored {
+            checkout_repo_file_state(runtime, file, state, None)?;
+        } else {
+            let volume = runtime.volume_open(None, None, None)?;
+            file.switch_volume(&volume.vid)?;
+        }
+    } else if let Some(state) = &restored {
+        checkout_repo_file_state_to_path(runtime, repo, state, &physical_path, None)?;
+    } else {
+        remove_materialized_repo_file(repo, &key)?;
+    }
+
+    update_restored_worktree_state(runtime, repo, &physical_path, restored.as_ref())?;
+    Ok(key)
+}
+
+fn export_repo_path(
+    runtime: &Runtime,
+    file: &VolFile,
+    repo: &Repository,
+    spec: &RepoExportSpec,
+) -> Result<String, ErrCtx> {
+    let path = spec.path.as_deref().unwrap_or_else(|| Path::new(&file.tag));
+    let (key, physical_path) = repo_physical_path_arg(repo, path)?;
+
+    if let Some(source) = &spec.source {
+        let state = repo
+            .file_from_revision(source, &physical_path)?
+            .ok_or_else(|| ErrCtx::Repo(graft::repo::RepoErr::PathNotTracked(key.clone())))?;
+        hydrate_repo_file_state(runtime, &state, None)?;
+        write_repo_file_state_to_path(runtime, &state, &spec.output)?;
+        return Ok(key);
+    }
+
+    let current_key = repo.file_key(&file.tag)?;
+    if key != current_key {
+        return Err(ErrCtx::PragmaErr(
+            format!(
+                "exporting worktree path `{key}` requires opening that database path or passing --source"
+            )
+            .into(),
+        ));
+    }
+
+    let reader = file.reader()?;
+    write_volume_reader_to_path(&reader, &spec.output)?;
+    Ok(key)
+}
+
+fn update_worktree_state_after_index_restore(
+    runtime: &Runtime,
+    file: &VolFile,
+    repo: &Repository,
+    path: &Path,
+) -> Result<(), ErrCtx> {
+    if repo.file_key(path)? != repo.file_key(&file.tag)? {
+        repo.clear_dirty_path(path)?;
+        return Ok(());
+    }
+
+    let worktree_state = current_repo_file_state(runtime, file)?;
+    let index_state = repo.index_file(path)?;
+    let matches_index = match index_state.as_ref() {
+        Some(index_state) => repo_file_state_content_eq(runtime, &worktree_state, index_state)?,
+        None => false,
+    };
+    if matches_index {
+        repo.clear_dirty_path(path)?;
+    } else {
+        repo.mark_dirty_path(path)?;
+    }
+    Ok(())
+}
+
+fn update_restored_worktree_state(
+    runtime: &Runtime,
+    repo: &Repository,
+    path: &Path,
+    restored: Option<&CommitFileState>,
+) -> Result<(), ErrCtx> {
+    let index_state = repo.index_file(path)?;
+    let matches_index = match (restored, index_state.as_ref()) {
+        (Some(restored), Some(index_state)) => {
+            repo_file_state_content_eq(runtime, restored, index_state)?
+        }
+        (None, None) => true,
+        _ => false,
+    };
+
+    if matches_index {
+        repo.clear_dirty_path(path)?;
+    } else if restored.is_none() {
+        repo.mark_deleted_path(path)?;
+    } else {
+        repo.mark_dirty_path(path)?;
+    }
+    Ok(())
+}
+
+fn checkout_repo_file_state(
+    runtime: &Runtime,
+    file: &mut VolFile,
+    state: &CommitFileState,
+    remote: Option<Arc<Remote>>,
+) -> Result<(), ErrCtx> {
+    let snapshot = state.snapshot.to_snapshot();
+    let volume = if snapshot.is_empty() {
+        runtime.volume_open(None, None, None)?
+    } else {
+        hydrate_repo_file_state(runtime, state, remote)?;
+        runtime.volume_from_snapshot(&snapshot)?
+    };
+    file.switch_volume(&volume.vid)?;
+    Ok(())
+}
+
+fn checkout_repo_file_state_to_path(
+    runtime: &Runtime,
+    repo: &Repository,
+    state: &CommitFileState,
+    path: &Path,
+    remote: Option<Arc<Remote>>,
+) -> Result<(), ErrCtx> {
+    let key = repo.file_key(path)?;
+    let path = repo.worktree().join(key);
+    if let Ok(metadata) = std::fs::symlink_metadata(&path)
+        && !metadata.file_type().is_file()
+    {
+        return Err(ErrCtx::PragmaErr(
+            format!(
+                "path `{}` is not a regular SQLite database file",
+                path.display()
+            )
+            .into(),
+        ));
+    }
+
+    hydrate_repo_file_state(runtime, state, remote)?;
+    write_repo_file_state_to_path(runtime, state, &path)
+}
+
+fn write_empty_sqlite_file_to_path(path: &Path) -> Result<(), ErrCtx> {
+    write_sqlite_file_to_path(path, |_| Ok(()))
+}
+
+fn write_volume_reader_to_path<R: VolumeRead>(reader: &R, path: &Path) -> Result<(), ErrCtx> {
+    write_sqlite_file_to_path(path, |output| {
+        for page_idx in reader.page_count().iter() {
+            let page = reader.read_page(page_idx)?;
+            output.write_all(page.as_ref())?;
+        }
+        Ok(())
+    })
+}
+
+fn write_sqlite_file_to_path(
+    path: &Path,
+    mut write_contents: impl FnMut(&mut File) -> Result<(), ErrCtx>,
+) -> Result<(), ErrCtx> {
+    if let Ok(metadata) = std::fs::symlink_metadata(path)
+        && !metadata.file_type().is_file()
+    {
+        return Err(ErrCtx::PragmaErr(
+            format!(
+                "path `{}` is not a regular SQLite database file",
+                path.display()
+            )
+            .into(),
+        ));
+    }
+
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+
+    let started_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    for attempt in 0..100 {
+        let tmp = parent.join(format!(
+            ".graft-checkout-{}-{started_ms}-{attempt}",
+            std::process::id()
+        ));
+        if tmp.exists() {
+            continue;
+        }
+
+        let write_result = (|| -> Result<(), ErrCtx> {
+            let mut output = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)?;
+            write_contents(&mut output)?;
+            output.flush()?;
+            Ok(())
+        })();
+
+        match write_result.and_then(|()| {
+            std::fs::rename(&tmp, path)?;
+            Ok(())
+        }) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(err);
+            }
+        }
+    }
+
+    Err(ErrCtx::PragmaErr(
+        format!(
+            "could not create temporary checkout file for `{}`",
+            path.display()
+        )
+        .into(),
+    ))
+}
+
+fn write_repo_file_state_to_path(
+    runtime: &Runtime,
+    state: &CommitFileState,
+    path: &Path,
+) -> Result<(), ErrCtx> {
+    let snapshot = state.snapshot.to_snapshot();
+    if snapshot.is_empty() {
+        return write_empty_sqlite_file_to_path(path);
+    }
+    let volume = runtime.volume_from_snapshot(&snapshot)?;
+    let reader = runtime.volume_reader(volume.vid)?;
+    write_volume_reader_to_path(&reader, path)
+}
+
+fn checkout_merge_outcome(
+    runtime: &Runtime,
+    file: &mut VolFile,
+    repo: &Repository,
+    outcome: &MergeOutcome,
+    fast_forward_plan: Option<&CheckoutPlan>,
+    previous_files: &BTreeMap<String, CommitFileState>,
+    remote: Option<Arc<Remote>>,
+) -> Result<(), ErrCtx> {
+    match outcome {
+        MergeOutcome::FastForward { .. } => {
+            if let Some(plan) = fast_forward_plan {
+                checkout_repo_plan(runtime, file, repo, plan, previous_files, remote)?;
+            } else {
+                checkout_repo_head(runtime, file, repo, remote)?;
+            }
+        }
+        MergeOutcome::Merged { staged, conflicted, .. } if conflicted.is_empty() => {
+            let key = repo.file_key(&file.tag)?;
+            let index = repo.read_index()?;
+            for entry in index.stage0_entries() {
+                if !staged.iter().any(|path| path == &entry.path) {
+                    continue;
+                }
+
+                if entry.path == key {
+                    if let Some(state) = &entry.file {
+                        checkout_repo_file_state(runtime, file, state, remote.clone())?;
+                    } else {
+                        let volume = runtime.volume_open(None, None, None)?;
+                        file.switch_volume(&volume.vid)?;
+                    }
+                } else if let Some(state) = &entry.file {
+                    checkout_repo_file_state_to_path(
+                        runtime,
+                        repo,
+                        state,
+                        &repo.worktree().join(&entry.path),
+                        remote.clone(),
+                    )?;
+                } else {
+                    remove_materialized_repo_file(repo, &entry.path)?;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn hydrate_repo_file_state(
+    runtime: &Runtime,
+    state: &CommitFileState,
+    remote: Option<Arc<Remote>>,
+) -> Result<(), ErrCtx> {
+    let snapshot = state.snapshot.to_snapshot();
+    if snapshot.is_empty() {
+        return Ok(());
+    }
+    if let Some(remote) = remote {
+        runtime.snapshot_hydrate_from(snapshot, remote)?;
+    } else {
+        for range in &state.snapshot.ranges {
+            runtime.fetch_log(range.log.clone(), Some(range.end))?;
+        }
+        runtime.snapshot_hydrate(snapshot)?;
+    }
+    verify_repo_file_state_commit_hashes(runtime, state)?;
+    Ok(())
+}
+
+fn verify_repo_checkout_plan(
+    runtime: &Runtime,
+    plan: &CheckoutPlan,
+    remote: Option<Arc<Remote>>,
+) -> Result<(), ErrCtx> {
+    for state in plan.files.values() {
+        hydrate_repo_file_state(runtime, state, remote.clone())?;
+    }
+    Ok(())
+}
+
+fn verify_repo_merge_plan(
+    runtime: &Runtime,
+    plan: &MergePlan,
+    remote: Option<Arc<Remote>>,
+) -> Result<(), ErrCtx> {
+    if matches!(plan.outcome, MergeOutcome::FastForward { .. }) {
+        verify_repo_checkout_plan(runtime, &plan.checkout, remote.clone())?;
+    }
+    if let Some(index) = &plan.index {
+        for entry in index.stage0_entries() {
+            if let Some(state) = &entry.file {
+                hydrate_repo_file_state(runtime, state, remote.clone())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_repo_file_state_commit_hashes(
+    runtime: &Runtime,
+    state: &CommitFileState,
+) -> Result<(), ErrCtx> {
+    for range in &state.snapshot.ranges {
+        let mut expected_commits = range.commits.iter();
+        for lsn in (range.start..=range.end).iter() {
+            let Some(expected) = expected_commits.next() else {
+                return Err(ErrCtx::PragmaErr(
+                    format!(
+                        "snapshot references missing storage commit hash for {:?}/{}",
+                        range.log, lsn
+                    )
+                    .into(),
+                ));
+            };
+            if expected.lsn != lsn {
+                if expected.lsn > lsn {
+                    return Err(ErrCtx::PragmaErr(
+                        format!(
+                            "snapshot references missing storage commit hash for {:?}/{}",
+                            range.log, lsn
+                        )
+                        .into(),
+                    ));
+                }
+                return Err(ErrCtx::PragmaErr(
+                    format!(
+                        "snapshot storage commit hash out of order for {:?}: expected LSN {}, got {}",
+                        range.log, lsn, expected.lsn
+                    )
+                    .into(),
+                ));
+            }
+            let Some(actual) = repo_storage_commit_hash(runtime, &range.log, lsn)? else {
+                return Err(ErrCtx::PragmaErr(
+                    format!(
+                        "snapshot references missing storage commit {:?}/{}",
+                        range.log, lsn
+                    )
+                    .into(),
+                ));
+            };
+            if actual != expected.commit_hash {
+                return Err(ErrCtx::PragmaErr(
+                    format!(
+                        "snapshot storage commit hash mismatch for {:?}/{}: expected {}, got {}",
+                        range.log, lsn, expected.commit_hash, actual
+                    )
+                    .into(),
+                ));
+            }
+        }
+        if let Some(extra) = expected_commits.next() {
+            return Err(ErrCtx::PragmaErr(
+                format!(
+                    "snapshot references extra storage commit hash for {:?}/{} outside {}..={}",
+                    range.log, extra.lsn, range.start, range.end
+                )
+                .into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn repo_storage_commit_hash(
+    runtime: &Runtime,
+    log: &LogId,
+    lsn: LSN,
+) -> Result<Option<graft::core::commit_hash::CommitHash>, ErrCtx> {
+    let Some(commit) = runtime.get_commit(log, lsn)? else {
+        return Ok(None);
+    };
+    if let Some(commit_hash) = commit.commit_hash().cloned() {
+        return Ok(Some(commit_hash));
+    }
+    runtime.commit_hash(log, lsn).map_err(ErrCtx::from)
+}
+
+fn publish_repo_branch_snapshots(
+    runtime: &Runtime,
+    repo: &Repository,
+    remote: &str,
+    branch: &str,
+) -> Result<(), ErrCtx> {
+    let remote = Arc::new(repo.remote_store(remote)?);
+    let mut stack = vec![
+        repo.branch_target(branch)?
+            .ok_or(ErrCtx::Repo(graft::repo::RepoErr::UnbornHead))?,
+    ];
+    let mut seen = std::collections::BTreeSet::<String>::new();
+
+    while let Some(next) = stack.pop() {
+        if !seen.insert(next.clone()) {
+            continue;
+        }
+        let commit = repo.read_commit(&next)?;
+        for state in commit.files.values() {
+            let snapshot = state.snapshot.to_snapshot();
+            if snapshot.is_empty() {
+                continue;
+            }
+            hydrate_repo_file_state(runtime, state, None)?;
+            runtime.snapshot_push_to(snapshot, remote.clone())?;
+        }
+
+        if commit.parents.is_empty() {
+            if let Some(parent) = commit.parent {
+                stack.push(parent);
+            }
+        } else {
+            stack.extend(commit.parents);
+        }
+    }
+
+    Ok(())
+}
+
+fn publish_repo_all_branch_snapshots(
+    runtime: &Runtime,
+    repo: &Repository,
+    remote: &str,
+) -> Result<(), ErrCtx> {
+    for branch in repo.branches()? {
+        if branch.target.is_some() {
+            publish_repo_branch_snapshots(runtime, repo, remote, &branch.name)?;
+        }
+    }
+    Ok(())
+}
+
+fn parse_remote_add(arg: &str) -> Result<(String, RemoteConfig), PragmaErr> {
+    let (name, uri) = arg
+        .split_once(char::is_whitespace)
+        .ok_or_else(|| pragma_fail("argument must be in the form: `name remote-uri`"))?;
+    Ok((
+        name.trim().to_string(),
+        parse_remote_config_uri(uri.trim())?,
+    ))
+}
+
+fn parse_remote_rename(arg: &str) -> Result<(String, String), PragmaErr> {
+    let parts: Vec<&str> = arg.split_whitespace().collect();
+    match parts.as_slice() {
+        [old, new] => Ok(((*old).to_string(), (*new).to_string())),
+        _ => Err(pragma_fail("argument must be in the form: `old new`")),
+    }
+}
+
+fn parse_repo_clone_arg(arg: &str) -> Result<RepoCloneSpec, PragmaErr> {
+    let parts: Vec<&str> = arg.split_whitespace().collect();
+    let (uri, branch) = match parts.as_slice() {
+        [uri] => (*uri, None),
+        [uri, branch] => (*uri, Some(*branch)),
+        ["--branch" | "-b", branch, uri] => (*uri, Some(*branch)),
+        _ => {
+            return Err(pragma_fail(
+                "argument must be in the form: `remote-uri [branch]` or `--branch branch remote-uri`",
+            ));
+        }
+    };
+    if branch.is_some_and(str::is_empty) {
+        return Err(pragma_fail("branch name must not be empty"));
+    }
+    Ok(RepoCloneSpec {
+        config: parse_remote_config_uri(uri)?,
+        branch: branch.map(str::to_string),
+    })
+}
+
+fn parse_remote_config_uri(uri: &str) -> Result<RemoteConfig, PragmaErr> {
+    if uri.is_empty() {
+        return Err(pragma_fail("remote URI must not be empty"));
+    }
+
+    Ok(if uri == "memory" {
+        RemoteConfig::Memory
+    } else if let Some(root) = uri.strip_prefix("fs://") {
+        RemoteConfig::Fs { root: root.to_string() }
+    } else if let Some(rest) = uri
+        .strip_prefix("s3://")
+        .or_else(|| uri.strip_prefix("s3_compatible://"))
+    {
+        let (path, endpoint) = parse_s3_remote_uri_query(rest)?;
+        let (bucket, prefix) = path
+            .split_once('/')
+            .map_or((path, None), |(bucket, prefix)| (bucket, Some(prefix)));
+        if bucket.is_empty() {
+            return Err(pragma_fail("S3 remote URI must include a bucket"));
+        }
+        RemoteConfig::S3Compatible {
+            bucket: bucket.to_string(),
+            prefix: prefix
+                .filter(|prefix| !prefix.is_empty())
+                .map(ToString::to_string),
+            endpoint,
+        }
+    } else {
+        return Err(pragma_fail(
+            "remote URI must start with memory, fs://, s3://, or s3_compatible://",
+        ));
+    })
+}
+
+fn parse_s3_remote_uri_query(uri: &str) -> Result<(&str, Option<String>), PragmaErr> {
+    let (path, query) = uri
+        .split_once('?')
+        .map_or((uri, ""), |(path, query)| (path, query));
+    if query.is_empty() {
+        return Ok((path, None));
+    }
+
+    let mut endpoint = None;
+    for part in query.split('&').filter(|part| !part.is_empty()) {
+        let (key, value) = part
+            .split_once('=')
+            .map_or((part, ""), |(key, value)| (key, value));
+        match key {
+            "endpoint" => {
+                if value.is_empty() {
+                    return Err(pragma_fail("S3 remote endpoint must not be empty"));
+                }
+                if endpoint.replace(value.to_string()).is_some() {
+                    return Err(pragma_fail("S3 remote endpoint specified more than once"));
+                }
+            }
+            _ => {
+                return Err(pragma_fail(format!(
+                    "unsupported S3 remote URI query parameter `{key}`"
+                )));
+            }
+        }
+    }
+
+    Ok((path, endpoint))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemoteBranchArg {
+    remote: Option<String>,
+    branch: Option<String>,
+    refspec: Option<String>,
+    all: bool,
+    force: bool,
+}
+
+fn parse_remote_branch_arg(arg: Option<&str>) -> Result<RemoteBranchArg, PragmaErr> {
+    let Some(arg) = arg else {
+        return Ok(RemoteBranchArg {
+            remote: None,
+            branch: None,
+            refspec: None,
+            all: false,
+            force: false,
+        });
+    };
+    let mut all = false;
+    let mut force = false;
+    let mut positional = Vec::new();
+    for part in arg.split_whitespace() {
+        match part {
+            "--all" => all = true,
+            "--force" | "-f" => force = true,
+            part => positional.push(part),
+        }
+    }
+
+    if all {
+        return match positional.as_slice() {
+            [] => Ok(RemoteBranchArg {
+                remote: None,
+                branch: None,
+                refspec: None,
+                all,
+                force,
+            }),
+            [remote] => Ok(RemoteBranchArg {
+                remote: Some((*remote).to_string()),
+                branch: None,
+                refspec: None,
+                all,
+                force,
+            }),
+            _ => Err(pragma_fail(
+                "argument must be in the form: `[--force] [remote] [branch]` or `[--force] --all [remote]`",
+            )),
+        };
+    }
+
+    match positional.as_slice() {
+        [] => Ok(RemoteBranchArg {
+            remote: None,
+            branch: None,
+            refspec: None,
+            all,
+            force,
+        }),
+        [remote_or_refspec] if looks_like_refspec(remote_or_refspec) => Ok(RemoteBranchArg {
+            remote: None,
+            branch: None,
+            refspec: Some((*remote_or_refspec).to_string()),
+            all,
+            force,
+        }),
+        [remote] => Ok(RemoteBranchArg {
+            remote: Some((*remote).to_string()),
+            branch: None,
+            refspec: None,
+            all,
+            force,
+        }),
+        [remote, branch_or_refspec] if looks_like_refspec(branch_or_refspec) => {
+            Ok(RemoteBranchArg {
+                remote: Some((*remote).to_string()),
+                branch: None,
+                refspec: Some((*branch_or_refspec).to_string()),
+                all,
+                force,
+            })
+        }
+        [remote, branch] => Ok(RemoteBranchArg {
+            remote: Some((*remote).to_string()),
+            branch: Some((*branch).to_string()),
+            refspec: None,
+            all,
+            force,
+        }),
+        _ => Err(pragma_fail(
+            "argument must be in the form: `[--force] [remote] [branch]` or `[--force] --all [remote]`",
+        )),
+    }
+}
+
+fn looks_like_refspec(value: &str) -> bool {
+    let value = value.strip_prefix('+').unwrap_or(value);
+    value.contains(':') || value.contains('*') || value.starts_with("refs/")
+}
+
+fn parse_repo_diff_arg(arg: Option<&str>) -> Result<RepoDiffSpec, PragmaErr> {
+    let Some(arg) = arg else {
+        return Ok(RepoDiffSpec::Worktree { path: None });
+    };
+    let parts: Vec<&str> = arg.split_whitespace().collect();
+    match parts.as_slice() {
+        [] => Ok(RepoDiffSpec::Worktree { path: None }),
+        ["--", path @ ..] if !path.is_empty() => {
+            Ok(RepoDiffSpec::Worktree { path: Some(path.join(" ")) })
+        }
+        ["--staged"] | ["--cached"] => Ok(RepoDiffSpec::Staged { path: None }),
+        ["--staged", "--", path @ ..] | ["--cached", "--", path @ ..] if !path.is_empty() => {
+            Ok(RepoDiffSpec::Staged { path: Some(path.join(" ")) })
+        }
+        [rev] => Ok(RepoDiffSpec::RevisionToWorktree { rev: (*rev).to_string(), path: None }),
+        [rev, "--", path @ ..] if !path.is_empty() => Ok(RepoDiffSpec::RevisionToWorktree {
+            rev: (*rev).to_string(),
+            path: Some(path.join(" ")),
+        }),
+        [from, to] => Ok(RepoDiffSpec::Revisions {
+            from: (*from).to_string(),
+            to: (*to).to_string(),
+            path: None,
+        }),
+        [from, to, "--", path @ ..] if !path.is_empty() => Ok(RepoDiffSpec::Revisions {
+            from: (*from).to_string(),
+            to: (*to).to_string(),
+            path: Some(path.join(" ")),
+        }),
+        _ => Err(pragma_fail(
+            "argument must be in the form: `[--staged] [rev] [rev] [-- path]`",
+        )),
+    }
+}
+
+fn parse_volume_diff_arg(arg: &str) -> Result<(LSN, LSN, DiffMode), PragmaErr> {
+    let parts: Vec<&str> = arg.split(',').collect();
+    if parts.len() < 2 || parts.len() > 3 {
+        return Err(pragma_fail(
+            "argument must be in the form: `from_lsn,to_lsn[,mode]`",
+        ));
+    }
+    let mode = if parts.len() == 3 {
+        match parts[2] {
+            "rows" => DiffMode::Rows,
+            _ => return Err(pragma_fail("mode must be 'rows' or omitted")),
+        }
+    } else {
+        DiffMode::Default
+    };
+    Ok((parse_or_fail(parts[0])?, parse_or_fail(parts[1])?, mode))
+}
+
+fn parse_debug_diff_lsn_arg(arg: &str) -> Result<(LogRef, LogRef), PragmaErr> {
+    let parts: Vec<&str> = arg.split_whitespace().collect();
+    match parts.as_slice() {
+        [from, to] => Ok((parse_or_fail(from)?, parse_or_fail(to)?)),
+        _ => Err(pragma_fail(
+            "argument must be in the form: `from_log:from_lsn to_log:to_lsn`",
+        )),
+    }
+}
+
+fn parse_repo_checkout_arg(arg: &str) -> Result<RepoCheckoutSpec, PragmaErr> {
+    let parts: Vec<&str> = arg.split_whitespace().collect();
+    match parts.as_slice() {
+        [rev] => Ok(RepoCheckoutSpec::Detach { rev: (*rev).to_string(), force: false }),
+        ["--force" | "-f", rev] => {
+            Ok(RepoCheckoutSpec::Detach { rev: (*rev).to_string(), force: true })
+        }
+        [rev, "--", path @ ..] if !path.is_empty() => Ok(RepoCheckoutSpec::Path {
+            rev: (*rev).to_string(),
+            path: path.join(" "),
+        }),
+        _ => Err(pragma_fail(
+            "argument must be in the form: `[--force] rev [-- path]`",
+        )),
+    }
+}
+
+fn parse_repo_restore_arg(arg: &str) -> Result<RepoRestoreSpec, PragmaErr> {
+    let parts: Vec<&str> = arg.split_whitespace().collect();
+    match parts.as_slice() {
+        [
+            "--staged" | "--cached",
+            "--source" | "-s",
+            source,
+            "--",
+            path @ ..,
+        ]
+        | [
+            "--source" | "-s",
+            source,
+            "--staged" | "--cached",
+            "--",
+            path @ ..,
+        ] if !path.is_empty() => Ok(RepoRestoreSpec {
+            source: Some((*source).to_string()),
+            staged: true,
+            path: PathBuf::from(path.join(" ")),
+        }),
+        [
+            "--staged" | "--cached",
+            "--source" | "-s",
+            source,
+            path @ ..,
+        ]
+        | [
+            "--source" | "-s",
+            source,
+            "--staged" | "--cached",
+            path @ ..,
+        ] if !path.is_empty() => Ok(RepoRestoreSpec {
+            source: Some((*source).to_string()),
+            staged: true,
+            path: PathBuf::from(path.join(" ")),
+        }),
+        ["--staged" | "--cached", "--", path @ ..] if !path.is_empty() => Ok(RepoRestoreSpec {
+            source: None,
+            staged: true,
+            path: PathBuf::from(path.join(" ")),
+        }),
+        ["--staged" | "--cached", path @ ..] if !path.is_empty() => Ok(RepoRestoreSpec {
+            source: None,
+            staged: true,
+            path: PathBuf::from(path.join(" ")),
+        }),
+        ["--source" | "-s", source, "--", path @ ..] if !path.is_empty() => Ok(RepoRestoreSpec {
+            source: Some((*source).to_string()),
+            staged: false,
+            path: PathBuf::from(path.join(" ")),
+        }),
+        ["--source" | "-s", source, path @ ..] if !path.is_empty() => Ok(RepoRestoreSpec {
+            source: Some((*source).to_string()),
+            staged: false,
+            path: PathBuf::from(path.join(" ")),
+        }),
+        ["--", path @ ..] if !path.is_empty() => Ok(RepoRestoreSpec {
+            source: None,
+            staged: false,
+            path: PathBuf::from(path.join(" ")),
+        }),
+        path @ [_first, ..] => Ok(RepoRestoreSpec {
+            source: None,
+            staged: false,
+            path: PathBuf::from(path.join(" ")),
+        }),
+        _ => Err(pragma_fail(
+            "argument must be in the form: `[--staged] [--source rev] path`",
+        )),
+    }
+}
+
+fn split_pragma_words(arg: &str) -> Result<Vec<String>, PragmaErr> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut in_word = false;
+
+    for ch in arg.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            in_word = true;
+            continue;
+        }
+
+        if ch == '\\' {
+            escaped = true;
+            in_word = true;
+            continue;
+        }
+
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            } else {
+                current.push(ch);
+            }
+            in_word = true;
+            continue;
+        }
+
+        match ch {
+            '\'' | '"' => {
+                quote = Some(ch);
+                in_word = true;
+            }
+            ch if ch.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut current));
+                    in_word = false;
+                }
+            }
+            ch => {
+                current.push(ch);
+                in_word = true;
+            }
+        }
+    }
+
+    if escaped {
+        current.push('\\');
+    }
+    if quote.is_some() {
+        return Err(pragma_fail("unterminated quoted argument"));
+    }
+    if in_word {
+        words.push(current);
+    }
+    Ok(words)
+}
+
+fn parse_repo_export_arg(arg: &str) -> Result<RepoExportSpec, PragmaErr> {
+    let mut source = None;
+    let mut output = None;
+    let mut path = Vec::new();
+    let mut after_path_separator = false;
+    let mut parts = split_pragma_words(arg)?.into_iter().peekable();
+
+    while let Some(part) = parts.next() {
+        match part.as_str() {
+            "--source" | "-s" if !after_path_separator => {
+                if source.is_some() {
+                    return Err(pragma_fail("export accepts only one source revision"));
+                }
+                let Some(value) = parts.next() else {
+                    return Err(pragma_fail("export --source requires a revision"));
+                };
+                source = Some(value);
+            }
+            "--output" | "-o" if !after_path_separator => {
+                if output.is_some() {
+                    return Err(pragma_fail("export accepts only one output path"));
+                }
+                let Some(value) = parts.next() else {
+                    return Err(pragma_fail("export --output requires a path"));
+                };
+                output = Some(PathBuf::from(value));
+            }
+            "--" if !after_path_separator => {
+                after_path_separator = true;
+            }
+            value if value.starts_with('-') && !after_path_separator => {
+                return Err(pragma_fail(format!("unknown export option `{value}`")));
+            }
+            _ => {
+                path.push(part);
+                if after_path_separator {
+                    path.extend(parts);
+                    break;
+                }
+            }
+        }
+    }
+
+    let Some(output) = output else {
+        return Err(pragma_fail(
+            "argument must be in the form: `[--source rev] --output output.db [-- path]`",
+        ));
+    };
+
+    Ok(RepoExportSpec {
+        source,
+        path: (!path.is_empty()).then(|| PathBuf::from(path.join(" "))),
+        output,
+    })
+}
+
+fn parse_repo_resolve_arg(arg: &str) -> Result<RepoResolveSpec, PragmaErr> {
+    let mut side = None;
+    let mut path = Vec::new();
+
+    for part in arg.split_whitespace() {
+        match part {
+            "--ours" => {
+                if side.replace(ResolveSide::Ours).is_some() {
+                    return Err(pragma_fail("resolve accepts only one side"));
+                }
+            }
+            "--theirs" => {
+                if side.replace(ResolveSide::Theirs).is_some() {
+                    return Err(pragma_fail("resolve accepts only one side"));
+                }
+            }
+            value => path.push(value),
+        }
+    }
+
+    let Some(side) = side else {
+        return Err(pragma_fail("argument must include `--ours` or `--theirs`"));
+    };
+
+    Ok(RepoResolveSpec {
+        side,
+        path: (!path.is_empty()).then(|| PathBuf::from(path.join(" "))),
+    })
+}
+
+fn parse_branch_delete_arg(arg: &str) -> Result<(String, bool), PragmaErr> {
+    let parts: Vec<&str> = arg.split_whitespace().collect();
+    match parts.as_slice() {
+        [name] => Ok(((*name).to_string(), false)),
+        ["--force", name] | ["-D", name] | ["-f", name] => Ok(((*name).to_string(), true)),
+        _ => Err(pragma_fail(
+            "argument must be in the form: `[--force] name`",
+        )),
+    }
+}
+
+fn parse_branch_list_mode(arg: Option<&str>) -> Result<BranchListMode, PragmaErr> {
+    match arg.map(str::trim).filter(|arg| !arg.is_empty()) {
+        None => Ok(BranchListMode::Local),
+        Some("-r" | "--remote" | "--remotes") => Ok(BranchListMode::Remote),
+        Some("-a" | "--all") => Ok(BranchListMode::All),
+        Some(_) => Err(pragma_fail(
+            "argument must be one of: `--remote`, `-r`, `--all`, `-a`",
+        )),
+    }
+}
+
+fn parse_branch_rename_arg(arg: &str) -> Result<(Option<String>, String, bool), PragmaErr> {
+    let parts: Vec<&str> = arg.split_whitespace().collect();
+    match parts.as_slice() {
+        [new] => Ok((None, (*new).to_string(), false)),
+        ["--force" | "-M" | "-f", new] => Ok((None, (*new).to_string(), true)),
+        ["--force" | "-M" | "-f", old, new] => {
+            Ok((Some((*old).to_string()), (*new).to_string(), true))
+        }
+        [old, new] => Ok((Some((*old).to_string()), (*new).to_string(), false)),
+        _ => Err(pragma_fail(
+            "argument must be in the form: `[--force] [old] new`",
+        )),
+    }
+}
+
+fn parse_branch_upstream_arg(arg: &str) -> Result<(Option<String>, String, String), PragmaErr> {
+    let parts: Vec<&str> = arg.split_whitespace().collect();
+    match parts.as_slice() {
+        [upstream] => {
+            let (remote, branch) = parse_remote_branch_ref(upstream)?;
+            Ok((None, remote, branch))
+        }
+        [branch, upstream] => {
+            let (remote, remote_branch) = parse_remote_branch_ref(upstream)?;
+            Ok((Some((*branch).to_string()), remote, remote_branch))
+        }
+        _ => Err(pragma_fail(
+            "argument must be in the form: `[branch] remote/branch`",
+        )),
+    }
+}
+
+fn parse_remote_branch_ref(value: &str) -> Result<(String, String), PragmaErr> {
+    let Some((remote, branch)) = value.split_once('/') else {
+        return Err(pragma_fail("upstream must be in the form: `remote/branch`"));
+    };
+    if remote.is_empty() || branch.is_empty() {
+        return Err(pragma_fail("upstream must be in the form: `remote/branch`"));
+    }
+    Ok((remote.to_string(), branch.to_string()))
+}
+
+fn parse_branch_create_arg(arg: &str) -> Result<(String, Option<String>), PragmaErr> {
+    let parts: Vec<&str> = arg.split_whitespace().collect();
+    match parts.as_slice() {
+        [name] => Ok(((*name).to_string(), None)),
+        [name, start_point] => Ok(((*name).to_string(), Some((*start_point).to_string()))),
+        _ => Err(pragma_fail(
+            "argument must be in the form: `name [start-point]`",
+        )),
+    }
+}
+
+fn parse_switch_branch_arg(arg: &str) -> Result<(String, bool), PragmaErr> {
+    let parts: Vec<&str> = arg.split_whitespace().collect();
+    match parts.as_slice() {
+        [name] => Ok(((*name).to_string(), false)),
+        ["--force" | "-f", name] => Ok(((*name).to_string(), true)),
+        _ => Err(pragma_fail(
+            "argument must be in the form: `[--force] name`",
+        )),
+    }
+}
+
+fn parse_switch_create_arg(arg: &str) -> Result<(String, Option<String>, bool), PragmaErr> {
+    let parts: Vec<&str> = arg.split_whitespace().collect();
+    match parts.as_slice() {
+        [name] => Ok(((*name).to_string(), None, false)),
+        ["--force" | "-f", name] => Ok(((*name).to_string(), None, true)),
+        ["--force" | "-f", name, start_point] => {
+            Ok(((*name).to_string(), Some((*start_point).to_string()), true))
+        }
+        [name, start_point] => Ok(((*name).to_string(), Some((*start_point).to_string()), false)),
+        _ => Err(pragma_fail(
+            "argument must be in the form: `[--force] name [start-point]`",
+        )),
+    }
+}
+
+fn parse_tag_create_arg(arg: &str) -> Result<(String, Option<String>, Option<String>), PragmaErr> {
+    let arg = arg.trim();
+    if let Some(rest) = arg
+        .strip_prefix("--annotated ")
+        .or_else(|| arg.strip_prefix("-a "))
+    {
+        let Some((spec, message)) = rest.split_once(" -- ") else {
+            return Err(pragma_fail(
+                "annotated tag argument must be in the form: `--annotated name [rev] -- message`",
+            ));
+        };
+        let message = message.trim();
+        if message.is_empty() {
+            return Err(pragma_fail("annotated tag message cannot be empty"));
+        }
+        let parts: Vec<&str> = spec.split_whitespace().collect();
+        return match parts.as_slice() {
+            [name] => Ok(((*name).to_string(), None, Some(message.to_string()))),
+            [name, target] => Ok((
+                (*name).to_string(),
+                Some((*target).to_string()),
+                Some(message.to_string()),
+            )),
+            _ => Err(pragma_fail(
+                "annotated tag argument must be in the form: `--annotated name [rev] -- message`",
+            )),
+        };
+    }
+
+    let parts: Vec<&str> = arg.split_whitespace().collect();
+    match parts.as_slice() {
+        [name] => Ok(((*name).to_string(), None, None)),
+        [name, target] => Ok(((*name).to_string(), Some((*target).to_string()), None)),
+        _ => Err(pragma_fail("argument must be in the form: `name [rev]`")),
+    }
+}
+
+fn parse_repo_reset_arg(arg: &str) -> Result<(ResetMode, String), PragmaErr> {
+    let parts: Vec<&str> = arg.split_whitespace().collect();
+    match parts.as_slice() {
+        [rev] => Ok((ResetMode::Mixed, (*rev).to_string())),
+        ["--soft", rev] => Ok((ResetMode::Soft, (*rev).to_string())),
+        ["--mixed", rev] => Ok((ResetMode::Mixed, (*rev).to_string())),
+        ["--hard", rev] => Ok((ResetMode::Hard, (*rev).to_string())),
+        _ => Err(pragma_fail(
+            "argument must be in the form: `[--soft|--mixed|--hard] rev`",
+        )),
+    }
+}
+
+fn repo_diff_path(repo: &Repository, path: Option<&str>) -> Result<Option<String>, ErrCtx> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    Ok(Some(repo_path_arg(repo, path)?))
+}
+
+fn repo_path_arg(repo: &Repository, path: &str) -> Result<String, ErrCtx> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Ok(String::new());
+    }
+    let path_obj = Path::new(path);
+    if path_obj.is_absolute() {
+        return Ok(repo.file_key(path_obj)?);
+    }
+    Ok(path.trim_start_matches("./").replace('\\', "/"))
+}
+
+fn repo_physical_path_arg(repo: &Repository, path: &Path) -> Result<(String, PathBuf), ErrCtx> {
+    let physical_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        repo.worktree().join(path)
+    };
+    let key = repo.file_key(&physical_path)?;
+    Ok((key.clone(), repo.worktree().join(key)))
+}
+
+fn remove_physical_sqlite_file(repo: &Repository, key: &str, path: &Path) -> Result<(), ErrCtx> {
+    if repo.head_file(path)?.is_none() {
+        return Err(ErrCtx::Repo(graft::repo::RepoErr::PathNotTracked(
+            key.to_string(),
+        )));
+    }
+
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() {
+                return Err(ErrCtx::PragmaErr(
+                    format!(
+                        "path `{}` is not a regular SQLite database file",
+                        path.display()
+                    )
+                    .into(),
+                ));
+            }
+            std::fs::remove_file(path)?;
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+
+    Ok(())
+}
+
+fn stage_physical_sqlite_file(
+    runtime: &Runtime,
+    repo: &Repository,
+    key: &str,
+    path: &Path,
+) -> Result<graft::repo::index::IndexEntry, ErrCtx> {
+    let state = import_physical_sqlite_file_state(runtime, path)?;
+    let entry = repo.stage_file_state_path(repo.worktree().join(key), state)?;
+    Ok(entry)
+}
+
+fn import_physical_sqlite_file_state(
+    runtime: &Runtime,
+    path: &Path,
+) -> Result<CommitFileState, ErrCtx> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        return Err(ErrCtx::PragmaErr(
+            format!(
+                "path `{}` is not a regular SQLite database file",
+                path.display()
+            )
+            .into(),
+        ));
+    }
+
+    if metadata.len() < 100 {
+        return Err(ErrCtx::PragmaErr(
+            format!("path `{}` is not a SQLite database", path.display()).into(),
+        ));
+    }
+
+    let mut input = File::open(path)?;
+    let mut header = [0_u8; 100];
+    input.read_exact(&mut header)?;
+    if &header[..SQLITE_DATABASE_MAGIC.len()] != SQLITE_DATABASE_MAGIC {
+        return Err(ErrCtx::PragmaErr(
+            format!("path `{}` is not a SQLite database", path.display()).into(),
+        ));
+    }
+
+    let sqlite_page_size = sqlite_page_size_from_header(&header);
+    let graft_page_size = PAGESIZE.as_usize() as u32;
+    if sqlite_page_size != graft_page_size {
+        return Err(ErrCtx::PragmaErr(format!(
+            "can only add SQLite databases with {graft_page_size}-byte pages directly; \
+             `{}` uses {sqlite_page_size}-byte pages. Use VACUUM INTO with the Graft VFS to import it.",
+            path.display()
+        ).into()));
+    }
+
+    let page_size = PAGESIZE.as_usize();
+    if metadata.len() % page_size as u64 != 0 {
+        return Err(ErrCtx::PragmaErr(
+            format!(
+                "SQLite database `{}` is not an even multiple of {page_size} bytes",
+                path.display()
+            )
+            .into(),
+        ));
+    }
+
+    let page_count = metadata.len() / page_size as u64;
+    let page_count_u32 = u32::try_from(page_count).map_err(|_| {
+        ErrCtx::PragmaErr(
+            format!(
+                "SQLite database `{}` has too many pages to import",
+                path.display()
+            )
+            .into(),
+        )
+    })?;
+
+    let volume = runtime.volume_open(None, None, None)?;
+    let vid = volume.vid;
+    let mut writer = runtime.volume_writer(vid.clone())?;
+    let mut page_bytes = vec![0_u8; page_size];
+    let mut input = File::open(path)?;
+    for page_number in 1..=page_count_u32 {
+        input.read_exact(&mut page_bytes)?;
+        let page = Page::try_from(page_bytes.as_slice()).map_err(|err| {
+            ErrCtx::PragmaErr(format!("invalid SQLite page in `{}`: {err}", path.display()).into())
+        })?;
+        let pageidx = PageIdx::try_from(page_number).map_err(|err| {
+            ErrCtx::PragmaErr(
+                format!("invalid SQLite page index in `{}`: {err}", path.display()).into(),
+            )
+        })?;
+        writer.write_page(pageidx, page)?;
+    }
+    let reader = writer.commit()?;
+    Ok(CommitFileState {
+        volume: vid,
+        snapshot: repo_snapshot_with_commit_hashes(runtime, reader.snapshot())?,
+    })
+}
+
+fn sqlite_page_size_from_header(header: &[u8; 100]) -> u32 {
+    let raw = u16::from_be_bytes([header[16], header[17]]);
+    if raw == 1 { 65_536 } else { raw as u32 }
+}
+
+fn repo_diff_for_spec(
+    runtime: &Runtime,
+    file: &VolFile,
+    repo: &Repository,
+    spec: RepoDiffSpec,
+) -> Result<RepoDiff, ErrCtx> {
+    match spec {
+        RepoDiffSpec::Worktree { path } => {
+            let path = repo_diff_path(repo, path.as_deref())?;
+            let current_key = repo.file_key(&file.tag)?;
+            if let Some(path) = path.as_deref()
+                && path != current_key
+            {
+                let (key, physical_path, state) =
+                    physical_worktree_file_state(runtime, repo, path)?;
+                let expected = repo.index_files()?.get(&key).cloned();
+                return match state {
+                    Some(state) => {
+                        let state = if let Some(expected) = expected
+                            && repo_file_state_content_eq(runtime, &state, &expected)?
+                        {
+                            expected
+                        } else {
+                            state
+                        };
+                        Ok(repo.diff_worktree_file(&physical_path, state, Some(&key))?)
+                    }
+                    None => Ok(repo.diff_worktree_file_removal(&physical_path, Some(&key))?),
+                };
+            }
+            let state = current_repo_file_state(runtime, file)?;
+            Ok(repo.diff_worktree_file(&file.tag, state, path.as_deref())?)
+        }
+        RepoDiffSpec::Staged { path } => {
+            let path = repo_diff_path(repo, path.as_deref())?;
+            Ok(repo.diff_staged(path.as_deref())?)
+        }
+        RepoDiffSpec::RevisionToWorktree { rev, path } => {
+            let path = repo_diff_path(repo, path.as_deref())?;
+            let current_key = repo.file_key(&file.tag)?;
+            if let Some(path) = path.as_deref()
+                && path != current_key
+            {
+                let (key, physical_path, state) =
+                    physical_worktree_file_state(runtime, repo, path)?;
+                let from_id = repo.resolve_revision(&rev)?;
+                let expected = repo.read_commit(&from_id)?.files.get(&key).cloned();
+                return match state {
+                    Some(state) => {
+                        let state = if let Some(expected) = expected
+                            && repo_file_state_content_eq(runtime, &state, &expected)?
+                        {
+                            expected
+                        } else {
+                            state
+                        };
+                        Ok(repo.diff_revision_to_worktree_file(
+                            &rev,
+                            &physical_path,
+                            state,
+                            Some(&key),
+                        )?)
+                    }
+                    None => Ok(repo.diff_revision_to_worktree_file_removal(
+                        &rev,
+                        &physical_path,
+                        Some(&key),
+                    )?),
+                };
+            }
+            let state = current_repo_file_state(runtime, file)?;
+            Ok(repo.diff_revision_to_worktree_file(&rev, &file.tag, state, path.as_deref())?)
+        }
+        RepoDiffSpec::Revisions { from, to, path } => {
+            let path = repo_diff_path(repo, path.as_deref())?;
+            Ok(repo.diff_revisions(&from, &to, path.as_deref())?)
+        }
+    }
+}
+
+fn physical_worktree_file_state(
+    runtime: &Runtime,
+    repo: &Repository,
+    path: &str,
+) -> Result<(String, PathBuf, Option<CommitFileState>), ErrCtx> {
+    let (key, physical_path) = repo_physical_path_arg(repo, Path::new(path))?;
+    match std::fs::symlink_metadata(&physical_path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() {
+                return Err(ErrCtx::PragmaErr(
+                    format!(
+                        "path `{}` is not a regular SQLite database file",
+                        physical_path.display()
+                    )
+                    .into(),
+                ));
+            }
+            let state = import_physical_sqlite_file_state(runtime, &physical_path)?;
+            Ok((key, physical_path, Some(state)))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok((key, physical_path, None)),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn repo_status_for_file(
+    runtime: &Runtime,
+    file: &VolFile,
+    repo: &Repository,
+) -> Result<RepoStatus, ErrCtx> {
+    let mut status = repo.status()?;
+    let current_key = repo.file_key(&file.tag)?;
+    let tracked = match repo.index_files() {
+        Ok(tracked) => tracked,
+        Err(graft::repo::RepoErr::UnresolvedConflicts) => return Ok(status),
+        Err(err) => return Err(err.into()),
+    };
+    status
+        .unstaged_changes
+        .retain(|change| change.path == current_key || tracked.contains_key(&change.path));
+    for (key, expected_state) in tracked {
+        if key == current_key
+            || status
+                .unstaged_changes
+                .iter()
+                .any(|change| change.path == key)
+        {
+            continue;
+        }
+
+        let physical_path = repo.worktree().join(&key);
+        let change = match std::fs::symlink_metadata(&physical_path) {
+            Ok(metadata) => {
+                if !metadata.file_type().is_file() {
+                    continue;
+                }
+                if !is_sqlite_database_path(&physical_path)? {
+                    continue;
+                }
+                let state = import_physical_sqlite_file_state(runtime, &physical_path)?;
+                if repo_file_state_content_eq(runtime, &state, &expected_state)? {
+                    None
+                } else {
+                    Some(RepoWorktreeChangeKind::Modified)
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                Some(RepoWorktreeChangeKind::Deleted)
+            }
+            Err(err) => return Err(err.into()),
+        };
+
+        if let Some(change) = change {
+            status
+                .unstaged_changes
+                .push(graft::repo::RepoWorktreeChange { path: key, change });
+        }
+    }
+    status.unstaged_changes.sort_by(|a, b| a.path.cmp(&b.path));
+    status.unstaged = status
+        .unstaged_changes
+        .iter()
+        .map(|change| change.path.clone())
+        .collect();
+    status.dirty = !status.unstaged_changes.is_empty();
+    Ok(status)
+}
+
+fn repo_has_work_in_progress_for_file(
+    runtime: &Runtime,
+    file: &VolFile,
+    repo: &Repository,
+) -> Result<bool, ErrCtx> {
+    let status = repo_status_for_file(runtime, file, repo)?;
+    Ok(status.dirty
+        || !status.staged.is_empty()
+        || !status.conflicted.is_empty()
+        || status.merge_head.is_some())
+}
+
+fn repo_file_state_content_eq(
+    runtime: &Runtime,
+    left: &CommitFileState,
+    right: &CommitFileState,
+) -> Result<bool, ErrCtx> {
+    if left.snapshot.page_count != right.snapshot.page_count {
+        return Ok(false);
+    }
+    let left_snapshot = left.snapshot.to_snapshot();
+    let right_snapshot = right.snapshot.to_snapshot();
+    Ok(runtime.snapshot_checksum(&left_snapshot)? == runtime.snapshot_checksum(&right_snapshot)?)
+}
+
+fn staged_commit_table_summary(
+    runtime: &Runtime,
+    repo: &Repository,
+) -> Result<Vec<CommitTableSummary>, ErrCtx> {
+    let diff = repo.diff_staged(None)?;
+    let mut by_name = BTreeMap::<String, CommitTableSummary>::new();
+    for file in &diff.files {
+        let summaries = repo_file_table_summary(runtime, file)?;
+        for summary in summaries {
+            merge_table_summary(&mut by_name, summary);
+        }
+    }
+    Ok(by_name.into_values().collect())
+}
+
+fn repo_file_table_summary(
+    runtime: &Runtime,
+    file: &graft::repo::RepoFileDiff,
+) -> Result<Vec<CommitTableSummary>, ErrCtx> {
+    match (&file.from, &file.to) {
+        (Some(from), Some(to)) => {
+            let from_snapshot = from.snapshot.to_snapshot();
+            let to_snapshot = to.snapshot.to_snapshot();
+            if from_snapshot.is_empty() {
+                return snapshot_table_summary(
+                    runtime,
+                    &to_snapshot,
+                    SnapshotSummaryMode::Inserted,
+                );
+            }
+            if to_snapshot.is_empty() {
+                return snapshot_table_summary(
+                    runtime,
+                    &from_snapshot,
+                    SnapshotSummaryMode::Deleted,
+                );
+            }
+            let diff = crate::row_level_diff::row_level_diff_snapshots(
+                runtime,
+                &from_snapshot,
+                &to_snapshot,
+            )
+            .map_err(|e| ErrCtx::PragmaErr(format!("Diff error: {e:?}").into()))?;
+            Ok(diff
+                .table_changes
+                .iter()
+                .filter_map(|table| {
+                    let (inserts, deletes, updates) = count_changes_json(&table.changes);
+                    table_summary(table.table_name.clone(), inserts, deletes, updates)
+                })
+                .collect())
+        }
+        (None, Some(to)) => snapshot_table_summary(
+            runtime,
+            &to.snapshot.to_snapshot(),
+            SnapshotSummaryMode::Inserted,
+        ),
+        (Some(from), None) => snapshot_table_summary(
+            runtime,
+            &from.snapshot.to_snapshot(),
+            SnapshotSummaryMode::Deleted,
+        ),
+        (None, None) => Ok(Vec::new()),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SnapshotSummaryMode {
+    Inserted,
+    Deleted,
+}
+
+fn snapshot_table_summary(
+    runtime: &Runtime,
+    snapshot: &graft::snapshot::Snapshot,
+    mode: SnapshotSummaryMode,
+) -> Result<Vec<CommitTableSummary>, ErrCtx> {
+    if snapshot.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let volume = runtime.volume_from_snapshot(snapshot)?;
+    let vid = volume.vid.clone();
+    let result = snapshot_table_summary_checked_out(runtime, &vid, mode);
+    let _ = runtime.volume_delete(&vid);
+    result
+}
+
+fn snapshot_table_summary_checked_out(
+    runtime: &Runtime,
+    vid: &VolumeId,
+    mode: SnapshotSummaryMode,
+) -> Result<Vec<CommitTableSummary>, ErrCtx> {
+    let reader = runtime.volume_reader(vid.clone())?;
+    let scanner = crate::sqlite_parse::TableScanner::new(&reader)
+        .map_err(|e| ErrCtx::PragmaErr(format!("Parse error: {e:?}").into()))?;
+    let master = scanner
+        .read_master_table()
+        .map_err(|e| ErrCtx::PragmaErr(format!("Schema error: {e:?}").into()))?;
+    let mut summaries = Vec::new();
+
+    for entry in master {
+        if entry.entry_type != "table" || entry.name.starts_with("sqlite_") {
+            continue;
+        }
+        let row_count = crate::sqlite_parse::read_all_rows(&reader, entry.root_page)
+            .map_err(|e| ErrCtx::PragmaErr(format!("Table read error: {e:?}").into()))?
+            .len();
+        let summary = match mode {
+            SnapshotSummaryMode::Inserted => table_summary(entry.name, row_count, 0, 0),
+            SnapshotSummaryMode::Deleted => table_summary(entry.name, 0, row_count, 0),
+        };
+        if let Some(summary) = summary {
+            summaries.push(summary);
+        }
+    }
+
+    Ok(summaries)
+}
+
+fn table_summary(
+    name: String,
+    inserts: usize,
+    deletes: usize,
+    updates: usize,
+) -> Option<CommitTableSummary> {
+    if name.is_empty() || inserts + deletes + updates == 0 {
+        None
+    } else {
+        Some(CommitTableSummary { name, inserts, deletes, updates })
+    }
+}
+
+fn merge_table_summary(
+    by_name: &mut BTreeMap<String, CommitTableSummary>,
+    summary: CommitTableSummary,
+) {
+    by_name
+        .entry(summary.name.clone())
+        .and_modify(|entry| {
+            entry.inserts += summary.inserts;
+            entry.deletes += summary.deletes;
+            entry.updates += summary.updates;
+        })
+        .or_insert(summary);
+}
+
+fn is_sqlite_database_path(path: &Path) -> Result<bool, ErrCtx> {
+    let mut file = File::open(path)?;
+    let mut magic = [0_u8; SQLITE_DATABASE_MAGIC.len()];
+    match file.read_exact(&mut magic) {
+        Ok(()) => Ok(&magic == SQLITE_DATABASE_MAGIC),
+        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn current_repo_file_state(runtime: &Runtime, file: &VolFile) -> Result<CommitFileState, ErrCtx> {
+    let snapshot = file.snapshot_or_latest()?;
+    Ok(CommitFileState {
+        volume: file.vid.clone(),
+        snapshot: repo_snapshot_with_commit_hashes(runtime, &snapshot)?,
+    })
+}
+
+fn repo_snapshot_with_commit_hashes(
+    runtime: &Runtime,
+    snapshot: &graft::snapshot::Snapshot,
+) -> Result<RepoSnapshot, ErrCtx> {
+    let mut ranges = Vec::new();
+    for range in snapshot.iter() {
+        let mut commits = Vec::new();
+        for lsn in range.lsns.iter() {
+            let commit_hash =
+                repo_storage_commit_hash(runtime, &range.log, lsn)?.ok_or_else(|| {
+                    ErrCtx::PragmaErr(
+                        format!(
+                            "snapshot references missing storage commit {:?}/{}",
+                            range.log, lsn
+                        )
+                        .into(),
+                    )
+                })?;
+            commits.push(RepoStorageCommit { lsn, commit_hash });
+        }
+        ranges.push(RepoLogRange {
+            log: range.log.clone(),
+            start: *range.lsns.start(),
+            end: *range.lsns.end(),
+            commits,
+        });
+    }
+    Ok(RepoSnapshot { page_count: snapshot.page_count, ranges })
+}
+
+fn conflict_file_state(
+    repo: &Repository,
+    path: &Path,
+    side: ResolveSide,
+) -> Result<Option<CommitFileState>, ErrCtx> {
+    let key = repo.file_key(path)?;
+    let stage = side.index_stage();
+    let index = repo.read_index()?;
+    index
+        .entries
+        .iter()
+        .find(|entry| entry.path == key && entry.stage == stage)
+        .map(|entry| entry.file.clone())
+        .ok_or_else(|| {
+            ErrCtx::PragmaErr(format!("path `{key}` has no {} conflict stage", side.label()).into())
+        })
+}
+
+fn reset_mode_label(mode: ResetMode) -> &'static str {
+    match mode {
+        ResetMode::Soft => "soft",
+        ResetMode::Mixed => "mixed",
+        ResetMode::Hard => "hard",
+    }
+}
+
+fn repo_remote_branch(
+    repo: &Repository,
+    remote: Option<String>,
+    branch: Option<String>,
+) -> Result<BranchUpstream, ErrCtx> {
+    Ok(repo.default_remote_branch(remote.as_deref(), branch.as_deref())?)
+}
+
+fn repo_default_remote(repo: &Repository, remote: Option<String>) -> Result<String, ErrCtx> {
+    Ok(repo.default_remote_branch(remote.as_deref(), None)?.remote)
+}
+
+fn repo_push_branches(
+    repo: &Repository,
+    remote: Option<String>,
+    branch: Option<String>,
+) -> Result<(String, String, String), ErrCtx> {
+    let current_branch = repo
+        .current_branch()?
+        .ok_or_else(|| ErrCtx::PragmaErr("cannot push in detached HEAD".into()))?;
+    let upstream = repo.default_remote_branch(remote.as_deref(), branch.as_deref())?;
+    let local_branch = branch.unwrap_or(current_branch);
+    Ok((upstream.remote, local_branch, upstream.branch))
+}
+
+fn format_fetch_all_outcome(outcome: &FetchAllOutcome) -> Result<String, ErrCtx> {
+    let mut f = String::new();
+    let commits: usize = outcome.branches.iter().map(|branch| branch.commits).sum();
+    writeln!(
+        &mut f,
+        "Fetched {} ({} {}, {} new {})",
+        outcome.remote,
+        outcome.branches.len(),
+        pluralize!(outcome.branches.len(), "branch"),
+        commits,
+        pluralize!(commits, "commit")
+    )?;
+    for branch in &outcome.branches {
+        writeln!(
+            &mut f,
+            "  {}/{} at {} ({} new {})",
+            branch.remote,
+            branch.branch,
+            &branch.head[..12],
+            branch.commits,
+            pluralize!(branch.commits, "commit")
+        )?;
+    }
+    Ok(f)
+}
+
+fn format_push_all_outcome(outcome: &PushAllOutcome) -> Result<String, ErrCtx> {
+    let mut f = String::new();
+    let commits: usize = outcome.branches.iter().map(|branch| branch.commits).sum();
+    let forced = outcome.branches.iter().any(|branch| branch.forced);
+    writeln!(
+        &mut f,
+        "{} {} ({} {}, {} {})",
+        if forced { "Force-pushed" } else { "Pushed" },
+        outcome.remote,
+        outcome.branches.len(),
+        pluralize!(outcome.branches.len(), "branch"),
+        commits,
+        pluralize!(commits, "commit")
+    )?;
+    for branch in &outcome.branches {
+        if branch.deleted {
+            writeln!(
+                &mut f,
+                "  Deleted {}/{} (was {})",
+                branch.remote,
+                branch.remote_branch,
+                &branch.head[..branch.head.len().min(12)]
+            )?;
+            continue;
+        }
+        writeln!(
+            &mut f,
+            "  {}{}/{} at {} ({} {})",
+            if branch.forced { "+" } else { "" },
+            branch.remote,
+            branch.remote_branch,
+            &branch.head[..12],
+            branch.commits,
+            pluralize!(branch.commits, "commit")
+        )?;
+    }
+    Ok(f)
+}
+
+fn format_repo_diff(diff: &RepoDiff) -> Result<String, ErrCtx> {
+    let mut f = String::new();
+    writeln!(
+        &mut f,
+        "Diff {}..{}",
+        &diff.from[..diff.from.len().min(12)],
+        &diff.to[..diff.to.len().min(12)]
+    )?;
+    if diff.files.is_empty() {
+        writeln!(&mut f, "No changes.")?;
+        return Ok(f);
+    }
+
+    for file in &diff.files {
+        let change = match file.change {
+            RepoFileChange::Added => "added",
+            RepoFileChange::Deleted => "deleted",
+            RepoFileChange::Modified => "modified",
+        };
+        writeln!(&mut f, "{change}: {}", file.path)?;
+        if let Some(from) = &file.from {
+            writeln!(
+                &mut f,
+                "  from: {} page(s), {} range(s)",
+                from.snapshot.page_count,
+                from.snapshot.ranges.len()
+            )?;
+        }
+        if let Some(to) = &file.to {
+            writeln!(
+                &mut f,
+                "  to:   {} page(s), {} range(s)",
+                to.snapshot.page_count,
+                to.snapshot.ranges.len()
+            )?;
+        }
+    }
+    Ok(f)
+}
+
+fn format_repo_show(commit: &graft::repo::CommitObject) -> Result<String, ErrCtx> {
+    let mut f = String::new();
+    writeln!(&mut f, "commit {}", commit.id)?;
+    if commit.parents.is_empty() {
+        if let Some(parent) = &commit.parent {
+            writeln!(&mut f, "parent {parent}")?;
+        }
+    } else {
+        for parent in &commit.parents {
+            writeln!(&mut f, "parent {parent}")?;
+        }
+    }
+    if let Some(tree) = &commit.tree {
+        writeln!(&mut f, "tree {tree}")?;
+    }
+    writeln!(&mut f, "date {}", format_unix_millis(commit.timestamp_ms))?;
+    writeln!(&mut f)?;
+    writeln!(&mut f, "    {}", commit.message)?;
+    if !commit.files.is_empty() {
+        writeln!(&mut f)?;
+        writeln!(&mut f, "Files:")?;
+        for (path, state) in &commit.files {
+            writeln!(
+                &mut f,
+                "  {} ({} page(s), {} range(s))",
+                path,
+                state.snapshot.page_count,
+                state.snapshot.ranges.len()
+            )?;
+        }
+    }
+    Ok(f)
+}
+
+fn format_repo_status(status: &RepoStatus) -> Result<String, ErrCtx> {
+    let mut f = String::new();
+    match &status.head {
+        Head::Branch { name } => writeln!(&mut f, "On branch {name}")?,
+        Head::Detached { commit } => writeln!(&mut f, "HEAD detached at {commit}")?,
+    }
+    if let Some(upstream) = &status.upstream {
+        writeln!(&mut f, "Tracking: {}/{}", upstream.remote, upstream.branch)?;
+    }
+    writeln!(&mut f, "Repository: {}", status.worktree.display())?;
+    writeln!(&mut f, "Format: v{}", status.repository_format_version)?;
+    match &status.head_target {
+        Some(target) => writeln!(&mut f, "HEAD: {target}")?,
+        None => writeln!(&mut f, "No commits yet")?,
+    }
+    if let Some(merge_head) = &status.merge_head {
+        writeln!(
+            &mut f,
+            "Merge in progress with {}",
+            &merge_head[..merge_head.len().min(12)]
+        )?;
+    }
+    if !status.conflicted.is_empty() {
+        writeln!(&mut f, "Unmerged paths:")?;
+        for path in &status.conflicted {
+            writeln!(&mut f, "  {path}")?;
+        }
+    }
+    if !status.staged.is_empty() {
+        writeln!(&mut f, "Changes to be committed:")?;
+        for path in &status.staged {
+            writeln!(&mut f, "  {path}")?;
+        }
+    }
+    if !status.unstaged_changes.is_empty() {
+        writeln!(&mut f, "Changes not staged for commit.")?;
+        writeln!(&mut f, "  (use 'pragma graft_add' to stage)")?;
+        for change in &status.unstaged_changes {
+            writeln!(
+                &mut f,
+                "  {}: {}",
+                worktree_change_label(change.change),
+                change.path
+            )?;
+        }
+    } else if !status.unstaged.is_empty() {
+        writeln!(&mut f, "Changes not staged for commit.")?;
+        writeln!(&mut f, "  (use 'pragma graft_add' to stage)")?;
+        for path in &status.unstaged {
+            writeln!(&mut f, "  {path}")?;
+        }
+    }
+    if status.unstaged.is_empty()
+        && status.staged.is_empty()
+        && status.conflicted.is_empty()
+        && status.merge_head.is_none()
+    {
+        writeln!(&mut f, "Worktree clean.")?;
+    }
+    Ok(f)
+}
+
+fn worktree_change_label(change: RepoWorktreeChangeKind) -> &'static str {
+    match change {
+        RepoWorktreeChangeKind::Modified => "modified",
+        RepoWorktreeChangeKind::Deleted => "deleted",
+        RepoWorktreeChangeKind::Untracked => "untracked",
+    }
+}
+
+fn format_conflicts(status: &RepoStatus) -> Result<String, ErrCtx> {
+    let mut f = String::new();
+    if status.conflicted.is_empty() {
+        writeln!(&mut f, "No conflicts.")?;
+        return Ok(f);
+    }
+
+    writeln!(&mut f, "Unmerged paths:")?;
+    for path in &status.conflicted {
+        writeln!(&mut f, "  {path}")?;
+    }
+    writeln!(&mut f)?;
+    writeln!(
+        &mut f,
+        "Resolve a path with `pragma graft_resolve = \"--ours [path]\"` or `pragma graft_resolve = \"--theirs [path]\"`."
+    )?;
+    Ok(f)
+}
+
+fn format_branches(
+    branches: &[BranchInfo],
+    remote_branches: &[RemoteBranchRef],
+    mode: BranchListMode,
+) -> Result<String, ErrCtx> {
+    if branches.is_empty() && remote_branches.is_empty() && !matches!(mode, BranchListMode::Remote)
+    {
+        return Ok("No branches.".to_string());
+    }
+    if remote_branches.is_empty() && matches!(mode, BranchListMode::Remote) {
+        return Ok("No remote branches.".to_string());
+    }
+
+    let mut f = String::new();
+    if !matches!(mode, BranchListMode::Remote) {
+        for branch in branches {
+            let marker = if branch.current { "*" } else { " " };
+            let target = branch
+                .target
+                .as_deref()
+                .map_or("(unborn)", |target| &target[..target.len().min(12)]);
+            let upstream = branch
+                .upstream
+                .as_ref()
+                .map(|upstream| format!(" [{}{}{}]", upstream.remote, "/", upstream.branch))
+                .unwrap_or_default();
+            writeln!(&mut f, "{marker} {:<24} {target}{upstream}", branch.name)?;
+        }
+    }
+    if mode.includes_remote() {
+        for branch in remote_branches {
+            let name = if matches!(mode, BranchListMode::All) {
+                format!("remotes/{}/{}", branch.remote, branch.branch)
+            } else {
+                format!("{}/{}", branch.remote, branch.branch)
+            };
+            writeln!(
+                &mut f,
+                "  {name:<24} {}",
+                &branch.head[..branch.head.len().min(12)]
+            )?;
+        }
+    }
+    Ok(f)
+}
+
+fn format_branch_created(branch: &BranchInfo) -> String {
+    match &branch.target {
+        Some(target) => format!("Created branch '{}' at {}", branch.name, &target[..12]),
+        None => format!("Created unborn branch '{}'", branch.name),
+    }
+}
+
+fn format_branch_upstream(branch: &BranchInfo) -> String {
+    match &branch.upstream {
+        Some(upstream) => format!(
+            "Branch '{}' set to track {}/{}",
+            branch.name, upstream.remote, upstream.branch
+        ),
+        None => format!("Branch '{}' has no upstream", branch.name),
+    }
+}
+
+fn format_branch_upstream_unset(branch: &BranchInfo) -> String {
+    format!("Branch '{}' upstream unset", branch.name)
+}
+
+fn format_branch_deleted(branch: &BranchInfo, force: bool) -> String {
+    let forced = if force { " forcibly" } else { "" };
+    match &branch.target {
+        Some(target) => format!(
+            "Deleted branch '{}'{} (was {})",
+            branch.name,
+            forced,
+            &target[..target.len().min(12)]
+        ),
+        None => format!("Deleted unborn branch '{}'{}", branch.name, forced),
+    }
+}
+
+fn format_branch_renamed(old: &str, branch: &BranchInfo, force: bool) -> String {
+    let forced = if force { " forcibly" } else { "" };
+    match &branch.target {
+        Some(target) => format!(
+            "Renamed branch '{}' to '{}'{} at {}",
+            old,
+            branch.name,
+            forced,
+            &target[..target.len().min(12)]
+        ),
+        None => format!(
+            "Renamed unborn branch '{}' to '{}'{}",
+            old, branch.name, forced
+        ),
+    }
+}
+
+fn format_repo_tags(tags: &[TagInfo]) -> Result<String, ErrCtx> {
+    if tags.is_empty() {
+        return Ok("No tags.".to_string());
+    }
+
+    let mut f = String::new();
+    for tag in tags {
+        writeln!(
+            &mut f,
+            "{:<24} {}{}",
+            tag.name,
+            &tag.target[..tag.target.len().min(12)],
+            if tag.annotated {
+                format!(" (annotated {})", &tag.object[..tag.object.len().min(12)])
+            } else {
+                String::new()
+            }
+        )?;
+    }
+    Ok(f)
+}
+
+fn format_tag_created(tag: &TagInfo) -> String {
+    if tag.annotated {
+        format!(
+            "Created annotated tag '{}' at {} ({})",
+            tag.name,
+            &tag.target[..tag.target.len().min(12)],
+            &tag.object[..tag.object.len().min(12)]
+        )
+    } else {
+        format!(
+            "Created tag '{}' at {}",
+            tag.name,
+            &tag.target[..tag.target.len().min(12)]
+        )
+    }
+}
+
+fn format_tag_deleted(tag: &TagInfo) -> String {
+    if tag.annotated {
+        format!(
+            "Deleted annotated tag '{}' (was {} via {})",
+            tag.name,
+            &tag.target[..tag.target.len().min(12)],
+            &tag.object[..tag.object.len().min(12)]
+        )
+    } else {
+        format!(
+            "Deleted tag '{}' (was {})",
+            tag.name,
+            &tag.target[..tag.target.len().min(12)]
+        )
+    }
+}
+
+fn format_merge_outcome(outcome: &MergeOutcome) -> Result<String, ErrCtx> {
+    let mut f = String::new();
+    match outcome {
+        MergeOutcome::FastForward { from, to } => {
+            if let Some(from) = from {
+                writeln!(
+                    &mut f,
+                    "Fast-forward {}..{}",
+                    &from[..from.len().min(12)],
+                    &to[..to.len().min(12)]
+                )?;
+            } else {
+                writeln!(&mut f, "Fast-forward to {}", &to[..to.len().min(12)])?;
+            }
+        }
+        MergeOutcome::AlreadyUpToDate { head } => {
+            writeln!(
+                &mut f,
+                "Already up to date at {}",
+                &head[..head.len().min(12)]
+            )?;
+        }
+        MergeOutcome::Merged {
+            target, merge_base, staged, conflicted, ..
+        } => {
+            writeln!(&mut f, "Merged {}", &target[..target.len().min(12)])?;
+            if let Some(merge_base) = merge_base {
+                writeln!(
+                    &mut f,
+                    "Merge base {}",
+                    &merge_base[..merge_base.len().min(12)]
+                )?;
+            }
+            if !staged.is_empty() {
+                writeln!(&mut f, "Staged paths:")?;
+                for path in staged {
+                    writeln!(&mut f, "  {path}")?;
+                }
+            }
+            if !conflicted.is_empty() {
+                writeln!(&mut f, "Unmerged paths:")?;
+                for path in conflicted {
+                    writeln!(&mut f, "  {path}")?;
+                }
+            }
+            if staged.is_empty() && conflicted.is_empty() {
+                writeln!(&mut f, "No changes.")?;
+            }
+        }
+    }
+    Ok(f)
+}
+
+fn format_merge_outcome_with_row_analysis(
+    runtime: &Runtime,
+    file: &VolFile,
+    repo: &Repository,
+    outcome: &MergeOutcome,
+    remote: Option<Arc<Remote>>,
+) -> Result<String, ErrCtx> {
+    let mut f = format_merge_outcome(outcome)?;
+    append_row_merge_analysis(&mut f, runtime, file, repo, outcome, remote)?;
+    Ok(f)
+}
+
+fn format_pull_outcome(outcome: &PullOutcome) -> Result<String, ErrCtx> {
+    let mut f = String::new();
+    writeln!(
+        &mut f,
+        "Fetched {}/{} at {} ({} new commits)",
+        outcome.remote,
+        outcome.remote_branch,
+        &outcome.head[..outcome.head.len().min(12)],
+        outcome.commits
+    )?;
+    match &outcome.merge {
+        MergeOutcome::FastForward { from, to } => {
+            if let Some(from) = from {
+                writeln!(
+                    &mut f,
+                    "Fast-forwarded {} {}..{}",
+                    outcome.local_branch,
+                    &from[..from.len().min(12)],
+                    &to[..to.len().min(12)]
+                )?;
+            } else {
+                writeln!(
+                    &mut f,
+                    "Fast-forwarded {} to {}",
+                    outcome.local_branch,
+                    &to[..to.len().min(12)]
+                )?;
+            }
+        }
+        MergeOutcome::AlreadyUpToDate { head } => {
+            writeln!(
+                &mut f,
+                "{} already up to date at {}",
+                outcome.local_branch,
+                &head[..head.len().min(12)]
+            )?;
+        }
+        MergeOutcome::Merged {
+            target, merge_base, staged, conflicted, ..
+        } => {
+            writeln!(
+                &mut f,
+                "Merged {}/{} ({}) into {}",
+                outcome.remote,
+                outcome.remote_branch,
+                &target[..target.len().min(12)],
+                outcome.local_branch
+            )?;
+            if let Some(merge_base) = merge_base {
+                writeln!(
+                    &mut f,
+                    "Merge base {}",
+                    &merge_base[..merge_base.len().min(12)]
+                )?;
+            }
+            if !staged.is_empty() {
+                writeln!(&mut f, "Staged paths:")?;
+                for path in staged {
+                    writeln!(&mut f, "  {path}")?;
+                }
+            }
+            if !conflicted.is_empty() {
+                writeln!(&mut f, "Unmerged paths:")?;
+                for path in conflicted {
+                    writeln!(&mut f, "  {path}")?;
+                }
+            }
+            if conflicted.is_empty() {
+                writeln!(&mut f, "Commit to complete the merge.")?;
+            }
+        }
+    }
+    Ok(f)
+}
+
+fn format_pull_outcome_with_row_analysis(
+    runtime: &Runtime,
+    file: &VolFile,
+    repo: &Repository,
+    outcome: &PullOutcome,
+    remote: Option<Arc<Remote>>,
+) -> Result<String, ErrCtx> {
+    let mut f = format_pull_outcome(outcome)?;
+    append_row_merge_analysis(&mut f, runtime, file, repo, &outcome.merge, remote)?;
+    Ok(f)
+}
+
+fn append_row_merge_analysis(
+    output: &mut String,
+    runtime: &Runtime,
+    file: &VolFile,
+    repo: &Repository,
+    outcome: &MergeOutcome,
+    remote: Option<Arc<Remote>>,
+) -> Result<(), ErrCtx> {
+    let MergeOutcome::Merged { conflicted, .. } = outcome else {
+        return Ok(());
+    };
+    let key = repo.file_key(&file.tag)?;
+    if !conflicted.iter().any(|path| path == &key) {
+        return Ok(());
+    }
+
+    if !output.ends_with('\n') {
+        output.push('\n');
+    }
+    match format_current_file_row_merge_analysis(runtime, repo, &key, remote) {
+        Ok(Some(analysis)) => output.push_str(&analysis),
+        Ok(None) => {}
+        Err(err) => {
+            writeln!(output, "Row-level analysis for {key} unavailable: {err}")?;
+        }
+    }
+    Ok(())
+}
+
+fn format_current_file_row_merge_analysis(
+    runtime: &Runtime,
+    repo: &Repository,
+    key: &str,
+    remote: Option<Arc<Remote>>,
+) -> Result<Option<String>, ErrCtx> {
+    let index = repo.read_index()?;
+    let mut base = None;
+    let mut ours = None;
+    let mut theirs = None;
+
+    for entry in index.entries.iter().filter(|entry| entry.path == key) {
+        match entry.stage {
+            graft::repo::index::IndexStage::Base => base = entry.file.as_ref(),
+            graft::repo::index::IndexStage::Ours => ours = entry.file.as_ref(),
+            graft::repo::index::IndexStage::Theirs => theirs = entry.file.as_ref(),
+            graft::repo::index::IndexStage::Normal => {}
+        }
+    }
+
+    let (Some(base), Some(ours), Some(theirs)) = (base, ours, theirs) else {
+        return Ok(Some(formatdoc!(
+            "
+            Row-level analysis for {key}:
+              unavailable: merge involves add/delete of this database path.
+            "
+        )));
+    };
+
+    hydrate_repo_file_state(runtime, base, None)?;
+    hydrate_repo_file_state(runtime, ours, None)?;
+    hydrate_repo_file_state(runtime, theirs, remote)?;
+    let analysis = crate::row_merge::analyze_snapshot_merge(runtime, base, ours, theirs)?;
+    let mut f = String::new();
+    writeln!(&mut f, "Row-level analysis for {key}:")?;
+    writeln!(&mut f, "  ours: {} row change(s)", analysis.ours_changes)?;
+    writeln!(
+        &mut f,
+        "  theirs: {} row change(s)",
+        analysis.theirs_changes
+    )?;
+    if analysis.has_conflicts() {
+        writeln!(&mut f, "  Row conflicts:")?;
+        for conflict in &analysis.conflicts {
+            writeln!(
+                &mut f,
+                "    {} rowid={} (ours {}, theirs {})",
+                conflict.table,
+                conflict.rowid,
+                row_change_kind_label(conflict.ours),
+                row_change_kind_label(conflict.theirs)
+            )?;
+        }
+    } else {
+        writeln!(
+            &mut f,
+            "  No row conflicts detected; row-level auto-merge candidate."
+        )?;
+    }
+    Ok(Some(f))
+}
+
+fn row_change_kind_label(kind: crate::row_merge::RowChangeKind) -> &'static str {
+    match kind {
+        crate::row_merge::RowChangeKind::Insert => "insert",
+        crate::row_merge::RowChangeKind::Delete => "delete",
+        crate::row_merge::RowChangeKind::Update => "update",
+    }
+}
+
+fn format_remote(remote: &RemoteInfo) -> String {
+    format!(
+        "Added remote '{}': {}",
+        remote.name,
+        remote_config_uri(&remote.config)
+    )
+}
+
+fn format_remotes(remotes: &[RemoteInfo]) -> Result<String, ErrCtx> {
+    if remotes.is_empty() {
+        return Ok("No remotes configured.".to_string());
+    }
+
+    let mut f = String::new();
+    for remote in remotes {
+        writeln!(
+            &mut f,
+            "{}\t{}",
+            remote.name,
+            remote_config_uri(&remote.config)
+        )?;
+    }
+    Ok(f)
+}
+
+fn format_remote_prune_outcome(outcome: &RemotePruneOutcome) -> Result<String, ErrCtx> {
+    if outcome.branches.is_empty() {
+        return Ok(format!(
+            "Pruned {} (no stale remote-tracking branches)",
+            outcome.remote
+        ));
+    }
+
+    let mut f = String::new();
+    writeln!(
+        &mut f,
+        "Pruned {} ({} {})",
+        outcome.remote,
+        outcome.branches.len(),
+        pluralize!(outcome.branches.len(), "branch")
+    )?;
+    for branch in &outcome.branches {
+        writeln!(&mut f, "  {}/{}", outcome.remote, branch)?;
+    }
+    Ok(f)
+}
+
+fn format_ls_remote(
+    remote: &str,
+    default_branch: Option<&str>,
+    refs: &[RemoteBranchRef],
+) -> Result<String, ErrCtx> {
+    if refs.is_empty() {
+        return Ok(format!("No refs found for {remote}."));
+    }
+
+    let mut f = String::new();
+    if let Some(default_branch) = default_branch
+        && let Some(reference) = refs
+            .iter()
+            .find(|reference| reference.branch == default_branch)
+    {
+        writeln!(&mut f, "{}\tHEAD", reference.head)?;
+    }
+    for reference in refs {
+        writeln!(
+            &mut f,
+            "{}\trefs/heads/{}",
+            reference.head, reference.branch
+        )?;
+    }
+    Ok(f)
+}
+
+fn remote_config_uri(config: &RemoteConfig) -> String {
+    match config {
+        RemoteConfig::Memory => "memory".to_string(),
+        RemoteConfig::Fs { root } => format!("fs://{root}"),
+        RemoteConfig::S3Compatible { bucket, prefix, endpoint } => {
+            let mut uri = prefix.as_ref().map_or_else(
+                || format!("s3://{bucket}"),
+                |prefix| format!("s3://{bucket}/{prefix}"),
+            );
+            if let Some(endpoint) = endpoint {
+                uri.push_str("?endpoint=");
+                uri.push_str(endpoint);
+            }
+            uri
+        }
+    }
+}
+
+fn format_repo_log(repo: &Repository) -> Result<String, ErrCtx> {
+    let commits = repo.log()?;
+    if commits.is_empty() {
+        return Ok("No commits yet.".to_string());
+    }
+
+    let mut f = String::new();
+    for commit in commits {
+        writeln!(&mut f, "commit {}", commit.id)?;
+        if let Some(parent) = commit.parent {
+            writeln!(&mut f, "parent {parent}")?;
+        }
+        writeln!(&mut f, "date {}", format_unix_millis(commit.timestamp_ms))?;
+        writeln!(&mut f)?;
+        writeln!(&mut f, "    {}", commit.message)?;
+        writeln!(&mut f)?;
+    }
+    Ok(f)
+}
+
+fn format_debug_log_lsn(runtime: &Runtime, file: &VolFile) -> Result<String, ErrCtx> {
+    let volume = runtime.volume_get(&file.vid)?;
+    let commits = runtime.volume_log(&file.vid)?;
+    if commits.is_empty() {
+        return Ok(format!("No storage commits yet for log {}.", volume.local));
+    }
+
+    let mut f = String::new();
+    writeln!(&mut f, "log {}", volume.local)?;
+    for commit in commits {
+        writeln!(&mut f, "commit {}:{}", volume.local, commit.lsn)?;
+        writeln!(&mut f, "page_count {}", commit.page_count)?;
+        writeln!(&mut f, "changed_pages {}", commit.changed_pages)?;
+        if let Some(segment) = commit.segment_id {
+            writeln!(&mut f, "segment {}", segment.short())?;
+        }
+        if commit.is_checkpoint {
+            writeln!(&mut f, "checkpoint true")?;
+        }
+        if let Some(timestamp) = commit.timestamp {
+            writeln!(&mut f, "date {}", format_unix_millis(timestamp))?;
+        }
+        if let Some(message) = commit.message {
+            writeln!(&mut f)?;
+            writeln!(&mut f, "    {message}")?;
+        }
+        writeln!(&mut f)?;
+    }
+    Ok(f)
+}
+
+fn format_debug_show_lsn(runtime: &Runtime, logref: &LogRef) -> Result<String, ErrCtx> {
+    let Some(commit) = runtime.get_commit(&logref.log, logref.lsn)? else {
+        return pragma_err!("commit not found");
+    };
+    let log = &commit.log;
+    let lsn = commit.lsn;
+    let page_count = commit.page_count;
+    let commit_hash = &commit.commit_hash;
+    let segment_idx = &commit.segment_idx;
+    let checkpoints = &commit.checkpoints;
+    Ok(formatdoc!(
+        "
+            Commit @ {log}:{lsn}
+            page_count: {page_count}
+            commit_hash: {commit_hash:?}
+            segment_idx: {segment_idx:#?}
+            checkpoints: {checkpoints:?}
+        "
+    ))
 }
 
 fn format_volume_info(runtime: &Runtime, file: &VolFile) -> Result<String, ErrCtx> {
@@ -733,8 +4447,8 @@ fn format_volume_status(runtime: &Runtime, file: &VolFile) -> Result<String, Err
             write!(
                 &mut f,
                 indoc! {"
-                    The Volume is ahead of the remote by {} {}.
-                      (use 'pragma graft_push' to push changes)
+                      The Volume is ahead of the remote by {} {}.
+                        (use 'pragma graft_push' to push repository commits)
                 "},
                 local.len(),
                 pluralize!(local.len(), "commit")
@@ -744,8 +4458,8 @@ fn format_volume_status(runtime: &Runtime, file: &VolFile) -> Result<String, Err
             writeln!(
                 &mut f,
                 indoc! {"
-                    The Volume is behind the remote by {} {}.
-                      (use 'pragma graft_pull' to pull changes)
+                      The Volume is behind the remote by {} {}.
+                        (use 'pragma graft_pull' to pull repository commits)
                 "},
                 remote.len(),
                 pluralize!(remote.len(), "commit")
@@ -779,7 +4493,7 @@ fn format_volume_audit(runtime: &Runtime, file: &VolFile) -> Result<String, ErrC
         Ok(formatdoc!(
             "
                 Cached {have} of {pages} {} ({pct:.02}%%) from the remote Log.
-                  (use 'pragma graft_hydrate' to fetch missing pages)
+                  (use 'pragma graft_debug_volume_hydrate' to fetch missing pages)
             ",
             pluralize!(pages, "page"),
         ))
@@ -892,65 +4606,13 @@ fn volume_export(_runtime: &Runtime, file: &VolFile, path: PathBuf) -> Result<St
     let page_count = reader.page_count();
     let total_pages = page_count.to_usize();
 
-    let mut output_file = File::create(&path)?;
-
-    // Iterate over all pages and write them to the output file
-    for page_idx in page_count.iter() {
-        let page = reader.read_page(page_idx)?;
-        output_file.write_all(page.as_ref())?;
-    }
+    write_volume_reader_to_path(&reader, &path)?;
 
     Ok(format!(
         "exported {} {}",
         total_pages,
         pluralize!(total_pages, "page")
     ))
-}
-
-fn format_volume_log(runtime: &Runtime, file: &VolFile) -> Result<String, ErrCtx> {
-    let commits = runtime.volume_log(&file.vid)?;
-
-    if commits.is_empty() {
-        return Ok("No commits in this Volume.".to_string());
-    }
-
-    let has_any_msg = commits.iter().any(|c| c.message.is_some());
-    let mut f = String::new();
-    writeln!(&mut f, "Commit history for Volume {}:", file.vid)?;
-    if has_any_msg {
-        writeln!(&mut f, "{:<6} {:<12} {:<10} {:<12} {:<20} MESSAGE", "LSN", "PAGES", "CHANGED", "CHECKPOINT", "WHEN")?;
-        writeln!(&mut f, "{}", "-".repeat(105))?;
-    } else {
-        writeln!(&mut f, "{:<6} {:<12} {:<10} {:<12} {:<20} SEGMENT", "LSN", "PAGES", "CHANGED", "CHECKPOINT", "WHEN")?;
-        writeln!(&mut f, "{}", "-".repeat(85))?;
-    }
-
-    for commit in commits {
-        let checkpoint_mark = if commit.is_checkpoint { "✓" } else { "" };
-        let segment_short = commit
-            .segment_id.map_or_else(|| "-".to_string(), |s| s.short());
-        let when = commit.timestamp.map_or_else(|| "-".to_string(), |ts| {
-            format_unix_millis(ts)
-        });
-        let msg = commit.message.as_deref().unwrap_or("-");
-        if has_any_msg {
-            writeln!(
-                &mut f,
-                "{:<6} {:<12} {:<10} {:<12} {:<20} {}",
-                commit.lsn, commit.page_count, commit.changed_pages,
-                checkpoint_mark, when, msg
-            )?;
-        } else {
-            writeln!(
-                &mut f,
-                "{:<6} {:<12} {:<10} {:<12} {:<20} {}",
-                commit.lsn, commit.page_count, commit.changed_pages,
-                checkpoint_mark, when, segment_short
-            )?;
-        }
-    }
-
-    Ok(f)
 }
 
 /// Format unix millis as "YYYY-MM-DD HH:MM:SS" without external crate
@@ -969,16 +4631,25 @@ fn format_unix_millis(ts: u64) -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     let day_secs = secs.rem_euclid(86400) as u32;
-    format!("{}-{:02}-{:02} {:02}:{:02}:{:02}",
-        y, m, d,
+    format!(
+        "{}-{:02}-{:02} {:02}:{:02}:{:02}",
+        y,
+        m,
+        d,
         day_secs / 3600,
         (day_secs / 60) % 60,
-        day_secs % 60)
+        day_secs % 60
+    )
 }
 
-fn _format_diff(diff: &graft::PageDiffResult) -> String {
+fn format_debug_page_diff(diff: &graft::PageDiffResult) -> String {
     let mut f = String::new();
-    writeln!(&mut f, "Diff between LSN {} and LSN {}:", diff.from_lsn, diff.to_lsn).unwrap();
+    writeln!(
+        &mut f,
+        "Diff between LSN {} and LSN {}:",
+        diff.from_lsn, diff.to_lsn
+    )
+    .unwrap();
     writeln!(&mut f, "  Page count delta: {:+}", diff.page_count_delta).unwrap();
     writeln!(
         &mut f,
@@ -992,104 +4663,17 @@ fn _format_diff(diff: &graft::PageDiffResult) -> String {
         for page_idx in diff.added_or_modified_pages.iter().take(20) {
             writeln!(&mut f, "    - Page {page_idx}").unwrap();
         }
-        let remaining = diff.added_or_modified_pages.cardinality().to_usize().saturating_sub(20);
+        let remaining = diff
+            .added_or_modified_pages
+            .cardinality()
+            .to_usize()
+            .saturating_sub(20);
         if remaining > 0 {
             writeln!(&mut f, "    ... and {remaining} more").unwrap();
         }
     }
 
     f
-}
-
-/// Display detailed info for specified LSN
-fn show_lsn(runtime: &Runtime, file: &VolFile, lsn: LSN) -> Result<String, ErrCtx> {
-    let volume = runtime.volume_get(&file.vid)?;
-
-    // Get commit info
-    let commit = runtime
-        .get_commit(&volume.local, lsn)?
-        .ok_or_else(|| ErrCtx::PragmaErr(format!("LSN {lsn} not found").into()))?;
-
-    let mut output = String::new();
-
-    writeln!(&mut output, "Commit {} (LSN {})", volume.local, lsn)?;
-    writeln!(&mut output, "  Page count: {}", commit.page_count)?;
-    writeln!(
-        &mut output,
-        "  Checkpoint: {}",
-        if commit.is_checkpoint() { "yes" } else { "no" }
-    )?;
-
-    if let Some(idx) = commit.segment_idx() {
-        writeln!(&mut output, "  Segment: {}", idx.sid())?;
-        writeln!(
-            &mut output,
-            "  Changed pages: {}",
-            idx.pageset.cardinality()
-        )?;
-    }
-
-    // Checkout and gather table info using B-tree parser
-    let checkout_vol = runtime
-        .volume_checkout(&file.vid, lsn)
-        .map_err(|e| ErrCtx::PragmaErr(format!("Failed to checkout LSN {lsn}: {e:?}").into()))?;
-    let vid = checkout_vol.vid;
-    let reader = runtime.volume_reader(vid.clone()).map_err(|e| {
-        ErrCtx::PragmaErr(format!("Failed to create reader: {e:?}").into())
-    })?;
-
-    // Use B-tree parser to read sqlite_master
-    match crate::sqlite_parse::TableScanner::new(&reader) {
-        Ok(scanner) => {
-            match scanner.read_master_table() {
-                Ok(entries) => {
-                    writeln!(&mut output)?;
-                    writeln!(&mut output, "Schema ({} objects):", entries.len())?;
-                    for entry in &entries {
-                        if entry.entry_type == "table" && !entry.name.starts_with("sqlite_") {
-                            let row_count = match crate::sqlite_parse::read_all_rows(
-                                &reader,
-                                entry.root_page,
-                            ) {
-                                Ok(rows) => rows.len().to_string(),
-                                Err(_) => "?".to_string(),
-                            };
-                            writeln!(
-                                &mut output,
-                                "  {} {} (root_page={}, rows={})",
-                                entry.entry_type, entry.name, entry.root_page, row_count
-                            )?;
-                        } else {
-                            writeln!(
-                                &mut output,
-                                "  {} {}",
-                                entry.entry_type, entry.name
-                            )?;
-                        }
-                    }
-                }
-                Err(e) => {
-                    writeln!(&mut output)?;
-                    writeln!(
-                        &mut output,
-                        "  (Failed to read schema: {e:?})"
-                    )?;
-                }
-            }
-        }
-        Err(e) => {
-            writeln!(&mut output)?;
-            writeln!(
-                &mut output,
-                "  (Failed to parse B-tree: {e:?})"
-            )?;
-        }
-    }
-
-    // Cleanup
-    let _ = runtime.volume_delete(&vid);
-
-    Ok(output)
 }
 
 /// Row-level diff implementation
@@ -1100,32 +4684,32 @@ fn row_diff_impl(
     to: LSN,
 ) -> Result<Option<String>, ErrCtx> {
     let mut output = String::new();
-    
+
     // Call row-level diff
     let diff = crate::row_level_diff::row_level_diff(runtime, &file.vid, from, to)
         .map_err(|e| ErrCtx::PragmaErr(format!("Row diff error: {e:?}").into()))?;
-    
+
     writeln!(&mut output, "Row-level diff from LSN {from} to LSN {to}")?;
     writeln!(&mut output)?;
-    
+
     if diff.table_changes.is_empty() {
         writeln!(&mut output, "No table changes detected.")?;
         return Ok(Some(output));
     }
-    
+
     writeln!(&mut output, "Changed tables: {}", diff.table_changes.len())?;
     writeln!(&mut output)?;
-    
+
     // Show changes for each table
     for table in &diff.table_changes {
         writeln!(&mut output, "Table: {}", table.table_name)?;
         writeln!(&mut output, "  Changes: {}", table.changes.len())?;
-        
+
         // Count change types
         let mut inserts = 0;
         let mut deletes = 0;
         let mut updates = 0;
-        
+
         for change in &table.changes {
             match change {
                 crate::row_level_diff::RowChange::Insert { .. } => inserts += 1,
@@ -1133,7 +4717,7 @@ fn row_diff_impl(
                 crate::row_level_diff::RowChange::Update { .. } => updates += 1,
             }
         }
-        
+
         if inserts > 0 {
             writeln!(&mut output, "    +{inserts} inserts")?;
         }
@@ -1143,45 +4727,73 @@ fn row_diff_impl(
         if updates > 0 {
             writeln!(&mut output, "    ~{updates} updates")?;
         }
-        
+
         // Show details for first few changes
         for (i, change) in table.changes.iter().take(5).enumerate() {
             match change {
                 crate::row_level_diff::RowChange::Insert { rowid, row } => {
                     writeln!(&mut output, "    [{}] INSERT rowid={}", i + 1, rowid)?;
-                    writeln!(&mut output, "      values: {:?}", row.values.iter().map(|v| format!("{v:?}")).collect::<Vec<_>>().join(", "))?;
+                    writeln!(
+                        &mut output,
+                        "      values: {:?}",
+                        row.values
+                            .iter()
+                            .map(|v| format!("{v:?}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )?;
                 }
                 crate::row_level_diff::RowChange::Delete { rowid, .. } => {
                     writeln!(&mut output, "    [{}] DELETE rowid={}", i + 1, rowid)?;
                 }
                 crate::row_level_diff::RowChange::Update { rowid, old_row, new_row } => {
                     writeln!(&mut output, "    [{}] UPDATE rowid={}", i + 1, rowid)?;
-                    writeln!(&mut output, "      old: {:?}", old_row.values.iter().map(|v| format!("{v:?}")).collect::<Vec<_>>().join(", "))?;
-                    writeln!(&mut output, "      new: {:?}", new_row.values.iter().map(|v| format!("{v:?}")).collect::<Vec<_>>().join(", "))?;
+                    writeln!(
+                        &mut output,
+                        "      old: {:?}",
+                        old_row
+                            .values
+                            .iter()
+                            .map(|v| format!("{v:?}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )?;
+                    writeln!(
+                        &mut output,
+                        "      new: {:?}",
+                        new_row
+                            .values
+                            .iter()
+                            .map(|v| format!("{v:?}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )?;
                 }
             }
         }
-        
+
         if table.changes.len() > 5 {
-            writeln!(&mut output, "    ... and {} more changes", table.changes.len() - 5)?;
+            writeln!(
+                &mut output,
+                "    ... and {} more changes",
+                table.changes.len() - 5
+            )?;
         }
-        
+
         writeln!(&mut output)?;
     }
-    
+
     // Generate SQL script
     writeln!(&mut output, "-- SQL Script --")?;
     for table in &diff.table_changes {
         writeln!(&mut output, "{}", table.to_sql())?;
     }
-    
+
     Ok(Some(output))
 }
 
 /// Count changes for JSON summary
-fn count_changes_json(
-    changes: &[crate::row_level_diff::RowChange],
-) -> (usize, usize, usize) {
+fn count_changes_json(changes: &[crate::row_level_diff::RowChange]) -> (usize, usize, usize) {
     let mut inserts = 0;
     let mut deletes = 0;
     let mut updates = 0;
@@ -1195,63 +4807,15 @@ fn count_changes_json(
     (inserts, deletes, updates)
 }
 
-/// Generate JSON show output
-fn json_show_lsn(runtime: &Runtime, file: &VolFile, lsn: LSN) -> Result<crate::json::JsonShowResult, ErrCtx> {
-    let volume = runtime.volume_get(&file.vid)?;
-    let commit = runtime
-        .get_commit(&volume.local, lsn)?
-        .ok_or_else(|| ErrCtx::PragmaErr(format!("LSN {lsn} not found").into()))?;
-
-    let checkout_vol = runtime
-        .volume_checkout(&file.vid, lsn)
-        .map_err(|e| ErrCtx::PragmaErr(format!("Failed to checkout LSN {lsn}: {e:?}").into()))?;
-    let vid = checkout_vol.vid;
-    let reader = runtime.volume_reader(vid.clone()).map_err(|e| {
-        ErrCtx::PragmaErr(format!("Failed to create reader: {e:?}").into())
-    })?;
-
-    let tables = match crate::sqlite_parse::TableScanner::new(&reader) {
-        Ok(scanner) => match scanner.read_master_table() {
-            Ok(entries) => entries
-                .iter()
-                .map(|e| {
-                    let rows = if e.entry_type == "table" && !e.name.starts_with("sqlite_") {
-                        crate::sqlite_parse::read_all_rows(&reader, e.root_page)
-                            .ok()
-                            .map(|r| r.len())
-                    } else {
-                        None
-                    };
-                    crate::json::JsonTableEntry {
-                        entry_type: e.entry_type.clone(),
-                        name: e.name.clone(),
-                        root_page: e.root_page,
-                        rows,
-                    }
-                })
-                .collect(),
-            Err(_) => vec![],
-        },
-        Err(_) => vec![],
-    };
-
-    let _ = runtime.volume_delete(&vid);
-
-    Ok(crate::json::JsonShowResult {
-        lsn: lsn.to_u64(),
-        page_count: commit.page_count.to_u32(),
-        is_checkpoint: commit.is_checkpoint(),
-        segment: commit.segment_id().map(|s| s.short()),
-        changed_pages: commit.segment_idx().map_or(0, |idx| idx.pageset.cardinality().to_usize()),
-        tables,
-    })
-}
-
 /// Generate JSON volume info
-fn json_volume_info(runtime: &Runtime, file: &VolFile) -> Result<crate::json::JsonVolumeInfo, ErrCtx> {
+fn json_volume_info(
+    runtime: &Runtime,
+    file: &VolFile,
+) -> Result<crate::json::JsonVolumeInfo, ErrCtx> {
     let state = runtime.volume_get(&file.vid)?;
     let page_count = file.page_count()?;
-    let snapshot_size_bytes = (graft::core::page::PAGESIZE.as_usize() as u64) * (page_count.to_usize() as u64);
+    let snapshot_size_bytes =
+        (graft::core::page::PAGESIZE.as_usize() as u64) * (page_count.to_usize() as u64);
 
     Ok(crate::json::JsonVolumeInfo {
         vid: state.vid.to_string(),
@@ -1321,9 +4885,8 @@ fn table_log_entries(
     let mut entries = Vec::new();
     for (i, to) in results {
         let from = &commits[i];
-        let diff =
-            crate::row_level_diff::row_level_diff(runtime, vid, from.lsn, to.lsn)
-                .map_err(|e| ErrCtx::PragmaErr(format!("Diff error: {e:?}").into()))?;
+        let diff = crate::row_level_diff::row_level_diff(runtime, vid, from.lsn, to.lsn)
+            .map_err(|e| ErrCtx::PragmaErr(format!("Diff error: {e:?}").into()))?;
 
         if let Some(tc) = diff.table_changes.iter().find(|t| t.table_name == table)
             && !tc.is_empty()
@@ -1343,7 +4906,9 @@ fn table_log_entries(
             entries.push(TableLogEntry {
                 lsn: to.lsn.to_u64(),
                 timestamp_ms: to.timestamp,
-                when: to.timestamp.map_or_else(|| "-".to_string(), format_unix_millis),
+                when: to
+                    .timestamp
+                    .map_or_else(|| "-".to_string(), format_unix_millis),
                 summary: parts.join(" "),
                 detail,
             });
@@ -1354,11 +4919,7 @@ fn table_log_entries(
 }
 
 /// Get the set of page indices that belong to a table's B-tree.
-fn get_table_page_set(
-    runtime: &Runtime,
-    vid: &VolumeId,
-    table: &str,
-) -> Result<Vec<u32>, ErrCtx> {
+fn get_table_page_set(runtime: &Runtime, vid: &VolumeId, table: &str) -> Result<Vec<u32>, ErrCtx> {
     // Get latest LSN from commit history
     let commits = runtime
         .volume_log(vid)
@@ -1372,16 +4933,15 @@ fn get_table_page_set(
         .volume_checkout(vid, latest_lsn)
         .map_err(|e| ErrCtx::PragmaErr(format!("Checkout error: {e:?}").into()))?;
     let co_vid = co.vid;
-    let reader = runtime.volume_reader(co_vid.clone()).map_err(|e| {
-        ErrCtx::PragmaErr(format!("Reader error: {e:?}").into())
-    })?;
+    let reader = runtime
+        .volume_reader(co_vid.clone())
+        .map_err(|e| ErrCtx::PragmaErr(format!("Reader error: {e:?}").into()))?;
 
-    let scanner = crate::sqlite_parse::TableScanner::new(&reader).map_err(|e| {
-        ErrCtx::PragmaErr(format!("Parse error: {e:?}").into())
-    })?;
-    let master = scanner.read_master_table().map_err(|e| {
-        ErrCtx::PragmaErr(format!("Schema error: {e:?}").into())
-    })?;
+    let scanner = crate::sqlite_parse::TableScanner::new(&reader)
+        .map_err(|e| ErrCtx::PragmaErr(format!("Parse error: {e:?}").into()))?;
+    let master = scanner
+        .read_master_table()
+        .map_err(|e| ErrCtx::PragmaErr(format!("Schema error: {e:?}").into()))?;
 
     let root_page = master
         .iter()
@@ -1398,7 +4958,11 @@ fn get_table_page_set(
 }
 
 /// Recursively collect all page numbers in a table B-tree.
-fn collect_btree_pages(reader: &graft::volume_reader::VolumeReader, page_num: u32, pages: &mut Vec<u32>) {
+fn collect_btree_pages(
+    reader: &graft::volume_reader::VolumeReader,
+    page_num: u32,
+    pages: &mut Vec<u32>,
+) {
     if page_num == 0 || pages.contains(&page_num) {
         return;
     }
@@ -1408,7 +4972,9 @@ fn collect_btree_pages(reader: &graft::volume_reader::VolumeReader, page_num: u3
         Some(p) => p,
         None => return,
     };
-    let Ok(page) = reader.read_page(page_idx) else { return };
+    let Ok(page) = reader.read_page(page_idx) else {
+        return;
+    };
     let data = page.as_ref();
 
     if data.len() < 12 {
@@ -1423,13 +4989,388 @@ fn collect_btree_pages(reader: &graft::volume_reader::VolumeReader, page_num: u3
         collect_btree_pages(reader, right_child, pages);
         for i in 0..num_cells {
             let ptr = 12 + i * 2;
-            if ptr + 2 > data.len() { break; }
+            if ptr + 2 > data.len() {
+                break;
+            }
             let cell_off = u16::from_be_bytes([data[ptr], data[ptr + 1]]) as usize;
             if cell_off + 4 <= data.len() {
-                let left = u32::from_be_bytes([data[cell_off], data[cell_off+1], data[cell_off+2], data[cell_off+3]]);
+                let left = u32::from_be_bytes([
+                    data[cell_off],
+                    data[cell_off + 1],
+                    data[cell_off + 2],
+                    data[cell_off + 3],
+                ]);
                 collect_btree_pages(reader, left, pages);
             }
         }
     }
     // Leaf pages (13) have no children — nothing to recurse.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_volume_pragmas_are_debug_only() {
+        let legacy = Pragma { name: "graft_volume_push", arg: None };
+        assert!(GraftPragma::try_from(&legacy).is_err());
+
+        let debug = Pragma {
+            name: "graft_debug_volume_push",
+            arg: None,
+        };
+        assert!(matches!(
+            GraftPragma::try_from(&debug).unwrap(),
+            GraftPragma::VolumePush
+        ));
+    }
+
+    #[test]
+    fn undocumented_repo_compat_pragmas_are_rejected() {
+        for name in [
+            "graft_repo_status",
+            "graft_remove",
+            "graft_branch_move",
+            "graft_branch_set_upstream",
+            "graft_branch_set_upstream_to",
+            "graft_tag_rm",
+            "graft_remote_rm",
+            "graft_remote_mv",
+        ] {
+            let pragma = Pragma { name, arg: Some("app.db") };
+            assert!(
+                GraftPragma::try_from(&pragma).is_err(),
+                "{name} should be rejected"
+            );
+        }
+
+        let status = Pragma { name: "graft_status", arg: None };
+        assert!(matches!(
+            GraftPragma::try_from(&status).unwrap(),
+            GraftPragma::Status
+        ));
+
+        let remove = Pragma { name: "graft_rm", arg: Some("app.db") };
+        assert!(matches!(
+            GraftPragma::try_from(&remove).unwrap(),
+            GraftPragma::Remove { .. }
+        ));
+    }
+
+    #[test]
+    fn parse_remote_add_supports_explicit_s3_endpoint() {
+        let (name, config) = parse_remote_add(
+            "origin s3_compatible://my-bucket/prod/app?endpoint=http://localhost:9000",
+        )
+        .unwrap();
+
+        assert_eq!(name, "origin");
+        assert_eq!(
+            config,
+            RemoteConfig::S3Compatible {
+                bucket: "my-bucket".to_string(),
+                prefix: Some("prod/app".to_string()),
+                endpoint: Some("http://localhost:9000".to_string()),
+            }
+        );
+        assert_eq!(
+            remote_config_uri(&config),
+            "s3://my-bucket/prod/app?endpoint=http://localhost:9000"
+        );
+    }
+
+    #[test]
+    fn parse_remote_add_rejects_unknown_s3_query_parameters() {
+        assert!(parse_remote_add("origin s3://my-bucket/prod?region=auto").is_err());
+    }
+
+    #[test]
+    fn parse_remote_rename_requires_two_names() {
+        assert_eq!(
+            parse_remote_rename("origin upstream").unwrap(),
+            ("origin".to_string(), "upstream".to_string())
+        );
+        assert!(parse_remote_rename("origin").is_err());
+        assert!(parse_remote_rename("origin upstream backup").is_err());
+    }
+
+    #[test]
+    fn parse_branch_list_mode_supports_remote_and_all() {
+        assert_eq!(parse_branch_list_mode(None).unwrap(), BranchListMode::Local);
+        assert_eq!(
+            parse_branch_list_mode(Some("--remote")).unwrap(),
+            BranchListMode::Remote
+        );
+        assert_eq!(
+            parse_branch_list_mode(Some("-r")).unwrap(),
+            BranchListMode::Remote
+        );
+        assert_eq!(
+            parse_branch_list_mode(Some("--all")).unwrap(),
+            BranchListMode::All
+        );
+        assert_eq!(
+            parse_branch_list_mode(Some("-a")).unwrap(),
+            BranchListMode::All
+        );
+        assert!(parse_branch_list_mode(Some("--remote origin")).is_err());
+    }
+
+    #[test]
+    fn parse_repo_clone_arg_supports_default_branch_and_branch_flags() {
+        assert_eq!(
+            parse_repo_clone_arg("fs:///srv/graft/app").unwrap(),
+            RepoCloneSpec {
+                config: RemoteConfig::Fs { root: "/srv/graft/app".to_string() },
+                branch: None,
+            }
+        );
+        assert_eq!(
+            parse_repo_clone_arg("fs:///srv/graft/app feature/search").unwrap(),
+            RepoCloneSpec {
+                config: RemoteConfig::Fs { root: "/srv/graft/app".to_string() },
+                branch: Some("feature/search".to_string()),
+            }
+        );
+        assert_eq!(
+            parse_repo_clone_arg("--branch feature/search memory").unwrap(),
+            RepoCloneSpec {
+                config: RemoteConfig::Memory,
+                branch: Some("feature/search".to_string()),
+            }
+        );
+        assert_eq!(
+            parse_repo_clone_arg("-b release/1.0 memory").unwrap(),
+            RepoCloneSpec {
+                config: RemoteConfig::Memory,
+                branch: Some("release/1.0".to_string()),
+            }
+        );
+        assert!(parse_repo_clone_arg("").is_err());
+        assert!(parse_repo_clone_arg("--branch feature/search").is_err());
+        assert!(parse_repo_clone_arg("memory feature/search extra").is_err());
+    }
+
+    #[test]
+    fn parse_remote_branch_arg_supports_all_remote() {
+        assert_eq!(
+            parse_remote_branch_arg(Some("--all origin")).unwrap(),
+            RemoteBranchArg {
+                remote: Some("origin".to_string()),
+                branch: None,
+                refspec: None,
+                all: true,
+                force: false,
+            }
+        );
+        assert_eq!(
+            parse_remote_branch_arg(Some("origin main")).unwrap(),
+            RemoteBranchArg {
+                remote: Some("origin".to_string()),
+                branch: Some("main".to_string()),
+                refspec: None,
+                all: false,
+                force: false,
+            }
+        );
+        assert_eq!(
+            parse_remote_branch_arg(Some("--force origin main")).unwrap(),
+            RemoteBranchArg {
+                remote: Some("origin".to_string()),
+                branch: Some("main".to_string()),
+                refspec: None,
+                all: false,
+                force: true,
+            }
+        );
+        assert_eq!(
+            parse_remote_branch_arg(Some("main:backup")).unwrap(),
+            RemoteBranchArg {
+                remote: None,
+                branch: None,
+                refspec: Some("main:backup".to_string()),
+                all: false,
+                force: false,
+            }
+        );
+        assert_eq!(
+            parse_remote_branch_arg(Some("origin refs/heads/*:refs/remotes/origin/review/*"))
+                .unwrap(),
+            RemoteBranchArg {
+                remote: Some("origin".to_string()),
+                branch: None,
+                refspec: Some("refs/heads/*:refs/remotes/origin/review/*".to_string()),
+                all: false,
+                force: false,
+            }
+        );
+        assert_eq!(
+            parse_remote_branch_arg(Some("--all -f origin")).unwrap(),
+            RemoteBranchArg {
+                remote: Some("origin".to_string()),
+                branch: None,
+                refspec: None,
+                all: true,
+                force: true,
+            }
+        );
+        assert!(parse_remote_branch_arg(Some("--all origin main")).is_err());
+    }
+
+    #[test]
+    fn parse_debug_diff_lsn_arg_requires_two_log_refs() {
+        let log: LogId = "74ggbzxuMf-2uAmM7FwXntwW".parse().unwrap();
+        let (from, to) =
+            parse_debug_diff_lsn_arg("74ggbzxuMf-2uAmM7FwXntwW:2 74ggbzxuMf-2uAmM7FwXntwW:3")
+                .unwrap();
+
+        assert_eq!(from, LogRef::new(log.clone(), LSN::new(2)));
+        assert_eq!(to, LogRef::new(log, LSN::new(3)));
+        assert!(parse_debug_diff_lsn_arg("74ggbzxuMf-2uAmM7FwXntwW:2").is_err());
+        assert!(parse_debug_diff_lsn_arg("2 3").is_err());
+    }
+
+    #[test]
+    fn parse_tag_create_arg_supports_annotated_messages() {
+        assert_eq!(
+            parse_tag_create_arg("v1.0 HEAD").unwrap(),
+            ("v1.0".to_string(), Some("HEAD".to_string()), None)
+        );
+        assert_eq!(
+            parse_tag_create_arg("--annotated v1.0 HEAD -- release 1.0").unwrap(),
+            (
+                "v1.0".to_string(),
+                Some("HEAD".to_string()),
+                Some("release 1.0".to_string())
+            )
+        );
+        assert_eq!(
+            parse_tag_create_arg("-a v1.0 -- release 1.0").unwrap(),
+            ("v1.0".to_string(), None, Some("release 1.0".to_string()))
+        );
+        assert!(parse_tag_create_arg("--annotated v1.0 HEAD").is_err());
+        assert!(parse_tag_create_arg("--annotated v1.0 HEAD -- ").is_err());
+    }
+
+    #[test]
+    fn parse_checkout_and_switch_force_args() {
+        assert_eq!(
+            parse_repo_checkout_arg("--force HEAD~1").unwrap(),
+            RepoCheckoutSpec::Detach { rev: "HEAD~1".to_string(), force: true }
+        );
+        assert_eq!(
+            parse_repo_checkout_arg("HEAD~1 -- app.db").unwrap(),
+            RepoCheckoutSpec::Path {
+                rev: "HEAD~1".to_string(),
+                path: "app.db".to_string(),
+            }
+        );
+        assert!(parse_repo_checkout_arg("--force HEAD~1 -- app.db").is_err());
+        assert_eq!(
+            parse_repo_restore_arg("external.db").unwrap(),
+            RepoRestoreSpec {
+                source: None,
+                staged: false,
+                path: PathBuf::from("external.db"),
+            }
+        );
+        assert_eq!(
+            parse_repo_restore_arg("--source HEAD~1 -- external.db").unwrap(),
+            RepoRestoreSpec {
+                source: Some("HEAD~1".to_string()),
+                staged: false,
+                path: PathBuf::from("external.db"),
+            }
+        );
+        assert_eq!(
+            parse_repo_restore_arg("--staged -- external.db").unwrap(),
+            RepoRestoreSpec {
+                source: None,
+                staged: true,
+                path: PathBuf::from("external.db"),
+            }
+        );
+        assert_eq!(
+            parse_repo_restore_arg("--staged --source HEAD -- external.db").unwrap(),
+            RepoRestoreSpec {
+                source: Some("HEAD".to_string()),
+                staged: true,
+                path: PathBuf::from("external.db"),
+            }
+        );
+        assert_eq!(
+            parse_repo_export_arg("--output snapshot.db").unwrap(),
+            RepoExportSpec {
+                source: None,
+                path: None,
+                output: PathBuf::from("snapshot.db"),
+            }
+        );
+        assert_eq!(
+            parse_repo_export_arg("--source HEAD~1 --output snapshot.db -- app.db").unwrap(),
+            RepoExportSpec {
+                source: Some("HEAD~1".to_string()),
+                path: Some(PathBuf::from("app.db")),
+                output: PathBuf::from("snapshot.db"),
+            }
+        );
+        assert_eq!(
+            parse_repo_export_arg("--output '/tmp/Application Support/snapshot.db'").unwrap(),
+            RepoExportSpec {
+                source: None,
+                path: None,
+                output: PathBuf::from("/tmp/Application Support/snapshot.db"),
+            }
+        );
+        assert_eq!(
+            parse_repo_export_arg(
+                "--source HEAD --output \"/tmp/Application Support/snapshot.db\" -- \"app data.db\""
+            )
+            .unwrap(),
+            RepoExportSpec {
+                source: Some("HEAD".to_string()),
+                path: Some(PathBuf::from("app data.db")),
+                output: PathBuf::from("/tmp/Application Support/snapshot.db"),
+            }
+        );
+        assert_eq!(
+            parse_repo_export_arg("fixtures/users.db -o snapshot.db").unwrap(),
+            RepoExportSpec {
+                source: None,
+                path: Some(PathBuf::from("fixtures/users.db")),
+                output: PathBuf::from("snapshot.db"),
+            }
+        );
+        assert!(parse_repo_export_arg("--source HEAD").is_err());
+
+        assert_eq!(
+            parse_switch_branch_arg("--force main").unwrap(),
+            ("main".to_string(), true)
+        );
+        assert_eq!(
+            parse_branch_rename_arg("feature/query").unwrap(),
+            (None, "feature/query".to_string(), false)
+        );
+        assert_eq!(
+            parse_branch_rename_arg("feature/search feature/query").unwrap(),
+            (
+                Some("feature/search".to_string()),
+                "feature/query".to_string(),
+                false
+            )
+        );
+        assert_eq!(
+            parse_branch_rename_arg("-M feature/search feature/query").unwrap(),
+            (
+                Some("feature/search".to_string()),
+                "feature/query".to_string(),
+                true
+            )
+        );
+        assert_eq!(
+            parse_switch_create_arg("-f feature/search HEAD").unwrap(),
+            ("feature/search".to_string(), Some("HEAD".to_string()), true)
+        );
+    }
 }

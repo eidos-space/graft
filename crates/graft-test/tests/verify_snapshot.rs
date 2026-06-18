@@ -18,7 +18,7 @@ fn test_snapshot_correct_after_pull() -> anyhow::Result<()> {
 
     // open the same remote in two different volumes
     let vid1 = runtime.volume_open(None, None, Some(remote.clone()))?.vid;
-    let vid2 = runtime.volume_open(None, None, Some(remote.clone()))?.vid;
+    let vid2 = runtime.volume_open(None, None, Some(remote))?.vid;
 
     // write a page to vid1
     let mut writer = runtime.volume_writer(vid1.clone())?;
@@ -35,7 +35,7 @@ fn test_snapshot_correct_after_pull() -> anyhow::Result<()> {
     writer.commit()?;
 
     // push it to the remote
-    runtime.volume_push(vid2.clone())?;
+    runtime.volume_push(vid2)?;
 
     // pull and verify that we see the page in vid1
     runtime.volume_pull(vid1.clone())?;
@@ -45,7 +45,7 @@ fn test_snapshot_correct_after_pull() -> anyhow::Result<()> {
     assert!(page == Page::test_filled(2), "page is correct");
 
     // write to a different page, and then validate the resulting snapshot
-    let mut writer = runtime.volume_writer(vid1.clone())?;
+    let mut writer = runtime.volume_writer(vid1)?;
     writer.write_page(pageidx!(2), Page::test_filled(2))?;
     let reader = writer.commit()?;
     tracing::info!(snapshot=?reader.snapshot());
@@ -69,7 +69,7 @@ fn test_latest_snapshot_correct_after_pull() -> anyhow::Result<()> {
 
     // open the same remote in two different volumes
     let vid1 = runtime.volume_open(None, None, Some(remote.clone()))?.vid;
-    let vid2 = runtime.volume_open(None, None, Some(remote.clone()))?.vid;
+    let vid2 = runtime.volume_open(None, None, Some(remote))?.vid;
 
     // write a page to vid1
     let mut writer = runtime.volume_writer(vid1.clone())?;
@@ -91,7 +91,7 @@ fn test_latest_snapshot_correct_after_pull() -> anyhow::Result<()> {
     writer.write_page(pageidx!(1), Page::test_filled(2))?;
     tracing::info!(snapshot=?writer.snapshot());
     writer.commit()?;
-    runtime.volume_push(vid2.clone())?;
+    runtime.volume_push(vid2)?;
 
     // write a commit to vid1, but dont commit yet
     let mut writer = runtime.volume_writer(vid1.clone())?;

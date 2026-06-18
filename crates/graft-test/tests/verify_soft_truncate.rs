@@ -19,7 +19,7 @@ fn test_soft_truncate() -> anyhow::Result<()> {
     let runtime2 = runtime1.spawn_peer();
 
     let vid1 = runtime1.volume_open(None, None, Some(remote.clone()))?.vid;
-    let vid2 = runtime2.volume_open(None, None, Some(remote.clone()))?.vid;
+    let vid2 = runtime2.volume_open(None, None, Some(remote))?.vid;
 
     let mut writer = runtime1.volume_writer(vid1.clone())?;
     writer.write_page(pageidx!(1), Page::test_filled(1))?;
@@ -37,14 +37,14 @@ fn test_soft_truncate() -> anyhow::Result<()> {
     runtime1.volume_push(vid1.clone())?;
 
     // Verify that we can still read page 3 on the original volume
-    let reader = runtime1.volume_reader(vid1.clone())?;
+    let reader = runtime1.volume_reader(vid1)?;
     let page = reader.read_page(pageidx!(3))?;
     assert!(page == Page::test_filled(3));
 
     // Verify that soft truncation is being respected on the replica. We should
     // see page 3 even though we just truncated the volume through PageCount == 0
     runtime2.volume_pull(vid2.clone())?;
-    let reader = runtime2.volume_reader(vid2.clone())?;
+    let reader = runtime2.volume_reader(vid2)?;
     let page = reader.read_page(pageidx!(3))?;
     assert!(page == Page::test_filled(3));
 
