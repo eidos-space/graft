@@ -237,7 +237,7 @@ mod tests {
     fn test_merge() {
         // generate some random data
         let data = (0..1_000)
-            .map(|i| format!("random_data_{}", i))
+            .map(|i| format!("random_data_{i}"))
             .collect::<Vec<_>>();
 
         // first build the checksum serially

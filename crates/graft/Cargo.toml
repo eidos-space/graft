@@ -41,6 +41,7 @@ thin-vec = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync", "rt", "time", "parking_lot"] }
 tokio-stream = { workspace = true }
+toml = { workspace = true }
 tracing = { workspace = true }
 tryiter = { workspace = true }
 xxhash-rust = { workspace = true }

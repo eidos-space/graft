@@ -40,6 +40,28 @@ pub enum InitErr {
 /// For more complex setups such as custom Tokio runtimes, it's recommended to
 /// setup the Graft Runtime manually instead.
 pub fn setup_graft(config: GraftConfig) -> Result<Runtime, InitErr> {
+    let storage = Arc::new(FjallStorage::open(config.data_dir)?);
+    setup_runtime(config.remote, storage, config.autosync)
+}
+
+/// Set up a Graft runtime with temporary local storage.
+///
+/// This is useful for `SQLite` extension loaders and other entry points where
+/// durable state should come from a discovered `.graft/` repository rather than
+/// a process-global default directory.
+pub fn setup_graft_temporary(
+    remote: RemoteConfig,
+    autosync: Option<NonZero<u64>>,
+) -> Result<Runtime, InitErr> {
+    let storage = Arc::new(FjallStorage::open_temporary()?);
+    setup_runtime(remote, storage, autosync)
+}
+
+fn setup_runtime(
+    remote: RemoteConfig,
+    storage: Arc<FjallStorage>,
+    autosync: Option<NonZero<u64>>,
+) -> Result<Runtime, InitErr> {
     // spin up a tokio current thread runtime in a new thread
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -52,8 +74,7 @@ pub fn setup_graft(config: GraftConfig) -> Result<Runtime, InitErr> {
             rt.block_on(pending::<()>())
         })?;
 
-    let remote = Arc::new(config.remote.build()?);
-    let storage = Arc::new(FjallStorage::open(config.data_dir)?);
-    let autosync = config.autosync.map(|s| Duration::from_secs(s.get()));
+    let remote = Arc::new(remote.build()?);
+    let autosync = autosync.map(|s| Duration::from_secs(s.get()));
     Ok(Runtime::new(tokio_handle, remote, storage, autosync))
 }

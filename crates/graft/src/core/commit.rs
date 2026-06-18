@@ -384,7 +384,7 @@ mod tests {
             (
                 pageidx!(25),
                 Some(SegmentRangeRef {
-                    sid: sid.clone(),
+                    sid,
                     bytes: 300..450,
                     pageset: PageSet::from_range(pageidx!(21)..=pageidx!(25)),
                 }),
@@ -423,7 +423,7 @@ mod tests {
             pageset: PageSet::from_range(pageidx!(5)..=pageidx!(10)),
         };
         let frame2 = SegmentRangeRef {
-            sid: sid.clone(),
+            sid,
             bytes: 100..200,
             pageset: PageSet::from_range(pageidx!(11)..=pageidx!(20)),
         };
@@ -454,7 +454,7 @@ mod tests {
             pageset: PageSet::from_range(pageidx!(5)..=pageidx!(10)),
         };
         let frame2 = SegmentRangeRef {
-            sid: sid.clone(),
+            sid,
             bytes: 150..250,
             pageset: PageSet::from_range(pageidx!(20)..=pageidx!(30)),
         };

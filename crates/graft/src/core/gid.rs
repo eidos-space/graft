@@ -292,7 +292,7 @@ impl<'de, P: Prefix> Deserialize<'de> for Gid<P> {
         D: serde::Deserializer<'de>,
     {
         if deserializer.is_human_readable() {
-            let s = <&str>::deserialize(deserializer)?;
+            let s = String::deserialize(deserializer)?;
             s.parse().map_err(serde::de::Error::custom)
         } else {
             let bytes = <&[u8]>::deserialize(deserializer)?;

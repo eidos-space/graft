@@ -642,7 +642,7 @@ mod tests {
         ];
 
         for (i, case) in cases.into_iter().enumerate() {
-            println!("Case {}: {:?}", i, case);
+            println!("Case {i}: {case:?}");
             assert_eq!(case.range.len(), case.len, "len");
             let is_empty = LSNRangeExt::is_empty(&case.range);
             assert_eq!(is_empty, case.len == 0, "is_empty");

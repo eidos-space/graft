@@ -1,8 +1,14 @@
-use std::{ops::RangeInclusive, sync::Arc, time::Duration};
+use std::{ops::RangeInclusive, path::Path, sync::Arc, time::Duration};
 
 use crate::core::{
-    LogId, PageCount, PageIdx, SegmentId, VolumeId, checksum::Checksum, commit::Commit,
-    logref::LogRef, lsn::{LSN, LSNRangeExt}, page::Page, pageset::PageSet,
+    CommitHashBuilder, LogId, PageCount, PageIdx, SegmentId, VolumeId,
+    checksum::Checksum,
+    commit::Commit,
+    commit_hash::CommitHash,
+    logref::LogRef,
+    lsn::{LSN, LSNRangeExt},
+    page::Page,
+    pageset::PageSet,
 };
 use bytestring::ByteString;
 use tracing::Instrument;
@@ -12,7 +18,7 @@ use crate::{
     GraftErr, LogicalErr,
     remote::Remote,
     rt::{
-        action::{Action, FetchLog, FetchSegment, HydrateSnapshot, RemoteCommit},
+        action::{Action, FetchLog, FetchSegment, HydrateSnapshot, RemoteCommit, SnapshotPush},
         task::{autosync::AutosyncTask, supervise},
     },
     snapshot::Snapshot,
@@ -21,7 +27,7 @@ use crate::{
     volume_writer::VolumeWriter,
 };
 
-use crate::local::fjall_storage::FjallStorage;
+use crate::local::fjall_storage::{FjallStorage, FjallStorageErr};
 
 pub type Result<T> = std::result::Result<T, GraftErr>;
 
@@ -89,6 +95,23 @@ impl Runtime {
         &self.inner.storage
     }
 
+    pub fn fork_with_storage(&self, storage: Arc<FjallStorage>) -> Runtime {
+        Runtime::new(
+            self.inner.tokio.clone(),
+            self.inner.remote.clone(),
+            storage,
+            None,
+        )
+    }
+
+    pub fn fork_with_storage_path(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> std::result::Result<Runtime, FjallStorageErr> {
+        let storage = Arc::new(FjallStorage::open(path)?);
+        Ok(self.fork_with_storage(storage))
+    }
+
     pub(crate) fn read_page(&self, snapshot: &Snapshot, pageidx: PageIdx) -> Result<Page> {
         let reader = self.storage().read();
         if let Some(commit) = reader.search_page(snapshot, pageidx)? {
@@ -121,11 +144,15 @@ impl Runtime {
     }
 
     fn run_action<A: Action>(&self, action: A) -> Result<()> {
+        self.run_action_with_remote(action, self.inner.remote.clone())
+    }
+
+    fn run_action_with_remote<A: Action>(&self, action: A, remote: Arc<Remote>) -> Result<()> {
         let span = tracing::debug_span!("Action::run", ?action);
 
         self.inner.tokio.block_on(
             action
-                .run(self.inner.storage.clone(), self.inner.remote.clone())
+                .run(self.inner.storage.clone(), remote)
                 .instrument(span),
         )
     }
@@ -246,8 +273,55 @@ impl Runtime {
         self.run_action(FetchLog { log, max_lsn })
     }
 
+    pub fn fetch_log_from(
+        &self,
+        log: LogId,
+        max_lsn: Option<LSN>,
+        remote: Arc<Remote>,
+    ) -> Result<()> {
+        self.run_action_with_remote(FetchLog { log, max_lsn }, remote)
+    }
+
     pub fn get_commit(&self, log: &LogId, lsn: LSN) -> Result<Option<Commit>> {
         Ok(self.storage().read().get_commit(log, lsn)?)
+    }
+
+    pub fn commit_hash(&self, log: &LogId, lsn: LSN) -> Result<Option<CommitHash>> {
+        let reader = self.storage().read();
+        let Some(commit) = reader.get_commit(log, lsn)? else {
+            return Ok(None);
+        };
+        let Some(segment_idx) = commit.segment_idx().cloned() else {
+            return Ok(Some(
+                CommitHashBuilder::new(
+                    commit.log.clone(),
+                    commit.lsn,
+                    commit.page_count,
+                    PageCount::ZERO,
+                )
+                .build(),
+            ));
+        };
+
+        let mut hash_builder = CommitHashBuilder::new(
+            commit.log.clone(),
+            commit.lsn,
+            commit.page_count,
+            segment_idx.page_count(),
+        );
+        for pageidx in segment_idx.pageset.iter() {
+            let page = reader
+                .read_page(segment_idx.sid.clone(), pageidx)?
+                .ok_or_else(|| {
+                    LogicalErr::Other(format!(
+                        "commit {:?}/{} references missing page {:?} in segment {:?}",
+                        commit.log, commit.lsn, pageidx, segment_idx.sid
+                    ))
+                })?;
+            hash_builder.write_page(pageidx, &page);
+        }
+
+        Ok(Some(hash_builder.build()))
     }
 }
 
@@ -288,6 +362,40 @@ impl Runtime {
 
     pub fn snapshot_hydrate(&self, snapshot: Snapshot) -> Result<()> {
         self.run_action(HydrateSnapshot { snapshot })
+    }
+
+    pub fn snapshot_hydrate_from(&self, snapshot: Snapshot, remote: Arc<Remote>) -> Result<()> {
+        self.snapshot_fetch_from(&snapshot, remote.clone())?;
+        self.run_action_with_remote(HydrateSnapshot { snapshot }, remote)
+    }
+
+    pub fn snapshot_push_to(&self, snapshot: Snapshot, remote: Arc<Remote>) -> Result<()> {
+        self.run_action_with_remote(SnapshotPush { snapshot }, remote)
+    }
+
+    pub fn snapshot_fetch_from(&self, snapshot: &Snapshot, remote: Arc<Remote>) -> Result<()> {
+        for range in snapshot.iter() {
+            self.fetch_log_from(range.log.clone(), Some(*range.lsns.end()), remote.clone())?;
+        }
+        self.ensure_snapshot_commits(snapshot)
+    }
+
+    fn ensure_snapshot_commits(&self, snapshot: &Snapshot) -> Result<()> {
+        let reader = self.storage().read();
+        for range in snapshot.iter() {
+            let start = range.lsns.start().to_u64();
+            let end = range.lsns.end().to_u64();
+            for lsn in start..=end {
+                if reader.get_commit(&range.log, LSN::new(lsn))?.is_none() {
+                    return Err(LogicalErr::Other(format!(
+                        "snapshot is missing commit {:?}/{}",
+                        range.log, lsn
+                    ))
+                    .into());
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -363,12 +471,7 @@ impl Runtime {
 
     /// Compare differences between two commits (similar to git diff).
     /// Returns which pages changed.
-    pub fn diff_commits(
-        &self,
-        log: &LogId,
-        from_lsn: LSN,
-        to_lsn: LSN,
-    ) -> Result<DiffResult> {
+    pub fn diff_commits(&self, log: &LogId, from_lsn: LSN, to_lsn: LSN) -> Result<DiffResult> {
         let reader = self.storage().read();
 
         let from_commit = reader
@@ -391,9 +494,10 @@ impl Runtime {
         // Iterate over all commits in the range
         for lsn in range.iter() {
             if let Some(commit) = reader.get_commit(log, lsn)?
-                && let Some(idx) = commit.segment_idx() {
-                    changed_pages |= idx.pageset.clone();
-                }
+                && let Some(idx) = commit.segment_idx()
+            {
+                changed_pages |= idx.pageset.clone();
+            }
         }
 
         let page_count_delta = if to_lsn > from_lsn {
@@ -560,7 +664,7 @@ mod tests {
         assert_eq!(runtime_2.volume_status(&vid_2).unwrap().to_string(), "1 r2",);
 
         // sanity check volume reader semantics in the first runtime
-        let reader = runtime.volume_reader(vid.clone()).unwrap();
+        let reader = runtime.volume_reader(vid).unwrap();
         let task = tokio_rt.spawn_blocking(move || {
             for i in [3u8, 4, 5, 7] {
                 let pageidx = PageIdx::must_new(i as u32);
@@ -586,12 +690,7 @@ mod tests {
 
         let remote = Arc::new(RemoteConfig::Memory.build().unwrap());
         let storage = Arc::new(FjallStorage::open_temporary().unwrap());
-        let runtime = Runtime::new(
-            tokio_rt.handle().clone(),
-            remote.clone(),
-            storage,
-            None,
-        );
+        let runtime = Runtime::new(tokio_rt.handle().clone(), remote, storage, None);
 
         // Create Volume and write multiple commits
         let volume = runtime.volume_open(None, None, None).unwrap();
@@ -617,7 +716,7 @@ mod tests {
         let elapsed = start.elapsed();
 
         println!("volume_checkout to LSN 50:");
-        println!("  Time: {:?}", elapsed);
+        println!("  Time: {elapsed:?}");
         println!("  Original Volume: {} ({} commits)", vid, log.len());
         println!(
             "  New Volume: {} ({} commits)",
@@ -653,12 +752,7 @@ mod tests {
 
         let remote = Arc::new(RemoteConfig::Memory.build().unwrap());
         let storage = Arc::new(FjallStorage::open_temporary().unwrap());
-        let runtime = Runtime::new(
-            tokio_rt.handle().clone(),
-            remote.clone(),
-            storage,
-            None,
-        );
+        let runtime = Runtime::new(tokio_rt.handle().clone(), remote, storage, None);
 
         let volume = runtime.volume_open(None, None, None).unwrap();
         let log = runtime.volume_log(&volume.vid).unwrap();
@@ -675,12 +769,7 @@ mod tests {
 
         let remote = Arc::new(RemoteConfig::Memory.build().unwrap());
         let storage = Arc::new(FjallStorage::open_temporary().unwrap());
-        let runtime = Runtime::new(
-            tokio_rt.handle().clone(),
-            remote.clone(),
-            storage,
-            None,
-        );
+        let runtime = Runtime::new(tokio_rt.handle().clone(), remote, storage, None);
 
         let volume = runtime.volume_open(None, None, None).unwrap();
         let vid = volume.vid;
@@ -717,12 +806,7 @@ mod tests {
 
         let remote = Arc::new(RemoteConfig::Memory.build().unwrap());
         let storage = Arc::new(FjallStorage::open_temporary().unwrap());
-        let runtime = Runtime::new(
-            tokio_rt.handle().clone(),
-            remote.clone(),
-            storage,
-            None,
-        );
+        let runtime = Runtime::new(tokio_rt.handle().clone(), remote, storage, None);
 
         let volume = runtime.volume_open(None, None, None).unwrap();
         let vid = volume.vid;
@@ -765,12 +849,7 @@ mod tests {
 
         let remote = Arc::new(RemoteConfig::Memory.build().unwrap());
         let storage = Arc::new(FjallStorage::open_temporary().unwrap());
-        let runtime = Runtime::new(
-            tokio_rt.handle().clone(),
-            remote.clone(),
-            storage,
-            None,
-        );
+        let runtime = Runtime::new(tokio_rt.handle().clone(), remote, storage, None);
 
         let volume = runtime.volume_open(None, None, None).unwrap();
         let vid = volume.vid;
@@ -809,12 +888,7 @@ mod tests {
 
         let remote = Arc::new(RemoteConfig::Memory.build().unwrap());
         let storage = Arc::new(FjallStorage::open_temporary().unwrap());
-        let runtime = Runtime::new(
-            tokio_rt.handle().clone(),
-            remote.clone(),
-            storage,
-            None,
-        );
+        let runtime = Runtime::new(tokio_rt.handle().clone(), remote, storage, None);
 
         let volume = runtime.volume_open(None, None, None).unwrap();
         let vid = volume.vid;
@@ -832,7 +906,9 @@ mod tests {
         runtime.tag_replace("test-reset", vid.clone()).unwrap();
 
         // Reset to LSN 3
-        let new_vol = runtime.volume_reset_to("test-reset", crate::lsn!(3)).unwrap();
+        let new_vol = runtime
+            .volume_reset_to("test-reset", crate::lsn!(3))
+            .unwrap();
 
         let new_log = runtime.volume_log(&new_vol.vid).unwrap();
         assert_eq!(new_log.len(), 3);
@@ -861,16 +937,11 @@ mod tests {
 
         let remote = Arc::new(RemoteConfig::Memory.build().unwrap());
         let storage = Arc::new(FjallStorage::open_temporary().unwrap());
-        let runtime = Runtime::new(
-            tokio_rt.handle().clone(),
-            remote.clone(),
-            storage,
-            None,
-        );
+        let runtime = Runtime::new(tokio_rt.handle().clone(), remote, storage, None);
 
         let volume = runtime.volume_open(None, None, None).unwrap();
         let vid = volume.vid;
-        let local = volume.local.clone();
+        let local = volume.local;
 
         // Write 3 commits, each writing one page
         for i in 1..=3 {
@@ -903,19 +974,14 @@ mod tests {
 
         let remote = Arc::new(RemoteConfig::Memory.build().unwrap());
         let storage = Arc::new(FjallStorage::open_temporary().unwrap());
-        let runtime = Runtime::new(
-            tokio_rt.handle().clone(),
-            remote.clone(),
-            storage,
-            None,
-        );
+        let runtime = Runtime::new(tokio_rt.handle().clone(), remote, storage, None);
 
         let volume = runtime.volume_open(None, None, None).unwrap();
         let vid = volume.vid;
-        let local = volume.local.clone();
+        let local = volume.local;
 
         // Write 1 commit
-        let mut writer = runtime.volume_writer(vid.clone()).unwrap();
+        let mut writer = runtime.volume_writer(vid).unwrap();
         writer
             .write_page(PageIdx::must_new(1), Page::test_filled(1))
             .unwrap();
@@ -939,12 +1005,7 @@ mod tests {
 
         let remote = Arc::new(RemoteConfig::Memory.build().unwrap());
         let storage = Arc::new(FjallStorage::open_temporary().unwrap());
-        let runtime = Runtime::new(
-            tokio_rt.handle().clone(),
-            remote.clone(),
-            storage,
-            None,
-        );
+        let runtime = Runtime::new(tokio_rt.handle().clone(), remote, storage, None);
 
         let volume = runtime.volume_open(None, None, None).unwrap();
         let vid = volume.vid;
@@ -965,7 +1026,7 @@ mod tests {
     }
 
     /// Performance benchmark (not a correctness test; informational only).
-    /// Run with: cargo test -p graft -- perf_assessment --nocapture
+    /// Run with: cargo test -p graft -- `perf_assessment` --nocapture
     #[test]
     fn perf_assessment() {
         use std::time::Instant;
@@ -978,9 +1039,7 @@ mod tests {
 
         let remote = Arc::new(RemoteConfig::Memory.build().unwrap());
         let storage = Arc::new(FjallStorage::open_temporary().unwrap());
-        let runtime = Runtime::new(
-            tokio_rt.handle().clone(), remote.clone(), storage, None,
-        );
+        let runtime = Runtime::new(tokio_rt.handle().clone(), remote, storage, None);
 
         let volume = runtime.volume_open(None, None, None).unwrap();
         let vid = volume.vid;
@@ -1000,10 +1059,13 @@ mod tests {
 
         // volume_log
         let t0 = Instant::now();
-        let log = runtime.volume_log(&vid).unwrap();
+        let _log = runtime.volume_log(&vid).unwrap();
         let vlog = t0.elapsed();
-        println!("volume_log: {n} commits → {:.0?} ({:.0} µs/commit)",
-            vlog, vlog.as_micros() as f64 / n as f64);
+        println!(
+            "volume_log: {n} commits → {:.0?} ({:.0} µs/commit)",
+            vlog,
+            vlog.as_micros() as f64 / n as f64
+        );
 
         // volume_checkout to various sizes
         for target in [10u64, 50, 100, 200] {
@@ -1011,7 +1073,11 @@ mod tests {
             let co = runtime.volume_checkout(&vid, LSN::new(target)).unwrap();
             let dur = t0.elapsed();
             let co_log = runtime.volume_log(&co.vid).unwrap();
-            println!("checkout LSN {target}: {:.0?} (result has {} commits)", dur, co_log.len());
+            println!(
+                "checkout LSN {target}: {:.0?} (result has {} commits)",
+                dur,
+                co_log.len()
+            );
             runtime.volume_delete(&co.vid).unwrap();
         }
 
@@ -1023,8 +1089,12 @@ mod tests {
                 .unwrap();
             let dur = t0.elapsed();
             let range = to - from + 1;
-            println!("diff {from}..{to} ({} commits): {:.0?} ({} changed pages)",
-                range, dur, diff.added_or_modified_pages.cardinality());
+            println!(
+                "diff {from}..{to} ({} commits): {:.0?} ({} changed pages)",
+                range,
+                dur,
+                diff.added_or_modified_pages.cardinality()
+            );
         }
     }
 }

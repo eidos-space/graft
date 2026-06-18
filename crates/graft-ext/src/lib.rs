@@ -11,7 +11,8 @@ use std::{
 use config::{Config, FileFormat};
 use graft::{
     remote::RemoteConfig,
-    setup::{GraftConfig, setup_graft},
+    rt::runtime::Runtime,
+    setup::{GraftConfig, setup_graft, setup_graft_temporary},
 };
 use graft_sqlite::vfs::GraftVfs;
 use graft_tracing::{SubscriberInitExt, TracingConsumer, setup_tracing_with_writer};
@@ -22,18 +23,13 @@ use sqlite_plugin::{
     vfs::{RegisterOpts, SqliteErr},
 };
 
-fn default_data_dir() -> PathBuf {
-    platform_dirs::AppDirs::new(Some("graft"), true)
-        .expect("must specify explicit data_dir on this platform")
-        .data_dir
-}
-
 #[derive(Debug, Deserialize)]
 pub struct ExtensionConfig {
+    #[serde(default)]
     remote: RemoteConfig,
 
-    #[serde(default = "default_data_dir")]
-    data_dir: PathBuf,
+    #[serde(default)]
+    data_dir: Option<PathBuf>,
 
     log_file: Option<PathBuf>,
 
@@ -46,11 +42,14 @@ pub struct ExtensionConfig {
 }
 
 impl ExtensionConfig {
-    pub fn graft_config(&self) -> GraftConfig {
-        GraftConfig {
-            remote: self.remote.clone(),
-            data_dir: self.data_dir.clone(),
-            autosync: self.autosync,
+    pub fn setup_runtime(&self) -> Result<Runtime, graft::setup::InitErr> {
+        match &self.data_dir {
+            Some(data_dir) => setup_graft(GraftConfig {
+                remote: self.remote.clone(),
+                data_dir: data_dir.clone(),
+                autosync: self.autosync,
+            }),
+            None => setup_graft_temporary(self.remote.clone(), self.autosync),
         }
     }
 }
@@ -68,6 +67,7 @@ fn setup_log_file(path: &Path) {
 }
 
 #[allow(dead_code, reason = "msg is unused in static build")]
+#[derive(Debug)]
 struct InitErr(SqliteErr, Cow<'static, str>);
 
 impl<T: Display> From<T> for InitErr {
@@ -96,34 +96,20 @@ fn write_err_msg(
 }
 
 fn resolve_config() -> Result<ExtensionConfig, InitErr> {
-    // a priority ordered list of config paths, the first path found will be used
-    let paths = [
-        std::env::var("GRAFT_CONFIG").ok().map(|s| s.into()),
-        Some("graft.toml".into()),
-        platform_dirs::AppDirs::new(Some("graft"), true)
-            .map(|app_dirs| app_dirs.config_dir.join("graft.toml")),
-    ];
+    resolve_config_from_path(Path::new("graft.toml"))
+}
 
-    // find the first path that is Some and resolves to a file
-    let path = paths
-        .into_iter()
-        .flatten()
-        .find(|p: &PathBuf| p.is_file())
-        .and_then(|p| p.to_str().map(|s| s.to_string()));
-
+fn resolve_config_from_path(path: &Path) -> Result<ExtensionConfig, InitErr> {
     // build the config
     let mut config = Config::builder();
 
     // add the config file if it exists
-    if let Some(path) = path {
-        config = config.add_source(config::File::new(&path, FileFormat::Toml).required(true));
+    if path.is_file() {
+        let path = path
+            .to_str()
+            .ok_or_else(|| InitErr(vars::SQLITE_CANTOPEN, "config path is not UTF-8".into()))?;
+        config = config.add_source(config::File::new(path, FileFormat::Toml).required(true));
     }
-
-    config = config.add_source(
-        config::Environment::with_prefix("GRAFT")
-            .prefix_separator("_")
-            .separator("__"),
-    );
 
     Ok(config.build()?.try_deserialize()?)
 }
@@ -160,7 +146,7 @@ fn dynamic_init(p_api: *mut sqlite_plugin::sqlite3_api_routines) -> Result<(), I
     let config = resolve_config()?;
 
     // initialize graft
-    let runtime = setup_graft(config.graft_config())?;
+    let runtime = config.setup_runtime()?;
     let vfs = GraftVfs::new(runtime);
     let opts = RegisterOpts { make_default: config.make_default };
 
@@ -203,7 +189,7 @@ fn graft_static_init_inner() -> Result<(), InitErr> {
     let config = resolve_config()?;
 
     // initialize graft
-    let runtime = setup_graft(config.graft_config())?;
+    let runtime = config.setup_runtime()?;
     let vfs = GraftVfs::new(runtime);
     let opts = RegisterOpts { make_default: config.make_default };
 
@@ -220,9 +206,49 @@ fn graft_static_init_inner() -> Result<(), InitErr> {
     Ok(())
 }
 
-/// Register the Graft SQLite extension statically.
+/// Register the Graft `SQLite` extension statically.
+///
+/// # Safety
+///
+/// This function is an FFI entry point for hosts that statically link the extension.
+/// It must only be called in a process where `SQLite` extension initialization through
+/// Graft's global registration path is appropriate.
 #[cfg(feature = "static")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn graft_static_init() -> c_int {
     graft_static_init_inner().map_or_else(|err| err.0, |_| 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_loader_config_uses_temporary_base_storage() {
+        let config =
+            resolve_config_from_path(Path::new("this-loader-config-file-should-not-exist.toml"))
+                .unwrap();
+
+        assert!(config.data_dir.is_none());
+    }
+
+    #[test]
+    fn explicit_loader_config_can_set_data_dir() {
+        let root =
+            std::env::temp_dir().join(format!("graft-ext-config-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let config_path = root.join("graft.toml");
+        let data_dir = root.join("data");
+        std::fs::write(
+            &config_path,
+            format!("data_dir = {:?}\n", data_dir.display().to_string()),
+        )
+        .unwrap();
+
+        let config = resolve_config_from_path(&config_path).unwrap();
+        assert_eq!(config.data_dir, Some(data_dir));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

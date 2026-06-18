@@ -13,6 +13,7 @@ pub mod core;
 pub mod err;
 pub mod oracle;
 pub mod remote;
+pub mod repo;
 pub mod setup;
 pub mod snapshot;
 pub mod volume;

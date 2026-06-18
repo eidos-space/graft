@@ -16,7 +16,6 @@ graft-sqlite = { path = "../graft-sqlite" }
 graft-tracing = { path = "../graft-tracing" }
 
 config = { workspace = true, features = ["toml"] }
-platform-dirs = { workspace = true }
 precept = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 sqlite-plugin = { workspace = true, default-features = false }

@@ -52,6 +52,12 @@ pub enum RemoteErr {
 
     #[error("Failed to decode file: {0}")]
     Decode(#[from] bilrost::DecodeError),
+
+    #[error("remote lock `{path}` is already held")]
+    LockBusy { path: String },
+
+    #[error("remote object `{path}` changed during compare-and-swap")]
+    CompareAndSwap { path: String },
 }
 
 impl RemoteErr {
@@ -80,7 +86,7 @@ impl RemoteErr {
 
 pub type Result<T> = std::result::Result<T, RemoteErr>;
 
-#[derive(Debug, Deserialize, Serialize, Default, Clone)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RemoteConfig {
     /// In memory object store
@@ -90,11 +96,13 @@ pub enum RemoteConfig {
     /// On disk object store
     Fs { root: String },
 
-    /// S3 compatible object store
-    /// Can load most config and secrets from standard AWS environment variables
+    /// S3 compatible object store.
     S3Compatible {
         bucket: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         prefix: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        endpoint: Option<String>,
     },
 }
 
@@ -114,12 +122,12 @@ impl Remote {
         let store = match config {
             RemoteConfig::Memory => Operator::new(Memory::default())?.finish(),
             RemoteConfig::Fs { root } => Operator::new(Fs::default().root(&root))?.finish(),
-            RemoteConfig::S3Compatible { bucket, prefix } => {
+            RemoteConfig::S3Compatible { bucket, prefix, endpoint } => {
                 let mut builder = S3::default().bucket(&bucket);
                 if let Some(prefix) = prefix {
                     builder = builder.root(&prefix);
                 }
-                if let Ok(endpoint) = std::env::var("AWS_ENDPOINT_URL") {
+                if let Some(endpoint) = endpoint {
                     builder = builder.endpoint(&endpoint);
                 }
                 let client = reqwest::ClientBuilder::new()
@@ -251,6 +259,128 @@ impl Remote {
         Ok(buffer.to_bytes())
     }
 
+    #[tracing::instrument(level = "trace", err(level = "debug"), skip(self))]
+    pub async fn get_raw(&self, path: &str) -> Result<Option<Bytes>> {
+        match self.store.read(path).await {
+            Ok(res) => Ok(Some(res.to_bytes())),
+            Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    #[tracing::instrument(level = "trace", err(level = "debug"), skip(self))]
+    pub async fn list_raw(&self, prefix: &str) -> Result<Vec<String>> {
+        Ok(self
+            .store
+            .list_with(prefix)
+            .recursive(true)
+            .await?
+            .into_iter()
+            .filter(|entry| entry.metadata().is_file())
+            .map(|entry| entry.path().to_string())
+            .collect())
+    }
+
+    #[tracing::instrument(level = "trace", err(level = "debug"), skip(self, bytes))]
+    pub async fn put_raw(&self, path: &str, bytes: impl Into<Bytes>) -> Result<()> {
+        self.store.write(path, bytes.into()).await?;
+        Ok(())
+    }
+
+    #[tracing::instrument(level = "trace", err(level = "debug"), skip(self))]
+    pub async fn delete_raw(&self, path: &str) -> Result<()> {
+        self.store.delete(path).await?;
+        Ok(())
+    }
+
+    #[tracing::instrument(level = "trace", err(level = "debug"), skip(self, bytes))]
+    pub async fn put_raw_if_not_exists(&self, path: &str, bytes: impl Into<Bytes>) -> Result<()> {
+        self.store
+            .write_options(
+                path,
+                bytes.into(),
+                WriteOptions {
+                    if_not_exists: true,
+                    concurrent: REMOTE_CONCURRENCY,
+                    ..WriteOptions::default()
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
+    #[tracing::instrument(level = "trace", err(level = "debug"), skip(self, expected, bytes))]
+    pub async fn compare_and_swap_raw(
+        &self,
+        path: &str,
+        expected: Option<&[u8]>,
+        bytes: impl Into<Bytes>,
+    ) -> Result<()> {
+        let bytes = bytes.into();
+        let lock_path = remote_lock_path(path);
+        match self
+            .put_raw_if_not_exists(&lock_path, "graft-lock-v1\n")
+            .await
+        {
+            Ok(()) => {}
+            Err(err) if err.precondition_failed() => {
+                return Err(RemoteErr::LockBusy { path: lock_path });
+            }
+            Err(err) => return Err(err),
+        }
+
+        let result = async {
+            let current = self.get_raw(path).await?;
+            if current.as_ref().map(Bytes::as_ref) != expected {
+                return Err(RemoteErr::CompareAndSwap { path: path.to_string() });
+            }
+            self.put_raw(path, bytes).await
+        }
+        .await;
+
+        let unlock = self.delete_raw(&lock_path).await;
+        result?;
+
+        match unlock {
+            Ok(()) => Ok(()),
+            Err(err) if err.is_not_found() => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+
+    #[tracing::instrument(level = "trace", err(level = "debug"), skip(self, expected))]
+    pub async fn compare_and_delete_raw(&self, path: &str, expected: Option<&[u8]>) -> Result<()> {
+        let lock_path = remote_lock_path(path);
+        match self
+            .put_raw_if_not_exists(&lock_path, "graft-lock-v1\n")
+            .await
+        {
+            Ok(()) => {}
+            Err(err) if err.precondition_failed() => {
+                return Err(RemoteErr::LockBusy { path: lock_path });
+            }
+            Err(err) => return Err(err),
+        }
+
+        let result = async {
+            let current = self.get_raw(path).await?;
+            if current.as_ref().map(Bytes::as_ref) != expected {
+                return Err(RemoteErr::CompareAndSwap { path: path.to_string() });
+            }
+            self.delete_raw(path).await
+        }
+        .await;
+
+        let unlock = self.delete_raw(&lock_path).await;
+        result?;
+
+        match unlock {
+            Ok(()) => Ok(()),
+            Err(err) if err.is_not_found() => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+
     /// TESTONLY: list contents of this remote in a tree-like format
     #[cfg(test)]
     pub async fn testonly_format_tree(&self) -> String {
@@ -286,7 +416,7 @@ impl Remote {
                 self.children.entry(first.clone()).or_default().insert(rest);
             }
 
-            fn to_tree_node(self, name: String) -> TreeNode<String> {
+            fn into_tree_node(self, name: String) -> TreeNode<String> {
                 if self.children.is_empty() {
                     // This is a leaf node
                     TreeNode::new(name)
@@ -295,7 +425,7 @@ impl Remote {
                     let child_nodes = self
                         .children
                         .into_iter()
-                        .map(|(name, builder)| builder.to_tree_node(name));
+                        .map(|(name, builder)| builder.into_tree_node(name));
                     TreeNode::with_child_nodes(name, child_nodes)
                 }
             }
@@ -306,7 +436,7 @@ impl Remote {
             root.insert(&path);
         }
 
-        root.to_tree_node(format!("{:?}", self.store))
+        root.into_tree_node(format!("{:?}", self.store))
             .to_string_with_format(&TreeFormatting {
                 prefix_str: None,
                 orientation: TreeOrientation::TopDown,
@@ -314,6 +444,100 @@ impl Remote {
                 chars: FormatCharacters::box_chars(),
             })
             .unwrap()
-            .to_string()
+    }
+}
+
+fn remote_lock_path(path: &str) -> String {
+    format!("locks/{path}.lock")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compare_and_swap_raw_updates_only_when_expected_matches() {
+        let remote = RemoteConfig::Memory.build().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        runtime.block_on(async {
+            remote
+                .compare_and_swap_raw("refs/heads/main", None, "a\n")
+                .await
+                .unwrap();
+            assert_eq!(
+                remote.get_raw("refs/heads/main").await.unwrap().unwrap(),
+                Bytes::from_static(b"a\n")
+            );
+
+            assert!(matches!(
+                remote
+                    .compare_and_swap_raw("refs/heads/main", Some(b"wrong\n"), "b\n")
+                    .await,
+                Err(RemoteErr::CompareAndSwap { .. })
+            ));
+            assert_eq!(
+                remote.get_raw("refs/heads/main").await.unwrap().unwrap(),
+                Bytes::from_static(b"a\n")
+            );
+
+            remote
+                .compare_and_swap_raw("refs/heads/main", Some(b"a\n"), "b\n")
+                .await
+                .unwrap();
+            assert_eq!(
+                remote.get_raw("refs/heads/main").await.unwrap().unwrap(),
+                Bytes::from_static(b"b\n")
+            );
+        });
+    }
+
+    #[test]
+    fn compare_and_swap_raw_releases_lock_after_failed_compare() {
+        let remote = RemoteConfig::Memory.build().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        runtime.block_on(async {
+            remote
+                .compare_and_swap_raw("refs/heads/main", None, "a\n")
+                .await
+                .unwrap();
+            assert!(matches!(
+                remote
+                    .compare_and_swap_raw("refs/heads/main", Some(b"stale\n"), "b\n")
+                    .await,
+                Err(RemoteErr::CompareAndSwap { .. })
+            ));
+
+            remote
+                .compare_and_swap_raw("refs/heads/main", Some(b"a\n"), "b\n")
+                .await
+                .unwrap();
+            assert_eq!(
+                remote.get_raw("refs/heads/main").await.unwrap().unwrap(),
+                Bytes::from_static(b"b\n")
+            );
+        });
+    }
+
+    #[test]
+    fn compare_and_swap_raw_reports_busy_lock() {
+        let remote = RemoteConfig::Memory.build().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        runtime.block_on(async {
+            remote
+                .put_raw_if_not_exists(&remote_lock_path("refs/heads/main"), "held\n")
+                .await
+                .unwrap();
+
+            assert!(matches!(
+                remote
+                    .compare_and_swap_raw("refs/heads/main", None, "a\n")
+                    .await,
+                Err(RemoteErr::LockBusy { .. })
+            ));
+            assert!(remote.get_raw("refs/heads/main").await.unwrap().is_none());
+        });
     }
 }

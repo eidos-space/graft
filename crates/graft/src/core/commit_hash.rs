@@ -3,6 +3,8 @@ use std::{
     str::FromStr,
 };
 
+use serde::{Deserialize, Serialize};
+
 use crate::core::{
     LogId,
     cbe::CBE64,
@@ -124,6 +126,36 @@ impl FromStr for CommitHash {
         // parse from base58
         let bytes: [u8; COMMIT_HASH_SIZE] = bs58::decode(value.as_bytes()).into_array_const()?;
         bytes.try_into()
+    }
+}
+
+impl Serialize for CommitHash {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if serializer.is_human_readable() {
+            serializer.serialize_str(&self.pretty())
+        } else {
+            serializer.serialize_bytes(self.as_bytes())
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for CommitHash {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        if deserializer.is_human_readable() {
+            let s = String::deserialize(deserializer)?;
+            s.parse().map_err(serde::de::Error::custom)
+        } else {
+            let bytes = <&[u8]>::deserialize(deserializer)?;
+            let bytes: [u8; COMMIT_HASH_SIZE] =
+                bytes.try_into().map_err(serde::de::Error::custom)?;
+            bytes.try_into().map_err(serde::de::Error::custom)
+        }
     }
 }
 
