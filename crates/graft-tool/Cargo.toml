@@ -7,11 +7,20 @@ license = { workspace = true }
 repository = { workspace = true }
 homepage = { workspace = true }
 rust-version = { workspace = true }
+autobins = false
+
+[[bin]]
+name = "graft"
+path = "src/main.rs"
 
 [dependencies]
 graft = { path = "../graft" }
+graft-sqlite = { path = "../graft-sqlite", features = ["register-static"] }
 
+anyhow = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
+rusqlite = { workspace = true, features = ["bundled"] }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
