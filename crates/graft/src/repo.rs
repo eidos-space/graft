@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     fmt::{self, Display},
     fs,
@@ -7,6 +8,8 @@ use std::{
     str::FromStr,
     time::{SystemTime, UNIX_EPOCH},
 };
+
+use futures::{StreamExt, TryStreamExt, stream};
 
 pub mod index;
 pub mod object;
@@ -46,6 +49,7 @@ const DIR_TMP: &str = "tmp";
 const DIR_LOGS_REFS: &str = "logs/refs";
 const DIR_LOGS_HEAD: &str = "logs/HEAD";
 const SQLITE_DATABASE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
+const REMOTE_REF_READ_CONCURRENCY: usize = 5;
 
 #[derive(Debug, Error)]
 pub enum RepoErr {
@@ -338,6 +342,12 @@ pub struct PushOutcome {
 pub struct PushAllOutcome {
     pub remote: String,
     pub branches: Vec<PushOutcome>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PushRefspecBranch {
+    pub local_branch: String,
+    pub remote_branch: String,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -641,6 +651,32 @@ pub struct RepoStatus {
     pub branches: Vec<BranchInfo>,
     pub remotes: Vec<RemoteInfo>,
     pub upstream: Option<BranchUpstream>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_status: Option<RepoUpstreamStatus>,
+    #[serde(default)]
+    pub ahead: usize,
+    #[serde(default)]
+    pub behind: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoUpstreamStatus {
+    pub remote: String,
+    pub branch: String,
+    pub local: String,
+    pub remote_target: String,
+    pub ahead: usize,
+    pub behind: usize,
+    pub state: RepoUpstreamState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepoUpstreamState {
+    UpToDate,
+    Ahead,
+    Behind,
+    Diverged,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -796,6 +832,9 @@ impl Repository {
         let index = self.read_index()?;
         let branches = self.branches()?;
         let remotes = self.remotes()?;
+        let upstream_status = self.upstream_status(head_target.as_deref(), upstream.as_ref())?;
+        let ahead = upstream_status.as_ref().map_or(0, |status| status.ahead);
+        let behind = upstream_status.as_ref().map_or(0, |status| status.behind);
         let unstaged_changes = self.unstaged_changes_for_index(&index)?;
         let unstaged = unstaged_changes
             .iter()
@@ -819,7 +858,62 @@ impl Repository {
             branches,
             remotes,
             upstream,
+            upstream_status,
+            ahead,
+            behind,
         })
+    }
+
+    fn upstream_status(
+        &self,
+        local: Option<&str>,
+        upstream: Option<&BranchUpstream>,
+    ) -> Result<Option<RepoUpstreamStatus>> {
+        let Some(local) = local else {
+            return Ok(None);
+        };
+        let Some(upstream) = upstream else {
+            return Ok(None);
+        };
+        let Some(remote_target) = self.remote_tracking_ref(&upstream.remote, &upstream.branch)?
+        else {
+            return Ok(None);
+        };
+
+        let local_reachable = self.reachable_commits(local)?;
+        let remote_reachable = self.reachable_commits(&remote_target)?;
+        let ahead = local_reachable.difference(&remote_reachable).count();
+        let behind = remote_reachable.difference(&local_reachable).count();
+        let state = match (ahead, behind) {
+            (0, 0) => RepoUpstreamState::UpToDate,
+            (_, 0) => RepoUpstreamState::Ahead,
+            (0, _) => RepoUpstreamState::Behind,
+            _ => RepoUpstreamState::Diverged,
+        };
+
+        Ok(Some(RepoUpstreamStatus {
+            remote: upstream.remote.clone(),
+            branch: upstream.branch.clone(),
+            local: local.to_string(),
+            remote_target,
+            ahead,
+            behind,
+            state,
+        }))
+    }
+
+    fn reachable_commits(&self, start: &str) -> Result<BTreeSet<String>> {
+        let mut reachable = BTreeSet::new();
+        let mut stack = vec![start.to_string()];
+        while let Some(id) = stack.pop() {
+            if !reachable.insert(id.clone()) {
+                continue;
+            }
+            for parent in commit_parent_ids(&self.read_commit(&id)?) {
+                stack.push(parent);
+            }
+        }
+        Ok(reachable)
     }
 
     pub fn branches(&self) -> Result<Vec<BranchInfo>> {
@@ -1325,6 +1419,17 @@ impl Repository {
         self.remote_branch_refs_from_store(remote, &remote_store)
     }
 
+    pub fn remote_branch_head(&self, remote: &str, branch: &str) -> Result<Option<String>> {
+        validate_remote_name(remote)?;
+        validate_ref_name(branch)?;
+        let remote_store = self.remote_store(remote)?;
+        let head_path = format!("refs/heads/{branch}");
+        let Some(head) = block_on_remote(remote_store.get_raw(&head_path))? else {
+            return Ok(None);
+        };
+        Ok(Some(parse_remote_ref(&head_path, head)?))
+    }
+
     pub fn remote_prune(&self, remote: &str) -> Result<RemotePruneOutcome> {
         validate_remote_name(remote)?;
         let remote_store = self.remote_store(remote)?;
@@ -1659,6 +1764,42 @@ impl Repository {
             });
         }
         Ok(PushAllOutcome { remote: remote.to_string(), branches })
+    }
+
+    pub fn push_refspec_branches(&self, refspec: &str) -> Result<Vec<PushRefspecBranch>> {
+        let parsed = parse_push_refspec(refspec)?;
+        let Some(source) = parsed.source.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let destination = parsed.destination.as_ref().unwrap_or(source);
+
+        if let Some(local_branch) = source.exact() {
+            let remote_branch = destination.expand("")?;
+            return Ok(vec![PushRefspecBranch {
+                local_branch: local_branch.to_string(),
+                remote_branch,
+            }]);
+        }
+
+        let mut branches = Vec::new();
+        for branch in self.branches()? {
+            if branch.target.is_none() {
+                continue;
+            }
+            let Some(capture) = source.capture(&branch.name)? else {
+                continue;
+            };
+            let remote_branch = destination.expand(capture)?;
+            branches.push(PushRefspecBranch { local_branch: branch.name, remote_branch });
+        }
+
+        if branches.is_empty() {
+            return Err(RepoErr::InvalidRefspec {
+                refspec: refspec.to_string(),
+                message: "wildcard matched no local branches".to_string(),
+            });
+        }
+        Ok(branches)
     }
 
     pub fn push_branch(
@@ -3109,7 +3250,7 @@ impl Repository {
         validate_remote_name(remote)?;
         let prefix = "refs/heads/";
         let mut refs = BTreeMap::<String, String>::new();
-
+        let mut paths = Vec::new();
         for path in block_on_remote(remote_store.list_raw(prefix))? {
             if path == prefix || path.ends_with('/') {
                 continue;
@@ -3118,10 +3259,26 @@ impl Repository {
                 continue;
             };
             validate_ref_name(branch)?;
-            let Some(bytes) = block_on_remote(remote_store.get_raw(&path))? else {
+            let branch = branch.to_string();
+            paths.push((path, branch));
+        }
+
+        let remote_refs = block_on_remote(async {
+            stream::iter(paths)
+                .map(|(path, branch)| async move {
+                    let bytes = remote_store.get_raw(&path).await?;
+                    Ok::<_, RemoteErr>((path, branch, bytes))
+                })
+                .buffer_unordered(REMOTE_REF_READ_CONCURRENCY)
+                .try_collect::<Vec<_>>()
+                .await
+        })?;
+
+        for (path, branch, bytes) in remote_refs {
+            let Some(bytes) = bytes else {
                 continue;
             };
-            refs.insert(branch.to_string(), parse_remote_ref(&path, bytes)?);
+            refs.insert(branch, parse_remote_ref(&path, bytes)?);
         }
 
         Ok(refs
@@ -3280,29 +3437,6 @@ impl Repository {
         remote: &crate::remote::Remote,
         id: &object::ObjectId,
     ) -> Result<()> {
-        let object = self.push_loose_object(remote, id)?;
-        match object {
-            object::Object::Commit(commit) => {
-                self.push_object_graph(remote, &commit.tree)?;
-                for parent in commit.parents {
-                    self.push_object_graph(remote, &parent)?;
-                }
-            }
-            object::Object::Tree(tree) => {
-                for entry in tree.entries {
-                    self.push_object_graph(remote, &entry.oid)?;
-                }
-            }
-            object::Object::Blob(_) | object::Object::Tag(_) => {}
-        }
-        Ok(())
-    }
-
-    fn push_loose_object(
-        &self,
-        remote: &crate::remote::Remote,
-        id: &object::ObjectId,
-    ) -> Result<object::Object> {
         let Some(bytes) = self.object_store().read_raw(id)? else {
             return Err(RepoErr::Object(object::ObjectErr::InvalidObject {
                 kind: "object",
@@ -3317,13 +3451,35 @@ impl Repository {
                 actual,
             }));
         }
+
         let path = object::LooseObjectStore::relative_path(id);
+        if matches!(object, object::Object::Commit(_) | object::Object::Tree(_))
+            && block_on_remote(remote.get_raw(&path))?.is_some()
+        {
+            return Ok(());
+        }
+
+        match &object {
+            object::Object::Commit(commit) => {
+                self.push_object_graph(remote, &commit.tree)?;
+                for parent in &commit.parents {
+                    self.push_object_graph(remote, parent)?;
+                }
+            }
+            object::Object::Tree(tree) => {
+                for entry in &tree.entries {
+                    self.push_object_graph(remote, &entry.oid)?;
+                }
+            }
+            object::Object::Blob(_) | object::Object::Tag(_) => {}
+        }
+
         match block_on_remote(remote.put_raw_if_not_exists(&path, bytes)) {
             Ok(()) => {}
             Err(RepoErr::Remote(err)) if err.precondition_failed() => {}
             Err(err) => return Err(err),
         }
-        Ok(object)
+        Ok(())
     }
 
     fn write_tree_object(
@@ -4334,10 +4490,24 @@ fn commit_parent_ids(commit: &CommitObject) -> Vec<String> {
 fn block_on_remote<T>(
     future: impl std::future::Future<Output = std::result::Result<T, RemoteErr>>,
 ) -> Result<T> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    Ok(runtime.block_on(future)?)
+    thread_local! {
+        static REMOTE_RUNTIME: RefCell<Option<tokio::runtime::Runtime>> = const { RefCell::new(None) };
+    }
+
+    REMOTE_RUNTIME.with(|runtime| {
+        let mut runtime = runtime.borrow_mut();
+        if runtime.is_none() {
+            *runtime = Some(
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?,
+            );
+        }
+        Ok(runtime
+            .as_ref()
+            .expect("runtime initialized")
+            .block_on(future)?)
+    })
 }
 
 fn parse_remote_ref(path: &str, bytes: bytes::Bytes) -> Result<String> {
