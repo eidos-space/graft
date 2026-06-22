@@ -133,6 +133,19 @@ pub struct ColumnInfo {
     pub not_null: bool,
     pub default_value: Option<Value>,
     pub pk: bool,
+    pub unique: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyConstraint {
+    pub kind: KeyConstraintKind,
+    pub columns: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyConstraintKind {
+    PrimaryKey,
+    Unique,
 }
 
 /// Table scanner for reading B-tree pages
@@ -569,6 +582,10 @@ impl MasterEntry {
     pub fn parse_columns(&self) -> Vec<ColumnInfo> {
         parse_create_table_columns(&self.sql)
     }
+
+    pub fn parse_key_constraints(&self) -> Vec<KeyConstraint> {
+        parse_create_table_key_constraints(&self.sql)
+    }
 }
 
 impl Record {
@@ -749,8 +766,40 @@ pub fn read_all_rows(
 /// Parse column definitions from a CREATE TABLE SQL statement.
 /// Returns column names and their types (as strings).
 pub fn parse_create_table_columns(sql: &str) -> Vec<ColumnInfo> {
-    // Find the opening parenthesis after CREATE TABLE name
-    let _sql_upper = sql.to_uppercase();
+    let mut columns = Vec::new();
+    for item in split_create_table_items(sql) {
+        if let Some(col) = parse_one_column(item.trim()) {
+            columns.push(col);
+        }
+    }
+
+    columns
+}
+
+pub fn parse_create_table_key_constraints(sql: &str) -> Vec<KeyConstraint> {
+    let mut constraints = Vec::new();
+    for item in split_create_table_items(sql) {
+        let item = strip_constraint_name(item.trim());
+        let upper = item.to_ascii_uppercase();
+        let (kind, rest) = if upper.starts_with("PRIMARY KEY") {
+            (KeyConstraintKind::PrimaryKey, &item["PRIMARY KEY".len()..])
+        } else if upper.starts_with("UNIQUE") {
+            (KeyConstraintKind::Unique, &item["UNIQUE".len()..])
+        } else {
+            continue;
+        };
+        let Some(columns) = parse_parenthesized_identifier_list(rest) else {
+            continue;
+        };
+        if !columns.is_empty() {
+            constraints.push(KeyConstraint { kind, columns });
+        }
+    }
+
+    constraints
+}
+
+fn split_create_table_items(sql: &str) -> Vec<&str> {
     let Some(open_paren) = sql.find('(') else {
         return vec![];
     };
@@ -758,36 +807,7 @@ pub fn parse_create_table_columns(sql: &str) -> Vec<ColumnInfo> {
         return vec![];
     };
 
-    let mut columns = Vec::new();
-    let body = &sql[open_paren + 1..close_paren];
-
-    // Split by commas, respecting nested parentheses
-    let mut depth = 0;
-    let mut current = String::new();
-    for c in body.chars() {
-        match c {
-            '(' => {
-                depth += 1;
-                current.push(c);
-            }
-            ')' => {
-                depth -= 1;
-                current.push(c);
-            }
-            ',' if depth == 0 => {
-                if let Some(col) = parse_one_column(current.trim()) {
-                    columns.push(col);
-                }
-                current = String::new();
-            }
-            _ => current.push(c),
-        }
-    }
-    if let Some(col) = parse_one_column(current.trim()) {
-        columns.push(col);
-    }
-
-    columns
+    split_top_level_comma(&sql[open_paren + 1..close_paren])
 }
 
 /// Parse a single column definition like "name TEXT" or "name TEXT NOT NULL"
@@ -817,6 +837,7 @@ fn parse_one_column(def: &str) -> Option<ColumnInfo> {
 
     let not_null = rest_upper.contains("NOT NULL");
     let pk = rest_upper.contains("PRIMARY KEY");
+    let unique = rest_upper.contains("UNIQUE");
 
     Some(ColumnInfo {
         name: name.to_string(),
@@ -824,7 +845,70 @@ fn parse_one_column(def: &str) -> Option<ColumnInfo> {
         not_null,
         default_value: None,
         pk,
+        unique,
     })
+}
+
+fn strip_constraint_name(def: &str) -> &str {
+    let def = def.trim();
+    if !def.to_ascii_uppercase().starts_with("CONSTRAINT") {
+        return def;
+    }
+
+    let rest = def["CONSTRAINT".len()..].trim_start();
+    let (_, after_name) = extract_identifier(rest);
+    after_name
+}
+
+fn parse_parenthesized_identifier_list(s: &str) -> Option<Vec<String>> {
+    let s = s.trim_start();
+    let start = s.find('(')?;
+    let end = matching_close_paren(s, start)?;
+    Some(
+        split_top_level_comma(&s[start + 1..end])
+            .into_iter()
+            .filter_map(|part| {
+                let (name, _) = extract_identifier(part.trim());
+                (!name.is_empty()).then(|| name.to_string())
+            })
+            .collect(),
+    )
+}
+
+fn matching_close_paren(s: &str, open: usize) -> Option<usize> {
+    let mut depth = 0;
+    for (idx, ch) in s.char_indices().skip_while(|(idx, _)| *idx < open) {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(idx);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn split_top_level_comma(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0;
+    let mut start = 0;
+    for (idx, ch) in s.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                parts.push(s[start..idx].trim());
+                start = idx + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    parts.push(s[start..].trim());
+    parts
 }
 
 /// Extract the first identifier (quoted or unquoted) from a definition string.
@@ -928,6 +1012,28 @@ mod tests {
         assert!(cols[0].not_null);
         assert_eq!(cols[1].name, "b");
         assert_eq!(cols[2].name, "c");
+
+        let keys = parse_create_table_key_constraints(sql);
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].kind, KeyConstraintKind::PrimaryKey);
+        assert_eq!(keys[0].columns, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn test_table_unique_constraint_parsing() {
+        let sql = "CREATE TABLE t (a TEXT, b TEXT, CONSTRAINT uq_t UNIQUE(a, b))";
+        let keys = parse_create_table_key_constraints(sql);
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].kind, KeyConstraintKind::Unique);
+        assert_eq!(keys[0].columns, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn test_column_unique_parsing() {
+        let sql = "CREATE TABLE t (id TEXT PRIMARY KEY, email TEXT UNIQUE)";
+        let cols = parse_create_table_columns(sql);
+        assert!(cols[0].pk);
+        assert!(cols[1].unique);
     }
 
     #[test]

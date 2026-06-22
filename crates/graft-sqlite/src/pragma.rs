@@ -31,6 +31,7 @@ use graft::{
 };
 use indoc::{formatdoc, indoc, writedoc};
 use parking_lot::Mutex;
+use rusqlite::config::DbConfig;
 use serde::Serialize;
 use sqlite_plugin::{
     vars::SQLITE_ERROR,
@@ -48,6 +49,12 @@ use crate::{
 const SQLITE_DATABASE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
 static NEXT_JOB_ID: AtomicU64 = AtomicU64::new(1);
 static ASYNC_JOBS: OnceLock<AsyncJobRegistry> = OnceLock::new();
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SnapshotHashPolicy {
+    Strict,
+    AllowHydratedMismatch,
+}
 
 fn async_jobs() -> &'static AsyncJobRegistry {
     ASYNC_JOBS.get_or_init(AsyncJobRegistry::default)
@@ -317,6 +324,16 @@ struct JsonPullCommandOutcome {
     operation: &'static str,
     #[serde(flatten)]
     outcome: PullOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    conflict_analysis: Option<JsonRowMergeAnalysis>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct JsonRepoStatus {
+    #[serde(flatten)]
+    status: RepoStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    conflict_analysis: Option<JsonRowMergeAnalysis>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -332,6 +349,43 @@ struct JsonResetCommandOutcome {
     operation: &'static str,
     #[serde(flatten)]
     outcome: ResetOutcome,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct JsonRowMergeAnalysis {
+    path: String,
+    available: bool,
+    can_auto_merge: bool,
+    ours_changes: usize,
+    theirs_changes: usize,
+    apply_changes: usize,
+    opaque_changes: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    blocked_reasons: Vec<&'static str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    row_conflicts: Vec<JsonRowMergeConflict>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    schema_conflicts: Vec<JsonSchemaMergeConflict>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct JsonRowMergeConflict {
+    table: String,
+    rowid: i64,
+    ours: &'static str,
+    theirs: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct JsonSchemaMergeConflict {
+    name: String,
+    entry_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ours: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    theirs: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -387,7 +441,7 @@ impl<'a> PragmaExt<'a> for Pragma<'a> {
 }
 
 /// Diff granularity mode
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiffMode {
     /// Default: page-level + table-level
     Default,
@@ -396,7 +450,13 @@ pub enum DiffMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum RepoDiffSpec {
+pub(crate) struct RepoDiffSpec {
+    mode: DiffMode,
+    target: RepoDiffTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RepoDiffTarget {
     Worktree {
         path: Option<String>,
     },
@@ -1265,7 +1325,7 @@ impl GraftPragma {
                     attached = true;
                     let runtime = file.runtime().clone();
                     let remote = Arc::new(repo.remote_store("origin")?);
-                    verify_repo_checkout_plan(&runtime, &plan, Some(remote.clone()))?;
+                    let plan = prepare_repo_checkout_plan(&runtime, &plan, Some(remote.clone()))?;
                     let previous_files = BTreeMap::new();
                     repo.apply_switch_branch_plan(&branch, &plan)?;
                     checkout_repo_plan(
@@ -1292,9 +1352,12 @@ impl GraftPragma {
             GraftPragma::JsonStatus => {
                 let repo = repo_for_file(file)?;
                 let status = repo_status_for_file(&runtime, file, &repo)?;
-                Ok(Some(serde_json::to_string(&status).map_err(|e| {
-                    ErrCtx::PragmaErr(format!("JSON error: {e}").into())
-                })?))
+                let conflict_analysis =
+                    current_file_status_row_merge_analysis_lossy(&runtime, file, &repo, None);
+                Ok(Some(
+                    serde_json::to_string(&JsonRepoStatus { status, conflict_analysis })
+                        .map_err(|e| ErrCtx::PragmaErr(format!("JSON error: {e}").into()))?,
+                ))
             }
 
             GraftPragma::Add { path } => {
@@ -1503,7 +1566,7 @@ impl GraftPragma {
                     return pragma_err!("cannot merge with staged or unstaged changes");
                 }
                 let plan = repo.plan_merge_revision(&rev)?;
-                verify_repo_merge_plan(&runtime, &plan, None)?;
+                let plan = prepare_repo_merge_plan(&runtime, &plan, None)?;
                 let previous_files = current_repo_files_for_checkout(&repo)?;
                 let outcome = repo.apply_merge_plan(&plan)?;
                 checkout_merge_outcome(
@@ -1515,8 +1578,22 @@ impl GraftPragma {
                     &previous_files,
                     None,
                 )?;
-                Ok(Some(format_merge_outcome_with_row_analysis(
+                let row_auto_merge = match try_row_auto_merge_current_file_conflict(
                     &runtime, file, &repo, &outcome, None,
+                ) {
+                    Ok(row_auto_merge) => row_auto_merge,
+                    Err(err) => {
+                        tracing::warn!("row-level auto-merge unavailable: {err}");
+                        None
+                    }
+                };
+                Ok(Some(format_merge_outcome_with_row_auto_merge(
+                    &runtime,
+                    file,
+                    &repo,
+                    &outcome,
+                    row_auto_merge.as_ref(),
+                    None,
                 )?))
             }
 
@@ -1543,6 +1620,7 @@ impl GraftPragma {
                 if repo.status()?.merge_head.is_none() {
                     return pragma_err!("no merge in progress");
                 }
+                try_row_auto_merge_current_file_status_conflict(&runtime, file, &repo, None)?;
                 let tables = staged_commit_table_summary(&runtime, &repo)?;
                 let commit = repo.commit_staged_with_table_summary(message, tables)?;
                 Ok(Some(format!(
@@ -1703,9 +1781,14 @@ impl GraftPragma {
             }
             GraftPragma::JsonPull { remote, branch, refspec, all } => {
                 let outcome = run_repo_pull(&runtime, file, remote, branch, refspec, all)?;
+                let repo = repo_for_file(file)?;
+                let remote = repo.remote_store(&outcome.remote).ok().map(Arc::new);
+                let conflict_analysis =
+                    current_file_status_row_merge_analysis_lossy(&runtime, file, &repo, remote);
                 Ok(Some(to_json(&JsonPullCommandOutcome {
                     operation: "pull",
                     outcome,
+                    conflict_analysis,
                 })?))
             }
 
@@ -1849,9 +1932,13 @@ impl GraftPragma {
                 if !file.is_idle() {
                     return pragma_err!("cannot diff while there is an open transaction");
                 }
+                let mode = spec.mode;
                 let repo = repo_for_file(file)?;
                 let diff = repo_diff_for_spec(&runtime, file, &repo, spec)?;
-                Ok(Some(format_repo_diff(&diff)?))
+                match mode {
+                    DiffMode::Default => Ok(Some(format_repo_diff(&diff)?)),
+                    DiffMode::Rows => Ok(Some(format_repo_row_diff(&runtime, &repo, &diff)?)),
+                }
             }
 
             GraftPragma::Show { target } => {
@@ -1898,6 +1985,7 @@ impl GraftPragma {
                             from_lsn: from.to_u64(),
                             to_lsn: to.to_u64(),
                             tables,
+                            opaque_changes: json_opaque_changes(&diff.opaque_changes),
                         };
                         Ok(Some(serde_json::to_string(&result).map_err(|e| {
                             ErrCtx::PragmaErr(format!("JSON error: {e}").into())
@@ -1974,6 +2062,7 @@ impl GraftPragma {
                             from_lsn: from.to_u64(),
                             to_lsn: to.to_u64(),
                             tables,
+                            opaque_changes: json_opaque_changes(&diff.opaque_changes),
                         };
                         Ok(Some(serde_json::to_string(&result).map_err(|e| {
                             ErrCtx::PragmaErr(format!("JSON error: {e}").into())
@@ -1986,11 +2075,22 @@ impl GraftPragma {
                 if !file.is_idle() {
                     return pragma_err!("cannot diff while there is an open transaction");
                 }
+                let mode = spec.mode;
                 let repo = repo_for_file(file)?;
                 let diff = repo_diff_for_spec(&runtime, file, &repo, spec)?;
-                Ok(Some(serde_json::to_string(&diff).map_err(|e| {
-                    ErrCtx::PragmaErr(format!("JSON error: {e}").into())
-                })?))
+                match mode {
+                    DiffMode::Default => {
+                        Ok(Some(serde_json::to_string(&diff).map_err(|e| {
+                            ErrCtx::PragmaErr(format!("JSON error: {e}").into())
+                        })?))
+                    }
+                    DiffMode::Rows => {
+                        let rows = json_repo_row_diff(&runtime, &repo, &diff)?;
+                        Ok(Some(serde_json::to_string(&rows).map_err(|e| {
+                            ErrCtx::PragmaErr(format!("JSON error: {e}").into())
+                        })?))
+                    }
+                }
             }
 
             GraftPragma::JsonShow { target } => {
@@ -2157,7 +2257,7 @@ fn run_repo_pull(
     let local_branch = repo
         .current_branch()?
         .ok_or_else(|| ErrCtx::PragmaErr("cannot pull in detached HEAD".into()))?;
-    let (remote, plan) = if let Some(refspec) = refspec {
+    let (remote, mut plan) = if let Some(refspec) = refspec {
         let remote = repo_default_remote(&repo, remote)?;
         let plan = repo.plan_pull_refspec(&remote, &refspec, &local_branch)?;
         (remote, plan)
@@ -2167,9 +2267,9 @@ fn run_repo_pull(
         (upstream.remote, plan)
     };
     let checkout_remote = Arc::new(repo.remote_store(&remote)?);
-    verify_repo_merge_plan(runtime, &plan.merge, Some(checkout_remote.clone()))?;
+    plan.merge = prepare_repo_merge_plan(runtime, &plan.merge, Some(checkout_remote.clone()))?;
     let previous_files = current_repo_files_for_checkout(&repo)?;
-    let outcome = repo.apply_pull_plan(&plan)?;
+    let mut outcome = repo.apply_pull_plan(&plan)?;
     checkout_merge_outcome(
         runtime,
         file,
@@ -2177,8 +2277,17 @@ fn run_repo_pull(
         &outcome.merge,
         Some(&plan.merge.checkout),
         &previous_files,
-        Some(checkout_remote),
+        Some(checkout_remote.clone()),
     )?;
+    if let Ok(Some(row_auto_merge)) = try_row_auto_merge_current_file_conflict(
+        runtime,
+        file,
+        &repo,
+        &outcome.merge,
+        Some(checkout_remote),
+    ) {
+        outcome.merge = merge_outcome_with_row_auto_merge(&outcome.merge, &row_auto_merge.key);
+    }
     Ok(outcome)
 }
 
@@ -2203,9 +2312,26 @@ fn run_repo_push(
         Ok(PushCommandOutcome::Many(outcome))
     } else {
         let (remote, local_branch, remote_branch) = repo_push_branches(repo, remote, branch)?;
-        let stop_at = repo.remote_branch_head(&remote, &remote_branch)?;
-        publish_repo_branch_snapshots(runtime, repo, &remote, &local_branch, stop_at.as_deref())?;
-        let outcome = repo.push_branch_with_force(&remote, &local_branch, &remote_branch, force)?;
+        let remote_head = repo.remote_branch_head_state(&remote, &remote_branch)?;
+        let tracking_head = if !force {
+            repo.remote_tracking_ref(&remote, &remote_branch)?
+        } else {
+            None
+        };
+        publish_repo_branch_snapshots(
+            runtime,
+            repo,
+            &remote,
+            &local_branch,
+            tracking_head.as_deref().or(remote_head.head.as_deref()),
+        )?;
+        let outcome = repo.push_branch_with_force_and_remote_head(
+            &remote,
+            &local_branch,
+            &remote_branch,
+            force,
+            remote_head,
+        )?;
         Ok(PushCommandOutcome::One(outcome))
     }
 }
@@ -2313,6 +2439,18 @@ fn run_repo_reset(
     let old_head_state = repo.head_file(&file.tag)?;
     let had_staged_changes = repo.has_staged_changes()?;
     let plan = repo.plan_reset(rev, mode)?;
+    let plan = if matches!(mode, ResetMode::Hard) {
+        let mut plan = plan;
+        plan.checkout = prepare_repo_checkout_plan_with_hash_policy(
+            runtime,
+            &plan.checkout,
+            None,
+            SnapshotHashPolicy::AllowHydratedMismatch,
+        )?;
+        plan
+    } else {
+        plan
+    };
     if matches!(mode, ResetMode::Hard) {
         verify_repo_checkout_plan(runtime, &plan.checkout, None)?;
     }
@@ -2767,13 +2905,27 @@ fn hydrate_repo_file_state(
     state: &CommitFileState,
     remote: Option<Arc<Remote>>,
 ) -> Result<(), ErrCtx> {
-    hydrate_repo_snapshot(runtime, &state.snapshot, remote)
+    hydrate_repo_snapshot_with_hash_policy(
+        runtime,
+        &state.snapshot,
+        remote,
+        SnapshotHashPolicy::Strict,
+    )
 }
 
 fn hydrate_repo_snapshot(
     runtime: &Runtime,
     snapshot: &RepoSnapshot,
     remote: Option<Arc<Remote>>,
+) -> Result<(), ErrCtx> {
+    hydrate_repo_snapshot_with_hash_policy(runtime, snapshot, remote, SnapshotHashPolicy::Strict)
+}
+
+fn hydrate_repo_snapshot_with_hash_policy(
+    runtime: &Runtime,
+    snapshot: &RepoSnapshot,
+    remote: Option<Arc<Remote>>,
+    hash_policy: SnapshotHashPolicy,
 ) -> Result<(), ErrCtx> {
     let runtime_snapshot = snapshot.to_snapshot();
     if runtime_snapshot.is_empty() {
@@ -2787,7 +2939,7 @@ fn hydrate_repo_snapshot(
         }
         runtime.snapshot_hydrate(runtime_snapshot)?;
     }
-    verify_repo_snapshot_commit_hashes(runtime, snapshot)?;
+    verify_repo_snapshot_commit_hashes(runtime, snapshot, hash_policy)?;
     Ok(())
 }
 
@@ -2802,28 +2954,86 @@ fn verify_repo_checkout_plan(
     Ok(())
 }
 
-fn verify_repo_merge_plan(
+fn prepare_repo_file_state(
+    runtime: &Runtime,
+    state: &CommitFileState,
+    remote: Option<Arc<Remote>>,
+) -> Result<CommitFileState, ErrCtx> {
+    let hash_policy = if remote.is_some() {
+        SnapshotHashPolicy::AllowHydratedMismatch
+    } else {
+        SnapshotHashPolicy::Strict
+    };
+    prepare_repo_file_state_with_hash_policy(runtime, state, remote, hash_policy)
+}
+
+fn prepare_repo_file_state_with_hash_policy(
+    runtime: &Runtime,
+    state: &CommitFileState,
+    remote: Option<Arc<Remote>>,
+    hash_policy: SnapshotHashPolicy,
+) -> Result<CommitFileState, ErrCtx> {
+    hydrate_repo_snapshot_with_hash_policy(runtime, &state.snapshot, remote, hash_policy)?;
+    if hash_policy == SnapshotHashPolicy::Strict {
+        return Ok(state.clone());
+    }
+    Ok(CommitFileState {
+        volume: state.volume.clone(),
+        snapshot: repo_snapshot_with_commit_hashes(runtime, &state.snapshot.to_snapshot())?,
+    })
+}
+
+fn prepare_repo_checkout_plan(
+    runtime: &Runtime,
+    plan: &CheckoutPlan,
+    remote: Option<Arc<Remote>>,
+) -> Result<CheckoutPlan, ErrCtx> {
+    let mut plan = plan.clone();
+    for state in plan.files.values_mut() {
+        *state = prepare_repo_file_state(runtime, state, remote.clone())?;
+    }
+    Ok(plan)
+}
+
+fn prepare_repo_checkout_plan_with_hash_policy(
+    runtime: &Runtime,
+    plan: &CheckoutPlan,
+    remote: Option<Arc<Remote>>,
+    hash_policy: SnapshotHashPolicy,
+) -> Result<CheckoutPlan, ErrCtx> {
+    let mut plan = plan.clone();
+    for state in plan.files.values_mut() {
+        *state =
+            prepare_repo_file_state_with_hash_policy(runtime, state, remote.clone(), hash_policy)?;
+    }
+    Ok(plan)
+}
+
+fn prepare_repo_merge_plan(
     runtime: &Runtime,
     plan: &MergePlan,
     remote: Option<Arc<Remote>>,
-) -> Result<(), ErrCtx> {
+) -> Result<MergePlan, ErrCtx> {
+    let mut plan = plan.clone();
     if matches!(plan.outcome, MergeOutcome::FastForward { .. }) {
-        verify_repo_checkout_plan(runtime, &plan.checkout, remote.clone())?;
+        plan.checkout = prepare_repo_checkout_plan(runtime, &plan.checkout, remote.clone())?;
     }
-    if let Some(index) = &plan.index {
-        for entry in index.stage0_entries() {
-            if let Some(state) = &entry.file {
-                hydrate_repo_file_state(runtime, state, remote.clone())?;
+    if let Some(index) = &mut plan.index {
+        for entry in &mut index.entries {
+            if let Some(state) = entry.file.clone() {
+                entry.file = Some(prepare_repo_file_state(runtime, &state, remote.clone())?);
             }
         }
     }
-    Ok(())
+    Ok(plan)
 }
 
 fn verify_repo_snapshot_commit_hashes(
     runtime: &Runtime,
     snapshot: &RepoSnapshot,
+    hash_policy: SnapshotHashPolicy,
 ) -> Result<(), ErrCtx> {
+    let mut mismatches = 0_usize;
     for range in &snapshot.ranges {
         let mut expected_commits = range.commits.iter();
         for lsn in (range.start..=range.end).iter() {
@@ -2864,13 +3074,20 @@ fn verify_repo_snapshot_commit_hashes(
                 ));
             };
             if actual != expected.commit_hash {
-                return Err(ErrCtx::PragmaErr(
-                    format!(
-                        "snapshot storage commit hash mismatch for {:?}/{}: expected {}, got {}",
-                        range.log, lsn, expected.commit_hash, actual
-                    )
-                    .into(),
-                ));
+                match hash_policy {
+                    SnapshotHashPolicy::Strict => {
+                        return Err(ErrCtx::PragmaErr(
+                            format!(
+                                "snapshot storage commit hash mismatch for {:?}/{}: expected {}, got {}",
+                                range.log, lsn, expected.commit_hash, actual
+                            )
+                            .into(),
+                        ));
+                    }
+                    SnapshotHashPolicy::AllowHydratedMismatch => {
+                        mismatches += 1;
+                    }
+                }
             }
         }
         if let Some(extra) = expected_commits.next() {
@@ -2882,6 +3099,12 @@ fn verify_repo_snapshot_commit_hashes(
                 .into(),
             ));
         }
+    }
+    if mismatches > 0 {
+        tracing::warn!(
+            mismatches,
+            "snapshot storage commit hashes mismatched; using hydrated storage commit hashes"
+        );
     }
     Ok(())
 }
@@ -2919,6 +3142,7 @@ fn publish_repo_branch_snapshots(
             .ok_or(ErrCtx::Repo(graft::repo::RepoErr::UnbornHead))?,
     ];
     let mut seen = std::collections::BTreeSet::<String>::new();
+    let mut snapshots = Vec::new();
 
     while let Some(next) = stack.pop() {
         if !seen.insert(next.clone()) {
@@ -2939,7 +3163,7 @@ fn publish_repo_branch_snapshots(
                 continue;
             }
             hydrate_repo_snapshot(runtime, &snapshot, None)?;
-            runtime.snapshot_push_to(runtime_snapshot, remote_store.clone())?;
+            snapshots.push(runtime_snapshot);
         }
 
         if commit.parents.is_empty() {
@@ -2950,6 +3174,8 @@ fn publish_repo_branch_snapshots(
             stack.extend(commit.parents);
         }
     }
+
+    runtime.snapshots_push_to(snapshots, remote_store)?;
 
     Ok(())
 }
@@ -3360,37 +3586,59 @@ fn looks_like_refspec(value: &str) -> bool {
 
 fn parse_repo_diff_arg(arg: Option<&str>) -> Result<RepoDiffSpec, PragmaErr> {
     let Some(arg) = arg else {
-        return Ok(RepoDiffSpec::Worktree { path: None });
+        return Ok(RepoDiffSpec {
+            mode: DiffMode::Default,
+            target: RepoDiffTarget::Worktree { path: None },
+        });
     };
-    let parts: Vec<&str> = arg.split_whitespace().collect();
-    match parts.as_slice() {
-        [] => Ok(RepoDiffSpec::Worktree { path: None }),
+    let raw_parts: Vec<&str> = arg.split_whitespace().collect();
+    let mut mode = DiffMode::Default;
+    let mut parts = Vec::new();
+    let mut in_path = false;
+    for part in raw_parts {
+        if !in_path && part == "--" {
+            in_path = true;
+            parts.push(part);
+        } else if !in_path && part == "--rows" {
+            if mode == DiffMode::Rows {
+                return Err(pragma_fail("`--rows` may only be specified once"));
+            }
+            mode = DiffMode::Rows;
+        } else {
+            parts.push(part);
+        }
+    }
+    let target = match parts.as_slice() {
+        [] => RepoDiffTarget::Worktree { path: None },
         ["--", path @ ..] if !path.is_empty() => {
-            Ok(RepoDiffSpec::Worktree { path: Some(path.join(" ")) })
+            RepoDiffTarget::Worktree { path: Some(path.join(" ")) }
         }
-        ["--staged"] | ["--cached"] => Ok(RepoDiffSpec::Staged { path: None }),
+        ["--staged"] | ["--cached"] => RepoDiffTarget::Staged { path: None },
         ["--staged", "--", path @ ..] | ["--cached", "--", path @ ..] if !path.is_empty() => {
-            Ok(RepoDiffSpec::Staged { path: Some(path.join(" ")) })
+            RepoDiffTarget::Staged { path: Some(path.join(" ")) }
         }
-        [rev] => Ok(RepoDiffSpec::RevisionToWorktree { rev: (*rev).to_string(), path: None }),
-        [rev, "--", path @ ..] if !path.is_empty() => Ok(RepoDiffSpec::RevisionToWorktree {
+        [rev] => RepoDiffTarget::RevisionToWorktree { rev: (*rev).to_string(), path: None },
+        [rev, "--", path @ ..] if !path.is_empty() => RepoDiffTarget::RevisionToWorktree {
             rev: (*rev).to_string(),
             path: Some(path.join(" ")),
-        }),
-        [from, to] => Ok(RepoDiffSpec::Revisions {
+        },
+        [from, to] => RepoDiffTarget::Revisions {
             from: (*from).to_string(),
             to: (*to).to_string(),
             path: None,
-        }),
-        [from, to, "--", path @ ..] if !path.is_empty() => Ok(RepoDiffSpec::Revisions {
+        },
+        [from, to, "--", path @ ..] if !path.is_empty() => RepoDiffTarget::Revisions {
             from: (*from).to_string(),
             to: (*to).to_string(),
             path: Some(path.join(" ")),
-        }),
-        _ => Err(pragma_fail(
-            "argument must be in the form: `[--staged] [rev] [rev] [-- path]`",
-        )),
-    }
+        },
+        _ => {
+            return Err(pragma_fail(
+                "argument must be in the form: `[--rows] [--staged] [rev] [rev] [-- path]`",
+            ));
+        }
+    };
+    Ok(RepoDiffSpec { mode, target })
 }
 
 fn parse_volume_diff_arg(arg: &str) -> Result<(LSN, LSN, DiffMode), PragmaErr> {
@@ -3973,8 +4221,8 @@ fn repo_diff_for_spec(
     repo: &Repository,
     spec: RepoDiffSpec,
 ) -> Result<RepoDiff, ErrCtx> {
-    match spec {
-        RepoDiffSpec::Worktree { path } => {
+    match spec.target {
+        RepoDiffTarget::Worktree { path } => {
             let path = repo_diff_path(repo, path.as_deref())?;
             let current_key = repo.file_key(&file.tag)?;
             if let Some(path) = path.as_deref()
@@ -4000,11 +4248,11 @@ fn repo_diff_for_spec(
             let state = current_repo_file_state(runtime, file)?;
             Ok(repo.diff_worktree_file(&file.tag, state, path.as_deref())?)
         }
-        RepoDiffSpec::Staged { path } => {
+        RepoDiffTarget::Staged { path } => {
             let path = repo_diff_path(repo, path.as_deref())?;
             Ok(repo.diff_staged(path.as_deref())?)
         }
-        RepoDiffSpec::RevisionToWorktree { rev, path } => {
+        RepoDiffTarget::RevisionToWorktree { rev, path } => {
             let path = repo_diff_path(repo, path.as_deref())?;
             let current_key = repo.file_key(&file.tag)?;
             if let Some(path) = path.as_deref()
@@ -4040,7 +4288,7 @@ fn repo_diff_for_spec(
             let state = current_repo_file_state(runtime, file)?;
             Ok(repo.diff_revision_to_worktree_file(&rev, &file.tag, state, path.as_deref())?)
         }
-        RepoDiffSpec::Revisions { from, to, path } => {
+        RepoDiffTarget::Revisions { from, to, path } => {
             let path = repo_diff_path(repo, path.as_deref())?;
             Ok(repo.diff_revisions(&from, &to, path.as_deref())?)
         }
@@ -4084,9 +4332,12 @@ fn repo_status_for_file(
         Err(graft::repo::RepoErr::UnresolvedConflicts) => return Ok(status),
         Err(err) => return Err(err.into()),
     };
-    status
-        .unstaged_changes
-        .retain(|change| change.path == current_key || tracked.contains_key(&change.path));
+    status.unstaged_changes.retain(|change| {
+        change.path == current_key
+            || tracked.contains_key(&change.path)
+            || (change.change == RepoWorktreeChangeKind::Untracked
+                && should_report_untracked_status_path(repo))
+    });
     for (key, expected_state) in tracked {
         if key == current_key
             || status
@@ -4133,6 +4384,10 @@ fn repo_status_for_file(
         .collect();
     status.dirty = !status.unstaged_changes.is_empty();
     Ok(status)
+}
+
+fn should_report_untracked_status_path(repo: &Repository) -> bool {
+    repo.worktree().file_name().and_then(|name| name.to_str()) != Some(".eidos")
 }
 
 fn repo_has_work_in_progress_for_file(
@@ -4260,9 +4515,10 @@ fn snapshot_table_summary_checked_out(
         .read_master_table()
         .map_err(|e| ErrCtx::PragmaErr(format!("Schema error: {e:?}").into()))?;
     let mut summaries = Vec::new();
+    let ignored_tables = crate::row_level_diff::ignored_row_diff_tables(&master, &[]);
 
     for entry in master {
-        if entry.entry_type != "table" || entry.name.starts_with("sqlite_") {
+        if !crate::row_level_diff::is_diffable_table(&entry, &ignored_tables) {
             continue;
         }
         let row_count = crate::sqlite_parse::read_all_rows(&reader, entry.root_page)
@@ -4485,11 +4741,7 @@ fn format_repo_diff(diff: &RepoDiff) -> Result<String, ErrCtx> {
     }
 
     for file in &diff.files {
-        let change = match file.change {
-            RepoFileChange::Added => "added",
-            RepoFileChange::Deleted => "deleted",
-            RepoFileChange::Modified => "modified",
-        };
+        let change = repo_file_change_label(file.change);
         writeln!(&mut f, "{change}: {}", file.path)?;
         if let Some(from) = &file.from {
             writeln!(
@@ -4509,6 +4761,114 @@ fn format_repo_diff(diff: &RepoDiff) -> Result<String, ErrCtx> {
         }
     }
     Ok(f)
+}
+
+fn format_repo_row_diff(
+    runtime: &Runtime,
+    repo: &Repository,
+    diff: &RepoDiff,
+) -> Result<String, ErrCtx> {
+    let mut f = String::new();
+    writeln!(
+        &mut f,
+        "Row Diff {}..{}",
+        &diff.from[..diff.from.len().min(12)],
+        &diff.to[..diff.to.len().min(12)]
+    )?;
+    if diff.files.is_empty() {
+        writeln!(&mut f, "No changes.")?;
+        return Ok(f);
+    }
+
+    for file in &diff.files {
+        let change = repo_file_change_label(file.change);
+        writeln!(&mut f, "{change}: {}", file.path)?;
+        let Some(row_diff) = repo_file_row_diff(runtime, repo, file)? else {
+            writeln!(
+                &mut f,
+                "  Row diff unavailable for {} database snapshots.",
+                change
+            )?;
+            continue;
+        };
+        write_indented(&mut f, &row_diff.to_report(), "  ")?;
+    }
+    Ok(f)
+}
+
+fn repo_file_change_label(change: RepoFileChange) -> &'static str {
+    match change {
+        RepoFileChange::Added => "added",
+        RepoFileChange::Deleted => "deleted",
+        RepoFileChange::Modified => "modified",
+    }
+}
+
+fn repo_file_row_diff(
+    runtime: &Runtime,
+    repo: &Repository,
+    file: &graft::repo::RepoFileDiff,
+) -> Result<Option<crate::row_level_diff::RowLevelDiff>, ErrCtx> {
+    let (Some(from), Some(to)) = (&file.from, &file.to) else {
+        return Ok(None);
+    };
+    let remote = repo_row_diff_remote(repo);
+    hydrate_repo_snapshot_for_row_diff(runtime, &from.snapshot, remote.clone())?;
+    hydrate_repo_snapshot_for_row_diff(runtime, &to.snapshot, remote)?;
+    crate::row_level_diff::row_level_diff_snapshots(
+        runtime,
+        &from.snapshot.to_snapshot(),
+        &to.snapshot.to_snapshot(),
+    )
+    .map(Some)
+    .map_err(|err| ErrCtx::PragmaErr(format!("Row diff error for `{}`: {err:?}", file.path).into()))
+}
+
+fn repo_row_diff_remote(repo: &Repository) -> Option<Arc<Remote>> {
+    let remote = repo_default_remote(repo, None).ok()?;
+    repo.remote_store(&remote).ok().map(Arc::new)
+}
+
+fn hydrate_repo_snapshot_for_row_diff(
+    runtime: &Runtime,
+    snapshot: &RepoSnapshot,
+    remote: Option<Arc<Remote>>,
+) -> Result<(), ErrCtx> {
+    let local_result = hydrate_repo_snapshot_with_hash_policy(
+        runtime,
+        snapshot,
+        None,
+        SnapshotHashPolicy::AllowHydratedMismatch,
+    );
+    let Err(local_err) = local_result else {
+        return Ok(());
+    };
+
+    let Some(remote) = remote else {
+        return Err(local_err);
+    };
+
+    hydrate_repo_snapshot_with_hash_policy(
+        runtime,
+        snapshot,
+        Some(remote),
+        SnapshotHashPolicy::AllowHydratedMismatch,
+    )
+    .map_err(|remote_err| {
+        ErrCtx::PragmaErr(
+            format!(
+                "local snapshot hydrate failed: {local_err}; remote snapshot hydrate failed: {remote_err}"
+            )
+            .into(),
+        )
+    })
+}
+
+fn write_indented(out: &mut String, text: &str, prefix: &str) -> Result<(), ErrCtx> {
+    for line in text.lines() {
+        writeln!(out, "{prefix}{line}")?;
+    }
+    Ok(())
 }
 
 fn format_repo_show(commit: &graft::repo::CommitObject) -> Result<String, ErrCtx> {
@@ -4840,16 +5200,74 @@ fn format_merge_outcome(outcome: &MergeOutcome) -> Result<String, ErrCtx> {
     Ok(f)
 }
 
-fn format_merge_outcome_with_row_analysis(
+fn format_merge_outcome_with_row_auto_merge(
     runtime: &Runtime,
     file: &VolFile,
     repo: &Repository,
     outcome: &MergeOutcome,
+    row_auto_merge: Option<&RowAutoMergeResult>,
     remote: Option<Arc<Remote>>,
 ) -> Result<String, ErrCtx> {
-    let mut f = format_merge_outcome(outcome)?;
-    append_row_merge_analysis(&mut f, runtime, file, repo, outcome, remote)?;
+    let display_outcome = row_auto_merge
+        .map(|result| merge_outcome_with_row_auto_merge(outcome, &result.key))
+        .unwrap_or_else(|| outcome.clone());
+    let mut f = format_merge_outcome(&display_outcome)?;
+    if let Some(result) = row_auto_merge {
+        append_row_auto_merge_result(&mut f, result)?;
+    } else {
+        append_row_merge_analysis(&mut f, runtime, file, repo, outcome, remote)?;
+    }
     Ok(f)
+}
+
+fn merge_outcome_with_row_auto_merge(outcome: &MergeOutcome, key: &str) -> MergeOutcome {
+    let MergeOutcome::Merged {
+        head,
+        target,
+        merge_base,
+        staged,
+        conflicted,
+    } = outcome
+    else {
+        return outcome.clone();
+    };
+
+    let mut staged = staged.clone();
+    if !staged.iter().any(|path| path == key) {
+        staged.push(key.to_string());
+        staged.sort();
+    }
+    let conflicted = conflicted
+        .iter()
+        .filter(|path| path.as_str() != key)
+        .cloned()
+        .collect();
+
+    MergeOutcome::Merged {
+        head: head.clone(),
+        target: target.clone(),
+        merge_base: merge_base.clone(),
+        staged,
+        conflicted,
+    }
+}
+
+fn append_row_auto_merge_result(
+    output: &mut String,
+    result: &RowAutoMergeResult,
+) -> Result<(), ErrCtx> {
+    if !output.ends_with('\n') {
+        output.push('\n');
+    }
+    writeln!(output, "Row-level auto-merged {}:", result.key)?;
+    writeln!(
+        output,
+        "  applied {} row change(s) from theirs",
+        result.applied_changes
+    )?;
+    writeln!(output, "  ours: {} row change(s)", result.ours_changes)?;
+    writeln!(output, "  theirs: {} row change(s)", result.theirs_changes)?;
+    Ok(())
 }
 
 fn format_pull_outcome(outcome: &PullOutcome) -> Result<String, ErrCtx> {
@@ -5030,12 +5448,294 @@ fn format_current_file_row_merge_analysis(
     Ok(Some(f))
 }
 
+fn current_file_status_row_merge_analysis(
+    runtime: &Runtime,
+    file: &VolFile,
+    repo: &Repository,
+    remote: Option<Arc<Remote>>,
+) -> Result<Option<JsonRowMergeAnalysis>, ErrCtx> {
+    let key = repo.file_key(&file.tag)?;
+    current_file_row_merge_analysis(runtime, repo, &key, remote)
+}
+
+fn current_file_status_row_merge_analysis_lossy(
+    runtime: &Runtime,
+    file: &VolFile,
+    repo: &Repository,
+    remote: Option<Arc<Remote>>,
+) -> Option<JsonRowMergeAnalysis> {
+    match current_file_status_row_merge_analysis(runtime, file, repo, remote) {
+        Ok(analysis) => analysis,
+        Err(err) => {
+            let path = repo
+                .file_key(&file.tag)
+                .unwrap_or_else(|_| "db.sqlite3".to_string());
+            Some(JsonRowMergeAnalysis {
+                path,
+                available: false,
+                can_auto_merge: false,
+                ours_changes: 0,
+                theirs_changes: 0,
+                apply_changes: 0,
+                opaque_changes: 0,
+                blocked_reasons: vec!["analysis_error"],
+                row_conflicts: vec![],
+                schema_conflicts: vec![],
+                message: Some(format!("row-level analysis unavailable: {err}")),
+            })
+        }
+    }
+}
+
+fn current_file_row_merge_analysis(
+    runtime: &Runtime,
+    repo: &Repository,
+    key: &str,
+    remote: Option<Arc<Remote>>,
+) -> Result<Option<JsonRowMergeAnalysis>, ErrCtx> {
+    let index = repo.read_index()?;
+    if !index.conflicted_paths().iter().any(|path| path == key) {
+        return Ok(None);
+    }
+
+    let Some((base, ours, theirs)) = current_file_conflict_states(repo, key)? else {
+        return Ok(Some(JsonRowMergeAnalysis {
+            path: key.to_string(),
+            available: false,
+            can_auto_merge: false,
+            ours_changes: 0,
+            theirs_changes: 0,
+            apply_changes: 0,
+            opaque_changes: 0,
+            blocked_reasons: vec!["add_delete_conflict"],
+            row_conflicts: vec![],
+            schema_conflicts: vec![],
+            message: Some("merge involves add/delete of this database path".to_string()),
+        }));
+    };
+
+    hydrate_repo_file_state(runtime, &base, None)?;
+    hydrate_repo_file_state(runtime, &ours, None)?;
+    hydrate_repo_file_state(runtime, &theirs, remote)?;
+
+    let plan = crate::row_merge::plan_snapshot_merge(runtime, &base, &ours, &theirs)?;
+    let row_conflicts: Vec<JsonRowMergeConflict> = plan
+        .analysis
+        .conflicts
+        .iter()
+        .map(|conflict| JsonRowMergeConflict {
+            table: conflict.table.clone(),
+            rowid: conflict.rowid,
+            ours: row_change_kind_label(conflict.ours),
+            theirs: row_change_kind_label(conflict.theirs),
+        })
+        .collect();
+    let schema_conflicts: Vec<JsonSchemaMergeConflict> = plan
+        .schema_conflicts()
+        .iter()
+        .map(|conflict| JsonSchemaMergeConflict {
+            name: conflict.name.clone(),
+            entry_type: conflict.entry_type.clone(),
+            ours: conflict.ours.map(schema_change_kind_label),
+            theirs: conflict.theirs.map(schema_change_kind_label),
+        })
+        .collect();
+    let apply_changes = plan.apply_change_count();
+    let mut blocked_reasons = Vec::new();
+    if !row_conflicts.is_empty() {
+        blocked_reasons.push("row_conflicts");
+    }
+    if !schema_conflicts.is_empty() {
+        blocked_reasons.push("schema_conflicts");
+    }
+    if plan.opaque_changes() > 0 {
+        blocked_reasons.push("opaque_changes");
+    }
+    if apply_changes == 0 {
+        blocked_reasons.push("no_applicable_changes");
+    }
+    let can_auto_merge = blocked_reasons.is_empty();
+
+    Ok(Some(JsonRowMergeAnalysis {
+        path: key.to_string(),
+        available: true,
+        can_auto_merge,
+        ours_changes: plan.analysis.ours_changes,
+        theirs_changes: plan.analysis.theirs_changes,
+        apply_changes,
+        opaque_changes: plan.opaque_changes(),
+        blocked_reasons,
+        row_conflicts,
+        schema_conflicts,
+        message: None,
+    }))
+}
+
 fn row_change_kind_label(kind: crate::row_merge::RowChangeKind) -> &'static str {
     match kind {
         crate::row_merge::RowChangeKind::Insert => "insert",
         crate::row_merge::RowChangeKind::Delete => "delete",
         crate::row_merge::RowChangeKind::Update => "update",
     }
+}
+
+fn schema_change_kind_label(kind: crate::row_level_diff::SchemaChangeKind) -> &'static str {
+    match kind {
+        crate::row_level_diff::SchemaChangeKind::Added => "added",
+        crate::row_level_diff::SchemaChangeKind::Deleted => "deleted",
+        crate::row_level_diff::SchemaChangeKind::Modified => "modified",
+    }
+}
+
+#[derive(Debug)]
+struct RowAutoMergeResult {
+    key: String,
+    applied_changes: usize,
+    ours_changes: usize,
+    theirs_changes: usize,
+}
+
+fn try_row_auto_merge_current_file_conflict(
+    runtime: &Runtime,
+    file: &mut VolFile,
+    repo: &Repository,
+    outcome: &MergeOutcome,
+    remote: Option<Arc<Remote>>,
+) -> Result<Option<RowAutoMergeResult>, ErrCtx> {
+    let MergeOutcome::Merged { conflicted, .. } = outcome else {
+        return Ok(None);
+    };
+    let key = repo.file_key(&file.tag)?;
+    if !conflicted.iter().any(|path| path == &key) {
+        return Ok(None);
+    }
+
+    try_row_auto_merge_current_file_status_conflict(runtime, file, repo, remote)
+}
+
+fn try_row_auto_merge_current_file_status_conflict(
+    runtime: &Runtime,
+    file: &mut VolFile,
+    repo: &Repository,
+    remote: Option<Arc<Remote>>,
+) -> Result<Option<RowAutoMergeResult>, ErrCtx> {
+    let key = repo.file_key(&file.tag)?;
+    let index = repo.read_index()?;
+    if !index.conflicted_paths().iter().any(|path| path == &key) {
+        return Ok(None);
+    }
+
+    let Some((base, ours, theirs)) = current_file_conflict_states(repo, &key)? else {
+        return Ok(None);
+    };
+
+    hydrate_repo_file_state(runtime, &base, None)?;
+    hydrate_repo_file_state(runtime, &ours, None)?;
+    hydrate_repo_file_state(runtime, &theirs, remote)?;
+
+    let plan = crate::row_merge::plan_snapshot_merge(runtime, &base, &ours, &theirs)?;
+    if plan.has_conflicts() || plan.has_opaque_changes() || plan.apply_change_count() == 0 {
+        return Ok(None);
+    }
+
+    let applied_changes = plan.apply_change_count();
+    let sql = plan.theirs_apply_sql();
+    let merged = materialize_row_auto_merge_state(runtime, repo, &key, &ours, &sql)?;
+    checkout_repo_file_state(runtime, file, &merged, None)?;
+    repo.resolve_file_conflict(&file.tag, Some(merged))?;
+
+    Ok(Some(RowAutoMergeResult {
+        key,
+        applied_changes,
+        ours_changes: plan.analysis.ours_changes,
+        theirs_changes: plan.analysis.theirs_changes,
+    }))
+}
+
+fn current_file_conflict_states(
+    repo: &Repository,
+    key: &str,
+) -> Result<Option<(CommitFileState, CommitFileState, CommitFileState)>, ErrCtx> {
+    let index = repo.read_index()?;
+    let mut base = None;
+    let mut ours = None;
+    let mut theirs = None;
+
+    for entry in index.entries.iter().filter(|entry| entry.path == key) {
+        match entry.stage {
+            graft::repo::index::IndexStage::Base => base = entry.file.clone(),
+            graft::repo::index::IndexStage::Ours => ours = entry.file.clone(),
+            graft::repo::index::IndexStage::Theirs => theirs = entry.file.clone(),
+            graft::repo::index::IndexStage::Normal => {}
+        }
+    }
+
+    Ok(match (base, ours, theirs) {
+        (Some(base), Some(ours), Some(theirs)) => Some((base, ours, theirs)),
+        _ => None,
+    })
+}
+
+fn materialize_row_auto_merge_state(
+    runtime: &Runtime,
+    repo: &Repository,
+    key: &str,
+    ours: &CommitFileState,
+    sql: &str,
+) -> Result<CommitFileState, ErrCtx> {
+    let temp_path = row_auto_merge_temp_path(repo, key)?;
+    let result = (|| {
+        write_repo_file_state_to_path(runtime, ours, &temp_path)?;
+        apply_row_merge_sql_to_path(&temp_path, sql)?;
+        import_physical_sqlite_file_state(runtime, &temp_path)
+    })();
+    let cleanup = std::fs::remove_file(&temp_path);
+    match (result, cleanup) {
+        (Ok(state), Ok(()) | Err(_)) => Ok(state),
+        (Err(err), Ok(()) | Err(_)) => Err(err),
+    }
+}
+
+fn row_auto_merge_temp_path(repo: &Repository, key: &str) -> Result<PathBuf, ErrCtx> {
+    let dir = repo.worktree().join(".graft").join("tmp");
+    std::fs::create_dir_all(&dir)?;
+    let id = NEXT_JOB_ID.fetch_add(1, Ordering::Relaxed);
+    let key = key
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    Ok(dir.join(format!("row-merge-{}-{id}-{key}.db", std::process::id())))
+}
+
+fn apply_row_merge_sql_to_path(path: &Path, sql: &str) -> Result<(), ErrCtx> {
+    let conn = rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|err| row_auto_merge_sqlite_err(path, "open temporary database", err))?;
+    conn.execute_batch("PRAGMA foreign_keys = OFF;")
+        .map_err(|err| row_auto_merge_sqlite_err(path, "disable foreign keys", err))?;
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, false)
+        .map_err(|err| row_auto_merge_sqlite_err(path, "disable triggers", err))?;
+    conn.execute_batch(sql)
+        .map_err(|err| row_auto_merge_sqlite_err(path, "apply row changes", err))?;
+    Ok(())
+}
+
+fn row_auto_merge_sqlite_err(path: &Path, action: &str, err: rusqlite::Error) -> ErrCtx {
+    ErrCtx::PragmaErr(
+        format!(
+            "could not {action} for row-level auto-merge at `{}`: {err}",
+            path.display()
+        )
+        .into(),
+    )
 }
 
 fn format_remote(remote: &RemoteInfo) -> String {
@@ -5553,7 +6253,7 @@ fn row_diff_impl(
     writeln!(&mut output, "Row-level diff from LSN {from} to LSN {to}")?;
     writeln!(&mut output)?;
 
-    if diff.table_changes.is_empty() {
+    if diff.table_changes.is_empty() && diff.opaque_changes.is_empty() {
         writeln!(&mut output, "No table changes detected.")?;
         return Ok(Some(output));
     }
@@ -5644,6 +6344,26 @@ fn row_diff_impl(
         writeln!(&mut output)?;
     }
 
+    if !diff.opaque_changes.is_empty() {
+        writeln!(&mut output, "Opaque changes:")?;
+        for change in &diff.opaque_changes {
+            let owner = change
+                .owner
+                .as_ref()
+                .map(|owner| format!(" owned by {owner}"))
+                .unwrap_or_default();
+            writeln!(
+                &mut output,
+                "  {} {} ({}{})",
+                change.change.as_str(),
+                change.name,
+                change.reason.as_str(),
+                owner
+            )?;
+        }
+        writeln!(&mut output)?;
+    }
+
     // Generate SQL script
     writeln!(&mut output, "-- SQL Script --")?;
     for table in &diff.table_changes {
@@ -5651,6 +6371,126 @@ fn row_diff_impl(
     }
 
     Ok(Some(output))
+}
+
+fn json_opaque_changes(
+    changes: &[crate::row_level_diff::OpaqueChange],
+) -> Vec<crate::json::JsonOpaqueChange> {
+    changes
+        .iter()
+        .map(|change| crate::json::JsonOpaqueChange {
+            name: change.name.clone(),
+            change: change.change.as_str().to_string(),
+            reason: change.reason.as_str().to_string(),
+            owner: change.owner.clone(),
+        })
+        .collect()
+}
+
+fn json_repo_row_diff(
+    runtime: &Runtime,
+    repo: &Repository,
+    diff: &RepoDiff,
+) -> Result<crate::json::JsonRepoRowDiffResult, ErrCtx> {
+    let files = diff
+        .files
+        .iter()
+        .map(|file| {
+            let change = repo_file_change_label(file.change).to_string();
+            match repo_file_row_diff(runtime, repo, file) {
+                Ok(Some(row_diff)) => Ok(crate::json::JsonRepoRowDiffFile {
+                    path: file.path.clone(),
+                    change,
+                    row_diff_available: true,
+                    message: None,
+                    tables: json_table_changes(&row_diff.table_changes),
+                    opaque_changes: json_opaque_changes(&row_diff.opaque_changes),
+                }),
+                Ok(None) => Ok(crate::json::JsonRepoRowDiffFile {
+                    path: file.path.clone(),
+                    change: change.clone(),
+                    row_diff_available: false,
+                    message: Some(format!(
+                        "row diff unavailable for {change} database snapshots"
+                    )),
+                    tables: Vec::new(),
+                    opaque_changes: Vec::new(),
+                }),
+                Err(err) => Ok(crate::json::JsonRepoRowDiffFile {
+                    path: file.path.clone(),
+                    change: change.clone(),
+                    row_diff_available: false,
+                    message: Some(format!(
+                        "row diff unavailable for {change} database snapshots: {err}"
+                    )),
+                    tables: Vec::new(),
+                    opaque_changes: Vec::new(),
+                }),
+            }
+        })
+        .collect::<Result<Vec<_>, ErrCtx>>()?;
+
+    Ok(crate::json::JsonRepoRowDiffResult {
+        from: diff.from.clone(),
+        to: diff.to.clone(),
+        files,
+    })
+}
+
+fn json_table_changes(
+    changes: &[crate::row_level_diff::TableChanges],
+) -> Vec<crate::json::JsonTableChanges> {
+    changes
+        .iter()
+        .map(|table| crate::json::JsonTableChanges {
+            name: table.table_name.clone(),
+            columns: table.columns.clone(),
+            changes: table.changes.iter().map(json_row_change).collect(),
+        })
+        .collect()
+}
+
+fn json_row_change(change: &crate::row_level_diff::RowChange) -> crate::json::JsonRowChange {
+    match change {
+        crate::row_level_diff::RowChange::Insert { rowid, row } => crate::json::JsonRowChange {
+            op: "insert".into(),
+            rowid: *rowid,
+            values: row
+                .values
+                .iter()
+                .map(crate::json::JsonRowChange::value_to_json)
+                .collect(),
+            old_values: None,
+        },
+        crate::row_level_diff::RowChange::Delete { rowid, row } => crate::json::JsonRowChange {
+            op: "delete".into(),
+            rowid: *rowid,
+            values: row
+                .values
+                .iter()
+                .map(crate::json::JsonRowChange::value_to_json)
+                .collect(),
+            old_values: None,
+        },
+        crate::row_level_diff::RowChange::Update { rowid, old_row, new_row } => {
+            crate::json::JsonRowChange {
+                op: "update".into(),
+                rowid: *rowid,
+                values: new_row
+                    .values
+                    .iter()
+                    .map(crate::json::JsonRowChange::value_to_json)
+                    .collect(),
+                old_values: Some(
+                    old_row
+                        .values
+                        .iter()
+                        .map(crate::json::JsonRowChange::value_to_json)
+                        .collect(),
+                ),
+            }
+        }
+    }
 }
 
 /// Count changes for JSON summary
@@ -6120,6 +6960,46 @@ mod tests {
         assert_eq!(to, LogRef::new(log, LSN::new(3)));
         assert!(parse_debug_diff_lsn_arg("74ggbzxuMf-2uAmM7FwXntwW:2").is_err());
         assert!(parse_debug_diff_lsn_arg("2 3").is_err());
+    }
+
+    #[test]
+    fn parse_repo_diff_arg_supports_row_mode() {
+        assert_eq!(
+            parse_repo_diff_arg(Some("--rows")).unwrap(),
+            RepoDiffSpec {
+                mode: DiffMode::Rows,
+                target: RepoDiffTarget::Worktree { path: None },
+            }
+        );
+        assert_eq!(
+            parse_repo_diff_arg(Some("--rows --staged -- app.db")).unwrap(),
+            RepoDiffSpec {
+                mode: DiffMode::Rows,
+                target: RepoDiffTarget::Staged { path: Some("app.db".to_string()) },
+            }
+        );
+        assert_eq!(
+            parse_repo_diff_arg(Some("--rows HEAD~1 HEAD -- app.db")).unwrap(),
+            RepoDiffSpec {
+                mode: DiffMode::Rows,
+                target: RepoDiffTarget::Revisions {
+                    from: "HEAD~1".to_string(),
+                    to: "HEAD".to_string(),
+                    path: Some("app.db".to_string()),
+                },
+            }
+        );
+        assert_eq!(
+            parse_repo_diff_arg(Some("HEAD -- --rows")).unwrap(),
+            RepoDiffSpec {
+                mode: DiffMode::Default,
+                target: RepoDiffTarget::RevisionToWorktree {
+                    rev: "HEAD".to_string(),
+                    path: Some("--rows".to_string()),
+                },
+            }
+        );
+        assert!(parse_repo_diff_arg(Some("--rows --rows")).is_err());
     }
 
     #[test]

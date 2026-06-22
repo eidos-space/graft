@@ -24,7 +24,7 @@ pub fn generate_diff_report(
     writeln!(&mut output, "Diff Summary (LSN {from_lsn} -> {to_lsn}):").unwrap();
     writeln!(&mut output).unwrap();
 
-    if row_diff.table_changes.is_empty() {
+    if row_diff.table_changes.is_empty() && row_diff.opaque_changes.is_empty() {
         writeln!(&mut output, "No changes detected.").unwrap();
         return Ok(output);
     }
@@ -74,6 +74,32 @@ pub fn generate_diff_report(
             write!(&mut output, " ({})", parts.join(", ")).unwrap();
         }
         writeln!(&mut output).unwrap();
+    }
+
+    if !row_diff.opaque_changes.is_empty() {
+        writeln!(&mut output).unwrap();
+        writeln!(
+            &mut output,
+            "Opaque changes: {}",
+            row_diff.opaque_changes.len()
+        )
+        .unwrap();
+        for change in &row_diff.opaque_changes {
+            let owner = change
+                .owner
+                .as_ref()
+                .map(|owner| format!(" owned by {owner}"))
+                .unwrap_or_default();
+            writeln!(
+                &mut output,
+                "  {}: {} ({}{})",
+                change.name,
+                change.change.as_str(),
+                change.reason.as_str(),
+                owner
+            )
+            .unwrap();
+        }
     }
 
     writeln!(&mut output).unwrap();

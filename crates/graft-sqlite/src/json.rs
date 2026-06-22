@@ -28,12 +28,23 @@ pub struct JsonTableSummary {
     pub updates: usize,
 }
 
+/// A table-level change that cannot be expanded into ordinary row changes.
+#[derive(Debug, Clone, Serialize)]
+pub struct JsonOpaqueChange {
+    pub name: String,
+    pub change: String,
+    pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+}
+
 /// Diff result (for `graft_json_diff`, default mode)
 #[derive(Debug, Clone, Serialize)]
 pub struct JsonDiffResult {
     pub from_lsn: u64,
     pub to_lsn: u64,
     pub tables: Vec<JsonTableSummary>,
+    pub opaque_changes: Vec<JsonOpaqueChange>,
 }
 
 /// A single row change (for `graft_json_diff`, rows mode)
@@ -62,6 +73,29 @@ pub struct JsonRowDiffResult {
     pub from_lsn: u64,
     pub to_lsn: u64,
     pub tables: Vec<JsonTableChanges>,
+    pub opaque_changes: Vec<JsonOpaqueChange>,
+}
+
+/// Row-level repository diff result (for `graft_json_diff --rows`)
+#[derive(Debug, Clone, Serialize)]
+pub struct JsonRepoRowDiffResult {
+    pub from: String,
+    pub to: String,
+    pub files: Vec<JsonRepoRowDiffFile>,
+}
+
+/// Row-level changes for one repository file.
+#[derive(Debug, Clone, Serialize)]
+pub struct JsonRepoRowDiffFile {
+    pub path: String,
+    pub change: String,
+    pub row_diff_available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tables: Vec<JsonTableChanges>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub opaque_changes: Vec<JsonOpaqueChange>,
 }
 
 /// Table entry in show output (for `graft_json_show`)

@@ -2,7 +2,11 @@
 //!
 //! Parses `SQLite` B-tree directly to compare row data between versions
 
-use crate::sqlite_parse::{MasterEntry, ParseError, Record, TableScanner, read_all_rows};
+use std::collections::{BTreeMap, HashSet};
+
+use crate::sqlite_parse::{
+    ColumnInfo, KeyConstraintKind, MasterEntry, ParseError, Record, TableScanner, read_all_rows,
+};
 use graft::core::{VolumeId, lsn::LSN};
 use graft::rt::runtime::Runtime;
 use graft::snapshot::Snapshot;
@@ -31,7 +35,15 @@ pub enum RowChange {
 pub struct TableChanges {
     pub table_name: String,
     pub columns: Vec<String>,
+    pub rowid_alias: Option<String>,
+    pub semantic_key_columns: Vec<String>,
     pub changes: Vec<RowChange>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertRowidMode {
+    Preserve,
+    Omit,
 }
 
 impl TableChanges {
@@ -41,15 +53,35 @@ impl TableChanges {
 
     /// Generate SQL statements using actual column names
     pub fn to_sql(&self) -> String {
+        self.to_sql_filtered(|_| true)
+    }
+
+    pub fn to_sql_filtered(&self, include: impl FnMut(&RowChange) -> bool) -> String {
+        self.to_sql_filtered_with_insert_rowid(include, |_| InsertRowidMode::Preserve)
+    }
+
+    pub fn to_sql_filtered_with_insert_rowid(
+        &self,
+        mut include: impl FnMut(&RowChange) -> bool,
+        mut insert_rowid_mode: impl FnMut(&RowChange) -> InsertRowidMode,
+    ) -> String {
         let mut sql = String::new();
 
         for change in &self.changes {
+            if !include(change) {
+                continue;
+            }
             match change {
                 RowChange::Insert { rowid, row } => {
+                    let rowid = match insert_rowid_mode(change) {
+                        InsertRowidMode::Preserve => Some(*rowid),
+                        InsertRowidMode::Omit => None,
+                    };
                     sql.push_str(&format_sql_insert(
                         &self.table_name,
                         &self.columns,
-                        *rowid,
+                        self.rowid_alias.as_deref(),
+                        rowid,
                         row,
                     ));
                     sql.push('\n');
@@ -62,6 +94,7 @@ impl TableChanges {
                     sql.push_str(&format_sql_update(
                         &self.table_name,
                         &self.columns,
+                        self.rowid_alias.as_deref(),
                         *rowid,
                         new_row,
                     ));
@@ -74,12 +107,76 @@ impl TableChanges {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaChange {
+    pub name: String,
+    pub entry_type: String,
+    pub sql: String,
+    pub kind: SchemaChangeKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaChangeKind {
+    Added,
+    Deleted,
+    Modified,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpaqueChange {
+    pub name: String,
+    pub change: OpaqueChangeKind,
+    pub reason: OpaqueChangeReason,
+    pub owner: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpaqueChangeKind {
+    Added,
+    Deleted,
+    Modified,
+}
+
+impl OpaqueChangeKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Added => "added",
+            Self::Deleted => "deleted",
+            Self::Modified => "modified",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpaqueChangeReason {
+    VirtualTable,
+    FtsShadowTable,
+}
+
+impl OpaqueChangeReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::VirtualTable => "virtual_table",
+            Self::FtsShadowTable => "fts_shadow_table",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IgnoredTable {
+    pub name: String,
+    pub reason: OpaqueChangeReason,
+    pub owner: Option<String>,
+}
+
 /// Row-level diff result
 #[derive(Debug)]
 pub struct RowLevelDiff {
     pub from_lsn: LSN,
     pub to_lsn: LSN,
+    pub schema_changes: Vec<SchemaChange>,
     pub table_changes: Vec<TableChanges>,
+    pub opaque_changes: Vec<OpaqueChange>,
 }
 
 impl RowLevelDiff {
@@ -91,12 +188,46 @@ impl RowLevelDiff {
         );
         sql.push_str("BEGIN TRANSACTION;\n\n");
 
+        for change in &self.schema_changes {
+            match change.kind {
+                SchemaChangeKind::Added if !change.sql.trim().is_empty() => {
+                    sql.push_str(&change.sql);
+                    if !change.sql.trim_end().ends_with(';') {
+                        sql.push(';');
+                    }
+                    sql.push('\n');
+                }
+                SchemaChangeKind::Deleted
+                | SchemaChangeKind::Modified
+                | SchemaChangeKind::Added => {
+                    sql.push_str(&format!(
+                        "-- Schema change: {} {}\n",
+                        change_kind_label(change.kind),
+                        change.name
+                    ));
+                }
+            }
+        }
+
+        if !self.schema_changes.is_empty() {
+            sql.push('\n');
+        }
+
         for table in &self.table_changes {
             if !table.is_empty() {
                 sql.push_str(&format!("-- Table: {}\n", table.table_name));
                 sql.push_str(&table.to_sql());
                 sql.push('\n');
             }
+        }
+
+        for change in &self.opaque_changes {
+            sql.push_str(&format!(
+                "-- Opaque change: {} {} ({})\n",
+                change.change.as_str(),
+                change.name,
+                change.reason.as_str()
+            ));
         }
 
         sql.push_str("COMMIT;\n");
@@ -107,6 +238,27 @@ impl RowLevelDiff {
     pub fn to_report(&self) -> String {
         let mut report = format!("Diff LSN {} -> {}\n", self.from_lsn, self.to_lsn);
         report.push_str("============================\n\n");
+
+        if self.table_changes.is_empty()
+            && self.schema_changes.is_empty()
+            && self.opaque_changes.is_empty()
+        {
+            report.push_str("No row changes.\n\n");
+            return report;
+        }
+
+        if !self.schema_changes.is_empty() {
+            report.push_str("Schema changes:\n");
+            for change in &self.schema_changes {
+                report.push_str(&format!(
+                    "  {} {} ({})\n",
+                    change_kind_label(change.kind),
+                    change.name,
+                    change.entry_type
+                ));
+            }
+            report.push('\n');
+        }
 
         for table in &self.table_changes {
             if table.is_empty() {
@@ -142,6 +294,19 @@ impl RowLevelDiff {
                         report.push_str(&format!("    new: {:?}\n", new_row.values));
                     }
                 }
+            }
+            report.push('\n');
+        }
+
+        if !self.opaque_changes.is_empty() {
+            report.push_str("Opaque changes:\n");
+            for change in &self.opaque_changes {
+                report.push_str(&format!(
+                    "  {} {} ({})\n",
+                    change.change.as_str(),
+                    change.name,
+                    change.reason.as_str()
+                ));
             }
             report.push('\n');
         }
@@ -258,18 +423,28 @@ fn row_level_diff_checked_out(
         graft::err::LogicalErr::Other(format!("Failed to read schema for {to_vid}: {e:?}"))
     })?;
 
-    // Compare tables
+    // Compare schema and tables
+    let schema_changes = diff_schema_entries(&from_master, &to_master);
     let mut table_changes = Vec::new();
 
     // Collect all table names
-    let mut all_tables: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let ignored_table_infos = ignored_row_diff_table_infos(&from_master, &to_master);
+    let ignored_tables: HashSet<String> = ignored_table_infos.keys().cloned().collect();
+    let opaque_changes = diff_opaque_tables(
+        &from_reader,
+        &to_reader,
+        &from_master,
+        &to_master,
+        &ignored_table_infos,
+    );
+    let mut all_tables: HashSet<String> = HashSet::new();
     for entry in &from_master {
-        if entry.entry_type == "table" && !entry.name.starts_with("sqlite_") {
+        if is_diffable_table(entry, &ignored_tables) {
             all_tables.insert(entry.name.clone());
         }
     }
     for entry in &to_master {
-        if entry.entry_type == "table" && !entry.name.starts_with("sqlite_") {
+        if is_diffable_table(entry, &ignored_tables) {
             all_tables.insert(entry.name.clone());
         }
     }
@@ -280,10 +455,17 @@ fn row_level_diff_checked_out(
         let to_entry = to_master.iter().find(|e| e.name == table_name);
 
         // Get columns from schema (prefer to-entry, fallback to from-entry)
-        let columns: Vec<String> = to_entry
+        let column_infos: Vec<ColumnInfo> = to_entry
             .or(from_entry)
-            .map(|e| e.parse_columns().into_iter().map(|c| c.name).collect())
+            .map(MasterEntry::parse_columns)
             .unwrap_or_default();
+        let rowid_alias = rowid_alias_column(&column_infos);
+        let semantic_key_columns = semantic_key_columns(
+            to_entry.or(from_entry),
+            &column_infos,
+            rowid_alias.as_deref(),
+        );
+        let columns: Vec<String> = column_infos.into_iter().map(|c| c.name).collect();
 
         let changes = match (from_entry, to_entry) {
             (Some(from), Some(to)) => {
@@ -310,11 +492,110 @@ fn row_level_diff_checked_out(
         };
 
         if !changes.is_empty() {
-            table_changes.push(TableChanges { table_name, columns, changes });
+            table_changes.push(TableChanges {
+                table_name,
+                columns,
+                rowid_alias,
+                semantic_key_columns,
+                changes,
+            });
         }
     }
 
-    Ok(RowLevelDiff { from_lsn, to_lsn, table_changes })
+    Ok(RowLevelDiff {
+        from_lsn,
+        to_lsn,
+        schema_changes,
+        table_changes,
+        opaque_changes,
+    })
+}
+
+fn diff_schema_entries(
+    from_master: &[MasterEntry],
+    to_master: &[MasterEntry],
+) -> Vec<SchemaChange> {
+    let mut changes = Vec::new();
+    let mut names: HashSet<String> = HashSet::new();
+    for entry in from_master.iter().chain(to_master.iter()) {
+        if is_schema_diffable_entry(entry) {
+            names.insert(entry.name.clone());
+        }
+    }
+
+    let mut names: Vec<_> = names.into_iter().collect();
+    names.sort_by(|a, b| {
+        let a_entry = to_master
+            .iter()
+            .chain(from_master.iter())
+            .find(|entry| entry.name == *a);
+        let b_entry = to_master
+            .iter()
+            .chain(from_master.iter())
+            .find(|entry| entry.name == *b);
+        schema_entry_priority(a_entry)
+            .cmp(&schema_entry_priority(b_entry))
+            .then(a.cmp(b))
+    });
+
+    for name in names {
+        let from_entry = from_master.iter().find(|entry| entry.name == name);
+        let to_entry = to_master.iter().find(|entry| entry.name == name);
+        let Some(change) = (match (from_entry, to_entry) {
+            (None, Some(to)) => Some(SchemaChange {
+                name: to.name.clone(),
+                entry_type: to.entry_type.clone(),
+                sql: to.sql.clone(),
+                kind: SchemaChangeKind::Added,
+            }),
+            (Some(from), None) => Some(SchemaChange {
+                name: from.name.clone(),
+                entry_type: from.entry_type.clone(),
+                sql: from.sql.clone(),
+                kind: SchemaChangeKind::Deleted,
+            }),
+            (Some(from), Some(to))
+                if from.entry_type != to.entry_type
+                    || from.table_name != to.table_name
+                    || from.sql != to.sql =>
+            {
+                Some(SchemaChange {
+                    name: to.name.clone(),
+                    entry_type: to.entry_type.clone(),
+                    sql: to.sql.clone(),
+                    kind: SchemaChangeKind::Modified,
+                })
+            }
+            _ => None,
+        }) else {
+            continue;
+        };
+        changes.push(change);
+    }
+
+    changes
+}
+
+fn is_schema_diffable_entry(entry: &MasterEntry) -> bool {
+    !entry.name.starts_with("sqlite_") && !entry.sql.trim().is_empty()
+}
+
+fn schema_entry_priority(entry: Option<&MasterEntry>) -> u8 {
+    match entry.map(|entry| entry.entry_type.as_str()) {
+        Some("table") => 0,
+        Some("view") => 1,
+        Some("index") => 2,
+        Some("trigger") => 3,
+        _ => 4,
+    }
+}
+
+fn change_kind_label(kind: SchemaChangeKind) -> &'static str {
+    match kind {
+        SchemaChangeKind::Added => "added",
+        SchemaChangeKind::Deleted => "deleted",
+        SchemaChangeKind::Modified => "modified",
+    }
 }
 
 /// Diff rows for a single table
@@ -371,12 +652,245 @@ fn table_read_err(side: &str, entry: &MasterEntry, err: ParseError) -> graft::er
     ))
 }
 
-/// Format SQL INSERT (values only, `SQLite` auto-assigns rowid)
-fn format_sql_insert(table: &str, _columns: &[String], _rowid: i64, row: &Record) -> String {
-    let values: Vec<_> = row.values.iter().map(|v| v.to_sql()).collect();
+const FTS_SHADOW_SUFFIXES: &[&str] = &[
+    "_content",
+    "_data",
+    "_docsize",
+    "_idx",
+    "_segdir",
+    "_segments",
+    "_stat",
+    "_config",
+];
+
+pub(crate) fn ignored_row_diff_tables(
+    from_master: &[MasterEntry],
+    to_master: &[MasterEntry],
+) -> HashSet<String> {
+    ignored_row_diff_table_infos(from_master, to_master)
+        .into_keys()
+        .collect()
+}
+
+pub(crate) fn ignored_row_diff_table_infos(
+    from_master: &[MasterEntry],
+    to_master: &[MasterEntry],
+) -> BTreeMap<String, IgnoredTable> {
+    let mut ignored = BTreeMap::new();
+
+    for entry in from_master.iter().chain(to_master.iter()) {
+        if !is_virtual_table(entry) {
+            continue;
+        }
+
+        ignored
+            .entry(entry.name.clone())
+            .or_insert_with(|| IgnoredTable {
+                name: entry.name.clone(),
+                reason: OpaqueChangeReason::VirtualTable,
+                owner: None,
+            });
+
+        if is_fts_virtual_table(entry) {
+            for suffix in FTS_SHADOW_SUFFIXES {
+                let name = format!("{}{}", entry.name, suffix);
+                ignored.entry(name.clone()).or_insert_with(|| IgnoredTable {
+                    name,
+                    reason: OpaqueChangeReason::FtsShadowTable,
+                    owner: Some(entry.name.clone()),
+                });
+            }
+        }
+    }
+
+    ignored
+}
+
+fn diff_opaque_tables(
+    from_reader: &VolumeReader,
+    to_reader: &VolumeReader,
+    from_master: &[MasterEntry],
+    to_master: &[MasterEntry],
+    ignored_tables: &BTreeMap<String, IgnoredTable>,
+) -> Vec<OpaqueChange> {
+    let mut changes = Vec::new();
+
+    for (name, info) in ignored_tables {
+        let from_entry = from_master.iter().find(|entry| entry.name == *name);
+        let to_entry = to_master.iter().find(|entry| entry.name == *name);
+        let change = match (from_entry, to_entry) {
+            (None, None) => None,
+            (None, Some(_)) => Some(OpaqueChangeKind::Added),
+            (Some(_), None) => Some(OpaqueChangeKind::Deleted),
+            (Some(from), Some(to)) => opaque_table_change_kind(from_reader, to_reader, from, to),
+        };
+
+        if let Some(change) = change {
+            changes.push(OpaqueChange {
+                name: info.name.clone(),
+                change,
+                reason: info.reason,
+                owner: info.owner.clone(),
+            });
+        }
+    }
+
+    changes
+}
+
+fn opaque_table_change_kind(
+    from_reader: &VolumeReader,
+    to_reader: &VolumeReader,
+    from: &MasterEntry,
+    to: &MasterEntry,
+) -> Option<OpaqueChangeKind> {
+    if from.entry_type != to.entry_type || from.table_name != to.table_name || from.sql != to.sql {
+        return Some(OpaqueChangeKind::Modified);
+    }
+
+    if from.root_page == 0 || to.root_page == 0 {
+        return None;
+    }
+
+    match diff_table_rows(from_reader, to_reader, from, to) {
+        Ok(changes) => (!changes.is_empty()).then_some(OpaqueChangeKind::Modified),
+        Err(err) => {
+            tracing::warn!(
+                "Could not expand opaque table '{}' while detecting opaque diff: {:?}",
+                from.name,
+                err
+            );
+            Some(OpaqueChangeKind::Modified)
+        }
+    }
+}
+
+pub(crate) fn is_diffable_table(entry: &MasterEntry, ignored_tables: &HashSet<String>) -> bool {
+    entry.entry_type == "table"
+        && !entry.name.starts_with("sqlite_")
+        && entry.root_page != 0
+        && !ignored_tables.contains(&entry.name)
+}
+
+fn is_virtual_table(entry: &MasterEntry) -> bool {
+    entry.entry_type == "table"
+        && (entry.root_page == 0
+            || entry
+                .sql
+                .trim_start()
+                .to_ascii_lowercase()
+                .starts_with("create virtual table"))
+}
+
+fn is_fts_virtual_table(entry: &MasterEntry) -> bool {
+    if !is_virtual_table(entry) {
+        return false;
+    }
+
+    let sql = entry.sql.to_ascii_lowercase();
+    sql.contains(" using fts3")
+        || sql.contains(" using fts4")
+        || sql.contains(" using fts5")
+        || sql.contains(" using \"fts")
+        || sql.contains(" using 'fts")
+        || sql.contains(" using [fts")
+}
+
+fn rowid_alias_column(columns: &[ColumnInfo]) -> Option<String> {
+    columns
+        .iter()
+        .find(|column| column.pk && column.ctype.eq_ignore_ascii_case("INTEGER"))
+        .map(|column| column.name.clone())
+}
+
+fn semantic_key_columns(
+    entry: Option<&MasterEntry>,
+    columns: &[ColumnInfo],
+    rowid_alias: Option<&str>,
+) -> Vec<String> {
+    let constraints = entry
+        .map(MasterEntry::parse_key_constraints)
+        .unwrap_or_default();
+
+    for constraint in constraints
+        .iter()
+        .filter(|constraint| constraint.kind == KeyConstraintKind::PrimaryKey)
+    {
+        if let Some(columns) = resolve_key_columns(&constraint.columns, columns, rowid_alias) {
+            return columns;
+        }
+    }
+
+    for column in columns {
+        if column.pk
+            && rowid_alias != Some(column.name.as_str())
+            && !column.ctype.eq_ignore_ascii_case("INTEGER")
+        {
+            return vec![column.name.clone()];
+        }
+    }
+
+    for constraint in constraints
+        .iter()
+        .filter(|constraint| constraint.kind == KeyConstraintKind::Unique)
+    {
+        if let Some(columns) = resolve_key_columns(&constraint.columns, columns, rowid_alias) {
+            return columns;
+        }
+    }
+
+    for column in columns {
+        if column.unique && rowid_alias != Some(column.name.as_str()) {
+            return vec![column.name.clone()];
+        }
+    }
+
+    Vec::new()
+}
+
+fn resolve_key_columns(
+    key_columns: &[String],
+    columns: &[ColumnInfo],
+    rowid_alias: Option<&str>,
+) -> Option<Vec<String>> {
+    let mut resolved = Vec::with_capacity(key_columns.len());
+    for key_column in key_columns {
+        let column = columns
+            .iter()
+            .find(|column| column.name.eq_ignore_ascii_case(key_column))?;
+        if rowid_alias == Some(column.name.as_str()) {
+            return None;
+        }
+        resolved.push(column.name.clone());
+    }
+    Some(resolved)
+}
+
+/// Format SQL INSERT while preserving the SQLite rowid.
+fn format_sql_insert(
+    table: &str,
+    columns: &[String],
+    rowid_alias: Option<&str>,
+    rowid: Option<i64>,
+    row: &Record,
+) -> String {
+    let mut insert_columns = Vec::with_capacity(columns.len() + 1);
+    let mut values = Vec::with_capacity(row.values.len() + 1);
+    if let Some(rowid) = rowid {
+        insert_columns.push(quote_identifier("rowid"));
+        values.push(rowid.to_string());
+    }
+    for (column, value) in columns.iter().zip(&row.values) {
+        if rowid.is_some() && rowid_alias == Some(column.as_str()) {
+            continue;
+        }
+        insert_columns.push(quote_identifier(column));
+        values.push(value.to_sql());
+    }
     format!(
-        "INSERT INTO {} VALUES ({});",
+        "INSERT INTO {} ({}) VALUES ({});",
         quote_identifier(table),
+        insert_columns.join(", "),
         values.join(", ")
     )
 }
@@ -391,11 +905,18 @@ fn format_sql_delete(table: &str, rowid: i64) -> String {
 }
 
 /// Format SQL UPDATE using column names and rowid
-fn format_sql_update(table: &str, columns: &[String], rowid: i64, row: &Record) -> String {
+fn format_sql_update(
+    table: &str,
+    columns: &[String],
+    rowid_alias: Option<&str>,
+    rowid: i64,
+    row: &Record,
+) -> String {
     let set_clause: Vec<_> = if columns.len() == row.values.len() {
         columns
             .iter()
             .zip(row.values.iter())
+            .filter(|(col, _)| rowid_alias != Some(col.as_str()))
             .map(|(col, val)| format!("{} = {}", quote_identifier(col), val.to_sql()))
             .collect()
     } else {
@@ -440,9 +961,12 @@ mod tests {
         let diff = RowLevelDiff {
             from_lsn: graft::core::lsn::LSN::new(1),
             to_lsn: graft::core::lsn::LSN::new(2),
+            schema_changes: vec![],
             table_changes: vec![TableChanges {
                 table_name: "users".into(),
                 columns: vec!["id".into(), "name".into()],
+                rowid_alias: Some("id".into()),
+                semantic_key_columns: vec![],
                 changes: vec![
                     RowChange::Insert {
                         rowid: 1,
@@ -454,10 +978,11 @@ mod tests {
                     },
                 ],
             }],
+            opaque_changes: vec![],
         };
 
         let sql = diff.to_sql();
-        assert!(sql.contains("INSERT INTO users VALUES"));
+        assert!(sql.contains("INSERT INTO users (rowid, name) VALUES (1, 'Alice')"));
         assert!(sql.contains("'Alice'"));
         assert!(sql.contains("'Bob'"));
         assert!(sql.contains("COMMIT"));
@@ -468,14 +993,18 @@ mod tests {
         let diff = RowLevelDiff {
             from_lsn: graft::core::lsn::LSN::new(1),
             to_lsn: graft::core::lsn::LSN::new(2),
+            schema_changes: vec![],
             table_changes: vec![TableChanges {
                 table_name: "users".into(),
                 columns: vec!["id".into(), "name".into()],
+                rowid_alias: Some("id".into()),
+                semantic_key_columns: vec![],
                 changes: vec![RowChange::Delete {
                     rowid: 1,
                     row: make_record(vec![Value::Integer(1), Value::Text("Alice".into())]),
                 }],
             }],
+            opaque_changes: vec![],
         };
 
         let sql = diff.to_sql();
@@ -487,21 +1016,26 @@ mod tests {
         let diff = RowLevelDiff {
             from_lsn: graft::core::lsn::LSN::new(1),
             to_lsn: graft::core::lsn::LSN::new(2),
+            schema_changes: vec![],
             table_changes: vec![TableChanges {
                 table_name: "users".into(),
                 columns: vec!["id".into(), "name".into()],
+                rowid_alias: Some("id".into()),
+                semantic_key_columns: vec![],
                 changes: vec![RowChange::Update {
                     rowid: 1,
                     old_row: make_record(vec![Value::Integer(1), Value::Text("Alice".into())]),
                     new_row: make_record(vec![Value::Integer(1), Value::Text("Alicia".into())]),
                 }],
             }],
+            opaque_changes: vec![],
         };
 
         let sql = diff.to_sql();
         assert!(sql.contains("UPDATE users SET"));
         assert!(sql.contains("'Alicia'"));
         assert!(sql.contains("rowid = 1"));
+        assert!(!sql.contains("SET id ="));
     }
 
     #[test]
@@ -509,7 +1043,9 @@ mod tests {
         let diff = RowLevelDiff {
             from_lsn: graft::core::lsn::LSN::new(1),
             to_lsn: graft::core::lsn::LSN::new(2),
+            schema_changes: vec![],
             table_changes: vec![],
+            opaque_changes: vec![],
         };
 
         let sql = diff.to_sql();
@@ -524,6 +1060,8 @@ mod tests {
         let tc = TableChanges {
             table_name: "orders".into(),
             columns: vec!["id".into(), "amount".into()],
+            rowid_alias: Some("id".into()),
+            semantic_key_columns: vec![],
             changes: vec![
                 RowChange::Insert {
                     rowid: 1,
@@ -550,9 +1088,29 @@ mod tests {
 
     #[test]
     fn test_sql_insert_format() {
-        let row = make_record(vec![Value::Integer(1), Value::Text("test".into())]);
-        let sql = format_sql_insert("users", &["id".into(), "name".into()], 1, &row);
-        assert_eq!(sql, "INSERT INTO users VALUES (1, 'test');");
+        let row = make_record(vec![Value::Null, Value::Text("test".into())]);
+        let sql = format_sql_insert(
+            "users",
+            &["id".into(), "name".into()],
+            Some("id"),
+            Some(7),
+            &row,
+        );
+        assert_eq!(sql, "INSERT INTO users (rowid, name) VALUES (7, 'test');");
+    }
+
+    #[test]
+    fn test_sql_insert_format_preserves_hidden_rowid() {
+        let row = make_record(vec![Value::Text("test".into())]);
+        let sql = format_sql_insert("users", &["name".into()], None, Some(7), &row);
+        assert_eq!(sql, "INSERT INTO users (rowid, name) VALUES (7, 'test');");
+    }
+
+    #[test]
+    fn test_sql_insert_format_can_omit_hidden_rowid() {
+        let row = make_record(vec![Value::Text("test".into())]);
+        let sql = format_sql_insert("users", &["name".into()], None, None, &row);
+        assert_eq!(sql, "INSERT INTO users (name) VALUES ('test');");
     }
 
     #[test]
@@ -563,11 +1121,11 @@ mod tests {
 
     #[test]
     fn test_sql_update_format() {
-        let row = make_record(vec![Value::Integer(1), Value::Text("new_name".into())]);
-        let sql = format_sql_update("users", &["id".into(), "name".into()], 1, &row);
+        let row = make_record(vec![Value::Null, Value::Text("new_name".into())]);
+        let sql = format_sql_update("users", &["id".into(), "name".into()], Some("id"), 1, &row);
         assert!(sql.contains("UPDATE users SET"));
-        assert!(sql.contains("id = 1"));
         assert!(sql.contains("name = 'new_name'"));
+        assert!(!sql.contains("SET id ="));
     }
 
     #[test]

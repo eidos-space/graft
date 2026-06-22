@@ -78,6 +78,10 @@ enum Command {
 
     /// Compare repository revisions, staged changes, or the worktree
     Diff {
+        /// Emit row-level changes for modified SQLite database snapshots
+        #[arg(long)]
+        rows: bool,
+
         /// Emit staged diff instead of worktree diff
         #[arg(long, alias = "cached")]
         staged: bool,
@@ -489,9 +493,15 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
                 Some(&message),
             )?);
         }
-        Command::Diff { staged, from, to, path, json } => {
+        Command::Diff { rows, staged, from, to, path, json } => {
             let suffix = if json { "json_diff" } else { "diff" };
-            let arg = repo_diff_arg(staged, from.as_deref(), to.as_deref(), path.as_deref())?;
+            let arg = repo_diff_arg(
+                rows,
+                staged,
+                from.as_deref(),
+                to.as_deref(),
+                path.as_deref(),
+            )?;
             print_output(run_repo_pragma(db_override, None, suffix, arg.as_deref())?);
         }
         Command::Show { rev, json } => {
@@ -887,30 +897,39 @@ fn resolve_cli_db(path: Option<&Path>) -> Result<PathBuf> {
 }
 
 fn repo_diff_arg(
+    rows: bool,
     staged: bool,
     from: Option<&str>,
     to: Option<&str>,
     path: Option<&Path>,
 ) -> Result<Option<String>> {
+    let rows_prefix = if rows { "--rows" } else { "" };
     if staged {
         if to.is_some() || path.is_some() {
             bail!("--staged accepts at most one optional path");
         }
-        return Ok(Some(match from {
-            Some(path) => format!("--staged -- {path}"),
-            None => "--staged".to_string(),
+        return Ok(Some(match (rows, from) {
+            (true, Some(path)) => format!("--rows --staged -- {path}"),
+            (true, None) => "--rows --staged".to_string(),
+            (false, Some(path)) => format!("--staged -- {path}"),
+            (false, None) => "--staged".to_string(),
         }));
     }
 
-    Ok(match (from, to, path) {
-        (None, None, None) => None,
-        (None, None, Some(path)) => Some(format!("-- {}", path.display())),
-        (Some(from), None, None) => Some(from.to_string()),
-        (Some(from), None, Some(path)) => Some(format!("{from} -- {}", path.display())),
-        (Some(from), Some(to), None) => Some(format!("{from} {to}")),
-        (Some(from), Some(to), Some(path)) => Some(format!("{from} {to} -- {}", path.display())),
+    let arg = match (from, to, path) {
+        (None, None, None) => rows.then(|| "--rows".to_string()),
+        (None, None, Some(path)) => Some(format!("{rows_prefix} -- {}", path.display())),
+        (Some(from), None, None) => Some(format!("{rows_prefix} {from}")),
+        (Some(from), None, Some(path)) => {
+            Some(format!("{rows_prefix} {from} -- {}", path.display()))
+        }
+        (Some(from), Some(to), None) => Some(format!("{rows_prefix} {from} {to}")),
+        (Some(from), Some(to), Some(path)) => {
+            Some(format!("{rows_prefix} {from} {to} -- {}", path.display()))
+        }
         (None, Some(_), _) => unreachable!("clap cannot provide `to` without `from`"),
-    })
+    };
+    Ok(arg.map(|arg| arg.trim_start().to_string()))
 }
 
 fn repo_reset_arg(rev: &str, soft: bool, mixed: bool, hard: bool) -> String {
@@ -1293,6 +1312,43 @@ mod tests {
             panic!("expected rm command");
         };
         assert_eq!(args.path, Some(PathBuf::from("external.db")));
+    }
+
+    #[test]
+    fn parses_diff_rows_and_builds_pragma_arg() {
+        let cli = Cli::try_parse_from([
+            "graft", "diff", "--rows", "--json", "HEAD~1", "HEAD", "app.db",
+        ])
+        .unwrap();
+
+        let Command::Diff { rows, staged, from, to, path, json } = cli.command else {
+            panic!("expected diff command");
+        };
+        assert!(rows);
+        assert!(!staged);
+        assert_eq!(from.as_deref(), Some("HEAD~1"));
+        assert_eq!(to.as_deref(), Some("HEAD"));
+        assert_eq!(path, Some(PathBuf::from("app.db")));
+        assert!(json);
+        assert_eq!(
+            repo_diff_arg(
+                rows,
+                staged,
+                from.as_deref(),
+                to.as_deref(),
+                path.as_deref()
+            )
+            .unwrap(),
+            Some("--rows HEAD~1 HEAD -- app.db".to_string())
+        );
+        assert_eq!(
+            repo_diff_arg(true, true, Some("app.db"), None, None).unwrap(),
+            Some("--rows --staged -- app.db".to_string())
+        );
+        assert_eq!(
+            repo_diff_arg(true, false, None, None, None).unwrap(),
+            Some("--rows".to_string())
+        );
     }
 
     #[test]
