@@ -33,6 +33,7 @@ rand = { workspace = true }
 range-set-blaze = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+serde_json = "1.0"
 splinter-rs = { workspace = true }
 static_assertions = { workspace = true }
 tempfile = { workspace = true }

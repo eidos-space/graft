@@ -23,6 +23,7 @@ enum_dispatch = { workspace = true }
 indoc = { workspace = true }
 itertools = { workspace = true }
 parking_lot = { workspace = true }
+rusqlite = { workspace = true }
 sqlite-plugin = { workspace = true, default-features = false }
 thiserror = { workspace = true }
 tracing = { workspace = true }
