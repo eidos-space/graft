@@ -18,7 +18,10 @@ use crate::{
     GraftErr, LogicalErr,
     remote::Remote,
     rt::{
-        action::{Action, FetchLog, FetchSegment, HydrateSnapshot, RemoteCommit, SnapshotPush},
+        action::{
+            Action, FetchLog, FetchSegment, HydrateSnapshot, RemoteCommit, SnapshotPush,
+            SnapshotsPush,
+        },
         task::{autosync::AutosyncTask, supervise},
     },
     snapshot::Snapshot,
@@ -371,6 +374,10 @@ impl Runtime {
 
     pub fn snapshot_push_to(&self, snapshot: Snapshot, remote: Arc<Remote>) -> Result<()> {
         self.run_action_with_remote(SnapshotPush { snapshot }, remote)
+    }
+
+    pub fn snapshots_push_to(&self, snapshots: Vec<Snapshot>, remote: Arc<Remote>) -> Result<()> {
+        self.run_action_with_remote(SnapshotsPush { snapshots }, remote)
     }
 
     pub fn snapshot_fetch_from(&self, snapshot: &Snapshot, remote: Arc<Remote>) -> Result<()> {

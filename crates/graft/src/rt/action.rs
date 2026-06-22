@@ -3,9 +3,9 @@ use std::{fmt::Debug, sync::Arc};
 use crate::{GraftErr, local::fjall_storage::FjallStorage, remote::Remote};
 
 macro_rules! action {
-    ($mod:tt, $action:ident) => {
+    ($mod:tt, $($action:ident),+ $(,)?) => {
         mod $mod;
-        pub use $mod::$action;
+        pub use $mod::{$($action),+};
     };
 }
 
@@ -13,7 +13,7 @@ action!(fetch_segment, FetchSegment);
 action!(fetch_log, FetchLog);
 action!(hydrate_snapshot, HydrateSnapshot);
 action!(remote_commit, RemoteCommit);
-action!(snapshot_push, SnapshotPush);
+action!(snapshot_push, SnapshotPush, SnapshotsPush);
 
 pub type Result<T> = std::result::Result<T, GraftErr>;
 

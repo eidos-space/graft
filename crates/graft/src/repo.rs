@@ -9,6 +9,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream};
 
 pub mod index;
@@ -50,6 +51,8 @@ const DIR_LOGS_REFS: &str = "logs/refs";
 const DIR_LOGS_HEAD: &str = "logs/HEAD";
 const SQLITE_DATABASE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
 const REMOTE_REF_READ_CONCURRENCY: usize = 5;
+const REMOTE_OBJECT_PACK_VERSION: u32 = 1;
+const REMOTE_OBJECT_PACK_MAGIC: &[u8] = b"graft-object-pack-v1\n";
 
 #[derive(Debug, Error)]
 pub enum RepoErr {
@@ -359,6 +362,54 @@ pub struct RemoteBranchRef {
     pub remote: String,
     pub branch: String,
     pub head: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteBranchHead {
+    pub raw: Option<Bytes>,
+    pub head: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RemoteObjectPackIndex {
+    version: u32,
+    pack: String,
+    objects: Vec<RemoteObjectPackEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RemoteObjectPackEntry {
+    id: object::ObjectId,
+    offset: u64,
+    len: u64,
+}
+
+#[derive(Debug, Default)]
+struct RemoteObjectPackCache {
+    indexes: Option<Vec<RemoteObjectPackIndex>>,
+    packs: BTreeMap<String, Bytes>,
+}
+
+impl RemoteObjectPackCache {
+    fn indexes(&mut self, remote: &crate::remote::Remote) -> Result<&[RemoteObjectPackIndex]> {
+        if self.indexes.is_none() {
+            self.indexes = Some(fetch_remote_object_pack_indexes(remote)?);
+        }
+        Ok(self.indexes.as_deref().expect("pack indexes initialized"))
+    }
+
+    fn pack_bytes(&mut self, remote: &crate::remote::Remote, pack: &str) -> Result<Bytes> {
+        if let Some(bytes) = self.packs.get(pack) {
+            return Ok(bytes.clone());
+        }
+        let bytes =
+            block_on_remote(remote.get_raw(pack))?.ok_or_else(|| RepoErr::InvalidRemoteObject {
+                path: pack.to_string(),
+                message: "missing pack object".to_string(),
+            })?;
+        self.packs.insert(pack.to_string(), bytes.clone());
+        Ok(bytes)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1420,14 +1471,27 @@ impl Repository {
     }
 
     pub fn remote_branch_head(&self, remote: &str, branch: &str) -> Result<Option<String>> {
+        Ok(self.remote_branch_head_state(remote, branch)?.head)
+    }
+
+    pub fn remote_branch_head_state(&self, remote: &str, branch: &str) -> Result<RemoteBranchHead> {
         validate_remote_name(remote)?;
         validate_ref_name(branch)?;
         let remote_store = self.remote_store(remote)?;
+        Self::remote_branch_head_from_store(&remote_store, branch)
+    }
+
+    fn remote_branch_head_from_store(
+        remote_store: &crate::remote::Remote,
+        branch: &str,
+    ) -> Result<RemoteBranchHead> {
         let head_path = format!("refs/heads/{branch}");
-        let Some(head) = block_on_remote(remote_store.get_raw(&head_path))? else {
-            return Ok(None);
-        };
-        Ok(Some(parse_remote_ref(&head_path, head)?))
+        let raw = block_on_remote(remote_store.get_raw(&head_path))?;
+        let head = raw
+            .as_ref()
+            .map(|bytes| parse_remote_ref(&head_path, bytes.clone()))
+            .transpose()?;
+        Ok(RemoteBranchHead { raw, head })
     }
 
     pub fn remote_prune(&self, remote: &str) -> Result<RemotePruneOutcome> {
@@ -1818,6 +1882,24 @@ impl Repository {
         remote_branch: &str,
         force: bool,
     ) -> Result<PushOutcome> {
+        let remote_head = self.remote_branch_head_state(remote, remote_branch)?;
+        self.push_branch_with_force_and_remote_head(
+            remote,
+            local_branch,
+            remote_branch,
+            force,
+            remote_head,
+        )
+    }
+
+    pub fn push_branch_with_force_and_remote_head(
+        &self,
+        remote: &str,
+        local_branch: &str,
+        remote_branch: &str,
+        force: bool,
+        remote_head: RemoteBranchHead,
+    ) -> Result<PushOutcome> {
         validate_remote_name(remote)?;
         validate_ref_name(local_branch)?;
         validate_ref_name(remote_branch)?;
@@ -1826,12 +1908,21 @@ impl Repository {
         };
 
         let remote_store = self.remote_store(remote)?;
-        let head_path = format!("refs/heads/{remote_branch}");
-        let remote_head_raw = block_on_remote(remote_store.get_raw(&head_path))?;
-        let remote_head = remote_head_raw
-            .as_ref()
-            .map(|bytes| parse_remote_ref(&head_path, bytes.clone()))
-            .transpose()?;
+        let RemoteBranchHead { raw: remote_head_raw, head: remote_head } = remote_head;
+        let remote_branch_existed = remote_head_raw.is_some();
+
+        if remote_head.as_deref() == Some(head.as_str()) {
+            self.set_remote_tracking_ref(remote, remote_branch, &head)?;
+            return Ok(PushOutcome {
+                remote: remote.to_string(),
+                local_branch: local_branch.to_string(),
+                remote_branch: remote_branch.to_string(),
+                head,
+                commits: 0,
+                forced: force,
+                deleted: false,
+            });
+        }
 
         if let Some(remote_head) = &remote_head
             && !force
@@ -1845,6 +1936,7 @@ impl Repository {
         }
 
         let commits = self.push_commit_chain(&remote_store, &head, remote_head.as_deref())?;
+        let head_path = format!("refs/heads/{remote_branch}");
         match block_on_remote(remote_store.compare_and_swap_raw(
             &head_path,
             remote_head_raw.as_deref(),
@@ -1859,7 +1951,9 @@ impl Repository {
             }
             Err(err) => return Err(err),
         }
-        self.set_remote_head_if_absent(&remote_store, remote_branch)?;
+        if !remote_branch_existed {
+            self.set_remote_head_if_absent(&remote_store, remote_branch)?;
+        }
         self.set_remote_tracking_ref(remote, remote_branch, &head)?;
 
         Ok(PushOutcome {
@@ -2366,21 +2460,56 @@ impl Repository {
 
     pub fn log(&self) -> Result<Vec<CommitObject>> {
         let mut commits = vec![];
-        let mut stack = self.head_target()?.into_iter().collect::<Vec<_>>();
-        let mut seen = BTreeMap::<String, ()>::new();
+        let mut frontier = self.head_target()?.into_iter().collect::<Vec<_>>();
+        let mut seen = BTreeSet::<String>::new();
+        let mut cache = BTreeMap::<String, CommitObject>::new();
 
-        while let Some(id) = stack.pop() {
-            if seen.insert(id.clone(), ()).is_some() {
+        while let Some((idx, id)) = self.next_log_frontier_commit(&frontier, &seen, &mut cache)? {
+            frontier.remove(idx);
+            if !seen.insert(id.clone()) {
                 continue;
             }
-            let commit = self.read_commit(&id)?;
-            for parent in commit_parent_ids(&commit).into_iter().rev() {
-                stack.push(parent);
+            let commit = cache
+                .remove(&id)
+                .unwrap_or_else(|| unreachable!("commit was cached"));
+            for parent in commit_parent_ids(&commit) {
+                if !seen.contains(&parent) {
+                    frontier.push(parent);
+                }
             }
             commits.push(commit);
         }
 
         Ok(commits)
+    }
+
+    fn next_log_frontier_commit(
+        &self,
+        frontier: &[String],
+        seen: &BTreeSet<String>,
+        cache: &mut BTreeMap<String, CommitObject>,
+    ) -> Result<Option<(usize, String)>> {
+        let mut selected = None;
+        let mut selected_timestamp = 0;
+
+        for (idx, id) in frontier.iter().enumerate() {
+            if seen.contains(id) {
+                continue;
+            }
+            if !cache.contains_key(id) {
+                cache.insert(id.clone(), self.read_commit(id)?);
+            }
+            let timestamp = cache
+                .get(id)
+                .map(|commit| commit.timestamp_ms)
+                .unwrap_or_default();
+            if selected.is_none() || timestamp > selected_timestamp {
+                selected = Some((idx, id.clone()));
+                selected_timestamp = timestamp;
+            }
+        }
+
+        Ok(selected)
     }
 
     pub fn resolve_revision(&self, rev: &str) -> Result<String> {
@@ -3296,23 +3425,83 @@ impl Repository {
             return Ok(());
         }
 
-        match block_on_remote(remote_store.compare_and_swap_raw(
-            HEAD_FILE,
-            None,
-            Head::branch(branch).serialize(),
-        )) {
+        match block_on_remote(
+            remote_store.put_raw_if_not_exists(HEAD_FILE, Head::branch(branch).serialize()),
+        ) {
             Ok(()) => Ok(()),
-            Err(RepoErr::Remote(RemoteErr::CompareAndSwap { .. } | RemoteErr::LockBusy { .. })) => {
-                Ok(())
-            }
+            Err(RepoErr::Remote(err)) if err.precondition_failed() => Ok(()),
             Err(err) => Err(err),
         }
+    }
+
+    fn remote_object_ids(
+        &self,
+        remote: &crate::remote::Remote,
+    ) -> Result<BTreeSet<object::ObjectId>> {
+        let mut objects = BTreeSet::new();
+        for path in block_on_remote(remote.list_raw(DIR_OBJECTS))? {
+            if let Some(id) = remote_loose_object_id(&path)? {
+                objects.insert(id);
+            }
+        }
+
+        for index in fetch_remote_object_pack_indexes(remote)? {
+            for entry in index.objects {
+                objects.insert(entry.id);
+            }
+        }
+
+        Ok(objects)
+    }
+
+    fn fetch_packed_object_bytes(
+        &self,
+        remote: &crate::remote::Remote,
+        id: &object::ObjectId,
+        pack_cache: &mut RemoteObjectPackCache,
+    ) -> Result<Bytes> {
+        let hit = pack_cache.indexes(remote)?.iter().find_map(|index| {
+            index
+                .objects
+                .iter()
+                .find(|entry| &entry.id == id)
+                .map(|entry| (index.pack.clone(), entry.offset, entry.len))
+        });
+        let Some((pack, offset, len)) = hit else {
+            return Err(RepoErr::InvalidRemoteObject {
+                path: object::LooseObjectStore::relative_path(id),
+                message: "missing object".to_string(),
+            });
+        };
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| RepoErr::InvalidRemoteObject {
+                path: pack.clone(),
+                message: format!("pack entry for object {id} overflows u64 range"),
+            })?;
+        let pack_bytes = pack_cache.pack_bytes(remote, &pack)?;
+        let offset = usize::try_from(offset).map_err(|_| RepoErr::InvalidRemoteObject {
+            path: pack.clone(),
+            message: format!("pack entry for object {id} offset does not fit in usize"),
+        })?;
+        let end = usize::try_from(end).map_err(|_| RepoErr::InvalidRemoteObject {
+            path: pack.clone(),
+            message: format!("pack entry for object {id} end does not fit in usize"),
+        })?;
+        if end > pack_bytes.len() {
+            return Err(RepoErr::InvalidRemoteObject {
+                path: pack,
+                message: format!("pack entry for object {id} extends past pack length"),
+            });
+        }
+        Ok(pack_bytes.slice(offset..end))
     }
 
     fn fetch_commit_chain(&self, remote: &crate::remote::Remote, head: &str) -> Result<usize> {
         let mut count = 0;
         let mut stack = vec![head.to_string()];
         let mut seen = BTreeMap::<String, ()>::new();
+        let mut pack_cache = RemoteObjectPackCache::default();
         while let Some(id) = stack.pop() {
             if seen.insert(id.clone(), ()).is_some() {
                 continue;
@@ -3322,7 +3511,7 @@ impl Repository {
             let commit = match self.read_commit_object(&object_id)? {
                 Some(commit) => commit,
                 None => {
-                    let object = self.fetch_loose_object(remote, &object_id)?;
+                    let object = self.fetch_remote_object(remote, &object_id, &mut pack_cache)?;
                     let object::Object::Commit(commit) = object else {
                         return Err(RepoErr::InvalidRemoteObject {
                             path: object::LooseObjectStore::relative_path(&object_id),
@@ -3334,7 +3523,7 @@ impl Repository {
                 }
             };
 
-            self.fetch_object_graph(remote, &commit.tree)?;
+            self.fetch_object_graph(remote, &commit.tree, &mut pack_cache)?;
             for parent in commit.parents {
                 stack.push(parent.to_string());
             }
@@ -3348,95 +3537,91 @@ impl Repository {
         head: &str,
         stop_at: Option<&str>,
     ) -> Result<usize> {
-        let mut commits = vec![];
+        let remote_objects = if stop_at.is_some() {
+            BTreeSet::new()
+        } else {
+            self.remote_object_ids(remote)?
+        };
+        let stop_commits = stop_at
+            .map(|id| self.commit_ancestors_inclusive(id))
+            .transpose()?
+            .unwrap_or_default();
+        let mut commits = Vec::new();
+        let mut objects = BTreeMap::<object::ObjectId, Vec<u8>>::new();
         let mut stack = vec![head.to_string()];
         let mut seen = BTreeMap::<String, ()>::new();
         while let Some(id) = stack.pop() {
             if seen.insert(id.clone(), ()).is_some() {
                 continue;
             }
-            if stop_at == Some(id.as_str()) {
+            if stop_commits.contains(&id) {
                 continue;
             }
             let object_id = object::ObjectId::from_str(&id)?;
-            let path = object::LooseObjectStore::relative_path(&object_id);
-            if block_on_remote(remote.get_raw(&path))?.is_some() {
+            if remote_objects.contains(&object_id) {
                 continue;
             }
 
-            let commit = self
-                .read_commit_object(&object_id)?
-                .ok_or_else(|| RepoErr::CommitNotFound(id.clone()))?;
+            let Some(bytes) = self.object_store().read_raw(&object_id)? else {
+                return Err(RepoErr::CommitNotFound(id.clone()));
+            };
+            let object = object::Object::decode(&bytes)?;
+            let actual = object.id();
+            if actual != object_id {
+                return Err(RepoErr::Object(object::ObjectErr::ObjectIdMismatch {
+                    expected: object_id,
+                    actual,
+                }));
+            }
+            let object::Object::Commit(commit) = object else {
+                return Err(RepoErr::Object(object::ObjectErr::InvalidObject {
+                    kind: "commit",
+                    message: format!("object {id} is not a commit"),
+                }));
+            };
+            let commit_id = object::ObjectId::from_str(&id)?;
+            objects.insert(commit_id.clone(), bytes);
+            self.collect_object_graph_for_pack(&commit.tree, &remote_objects, &mut objects)?;
             for parent in &commit.parents {
                 stack.push(parent.to_string());
             }
-            commits.push(object_id);
+            commits.push(commit_id);
         }
 
         let count = commits.len();
-        for id in commits.into_iter().rev() {
-            self.push_object_graph(remote, &id)?;
-        }
+        self.push_object_pack(remote, objects)?;
         Ok(count)
     }
 
-    fn fetch_object_graph(
-        &self,
-        remote: &crate::remote::Remote,
-        id: &object::ObjectId,
-    ) -> Result<()> {
-        let object = match self.object_store().read_raw(id)? {
-            Some(bytes) => {
-                let object = object::Object::decode(&bytes)?;
-                let actual = object.id();
-                if actual != *id {
-                    return Err(RepoErr::Object(object::ObjectErr::ObjectIdMismatch {
-                        expected: id.clone(),
-                        actual,
-                    }));
-                }
-                object
+    fn commit_ancestors_inclusive(&self, head: &str) -> Result<BTreeSet<String>> {
+        let mut ancestors = BTreeSet::new();
+        let mut stack = vec![head.to_string()];
+        while let Some(id) = stack.pop() {
+            if !ancestors.insert(id.clone()) {
+                continue;
             }
-            None => self.fetch_loose_object(remote, id)?,
-        };
-
-        match object {
-            object::Object::Commit(commit) => {
-                self.fetch_object_graph(remote, &commit.tree)?;
-                for parent in commit.parents {
-                    self.fetch_object_graph(remote, &parent)?;
-                }
+            let commit = match self.read_commit(&id) {
+                Ok(commit) => commit,
+                Err(RepoErr::CommitNotFound(_)) => continue,
+                Err(err) => return Err(err),
+            };
+            for parent in commit_parent_ids(&commit) {
+                stack.push(parent);
             }
-            object::Object::Tree(tree) => {
-                for entry in tree.entries {
-                    self.fetch_object_graph(remote, &entry.oid)?;
-                }
-            }
-            object::Object::Blob(_) | object::Object::Tag(_) => {}
         }
-        Ok(())
+        Ok(ancestors)
     }
 
-    fn fetch_loose_object(
+    fn collect_object_graph_for_pack(
         &self,
-        remote: &crate::remote::Remote,
         id: &object::ObjectId,
-    ) -> Result<object::Object> {
-        let path = object::LooseObjectStore::relative_path(id);
-        let Some(bytes) = block_on_remote(remote.get_raw(&path))? else {
-            return Err(RepoErr::InvalidRemoteObject {
-                path,
-                message: "missing object".to_string(),
-            });
-        };
-        Ok(self.object_store().write_raw_validated(id, &bytes)?)
-    }
-
-    fn push_object_graph(
-        &self,
-        remote: &crate::remote::Remote,
-        id: &object::ObjectId,
+        remote_objects: &BTreeSet<object::ObjectId>,
+        objects: &mut BTreeMap<object::ObjectId, Vec<u8>>,
     ) -> Result<()> {
+        if remote_objects.contains(id) || objects.contains_key(id) {
+            return Ok(());
+        }
+
         let Some(bytes) = self.object_store().read_raw(id)? else {
             return Err(RepoErr::Object(object::ObjectErr::InvalidObject {
                 kind: "object",
@@ -3452,34 +3637,116 @@ impl Repository {
             }));
         }
 
-        let path = object::LooseObjectStore::relative_path(id);
-        if matches!(object, object::Object::Commit(_) | object::Object::Tree(_))
-            && block_on_remote(remote.get_raw(&path))?.is_some()
-        {
-            return Ok(());
-        }
-
-        match &object {
+        objects.insert(id.clone(), bytes);
+        match object {
             object::Object::Commit(commit) => {
-                self.push_object_graph(remote, &commit.tree)?;
-                for parent in &commit.parents {
-                    self.push_object_graph(remote, parent)?;
-                }
+                self.collect_object_graph_for_pack(&commit.tree, remote_objects, objects)?;
             }
             object::Object::Tree(tree) => {
-                for entry in &tree.entries {
-                    self.push_object_graph(remote, &entry.oid)?;
+                for entry in tree.entries {
+                    self.collect_object_graph_for_pack(&entry.oid, remote_objects, objects)?;
                 }
             }
             object::Object::Blob(_) | object::Object::Tag(_) => {}
         }
+        Ok(())
+    }
 
-        match block_on_remote(remote.put_raw_if_not_exists(&path, bytes)) {
+    fn push_object_pack(
+        &self,
+        remote: &crate::remote::Remote,
+        objects: BTreeMap<object::ObjectId, Vec<u8>>,
+    ) -> Result<()> {
+        if objects.is_empty() {
+            return Ok(());
+        }
+
+        let mut pack = REMOTE_OBJECT_PACK_MAGIC.to_vec();
+        let mut entries = Vec::with_capacity(objects.len());
+        for (id, bytes) in objects {
+            let offset = pack.len() as u64;
+            let len = bytes.len() as u64;
+            pack.extend_from_slice(&bytes);
+            entries.push(RemoteObjectPackEntry { id, offset, len });
+        }
+
+        let pack_id = blake3::hash(&pack).to_hex().to_string();
+        let pack_path = format!("{DIR_OBJECTS_PACK}/{pack_id}.pack");
+        let index_path = format!("{DIR_OBJECTS_PACK}/{pack_id}.idx");
+        let index = RemoteObjectPackIndex {
+            version: REMOTE_OBJECT_PACK_VERSION,
+            pack: pack_path.clone(),
+            objects: entries,
+        };
+        let index_bytes =
+            serde_json::to_vec(&index).map_err(|err| RepoErr::InvalidRemoteObject {
+                path: index_path.clone(),
+                message: format!("failed to encode pack index: {err}"),
+            })?;
+
+        match block_on_remote(remote.put_raw_if_not_exists(&pack_path, pack)) {
+            Ok(()) => {}
+            Err(RepoErr::Remote(err)) if err.precondition_failed() => {}
+            Err(err) => return Err(err),
+        }
+        match block_on_remote(remote.put_raw_if_not_exists(&index_path, index_bytes)) {
             Ok(()) => {}
             Err(RepoErr::Remote(err)) if err.precondition_failed() => {}
             Err(err) => return Err(err),
         }
         Ok(())
+    }
+
+    fn fetch_object_graph(
+        &self,
+        remote: &crate::remote::Remote,
+        id: &object::ObjectId,
+        pack_cache: &mut RemoteObjectPackCache,
+    ) -> Result<()> {
+        let object = match self.object_store().read_raw(id)? {
+            Some(bytes) => {
+                let object = object::Object::decode(&bytes)?;
+                let actual = object.id();
+                if actual != *id {
+                    return Err(RepoErr::Object(object::ObjectErr::ObjectIdMismatch {
+                        expected: id.clone(),
+                        actual,
+                    }));
+                }
+                object
+            }
+            None => self.fetch_remote_object(remote, id, pack_cache)?,
+        };
+
+        match object {
+            object::Object::Commit(commit) => {
+                self.fetch_object_graph(remote, &commit.tree, pack_cache)?;
+                for parent in commit.parents {
+                    self.fetch_object_graph(remote, &parent, pack_cache)?;
+                }
+            }
+            object::Object::Tree(tree) => {
+                for entry in tree.entries {
+                    self.fetch_object_graph(remote, &entry.oid, pack_cache)?;
+                }
+            }
+            object::Object::Blob(_) | object::Object::Tag(_) => {}
+        }
+        Ok(())
+    }
+
+    fn fetch_remote_object(
+        &self,
+        remote: &crate::remote::Remote,
+        id: &object::ObjectId,
+        pack_cache: &mut RemoteObjectPackCache,
+    ) -> Result<object::Object> {
+        let path = object::LooseObjectStore::relative_path(id);
+        let bytes = match block_on_remote(remote.get_raw(&path))? {
+            Some(bytes) => bytes,
+            None => self.fetch_packed_object_bytes(remote, id, pack_cache)?,
+        };
+        Ok(self.object_store().write_raw_validated(id, &bytes)?)
     }
 
     fn write_tree_object(
@@ -4523,6 +4790,91 @@ fn parse_remote_ref(path: &str, bytes: bytes::Bytes) -> Result<String> {
         });
     }
     Ok(target.to_string())
+}
+
+fn remote_loose_object_id(path: &str) -> Result<Option<object::ObjectId>> {
+    let Some(rest) = path.strip_prefix("objects/") else {
+        return Ok(None);
+    };
+    if rest.starts_with("pack/") {
+        return Ok(None);
+    }
+    let Some((fanout, suffix)) = rest.split_once('/') else {
+        return Ok(None);
+    };
+    if fanout.len() != 2 || suffix.len() != 62 || suffix.contains('/') {
+        return Ok(None);
+    }
+    let id = format!("{fanout}{suffix}");
+    if !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Ok(None);
+    }
+    Ok(Some(object::ObjectId::from_str(&id)?))
+}
+
+fn fetch_remote_object_pack_indexes(
+    remote: &crate::remote::Remote,
+) -> Result<Vec<RemoteObjectPackIndex>> {
+    let mut indexes = Vec::new();
+    for path in block_on_remote(remote.list_raw(DIR_OBJECTS_PACK))? {
+        if !path.ends_with(".idx") {
+            continue;
+        }
+        let Some(bytes) = block_on_remote(remote.get_raw(&path))? else {
+            continue;
+        };
+        indexes.push(decode_remote_object_pack_index(&path, &bytes)?);
+    }
+    Ok(indexes)
+}
+
+fn decode_remote_object_pack_index(path: &str, bytes: &[u8]) -> Result<RemoteObjectPackIndex> {
+    let index: RemoteObjectPackIndex =
+        serde_json::from_slice(bytes).map_err(|err| RepoErr::InvalidRemoteObject {
+            path: path.to_string(),
+            message: format!("invalid pack index JSON: {err}"),
+        })?;
+    if index.version != REMOTE_OBJECT_PACK_VERSION {
+        return Err(RepoErr::InvalidRemoteObject {
+            path: path.to_string(),
+            message: format!(
+                "unsupported pack index version {}; expected {}",
+                index.version, REMOTE_OBJECT_PACK_VERSION
+            ),
+        });
+    }
+    if !index.pack.starts_with(&format!("{DIR_OBJECTS_PACK}/")) || !index.pack.ends_with(".pack") {
+        return Err(RepoErr::InvalidRemoteObject {
+            path: path.to_string(),
+            message: format!("pack path `{}` is outside {DIR_OBJECTS_PACK}", index.pack),
+        });
+    }
+    let min_offset = REMOTE_OBJECT_PACK_MAGIC.len() as u64;
+    for entry in &index.objects {
+        if entry.len == 0 {
+            return Err(RepoErr::InvalidRemoteObject {
+                path: path.to_string(),
+                message: format!("pack entry for object {} is empty", entry.id),
+            });
+        }
+        if entry.offset < min_offset {
+            return Err(RepoErr::InvalidRemoteObject {
+                path: path.to_string(),
+                message: format!(
+                    "pack entry for object {} starts inside pack header",
+                    entry.id
+                ),
+            });
+        }
+        entry
+            .offset
+            .checked_add(entry.len)
+            .ok_or_else(|| RepoErr::InvalidRemoteObject {
+                path: path.to_string(),
+                message: format!("pack entry for object {} overflows u64 range", entry.id),
+            })?;
+    }
+    Ok(index)
 }
 
 fn parse_remote_head_branch(path: &str, bytes: bytes::Bytes) -> Result<Option<String>> {
@@ -6439,10 +6791,10 @@ mod tests {
             .into_iter()
             .map(|commit| commit.id)
             .collect();
-        assert!(log_ids.contains(&merge_commit.id));
-        assert!(log_ids.contains(&main.id));
-        assert!(log_ids.contains(&feature.id));
-        assert!(log_ids.contains(&base_commit.id));
+        assert_eq!(
+            log_ids,
+            vec![merge_commit.id.clone(), main.id, feature.id, base_commit.id]
+        );
         let object::Object::Commit(commit_object) = repo.read_object(&merge_commit.id).unwrap()
         else {
             panic!("merge commit id should point at a commit object");
@@ -6556,11 +6908,26 @@ mod tests {
         );
         let second_oid = object::ObjectId::from_str(&second.id).unwrap();
         assert!(
-            remote_dir
+            !remote_dir
                 .path()
                 .join(object::LooseObjectStore::relative_path(&second_oid))
                 .is_file()
         );
+        let pack_dir = remote_dir.path().join(DIR_OBJECTS_PACK);
+        assert!(fs::read_dir(&pack_dir).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == "pack")
+        }));
+        assert!(fs::read_dir(&pack_dir).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == "idx")
+        }));
         assert!(!remote_dir.path().join("objects/commits").exists());
 
         let clone_dir = tempfile::tempdir().unwrap();
@@ -6582,6 +6949,7 @@ mod tests {
             clone.read_commit(&second.id).unwrap().parent,
             Some(first.id)
         );
+        assert!(clone.object_store().path_for(&second_oid).is_file());
         let object::Object::Commit(commit_object) = clone.read_object(&second.id).unwrap() else {
             panic!("fetch should hydrate canonical commit object");
         };
@@ -6590,6 +6958,35 @@ mod tests {
             panic!("fetch should hydrate canonical tree object");
         };
         assert!(!clone.graft_dir().join("objects/commits").exists());
+    }
+
+    #[test]
+    fn push_noop_skips_remote_ref_lock() {
+        let remote_dir = tempfile::tempdir().unwrap();
+        let remote = RemoteConfig::Fs {
+            root: remote_dir.path().to_string_lossy().into_owned(),
+        };
+
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = Repository::init(source_dir.path()).unwrap();
+        source.remote_add("origin", remote).unwrap();
+        let commit = source.commit("initial database").unwrap();
+
+        let first = source.push("origin", "main").unwrap();
+        assert_eq!(first.head, commit.id);
+        assert_eq!(first.commits, 1);
+
+        let lock_path = remote_dir.path().join("locks/refs/heads/main.lock");
+        fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        fs::write(&lock_path, "held\n").unwrap();
+
+        let second = source.push("origin", "main").unwrap();
+        assert_eq!(second.head, commit.id);
+        assert_eq!(second.commits, 0);
+        assert_eq!(
+            source.remote_tracking_ref("origin", "main").unwrap(),
+            Some(commit.id)
+        );
     }
 
     #[test]

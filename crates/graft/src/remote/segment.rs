@@ -42,6 +42,9 @@ pub struct SegmentBuilder {
 
     /// the active chunk
     chunk: Vec<u8>,
+
+    /// whether compressed chunks should be retained by `finish`
+    keep_chunks: bool,
 }
 
 impl Default for SegmentBuilder {
@@ -68,12 +71,20 @@ impl SegmentBuilder {
             current_frame_pages: PageCount::ZERO,
             current_frame_bytes: 0,
             chunk: Vec::with_capacity(CCtx::out_size()),
+            keep_chunks: true,
         }
+    }
+
+    pub fn discard_chunks(mut self) -> Self {
+        self.keep_chunks = false;
+        self
     }
 
     fn flush_chunk(&mut self) {
         let chunk = std::mem::replace(&mut self.chunk, Vec::with_capacity(CCtx::out_size()));
-        self.chunks.push(chunk.into());
+        if self.keep_chunks {
+            self.chunks.push(chunk.into());
+        }
     }
 
     pub fn write(&mut self, pageidx: PageIdx, page: &Page) {
@@ -152,10 +163,12 @@ impl SegmentBuilder {
             self.end_frame();
         }
 
-        let Self { mut chunks, chunk, frames, .. } = self;
+        let Self {
+            mut chunks, chunk, frames, keep_chunks, ..
+        } = self;
 
         // flush the last chunk if it's non-empty
-        if !chunk.is_empty() {
+        if keep_chunks && !chunk.is_empty() {
             chunks.push(chunk.into());
         }
 
@@ -198,6 +211,21 @@ mod test {
         let (frames, chunks) = segment.finish();
         assert_eq!(frames.len(), 0);
         assert_eq!(chunks.len(), 0);
+    }
+
+    #[test]
+    fn test_segment_discard_chunks_keeps_frame_index() {
+        let mut segment = SegmentBuilder::new().discard_chunks();
+
+        for i in 1..=96 {
+            segment.write(PageIdx::must_new(i), &Page::test_filled(i as u8));
+        }
+
+        let (frames, chunks) = segment.finish();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].last_pageidx(), pageidx!(64));
+        assert_eq!(frames[1].last_pageidx(), pageidx!(96));
+        assert!(chunks.is_empty());
     }
 
     #[test]

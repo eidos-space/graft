@@ -226,19 +226,40 @@ impl Remote {
         chunks: I,
     ) -> Result<()> {
         let path = RemotePath::Segment(sid).build();
-        let mut w = self
-            .store
-            .writer_with(&path)
-            .concurrent(REMOTE_CONCURRENCY)
-            .await?;
-        let mut size = 0;
-        for chunk in chunks {
-            size += chunk.len();
-            w.write(chunk).await?;
+        let result: std::result::Result<(), opendal::Error> = async {
+            let mut w = self
+                .store
+                .writer_with(&path)
+                .if_not_exists(true)
+                .concurrent(REMOTE_CONCURRENCY)
+                .await?;
+            let mut size = 0;
+            for chunk in chunks {
+                size += chunk.len();
+                w.write(chunk).await?;
+            }
+            tracing::Span::current().record("size", size);
+            w.close().await?;
+            Ok(())
         }
-        tracing::Span::current().record("size", size);
-        w.close().await?;
-        Ok(())
+        .await;
+
+        match result {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == ErrorKind::ConditionNotMatch => Ok(()),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    /// Returns true if a segment already exists on this Remote.
+    #[tracing::instrument(level = "trace", err(level = "debug"), skip(self))]
+    pub async fn has_segment(&self, sid: &SegmentId) -> Result<bool> {
+        let path = RemotePath::Segment(sid).build();
+        match self.store.stat(&path).await {
+            Ok(_) => Ok(true),
+            Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(err.into()),
+        }
     }
 
     /// Reads a byte range of a segment
@@ -266,6 +287,22 @@ impl Remote {
             Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
             Err(err) => Err(err.into()),
         }
+    }
+
+    #[tracing::instrument(level = "trace", err(level = "debug"), skip(self))]
+    pub async fn get_raw_range(&self, path: &str, bytes: Range<u64>) -> Result<Bytes> {
+        let buffer = self
+            .store
+            .read_options(
+                path,
+                ReadOptions {
+                    range: bytes.into(),
+                    concurrent: REMOTE_CONCURRENCY,
+                    ..ReadOptions::default()
+                },
+            )
+            .await?;
+        Ok(buffer.to_bytes())
     }
 
     #[tracing::instrument(level = "trace", err(level = "debug"), skip(self))]
