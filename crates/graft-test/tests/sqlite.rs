@@ -2077,7 +2077,7 @@ fn test_repo_checkout_rejects_snapshot_missing_commit_hash() {
 }
 
 #[test]
-fn test_repo_push_rejects_snapshot_commit_hash_mismatch_before_remote_ref_update() {
+fn test_repo_push_rejects_snapshot_missing_commit_hash_before_remote_ref_update() {
     graft_test::ensure_test_env();
 
     let temp_dir = tempfile::tempdir().unwrap();
@@ -2110,7 +2110,7 @@ fn test_repo_push_rejects_snapshot_commit_hash_mismatch_before_remote_ref_update
 
     let repo = graft::repo::Repository::discover_for_file(&db_path).unwrap();
     let head = repo.resolve_revision("HEAD").unwrap();
-    let tampered = tamper_sqlite_snapshot_range_hash(&repo, &head, "app.db");
+    let tampered = remove_sqlite_snapshot_range_hash(&repo, &head, "app.db");
     std::fs::write(
         repo.graft_dir().join("refs/heads/main"),
         format!("{tampered}\n"),
@@ -2119,13 +2119,72 @@ fn test_repo_push_rejects_snapshot_commit_hash_mismatch_before_remote_ref_update
 
     let err = pragma_arg_error(&sqlite, "graft_push", "origin main");
     assert!(
-        err.contains("snapshot storage commit hash mismatch"),
-        "expected snapshot hash mismatch, got: {err}"
+        err.contains("invalid blob object")
+            && err.contains("storage commit hashes")
+            && err.contains("expected"),
+        "expected invalid snapshot hash object error, got: {err}"
     );
     assert!(
         !remote_dir.join("refs/heads/main").exists(),
         "hash mismatch should fail before updating the remote branch ref"
     );
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_push_accepts_hydrated_snapshot_commit_hash_mismatch() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let remote_dir = temp_dir.path().join("remote");
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+    assert!(
+        pragma_arg_string(
+            &sqlite,
+            "graft_remote_add",
+            format!("origin fs://{}", remote_dir.display()),
+        )
+        .contains("origin")
+    );
+
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE repo_push_hash_mismatch (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+            INSERT INTO repo_push_hash_mismatch (name) VALUES ('Alice');
+            "#,
+        )
+        .unwrap();
+    assert_eq!(pragma_query_string(&sqlite, "graft_add"), "Added app.db");
+    assert!(
+        pragma_arg_string(&sqlite, "graft_commit", "hash normalized").contains("hash normalized")
+    );
+
+    let repo = graft::repo::Repository::discover_for_file(&db_path).unwrap();
+    let head = repo.resolve_revision("HEAD").unwrap();
+    let tampered = tamper_sqlite_snapshot_range_hash(&repo, &head, "app.db");
+    std::fs::write(
+        repo.graft_dir().join("refs/heads/main"),
+        format!("{tampered}\n"),
+    )
+    .unwrap();
+
+    let push = pragma_arg_string(&sqlite, "graft_push", "origin main");
+    assert!(
+        push.contains("origin/main"),
+        "snapshot hash mismatch should be normalized from hydrated storage during push: {push}"
+    );
+    let remote_head = std::fs::read_to_string(remote_dir.join("refs/heads/main"))
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(remote_head, tampered);
 
     runtime.shutdown().unwrap();
 }
@@ -2256,6 +2315,126 @@ fn test_repo_pull_accepts_hydrated_remote_snapshot_commit_hash_mismatch() {
         .collect::<rusqlite::Result<_>>()
         .unwrap();
     assert_eq!(reset_names, vec!["Alice".to_string(), "Bob".to_string()]);
+
+    clone_runtime.shutdown().unwrap();
+    source_runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_push_after_resolving_pulled_row_conflict_with_hydrated_hash_mismatch() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let remote_dir = temp_dir.path().join("remote");
+    let source_db = temp_dir.path().join("source/app.db");
+    let clone_db = temp_dir.path().join("clone/app.db");
+    std::fs::create_dir_all(source_db.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(clone_db.parent().unwrap()).unwrap();
+
+    let mut source_runtime = GraftTestRuntime::with_memory_remote();
+    let source = source_runtime.open_sqlite(source_db.to_str().unwrap(), None);
+    let mut clone_runtime = GraftTestRuntime::with_memory_remote();
+    let clone = clone_runtime.open_sqlite(clone_db.to_str().unwrap(), None);
+
+    assert!(pragma_query_string(&source, "graft_init").contains(".graft"));
+    assert!(pragma_query_string(&clone, "graft_init").contains(".graft"));
+    assert!(
+        pragma_arg_string(
+            &source,
+            "graft_remote_add",
+            format!("origin fs://{}", remote_dir.display()),
+        )
+        .contains("origin")
+    );
+    assert!(
+        pragma_arg_string(
+            &clone,
+            "graft_remote_add",
+            format!("origin fs://{}", remote_dir.display()),
+        )
+        .contains("origin")
+    );
+
+    source
+        .execute_batch(
+            r#"
+            CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT NOT NULL);
+            INSERT INTO docs (id, body) VALUES (1, 'base');
+            "#,
+        )
+        .unwrap();
+    assert_eq!(pragma_query_string(&source, "graft_add"), "Added app.db");
+    assert!(pragma_arg_string(&source, "graft_commit", "base doc").contains("base doc"));
+    assert!(pragma_arg_string(&source, "graft_push", "origin main").contains("origin/main"));
+
+    let first_pull = pragma_arg_string(&clone, "graft_pull", "origin main");
+    assert!(first_pull.contains("Fast-forwarded main"));
+
+    source
+        .execute("UPDATE docs SET body = 'theirs' WHERE id = 1", [])
+        .unwrap();
+    assert_eq!(pragma_query_string(&source, "graft_add"), "Added app.db");
+    assert!(pragma_arg_string(&source, "graft_commit", "remote edit").contains("remote edit"));
+    assert!(pragma_arg_string(&source, "graft_push", "origin main").contains("origin/main"));
+
+    let source_repo = graft::repo::Repository::discover_for_file(&source_db).unwrap();
+    let remote_head = std::fs::read_to_string(remote_dir.join("refs/heads/main"))
+        .unwrap()
+        .trim()
+        .to_string();
+    let tampered = tamper_sqlite_snapshot_range_hash(&source_repo, &remote_head, "app.db");
+    write_remote_object_pack_for_commit(&remote_dir, &source_repo, &tampered);
+    std::fs::write(remote_dir.join("refs/heads/main"), format!("{tampered}\n")).unwrap();
+
+    clone
+        .execute("UPDATE docs SET body = 'ours' WHERE id = 1", [])
+        .unwrap();
+    assert_eq!(pragma_query_string(&clone, "graft_add"), "Added app.db");
+    assert!(pragma_arg_string(&clone, "graft_commit", "local edit").contains("local edit"));
+
+    let pull = pragma_arg_string(&clone, "graft_pull", "origin main");
+    assert!(pull.contains("Fetched origin/main"));
+    assert!(pull.contains("Unmerged paths:"));
+
+    let conflicts: Value =
+        serde_json::from_str(&pragma_query_string(&clone, "graft_json_conflicts"))
+            .expect("graft_json_conflicts should return conflict artifact JSON");
+    assert_eq!(conflicts["conflicts"].as_array().unwrap().len(), 1);
+    assert_eq!(conflicts["conflicts"][0]["kind"], "row");
+    assert_eq!(conflicts["conflicts"][0]["table"], "docs");
+
+    let resolved: Value = serde_json::from_str(&pragma_arg_string(
+        &clone,
+        "graft_json_resolve_conflict",
+        "--theirs --row docs 1",
+    ))
+    .expect("graft_json_resolve_conflict should return resolve JSON");
+    assert_eq!(resolved["remaining_conflicts"], 0);
+
+    let continued = pragma_arg_string(&clone, "graft_merge_continue", "merge remote edit");
+    assert!(continued.contains("Merge commit"));
+
+    clone
+        .execute("UPDATE docs SET body = 'after merge' WHERE id = 1", [])
+        .unwrap();
+    assert_eq!(pragma_query_string(&clone, "graft_add"), "Added app.db");
+    assert!(
+        pragma_arg_string(&clone, "graft_commit", "after merge edit").contains("after merge edit")
+    );
+
+    let push = pragma_arg_string(&clone, "graft_push", "origin main");
+    assert!(
+        push.contains("origin/main"),
+        "push after row conflict resolution should succeed, got: {push}"
+    );
+
+    let clone_repo = graft::repo::Repository::discover_for_file(&clone_db).unwrap();
+    let clone_head = clone_repo.resolve_revision("HEAD").unwrap();
+    let remote_head = std::fs::read_to_string(remote_dir.join("refs/heads/main"))
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(remote_head, clone_head);
 
     clone_runtime.shutdown().unwrap();
     source_runtime.shutdown().unwrap();
@@ -3740,6 +3919,33 @@ fn test_repo_merge_conflict_records_index_stages() {
         status["conflict_analysis"]["row_conflicts"][0]["theirs"],
         "insert"
     );
+    assert!(
+        status["conflict_analysis"]["row_conflicts"][0]["ours_row"]
+            .as_array()
+            .is_some()
+    );
+    assert!(
+        status["conflict_analysis"]["row_conflicts"][0]["theirs_row"]
+            .as_array()
+            .is_some()
+    );
+
+    let conflicts: Value =
+        serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_conflicts"))
+            .expect("graft_json_conflicts should return conflict artifact JSON");
+    assert_eq!(conflicts["merge_head"], status["merge_head"]);
+    assert_eq!(conflicts["conflicts"][0]["kind"], "row");
+    assert_eq!(conflicts["conflicts"][0]["reason"], "row_conflict");
+    assert_eq!(conflicts["conflicts"][0]["status"], "unresolved");
+    assert_eq!(conflicts["conflicts"][0]["path"], "app.db");
+    assert_eq!(conflicts["conflicts"][0]["table"], "repo_merge");
+    assert_eq!(conflicts["conflicts"][0]["rowid"], 2);
+    assert_eq!(conflicts["conflicts"][0]["ours_op"], "insert");
+    assert_eq!(conflicts["conflicts"][0]["theirs_op"], "insert");
+    let ours_row = conflicts["conflicts"][0]["ours_row"].as_array().unwrap();
+    let theirs_row = conflicts["conflicts"][0]["theirs_row"].as_array().unwrap();
+    assert!(ours_row.iter().any(|value| value == "Carol"));
+    assert!(theirs_row.iter().any(|value| value == "Bob"));
 
     let mut output = None;
     let result = sqlite.pragma(None, "graft_commit", "merge feature", |row| {
@@ -3764,6 +3970,291 @@ fn test_repo_merge_conflict_records_index_stages() {
     assert_eq!(count, 2);
 
     runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_row_conflict_resolution_preserves_non_conflicting_changes() {
+    graft_test::ensure_test_env();
+
+    for (resolve_arg, expected_body) in [("--ours", "ours"), ("--theirs", "theirs")] {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("app.db");
+        let db_name = db_path.to_str().unwrap();
+
+        let mut runtime = GraftTestRuntime::with_memory_remote();
+        let sqlite = runtime.open_sqlite(db_name, None);
+
+        assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+        sqlite
+            .execute_batch(
+                r#"
+                CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT NOT NULL);
+                INSERT INTO docs (id, body) VALUES (1, 'base');
+                "#,
+            )
+            .unwrap();
+        pragma_query_string(&sqlite, "graft_add");
+        assert!(pragma_arg_string(&sqlite, "graft_commit", "base doc").contains("base"));
+
+        assert!(
+            pragma_arg_string(&sqlite, "graft_branch_create", "feature/theirs")
+                .contains("feature/theirs")
+        );
+        assert!(
+            pragma_arg_string(&sqlite, "graft_switch_branch", "feature/theirs")
+                .contains("feature/theirs")
+        );
+        sqlite
+            .execute_batch(
+                r#"
+                CREATE TABLE theirs_table (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+                INSERT INTO theirs_table (id, name) VALUES (1, 'theirs table');
+                UPDATE docs SET body = 'theirs' WHERE id = 1;
+                "#,
+            )
+            .unwrap();
+        pragma_query_string(&sqlite, "graft_add");
+        assert!(
+            pragma_arg_string(&sqlite, "graft_commit", "theirs table and doc").contains("theirs")
+        );
+
+        assert!(pragma_arg_string(&sqlite, "graft_switch_branch", "main").contains("main"));
+        sqlite
+            .execute_batch(
+                r#"
+                CREATE TABLE ours_table (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+                INSERT INTO ours_table (id, name) VALUES (1, 'ours table');
+                UPDATE docs SET body = 'ours' WHERE id = 1;
+                "#,
+            )
+            .unwrap();
+        pragma_query_string(&sqlite, "graft_add");
+        assert!(pragma_arg_string(&sqlite, "graft_commit", "ours table and doc").contains("ours"));
+
+        let merge = pragma_arg_string(&sqlite, "graft_merge", "feature/theirs");
+        assert!(merge.contains("Unmerged paths:"));
+        assert!(merge.contains("app.db"));
+
+        let tables_before_resolve: Vec<String> = {
+            let mut stmt = sqlite
+                .prepare(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE '%_table' ORDER BY name",
+                )
+                .unwrap();
+            stmt.query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(
+            tables_before_resolve,
+            vec!["ours_table".to_string(), "theirs_table".to_string()]
+        );
+
+        let diff: Value = serde_json::from_str(&pragma_arg_string(
+            &sqlite,
+            "graft_json_diff",
+            "--rows HEAD",
+        ))
+        .expect("graft_json_diff should return row-level worktree diff JSON");
+        let diff_tables = diff["files"][0]["tables"]
+            .as_array()
+            .unwrap_or_else(|| panic!("worktree diff should include file tables: {diff}"));
+        assert!(
+            diff_tables
+                .iter()
+                .any(|table| table["name"].as_str() == Some("theirs_table")),
+            "worktree diff should include the auto-merged incoming table: {diff}"
+        );
+
+        let conflicts: Value =
+            serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_conflicts"))
+                .expect("graft_json_conflicts should return conflict artifact JSON");
+        assert_eq!(conflicts["conflicts"].as_array().unwrap().len(), 1);
+        assert_eq!(conflicts["conflicts"][0]["kind"], "row");
+        assert_eq!(conflicts["conflicts"][0]["table"], "docs");
+
+        let resolved: Value = serde_json::from_str(&pragma_arg_string(
+            &sqlite,
+            "graft_json_resolve_conflict",
+            resolve_arg,
+        ))
+        .expect("graft_json_resolve_conflict should return resolve JSON");
+        assert_eq!(resolved["remaining_conflicts"], 0);
+
+        let continued = pragma_arg_string(
+            &sqlite,
+            "graft_merge_continue",
+            &format!("merge with {resolve_arg}"),
+        );
+        assert!(continued.contains("Merge commit"));
+
+        let tables_after_resolve: Vec<String> = {
+            let mut stmt = sqlite
+                .prepare(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE '%_table' ORDER BY name",
+                )
+                .unwrap();
+            stmt.query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(
+            tables_after_resolve,
+            vec!["ours_table".to_string(), "theirs_table".to_string()]
+        );
+
+        let body: String = sqlite
+            .query_row("SELECT body FROM docs WHERE id = 1", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(body, expected_body);
+
+        runtime.shutdown().unwrap();
+    }
+}
+
+#[test]
+fn test_repo_row_conflict_resolution_can_choose_individual_rows() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT NOT NULL);
+            INSERT INTO docs (id, body) VALUES
+                (1, 'base-1'),
+                (2, 'base-2'),
+                (3, 'base-3');
+            "#,
+        )
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "base docs").contains("base"));
+
+    assert!(
+        pragma_arg_string(&sqlite, "graft_branch_create", "feature/theirs")
+            .contains("feature/theirs")
+    );
+    assert!(
+        pragma_arg_string(&sqlite, "graft_switch_branch", "feature/theirs")
+            .contains("feature/theirs")
+    );
+    sqlite
+        .execute_batch(
+            r#"
+            UPDATE docs SET body = 'theirs-only-1' WHERE id = 1;
+            UPDATE docs SET body = 'theirs-2' WHERE id = 2;
+            UPDATE docs SET body = 'theirs-3' WHERE id = 3;
+            "#,
+        )
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "theirs docs").contains("theirs"));
+
+    assert!(pragma_arg_string(&sqlite, "graft_switch_branch", "main").contains("main"));
+    sqlite
+        .execute_batch(
+            r#"
+            UPDATE docs SET body = 'ours-2' WHERE id = 2;
+            UPDATE docs SET body = 'ours-3' WHERE id = 3;
+            "#,
+        )
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "ours docs").contains("ours"));
+
+    let merge = pragma_arg_string(&sqlite, "graft_merge", "feature/theirs");
+    assert!(merge.contains("Unmerged paths:"));
+    assert!(merge.contains("app.db"));
+
+    let rows_after_partial_merge = docs_rows(&sqlite);
+    assert_eq!(
+        rows_after_partial_merge,
+        vec![
+            (1, "theirs-only-1".to_string()),
+            (2, "ours-2".to_string()),
+            (3, "ours-3".to_string())
+        ],
+        "non-conflicting incoming row should be applied before manual row picks"
+    );
+
+    let conflicts: Value =
+        serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_conflicts"))
+            .expect("graft_json_conflicts should return conflict artifact JSON");
+    assert_eq!(conflicts["conflicts"].as_array().unwrap().len(), 2);
+    assert_eq!(conflicts["conflicts"][0]["status"], "unresolved");
+    assert_eq!(conflicts["conflicts"][1]["status"], "unresolved");
+
+    let resolved_row_2: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_resolve_conflict",
+        "--theirs --row docs 2",
+    ))
+    .expect("graft_json_resolve_conflict should resolve one row");
+    assert_eq!(resolved_row_2["remaining_conflicts"], 1);
+    assert_eq!(
+        docs_rows(&sqlite),
+        vec![
+            (1, "theirs-only-1".to_string()),
+            (2, "theirs-2".to_string()),
+            (3, "ours-3".to_string())
+        ]
+    );
+
+    let conflicts: Value =
+        serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_conflicts"))
+            .expect("graft_json_conflicts should return conflict artifact JSON");
+    let conflicts = conflicts["conflicts"].as_array().unwrap();
+    assert_eq!(conflicts.len(), 2);
+    assert_eq!(conflicts[0]["rowid"], 2);
+    assert_eq!(conflicts[0]["status"], "resolved");
+    assert_eq!(conflicts[0]["resolution"], "theirs");
+    assert_eq!(conflicts[1]["rowid"], 3);
+    assert_eq!(conflicts[1]["status"], "unresolved");
+
+    let resolved_row_3: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_resolve_conflict",
+        "--ours --row docs 3",
+    ))
+    .expect("graft_json_resolve_conflict should resolve final row");
+    assert_eq!(resolved_row_3["remaining_conflicts"], 0);
+
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["conflicted"].as_array().unwrap().len(), 0);
+
+    let continued = pragma_arg_string(&sqlite, "graft_merge_continue", "row-picked merge");
+    assert!(continued.contains("Merge commit"));
+    assert_eq!(
+        docs_rows(&sqlite),
+        vec![
+            (1, "theirs-only-1".to_string()),
+            (2, "theirs-2".to_string()),
+            (3, "ours-3".to_string())
+        ]
+    );
+
+    runtime.shutdown().unwrap();
+}
+
+fn docs_rows(sqlite: &rusqlite::Connection) -> Vec<(i64, String)> {
+    let mut stmt = sqlite
+        .prepare("SELECT id, body FROM docs ORDER BY id")
+        .unwrap();
+    stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
 }
 
 #[test]
@@ -3825,8 +4316,22 @@ fn test_repo_merge_continue_creates_merge_commit_after_resolution() {
     assert!(conflicts.contains("Unmerged paths:"));
     assert!(conflicts.contains("app.db"));
 
-    let resolved = pragma_arg_string(&sqlite, "graft_resolve", "--theirs");
-    assert!(resolved.contains("Resolved app.db using theirs"));
+    sqlite
+        .execute(
+            "UPDATE repo_merge_continue SET name = 'Manual' WHERE id = 2",
+            [],
+        )
+        .unwrap();
+    let resolved: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_resolve_conflict",
+        "--manual",
+    ))
+    .expect("graft_json_resolve_conflict should return resolve JSON");
+    assert_eq!(resolved["operation"], "resolve_conflict");
+    assert_eq!(resolved["path"], "app.db");
+    assert_eq!(resolved["resolution"], "manual");
+    assert_eq!(resolved["remaining_conflicts"], 0);
     let continued = pragma_arg_string(&sqlite, "graft_merge_continue", "merge feature");
     assert!(continued.contains("Merge commit"));
     assert!(continued.contains("merge feature"));
@@ -3851,7 +4356,7 @@ fn test_repo_merge_continue_creates_merge_commit_after_resolution() {
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap()
     };
-    assert_eq!(names, vec!["Alice".to_string(), "Bob".to_string()]);
+    assert_eq!(names, vec!["Alice".to_string(), "Manual".to_string()]);
 
     runtime.shutdown().unwrap();
 }

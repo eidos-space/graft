@@ -32,7 +32,7 @@ use graft::{
 use indoc::{formatdoc, indoc, writedoc};
 use parking_lot::Mutex;
 use rusqlite::config::DbConfig;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlite_plugin::{
     vars::SQLITE_ERROR,
     vfs::{Pragma, PragmaErr},
@@ -418,9 +418,17 @@ struct JsonRowMergeAnalysis {
 #[derive(Debug, Clone, Serialize)]
 struct JsonRowMergeConflict {
     table: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    columns: Vec<String>,
     rowid: i64,
     ours: &'static str,
     theirs: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_row: Option<Vec<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ours_row: Option<Vec<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    theirs_row: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -431,6 +439,54 @@ struct JsonSchemaMergeConflict {
     ours: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     theirs: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct JsonConflictList {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    merge_head: Option<String>,
+    conflicts: Vec<JsonConflictArtifact>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct JsonConflictArtifact {
+    id: String,
+    path: String,
+    kind: &'static str,
+    reason: &'static str,
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resolution: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    table: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    columns: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rowid: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    entry_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ours_op: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    theirs_op: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_row: Option<Vec<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ours_row: Option<Vec<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    theirs_row: Option<Vec<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct JsonResolveConflictOutcome {
+    operation: &'static str,
+    path: String,
+    resolution: &'static str,
+    remaining_conflicts: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -549,13 +605,15 @@ pub(crate) struct RepoCloneSpec {
 pub(crate) enum ResolveSide {
     Ours,
     Theirs,
+    Manual,
 }
 
 impl ResolveSide {
-    fn index_stage(self) -> graft::repo::index::IndexStage {
+    fn index_stage(self) -> Option<graft::repo::index::IndexStage> {
         match self {
-            Self::Ours => graft::repo::index::IndexStage::Ours,
-            Self::Theirs => graft::repo::index::IndexStage::Theirs,
+            Self::Ours => Some(graft::repo::index::IndexStage::Ours),
+            Self::Theirs => Some(graft::repo::index::IndexStage::Theirs),
+            Self::Manual => None,
         }
     }
 
@@ -563,6 +621,7 @@ impl ResolveSide {
         match self {
             Self::Ours => "ours",
             Self::Theirs => "theirs",
+            Self::Manual => "manual",
         }
     }
 }
@@ -571,6 +630,19 @@ impl ResolveSide {
 pub(crate) struct RepoResolveSpec {
     side: ResolveSide,
     path: Option<PathBuf>,
+    row: Option<RepoResolveRowSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RepoResolveRowSpec {
+    table: String,
+    rowid: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct RowConflictResolutionState {
+    merge_head: Option<String>,
+    rows: BTreeMap<String, String>,
 }
 
 pub(crate) enum GraftPragma {
@@ -706,8 +778,14 @@ pub(crate) enum GraftPragma {
     /// `pragma graft_conflicts;`
     Conflicts,
 
-    /// `pragma graft_resolve = "--ours|--theirs [path]";`
+    /// `pragma graft_json_conflicts;`
+    JsonConflicts,
+
+    /// `pragma graft_resolve = "--ours|--theirs|--manual [path]";`
     Resolve { spec: RepoResolveSpec },
+
+    /// `pragma graft_json_resolve_conflict = "--ours|--theirs|--manual [path]";`
+    JsonResolveConflict { spec: RepoResolveSpec },
 
     /// `pragma graft_remote_add = "name remote-uri";`
     RemoteAdd { name: String, config: RemoteConfig },
@@ -1047,7 +1125,11 @@ impl TryFrom<&Pragma<'_>> for GraftPragma {
                     Ok(GraftPragma::MergeContinue { message: p.require_arg()?.to_string() })
                 }
                 "conflicts" => Ok(GraftPragma::Conflicts),
+                "json_conflicts" => Ok(GraftPragma::JsonConflicts),
                 "resolve" => Ok(GraftPragma::Resolve {
+                    spec: parse_repo_resolve_arg(p.require_arg()?)?,
+                }),
+                "json_resolve_conflict" => Ok(GraftPragma::JsonResolveConflict {
                     spec: parse_repo_resolve_arg(p.require_arg()?)?,
                 }),
                 "remote_add" => {
@@ -1610,6 +1692,7 @@ impl GraftPragma {
                 if repo_has_work_in_progress_for_file(&runtime, file, &repo)? {
                     return pragma_err!("cannot merge with staged or unstaged changes");
                 }
+                clear_row_conflict_resolution_state(&repo)?;
                 let plan = repo.plan_merge_revision(&rev)?;
                 let plan = prepare_repo_merge_plan(&runtime, &plan, None)?;
                 let previous_files = current_repo_files_for_checkout(&repo)?;
@@ -1651,6 +1734,7 @@ impl GraftPragma {
                 let previous_files = current_repo_files_for_checkout(&repo)?;
                 let target = repo.apply_merge_abort_plan(&plan)?;
                 checkout_repo_plan(&runtime, file, &repo, &plan.checkout, &previous_files, None)?;
+                clear_row_conflict_resolution_state(&repo)?;
                 Ok(Some(format!(
                     "Aborted merge; reset HEAD to {}",
                     &target[..target.len().min(12)]
@@ -1668,6 +1752,7 @@ impl GraftPragma {
                 try_row_auto_merge_current_file_status_conflict(&runtime, file, &repo, None)?;
                 let tables = staged_commit_table_summary(&runtime, &repo)?;
                 let commit = repo.commit_staged_with_table_summary(message, tables)?;
+                clear_row_conflict_resolution_state(&repo)?;
                 Ok(Some(format!(
                     "Merge commit [{}] {}",
                     &commit.id[..commit.id.len().min(12)],
@@ -1680,33 +1765,44 @@ impl GraftPragma {
                 Ok(Some(format_conflicts(&repo.status()?)?))
             }
 
+            GraftPragma::JsonConflicts => {
+                let repo = repo_for_file(file)?;
+                let remote = repo_default_remote_store(&repo);
+                Ok(Some(to_json(&repo_conflict_artifacts(
+                    &runtime, &repo, remote,
+                )?)?))
+            }
+
             GraftPragma::Resolve { spec } => {
                 if !file.is_idle() {
                     return pragma_err!("cannot resolve while there is an open transaction");
                 }
                 let repo = repo_for_file(file)?;
-                let path = spec.path.unwrap_or_else(|| PathBuf::from(&file.tag));
-                let (key, physical_path) = repo_physical_path_arg(&repo, &path)?;
-                let current_key = repo.file_key(&file.tag)?;
-                let state = conflict_file_state(&repo, &physical_path, spec.side)?;
-                if key == current_key {
-                    if let Some(state) = &state {
-                        checkout_repo_file_state(&runtime, file, state, None)?;
-                    } else {
-                        let volume = runtime.volume_open(None, None, None)?;
-                        file.switch_volume(&volume.vid)?;
-                    }
-                } else if let Some(state) = &state {
-                    checkout_repo_file_state_to_path(&runtime, &repo, state, &physical_path, None)?;
-                } else {
-                    remove_materialized_repo_file(&repo, &key)?;
-                }
-                let entry = repo.resolve_file_conflict(&physical_path, state)?;
+                let side = spec.side;
+                let resolved_path = resolve_repo_conflict_for_file(&runtime, file, &repo, spec)?;
                 Ok(Some(format!(
                     "Resolved {} using {}",
-                    entry.path,
-                    spec.side.label()
+                    resolved_path,
+                    side.label()
                 )))
+            }
+
+            GraftPragma::JsonResolveConflict { spec } => {
+                if !file.is_idle() {
+                    return pragma_err!("cannot resolve while there is an open transaction");
+                }
+                let repo = repo_for_file(file)?;
+                let side = spec.side;
+                let resolved_path = resolve_repo_conflict_for_file(&runtime, file, &repo, spec)?;
+                let remote = repo_default_remote_store(&repo);
+                let remaining_conflicts =
+                    unresolved_conflict_artifact_count(&runtime, &repo, remote)?;
+                Ok(Some(to_json(&JsonResolveConflictOutcome {
+                    operation: "resolve_conflict",
+                    path: resolved_path,
+                    resolution: side.label(),
+                    remaining_conflicts,
+                })?))
             }
 
             GraftPragma::RemoteAdd { name, config } => {
@@ -2314,6 +2410,7 @@ fn run_repo_pull(
     let checkout_remote = Arc::new(repo.remote_store(&remote)?);
     plan.merge = prepare_repo_merge_plan(runtime, &plan.merge, Some(checkout_remote.clone()))?;
     let previous_files = current_repo_files_for_checkout(&repo)?;
+    clear_row_conflict_resolution_state(&repo)?;
     let mut outcome = repo.apply_pull_plan(&plan)?;
     checkout_merge_outcome(
         runtime,
@@ -2964,14 +3061,18 @@ fn hydrate_repo_file_state_for(
         .map(|_| ())
 }
 
-fn hydrate_repo_snapshot(
+fn prepare_repo_snapshot_for_push(
     runtime: &Runtime,
     snapshot: &RepoSnapshot,
-    remote: Option<Arc<Remote>>,
 ) -> Result<(), ErrCtx> {
-    RepoSnapshotResolver::strict(runtime, remote, RepoSnapshotPurpose::Push)
-        .resolve_snapshot(snapshot)
-        .map(|_| ())
+    RepoSnapshotResolver::normalizing(
+        runtime,
+        None,
+        RepoSnapshotPurpose::Push,
+        SnapshotHashPolicy::AllowHydratedMismatch,
+    )
+    .resolve_snapshot(snapshot)
+    .map(|_| ())
 }
 
 fn verify_repo_checkout_plan(
@@ -3344,7 +3445,7 @@ fn publish_repo_branch_snapshots(
             if runtime_snapshot.is_empty() {
                 continue;
             }
-            hydrate_repo_snapshot(runtime, &snapshot, None)?;
+            prepare_repo_snapshot_for_push(runtime, &snapshot)?;
             snapshots.push(runtime_snapshot);
         }
 
@@ -4060,31 +4161,71 @@ fn parse_repo_export_arg(arg: &str) -> Result<RepoExportSpec, PragmaErr> {
 
 fn parse_repo_resolve_arg(arg: &str) -> Result<RepoResolveSpec, PragmaErr> {
     let mut side = None;
+    let mut row = None;
     let mut path = Vec::new();
+    let parts: Vec<&str> = arg.split_whitespace().collect();
+    let mut index = 0;
 
-    for part in arg.split_whitespace() {
-        match part {
+    while index < parts.len() {
+        match parts[index] {
             "--ours" => {
                 if side.replace(ResolveSide::Ours).is_some() {
                     return Err(pragma_fail("resolve accepts only one side"));
                 }
+                index += 1;
             }
             "--theirs" => {
                 if side.replace(ResolveSide::Theirs).is_some() {
                     return Err(pragma_fail("resolve accepts only one side"));
                 }
+                index += 1;
             }
-            value => path.push(value),
+            "--manual" => {
+                if side.replace(ResolveSide::Manual).is_some() {
+                    return Err(pragma_fail("resolve accepts only one side"));
+                }
+                index += 1;
+            }
+            "--row" => {
+                if row.is_some() {
+                    return Err(pragma_fail("resolve accepts only one row selector"));
+                }
+                let Some(table) = parts.get(index + 1) else {
+                    return Err(pragma_fail("resolve --row requires a table name"));
+                };
+                let Some(rowid) = parts.get(index + 2) else {
+                    return Err(pragma_fail("resolve --row requires a rowid"));
+                };
+                let rowid = rowid
+                    .parse::<i64>()
+                    .map_err(|_| pragma_fail("resolve --row rowid must be an integer"))?;
+                row = Some(RepoResolveRowSpec { table: (*table).to_string(), rowid });
+                index += 3;
+            }
+            "--path" => {
+                let Some(value) = parts.get(index + 1) else {
+                    return Err(pragma_fail("resolve --path requires a path"));
+                };
+                path.push(*value);
+                index += 2;
+            }
+            value => {
+                path.push(value);
+                index += 1;
+            }
         }
     }
 
     let Some(side) = side else {
-        return Err(pragma_fail("argument must include `--ours` or `--theirs`"));
+        return Err(pragma_fail(
+            "argument must include `--ours`, `--theirs`, or `--manual`",
+        ));
     };
 
     Ok(RepoResolveSpec {
         side,
         path: (!path.is_empty()).then(|| PathBuf::from(path.join(" "))),
+        row,
     })
 }
 
@@ -4799,7 +4940,11 @@ fn conflict_file_state(
     side: ResolveSide,
 ) -> Result<Option<CommitFileState>, ErrCtx> {
     let key = repo.file_key(path)?;
-    let stage = side.index_stage();
+    let Some(stage) = side.index_stage() else {
+        return Err(ErrCtx::PragmaErr(
+            "manual resolution does not have an index conflict stage".into(),
+        ));
+    };
     let index = repo.read_index()?;
     index
         .entries
@@ -4809,6 +4954,297 @@ fn conflict_file_state(
         .ok_or_else(|| {
             ErrCtx::PragmaErr(format!("path `{key}` has no {} conflict stage", side.label()).into())
         })
+}
+
+fn resolve_repo_conflict_for_file(
+    runtime: &Runtime,
+    file: &mut VolFile,
+    repo: &Repository,
+    spec: RepoResolveSpec,
+) -> Result<String, ErrCtx> {
+    let path = spec.path.unwrap_or_else(|| PathBuf::from(&file.tag));
+    let (key, physical_path) = repo_physical_path_arg(repo, &path)?;
+    let current_key = repo.file_key(&file.tag)?;
+    if let Some(row) = spec.row.as_ref() {
+        return resolve_repo_row_conflict(
+            runtime,
+            file,
+            repo,
+            &key,
+            &physical_path,
+            &current_key,
+            spec.side,
+            row,
+        );
+    }
+    if matches!(spec.side, ResolveSide::Ours | ResolveSide::Theirs) {
+        if let Some(state) = row_resolved_conflict_file_state(runtime, repo, &key, spec.side)? {
+            if key == current_key {
+                checkout_repo_file_state(runtime, file, &state, None)?;
+            } else {
+                checkout_repo_file_state_to_path(runtime, repo, &state, &physical_path, None)?;
+            }
+            let entry = repo.resolve_file_conflict(&physical_path, Some(state))?;
+            clear_row_conflict_resolution_state(repo)?;
+            return Ok(entry.path);
+        }
+    }
+    let state = match spec.side {
+        ResolveSide::Ours | ResolveSide::Theirs => {
+            let state = conflict_file_state(repo, &physical_path, spec.side)?;
+            if key == current_key {
+                if let Some(state) = &state {
+                    checkout_repo_file_state(runtime, file, state, None)?;
+                } else {
+                    let volume = runtime.volume_open(None, None, None)?;
+                    file.switch_volume(&volume.vid)?;
+                }
+            } else if let Some(state) = &state {
+                checkout_repo_file_state_to_path(runtime, repo, state, &physical_path, None)?;
+            } else {
+                remove_materialized_repo_file(repo, &key)?;
+            }
+            state
+        }
+        ResolveSide::Manual if key == current_key => Some(current_repo_file_state(runtime, file)?),
+        ResolveSide::Manual if physical_path.exists() => {
+            Some(import_physical_sqlite_file_state(runtime, &physical_path)?)
+        }
+        ResolveSide::Manual => None,
+    };
+    let entry = repo.resolve_file_conflict(&physical_path, state)?;
+    clear_row_conflict_resolution_state(repo)?;
+    Ok(entry.path)
+}
+
+fn resolve_repo_row_conflict(
+    runtime: &Runtime,
+    file: &mut VolFile,
+    repo: &Repository,
+    key: &str,
+    physical_path: &Path,
+    current_key: &str,
+    side: ResolveSide,
+    row: &RepoResolveRowSpec,
+) -> Result<String, ErrCtx> {
+    if side == ResolveSide::Manual {
+        return Err(ErrCtx::PragmaErr(
+            "row conflict resolution requires `--ours` or `--theirs`".into(),
+        ));
+    }
+
+    let status = repo.status()?;
+    let mut resolution_state =
+        read_row_conflict_resolution_state(repo, status.merge_head.as_deref())?;
+    let Some((base, ours, theirs)) = current_file_conflict_states(repo, key)? else {
+        return Err(ErrCtx::PragmaErr(
+            format!("path `{key}` has no row conflict stages").into(),
+        ));
+    };
+    let remote = repo_default_remote_store(repo);
+    hydrate_repo_file_state_for(runtime, &base, None, RepoSnapshotPurpose::Merge)?;
+    hydrate_repo_file_state_for(runtime, &ours, None, RepoSnapshotPurpose::Merge)?;
+    hydrate_repo_file_state_for(runtime, &theirs, remote, RepoSnapshotPurpose::Merge)?;
+
+    let plan = crate::row_merge::plan_snapshot_merge(runtime, &base, &ours, &theirs)?;
+    if !plan.schema_conflicts().is_empty() || plan.has_opaque_changes() {
+        return Err(ErrCtx::PragmaErr(
+            "row conflict resolution is not available with schema or opaque conflicts".into(),
+        ));
+    }
+    if !plan
+        .analysis
+        .conflicts
+        .iter()
+        .any(|conflict| conflict.table == row.table && conflict.rowid == row.rowid)
+    {
+        return Err(ErrCtx::PragmaErr(
+            format!(
+                "path `{key}` has no row conflict for {} rowid={}",
+                row.table, row.rowid
+            )
+            .into(),
+        ));
+    }
+
+    resolution_state.rows.insert(
+        row_conflict_resolution_key(key, &row.table, row.rowid),
+        side.label().to_string(),
+    );
+    let merged = materialize_row_conflict_resolution_state(
+        runtime,
+        repo,
+        key,
+        &ours,
+        &plan,
+        &resolution_state,
+    )?;
+    if key == current_key {
+        checkout_repo_file_state(runtime, file, &merged, None)?;
+    } else {
+        checkout_repo_file_state_to_path(runtime, repo, &merged, physical_path, None)?;
+    }
+
+    let unresolved = unresolved_row_conflict_count(key, &plan, &resolution_state);
+    if unresolved == 0 {
+        let entry = repo.resolve_file_conflict(physical_path, Some(merged))?;
+        clear_row_conflict_resolution_state(repo)?;
+        return Ok(entry.path);
+    }
+
+    write_row_conflict_resolution_state(repo, &resolution_state)?;
+    Ok(key.to_string())
+}
+
+fn row_resolved_conflict_file_state(
+    runtime: &Runtime,
+    repo: &Repository,
+    key: &str,
+    side: ResolveSide,
+) -> Result<Option<CommitFileState>, ErrCtx> {
+    let Some((base, ours, theirs)) = current_file_conflict_states(repo, key)? else {
+        return Ok(None);
+    };
+    let remote = repo_default_remote_store(repo);
+    hydrate_repo_file_state_for(runtime, &base, None, RepoSnapshotPurpose::Merge)?;
+    hydrate_repo_file_state_for(runtime, &ours, None, RepoSnapshotPurpose::Merge)?;
+    hydrate_repo_file_state_for(runtime, &theirs, remote, RepoSnapshotPurpose::Merge)?;
+
+    let plan = crate::row_merge::plan_snapshot_merge(runtime, &base, &ours, &theirs)?;
+    if !plan.analysis.has_conflicts()
+        || !plan.schema_conflicts().is_empty()
+        || plan.has_opaque_changes()
+    {
+        return Ok(None);
+    }
+
+    let (base_state, sql) = match side {
+        ResolveSide::Ours => (&ours, plan.theirs_apply_sql()),
+        ResolveSide::Theirs => (&theirs, plan.ours_apply_sql()),
+        ResolveSide::Manual => return Ok(None),
+    };
+    materialize_row_auto_merge_state(runtime, repo, key, base_state, &sql).map(Some)
+}
+
+fn materialize_row_conflict_resolution_state(
+    runtime: &Runtime,
+    repo: &Repository,
+    key: &str,
+    ours: &CommitFileState,
+    plan: &crate::row_merge::RowMergePlan,
+    resolution_state: &RowConflictResolutionState,
+) -> Result<CommitFileState, ErrCtx> {
+    let mut sql = plan.theirs_apply_sql();
+    for conflict in &plan.analysis.conflicts {
+        let selection_key = row_conflict_resolution_key(key, &conflict.table, conflict.rowid);
+        let Some(selection) = resolution_state.rows.get(&selection_key) else {
+            continue;
+        };
+        let Some(side) = row_merge_side_from_label(selection) else {
+            continue;
+        };
+        let Some(row_sql) = plan.conflict_apply_sql(side, &conflict.table, conflict.rowid) else {
+            return Err(ErrCtx::PragmaErr(
+                format!(
+                    "could not generate row resolution for {} rowid={}",
+                    conflict.table, conflict.rowid
+                )
+                .into(),
+            ));
+        };
+        sql.push('\n');
+        sql.push_str(&row_sql);
+    }
+    materialize_row_auto_merge_state(runtime, repo, key, ours, &sql)
+}
+
+fn unresolved_row_conflict_count(
+    key: &str,
+    plan: &crate::row_merge::RowMergePlan,
+    resolution_state: &RowConflictResolutionState,
+) -> usize {
+    plan.analysis
+        .conflicts
+        .iter()
+        .filter(|conflict| {
+            !resolution_state
+                .rows
+                .contains_key(&row_conflict_resolution_key(
+                    key,
+                    &conflict.table,
+                    conflict.rowid,
+                ))
+        })
+        .count()
+}
+
+fn row_merge_side_from_label(label: &str) -> Option<crate::row_merge::RowMergeSide> {
+    match label {
+        "ours" => Some(crate::row_merge::RowMergeSide::Ours),
+        "theirs" => Some(crate::row_merge::RowMergeSide::Theirs),
+        _ => None,
+    }
+}
+
+fn row_conflict_resolution_key(path: &str, table: &str, rowid: i64) -> String {
+    format!("{path}\u{1f}{table}\u{1f}{rowid}")
+}
+
+fn row_conflict_resolution_state_path(repo: &Repository) -> PathBuf {
+    repo.worktree()
+        .join(".graft")
+        .join("row-conflict-resolutions.json")
+}
+
+fn read_row_conflict_resolution_state(
+    repo: &Repository,
+    merge_head: Option<&str>,
+) -> Result<RowConflictResolutionState, ErrCtx> {
+    let path = row_conflict_resolution_state_path(repo);
+    let state = match std::fs::read_to_string(&path) {
+        Ok(raw) => serde_json::from_str::<RowConflictResolutionState>(&raw).map_err(|err| {
+            ErrCtx::PragmaErr(
+                format!(
+                    "could not parse row conflict resolution state `{}`: {err}",
+                    path.display()
+                )
+                .into(),
+            )
+        })?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            RowConflictResolutionState::default()
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let merge_head = merge_head.map(str::to_string);
+    if state.merge_head == merge_head {
+        Ok(state)
+    } else {
+        Ok(RowConflictResolutionState { merge_head, rows: BTreeMap::new() })
+    }
+}
+
+fn write_row_conflict_resolution_state(
+    repo: &Repository,
+    state: &RowConflictResolutionState,
+) -> Result<(), ErrCtx> {
+    let path = row_conflict_resolution_state_path(repo);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let raw = serde_json::to_string_pretty(state).map_err(|err| {
+        ErrCtx::PragmaErr(format!("could not encode row conflict resolution state: {err}").into())
+    })?;
+    std::fs::write(path, raw)?;
+    Ok(())
+}
+
+fn clear_row_conflict_resolution_state(repo: &Repository) -> Result<(), ErrCtx> {
+    match std::fs::remove_file(row_conflict_resolution_state_path(repo)) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+    }
 }
 
 fn reset_mode_label(mode: ResetMode) -> &'static str {
@@ -5141,7 +5577,7 @@ fn format_conflicts(status: &RepoStatus) -> Result<String, ErrCtx> {
     writeln!(&mut f)?;
     writeln!(
         &mut f,
-        "Resolve a path with `pragma graft_resolve = \"--ours [path]\"` or `pragma graft_resolve = \"--theirs [path]\"`."
+        "Resolve a path with `pragma graft_resolve = \"--ours [path]\"`, `pragma graft_resolve = \"--theirs [path]\"`, or `pragma graft_resolve = \"--manual [path]\"`."
     )?;
     Ok(f)
 }
@@ -5677,9 +6113,13 @@ fn current_file_row_merge_analysis(
         .iter()
         .map(|conflict| JsonRowMergeConflict {
             table: conflict.table.clone(),
+            columns: conflict.columns.clone(),
             rowid: conflict.rowid,
             ours: row_change_kind_label(conflict.ours),
             theirs: row_change_kind_label(conflict.theirs),
+            base_row: json_record_values_opt(conflict.base_row.as_ref()),
+            ours_row: json_record_values_opt(conflict.ours_row.as_ref()),
+            theirs_row: json_record_values_opt(conflict.theirs_row.as_ref()),
         })
         .collect();
     let schema_conflicts: Vec<JsonSchemaMergeConflict> = plan
@@ -5723,6 +6163,195 @@ fn current_file_row_merge_analysis(
     }))
 }
 
+fn repo_conflict_artifacts(
+    runtime: &Runtime,
+    repo: &Repository,
+    remote: Option<Arc<Remote>>,
+) -> Result<JsonConflictList, ErrCtx> {
+    let status = repo.status()?;
+    let resolution_state = read_row_conflict_resolution_state(repo, status.merge_head.as_deref())?;
+    let mut conflicts = Vec::new();
+    for path in &status.conflicted {
+        conflicts.extend(repo_path_conflict_artifacts(
+            runtime,
+            repo,
+            path,
+            remote.clone(),
+            &resolution_state,
+        )?);
+    }
+    Ok(JsonConflictList { merge_head: status.merge_head, conflicts })
+}
+
+fn unresolved_conflict_artifact_count(
+    runtime: &Runtime,
+    repo: &Repository,
+    remote: Option<Arc<Remote>>,
+) -> Result<usize, ErrCtx> {
+    Ok(repo_conflict_artifacts(runtime, repo, remote)?
+        .conflicts
+        .iter()
+        .filter(|conflict| conflict.status == "unresolved")
+        .count())
+}
+
+fn repo_path_conflict_artifacts(
+    runtime: &Runtime,
+    repo: &Repository,
+    key: &str,
+    remote: Option<Arc<Remote>>,
+    resolution_state: &RowConflictResolutionState,
+) -> Result<Vec<JsonConflictArtifact>, ErrCtx> {
+    let Some((base, ours, theirs)) = current_file_conflict_states(repo, key)? else {
+        return Ok(vec![file_conflict_artifact(
+            key,
+            "file",
+            "add_delete_conflict",
+            Some("merge involves add/delete of this database path".to_string()),
+        )]);
+    };
+
+    let result = (|| {
+        hydrate_repo_file_state_for(runtime, &base, None, RepoSnapshotPurpose::Merge)?;
+        hydrate_repo_file_state_for(runtime, &ours, None, RepoSnapshotPurpose::Merge)?;
+        hydrate_repo_file_state_for(runtime, &theirs, remote, RepoSnapshotPurpose::Merge)?;
+        let plan = crate::row_merge::plan_snapshot_merge(runtime, &base, &ours, &theirs)?;
+        let mut artifacts = Vec::new();
+
+        for conflict in &plan.analysis.conflicts {
+            let resolution = resolution_state
+                .rows
+                .get(&row_conflict_resolution_key(
+                    key,
+                    &conflict.table,
+                    conflict.rowid,
+                ))
+                .and_then(|label| match label.as_str() {
+                    "ours" => Some("ours"),
+                    "theirs" => Some("theirs"),
+                    _ => None,
+                });
+            artifacts.push(JsonConflictArtifact {
+                id: format!("{}:row:{}:{}", key, conflict.table, conflict.rowid),
+                path: key.to_string(),
+                kind: "row",
+                reason: "row_conflict",
+                status: if resolution.is_some() {
+                    "resolved"
+                } else {
+                    "unresolved"
+                },
+                resolution,
+                table: Some(conflict.table.clone()),
+                columns: Some(conflict.columns.clone()).filter(|columns| !columns.is_empty()),
+                rowid: Some(conflict.rowid),
+                name: None,
+                entry_type: None,
+                ours_op: Some(row_change_kind_label(conflict.ours)),
+                theirs_op: Some(row_change_kind_label(conflict.theirs)),
+                base_row: json_record_values_opt(conflict.base_row.as_ref()),
+                ours_row: json_record_values_opt(conflict.ours_row.as_ref()),
+                theirs_row: json_record_values_opt(conflict.theirs_row.as_ref()),
+                message: None,
+            });
+        }
+
+        for conflict in plan.schema_conflicts() {
+            artifacts.push(JsonConflictArtifact {
+                id: format!("{}:schema:{}:{}", key, conflict.entry_type, conflict.name),
+                path: key.to_string(),
+                kind: "schema",
+                reason: "schema_conflict",
+                status: "unresolved",
+                resolution: None,
+                table: None,
+                columns: None,
+                rowid: None,
+                name: Some(conflict.name.clone()),
+                entry_type: Some(conflict.entry_type.clone()),
+                ours_op: conflict.ours.map(schema_change_kind_label),
+                theirs_op: conflict.theirs.map(schema_change_kind_label),
+                base_row: None,
+                ours_row: None,
+                theirs_row: None,
+                message: None,
+            });
+        }
+
+        if plan.opaque_changes() > 0 {
+            artifacts.push(file_conflict_artifact(
+                key,
+                "opaque",
+                "opaque_changes",
+                Some(format!(
+                    "{} opaque table change(s) require manual resolution",
+                    plan.opaque_changes()
+                )),
+            ));
+        }
+
+        if artifacts.is_empty() && plan.apply_change_count() == 0 {
+            artifacts.push(file_conflict_artifact(
+                key,
+                "file",
+                "no_applicable_changes",
+                Some("no row or schema conflict details were produced".to_string()),
+            ));
+        }
+
+        Ok::<_, ErrCtx>(artifacts)
+    })();
+
+    match result {
+        Ok(artifacts) => Ok(artifacts),
+        Err(err) => Ok(vec![file_conflict_artifact(
+            key,
+            "file",
+            "analysis_error",
+            Some(format!("row-level conflict analysis unavailable: {err}")),
+        )]),
+    }
+}
+
+fn file_conflict_artifact(
+    key: &str,
+    kind: &'static str,
+    reason: &'static str,
+    message: Option<String>,
+) -> JsonConflictArtifact {
+    JsonConflictArtifact {
+        id: format!("{key}:{kind}:{reason}"),
+        path: key.to_string(),
+        kind,
+        reason,
+        status: "unresolved",
+        resolution: None,
+        table: None,
+        columns: None,
+        rowid: None,
+        name: None,
+        entry_type: None,
+        ours_op: None,
+        theirs_op: None,
+        base_row: None,
+        ours_row: None,
+        theirs_row: None,
+        message,
+    }
+}
+
+fn json_record_values_opt(
+    record: Option<&crate::sqlite_parse::Record>,
+) -> Option<Vec<serde_json::Value>> {
+    record.map(|record| {
+        record
+            .values
+            .iter()
+            .map(crate::json::JsonRowChange::value_to_json)
+            .collect()
+    })
+}
+
 fn row_change_kind_label(kind: crate::row_merge::RowChangeKind) -> &'static str {
     match kind {
         crate::row_merge::RowChangeKind::Insert => "insert",
@@ -5762,7 +6391,7 @@ fn try_row_auto_merge_current_file_conflict(
         return Ok(None);
     }
 
-    try_row_auto_merge_current_file_status_conflict(runtime, file, repo, remote)
+    try_row_merge_current_file_status_conflict(runtime, file, repo, remote, true)
 }
 
 fn try_row_auto_merge_current_file_status_conflict(
@@ -5770,6 +6399,16 @@ fn try_row_auto_merge_current_file_status_conflict(
     file: &mut VolFile,
     repo: &Repository,
     remote: Option<Arc<Remote>>,
+) -> Result<Option<RowAutoMergeResult>, ErrCtx> {
+    try_row_merge_current_file_status_conflict(runtime, file, repo, remote, false)
+}
+
+fn try_row_merge_current_file_status_conflict(
+    runtime: &Runtime,
+    file: &mut VolFile,
+    repo: &Repository,
+    remote: Option<Arc<Remote>>,
+    allow_partial: bool,
 ) -> Result<Option<RowAutoMergeResult>, ErrCtx> {
     let key = repo.file_key(&file.tag)?;
     let index = repo.read_index()?;
@@ -5786,7 +6425,13 @@ fn try_row_auto_merge_current_file_status_conflict(
     hydrate_repo_file_state_for(runtime, &theirs, remote, RepoSnapshotPurpose::Merge)?;
 
     let plan = crate::row_merge::plan_snapshot_merge(runtime, &base, &ours, &theirs)?;
-    if plan.has_conflicts() || plan.has_opaque_changes() || plan.apply_change_count() == 0 {
+    if plan.has_opaque_changes()
+        || !plan.schema_conflicts().is_empty()
+        || plan.apply_change_count() == 0
+    {
+        return Ok(None);
+    }
+    if plan.analysis.has_conflicts() && !allow_partial {
         return Ok(None);
     }
 
@@ -5794,6 +6439,9 @@ fn try_row_auto_merge_current_file_status_conflict(
     let sql = plan.theirs_apply_sql();
     let merged = materialize_row_auto_merge_state(runtime, repo, &key, &ours, &sql)?;
     checkout_repo_file_state(runtime, file, &merged, None)?;
+    if plan.analysis.has_conflicts() {
+        return Ok(None);
+    }
     repo.resolve_file_conflict(&file.tag, Some(merged))?;
 
     Ok(Some(RowAutoMergeResult {
