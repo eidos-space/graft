@@ -1,0 +1,252 @@
+name: Release SQLite Extension
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, for example 0.2.1 or v0.2.1-rc.1"
+        required: true
+        type: string
+      draft:
+        description: "Create the GitHub release as a draft"
+        required: true
+        default: true
+        type: boolean
+      prerelease:
+        description: "Mark the GitHub release as a prerelease"
+        required: true
+        default: false
+        type: boolean
+
+concurrency:
+  group: sqlite-extension-release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  metadata:
+    name: Resolve release metadata
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      release_tag: ${{ steps.meta.outputs.release_tag }}
+      draft: ${{ steps.meta.outputs.draft }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+    steps:
+      - name: Resolve release metadata
+        id: meta
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_DRAFT: ${{ inputs.draft }}
+          INPUT_PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            raw_version="${INPUT_VERSION}"
+            draft="${INPUT_DRAFT}"
+            prerelease="${INPUT_PRERELEASE}"
+          else
+            raw_version="${GITHUB_REF_NAME}"
+            draft="false"
+            prerelease="false"
+          fi
+
+          version="${raw_version#v}"
+          if [[ -z "$version" ]]; then
+            echo "::error::release version is empty"
+            exit 1
+          fi
+
+          release_tag="v${version}"
+          if [[ "$version" == *-* ]]; then
+            prerelease="true"
+          fi
+
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "release_tag=${release_tag}" >> "$GITHUB_OUTPUT"
+          echo "draft=${draft}" >> "$GITHUB_OUTPUT"
+          echo "prerelease=${prerelease}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "Version: ${version}"
+            echo "Tag: ${release_tag}"
+            echo "Draft: ${draft}"
+            echo "Prerelease: ${prerelease}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: metadata
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            library: libgraft_ext.so
+          - runner: ubuntu-24.04
+            target: aarch64-unknown-linux-gnu
+            library: libgraft_ext.so
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            library: libgraft_ext.dylib
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            library: libgraft_ext.dylib
+          - runner: windows-2022
+            target: x86_64-pc-windows-msvc
+            library: graft_ext.dll
+          - runner: windows-2022
+            target: aarch64-pc-windows-msvc
+            library: graft_ext.dll
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          persist-credentials: false
+
+      - name: Install Linux dependencies
+        if: startsWith(matrix.runner, 'ubuntu')
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev build-essential
+
+      - name: Install Linux aarch64 linker
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Configure macOS libclang
+        if: startsWith(matrix.runner, 'macos')
+        run: |
+          set -euo pipefail
+          if brew --prefix llvm@15 >/dev/null 2>&1; then
+            echo "LIBCLANG_PATH=$(brew --prefix llvm@15)/lib" >> "$GITHUB_ENV"
+          elif brew --prefix llvm >/dev/null 2>&1; then
+            echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
+          fi
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          key: sqlite-extension-${{ matrix.target }}
+
+      - name: Build SQLite extension
+        run: |
+          set -euo pipefail
+          cargo build \
+            --release \
+            --no-default-features \
+            --features dynamic \
+            --package graft-ext \
+            --target "${{ matrix.target }}"
+
+      - name: Stage extension artifact
+        run: |
+          set -euo pipefail
+
+          artifact_dir="package/${{ matrix.target }}"
+          mkdir -p "$artifact_dir"
+
+          cp "target/${{ matrix.target }}/release/${{ matrix.library }}" "$artifact_dir/"
+          cp LICENSE-APACHE LICENSE-MIT "$artifact_dir/"
+
+          cat > "$artifact_dir/README.txt" <<EOF
+          SQLite Graft extension
+          Version: ${{ needs.metadata.outputs.version }}
+          Target: ${{ matrix.target }}
+          Source: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}
+
+          Load this dynamic SQLite extension with SQLite's load_extension support.
+          EOF
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: graft-sqlite-extension-${{ matrix.target }}
+          path: package/${{ matrix.target }}
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub release
+    needs: [metadata, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download extension artifacts
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          pattern: graft-sqlite-extension-*
+          path: downloaded/
+
+      - name: Package release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y zip
+
+          mkdir -p release-assets
+          version="${{ needs.metadata.outputs.version }}"
+
+          for dir in downloaded/graft-sqlite-extension-*; do
+            target="${dir#downloaded/graft-sqlite-extension-}"
+            archive_base="sqlite-graft-${version}-${target}"
+
+            if [[ "$target" == *"windows"* ]]; then
+              (cd "$dir" && zip -r "../../release-assets/${archive_base}.zip" .)
+            else
+              tar -czf "release-assets/${archive_base}.tar.gz" -C "$dir" .
+            fi
+          done
+
+          (cd release-assets && sha256sum * > SHA256SUMS)
+          ls -lah release-assets
+
+      - name: Upload packaged artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sqlite-extension-release-assets
+          path: release-assets/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Create or update GitHub release
+        uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2
+        with:
+          name: ${{ needs.metadata.outputs.release_tag }}
+          tag_name: ${{ needs.metadata.outputs.release_tag }}
+          target_commitish: ${{ github.sha }}
+          draft: ${{ needs.metadata.outputs.draft }}
+          prerelease: ${{ needs.metadata.outputs.prerelease }}
+          make_latest: ${{ needs.metadata.outputs.prerelease == 'false' }}
+          fail_on_unmatched_files: true
+          files: release-assets/*
