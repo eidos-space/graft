@@ -141,20 +141,15 @@ jobs:
         if: startsWith(matrix.runner, 'macos')
         run: |
           set -euo pipefail
-          libclang="$(
-            find \
-              /Applications/Xcode*.app \
-              /Library/Developer/CommandLineTools \
-              "$(brew --prefix llvm@15 2>/dev/null || true)" \
-              "$(brew --prefix llvm 2>/dev/null || true)" \
-              -name libclang.dylib -print 2>/dev/null | head -n 1
-          )"
-          if [[ -z "$libclang" ]]; then
-            echo "::error::could not find libclang.dylib"
+          brew install llvm
+          llvm_prefix="$(brew --prefix llvm)"
+          libclang_path="${llvm_prefix}/lib/libclang.dylib"
+          if [[ ! -f "$libclang_path" ]]; then
+            echo "::error::could not find libclang at $libclang_path"
             exit 1
           fi
-          echo "LIBCLANG_PATH=$(dirname "$libclang")" >> "$GITHUB_ENV"
-          echo "Using libclang at $libclang"
+          echo "LIBCLANG_PATH=${llvm_prefix}/lib" >> "$GITHUB_ENV"
+          echo "Using libclang at $libclang_path"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
