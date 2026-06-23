@@ -1,83 +1,136 @@
-<h1 align="center">Graft</h1>
-<p align="center">
-  <a href="https://github.com/orbitinghail/graft/actions"><img alt="Build Status" src="https://img.shields.io/github/actions/workflow/status/orbitinghail/graft/ci.yml"></a>
-  &nbsp;
-  <a href="https://docs.rs/graft"><img alt="docs.rs" src="https://img.shields.io/docsrs/graft?label=docs.rs"></a>
-  &nbsp;
-  <a href="https://crates.io/crates/graft"><img alt="crates.io" src="https://img.shields.io/crates/v/graft.svg"></a>
-  &nbsp;
-  <a href="https://graft.rs"><img alt="graft.rs" src="https://img.shields.io/badge/graft.rs-docs-blue"></a>
-</p>
+# Graft
 
-**Graft** is an open-source transactional storage engine designed for efficient data synchronization at the edge. It supports lazy, partial replication with strong consistency, ensuring applications replicate only the data they need.
+This repository is a fork of
+[orbitinghail/graft](https://github.com/orbitinghail/graft). The upstream
+project is an open-source transactional storage engine for lazy, partial data
+replication on top of object storage. This fork keeps that foundation and adds
+application-facing SQLite repository workflows used by Eidos.
 
-**Core Benefits:**
+The fork should be treated as experimental. It currently focuses on making a
+single SQLite database feel closer to a Git worktree: commit local changes, view
+history, fetch and push to object storage, pull remote work, auto-merge compatible
+database changes, and expose structured conflict artifacts to an application UI.
 
-- **Lazy Replication**: Clients sync data on demand, saving network and compute.
-- **Partial Replication**: Minimize bandwidth by syncing only required data.
-- **Edge Optimization**: Lightweight client designed for edge, mobile, and embedded environments.
-- **Strong Consistency**: Serializable Snapshot Isolation ensures correct, consistent data views.
-- **Transactional Object Storage**: Graft turns object storage into a transactional system—supporting consistent updates to subsets of data at page granularity, without imposing any data format or schema.
-- **Instant Read Replicas**: Decoupled metadata and data allow replicas to spin up immediately—no replay, no waiting for full recovery.
+## What This Fork Adds
 
-**Use Cases:**
+- **Git-like repository mode for SQLite**: repository pragmas expose operations
+  such as `graft_init`, `graft_add`, `graft_commit`, `graft_status`,
+  `graft_log`, `graft_show`, `graft_diff`, `graft_checkout`, `graft_reset`,
+  `graft_fetch`, `graft_pull`, and `graft_push`.
+- **JSON-first application API**: app integrations can use `graft_json_*`
+  pragmas instead of parsing human-readable command output.
+- **Physical SQLite worktree support**: repository state can track and
+  materialize ordinary SQLite database files while still storing snapshot data
+  through Graft.
+- **Row-level SQLite diffs**: commit views and worktree diffs can describe table
+  and row changes, not just page-level database file changes.
+- **Row-level auto-merge**: disjoint row changes can be merged automatically even
+  when the underlying SQLite file changed on both sides.
+- **Conflict artifacts for UI flows**: unresolved row, schema, opaque, and file
+  conflicts can be listed as structured JSON so a product can show focused
+  conflict-resolution screens.
+- **Per-row conflict resolution**: when multiple rows conflict in the same table,
+  callers can choose ours/theirs per row rather than resolving the whole database
+  file at once.
+- **Preservation of non-conflicting changes**: compatible row changes are kept
+  while true conflicts wait for manual resolution.
+- **Snapshot resolution for pulled history**: historical commits fetched from
+  remotes can be hydrated on demand for row-level diff and merge operations.
+- **Hydrated snapshot hash normalization on push**: push can normalize stale
+  hydrated snapshot commit hashes while still rejecting missing storage objects.
 
-- Offline-first and mobile applications
-- Cross-platform synchronization
-- Stateless replicas for serverless or embedded environments
-- Diverse data replication scenarios
-- Storage and replication for databases
+## Upstream Graft
 
-**Learn more:**
+Upstream Graft is designed for efficient data synchronization at the edge. Its
+core ideas are still central to this fork:
 
-- [SyncConf 2025 Talk](https://www.youtube.com/watch?v=QoKzDyH2MEA)
-- [Blog Post](https://sqlsync.dev/posts/stop-syncing-everything/)
-- [Vancouver Systems Talk](https://www.youtube.com/watch?v=eRsD8uSAi0s)
-- [High Performance SQLite Talk](https://www.youtube.com/watch?v=dJurdmhPLH4)
+- Lazy replication: clients fetch data on demand.
+- Partial replication: clients only replicate the pages they need.
+- Transactional object storage: object storage becomes a consistent storage
+  layer for database snapshots.
+- Strong consistency: readers can observe consistent snapshot views.
+- Fast replicas: metadata and data are decoupled so replicas can start without a
+  full replay of history.
+
+Upstream resources:
+
+- [Original repository](https://github.com/orbitinghail/graft)
 - [Documentation](https://graft.rs)
+- [SyncConf 2025 talk](https://www.youtube.com/watch?v=QoKzDyH2MEA)
+- [Blog post](https://sqlsync.dev/posts/stop-syncing-everything/)
 
-## Using Graft
+## SQLite Extension
 
-Graft should be considered **Alpha** quality software. Thus, please contact @carlsverre before using it in production. The easiest way to contact @carlsverre is via Discord on the [orbitinghail server][discord].
+The primary integration surface for this fork is the Graft SQLite extension. It
+lets applications call repository operations through SQLite pragmas, which makes
+the workflow available from Electron, Node.js, Python, Ruby, Swift, and any
+runtime with native SQLite support.
 
-[discord]: https://discord.gg/dhyjne5XK9
+Example repository workflow:
 
-### SQLite extension
+```sql
+pragma graft_init;
+pragma graft_add;
+pragma graft_commit = 'Initial version';
+pragma graft_json_status;
+pragma graft_json_log;
+pragma graft_json_diff = '--rows HEAD';
+pragma graft_json_fetch;
+pragma graft_json_pull;
+pragma graft_json_push;
+```
 
-The easiest way to use Graft is via the Graft SQLite extension. [Please see the documentation][sqlite-docs] for instructions on how to download and use it with SQLite.
+Conflict-oriented commands include:
 
-[sqlite-docs]: https://graft.rs/docs/sqlite/
+```sql
+pragma graft_json_conflicts;
+pragma graft_json_resolve_conflict = '--theirs --row docs 42';
+pragma graft_merge_continue = 'Merge remote changes';
+pragma graft_merge_abort;
+```
 
-### Rust Crate
+## Development
 
-Graft can be embedded in your Rust application directly, although for now that is left as an exercise for the reader. You can find the Rust docs here: https://docs.rs/graft
+Common commands:
 
-### Other languages?
+```sh
+just test
+cargo nextest run
+just run sqlite test
+cargo check
+cargo fmt
+cargo clippy
+cargo build -p graft-ext --release
+```
 
-You can use the Graft SQLite extension from any language that has a native SQLite library. Please [see the documentation for details][sqlite-docs].
+The SQLite integration tests live in `crates/graft-test/tests/sqlite.rs` and
+cover the repository-mode workflows, row diffs, merge behavior, conflict
+resolution, and remote push/pull flows.
 
-If you'd like to access the Graft low-level Volume API from a language other than Rust, please [file an issue]!
+## Status
 
-[file an issue]: https://github.com/orbitinghail/graft/issues/new
+This fork is not a general-purpose replacement for Git. It is a focused
+experiment for SQLite-backed application data:
 
-## Technical Overview
-
-For an overview of how Graft works, visit https://graft.rs/docs/internals.
+- It treats the database file as the worktree object.
+- It uses Graft snapshots and object storage as the underlying storage layer.
+- It exposes Git-like commands to applications.
+- It adds row-aware behavior only where SQLite structure is available.
+- It falls back to opaque/file-level conflict handling when row-level analysis is
+  not safe.
 
 ## Contributing
 
-Thank you for your interest in contributing your time and expertise to the project. Please [read our contribution guide] to learn more about the process.
-
-[read our contribution guide]: https://github.com/orbitinghail/graft/blob/main/CONTRIBUTING.md
+For general coding style and development process, see [CONTRIBUTING.md](./CONTRIBUTING.md).
+When working on this fork, keep application-specific policy out of the storage
+engine where possible. Prefer structured, configurable primitives that Eidos or
+another host application can interpret.
 
 ## License
 
-Licensed under either of
+Licensed under either of:
 
-- Apache License, Version 2.0 ([LICENSE-APACHE] or https://www.apache.org/licenses/LICENSE-2.0)
-- MIT license ([LICENSE-MIT] or https://opensource.org/licenses/MIT)
+- Apache License, Version 2.0 ([LICENSE-APACHE](./LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](./LICENSE-MIT))
 
 at your option.
-
-[LICENSE-APACHE]: https://github.com/orbitinghail/graft/blob/main/LICENSE-APACHE
-[LICENSE-MIT]: https://github.com/orbitinghail/graft/blob/main/LICENSE-MIT
