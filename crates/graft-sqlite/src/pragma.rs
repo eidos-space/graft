@@ -56,6 +56,51 @@ enum SnapshotHashPolicy {
     AllowHydratedMismatch,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RepoSnapshotPurpose {
+    Checkout,
+    Diff,
+    Export,
+    Merge,
+    Push,
+    Reset,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RepoSnapshotRemoteMode {
+    LocalOnly,
+    Remote,
+    LocalThenRemote,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RepoSnapshotResolveSource {
+    Local,
+    Remote,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RepoSnapshotResolvePolicy {
+    purpose: RepoSnapshotPurpose,
+    remote_mode: RepoSnapshotRemoteMode,
+    hash_policy: SnapshotHashPolicy,
+    normalize: bool,
+}
+
+#[derive(Debug)]
+struct ResolvedRepoSnapshot {
+    snapshot: RepoSnapshot,
+    runtime_snapshot: graft::snapshot::Snapshot,
+    source: RepoSnapshotResolveSource,
+    hash_mismatches: usize,
+}
+
+struct RepoSnapshotResolver<'a> {
+    runtime: &'a Runtime,
+    remote: Option<Arc<Remote>>,
+    policy: RepoSnapshotResolvePolicy,
+}
+
 fn async_jobs() -> &'static AsyncJobRegistry {
     ASYNC_JOBS.get_or_init(AsyncJobRegistry::default)
 }
@@ -2644,7 +2689,7 @@ fn export_repo_path(
         let state = repo
             .file_from_revision(source, &physical_path)?
             .ok_or_else(|| ErrCtx::Repo(graft::repo::RepoErr::PathNotTracked(key.clone())))?;
-        hydrate_repo_file_state(runtime, &state, None)?;
+        hydrate_repo_file_state_for(runtime, &state, None, RepoSnapshotPurpose::Export)?;
         write_repo_file_state_to_path(runtime, &state, &spec.output)?;
         return Ok(key);
     }
@@ -2905,12 +2950,18 @@ fn hydrate_repo_file_state(
     state: &CommitFileState,
     remote: Option<Arc<Remote>>,
 ) -> Result<(), ErrCtx> {
-    hydrate_repo_snapshot_with_hash_policy(
-        runtime,
-        &state.snapshot,
-        remote,
-        SnapshotHashPolicy::Strict,
-    )
+    hydrate_repo_file_state_for(runtime, state, remote, RepoSnapshotPurpose::Checkout)
+}
+
+fn hydrate_repo_file_state_for(
+    runtime: &Runtime,
+    state: &CommitFileState,
+    remote: Option<Arc<Remote>>,
+    purpose: RepoSnapshotPurpose,
+) -> Result<(), ErrCtx> {
+    RepoSnapshotResolver::strict(runtime, remote, purpose)
+        .resolve_file_state(state)
+        .map(|_| ())
 }
 
 fn hydrate_repo_snapshot(
@@ -2918,29 +2969,9 @@ fn hydrate_repo_snapshot(
     snapshot: &RepoSnapshot,
     remote: Option<Arc<Remote>>,
 ) -> Result<(), ErrCtx> {
-    hydrate_repo_snapshot_with_hash_policy(runtime, snapshot, remote, SnapshotHashPolicy::Strict)
-}
-
-fn hydrate_repo_snapshot_with_hash_policy(
-    runtime: &Runtime,
-    snapshot: &RepoSnapshot,
-    remote: Option<Arc<Remote>>,
-    hash_policy: SnapshotHashPolicy,
-) -> Result<(), ErrCtx> {
-    let runtime_snapshot = snapshot.to_snapshot();
-    if runtime_snapshot.is_empty() {
-        return Ok(());
-    }
-    if let Some(remote) = remote {
-        runtime.snapshot_hydrate_from(runtime_snapshot, remote)?;
-    } else {
-        for range in &snapshot.ranges {
-            runtime.fetch_log(range.log.clone(), Some(range.end))?;
-        }
-        runtime.snapshot_hydrate(runtime_snapshot)?;
-    }
-    verify_repo_snapshot_commit_hashes(runtime, snapshot, hash_policy)?;
-    Ok(())
+    RepoSnapshotResolver::strict(runtime, remote, RepoSnapshotPurpose::Push)
+        .resolve_snapshot(snapshot)
+        .map(|_| ())
 }
 
 fn verify_repo_checkout_plan(
@@ -2948,39 +2979,9 @@ fn verify_repo_checkout_plan(
     plan: &CheckoutPlan,
     remote: Option<Arc<Remote>>,
 ) -> Result<(), ErrCtx> {
-    for state in plan.files.values() {
-        hydrate_repo_file_state(runtime, state, remote.clone())?;
-    }
-    Ok(())
-}
-
-fn prepare_repo_file_state(
-    runtime: &Runtime,
-    state: &CommitFileState,
-    remote: Option<Arc<Remote>>,
-) -> Result<CommitFileState, ErrCtx> {
-    let hash_policy = if remote.is_some() {
-        SnapshotHashPolicy::AllowHydratedMismatch
-    } else {
-        SnapshotHashPolicy::Strict
-    };
-    prepare_repo_file_state_with_hash_policy(runtime, state, remote, hash_policy)
-}
-
-fn prepare_repo_file_state_with_hash_policy(
-    runtime: &Runtime,
-    state: &CommitFileState,
-    remote: Option<Arc<Remote>>,
-    hash_policy: SnapshotHashPolicy,
-) -> Result<CommitFileState, ErrCtx> {
-    hydrate_repo_snapshot_with_hash_policy(runtime, &state.snapshot, remote, hash_policy)?;
-    if hash_policy == SnapshotHashPolicy::Strict {
-        return Ok(state.clone());
-    }
-    Ok(CommitFileState {
-        volume: state.volume.clone(),
-        snapshot: repo_snapshot_with_commit_hashes(runtime, &state.snapshot.to_snapshot())?,
-    })
+    RepoSnapshotResolver::strict(runtime, remote, RepoSnapshotPurpose::Checkout)
+        .resolve_checkout_plan(plan)
+        .map(|_| ())
 }
 
 fn prepare_repo_checkout_plan(
@@ -2988,11 +2989,13 @@ fn prepare_repo_checkout_plan(
     plan: &CheckoutPlan,
     remote: Option<Arc<Remote>>,
 ) -> Result<CheckoutPlan, ErrCtx> {
-    let mut plan = plan.clone();
-    for state in plan.files.values_mut() {
-        *state = prepare_repo_file_state(runtime, state, remote.clone())?;
-    }
-    Ok(plan)
+    let hash_policy = if remote.is_some() {
+        SnapshotHashPolicy::AllowHydratedMismatch
+    } else {
+        SnapshotHashPolicy::Strict
+    };
+    RepoSnapshotResolver::normalizing(runtime, remote, RepoSnapshotPurpose::Checkout, hash_policy)
+        .resolve_checkout_plan(plan)
 }
 
 fn prepare_repo_checkout_plan_with_hash_policy(
@@ -3001,12 +3004,8 @@ fn prepare_repo_checkout_plan_with_hash_policy(
     remote: Option<Arc<Remote>>,
     hash_policy: SnapshotHashPolicy,
 ) -> Result<CheckoutPlan, ErrCtx> {
-    let mut plan = plan.clone();
-    for state in plan.files.values_mut() {
-        *state =
-            prepare_repo_file_state_with_hash_policy(runtime, state, remote.clone(), hash_policy)?;
-    }
-    Ok(plan)
+    RepoSnapshotResolver::normalizing(runtime, remote, RepoSnapshotPurpose::Reset, hash_policy)
+        .resolve_checkout_plan(plan)
 }
 
 fn prepare_repo_merge_plan(
@@ -3014,25 +3013,214 @@ fn prepare_repo_merge_plan(
     plan: &MergePlan,
     remote: Option<Arc<Remote>>,
 ) -> Result<MergePlan, ErrCtx> {
-    let mut plan = plan.clone();
-    if matches!(plan.outcome, MergeOutcome::FastForward { .. }) {
-        plan.checkout = prepare_repo_checkout_plan(runtime, &plan.checkout, remote.clone())?;
-    }
-    if let Some(index) = &mut plan.index {
-        for entry in &mut index.entries {
-            if let Some(state) = entry.file.clone() {
-                entry.file = Some(prepare_repo_file_state(runtime, &state, remote.clone())?);
-            }
+    let hash_policy = if remote.is_some() {
+        SnapshotHashPolicy::AllowHydratedMismatch
+    } else {
+        SnapshotHashPolicy::Strict
+    };
+    RepoSnapshotResolver::normalizing(runtime, remote, RepoSnapshotPurpose::Merge, hash_policy)
+        .resolve_merge_plan(plan)
+}
+
+impl<'a> RepoSnapshotResolver<'a> {
+    fn strict(
+        runtime: &'a Runtime,
+        remote: Option<Arc<Remote>>,
+        purpose: RepoSnapshotPurpose,
+    ) -> Self {
+        let remote_mode = if remote.is_some() {
+            RepoSnapshotRemoteMode::Remote
+        } else {
+            RepoSnapshotRemoteMode::LocalOnly
+        };
+        Self {
+            runtime,
+            remote,
+            policy: RepoSnapshotResolvePolicy {
+                purpose,
+                remote_mode,
+                hash_policy: SnapshotHashPolicy::Strict,
+                normalize: false,
+            },
         }
     }
-    Ok(plan)
+
+    fn normalizing(
+        runtime: &'a Runtime,
+        remote: Option<Arc<Remote>>,
+        purpose: RepoSnapshotPurpose,
+        hash_policy: SnapshotHashPolicy,
+    ) -> Self {
+        let remote_mode = if remote.is_some() {
+            RepoSnapshotRemoteMode::Remote
+        } else {
+            RepoSnapshotRemoteMode::LocalOnly
+        };
+        Self {
+            runtime,
+            remote,
+            policy: RepoSnapshotResolvePolicy {
+                purpose,
+                remote_mode,
+                hash_policy,
+                normalize: hash_policy != SnapshotHashPolicy::Strict,
+            },
+        }
+    }
+
+    fn local_then_remote(
+        runtime: &'a Runtime,
+        remote: Option<Arc<Remote>>,
+        purpose: RepoSnapshotPurpose,
+        hash_policy: SnapshotHashPolicy,
+    ) -> Self {
+        Self {
+            runtime,
+            remote,
+            policy: RepoSnapshotResolvePolicy {
+                purpose,
+                remote_mode: RepoSnapshotRemoteMode::LocalThenRemote,
+                hash_policy,
+                normalize: false,
+            },
+        }
+    }
+
+    fn resolve_file_state(&self, state: &CommitFileState) -> Result<CommitFileState, ErrCtx> {
+        let resolved = self.resolve_snapshot(&state.snapshot)?;
+        Ok(CommitFileState {
+            volume: state.volume.clone(),
+            snapshot: resolved.snapshot,
+        })
+    }
+
+    fn resolve_checkout_plan(&self, plan: &CheckoutPlan) -> Result<CheckoutPlan, ErrCtx> {
+        let mut plan = plan.clone();
+        for state in plan.files.values_mut() {
+            *state = self.resolve_file_state(state)?;
+        }
+        Ok(plan)
+    }
+
+    fn resolve_merge_plan(&self, plan: &MergePlan) -> Result<MergePlan, ErrCtx> {
+        let mut plan = plan.clone();
+        if matches!(plan.outcome, MergeOutcome::FastForward { .. }) {
+            plan.checkout = self.resolve_checkout_plan(&plan.checkout)?;
+        }
+        if let Some(index) = &mut plan.index {
+            for entry in &mut index.entries {
+                if let Some(state) = entry.file.clone() {
+                    entry.file = Some(self.resolve_file_state(&state)?);
+                }
+            }
+        }
+        Ok(plan)
+    }
+
+    fn resolve_snapshot(&self, snapshot: &RepoSnapshot) -> Result<ResolvedRepoSnapshot, ErrCtx> {
+        if self.policy.remote_mode == RepoSnapshotRemoteMode::Remote {
+            return self.resolve_snapshot_once(
+                snapshot,
+                RepoSnapshotResolveSource::Remote,
+                self.remote.clone(),
+            );
+        }
+
+        match self.resolve_snapshot_once(snapshot, RepoSnapshotResolveSource::Local, None) {
+            Ok(resolved) => Ok(resolved),
+            Err(local_err)
+                if self.policy.remote_mode == RepoSnapshotRemoteMode::LocalThenRemote =>
+            {
+                let Some(remote) = self.remote.clone() else {
+                    return Err(local_err);
+                };
+                self.resolve_snapshot_once(snapshot, RepoSnapshotResolveSource::Remote, Some(remote))
+                    .map_err(|remote_err| {
+                        ErrCtx::PragmaErr(
+                            format!(
+                                "local snapshot hydrate failed: {local_err}; remote snapshot hydrate failed: {remote_err}"
+                            )
+                            .into(),
+                        )
+                    })
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn resolve_snapshot_once(
+        &self,
+        snapshot: &RepoSnapshot,
+        source: RepoSnapshotResolveSource,
+        remote: Option<Arc<Remote>>,
+    ) -> Result<ResolvedRepoSnapshot, ErrCtx> {
+        let runtime_snapshot = snapshot.to_snapshot();
+        if !runtime_snapshot.is_empty() {
+            match source {
+                RepoSnapshotResolveSource::Local => {
+                    for range in &snapshot.ranges {
+                        self.runtime.fetch_log(range.log.clone(), Some(range.end))?;
+                    }
+                    self.runtime.snapshot_hydrate(runtime_snapshot.clone())?;
+                }
+                RepoSnapshotResolveSource::Remote => {
+                    let Some(remote) = remote else {
+                        return Err(ErrCtx::PragmaErr(
+                            "snapshot resolver remote source requires a remote".into(),
+                        ));
+                    };
+                    self.runtime
+                        .snapshot_hydrate_from(runtime_snapshot.clone(), remote)?;
+                }
+            }
+        }
+
+        let hash_mismatches =
+            verify_repo_snapshot_commit_hashes(self.runtime, snapshot, self.policy.hash_policy)?;
+        let resolved_snapshot =
+            if self.policy.normalize && self.policy.hash_policy != SnapshotHashPolicy::Strict {
+                repo_snapshot_with_commit_hashes(self.runtime, &runtime_snapshot)?
+            } else {
+                snapshot.clone()
+            };
+        let resolved = ResolvedRepoSnapshot {
+            snapshot: resolved_snapshot,
+            runtime_snapshot,
+            source,
+            hash_mismatches,
+        };
+        resolved.trace_if_needed(self.policy.purpose);
+        Ok(resolved)
+    }
+}
+
+impl ResolvedRepoSnapshot {
+    fn trace_if_needed(&self, purpose: RepoSnapshotPurpose) {
+        if self.hash_mismatches > 0 {
+            tracing::warn!(
+                mismatches = self.hash_mismatches,
+                source = ?self.source,
+                purpose = ?purpose,
+                "snapshot storage commit hashes mismatched; using hydrated storage commit hashes"
+            );
+        } else if matches!(self.source, RepoSnapshotResolveSource::Remote) {
+            tracing::debug!(
+                source = ?self.source,
+                purpose = ?purpose,
+                ranges = self.snapshot.ranges.len(),
+                runtime_ranges = self.runtime_snapshot.iter().count(),
+                pages = self.snapshot.page_count.to_u32(),
+                "resolved repository snapshot from remote"
+            );
+        }
+    }
 }
 
 fn verify_repo_snapshot_commit_hashes(
     runtime: &Runtime,
     snapshot: &RepoSnapshot,
     hash_policy: SnapshotHashPolicy,
-) -> Result<(), ErrCtx> {
+) -> Result<usize, ErrCtx> {
     let mut mismatches = 0_usize;
     for range in &snapshot.ranges {
         let mut expected_commits = range.commits.iter();
@@ -3100,13 +3288,7 @@ fn verify_repo_snapshot_commit_hashes(
             ));
         }
     }
-    if mismatches > 0 {
-        tracing::warn!(
-            mismatches,
-            "snapshot storage commit hashes mismatched; using hydrated storage commit hashes"
-        );
-    }
-    Ok(())
+    Ok(mismatches)
 }
 
 fn repo_storage_commit_hash(
@@ -4812,9 +4994,14 @@ fn repo_file_row_diff(
     let (Some(from), Some(to)) = (&file.from, &file.to) else {
         return Ok(None);
     };
-    let remote = repo_row_diff_remote(repo);
-    hydrate_repo_snapshot_for_row_diff(runtime, &from.snapshot, remote.clone())?;
-    hydrate_repo_snapshot_for_row_diff(runtime, &to.snapshot, remote)?;
+    let resolver = RepoSnapshotResolver::local_then_remote(
+        runtime,
+        repo_default_remote_store(repo),
+        RepoSnapshotPurpose::Diff,
+        SnapshotHashPolicy::AllowHydratedMismatch,
+    );
+    resolver.resolve_snapshot(&from.snapshot)?;
+    resolver.resolve_snapshot(&to.snapshot)?;
     crate::row_level_diff::row_level_diff_snapshots(
         runtime,
         &from.snapshot.to_snapshot(),
@@ -4824,44 +5011,9 @@ fn repo_file_row_diff(
     .map_err(|err| ErrCtx::PragmaErr(format!("Row diff error for `{}`: {err:?}", file.path).into()))
 }
 
-fn repo_row_diff_remote(repo: &Repository) -> Option<Arc<Remote>> {
+fn repo_default_remote_store(repo: &Repository) -> Option<Arc<Remote>> {
     let remote = repo_default_remote(repo, None).ok()?;
     repo.remote_store(&remote).ok().map(Arc::new)
-}
-
-fn hydrate_repo_snapshot_for_row_diff(
-    runtime: &Runtime,
-    snapshot: &RepoSnapshot,
-    remote: Option<Arc<Remote>>,
-) -> Result<(), ErrCtx> {
-    let local_result = hydrate_repo_snapshot_with_hash_policy(
-        runtime,
-        snapshot,
-        None,
-        SnapshotHashPolicy::AllowHydratedMismatch,
-    );
-    let Err(local_err) = local_result else {
-        return Ok(());
-    };
-
-    let Some(remote) = remote else {
-        return Err(local_err);
-    };
-
-    hydrate_repo_snapshot_with_hash_policy(
-        runtime,
-        snapshot,
-        Some(remote),
-        SnapshotHashPolicy::AllowHydratedMismatch,
-    )
-    .map_err(|remote_err| {
-        ErrCtx::PragmaErr(
-            format!(
-                "local snapshot hydrate failed: {local_err}; remote snapshot hydrate failed: {remote_err}"
-            )
-            .into(),
-        )
-    })
 }
 
 fn write_indented(out: &mut String, text: &str, prefix: &str) -> Result<(), ErrCtx> {
@@ -5415,9 +5567,9 @@ fn format_current_file_row_merge_analysis(
         )));
     };
 
-    hydrate_repo_file_state(runtime, base, None)?;
-    hydrate_repo_file_state(runtime, ours, None)?;
-    hydrate_repo_file_state(runtime, theirs, remote)?;
+    hydrate_repo_file_state_for(runtime, base, None, RepoSnapshotPurpose::Merge)?;
+    hydrate_repo_file_state_for(runtime, ours, None, RepoSnapshotPurpose::Merge)?;
+    hydrate_repo_file_state_for(runtime, theirs, remote, RepoSnapshotPurpose::Merge)?;
     let analysis = crate::row_merge::analyze_snapshot_merge(runtime, base, ours, theirs)?;
     let mut f = String::new();
     writeln!(&mut f, "Row-level analysis for {key}:")?;
@@ -5514,9 +5666,9 @@ fn current_file_row_merge_analysis(
         }));
     };
 
-    hydrate_repo_file_state(runtime, &base, None)?;
-    hydrate_repo_file_state(runtime, &ours, None)?;
-    hydrate_repo_file_state(runtime, &theirs, remote)?;
+    hydrate_repo_file_state_for(runtime, &base, None, RepoSnapshotPurpose::Merge)?;
+    hydrate_repo_file_state_for(runtime, &ours, None, RepoSnapshotPurpose::Merge)?;
+    hydrate_repo_file_state_for(runtime, &theirs, remote, RepoSnapshotPurpose::Merge)?;
 
     let plan = crate::row_merge::plan_snapshot_merge(runtime, &base, &ours, &theirs)?;
     let row_conflicts: Vec<JsonRowMergeConflict> = plan
@@ -5629,9 +5781,9 @@ fn try_row_auto_merge_current_file_status_conflict(
         return Ok(None);
     };
 
-    hydrate_repo_file_state(runtime, &base, None)?;
-    hydrate_repo_file_state(runtime, &ours, None)?;
-    hydrate_repo_file_state(runtime, &theirs, remote)?;
+    hydrate_repo_file_state_for(runtime, &base, None, RepoSnapshotPurpose::Merge)?;
+    hydrate_repo_file_state_for(runtime, &ours, None, RepoSnapshotPurpose::Merge)?;
+    hydrate_repo_file_state_for(runtime, &theirs, remote, RepoSnapshotPurpose::Merge)?;
 
     let plan = crate::row_merge::plan_snapshot_merge(runtime, &base, &ours, &theirs)?;
     if plan.has_conflicts() || plan.has_opaque_changes() || plan.apply_change_count() == 0 {
