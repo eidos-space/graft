@@ -26,6 +26,7 @@ tracing = { workspace = true }
 default = ["dynamic"]
 dynamic = ["sqlite-plugin/dynamic"]
 static = ["sqlite-plugin/static"]
+bundled-sqlite = ["graft-sqlite/bundled-sqlite"]
 
 [lints]
 workspace = true

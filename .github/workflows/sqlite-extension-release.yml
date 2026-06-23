@@ -135,16 +135,26 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
 
       - name: Configure macOS libclang
         if: startsWith(matrix.runner, 'macos')
         run: |
           set -euo pipefail
-          if brew --prefix llvm@15 >/dev/null 2>&1; then
-            echo "LIBCLANG_PATH=$(brew --prefix llvm@15)/lib" >> "$GITHUB_ENV"
-          elif brew --prefix llvm >/dev/null 2>&1; then
-            echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
+          libclang="$(
+            find \
+              /Applications/Xcode*.app \
+              /Library/Developer/CommandLineTools \
+              "$(brew --prefix llvm@15 2>/dev/null || true)" \
+              "$(brew --prefix llvm 2>/dev/null || true)" \
+              -name libclang.dylib -print 2>/dev/null | head -n 1
+          )"
+          if [[ -z "$libclang" ]]; then
+            echo "::error::could not find libclang.dylib"
+            exit 1
           fi
+          echo "LIBCLANG_PATH=$(dirname "$libclang")" >> "$GITHUB_ENV"
+          echo "Using libclang at $libclang"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
@@ -163,7 +173,7 @@ jobs:
           cargo build \
             --release \
             --no-default-features \
-            --features dynamic \
+            --features dynamic,bundled-sqlite \
             --package graft-ext \
             --target "${{ matrix.target }}"
 

@@ -35,3 +35,4 @@ default = []
 # export a register_static method allowing the Graft SQLite extension to be
 # statically setup in a Rust project
 register-static = ["sqlite-plugin/static"]
+bundled-sqlite = ["rusqlite/bundled"]
