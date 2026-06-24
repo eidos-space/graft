@@ -89,6 +89,78 @@ pragma graft_merge_continue = 'Merge remote changes';
 pragma graft_merge_abort;
 ```
 
+## Release Downloads
+
+Prebuilt release assets are published on the
+[GitHub releases page](https://github.com/eidos-space/graft/releases). Each
+release includes:
+
+- `sqlite-graft-<version>-<target>`: the dynamic SQLite extension
+  (`libgraft_ext.so`, `libgraft_ext.dylib`, or `graft_ext.dll`).
+- `graft-cli-<version>-<target>`: the `graft` command-line tool.
+- `SHA256SUMS`: checksums for all release archives.
+
+Supported release targets:
+
+- `x86_64-unknown-linux-gnu`
+- `aarch64-unknown-linux-gnu`
+- `x86_64-apple-darwin`
+- `aarch64-apple-darwin`
+- `x86_64-pc-windows-msvc`
+- `aarch64-pc-windows-msvc`
+
+Install the latest CLI with one command:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/eidos-space/graft/main/install.sh | sh
+```
+
+Pin a version or choose an install directory with environment variables:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/eidos-space/graft/main/install.sh \
+  | env GRAFT_VERSION=0.3.1 GRAFT_INSTALL_DIR="$HOME/.local/bin" sh
+```
+
+The installer downloads the matching `graft-cli` asset for the current OS and
+CPU, verifies it against `SHA256SUMS`, and installs `graft` into `/usr/local/bin`
+when writable or `$HOME/.local/bin` otherwise. On Windows, download the matching
+`.zip` archive from the release page, extract `graft.exe`, and place it
+somewhere on `PATH`.
+
+## CLI
+
+The CLI package is `graft-tool` and the installed binary is `graft`. It wraps the
+same repository-mode SQLite pragmas exposed by the extension. By default it uses
+`app.db` in the current directory; pass `--db path/to/db.sqlite3` to work with a
+different database file.
+
+Basic workflow:
+
+```sh
+graft --db db.sqlite3 init
+graft --db db.sqlite3 add
+graft --db db.sqlite3 commit -m "Initial version"
+graft --db db.sqlite3 status --json
+graft --db db.sqlite3 log
+graft --db db.sqlite3 diff --rows --json HEAD
+```
+
+Remote workflow:
+
+```sh
+graft --db db.sqlite3 remote add origin s3://bucket/path
+graft --db db.sqlite3 fetch
+graft --db db.sqlite3 pull
+graft --db db.sqlite3 push
+```
+
+Clone an existing repository into a local SQLite worktree:
+
+```sh
+graft --db db.sqlite3 clone s3://bucket/path main
+```
+
 ## Development
 
 Common commands:

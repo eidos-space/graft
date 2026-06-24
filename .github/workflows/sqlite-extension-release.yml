@@ -1,4 +1,4 @@
-name: Release SQLite Extension
+name: Release SQLite Extension and CLI
 
 on:
   push:
@@ -136,6 +136,7 @@ jobs:
           set -euo pipefail
           sudo apt-get install -y gcc-aarch64-linux-gnu
           echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
 
       - name: Configure macOS libclang
         if: startsWith(matrix.runner, 'macos')
@@ -172,6 +173,14 @@ jobs:
             --package graft-ext \
             --target "${{ matrix.target }}"
 
+      - name: Build CLI
+        run: |
+          set -euo pipefail
+          cargo build \
+            --release \
+            --package graft-tool \
+            --target "${{ matrix.target }}"
+
       - name: Stage extension artifact
         run: |
           set -euo pipefail
@@ -191,11 +200,43 @@ jobs:
           Load this dynamic SQLite extension with SQLite's load_extension support.
           EOF
 
+      - name: Stage CLI artifact
+        run: |
+          set -euo pipefail
+
+          artifact_dir="cli-package/${{ matrix.target }}"
+          mkdir -p "$artifact_dir"
+
+          binary="graft"
+          if [[ "${{ matrix.target }}" == *"windows"* ]]; then
+            binary="graft.exe"
+          fi
+
+          cp "target/${{ matrix.target }}/release/${binary}" "$artifact_dir/"
+          cp LICENSE-APACHE LICENSE-MIT "$artifact_dir/"
+
+          cat > "$artifact_dir/README.txt" <<EOF
+          Graft CLI
+          Version: ${{ needs.metadata.outputs.version }}
+          Target: ${{ matrix.target }}
+          Source: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}
+
+          Run ./graft --help or graft.exe --help to see available repository commands.
+          EOF
+
       - name: Upload build artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: graft-sqlite-extension-${{ matrix.target }}
           path: package/${{ matrix.target }}
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload CLI artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: graft-cli-${{ matrix.target }}
+          path: cli-package/${{ matrix.target }}
           if-no-files-found: error
           retention-days: 7
 
@@ -212,25 +253,58 @@ jobs:
           pattern: graft-sqlite-extension-*
           path: downloaded/
 
+      - name: Download CLI artifacts
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          pattern: graft-cli-*
+          path: downloaded/
+
       - name: Package release assets
         shell: bash
         run: |
           set -euo pipefail
+          shopt -s nullglob
           sudo apt-get update
           sudo apt-get install -y zip
 
           mkdir -p release-assets
+          asset_dir="$PWD/release-assets"
           version="${{ needs.metadata.outputs.version }}"
 
-          for dir in downloaded/graft-sqlite-extension-*; do
-            target="${dir#downloaded/graft-sqlite-extension-}"
-            archive_base="sqlite-graft-${version}-${target}"
+          package_dir() {
+            local dir="$1"
+            local archive_base="$2"
+            local target="$3"
 
             if [[ "$target" == *"windows"* ]]; then
-              (cd "$dir" && zip -r "../../release-assets/${archive_base}.zip" .)
+              (cd "$dir" && zip -r "${asset_dir}/${archive_base}.zip" .)
             else
-              tar -czf "release-assets/${archive_base}.tar.gz" -C "$dir" .
+              tar -czf "${asset_dir}/${archive_base}.tar.gz" -C "$dir" .
             fi
+          }
+
+          extension_dirs=(downloaded/graft-sqlite-extension-*)
+          if ((${#extension_dirs[@]} == 0)); then
+            echo "::error::no SQLite extension artifacts were downloaded"
+            exit 1
+          fi
+
+          for dir in "${extension_dirs[@]}"; do
+            target="${dir#downloaded/graft-sqlite-extension-}"
+            archive_base="sqlite-graft-${version}-${target}"
+            package_dir "$dir" "$archive_base" "$target"
+          done
+
+          cli_dirs=(downloaded/graft-cli-*)
+          if ((${#cli_dirs[@]} == 0)); then
+            echo "::error::no CLI artifacts were downloaded"
+            exit 1
+          fi
+
+          for dir in "${cli_dirs[@]}"; do
+            target="${dir#downloaded/graft-cli-}"
+            archive_base="graft-cli-${version}-${target}"
+            package_dir "$dir" "$archive_base" "$target"
           done
 
           (cd release-assets && sha256sum * > SHA256SUMS)
