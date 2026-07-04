@@ -139,7 +139,7 @@ jobs:
               target/aarch64-apple-darwin/release/libgraft_ext.a
 
           - runs-on: ubuntu-24.04
-            features: dynamic
+            features: dynamic,bundled-sqlite
             targets:
               - aarch64-linux-android
               - x86_64-linux-android
