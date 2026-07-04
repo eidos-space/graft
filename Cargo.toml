@@ -59,7 +59,7 @@ zerocopy = { version = "0.8.27", features = ["derive"] }
 zstd = "0.13.3"
 
 [workspace.dependencies.opendal]
-# version = "0.55.0"
+version = "0.55.0"
 features = ["services-s3", "services-fs"]
 git = "https://github.com/apache/opendal"
 branch = "main"
