@@ -5,12 +5,109 @@
 use std::collections::{BTreeMap, HashSet};
 
 use crate::sqlite_parse::{
-    ColumnInfo, KeyConstraintKind, MasterEntry, ParseError, Record, TableScanner, read_all_rows,
+    ColumnInfo, GeneratedColumnKind, KeyConstraintKind, MasterEntry, ParseError, Record,
+    TableScanner, Value, read_all_rows,
 };
-use graft::core::{VolumeId, lsn::LSN};
+use graft::core::{PageIdx, VolumeId, lsn::LSN};
 use graft::rt::runtime::Runtime;
 use graft::snapshot::Snapshot;
-use graft::volume_reader::VolumeReader;
+use graft::volume_reader::{VolumeRead, VolumeReader};
+
+/// Coarse logical status for a SQLite snapshot diff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogicalDiffStatus {
+    LogicalChanges,
+    UnsupportedLogicalSurface,
+    FileChangedNoSupportedLogicalChanges,
+}
+
+impl LogicalDiffStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LogicalChanges => "logical_changes",
+            Self::UnsupportedLogicalSurface => "unsupported_logical_surface",
+            Self::FileChangedNoSupportedLogicalChanges => {
+                "file_changed_no_supported_logical_changes"
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowLevelDiffCapability {
+    RowidTableRows,
+    SchemaEntries,
+    OpaqueTableDetection,
+    SemanticInsertKeys,
+}
+
+impl RowLevelDiffCapability {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RowidTableRows => "rowid_table_rows",
+            Self::SchemaEntries => "schema_entries",
+            Self::OpaqueTableDetection => "opaque_table_detection",
+            Self::SemanticInsertKeys => "semantic_insert_keys",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowLevelDiffLimitationKind {
+    VirtualTable,
+    FtsShadowTable,
+    WithoutRowidTable,
+    SqliteInternalTable,
+    IndexBtree,
+    Utf16TextEncoding,
+    GeneratedColumns,
+}
+
+impl RowLevelDiffLimitationKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::VirtualTable => "virtual_table",
+            Self::FtsShadowTable => "fts_shadow_table",
+            Self::WithoutRowidTable => "without_rowid_table",
+            Self::SqliteInternalTable => "sqlite_internal_table",
+            Self::IndexBtree => "index_btree",
+            Self::Utf16TextEncoding => "utf16_text_encoding",
+            Self::GeneratedColumns => "generated_columns",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowLevelDiffLimitation {
+    pub kind: RowLevelDiffLimitationKind,
+    pub subject: Option<String>,
+}
+
+impl RowLevelDiffLimitation {
+    fn new(kind: RowLevelDiffLimitationKind, subject: Option<String>) -> Self {
+        Self { kind, subject }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowLevelDiffAnalysis {
+    pub capabilities: Vec<RowLevelDiffCapability>,
+    pub limitations: Vec<RowLevelDiffLimitation>,
+}
+
+impl Default for RowLevelDiffAnalysis {
+    fn default() -> Self {
+        Self {
+            capabilities: vec![
+                RowLevelDiffCapability::RowidTableRows,
+                RowLevelDiffCapability::SchemaEntries,
+                RowLevelDiffCapability::OpaqueTableDetection,
+                RowLevelDiffCapability::SemanticInsertKeys,
+            ],
+            limitations: Vec::new(),
+        }
+    }
+}
 
 /// Type of row change
 #[derive(Debug, Clone, PartialEq)]
@@ -36,6 +133,7 @@ pub struct TableChanges {
     pub table_name: String,
     pub columns: Vec<String>,
     pub rowid_alias: Option<String>,
+    pub generated_columns: BTreeMap<String, GeneratedColumnKind>,
     pub semantic_key_columns: Vec<String>,
     pub changes: Vec<RowChange>,
 }
@@ -62,6 +160,19 @@ impl TableChanges {
 
     pub fn to_sql_filtered_with_insert_rowid(
         &self,
+        include: impl FnMut(&RowChange) -> bool,
+        insert_rowid_mode: impl FnMut(&RowChange) -> InsertRowidMode,
+    ) -> String {
+        self.to_sql_filtered_with_insert_rowid_and_generated(
+            &self.generated_columns,
+            include,
+            insert_rowid_mode,
+        )
+    }
+
+    pub fn to_sql_filtered_with_insert_rowid_and_generated(
+        &self,
+        generated_columns: &BTreeMap<String, GeneratedColumnKind>,
         mut include: impl FnMut(&RowChange) -> bool,
         mut insert_rowid_mode: impl FnMut(&RowChange) -> InsertRowidMode,
     ) -> String {
@@ -81,25 +192,27 @@ impl TableChanges {
                         &self.table_name,
                         &self.columns,
                         self.rowid_alias.as_deref(),
+                        generated_columns,
                         rowid,
                         row,
                     ));
-                    sql.push('\n');
                 }
                 RowChange::Delete { rowid, .. } => {
                     sql.push_str(&format_sql_delete(&self.table_name, *rowid));
-                    sql.push('\n');
                 }
                 RowChange::Update { rowid, new_row, .. } => {
                     sql.push_str(&format_sql_update(
                         &self.table_name,
                         &self.columns,
                         self.rowid_alias.as_deref(),
+                        generated_columns,
                         *rowid,
                         new_row,
                     ));
-                    sql.push('\n');
                 }
+            }
+            if !sql.ends_with('\n') && !sql.is_empty() {
+                sql.push('\n');
             }
         }
 
@@ -112,6 +225,7 @@ pub struct SchemaChange {
     pub name: String,
     pub entry_type: String,
     pub sql: String,
+    pub old_sql: Option<String>,
     pub kind: SchemaChangeKind,
 }
 
@@ -151,6 +265,9 @@ impl OpaqueChangeKind {
 pub enum OpaqueChangeReason {
     VirtualTable,
     FtsShadowTable,
+    WithoutRowidTable,
+    SqliteInternalTable,
+    IndexBtree,
 }
 
 impl OpaqueChangeReason {
@@ -158,6 +275,19 @@ impl OpaqueChangeReason {
         match self {
             Self::VirtualTable => "virtual_table",
             Self::FtsShadowTable => "fts_shadow_table",
+            Self::WithoutRowidTable => "without_rowid_table",
+            Self::SqliteInternalTable => "sqlite_internal_table",
+            Self::IndexBtree => "index_btree",
+        }
+    }
+
+    fn limitation_kind(self) -> RowLevelDiffLimitationKind {
+        match self {
+            Self::VirtualTable => RowLevelDiffLimitationKind::VirtualTable,
+            Self::FtsShadowTable => RowLevelDiffLimitationKind::FtsShadowTable,
+            Self::WithoutRowidTable => RowLevelDiffLimitationKind::WithoutRowidTable,
+            Self::SqliteInternalTable => RowLevelDiffLimitationKind::SqliteInternalTable,
+            Self::IndexBtree => RowLevelDiffLimitationKind::IndexBtree,
         }
     }
 }
@@ -174,12 +304,23 @@ pub(crate) struct IgnoredTable {
 pub struct RowLevelDiff {
     pub from_lsn: LSN,
     pub to_lsn: LSN,
+    pub analysis: RowLevelDiffAnalysis,
     pub schema_changes: Vec<SchemaChange>,
     pub table_changes: Vec<TableChanges>,
     pub opaque_changes: Vec<OpaqueChange>,
 }
 
 impl RowLevelDiff {
+    pub fn logical_status(&self) -> LogicalDiffStatus {
+        if !self.schema_changes.is_empty() || !self.table_changes.is_empty() {
+            LogicalDiffStatus::LogicalChanges
+        } else if !self.opaque_changes.is_empty() {
+            LogicalDiffStatus::UnsupportedLogicalSurface
+        } else {
+            LogicalDiffStatus::FileChangedNoSupportedLogicalChanges
+        }
+    }
+
     /// Generate complete SQL diff
     pub fn to_sql(&self) -> String {
         let mut sql = format!(
@@ -426,9 +567,15 @@ fn row_level_diff_checked_out(
     // Compare schema and tables
     let schema_changes = diff_schema_entries(&from_master, &to_master);
     let mut table_changes = Vec::new();
+    let mut limitations = diff_parser_limitations(&from_scanner, &to_scanner);
 
     // Collect all table names
     let ignored_table_infos = ignored_row_diff_table_infos(&from_master, &to_master);
+    limitations.extend(ignored_table_infos.values().map(|table| {
+        RowLevelDiffLimitation::new(table.reason.limitation_kind(), Some(table.name.clone()))
+    }));
+    limitations.extend(generated_column_limitations(&from_master, &to_master));
+    dedupe_limitations(&mut limitations);
     let ignored_tables: HashSet<String> = ignored_table_infos.keys().cloned().collect();
     let opaque_changes = diff_opaque_tables(
         &from_reader,
@@ -437,6 +584,15 @@ fn row_level_diff_checked_out(
         &to_master,
         &ignored_table_infos,
     );
+    let index_btree_changes = diff_index_btrees(&from_reader, &to_reader, &from_master, &to_master);
+    limitations.extend(index_btree_changes.iter().map(|change| {
+        RowLevelDiffLimitation::new(change.reason.limitation_kind(), Some(change.name.clone()))
+    }));
+    dedupe_limitations(&mut limitations);
+    let opaque_changes = opaque_changes
+        .into_iter()
+        .chain(index_btree_changes)
+        .collect();
     let mut all_tables: HashSet<String> = HashSet::new();
     for entry in &from_master {
         if is_diffable_table(entry, &ignored_tables) {
@@ -465,6 +621,7 @@ fn row_level_diff_checked_out(
             &column_infos,
             rowid_alias.as_deref(),
         );
+        let generated_columns = generated_columns(&column_infos);
         let columns: Vec<String> = column_infos.into_iter().map(|c| c.name).collect();
 
         let changes = match (from_entry, to_entry) {
@@ -496,6 +653,7 @@ fn row_level_diff_checked_out(
                 table_name,
                 columns,
                 rowid_alias,
+                generated_columns,
                 semantic_key_columns,
                 changes,
             });
@@ -505,6 +663,10 @@ fn row_level_diff_checked_out(
     Ok(RowLevelDiff {
         from_lsn,
         to_lsn,
+        analysis: RowLevelDiffAnalysis {
+            limitations,
+            ..RowLevelDiffAnalysis::default()
+        },
         schema_changes,
         table_changes,
         opaque_changes,
@@ -546,12 +708,14 @@ fn diff_schema_entries(
                 name: to.name.clone(),
                 entry_type: to.entry_type.clone(),
                 sql: to.sql.clone(),
+                old_sql: None,
                 kind: SchemaChangeKind::Added,
             }),
             (Some(from), None) => Some(SchemaChange {
                 name: from.name.clone(),
                 entry_type: from.entry_type.clone(),
                 sql: from.sql.clone(),
+                old_sql: Some(from.sql.clone()),
                 kind: SchemaChangeKind::Deleted,
             }),
             (Some(from), Some(to))
@@ -563,6 +727,7 @@ fn diff_schema_entries(
                     name: to.name.clone(),
                     entry_type: to.entry_type.clone(),
                     sql: to.sql.clone(),
+                    old_sql: Some(from.sql.clone()),
                     kind: SchemaChangeKind::Modified,
                 })
             }
@@ -652,6 +817,59 @@ fn table_read_err(side: &str, entry: &MasterEntry, err: ParseError) -> graft::er
     ))
 }
 
+fn diff_parser_limitations(
+    from_scanner: &TableScanner<'_>,
+    to_scanner: &TableScanner<'_>,
+) -> Vec<RowLevelDiffLimitation> {
+    let mut limitations = Vec::new();
+    if from_scanner.get_header().text_encoding != crate::sqlite_parse::TextEncoding::Utf8
+        || to_scanner.get_header().text_encoding != crate::sqlite_parse::TextEncoding::Utf8
+    {
+        limitations.push(RowLevelDiffLimitation::new(
+            RowLevelDiffLimitationKind::Utf16TextEncoding,
+            None,
+        ));
+    }
+    limitations
+}
+
+fn generated_column_limitations(
+    from_master: &[MasterEntry],
+    to_master: &[MasterEntry],
+) -> Vec<RowLevelDiffLimitation> {
+    let mut limitations = Vec::new();
+    let mut seen = HashSet::new();
+    for entry in from_master.iter().chain(to_master.iter()) {
+        if entry.entry_type != "table" || !has_generated_columns(entry) {
+            continue;
+        }
+        if seen.insert(entry.name.clone()) {
+            limitations.push(RowLevelDiffLimitation::new(
+                RowLevelDiffLimitationKind::GeneratedColumns,
+                Some(entry.name.clone()),
+            ));
+        }
+    }
+    limitations
+}
+
+fn has_generated_columns(entry: &MasterEntry) -> bool {
+    let sql = entry.sql.to_ascii_lowercase();
+    sql.contains(" generated always ")
+        || sql.contains(" generated\n")
+        || sql.contains(" generated\t")
+}
+
+fn dedupe_limitations(limitations: &mut Vec<RowLevelDiffLimitation>) {
+    let mut seen = HashSet::new();
+    limitations.retain(|limitation| {
+        seen.insert((
+            limitation.kind.as_str(),
+            limitation.subject.clone().unwrap_or_default(),
+        ))
+    });
+}
+
 const FTS_SHADOW_SUFFIXES: &[&str] = &[
     "_content",
     "_data",
@@ -679,7 +897,27 @@ pub(crate) fn ignored_row_diff_table_infos(
     let mut ignored = BTreeMap::new();
 
     for entry in from_master.iter().chain(to_master.iter()) {
+        if is_sqlite_internal_table(entry) {
+            ignored
+                .entry(entry.name.clone())
+                .or_insert_with(|| IgnoredTable {
+                    name: entry.name.clone(),
+                    reason: OpaqueChangeReason::SqliteInternalTable,
+                    owner: None,
+                });
+            continue;
+        }
+
         if !is_virtual_table(entry) {
+            if is_without_rowid_table(entry) {
+                ignored
+                    .entry(entry.name.clone())
+                    .or_insert_with(|| IgnoredTable {
+                        name: entry.name.clone(),
+                        reason: OpaqueChangeReason::WithoutRowidTable,
+                        owner: None,
+                    });
+            }
             continue;
         }
 
@@ -722,7 +960,9 @@ fn diff_opaque_tables(
             (None, None) => None,
             (None, Some(_)) => Some(OpaqueChangeKind::Added),
             (Some(_), None) => Some(OpaqueChangeKind::Deleted),
-            (Some(from), Some(to)) => opaque_table_change_kind(from_reader, to_reader, from, to),
+            (Some(from), Some(to)) => {
+                opaque_table_change_kind(from_reader, to_reader, from, to, info.reason)
+            }
         };
 
         if let Some(change) = change {
@@ -738,11 +978,46 @@ fn diff_opaque_tables(
     changes
 }
 
+fn diff_index_btrees(
+    from_reader: &VolumeReader,
+    to_reader: &VolumeReader,
+    from_master: &[MasterEntry],
+    to_master: &[MasterEntry],
+) -> Vec<OpaqueChange> {
+    let mut changes = Vec::new();
+    let mut names = HashSet::new();
+    for entry in from_master.iter().chain(to_master.iter()) {
+        if is_index_btree(entry) {
+            names.insert(entry.name.clone());
+        }
+    }
+    for name in names {
+        let from_entry = from_master.iter().find(|entry| entry.name == name);
+        let to_entry = to_master.iter().find(|entry| entry.name == name);
+        let change = match (from_entry, to_entry) {
+            (Some(from), Some(to)) => {
+                opaque_root_page_change_kind(from_reader, to_reader, from, to)
+            }
+            _ => None,
+        };
+        if let Some(change) = change {
+            changes.push(OpaqueChange {
+                name,
+                change,
+                reason: OpaqueChangeReason::IndexBtree,
+                owner: None,
+            });
+        }
+    }
+    changes
+}
+
 fn opaque_table_change_kind(
     from_reader: &VolumeReader,
     to_reader: &VolumeReader,
     from: &MasterEntry,
     to: &MasterEntry,
+    reason: OpaqueChangeReason,
 ) -> Option<OpaqueChangeKind> {
     if from.entry_type != to.entry_type || from.table_name != to.table_name || from.sql != to.sql {
         return Some(OpaqueChangeKind::Modified);
@@ -750,6 +1025,13 @@ fn opaque_table_change_kind(
 
     if from.root_page == 0 || to.root_page == 0 {
         return None;
+    }
+
+    if matches!(
+        reason,
+        OpaqueChangeReason::WithoutRowidTable | OpaqueChangeReason::SqliteInternalTable
+    ) {
+        return opaque_root_page_change_kind(from_reader, to_reader, from, to);
     }
 
     match diff_table_rows(from_reader, to_reader, from, to) {
@@ -765,11 +1047,41 @@ fn opaque_table_change_kind(
     }
 }
 
+fn opaque_root_page_change_kind(
+    from_reader: &VolumeReader,
+    to_reader: &VolumeReader,
+    from: &MasterEntry,
+    to: &MasterEntry,
+) -> Option<OpaqueChangeKind> {
+    if from.root_page != to.root_page {
+        return Some(OpaqueChangeKind::Modified);
+    }
+    let Some(page_idx) = PageIdx::try_new(from.root_page) else {
+        return Some(OpaqueChangeKind::Modified);
+    };
+    let from_page = from_reader.read_page(page_idx);
+    let to_page = to_reader.read_page(page_idx);
+    match (from_page, to_page) {
+        (Ok(from_page), Ok(to_page)) => {
+            (from_page.as_ref() != to_page.as_ref()).then_some(OpaqueChangeKind::Modified)
+        }
+        _ => Some(OpaqueChangeKind::Modified),
+    }
+}
+
 pub(crate) fn is_diffable_table(entry: &MasterEntry, ignored_tables: &HashSet<String>) -> bool {
     entry.entry_type == "table"
         && !entry.name.starts_with("sqlite_")
         && entry.root_page != 0
         && !ignored_tables.contains(&entry.name)
+}
+
+fn is_sqlite_internal_table(entry: &MasterEntry) -> bool {
+    entry.entry_type == "table" && entry.name.starts_with("sqlite_") && entry.root_page != 0
+}
+
+fn is_index_btree(entry: &MasterEntry) -> bool {
+    entry.entry_type == "index" && entry.root_page != 0
 }
 
 fn is_virtual_table(entry: &MasterEntry) -> bool {
@@ -780,6 +1092,10 @@ fn is_virtual_table(entry: &MasterEntry) -> bool {
                 .trim_start()
                 .to_ascii_lowercase()
                 .starts_with("create virtual table"))
+}
+
+fn is_without_rowid_table(entry: &MasterEntry) -> bool {
+    entry.entry_type == "table" && entry.sql.to_ascii_lowercase().contains("without rowid")
 }
 
 fn is_fts_virtual_table(entry: &MasterEntry) -> bool {
@@ -801,6 +1117,13 @@ fn rowid_alias_column(columns: &[ColumnInfo]) -> Option<String> {
         .iter()
         .find(|column| column.pk && column.ctype.eq_ignore_ascii_case("INTEGER"))
         .map(|column| column.name.clone())
+}
+
+fn generated_columns(columns: &[ColumnInfo]) -> BTreeMap<String, GeneratedColumnKind> {
+    columns
+        .iter()
+        .filter_map(|column| column.generated.map(|kind| (column.name.clone(), kind)))
+        .collect()
 }
 
 fn semantic_key_columns(
@@ -871,6 +1194,7 @@ fn format_sql_insert(
     table: &str,
     columns: &[String],
     rowid_alias: Option<&str>,
+    generated_columns: &BTreeMap<String, GeneratedColumnKind>,
     rowid: Option<i64>,
     row: &Record,
 ) -> String {
@@ -880,7 +1204,7 @@ fn format_sql_insert(
         insert_columns.push(quote_identifier("rowid"));
         values.push(rowid.to_string());
     }
-    for (column, value) in columns.iter().zip(&row.values) {
+    for (column, value) in writable_column_values(columns, generated_columns, row) {
         if rowid.is_some() && rowid_alias == Some(column.as_str()) {
             continue;
         }
@@ -909,24 +1233,18 @@ fn format_sql_update(
     table: &str,
     columns: &[String],
     rowid_alias: Option<&str>,
+    generated_columns: &BTreeMap<String, GeneratedColumnKind>,
     rowid: i64,
     row: &Record,
 ) -> String {
-    let set_clause: Vec<_> = if columns.len() == row.values.len() {
-        columns
-            .iter()
-            .zip(row.values.iter())
-            .filter(|(col, _)| rowid_alias != Some(col.as_str()))
-            .map(|(col, val)| format!("{} = {}", quote_identifier(col), val.to_sql()))
-            .collect()
-    } else {
-        // Fallback: use positional names when column count doesn't match
-        row.values
-            .iter()
-            .enumerate()
-            .map(|(i, val)| format!("col{} = {}", i, val.to_sql()))
-            .collect()
-    };
+    let set_clause: Vec<_> = writable_column_values(columns, generated_columns, row)
+        .into_iter()
+        .filter(|(col, _)| rowid_alias != Some(col.as_str()))
+        .map(|(col, val)| format!("{} = {}", quote_identifier(col), val.to_sql()))
+        .collect();
+    if set_clause.is_empty() {
+        return String::new();
+    }
 
     format!(
         "UPDATE {} SET {} WHERE rowid = {};",
@@ -934,6 +1252,31 @@ fn format_sql_update(
         set_clause.join(", "),
         rowid
     )
+}
+
+fn writable_column_values<'a>(
+    columns: &'a [String],
+    generated_columns: &BTreeMap<String, GeneratedColumnKind>,
+    row: &'a Record,
+) -> Vec<(&'a String, &'a Value)> {
+    let mut values = Vec::new();
+    let mut value_index = 0;
+    for column in columns {
+        match generated_columns.get(column) {
+            Some(GeneratedColumnKind::Virtual) => continue,
+            Some(GeneratedColumnKind::Stored) => {
+                value_index += 1;
+                continue;
+            }
+            None => {}
+        }
+        let Some(value) = row.values.get(value_index) else {
+            break;
+        };
+        value_index += 1;
+        values.push((column, value));
+    }
+    values
 }
 
 /// Escape SQL identifier
@@ -950,7 +1293,6 @@ fn quote_identifier(id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sqlite_parse::Value;
 
     fn make_record(vals: Vec<Value>) -> Record {
         Record { values: vals }
@@ -961,11 +1303,13 @@ mod tests {
         let diff = RowLevelDiff {
             from_lsn: graft::core::lsn::LSN::new(1),
             to_lsn: graft::core::lsn::LSN::new(2),
+            analysis: RowLevelDiffAnalysis::default(),
             schema_changes: vec![],
             table_changes: vec![TableChanges {
                 table_name: "users".into(),
                 columns: vec!["id".into(), "name".into()],
                 rowid_alias: Some("id".into()),
+                generated_columns: BTreeMap::new(),
                 semantic_key_columns: vec![],
                 changes: vec![
                     RowChange::Insert {
@@ -993,11 +1337,13 @@ mod tests {
         let diff = RowLevelDiff {
             from_lsn: graft::core::lsn::LSN::new(1),
             to_lsn: graft::core::lsn::LSN::new(2),
+            analysis: RowLevelDiffAnalysis::default(),
             schema_changes: vec![],
             table_changes: vec![TableChanges {
                 table_name: "users".into(),
                 columns: vec!["id".into(), "name".into()],
                 rowid_alias: Some("id".into()),
+                generated_columns: BTreeMap::new(),
                 semantic_key_columns: vec![],
                 changes: vec![RowChange::Delete {
                     rowid: 1,
@@ -1016,11 +1362,13 @@ mod tests {
         let diff = RowLevelDiff {
             from_lsn: graft::core::lsn::LSN::new(1),
             to_lsn: graft::core::lsn::LSN::new(2),
+            analysis: RowLevelDiffAnalysis::default(),
             schema_changes: vec![],
             table_changes: vec![TableChanges {
                 table_name: "users".into(),
                 columns: vec!["id".into(), "name".into()],
                 rowid_alias: Some("id".into()),
+                generated_columns: BTreeMap::new(),
                 semantic_key_columns: vec![],
                 changes: vec![RowChange::Update {
                     rowid: 1,
@@ -1043,6 +1391,7 @@ mod tests {
         let diff = RowLevelDiff {
             from_lsn: graft::core::lsn::LSN::new(1),
             to_lsn: graft::core::lsn::LSN::new(2),
+            analysis: RowLevelDiffAnalysis::default(),
             schema_changes: vec![],
             table_changes: vec![],
             opaque_changes: vec![],
@@ -1061,6 +1410,7 @@ mod tests {
             table_name: "orders".into(),
             columns: vec!["id".into(), "amount".into()],
             rowid_alias: Some("id".into()),
+            generated_columns: BTreeMap::new(),
             semantic_key_columns: vec![],
             changes: vec![
                 RowChange::Insert {
@@ -1093,6 +1443,7 @@ mod tests {
             "users",
             &["id".into(), "name".into()],
             Some("id"),
+            &BTreeMap::new(),
             Some(7),
             &row,
         );
@@ -1102,15 +1453,63 @@ mod tests {
     #[test]
     fn test_sql_insert_format_preserves_hidden_rowid() {
         let row = make_record(vec![Value::Text("test".into())]);
-        let sql = format_sql_insert("users", &["name".into()], None, Some(7), &row);
+        let sql = format_sql_insert(
+            "users",
+            &["name".into()],
+            None,
+            &BTreeMap::new(),
+            Some(7),
+            &row,
+        );
         assert_eq!(sql, "INSERT INTO users (rowid, name) VALUES (7, 'test');");
     }
 
     #[test]
     fn test_sql_insert_format_can_omit_hidden_rowid() {
         let row = make_record(vec![Value::Text("test".into())]);
-        let sql = format_sql_insert("users", &["name".into()], None, None, &row);
+        let sql = format_sql_insert(
+            "users",
+            &["name".into()],
+            None,
+            &BTreeMap::new(),
+            None,
+            &row,
+        );
         assert_eq!(sql, "INSERT INTO users (name) VALUES ('test');");
+    }
+
+    #[test]
+    fn test_sql_insert_skips_stored_generated_columns() {
+        let row = make_record(vec![
+            Value::Integer(1),
+            Value::Text("alpha".into()),
+            Value::Text("ALPHA".into()),
+        ]);
+        let generated = BTreeMap::from([("body_upper".to_string(), GeneratedColumnKind::Stored)]);
+        let sql = format_sql_insert(
+            "docs",
+            &["id".into(), "body".into(), "body_upper".into()],
+            Some("id"),
+            &generated,
+            Some(1),
+            &row,
+        );
+        assert_eq!(sql, "INSERT INTO docs (rowid, body) VALUES (1, 'alpha');");
+    }
+
+    #[test]
+    fn test_sql_update_skips_virtual_generated_columns_without_consuming_values() {
+        let row = make_record(vec![Value::Integer(1), Value::Text("alpha".into())]);
+        let generated = BTreeMap::from([("body_len".to_string(), GeneratedColumnKind::Virtual)]);
+        let sql = format_sql_update(
+            "docs",
+            &["id".into(), "body_len".into(), "body".into()],
+            Some("id"),
+            &generated,
+            1,
+            &row,
+        );
+        assert_eq!(sql, "UPDATE docs SET body = 'alpha' WHERE rowid = 1;");
     }
 
     #[test]
@@ -1122,7 +1521,14 @@ mod tests {
     #[test]
     fn test_sql_update_format() {
         let row = make_record(vec![Value::Null, Value::Text("new_name".into())]);
-        let sql = format_sql_update("users", &["id".into(), "name".into()], Some("id"), 1, &row);
+        let sql = format_sql_update(
+            "users",
+            &["id".into(), "name".into()],
+            Some("id"),
+            &BTreeMap::new(),
+            1,
+            &row,
+        );
         assert!(sql.contains("UPDATE users SET"));
         assert!(sql.contains("name = 'new_name'"));
         assert!(!sql.contains("SET id ="));

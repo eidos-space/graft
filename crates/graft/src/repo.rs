@@ -195,6 +195,9 @@ pub struct RepoConfig {
     #[serde(default)]
     pub extensions: ExtensionsConfig,
 
+    #[serde(default, skip_serializing_if = "MergeConfig::is_empty")]
+    pub merge: MergeConfig,
+
     #[serde(default)]
     pub remotes: BTreeMap<String, RemoteConfig>,
 
@@ -225,6 +228,30 @@ pub struct ExtensionsConfig {
 impl Default for ExtensionsConfig {
     fn default() -> Self {
         Self { object_format: OBJECT_FORMAT.to_string() }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeConfig {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub default_semantic_keys: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub semantic_keys: BTreeMap<String, Vec<String>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub internal_resolvers: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub schema_resolvers: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub generated_columns: BTreeMap<String, Vec<String>>,
+}
+
+impl MergeConfig {
+    fn is_empty(&self) -> bool {
+        self.default_semantic_keys.is_empty()
+            && self.semantic_keys.is_empty()
+            && self.internal_resolvers.is_empty()
+            && self.schema_resolvers.is_empty()
+            && self.generated_columns.is_empty()
     }
 }
 

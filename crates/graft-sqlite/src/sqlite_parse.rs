@@ -134,6 +134,19 @@ pub struct ColumnInfo {
     pub default_value: Option<Value>,
     pub pk: bool,
     pub unique: bool,
+    pub generated: Option<GeneratedColumnKind>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeneratedColumnKind {
+    Virtual,
+    Stored,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnDefinition {
+    pub name: String,
+    pub sql: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -776,6 +789,27 @@ pub fn parse_create_table_columns(sql: &str) -> Vec<ColumnInfo> {
     columns
 }
 
+pub fn parse_create_table_column_definitions(sql: &str) -> Vec<ColumnDefinition> {
+    let mut columns = Vec::new();
+    for item in split_create_table_items(sql) {
+        if let Some(col) = parse_one_column(item.trim()) {
+            columns.push(ColumnDefinition {
+                name: col.name,
+                sql: item.trim().to_string(),
+            });
+        }
+    }
+
+    columns
+}
+
+pub fn parse_create_table_items(sql: &str) -> Vec<String> {
+    split_create_table_items(sql)
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
 pub fn parse_create_table_key_constraints(sql: &str) -> Vec<KeyConstraint> {
     let mut constraints = Vec::new();
     for item in split_create_table_items(sql) {
@@ -838,6 +872,15 @@ fn parse_one_column(def: &str) -> Option<ColumnInfo> {
     let not_null = rest_upper.contains("NOT NULL");
     let pk = rest_upper.contains("PRIMARY KEY");
     let unique = rest_upper.contains("UNIQUE");
+    let generated = if rest_upper.contains("GENERATED ALWAYS") || rest_upper.contains(" AS (") {
+        Some(if rest_upper.contains(" STORED") {
+            GeneratedColumnKind::Stored
+        } else {
+            GeneratedColumnKind::Virtual
+        })
+    } else {
+        None
+    };
 
     Some(ColumnInfo {
         name: name.to_string(),
@@ -846,6 +889,7 @@ fn parse_one_column(def: &str) -> Option<ColumnInfo> {
         default_value: None,
         pk,
         unique,
+        generated,
     })
 }
 

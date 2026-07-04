@@ -4718,6 +4718,747 @@ fn test_repo_merge_continue_auto_merge_ignores_application_triggers() {
 }
 
 #[test]
+fn test_repo_row_auto_merge_skips_generated_columns_in_apply_sql() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE repo_generated_merge (
+              id INTEGER PRIMARY KEY,
+              body TEXT NOT NULL,
+              body_upper TEXT GENERATED ALWAYS AS (upper(body)) STORED
+            );
+            INSERT INTO repo_generated_merge (id, body) VALUES (1, 'alpha');
+            "#,
+        )
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "base generated row").contains("base"));
+
+    assert!(
+        pragma_arg_string(&sqlite, "graft_branch_create", "feature/generated-apply")
+            .contains("feature")
+    );
+    assert!(
+        pragma_arg_string(&sqlite, "graft_switch_branch", "feature/generated-apply")
+            .contains("feature")
+    );
+    sqlite
+        .execute(
+            "INSERT INTO repo_generated_merge (id, body) VALUES (2, 'beta')",
+            [],
+        )
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(
+        pragma_arg_string(&sqlite, "graft_commit", "feature generated insert").contains("feature")
+    );
+
+    assert!(pragma_arg_string(&sqlite, "graft_switch_branch", "main").contains("main"));
+    sqlite
+        .execute(
+            "UPDATE repo_generated_merge SET body = 'alpha main' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "main generated update").contains("main"));
+
+    let merge = pragma_arg_string(&sqlite, "graft_merge", "feature/generated-apply");
+    assert!(merge.contains("Row-level auto-merged app.db:"), "{merge}");
+    assert!(
+        !merge.contains("Unmerged paths:"),
+        "generated columns should be omitted from apply SQL: {merge}"
+    );
+
+    let rows: Vec<(i64, String, String)> = {
+        let mut stmt = sqlite
+            .prepare("SELECT id, body, body_upper FROM repo_generated_merge ORDER BY id")
+            .unwrap();
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    assert_eq!(
+        rows,
+        vec![
+            (1, "alpha main".to_string(), "ALPHA MAIN".to_string()),
+            (2, "beta".to_string(), "BETA".to_string()),
+        ]
+    );
+
+    let continued = pragma_arg_string(&sqlite, "graft_merge_continue", "merge generated rows");
+    assert!(continued.contains("Merge commit"));
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_row_auto_merge_resolves_sqlite_sequence_internal_state() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE repo_auto_docs (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              body TEXT NOT NULL
+            );
+            INSERT INTO repo_auto_docs (body) VALUES ('alpha');
+            "#,
+        )
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "base auto docs").contains("base"));
+
+    let repo = graft::repo::Repository::discover_for_file(&db_path).unwrap();
+    let mut config = repo.config().unwrap();
+    config
+        .merge
+        .internal_resolvers
+        .insert("sqlite_sequence".to_string(), "sequence_max".to_string());
+    repo.write_config(&config).unwrap();
+    assert_eq!(
+        repo.config().unwrap().merge.internal_resolvers["sqlite_sequence"],
+        "sequence_max"
+    );
+
+    assert!(
+        pragma_arg_string(&sqlite, "graft_branch_create", "feature/auto-sequence")
+            .contains("feature")
+    );
+    assert!(
+        pragma_arg_string(&sqlite, "graft_switch_branch", "feature/auto-sequence")
+            .contains("feature")
+    );
+    sqlite
+        .execute("INSERT INTO repo_auto_docs (body) VALUES ('beta')", [])
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "feature insert").contains("feature"));
+
+    assert!(pragma_arg_string(&sqlite, "graft_switch_branch", "main").contains("main"));
+    sqlite
+        .execute(
+            "UPDATE repo_auto_docs SET body = 'alpha main' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "main update").contains("main"));
+
+    let plan = repo.plan_merge_revision("feature/auto-sequence").unwrap();
+    let outcome = repo.apply_merge_plan(&plan).unwrap();
+    let graft::repo::MergeOutcome::Merged { conflicted, .. } = outcome else {
+        panic!("expected a merge conflict outcome");
+    };
+    assert_eq!(conflicted, vec!["app.db".to_string()]);
+
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return JSON");
+    assert_eq!(status["conflict_analysis"]["can_auto_merge"], true);
+    assert_eq!(status["conflict_analysis"]["opaque_changes"], 0);
+    assert_eq!(status["conflict_analysis"]["resolved_opaque_changes"], 1);
+    assert!(
+        status["conflict_analysis"]["resolved_opaque_change_details"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|change| {
+                change["name"] == "sqlite_sequence"
+                    && change["reason"] == "sqlite_internal_table"
+                    && change["resolver"] == "sequence_max"
+            }),
+        "resolved sqlite_sequence details should be exposed: {status}"
+    );
+    assert!(
+        status["conflict_analysis"]["apply_policy"]["internal_resolvers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|resolver| {
+                resolver["table"] == "sqlite_sequence" && resolver["resolver"] == "sequence_max"
+            }),
+        "sqlite_sequence resolver should be exposed in apply policy: {status}"
+    );
+
+    let continued = pragma_arg_string(&sqlite, "graft_merge_continue", "merge auto sequence");
+    assert!(continued.contains("Merge commit"));
+
+    let rows: Vec<(i64, String)> = {
+        let mut stmt = sqlite
+            .prepare("SELECT id, body FROM repo_auto_docs ORDER BY id")
+            .unwrap();
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    assert_eq!(
+        rows,
+        vec![(1, "alpha main".to_string()), (2, "beta".to_string())]
+    );
+    let sequence: i64 = sqlite
+        .query_row(
+            "SELECT seq FROM sqlite_sequence WHERE name = 'repo_auto_docs'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(sequence, 2);
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_row_auto_merge_rebuilds_sqlite_statistics_internal_state() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE repo_stat_docs (
+              id INTEGER PRIMARY KEY,
+              category TEXT NOT NULL,
+              body TEXT NOT NULL
+            );
+            CREATE INDEX repo_stat_docs_category ON repo_stat_docs(category);
+            INSERT INTO repo_stat_docs (id, category, body)
+              VALUES (1, 'base', 'alpha');
+            "#,
+        )
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "base stat docs").contains("base"));
+
+    assert!(
+        pragma_arg_string(&sqlite, "graft_branch_create", "feature/stat-rebuild")
+            .contains("feature")
+    );
+    assert!(
+        pragma_arg_string(&sqlite, "graft_switch_branch", "feature/stat-rebuild")
+            .contains("feature")
+    );
+    sqlite
+        .execute_batch(
+            r#"
+            INSERT INTO repo_stat_docs (id, category, body)
+              VALUES (2, 'feature', 'beta');
+            ANALYZE;
+            "#,
+        )
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "feature stats").contains("feature"));
+
+    assert!(pragma_arg_string(&sqlite, "graft_switch_branch", "main").contains("main"));
+    sqlite
+        .execute(
+            "UPDATE repo_stat_docs SET body = 'alpha main' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "main update").contains("main"));
+
+    let repo = graft::repo::Repository::discover_for_file(&db_path).unwrap();
+    let plan = repo.plan_merge_revision("feature/stat-rebuild").unwrap();
+    let outcome = repo.apply_merge_plan(&plan).unwrap();
+    let graft::repo::MergeOutcome::Merged { conflicted, .. } = outcome else {
+        panic!("expected a merge conflict outcome");
+    };
+    assert_eq!(conflicted, vec!["app.db".to_string()]);
+
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return JSON");
+    assert_eq!(status["conflict_analysis"]["can_auto_merge"], true);
+    assert_eq!(status["conflict_analysis"]["opaque_changes"], 0);
+    assert!(
+        status["conflict_analysis"]["resolved_opaque_changes"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
+    assert!(
+        status["conflict_analysis"]["apply_policy"]["internal_resolvers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|resolver| {
+                resolver["table"] == "sqlite_stat1" && resolver["resolver"] == "rebuild"
+            }),
+        "sqlite_stat1 resolver should be exposed in apply policy: {status}"
+    );
+    assert!(
+        status["conflict_analysis"]["apply_policy"]["internal_resolvers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|resolver| {
+                resolver["table"] == "index_btree" && resolver["resolver"] == "reindex"
+            }),
+        "index btree resolver should be exposed in apply policy: {status}"
+    );
+
+    let continued = pragma_arg_string(&sqlite, "graft_merge_continue", "merge stat rebuild");
+    assert!(continued.contains("Merge commit"));
+
+    let rows: Vec<(i64, String, String)> = {
+        let mut stmt = sqlite
+            .prepare("SELECT id, category, body FROM repo_stat_docs ORDER BY id")
+            .unwrap();
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    assert_eq!(
+        rows,
+        vec![
+            (1, "base".to_string(), "alpha main".to_string()),
+            (2, "feature".to_string(), "beta".to_string())
+        ]
+    );
+    let stat_rows: i64 = sqlite
+        .query_row(
+            "SELECT count(*) FROM sqlite_stat1 WHERE tbl = 'repo_stat_docs'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(stat_rows > 0, "ANALYZE should rebuild sqlite_stat1 rows");
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_row_auto_merge_applies_compatible_add_column_schema_change() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+    let repo = graft::repo::Repository::discover_for_file(&db_path).unwrap();
+    let mut config = repo.config().unwrap();
+    config.merge.schema_resolvers.insert(
+        "add_column".to_string(),
+        "alter_table_add_column".to_string(),
+    );
+    repo.write_config(&config).unwrap();
+    assert_eq!(
+        repo.config().unwrap().merge.schema_resolvers["add_column"],
+        "alter_table_add_column"
+    );
+
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE repo_schema_docs (
+              id INTEGER PRIMARY KEY,
+              title TEXT NOT NULL
+            );
+            INSERT INTO repo_schema_docs (id, title) VALUES (1, 'alpha');
+            "#,
+        )
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "base schema docs").contains("base"));
+
+    assert!(
+        pragma_arg_string(&sqlite, "graft_branch_create", "feature/add-column").contains("feature")
+    );
+    assert!(
+        pragma_arg_string(&sqlite, "graft_switch_branch", "feature/add-column").contains("feature")
+    );
+    sqlite
+        .execute("ALTER TABLE repo_schema_docs ADD COLUMN note TEXT", [])
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "feature add note").contains("feature"));
+
+    assert!(pragma_arg_string(&sqlite, "graft_switch_branch", "main").contains("main"));
+    sqlite
+        .execute(
+            "UPDATE repo_schema_docs SET title = 'alpha main' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "main update").contains("main"));
+
+    let merge = pragma_arg_string(&sqlite, "graft_merge", "feature/add-column");
+    assert!(merge.contains("Row-level auto-merged app.db:"), "{merge}");
+    assert!(
+        !merge.contains("Unmerged paths:"),
+        "compatible ADD COLUMN should not remain conflicted: {merge}"
+    );
+
+    let table_info: Vec<String> = {
+        let mut stmt = sqlite
+            .prepare("PRAGMA table_info(repo_schema_docs)")
+            .unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    assert_eq!(table_info, vec!["id", "title", "note"]);
+    let title: String = sqlite
+        .query_row(
+            "SELECT title FROM repo_schema_docs WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(title, "alpha main");
+
+    let continued = pragma_arg_string(&sqlite, "graft_merge_continue", "merge add column");
+    assert!(continued.contains("Merge commit"));
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_row_merge_reports_schema_modify_conflict_reason() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE repo_schema_reason_docs (
+              id INTEGER PRIMARY KEY,
+              body TEXT NOT NULL
+            );
+            INSERT INTO repo_schema_reason_docs (id, body) VALUES (1, 'alpha');
+            "#,
+        )
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "base schema reason").contains("base"));
+
+    assert!(
+        pragma_arg_string(&sqlite, "graft_branch_create", "feature/rename-column")
+            .contains("feature")
+    );
+    assert!(
+        pragma_arg_string(&sqlite, "graft_switch_branch", "feature/rename-column")
+            .contains("feature")
+    );
+    sqlite
+        .execute(
+            "ALTER TABLE repo_schema_reason_docs RENAME COLUMN body TO text_body",
+            [],
+        )
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(
+        pragma_arg_string(&sqlite, "graft_commit", "feature rename column").contains("feature")
+    );
+
+    assert!(pragma_arg_string(&sqlite, "graft_switch_branch", "main").contains("main"));
+    sqlite
+        .execute(
+            "UPDATE repo_schema_reason_docs SET body = 'alpha main' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "main body update").contains("main"));
+
+    let merge = pragma_arg_string(&sqlite, "graft_merge", "feature/rename-column");
+    assert!(merge.contains("Unmerged paths:"), "{merge}");
+
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return JSON");
+    let schema_conflict = &status["conflict_analysis"]["schema_conflicts"][0];
+    assert_eq!(schema_conflict["reason"], "schema_modify_conflict");
+    assert_eq!(schema_conflict["name"], "repo_schema_reason_docs");
+    assert_eq!(schema_conflict["entry_type"], "table");
+    assert!(
+        schema_conflict["column_changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|change| {
+                change["side"] == "theirs"
+                    && change["operation"] == "rename_column"
+                    && change["from"] == "body"
+                    && change["to"] == "text_body"
+            }),
+        "schema conflict should expose column rename details: {status}"
+    );
+    assert!(
+        schema_conflict["message"]
+            .as_str()
+            .unwrap()
+            .contains("compatible schema resolver"),
+        "schema conflict message should explain why resolver did not apply: {status}"
+    );
+
+    let conflicts: Value =
+        serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_conflicts"))
+            .expect("graft_json_conflicts should return JSON");
+    let artifact = conflicts["conflicts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|artifact| artifact["kind"] == "schema")
+        .expect("schema conflict artifact should be present");
+    assert_eq!(artifact["reason"], "schema_modify_conflict");
+    assert!(
+        artifact["column_changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|change| {
+                change["side"] == "theirs"
+                    && change["operation"] == "rename_column"
+                    && change["from"] == "body"
+                    && change["to"] == "text_body"
+            }),
+        "schema conflict artifact should expose column rename details: {conflicts}"
+    );
+    assert!(
+        artifact["message"]
+            .as_str()
+            .unwrap()
+            .contains("compatible schema resolver")
+    );
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_row_merge_reports_opaque_conflict_artifact_details() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE repo_opaque_marker (
+              id INTEGER PRIMARY KEY,
+              body TEXT NOT NULL
+            );
+            CREATE TABLE repo_opaque_docs (
+              id TEXT PRIMARY KEY,
+              body TEXT NOT NULL
+            ) WITHOUT ROWID;
+            INSERT INTO repo_opaque_marker (id, body) VALUES (1, 'base');
+            INSERT INTO repo_opaque_docs (id, body) VALUES ('doc-1', 'base');
+            "#,
+        )
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "base opaque docs").contains("base"));
+
+    assert!(
+        pragma_arg_string(
+            &sqlite,
+            "graft_branch_create",
+            "feature/opaque-without-rowid"
+        )
+        .contains("feature")
+    );
+    assert!(
+        pragma_arg_string(
+            &sqlite,
+            "graft_switch_branch",
+            "feature/opaque-without-rowid"
+        )
+        .contains("feature")
+    );
+    sqlite
+        .execute(
+            "UPDATE repo_opaque_docs SET body = 'feature' WHERE id = 'doc-1'",
+            [],
+        )
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(
+        pragma_arg_string(&sqlite, "graft_commit", "feature opaque update").contains("feature")
+    );
+
+    assert!(pragma_arg_string(&sqlite, "graft_switch_branch", "main").contains("main"));
+    sqlite
+        .execute(
+            "UPDATE repo_opaque_marker SET body = 'main' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "main marker update").contains("main"));
+
+    let merge = pragma_arg_string(&sqlite, "graft_merge", "feature/opaque-without-rowid");
+    assert!(merge.contains("Unmerged paths:"), "{merge}");
+
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return JSON");
+    assert_eq!(status["conflict_analysis"]["can_auto_merge"], false);
+    assert_eq!(status["conflict_analysis"]["opaque_changes"], 1);
+    assert!(
+        status["conflict_analysis"]["blocked_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason == "opaque_changes"),
+        "opaque changes should block auto merge: {status}"
+    );
+    assert!(
+        status["conflict_analysis"]["limitations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|limitation| {
+                limitation["kind"] == "without_rowid_table"
+                    && limitation["subject"] == "repo_opaque_docs"
+            }),
+        "merge analysis should expose unsupported opaque surface: {status}"
+    );
+
+    let conflicts: Value =
+        serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_conflicts"))
+            .expect("graft_json_conflicts should return JSON");
+    let artifact = conflicts["conflicts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|artifact| artifact["kind"] == "opaque")
+        .expect("opaque conflict artifact should be present");
+    assert_eq!(artifact["reason"], "without_rowid_table");
+    assert_eq!(artifact["name"], "repo_opaque_docs");
+    assert_eq!(artifact["change"], "modified");
+    assert_eq!(artifact["status"], "unresolved");
+    assert!(
+        artifact["message"]
+            .as_str()
+            .unwrap()
+            .contains("WITHOUT ROWID"),
+        "opaque artifact message should explain resolver boundary: {conflicts}"
+    );
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_row_auto_merge_combines_independent_add_column_schema_changes() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE repo_dual_schema_docs (
+              id INTEGER PRIMARY KEY,
+              title TEXT NOT NULL
+            );
+            INSERT INTO repo_dual_schema_docs (id, title) VALUES (1, 'alpha');
+            "#,
+        )
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "base dual schema").contains("base"));
+
+    assert!(
+        pragma_arg_string(&sqlite, "graft_branch_create", "feature/add-note").contains("feature")
+    );
+    assert!(
+        pragma_arg_string(&sqlite, "graft_switch_branch", "feature/add-note").contains("feature")
+    );
+    sqlite
+        .execute("ALTER TABLE repo_dual_schema_docs ADD COLUMN note TEXT", [])
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "feature note").contains("feature"));
+
+    assert!(pragma_arg_string(&sqlite, "graft_switch_branch", "main").contains("main"));
+    sqlite
+        .execute(
+            "ALTER TABLE repo_dual_schema_docs ADD COLUMN status TEXT DEFAULT 'open'",
+            [],
+        )
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "main status").contains("main"));
+
+    let merge = pragma_arg_string(&sqlite, "graft_merge", "feature/add-note");
+    assert!(merge.contains("Row-level auto-merged app.db:"), "{merge}");
+    assert!(
+        !merge.contains("Unmerged paths:"),
+        "independent ADD COLUMN changes should be combined: {merge}"
+    );
+
+    let table_info: Vec<String> = {
+        let mut stmt = sqlite
+            .prepare("PRAGMA table_info(repo_dual_schema_docs)")
+            .unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    assert_eq!(table_info, vec!["id", "title", "status", "note"]);
+
+    let continued = pragma_arg_string(&sqlite, "graft_merge_continue", "merge dual add column");
+    assert!(continued.contains("Merge commit"));
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
 fn test_repo_row_auto_merge_preserves_hidden_rowid_insert() {
     graft_test::ensure_test_env();
 
@@ -5154,6 +5895,795 @@ fn test_json_row_diff_reports_opaque_fts_only_changes() {
 }
 
 #[test]
+fn test_repo_row_auto_merge_uses_configured_semantic_key_policy() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE policy_entities (
+              name TEXT NOT NULL
+            );
+            "#,
+        )
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "base policy table").contains("base"));
+
+    let repo = graft::repo::Repository::discover_for_file(&db_path).unwrap();
+    let mut config = repo.config().unwrap();
+    config
+        .merge
+        .semantic_keys
+        .insert("policy_entities".to_string(), vec!["name".to_string()]);
+    repo.write_config(&config).unwrap();
+
+    assert!(
+        pragma_arg_string(&sqlite, "graft_branch_create", "feature/policy-key").contains("feature")
+    );
+    assert!(
+        pragma_arg_string(&sqlite, "graft_switch_branch", "feature/policy-key").contains("feature")
+    );
+    sqlite
+        .execute(
+            "INSERT INTO policy_entities (rowid, name) VALUES (1, 'feature')",
+            [],
+        )
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "feature insert").contains("feature"));
+
+    assert!(pragma_arg_string(&sqlite, "graft_switch_branch", "main").contains("main"));
+    sqlite
+        .execute(
+            "INSERT INTO policy_entities (rowid, name) VALUES (1, 'main')",
+            [],
+        )
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "main insert").contains("main"));
+
+    let merge = pragma_arg_string(&sqlite, "graft_merge", "feature/policy-key");
+    assert!(merge.contains("Row-level auto-merged app.db:"), "{merge}");
+    assert!(
+        !merge.contains("Unmerged paths:"),
+        "semantic key policy should avoid rowid-only conflicts: {merge}"
+    );
+
+    let rows: Vec<(i64, String)> = {
+        let mut stmt = sqlite
+            .prepare("SELECT rowid, name FROM policy_entities ORDER BY name")
+            .unwrap();
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    assert_eq!(
+        rows,
+        vec![(2, "feature".to_string()), (1, "main".to_string())]
+    );
+
+    let continued = pragma_arg_string(&sqlite, "graft_merge_continue", "merge policy key");
+    assert!(continued.contains("Merge commit"));
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_row_merge_detects_configured_semantic_key_insert_conflict() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE policy_conflict_entities (
+              entity_id TEXT NOT NULL,
+              body TEXT NOT NULL
+            );
+            "#,
+        )
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "base semantic conflict").contains("base"));
+
+    let repo = graft::repo::Repository::discover_for_file(&db_path).unwrap();
+    let mut config = repo.config().unwrap();
+    config.merge.semantic_keys.insert(
+        "policy_conflict_entities".to_string(),
+        vec!["entity_id".to_string()],
+    );
+    repo.write_config(&config).unwrap();
+
+    assert!(
+        pragma_arg_string(&sqlite, "graft_branch_create", "feature/semantic-conflict")
+            .contains("feature")
+    );
+    assert!(
+        pragma_arg_string(&sqlite, "graft_switch_branch", "feature/semantic-conflict")
+            .contains("feature")
+    );
+    sqlite
+        .execute(
+            "INSERT INTO policy_conflict_entities (rowid, entity_id, body)
+             VALUES (2, 'entity-1', 'feature')",
+            [],
+        )
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "feature entity").contains("feature"));
+
+    assert!(pragma_arg_string(&sqlite, "graft_switch_branch", "main").contains("main"));
+    sqlite
+        .execute(
+            "INSERT INTO policy_conflict_entities (rowid, entity_id, body)
+             VALUES (1, 'entity-1', 'main')",
+            [],
+        )
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "main entity").contains("main"));
+
+    let merge = pragma_arg_string(&sqlite, "graft_merge", "feature/semantic-conflict");
+    assert!(merge.contains("Unmerged paths:"), "{merge}");
+    assert!(
+        !merge.contains("Row-level auto-merged"),
+        "same semantic key inserts should block auto-merge: {merge}"
+    );
+
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return JSON");
+    assert_eq!(status["conflict_analysis"]["can_auto_merge"], false);
+    let conflict = &status["conflict_analysis"]["row_conflicts"][0];
+    assert_eq!(conflict["reason"], "semantic_key_conflict");
+    assert_eq!(conflict["rowid"], 1);
+    assert_eq!(conflict["ours_rowid"], Value::Null);
+    assert_eq!(conflict["theirs_rowid"], 2);
+    assert_eq!(conflict["semantic_key"][0], "t:entity-1");
+
+    let conflicts: Value =
+        serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_conflicts"))
+            .expect("graft_json_conflicts should return JSON");
+    let artifact = &conflicts["conflicts"][0];
+    assert_eq!(artifact["reason"], "semantic_key_conflict");
+    assert_eq!(artifact["semantic_key"][0], "t:entity-1");
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_row_merge_detects_default_semantic_key_insert_conflict() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE app_default_key_entities (
+              _id TEXT NOT NULL,
+              title TEXT NOT NULL
+            );
+            "#,
+        )
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "base default key").contains("base"));
+
+    let repo = graft::repo::Repository::discover_for_file(&db_path).unwrap();
+    let mut config = repo.config().unwrap();
+    config.merge.default_semantic_keys = vec!["_id".to_string()];
+    repo.write_config(&config).unwrap();
+
+    assert!(
+        pragma_arg_string(&sqlite, "graft_branch_create", "feature/default-semantic")
+            .contains("feature")
+    );
+    assert!(
+        pragma_arg_string(&sqlite, "graft_switch_branch", "feature/default-semantic")
+            .contains("feature")
+    );
+    sqlite
+        .execute(
+            "INSERT INTO app_default_key_entities (rowid, _id, title)
+             VALUES (5, 'row-1', 'feature')",
+            [],
+        )
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "feature default key").contains("feature"));
+
+    assert!(pragma_arg_string(&sqlite, "graft_switch_branch", "main").contains("main"));
+    sqlite
+        .execute(
+            "INSERT INTO app_default_key_entities (rowid, _id, title)
+             VALUES (3, 'row-1', 'main')",
+            [],
+        )
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "main default key").contains("main"));
+
+    let merge = pragma_arg_string(&sqlite, "graft_merge", "feature/default-semantic");
+    assert!(merge.contains("Unmerged paths:"), "{merge}");
+
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return JSON");
+    assert_eq!(
+        status["conflict_analysis"]["apply_policy"]["default_semantic_keys"][0],
+        "_id"
+    );
+    let conflict = &status["conflict_analysis"]["row_conflicts"][0];
+    assert_eq!(conflict["reason"], "semantic_key_conflict");
+    assert_eq!(conflict["rowid"], 3);
+    assert_eq!(conflict["theirs_rowid"], 5);
+    assert_eq!(conflict["semantic_key"][0], "t:row-1");
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_row_merge_reports_semantic_key_on_rowid_update_conflict() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE app_update_key_entities (
+              _id TEXT NOT NULL,
+              title TEXT NOT NULL
+            );
+            INSERT INTO app_update_key_entities (rowid, _id, title)
+            VALUES (1, 'row-1', 'base');
+            "#,
+        )
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "base update key").contains("base"));
+
+    let repo = graft::repo::Repository::discover_for_file(&db_path).unwrap();
+    let mut config = repo.config().unwrap();
+    config.merge.default_semantic_keys = vec!["_id".to_string()];
+    repo.write_config(&config).unwrap();
+
+    assert!(
+        pragma_arg_string(&sqlite, "graft_branch_create", "feature/update-semantic")
+            .contains("feature")
+    );
+    assert!(
+        pragma_arg_string(&sqlite, "graft_switch_branch", "feature/update-semantic")
+            .contains("feature")
+    );
+    sqlite
+        .execute(
+            "UPDATE app_update_key_entities SET title = 'feature' WHERE rowid = 1",
+            [],
+        )
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "feature update key").contains("feature"));
+
+    assert!(pragma_arg_string(&sqlite, "graft_switch_branch", "main").contains("main"));
+    sqlite
+        .execute(
+            "UPDATE app_update_key_entities SET title = 'main' WHERE rowid = 1",
+            [],
+        )
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "main update key").contains("main"));
+
+    let merge = pragma_arg_string(&sqlite, "graft_merge", "feature/update-semantic");
+    assert!(merge.contains("Unmerged paths:"), "{merge}");
+
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return JSON");
+    let conflict = &status["conflict_analysis"]["row_conflicts"][0];
+    assert_eq!(conflict["reason"], "row_conflict");
+    assert_eq!(conflict["rowid"], 1);
+    assert_eq!(conflict["semantic_key"][0], "t:row-1");
+
+    let conflicts: Value =
+        serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_conflicts"))
+            .expect("graft_json_conflicts should return JSON");
+    let artifact = &conflicts["conflicts"][0];
+    assert_eq!(artifact["reason"], "row_conflict");
+    assert_eq!(artifact["semantic_key"][0], "t:row-1");
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_row_merge_analysis_reports_parser_limitations() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE limited_merge_rows (
+              id INTEGER PRIMARY KEY,
+              body TEXT NOT NULL
+            );
+            CREATE TABLE generated_merge_surface (
+              id INTEGER PRIMARY KEY,
+              body TEXT NOT NULL,
+              body_len INTEGER GENERATED ALWAYS AS (length(body)) VIRTUAL
+            );
+            INSERT INTO limited_merge_rows (id, body) VALUES (1, 'base');
+            INSERT INTO generated_merge_surface (id, body) VALUES (1, 'unchanged');
+            "#,
+        )
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "base limited merge").contains("base"));
+
+    let repo = graft::repo::Repository::discover_for_file(&db_path).unwrap();
+    let mut config = repo.config().unwrap();
+    config.merge.generated_columns.insert(
+        "generated_merge_surface".to_string(),
+        vec!["body_len".to_string()],
+    );
+    repo.write_config(&config).unwrap();
+
+    assert!(
+        pragma_arg_string(&sqlite, "graft_branch_create", "feature/limited-analysis")
+            .contains("feature")
+    );
+    assert!(
+        pragma_arg_string(&sqlite, "graft_switch_branch", "feature/limited-analysis")
+            .contains("feature")
+    );
+    sqlite
+        .execute(
+            "UPDATE limited_merge_rows SET body = 'feature' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "feature limited row").contains("feature"));
+
+    assert!(pragma_arg_string(&sqlite, "graft_switch_branch", "main").contains("main"));
+    sqlite
+        .execute(
+            "UPDATE limited_merge_rows SET body = 'main' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "main limited row").contains("main"));
+
+    let merge = pragma_arg_string(&sqlite, "graft_merge", "feature/limited-analysis");
+    assert!(merge.contains("Unmerged paths:"), "{merge}");
+
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return JSON");
+    assert_eq!(status["conflict_analysis"]["can_auto_merge"], false);
+    assert!(
+        status["conflict_analysis"]["limitations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|limitation| {
+                limitation["kind"] == "generated_columns"
+                    && limitation["subject"] == "generated_merge_surface"
+            }),
+        "merge analysis should expose parser limitations: {status}"
+    );
+    assert!(
+        status["conflict_analysis"]["apply_policy"]["generated_columns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| {
+                entry["table"] == "generated_merge_surface" && entry["columns"][0] == "body_len"
+            }),
+        "merge analysis should expose configured generated column policy: {status}"
+    );
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_row_diff_reports_file_changed_without_supported_logical_changes() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE logical_noop (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+            INSERT INTO logical_noop (id, name) VALUES (1, 'Alice');
+            "#,
+        )
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "base logical row").contains("base"));
+
+    sqlite
+        .execute(
+            "INSERT INTO logical_noop (id, name) VALUES (2, 'temporary')",
+            [],
+        )
+        .unwrap();
+    sqlite
+        .execute("DELETE FROM logical_noop WHERE id = 2", [])
+        .unwrap();
+
+    let diff: Value =
+        serde_json::from_str(&pragma_arg_string(&sqlite, "graft_json_diff", "--rows"))
+            .expect("graft_json_diff --rows should return JSON for logical no-op file changes");
+    assert_eq!(diff["files"][0]["path"], "app.db");
+    assert_eq!(diff["files"][0]["change"], "modified");
+    assert_eq!(diff["files"][0]["row_diff_available"], true);
+    assert_eq!(
+        diff["files"][0]["logical_status"],
+        "file_changed_no_supported_logical_changes"
+    );
+    assert_eq!(diff["files"][0]["tables"].as_array().map_or(0, Vec::len), 0);
+    assert_eq!(
+        diff["files"][0]["opaque_changes"]
+            .as_array()
+            .map_or(0, Vec::len),
+        0
+    );
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_json_row_diff_reports_without_rowid_as_unsupported_surface() {
+    graft_test::ensure_test_env();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite("main", None);
+
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE without_rowid_docs (
+              id TEXT PRIMARY KEY,
+              body TEXT NOT NULL
+            ) WITHOUT ROWID;
+            INSERT INTO without_rowid_docs (id, body) VALUES ('doc-1', 'alpha');
+            "#,
+        )
+        .unwrap();
+    let vid = runtime.tag_get("main").unwrap().unwrap();
+    let from_lsn = runtime
+        .volume_status(&vid)
+        .unwrap()
+        .local_status
+        .head
+        .unwrap();
+
+    sqlite
+        .execute(
+            "UPDATE without_rowid_docs SET body = 'beta' WHERE id = 'doc-1'",
+            [],
+        )
+        .unwrap();
+    let to_lsn = runtime
+        .volume_status(&vid)
+        .unwrap()
+        .local_status
+        .head
+        .unwrap();
+
+    let diff: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_debug_volume_json_diff",
+        format!("{from_lsn},{to_lsn},rows"),
+    ))
+    .expect("row diff should return JSON for WITHOUT ROWID changes");
+    assert_eq!(diff["logical_status"], "unsupported_logical_surface");
+    assert_eq!(diff["tables"].as_array().unwrap().len(), 0);
+    assert!(
+        diff["opaque_changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|change| {
+                change["name"] == "without_rowid_docs"
+                    && change["reason"] == "without_rowid_table"
+                    && change["change"] == "modified"
+            }),
+        "WITHOUT ROWID table changes should be opaque: {diff}"
+    );
+    assert!(
+        diff["limitations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|limitation| {
+                limitation["kind"] == "without_rowid_table"
+                    && limitation["subject"] == "without_rowid_docs"
+            }),
+        "WITHOUT ROWID limitation should be explicit: {diff}"
+    );
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_json_row_diff_reports_sqlite_sequence_internal_change() {
+    graft_test::ensure_test_env();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite("main", None);
+
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE auto_docs (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              body TEXT NOT NULL
+            );
+            INSERT INTO auto_docs (body) VALUES ('alpha');
+            "#,
+        )
+        .unwrap();
+    let vid = runtime.tag_get("main").unwrap().unwrap();
+    let from_lsn = runtime
+        .volume_status(&vid)
+        .unwrap()
+        .local_status
+        .head
+        .unwrap();
+
+    sqlite
+        .execute("INSERT INTO auto_docs (body) VALUES ('beta')", [])
+        .unwrap();
+    let to_lsn = runtime
+        .volume_status(&vid)
+        .unwrap()
+        .local_status
+        .head
+        .unwrap();
+
+    let diff: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_debug_volume_json_diff",
+        format!("{from_lsn},{to_lsn},rows"),
+    ))
+    .expect("row diff should return JSON for sqlite_sequence changes");
+    assert_eq!(diff["logical_status"], "logical_changes");
+    assert!(
+        diff["opaque_changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|change| {
+                change["name"] == "sqlite_sequence"
+                    && change["reason"] == "sqlite_internal_table"
+                    && change["change"] == "modified"
+            }),
+        "sqlite_sequence changes should be exposed as internal opaque changes: {diff}"
+    );
+    assert!(
+        diff["limitations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|limitation| {
+                limitation["kind"] == "sqlite_internal_table"
+                    && limitation["subject"] == "sqlite_sequence"
+            }),
+        "sqlite_sequence limitation should be explicit: {diff}"
+    );
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_json_row_diff_reports_index_btree_internal_change() {
+    graft_test::ensure_test_env();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite("main", None);
+
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE indexed_docs (
+              id INTEGER PRIMARY KEY,
+              category TEXT NOT NULL,
+              body TEXT NOT NULL
+            );
+            CREATE INDEX indexed_docs_category ON indexed_docs(category);
+            INSERT INTO indexed_docs (id, category, body) VALUES (1, 'alpha', 'first');
+            "#,
+        )
+        .unwrap();
+    let vid = runtime.tag_get("main").unwrap().unwrap();
+    let from_lsn = runtime
+        .volume_status(&vid)
+        .unwrap()
+        .local_status
+        .head
+        .unwrap();
+
+    sqlite
+        .execute("UPDATE indexed_docs SET category = 'beta' WHERE id = 1", [])
+        .unwrap();
+    let to_lsn = runtime
+        .volume_status(&vid)
+        .unwrap()
+        .local_status
+        .head
+        .unwrap();
+
+    let diff: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_debug_volume_json_diff",
+        format!("{from_lsn},{to_lsn},rows"),
+    ))
+    .expect("row diff should return JSON for index btree changes");
+    assert_eq!(diff["logical_status"], "logical_changes");
+    assert!(
+        diff["opaque_changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|change| {
+                change["name"] == "indexed_docs_category"
+                    && change["reason"] == "index_btree"
+                    && change["change"] == "modified"
+            }),
+        "index btree changes should be exposed as resolved internal state: {diff}"
+    );
+    assert!(
+        diff["limitations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|limitation| {
+                limitation["kind"] == "index_btree"
+                    && limitation["subject"] == "indexed_docs_category"
+            }),
+        "index btree limitation should be explicit: {diff}"
+    );
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_row_auto_merge_validates_foreign_keys_after_apply() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+    sqlite.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE fk_parent (id INTEGER PRIMARY KEY);
+            CREATE TABLE fk_child (
+              id INTEGER PRIMARY KEY,
+              parent_id INTEGER NOT NULL REFERENCES fk_parent(id)
+            );
+            INSERT INTO fk_parent (id) VALUES (1);
+            "#,
+        )
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "base fk").contains("base"));
+
+    assert!(
+        pragma_arg_string(&sqlite, "graft_branch_create", "feature/fk-child").contains("feature")
+    );
+    assert!(
+        pragma_arg_string(&sqlite, "graft_switch_branch", "feature/fk-child").contains("feature")
+    );
+    sqlite
+        .execute("INSERT INTO fk_child (id, parent_id) VALUES (1, 1)", [])
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "child insert").contains("child"));
+
+    assert!(pragma_arg_string(&sqlite, "graft_switch_branch", "main").contains("main"));
+    sqlite
+        .execute("DELETE FROM fk_parent WHERE id = 1", [])
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "parent delete").contains("parent"));
+
+    let merge = pragma_arg_string(&sqlite, "graft_merge", "feature/fk-child");
+    assert!(merge.contains("Unmerged paths:"), "{merge}");
+    assert!(
+        !merge.contains("Row-level auto-merged"),
+        "validation failure should keep the database conflicted: {merge}"
+    );
+
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return JSON");
+    assert_eq!(
+        status["conflict_analysis"]["apply_policy"]["foreign_keys"],
+        "disabled_during_apply_checked_after"
+    );
+    assert_eq!(
+        status["conflict_analysis"]["apply_policy"]["triggers"],
+        "disabled_during_apply"
+    );
+    assert!(
+        status["conflict_analysis"]["apply_policy"]["validation"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "foreign_key_check")
+    );
+    assert!(
+        status["conflict_analysis"]["apply_policy"]["schema_resolvers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|resolver| {
+                resolver["operation"] == "add_column"
+                    && resolver["resolver"] == "alter_table_add_column"
+            }),
+        "ADD COLUMN schema resolver should be exposed in apply policy: {status}"
+    );
+
+    let err = pragma_arg_error(&sqlite, "graft_merge_continue", "invalid fk merge");
+    assert!(
+        err.contains("foreign_key_check"),
+        "merge_continue should fail with foreign_key_check details: {err}"
+    );
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
 fn test_repo_commit_summary_skips_fts_virtual_tables() {
     graft_test::ensure_test_env();
 
@@ -5381,6 +6911,15 @@ fn assert_repo_row_diff_json(diff: &Value) {
     assert_eq!(diff["files"][0]["path"], "app.db");
     assert_eq!(diff["files"][0]["change"], "modified");
     assert_eq!(diff["files"][0]["row_diff_available"], true);
+    assert_eq!(diff["files"][0]["logical_status"], "logical_changes");
+    assert!(
+        diff["files"][0]["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "rowid_table_rows"),
+        "{diff}"
+    );
 
     let tables = diff["files"][0]["tables"]
         .as_array()

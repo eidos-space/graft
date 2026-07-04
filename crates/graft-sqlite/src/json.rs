@@ -38,11 +38,22 @@ pub struct JsonOpaqueChange {
     pub owner: Option<String>,
 }
 
+/// A row-diff semantic limitation or unsupported SQLite surface.
+#[derive(Debug, Clone, Serialize)]
+pub struct JsonDiffLimitation {
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+}
+
 /// Diff result (for `graft_json_diff`, default mode)
 #[derive(Debug, Clone, Serialize)]
 pub struct JsonDiffResult {
     pub from_lsn: u64,
     pub to_lsn: u64,
+    pub logical_status: String,
+    pub capabilities: Vec<String>,
+    pub limitations: Vec<JsonDiffLimitation>,
     pub tables: Vec<JsonTableSummary>,
     pub opaque_changes: Vec<JsonOpaqueChange>,
 }
@@ -72,6 +83,9 @@ pub struct JsonTableChanges {
 pub struct JsonRowDiffResult {
     pub from_lsn: u64,
     pub to_lsn: u64,
+    pub logical_status: String,
+    pub capabilities: Vec<String>,
+    pub limitations: Vec<JsonDiffLimitation>,
     pub tables: Vec<JsonTableChanges>,
     pub opaque_changes: Vec<JsonOpaqueChange>,
 }
@@ -90,6 +104,9 @@ pub struct JsonRepoRowDiffFile {
     pub path: String,
     pub change: String,
     pub row_diff_available: bool,
+    pub logical_status: String,
+    pub capabilities: Vec<String>,
+    pub limitations: Vec<JsonDiffLimitation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]

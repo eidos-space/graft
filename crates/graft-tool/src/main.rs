@@ -49,7 +49,7 @@ enum Command {
         #[arg(short = 'b', long = "branch", conflicts_with = "branch")]
         branch_option: Option<String>,
 
-        /// Remote URI: memory, fs://..., s3://..., or `s3_compatible://...`
+        /// Remote URI: memory, fs://..., s3://..., s3_compatible://..., graft+https://..., or graft+http://...
         remote: String,
 
         /// Optional branch to clone. Defaults to remote HEAD, then main.
@@ -344,7 +344,7 @@ enum RemoteCommand {
         /// Remote name, for example origin
         name: String,
 
-        /// Remote URI: memory, fs://..., s3://..., or `s3_compatible://...`
+        /// Remote URI: memory, fs://..., s3://..., s3_compatible://..., graft+https://..., or graft+http://...
         uri: String,
     },
 
@@ -380,7 +380,7 @@ enum RemoteCommand {
         /// Remote name, for example origin
         name: String,
 
-        /// Remote URI: memory, fs://..., s3://..., or `s3_compatible://...`
+        /// Remote URI: memory, fs://..., s3://..., s3_compatible://..., graft+https://..., or graft+http://...
         uri: String,
     },
 
