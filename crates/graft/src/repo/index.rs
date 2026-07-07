@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    CommitFileState,
+    CommitArtifactState, CommitFileState,
     object::{ObjectId, TreeEntryMode},
 };
 
@@ -80,6 +80,8 @@ pub struct IndexEntry {
     pub stage: IndexStage,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<CommitFileState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<CommitArtifactState>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

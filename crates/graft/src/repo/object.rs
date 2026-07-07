@@ -212,12 +212,16 @@ impl Object {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlobObject {
     SqliteSnapshot(SqliteSnapshotBlob),
+    File(FileBlob),
+    LargeFilePointer(LargeFilePointerBlob),
 }
 
 impl BlobObject {
     fn canonical_payload(&self) -> String {
         match self {
             Self::SqliteSnapshot(blob) => blob.canonical_payload(),
+            Self::File(blob) => blob.canonical_payload(),
+            Self::LargeFilePointer(blob) => blob.canonical_payload(),
         }
     }
 
@@ -227,9 +231,13 @@ impl BlobObject {
             Some("sqlite-snapshot-v1") => {
                 SqliteSnapshotBlob::decode(lines).map(Self::SqliteSnapshot)
             }
+            Some("file-blob-v1") => FileBlob::decode(lines).map(Self::File),
+            Some("large-file-pointer-v1") => {
+                LargeFilePointerBlob::decode(lines).map(Self::LargeFilePointer)
+            }
             _ => Err(ObjectErr::InvalidObject {
                 kind: "blob",
-                message: "missing sqlite-snapshot-v1 header".to_string(),
+                message: "missing supported blob header".to_string(),
             }),
         }
     }
@@ -377,6 +385,159 @@ fn validate_sqlite_snapshot_ranges(ranges: &[SqliteSnapshotRange]) -> Result<()>
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileBlob {
+    pub kind: FileContentKind,
+    pub bytes: Vec<u8>,
+}
+
+impl FileBlob {
+    fn canonical_payload(&self) -> String {
+        format!(
+            "file-blob-v1\nkind {}\nsize {}\ndata {}\n",
+            self.kind,
+            self.bytes.len(),
+            bs58::encode(&self.bytes).into_string()
+        )
+    }
+
+    fn decode<'a>(lines: impl Iterator<Item = &'a str>) -> Result<Self> {
+        let mut kind = None;
+        let mut size = None;
+        let mut data = None;
+
+        for line in lines {
+            let mut parts = line.splitn(2, ' ');
+            match parts.next() {
+                Some("kind") => {
+                    kind = Some(parse_field(parts.next(), "blob", "kind")?);
+                }
+                Some("size") => {
+                    size = Some(parse_field(parts.next(), "blob", "size")?);
+                }
+                Some("data") => {
+                    let raw = parts.next().ok_or_else(|| missing("blob", "data"))?;
+                    let bytes =
+                        bs58::decode(raw)
+                            .into_vec()
+                            .map_err(|err| ObjectErr::InvalidObject {
+                                kind: "blob",
+                                message: format!("invalid file data encoding: {err}"),
+                            })?;
+                    data = Some(bytes);
+                }
+                Some("") => {}
+                _ => {
+                    return Err(ObjectErr::InvalidObject {
+                        kind: "blob",
+                        message: format!("invalid line `{line}`"),
+                    });
+                }
+            }
+        }
+
+        let bytes = data.ok_or_else(|| missing("blob", "data"))?;
+        let size: usize = size.ok_or_else(|| missing("blob", "size"))?;
+        if bytes.len() != size {
+            return Err(ObjectErr::InvalidObject {
+                kind: "blob",
+                message: format!(
+                    "file blob size mismatch: expected {size}, got {}",
+                    bytes.len()
+                ),
+            });
+        }
+
+        Ok(Self {
+            kind: kind.ok_or_else(|| missing("blob", "kind"))?,
+            bytes,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileContentKind {
+    TextFile,
+    BinaryFile,
+}
+
+impl Display for FileContentKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TextFile => f.write_str("text_file"),
+            Self::BinaryFile => f.write_str("binary_file"),
+        }
+    }
+}
+
+impl FromStr for FileContentKind {
+    type Err = ObjectErr;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "text_file" => Ok(Self::TextFile),
+            "binary_file" => Ok(Self::BinaryFile),
+            _ => Err(ObjectErr::InvalidObject {
+                kind: "blob",
+                message: format!("invalid file content kind `{value}`"),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LargeFilePointerBlob {
+    pub kind: FileContentKind,
+    pub content_hash: ObjectId,
+    pub size: u64,
+}
+
+impl LargeFilePointerBlob {
+    fn canonical_payload(&self) -> String {
+        format!(
+            "large-file-pointer-v1\nkind {}\nhash {}\nsize {}\n",
+            self.kind, self.content_hash, self.size
+        )
+    }
+
+    fn decode<'a>(lines: impl Iterator<Item = &'a str>) -> Result<Self> {
+        let mut kind = None;
+        let mut content_hash = None;
+        let mut size = None;
+
+        for line in lines {
+            let mut parts = line.split(' ');
+            match parts.next() {
+                Some("kind") => {
+                    kind = Some(parse_field(parts.next(), "blob", "kind")?);
+                    ensure_no_extra(parts, "blob")?;
+                }
+                Some("hash") => {
+                    content_hash = Some(parse_field(parts.next(), "blob", "hash")?);
+                    ensure_no_extra(parts, "blob")?;
+                }
+                Some("size") => {
+                    size = Some(parse_field(parts.next(), "blob", "size")?);
+                    ensure_no_extra(parts, "blob")?;
+                }
+                Some("") => {}
+                _ => {
+                    return Err(ObjectErr::InvalidObject {
+                        kind: "blob",
+                        message: format!("invalid line `{line}`"),
+                    });
+                }
+            }
+        }
+
+        Ok(Self {
+            kind: kind.ok_or_else(|| missing("blob", "kind"))?,
+            content_hash: content_hash.ok_or_else(|| missing("blob", "hash"))?,
+            size: size.ok_or_else(|| missing("blob", "size"))?,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -1,4 +1,7 @@
-use graft::core::{LogId, PageCount};
+use graft::{
+    core::{LogId, PageCount},
+    repo::Repository,
+};
 use graft_test::GraftTestRuntime;
 use rusqlite::{Connection, OpenFlags, ToSql, functions::FunctionFlags};
 use serde_json::Value;
@@ -169,6 +172,142 @@ fn test_repo_history_pragmas_require_repository() {
 }
 
 #[test]
+fn test_repo_json_init_reports_repository_and_preserves_database_contents() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let project_dir = temp_dir.path().join("project");
+    let db_path = project_dir.join("app.db");
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_path.to_str().unwrap(), None);
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE repo_json_init (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+            INSERT INTO repo_json_init (name) VALUES ('Alice');
+            "#,
+        )
+        .unwrap();
+
+    let init: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_init"))
+        .expect("graft_json_init should return JSON");
+    let canonical_project = project_dir.canonicalize().unwrap();
+    let expected_worktree = canonical_project.to_str().unwrap();
+    let expected_graft_dir = canonical_project.join(".graft");
+    let expected_graft_dir = expected_graft_dir.to_str().unwrap();
+    assert_eq!(init["operation"], "init");
+    assert!(init.get("current_head").is_none());
+    assert_eq!(init["current_branch"], "main");
+    assert_eq!(init["path"], "app.db");
+    assert_eq!(init["kind"], "sqlite_database");
+    assert_eq!(init["preserved_contents"], true);
+    assert_eq!(init["worktree"].as_str(), Some(expected_worktree));
+    assert_eq!(init["graft_dir"].as_str(), Some(expected_graft_dir));
+    assert!(project_dir.join(".graft").is_dir());
+
+    let count: i64 = sqlite
+        .query_row("SELECT COUNT(*) FROM repo_json_init", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 1);
+
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return JSON after graft_json_init");
+    assert_eq!(status["dirty"], true);
+    assert_eq!(status["unstaged_changes"][0]["path"], "app.db");
+    assert_eq!(status["unstaged_changes"][0]["kind"], "sqlite_database");
+    assert_eq!(status["unstaged_changes"][0]["change"], "untracked");
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_json_export_reports_output_path_and_source() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("project/app.db");
+    let current_export = temp_dir.path().join("current-export.db");
+    let head_export = temp_dir.path().join("head-export.db");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_path.to_str().unwrap(), None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE repo_json_export (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+            INSERT INTO repo_json_export (name) VALUES ('Alice');
+            "#,
+        )
+        .unwrap();
+    assert_eq!(pragma_query_string(&sqlite, "graft_add"), "Added app.db");
+    let committed: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_commit",
+        "base export",
+    ))
+    .expect("graft_json_commit should return JSON");
+    assert!(committed["commit"]["id"].as_str().is_some());
+
+    sqlite
+        .execute("INSERT INTO repo_json_export (name) VALUES ('Bob')", [])
+        .unwrap();
+
+    let current: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_export",
+        format!("--output {}", current_export.display()),
+    ))
+    .expect("graft_json_export should return JSON");
+    assert_eq!(current["operation"], "export");
+    assert_eq!(current["current_head"], committed["commit"]["id"]);
+    assert_eq!(current["current_branch"], "main");
+    assert_eq!(current["path"], "app.db");
+    assert_eq!(current["kind"], "sqlite_database");
+    assert_eq!(
+        current["output"].as_str(),
+        Some(current_export.to_str().unwrap())
+    );
+    assert!(current.get("source").is_none());
+
+    let current_conn = Connection::open(&current_export).unwrap();
+    let current_count: i64 = current_conn
+        .query_row("SELECT COUNT(*) FROM repo_json_export", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(current_count, 2);
+    drop(current_conn);
+
+    let head: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_export",
+        format!("--source HEAD --output {} -- app.db", head_export.display()),
+    ))
+    .expect("graft_json_export with source should return JSON");
+    assert_eq!(head["operation"], "export");
+    assert_eq!(head["current_head"], committed["commit"]["id"]);
+    assert_eq!(head["current_branch"], "main");
+    assert_eq!(head["source"], "HEAD");
+    assert_eq!(head["path"], "app.db");
+    assert_eq!(head["kind"], "sqlite_database");
+    assert_eq!(head["output"].as_str(), Some(head_export.to_str().unwrap()));
+
+    let head_conn = Connection::open(&head_export).unwrap();
+    let head_count: i64 = head_conn
+        .query_row("SELECT COUNT(*) FROM repo_json_export", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(head_count, 1);
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
 fn test_debug_lsn_pragmas_expose_storage_coordinates_without_repo() {
     graft_test::ensure_test_env();
 
@@ -236,7 +375,18 @@ fn test_repo_pragmas_on_physical_database_path() {
     assert_eq!(status["head"]["type"], "branch");
     assert_eq!(status["head"]["name"], "main");
     assert_eq!(status["head_target"], Value::Null);
+    assert!(status.get("current_head").is_none());
+    assert_eq!(status["current_branch"], "main");
     assert_eq!(status["dirty"], false);
+    assert_eq!(status["has_unstaged_changes"], false);
+    assert_eq!(status["has_staged_changes"], false);
+    assert_eq!(status["has_conflicts"], false);
+    assert_eq!(status["work_in_progress"], false);
+    assert_eq!(
+        status["counts"],
+        serde_json::json!({ "unstaged": 0, "staged": 0, "conflicted": 0 })
+    );
+    assert_eq!(status["paths"], serde_json::json!([]));
 
     sqlite
         .execute_batch(
@@ -250,9 +400,33 @@ fn test_repo_pragmas_on_physical_database_path() {
     let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
         .expect("graft_json_status should return repo status JSON");
     assert_eq!(status["dirty"], true);
+    assert_eq!(status["has_unstaged_changes"], true);
+    assert_eq!(status["has_staged_changes"], false);
+    assert_eq!(status["has_conflicts"], false);
+    assert_eq!(status["work_in_progress"], true);
+    assert_eq!(
+        status["counts"],
+        serde_json::json!({ "unstaged": 1, "staged": 0, "conflicted": 0 })
+    );
+    assert_eq!(
+        status["paths"],
+        serde_json::json!([
+            {
+                "path": "app.db",
+                "kind": "sqlite_database",
+                "storage": "sqlite_snapshot",
+                "index_status": "none",
+                "worktree_status": "untracked",
+                "code": "??",
+                "unstaged_change": "untracked",
+                "conflicted": false
+            }
+        ])
+    );
     assert_eq!(status["unstaged"][0], "app.db");
     assert_eq!(status["unstaged_changes"][0]["path"], "app.db");
     assert_eq!(status["unstaged_changes"][0]["change"], "untracked");
+    assert_eq!(status["unstaged_changes"][0]["kind"], "sqlite_database");
     let text_status = pragma_query_string(&sqlite, "graft_status");
     assert!(text_status.contains("Changes not staged for commit."));
     assert!(text_status.contains("untracked: app.db"));
@@ -261,16 +435,55 @@ fn test_repo_pragmas_on_physical_database_path() {
     assert!(add.contains("app.db"));
     let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
         .expect("graft_json_status should return repo status JSON");
+    assert!(status.get("current_head").is_none());
+    assert_eq!(status["current_branch"], "main");
     assert_eq!(status["dirty"], false);
+    assert_eq!(status["has_unstaged_changes"], false);
+    assert_eq!(status["has_staged_changes"], true);
+    assert_eq!(status["has_conflicts"], false);
+    assert_eq!(status["work_in_progress"], true);
+    assert_eq!(
+        status["counts"],
+        serde_json::json!({ "unstaged": 0, "staged": 1, "conflicted": 0 })
+    );
+    assert_eq!(
+        status["paths"],
+        serde_json::json!([
+            {
+                "path": "app.db",
+                "kind": "sqlite_database",
+                "storage": "sqlite_snapshot",
+                "index_status": "added",
+                "worktree_status": "none",
+                "code": "A ",
+                "staged_change": "added",
+                "conflicted": false
+            }
+        ])
+    );
     assert_eq!(status["unstaged"].as_array().unwrap().len(), 0);
     assert_eq!(status["staged"][0], "app.db");
+    assert_eq!(status["staged_changes"][0]["path"], "app.db");
+    assert_eq!(status["staged_changes"][0]["change"], "added");
+    assert_eq!(status["staged_changes"][0]["kind"], "sqlite_database");
 
     let commit = pragma_arg_string(&sqlite, "graft_commit", "initial schema");
     assert!(commit.contains("initial schema"));
 
     let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
         .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["current_head"], status["head_target"]);
+    assert_eq!(status["current_branch"], "main");
     assert_eq!(status["dirty"], false);
+    assert_eq!(status["has_unstaged_changes"], false);
+    assert_eq!(status["has_staged_changes"], false);
+    assert_eq!(status["has_conflicts"], false);
+    assert_eq!(status["work_in_progress"], false);
+    assert_eq!(
+        status["counts"],
+        serde_json::json!({ "unstaged": 0, "staged": 0, "conflicted": 0 })
+    );
+    assert_eq!(status["paths"], serde_json::json!([]));
     assert_eq!(status["staged"].as_array().unwrap().len(), 0);
     assert!(status["head_target"].as_str().is_some());
 
@@ -302,6 +515,7 @@ fn test_repo_pragmas_on_physical_database_path() {
     assert_eq!(status["dirty"], true);
     assert_eq!(status["unstaged_changes"][0]["path"], "app.db");
     assert_eq!(status["unstaged_changes"][0]["change"], "modified");
+    assert_eq!(status["unstaged_changes"][0]["kind"], "sqlite_database");
     let text_status = pragma_query_string(&sqlite, "graft_status");
     assert!(text_status.contains("modified: app.db"));
 
@@ -309,8 +523,13 @@ fn test_repo_pragmas_on_physical_database_path() {
     assert!(add.contains("app.db"));
     let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
         .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["current_head"], status["head_target"]);
+    assert_eq!(status["current_branch"], "feature/search");
     assert_eq!(status["dirty"], false);
     assert_eq!(status["staged"][0], "app.db");
+    assert_eq!(status["staged_changes"][0]["path"], "app.db");
+    assert_eq!(status["staged_changes"][0]["change"], "modified");
+    assert_eq!(status["staged_changes"][0]["kind"], "sqlite_database");
 
     let commit = pragma_arg_string(&sqlite, "graft_commit", "feature row");
     assert!(commit.contains("feature row"));
@@ -324,6 +543,14 @@ fn test_repo_pragmas_on_physical_database_path() {
         "HEAD~1 HEAD -- app.db",
     ))
     .expect("graft_json_diff should return repo diff JSON");
+    assert_eq!(json_diff["current_head"], json_diff["to"]);
+    assert_eq!(json_diff["current_branch"], "feature/search");
+    assert_eq!(
+        json_diff["paths"],
+        serde_json::json!([
+            { "path": "app.db", "change": "modified", "kind": "sqlite_database", "storage": "sqlite_snapshot" }
+        ])
+    );
     assert_eq!(json_diff["files"][0]["path"], "app.db");
     assert_eq!(json_diff["files"][0]["change"], "modified");
 
@@ -334,6 +561,8 @@ fn test_repo_pragmas_on_physical_database_path() {
     let json_show: Value =
         serde_json::from_str(&pragma_arg_string(&sqlite, "graft_json_show", "HEAD"))
             .expect("graft_json_show should return repo commit JSON");
+    assert_eq!(json_show["current_head"], json_show["id"]);
+    assert_eq!(json_show["current_branch"], "feature/search");
     assert_eq!(json_show["message"], "feature row");
     assert!(json_show["files"]["app.db"].is_object());
     let app_ranges = json_show["files"]["app.db"]["snapshot"]["ranges"]
@@ -351,11 +580,26 @@ fn test_repo_pragmas_on_physical_database_path() {
     let json_log: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_log"))
         .expect("graft_json_log should return repo commit JSON");
     assert_eq!(json_log[0]["message"], "feature row");
+    assert_eq!(json_log[0]["changes"][0]["path"], "app.db");
+    assert_eq!(json_log[0]["changes"][0]["change"], "modified");
+    assert_eq!(json_log[0]["changes"][0]["kind"], "sqlite_database");
+    assert_eq!(json_log[1]["changes"][0]["path"], "app.db");
+    assert_eq!(json_log[1]["changes"][0]["change"], "added");
+    assert_eq!(json_log[1]["changes"][0]["kind"], "sqlite_database");
     assert_eq!(json_log[0]["changed_tables"], 1);
     assert_eq!(json_log[0]["tables"][0]["name"], "repo_test");
     assert_eq!(json_log[0]["tables"][0]["inserts"], 1);
     assert_eq!(json_log[0]["tables"][0]["deletes"], 0);
     assert_eq!(json_log[0]["tables"][0]["updates"], 0);
+    let json_log_with_status: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_log",
+        "--with-status",
+    ))
+    .expect("graft_json_log --with-status should return repo commit JSON");
+    assert_eq!(json_log_with_status["current_head"], json_log[0]["id"]);
+    assert_eq!(json_log_with_status["current_branch"], "feature/search");
+    assert_eq!(json_log_with_status["commits"], json_log);
 
     let tag = pragma_arg_string(&sqlite, "graft_tag_create", "v-feature HEAD");
     assert!(tag.contains("Created tag 'v-feature'"));
@@ -1054,6 +1298,109 @@ fn test_repo_clone_pragma_fetches_branch_and_materializes_worktree() {
 }
 
 #[test]
+fn test_repo_json_clone_reports_materialized_paths_and_tracking_info() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let remote_dir = temp_dir.path().join("remote");
+    let source_db = temp_dir.path().join("source/app.db");
+    let clone_db = temp_dir.path().join("clone/app.db");
+    let remote_url = format!("fs://{}", remote_dir.display());
+    std::fs::create_dir_all(source_db.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(clone_db.parent().unwrap()).unwrap();
+
+    let mut source_runtime = GraftTestRuntime::with_memory_remote();
+    let source = source_runtime.open_sqlite(source_db.to_str().unwrap(), None);
+    assert!(pragma_query_string(&source, "graft_init").contains(".graft"));
+    assert!(
+        pragma_arg_string(&source, "graft_remote_add", format!("origin {remote_url}"))
+            .contains("origin")
+    );
+    source
+        .execute_batch(
+            r#"
+            CREATE TABLE repo_json_clone (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+            INSERT INTO repo_json_clone (name) VALUES ('Alice');
+            "#,
+        )
+        .unwrap();
+    assert_eq!(pragma_query_string(&source, "graft_add"), "Added app.db");
+    let committed: Value = serde_json::from_str(&pragma_arg_string(
+        &source,
+        "graft_json_commit",
+        "json clone data",
+    ))
+    .expect("graft_json_commit should return JSON");
+    let head = committed["commit"]["id"]
+        .as_str()
+        .expect("commit id should be present")
+        .to_string();
+    let pushed: Value = serde_json::from_str(&pragma_arg_string(
+        &source,
+        "graft_json_push",
+        "origin main",
+    ))
+    .expect("graft_json_push should return JSON");
+    assert_eq!(pushed["branches"][0]["head"], head);
+
+    let mut clone_runtime = GraftTestRuntime::with_memory_remote();
+    let clone = clone_runtime.open_sqlite(clone_db.to_str().unwrap(), None);
+    let cloned: Value = serde_json::from_str(&pragma_arg_string(
+        &clone,
+        "graft_json_clone",
+        format!("{remote_url} main"),
+    ))
+    .expect("graft_json_clone should return JSON");
+    assert_eq!(cloned["operation"], "clone");
+    assert_eq!(cloned["remote"]["name"], "origin");
+    assert_eq!(cloned["remote"]["url"].as_str(), Some(remote_url.as_str()));
+    assert_eq!(cloned["current_head"], head);
+    assert_eq!(cloned["current_branch"], "main");
+    assert_eq!(cloned["branch"], "main");
+    assert_eq!(cloned["head"], head);
+    assert_eq!(cloned["commits"], 1);
+    assert!(
+        cloned["graft_dir"]
+            .as_str()
+            .is_some_and(|path| path.ends_with(".graft"))
+    );
+    assert_eq!(
+        cloned["paths"],
+        serde_json::json!([
+            { "path": "app.db", "kind": "sqlite_database", "storage": "sqlite_snapshot", "action": "checked_out" }
+        ])
+    );
+
+    let count: i64 = clone
+        .query_row("SELECT COUNT(*) FROM repo_json_clone", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 1);
+
+    let clone_repo = graft::repo::Repository::discover_for_file(&clone_db).unwrap();
+    assert_eq!(
+        clone_repo.current_branch().unwrap().as_deref(),
+        Some("main")
+    );
+    assert_eq!(
+        clone_repo.branch_target("main").unwrap(),
+        Some(head.clone())
+    );
+    assert_eq!(
+        clone_repo.remote_tracking_ref("origin", "main").unwrap(),
+        Some(head)
+    );
+    let upstream = clone_repo
+        .branch_upstream("main")
+        .unwrap()
+        .expect("json clone should configure branch upstream");
+    assert_eq!(upstream.remote, "origin");
+    assert_eq!(upstream.branch, "main");
+
+    source_runtime.shutdown().unwrap();
+    clone_runtime.shutdown().unwrap();
+}
+
+#[test]
 fn test_repo_remote_rename_pragma_updates_upstreams_and_tracking_refs() {
     graft_test::ensure_test_env();
 
@@ -1630,9 +1977,108 @@ fn test_repo_status_scans_physical_untracked_sqlite_files() {
     assert_eq!(status["dirty"], true);
     assert_eq!(status["unstaged_changes"][0]["path"], "external.db");
     assert_eq!(status["unstaged_changes"][0]["change"], "untracked");
+    assert_eq!(status["unstaged_changes"][0]["kind"], "sqlite_database");
 
     let text_status = pragma_query_string(&sqlite, "graft_status");
     assert!(text_status.contains("untracked: external.db"));
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_ls_files_others_lists_untracked_worktree_candidates() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+    assert_eq!(
+        pragma_arg_string(
+            &sqlite,
+            "graft_config_set",
+            "files.inline_text_threshold -- 4 B"
+        ),
+        "files.inline_text_threshold = 4 B\n"
+    );
+
+    std::fs::write(
+        temp_dir.path().join(".graftignore"),
+        "*.tmp\n.graftignore\nignored_dir/\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(temp_dir.path().join("assets")).unwrap();
+    std::fs::create_dir_all(temp_dir.path().join("ignored_dir")).unwrap();
+    std::fs::write(temp_dir.path().join("assets").join("note.txt"), b"note").unwrap();
+    std::fs::write(
+        temp_dir.path().join("assets").join("model.bin"),
+        b"large inventory payload",
+    )
+    .unwrap();
+    std::fs::write(temp_dir.path().join("scratch.tmp"), b"ignored").unwrap();
+    std::fs::write(
+        temp_dir.path().join("ignored_dir").join("secret.txt"),
+        b"ignored",
+    )
+    .unwrap();
+
+    let external_db = temp_dir.path().join("external.db");
+    {
+        let external = Connection::open(&external_db).unwrap();
+        external
+            .execute_batch("CREATE TABLE external_data (id INTEGER PRIMARY KEY);")
+            .unwrap();
+    }
+
+    let others: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_ls_files",
+        "--others",
+    ))
+    .expect("graft_json_ls_files --others should return path JSON");
+    assert_eq!(others["current_branch"], "main");
+    assert_eq!(others["stage"], false);
+    assert_eq!(others["others"], true);
+    let paths = others["paths"].as_array().unwrap();
+    assert!(paths.iter().any(|entry| entry["path"] == "external.db"
+        && entry["kind"] == "sqlite_database"
+        && entry["storage"] == "sqlite_snapshot"));
+    assert!(paths.iter().any(|entry| entry["path"] == "assets/note.txt"
+        && entry["kind"] == "text_file"
+        && entry["storage"] == "inline"));
+    assert!(paths.iter().any(|entry| entry["path"] == "assets/model.bin"
+        && entry["kind"] == "text_file"
+        && entry["storage"] == "external"));
+    assert!(
+        !paths
+            .iter()
+            .any(|entry| entry["path"] == "scratch.tmp" || entry["path"] == ".graftignore")
+    );
+
+    let text_files: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_ls_files",
+        "--others --kind text_file",
+    ))
+    .expect("graft_json_ls_files --others --kind should return path JSON");
+    assert_eq!(text_files["kind"], "text_file");
+    assert_eq!(text_files["others"], true);
+    assert_eq!(text_files["paths"].as_array().unwrap().len(), 2);
+    assert!(
+        text_files["paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["path"] == "assets/model.bin" && entry["storage"] == "external")
+    );
+
+    let text = pragma_arg_string(&sqlite, "graft_ls_files", "--others");
+    assert!(text.contains("external.db (sqlite,"));
+    assert!(text.contains("assets/note.txt (text file, inline, 4 byte(s))"));
+    assert!(text.contains("assets/model.bin (text file, external, 23 byte(s))"));
 
     runtime.shutdown().unwrap();
 }
@@ -1746,6 +2192,7 @@ fn test_repo_add_stages_physical_untracked_sqlite_file() {
         .expect("graft_json_status should return repo status JSON");
     assert_eq!(status["unstaged_changes"][0]["path"], "external.db");
     assert_eq!(status["unstaged_changes"][0]["change"], "untracked");
+    assert_eq!(status["unstaged_changes"][0]["kind"], "sqlite_database");
 
     let added = pragma_arg_string(&sqlite, "graft_add", "external.db");
     assert_eq!(added, "Added external.db");
@@ -1753,6 +2200,9 @@ fn test_repo_add_stages_physical_untracked_sqlite_file() {
     let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
         .expect("graft_json_status should return repo status JSON");
     assert_eq!(status["staged"][0], "external.db");
+    assert_eq!(status["staged_changes"][0]["path"], "external.db");
+    assert_eq!(status["staged_changes"][0]["change"], "added");
+    assert_eq!(status["staged_changes"][0]["kind"], "sqlite_database");
     assert!(
         status["unstaged_changes"].as_array().is_none_or(|changes| {
             !changes.iter().any(|change| change["path"] == "external.db")
@@ -1763,6 +2213,2304 @@ fn test_repo_add_stages_physical_untracked_sqlite_file() {
     assert!(commit.contains("add external database"));
     let show = pragma_arg_string(&sqlite, "graft_show", "HEAD");
     assert!(show.contains("external.db"));
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_pragmas_track_regular_file_artifacts() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+
+    let notes = temp_dir.path().join("notes.txt");
+    std::fs::write(&notes, "first note").unwrap();
+
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_add", "notes.txt"),
+        "Added notes.txt"
+    );
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["dirty"], false);
+    assert_eq!(status["staged"][0], "notes.txt");
+    assert_eq!(status["staged_changes"][0]["path"], "notes.txt");
+    assert_eq!(status["staged_changes"][0]["change"], "added");
+    assert_eq!(status["staged_changes"][0]["kind"], "text_file");
+    assert_eq!(status["staged_changes"][0]["storage"], "inline");
+
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "notes v1").contains("notes v1"));
+    let show = pragma_arg_string(&sqlite, "graft_show", "HEAD");
+    assert!(show.contains("Artifacts:"));
+    assert!(show.contains("notes.txt"));
+
+    std::fs::write(&notes, "second note").unwrap();
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["dirty"], true);
+    assert!(
+        status["unstaged_changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|change| {
+                change["path"] == "notes.txt"
+                    && change["change"] == "modified"
+                    && change["kind"] == "text_file"
+                    && change["storage"] == "inline"
+            })
+    );
+    let diff = pragma_arg_string(&sqlite, "graft_diff", "-- notes.txt");
+    assert!(diff.contains("modified: notes.txt"));
+    let json_diff: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_diff",
+        "-- notes.txt",
+    ))
+    .expect("graft_json_diff should return repo diff JSON");
+    assert_eq!(
+        json_diff["paths"],
+        serde_json::json!([
+            { "path": "notes.txt", "change": "modified", "kind": "text_file", "storage": "inline" }
+        ])
+    );
+    assert_eq!(json_diff["artifacts"][0]["path"], "notes.txt");
+    assert_eq!(json_diff["artifacts"][0]["change"], "modified");
+    assert_eq!(json_diff["artifacts"][0]["kind"], "text_file");
+    assert_eq!(json_diff["artifacts"][0]["storage"], "inline");
+    let row_diff: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_diff",
+        "--rows -- notes.txt",
+    ))
+    .expect("graft_json_diff --rows should retain file path summary");
+    assert_eq!(
+        row_diff["paths"],
+        serde_json::json!([
+            { "path": "notes.txt", "change": "modified", "kind": "text_file", "storage": "inline" }
+        ])
+    );
+    assert_eq!(row_diff["files"], serde_json::json!([]));
+
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_add", "notes.txt"),
+        "Added notes.txt"
+    );
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "notes v2").contains("notes v2"));
+
+    std::fs::remove_file(&notes).unwrap();
+    let checkout = pragma_arg_string(&sqlite, "graft_checkout", "HEAD~1 -- notes.txt");
+    assert!(checkout.contains("Checked out notes.txt"));
+    assert_eq!(std::fs::read_to_string(&notes).unwrap(), "first note");
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["dirty"], false);
+    assert_eq!(status["staged"][0], "notes.txt");
+    assert_eq!(status["staged_changes"][0]["path"], "notes.txt");
+    assert_eq!(status["staged_changes"][0]["change"], "modified");
+    assert_eq!(status["staged_changes"][0]["kind"], "text_file");
+    assert_eq!(status["staged_changes"][0]["storage"], "inline");
+
+    let restored = pragma_arg_string(&sqlite, "graft_restore", "--staged notes.txt");
+    assert_eq!(restored, "Restored notes.txt");
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["dirty"], true);
+    assert_eq!(status["unstaged"][0], "notes.txt");
+    assert_eq!(status["staged"].as_array().unwrap().len(), 0);
+
+    let restored = pragma_arg_string(&sqlite, "graft_restore", "notes.txt");
+    assert_eq!(restored, "Restored notes.txt");
+    assert_eq!(std::fs::read_to_string(&notes).unwrap(), "second note");
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["dirty"], false);
+    assert_eq!(status["unstaged"].as_array().unwrap().len(), 0);
+    assert_eq!(status["staged"].as_array().unwrap().len(), 0);
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_pragmas_add_all_stages_database_and_file_changes() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE app_notes (
+              id INTEGER PRIMARY KEY,
+              body TEXT NOT NULL
+            );
+            INSERT INTO app_notes (id, body) VALUES (1, 'alpha');
+            "#,
+        )
+        .unwrap();
+
+    let external_path = temp_dir.path().join("external.db");
+    {
+        let external = Connection::open(&external_path).unwrap();
+        external
+            .execute_batch(
+                r#"
+                CREATE TABLE external_notes (
+                  id INTEGER PRIMARY KEY,
+                  body TEXT NOT NULL
+                );
+                INSERT INTO external_notes (id, body) VALUES (1, 'outside');
+                "#,
+            )
+            .unwrap();
+    }
+
+    let assets = temp_dir.path().join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    std::fs::write(assets.join("note.txt"), "first note").unwrap();
+
+    let added = pragma_arg_string(&sqlite, "graft_add", "--all");
+    assert!(added.contains("Added 3 paths"), "{added}");
+    assert!(added.contains("app.db"), "{added}");
+    assert!(added.contains("assets/note.txt"), "{added}");
+    assert!(added.contains("external.db"), "{added}");
+
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(
+        status["staged"],
+        serde_json::json!(["app.db", "assets/note.txt", "external.db"])
+    );
+    assert_eq!(
+        status["staged_changes"],
+        serde_json::json!([
+            { "path": "app.db", "change": "added", "kind": "sqlite_database", "storage": "sqlite_snapshot" },
+            { "path": "assets/note.txt", "change": "added", "kind": "text_file", "storage": "inline" },
+            { "path": "external.db", "change": "added", "kind": "sqlite_database", "storage": "sqlite_snapshot" }
+        ])
+    );
+    assert_eq!(status["dirty"], false);
+    assert_eq!(status["has_unstaged_changes"], false);
+    assert_eq!(status["has_staged_changes"], true);
+    assert_eq!(status["has_conflicts"], false);
+    assert_eq!(status["work_in_progress"], true);
+    assert_eq!(
+        status["counts"],
+        serde_json::json!({ "unstaged": 0, "staged": 3, "conflicted": 0 })
+    );
+    assert_eq!(
+        status["paths"],
+        serde_json::json!([
+            {
+                "path": "app.db",
+                "kind": "sqlite_database",
+                "storage": "sqlite_snapshot",
+                "index_status": "added",
+                "worktree_status": "none",
+                "code": "A ",
+                "staged_change": "added",
+                "conflicted": false
+            },
+            {
+                "path": "assets/note.txt",
+                "kind": "text_file",
+                "storage": "inline",
+                "index_status": "added",
+                "worktree_status": "none",
+                "code": "A ",
+                "staged_change": "added",
+                "conflicted": false
+            },
+            {
+                "path": "external.db",
+                "kind": "sqlite_database",
+                "storage": "sqlite_snapshot",
+                "index_status": "added",
+                "worktree_status": "none",
+                "code": "A ",
+                "staged_change": "added",
+                "conflicted": false
+            }
+        ])
+    );
+    assert_eq!(status["unstaged"].as_array().unwrap().len(), 0);
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "initial app state").contains("initial"));
+
+    sqlite
+        .execute("INSERT INTO app_notes (id, body) VALUES (2, 'beta')", [])
+        .unwrap();
+    std::fs::write(assets.join("note.txt"), "second note").unwrap();
+    std::fs::remove_file(&external_path).unwrap();
+
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["dirty"], true);
+    assert_eq!(status["has_unstaged_changes"], true);
+    assert_eq!(status["has_staged_changes"], false);
+    assert_eq!(status["has_conflicts"], false);
+    assert_eq!(status["work_in_progress"], true);
+    assert_eq!(
+        status["counts"],
+        serde_json::json!({ "unstaged": 3, "staged": 0, "conflicted": 0 })
+    );
+    assert_eq!(
+        status["paths"],
+        serde_json::json!([
+            {
+                "path": "app.db",
+                "kind": "sqlite_database",
+                "storage": "sqlite_snapshot",
+                "index_status": "none",
+                "worktree_status": "modified",
+                "code": " M",
+                "unstaged_change": "modified",
+                "conflicted": false
+            },
+            {
+                "path": "assets/note.txt",
+                "kind": "text_file",
+                "storage": "inline",
+                "index_status": "none",
+                "worktree_status": "modified",
+                "code": " M",
+                "unstaged_change": "modified",
+                "conflicted": false
+            },
+            {
+                "path": "external.db",
+                "kind": "sqlite_database",
+                "storage": "sqlite_snapshot",
+                "index_status": "none",
+                "worktree_status": "deleted",
+                "code": " D",
+                "unstaged_change": "deleted",
+                "conflicted": false
+            }
+        ])
+    );
+    assert!(
+        status["unstaged_changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|change| {
+                change["path"] == "app.db"
+                    && change["change"] == "modified"
+                    && change["kind"] == "sqlite_database"
+                    && change["storage"] == "sqlite_snapshot"
+            })
+    );
+    assert!(
+        status["unstaged_changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|change| {
+                change["path"] == "assets/note.txt"
+                    && change["change"] == "modified"
+                    && change["kind"] == "text_file"
+                    && change["storage"] == "inline"
+            })
+    );
+    assert!(
+        status["unstaged_changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|change| {
+                change["path"] == "external.db"
+                    && change["change"] == "deleted"
+                    && change["kind"] == "sqlite_database"
+                    && change["storage"] == "sqlite_snapshot"
+            })
+    );
+
+    let added = pragma_arg_string(&sqlite, "graft_add", "-A");
+    assert!(added.contains("Added 3 paths"), "{added}");
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(
+        status["staged"],
+        serde_json::json!(["app.db", "assets/note.txt", "external.db"])
+    );
+    assert_eq!(
+        status["staged_changes"],
+        serde_json::json!([
+            { "path": "app.db", "change": "modified", "kind": "sqlite_database", "storage": "sqlite_snapshot" },
+            { "path": "assets/note.txt", "change": "modified", "kind": "text_file", "storage": "inline" },
+            { "path": "external.db", "change": "deleted", "kind": "sqlite_database", "storage": "sqlite_snapshot" }
+        ])
+    );
+    assert_eq!(status["dirty"], false);
+    assert_eq!(status["has_unstaged_changes"], false);
+    assert_eq!(status["has_staged_changes"], true);
+    assert_eq!(status["has_conflicts"], false);
+    assert_eq!(status["work_in_progress"], true);
+    assert_eq!(
+        status["counts"],
+        serde_json::json!({ "unstaged": 0, "staged": 3, "conflicted": 0 })
+    );
+    assert_eq!(
+        status["paths"],
+        serde_json::json!([
+            {
+                "path": "app.db",
+                "kind": "sqlite_database",
+                "storage": "sqlite_snapshot",
+                "index_status": "modified",
+                "worktree_status": "none",
+                "code": "M ",
+                "staged_change": "modified",
+                "conflicted": false
+            },
+            {
+                "path": "assets/note.txt",
+                "kind": "text_file",
+                "storage": "inline",
+                "index_status": "modified",
+                "worktree_status": "none",
+                "code": "M ",
+                "staged_change": "modified",
+                "conflicted": false
+            },
+            {
+                "path": "external.db",
+                "kind": "sqlite_database",
+                "storage": "sqlite_snapshot",
+                "index_status": "deleted",
+                "worktree_status": "none",
+                "code": "D ",
+                "staged_change": "deleted",
+                "conflicted": false
+            }
+        ])
+    );
+    assert_eq!(status["unstaged"].as_array().unwrap().len(), 0);
+
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "second app state").contains("second"));
+    let log: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_log"))
+        .expect("graft_json_log should return repo commit JSON");
+    assert_eq!(
+        log[0]["changes"],
+        serde_json::json!([
+            { "path": "app.db", "change": "modified", "kind": "sqlite_database", "storage": "sqlite_snapshot" },
+            { "path": "assets/note.txt", "change": "modified", "kind": "text_file", "storage": "inline" },
+            { "path": "external.db", "change": "deleted", "kind": "sqlite_database", "storage": "sqlite_snapshot" }
+        ])
+    );
+    let tracked: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_ls_files"))
+        .expect("graft_json_ls_files should return tracked path JSON");
+    assert_eq!(tracked["current_head"], log[0]["id"]);
+    assert_eq!(tracked["current_branch"], "main");
+    assert_eq!(tracked["stage"], false);
+    let tracked_paths = tracked["paths"].as_array().unwrap();
+    assert!(tracked_paths.iter().any(|entry| entry["path"] == "app.db"
+        && entry["kind"] == "sqlite_database"
+        && entry["storage"] == "sqlite_snapshot"));
+    assert!(
+        tracked_paths
+            .iter()
+            .any(|entry| entry["path"] == "assets/note.txt"
+                && entry["kind"] == "text_file"
+                && entry["storage"] == "inline")
+    );
+    assert!(
+        !tracked_paths
+            .iter()
+            .any(|entry| entry["path"] == "external.db")
+    );
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_json_add_reports_staged_database_file_and_large_file_paths() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE app_notes (
+              id INTEGER PRIMARY KEY,
+              body TEXT NOT NULL
+            );
+            INSERT INTO app_notes (id, body) VALUES (1, 'alpha');
+            "#,
+        )
+        .unwrap();
+
+    assert_eq!(pragma_query_string(&sqlite, "graft_add"), "Added app.db");
+    let base_commit: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_commit",
+        "base app state",
+    ))
+    .expect("graft_json_commit should return commit JSON");
+    let base_id = base_commit["commit"]["id"].as_str().unwrap();
+    assert_eq!(base_commit["head"], base_id);
+    assert_eq!(base_commit["branch"], "main");
+    assert_eq!(
+        pragma_arg_string(
+            &sqlite,
+            "graft_config_set",
+            "files.inline_text_threshold -- 16 B"
+        ),
+        "files.inline_text_threshold = 16 B\n"
+    );
+
+    sqlite
+        .execute("INSERT INTO app_notes (id, body) VALUES (2, 'beta')", [])
+        .unwrap();
+    let assets = temp_dir.path().join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    std::fs::write(assets.join("note.txt"), "feature note").unwrap();
+    std::fs::write(assets.join("model.bin"), b"large merge payload").unwrap();
+
+    let added: Value = serde_json::from_str(&pragma_arg_string(&sqlite, "graft_json_add", "--all"))
+        .expect("graft_json_add should return staged path JSON");
+    assert_eq!(added["operation"], "add");
+    assert_eq!(added["current_head"], base_id);
+    assert_eq!(added["current_branch"], "main");
+    assert_eq!(
+        added["paths"],
+        serde_json::json!([
+            { "path": "app.db", "change": "modified", "kind": "sqlite_database", "storage": "sqlite_snapshot" },
+            { "path": "assets/model.bin", "change": "added", "kind": "text_file", "storage": "external" },
+            { "path": "assets/note.txt", "change": "added", "kind": "text_file", "storage": "inline" }
+        ])
+    );
+
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["dirty"], false);
+    assert_eq!(
+        status["counts"],
+        serde_json::json!({ "unstaged": 0, "staged": 3, "conflicted": 0 })
+    );
+    assert_eq!(status["staged_changes"], added["paths"]);
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_json_diff_filters_by_path_kind() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE app_notes (
+              id INTEGER PRIMARY KEY,
+              body TEXT NOT NULL
+            );
+            INSERT INTO app_notes (id, body) VALUES (1, 'alpha');
+            "#,
+        )
+        .unwrap();
+
+    assert_eq!(pragma_query_string(&sqlite, "graft_add"), "Added app.db");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "base app state").contains("base"));
+    assert_eq!(
+        pragma_arg_string(
+            &sqlite,
+            "graft_config_set",
+            "files.inline_text_threshold -- 16 B"
+        ),
+        "files.inline_text_threshold = 16 B\n"
+    );
+
+    sqlite
+        .execute("INSERT INTO app_notes (id, body) VALUES (2, 'beta')", [])
+        .unwrap();
+    let assets = temp_dir.path().join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    std::fs::write(assets.join("note.txt"), "feature note").unwrap();
+    std::fs::write(assets.join("model.bin"), b"large merge payload").unwrap();
+    assert!(pragma_arg_string(&sqlite, "graft_add", "--all").contains("Added 3 paths"));
+
+    let file_diff: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_diff",
+        "--staged --kind text_file",
+    ))
+    .expect("graft_json_diff --kind text_file should return filtered repo diff JSON");
+    assert_eq!(file_diff["kind"], "text_file");
+    assert_eq!(
+        file_diff["paths"],
+        serde_json::json!([
+            { "path": "assets/model.bin", "change": "added", "kind": "text_file", "storage": "external" },
+            { "path": "assets/note.txt", "change": "added", "kind": "text_file", "storage": "inline" }
+        ])
+    );
+    assert_eq!(file_diff["files"], serde_json::json!([]));
+    assert_eq!(file_diff["artifacts"].as_array().unwrap().len(), 2);
+    assert!(
+        file_diff["artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|artifact| artifact["path"] == "assets/note.txt"
+                && artifact["change"] == "added"
+                && artifact["kind"] == "text_file"
+                && artifact["storage"] == "inline")
+    );
+
+    let sqlite_diff: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_diff",
+        "--staged --kind db",
+    ))
+    .expect("graft_json_diff --kind db should return filtered repo diff JSON");
+    assert_eq!(sqlite_diff["kind"], "sqlite_database");
+    assert_eq!(
+        sqlite_diff["paths"],
+        serde_json::json!([
+            { "path": "app.db", "change": "modified", "kind": "sqlite_database", "storage": "sqlite_snapshot" }
+        ])
+    );
+    assert_eq!(sqlite_diff["files"][0]["path"], "app.db");
+    assert_eq!(sqlite_diff["files"][0]["change"], "modified");
+    assert_eq!(sqlite_diff["files"][0]["kind"], "sqlite_database");
+    assert_eq!(sqlite_diff["files"][0]["storage"], "sqlite_snapshot");
+    assert!(
+        sqlite_diff["artifacts"]
+            .as_array()
+            .is_none_or(|artifacts| artifacts.is_empty())
+    );
+
+    let row_diff: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_diff",
+        "--rows --staged --kind db",
+    ))
+    .expect("graft_json_diff --rows --kind db should return filtered row diff JSON");
+    assert_eq!(row_diff["kind"], "sqlite_database");
+    assert_eq!(
+        row_diff["paths"],
+        serde_json::json!([
+            { "path": "app.db", "change": "modified", "kind": "sqlite_database", "storage": "sqlite_snapshot" }
+        ])
+    );
+    assert_eq!(row_diff["files"][0]["path"], "app.db");
+    assert_eq!(row_diff["files"][0]["kind"], "sqlite_database");
+    assert_eq!(row_diff["files"][0]["storage"], "sqlite_snapshot");
+    assert_eq!(row_diff["files"][0]["row_diff_available"], true);
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_json_rm_cached_keeps_database_file_and_large_file_paths() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+    assert_eq!(
+        pragma_arg_string(
+            &sqlite,
+            "graft_config_set",
+            "files.inline_text_threshold -- 16 B"
+        ),
+        "files.inline_text_threshold = 16 B\n"
+    );
+
+    let external_db = temp_dir.path().join("external.db");
+    {
+        let external = Connection::open(&external_db).unwrap();
+        external
+            .execute_batch(
+                r#"
+                CREATE TABLE external_notes (
+                  id INTEGER PRIMARY KEY,
+                  body TEXT NOT NULL
+                );
+                INSERT INTO external_notes (id, body) VALUES (1, 'outside');
+                "#,
+            )
+            .unwrap();
+    }
+    let assets = temp_dir.path().join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    let note = assets.join("note.txt");
+    let model = assets.join("model.bin");
+    std::fs::write(&note, "feature note").unwrap();
+    std::fs::write(&model, b"large merge payload").unwrap();
+
+    assert!(pragma_arg_string(&sqlite, "graft_add", "--all").contains("Added 3 paths"));
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "track files").contains("track files"));
+
+    let removed: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_rm",
+        "--cached -- external.db",
+    ))
+    .expect("graft_json_rm --cached should return remove JSON");
+    assert_eq!(removed["operation"], "rm");
+    assert_eq!(removed["cached"], true);
+    assert_eq!(
+        removed["paths"],
+        serde_json::json!([
+            { "path": "external.db", "kind": "sqlite_database", "storage": "sqlite_snapshot", "action": "staged" }
+        ])
+    );
+    assert!(external_db.exists());
+
+    let removed: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_rm",
+        "--cached -- assets/note.txt",
+    ))
+    .expect("graft_json_rm --cached should return remove JSON");
+    assert_eq!(removed["cached"], true);
+    assert_eq!(
+        removed["paths"],
+        serde_json::json!([
+            { "path": "assets/note.txt", "kind": "text_file", "storage": "inline", "action": "staged" }
+        ])
+    );
+    assert!(note.exists());
+
+    let removed: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_rm",
+        "--cached -- assets/model.bin",
+    ))
+    .expect("graft_json_rm --cached should return remove JSON");
+    assert_eq!(removed["cached"], true);
+    assert_eq!(
+        removed["paths"],
+        serde_json::json!([
+            { "path": "assets/model.bin", "kind": "text_file", "storage": "external", "action": "staged" }
+        ])
+    );
+    assert!(model.exists());
+
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(
+        status["staged_changes"],
+        serde_json::json!([
+            { "path": "assets/model.bin", "change": "deleted", "kind": "text_file", "storage": "external" },
+            { "path": "assets/note.txt", "change": "deleted", "kind": "text_file", "storage": "inline" },
+            { "path": "external.db", "change": "deleted", "kind": "sqlite_database", "storage": "sqlite_snapshot" }
+        ])
+    );
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_json_add_all_filters_by_path_kind() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE app_notes (
+              id INTEGER PRIMARY KEY,
+              body TEXT NOT NULL
+            );
+            INSERT INTO app_notes (id, body) VALUES (1, 'alpha');
+            "#,
+        )
+        .unwrap();
+
+    assert_eq!(pragma_query_string(&sqlite, "graft_add"), "Added app.db");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "base app state").contains("base"));
+    assert_eq!(
+        pragma_arg_string(
+            &sqlite,
+            "graft_config_set",
+            "files.inline_text_threshold -- 16 B"
+        ),
+        "files.inline_text_threshold = 16 B\n"
+    );
+
+    sqlite
+        .execute("INSERT INTO app_notes (id, body) VALUES (2, 'beta')", [])
+        .unwrap();
+    let assets = temp_dir.path().join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    std::fs::write(assets.join("note.txt"), "feature note").unwrap();
+    std::fs::write(assets.join("model.bin"), b"large merge payload").unwrap();
+
+    let added: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_add",
+        "--all --kind text_file",
+    ))
+    .expect("graft_json_add --all --kind text_file should return staged path JSON");
+    assert_eq!(added["operation"], "add");
+    assert_eq!(added["kind"], "text_file");
+    assert_eq!(
+        added["paths"],
+        serde_json::json!([
+            { "path": "assets/model.bin", "change": "added", "kind": "text_file", "storage": "external" },
+            { "path": "assets/note.txt", "change": "added", "kind": "text_file", "storage": "inline" }
+        ])
+    );
+
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(
+        status["counts"],
+        serde_json::json!({ "unstaged": 1, "staged": 2, "conflicted": 0 })
+    );
+    assert_eq!(
+        status["staged_changes"],
+        serde_json::json!([
+            { "path": "assets/model.bin", "change": "added", "kind": "text_file", "storage": "external" },
+            { "path": "assets/note.txt", "change": "added", "kind": "text_file", "storage": "inline" }
+        ])
+    );
+    let unstaged = status["unstaged_changes"].as_array().unwrap();
+    assert!(unstaged.iter().any(|change| change["path"] == "app.db"
+        && change["change"] == "modified"
+        && change["kind"] == "sqlite_database"
+        && change["storage"] == "sqlite_snapshot"));
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_json_restore_staged_all_filters_by_path_kind() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE app_notes (
+              id INTEGER PRIMARY KEY,
+              body TEXT NOT NULL
+            );
+            INSERT INTO app_notes (id, body) VALUES (1, 'alpha');
+            "#,
+        )
+        .unwrap();
+
+    assert_eq!(pragma_query_string(&sqlite, "graft_add"), "Added app.db");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "base app state").contains("base"));
+    assert_eq!(
+        pragma_arg_string(
+            &sqlite,
+            "graft_config_set",
+            "files.inline_text_threshold -- 16 B"
+        ),
+        "files.inline_text_threshold = 16 B\n"
+    );
+
+    sqlite
+        .execute("INSERT INTO app_notes (id, body) VALUES (2, 'beta')", [])
+        .unwrap();
+    let assets = temp_dir.path().join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    std::fs::write(assets.join("note.txt"), "feature note").unwrap();
+    std::fs::write(assets.join("model.bin"), b"large merge payload").unwrap();
+
+    assert!(pragma_arg_string(&sqlite, "graft_add", "--all").contains("Added 3 paths"));
+    let restored: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_restore",
+        "--staged --all --kind sqlite_database",
+    ))
+    .expect("graft_json_restore --staged --all --kind should return restore JSON");
+    assert_eq!(restored["operation"], "restore");
+    assert_eq!(restored["staged"], true);
+    assert_eq!(restored["all"], true);
+    assert_eq!(restored["kind"], "sqlite_database");
+    assert_eq!(restored["path"], "app.db");
+    assert_eq!(
+        restored["path_details"],
+        serde_json::json!([
+            { "path": "app.db", "kind": "sqlite_database", "storage": "sqlite_snapshot" }
+        ])
+    );
+
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(
+        status["counts"],
+        serde_json::json!({ "unstaged": 1, "staged": 2, "conflicted": 0 })
+    );
+    assert_eq!(
+        status["staged_changes"],
+        serde_json::json!([
+            { "path": "assets/model.bin", "change": "added", "kind": "text_file", "storage": "external" },
+            { "path": "assets/note.txt", "change": "added", "kind": "text_file", "storage": "inline" }
+        ])
+    );
+    assert_eq!(
+        status["unstaged_changes"],
+        serde_json::json!([
+            { "path": "app.db", "change": "modified", "kind": "sqlite_database", "storage": "sqlite_snapshot" }
+        ])
+    );
+
+    let restored: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_restore",
+        "--staged --all",
+    ))
+    .expect("graft_json_restore --staged --all should return restore JSON");
+    assert_eq!(restored["operation"], "restore");
+    assert_eq!(restored["staged"], true);
+    assert_eq!(restored["all"], true);
+    assert!(restored.get("kind").is_none());
+    assert_eq!(
+        restored["paths"],
+        serde_json::json!(["assets/model.bin", "assets/note.txt"])
+    );
+
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(
+        status["counts"],
+        serde_json::json!({ "unstaged": 3, "staged": 0, "conflicted": 0 })
+    );
+    assert!(
+        status["staged_changes"]
+            .as_array()
+            .is_none_or(|changes| changes.is_empty())
+    );
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_json_rm_reports_removed_database_file_and_large_file_paths() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+    assert_eq!(
+        pragma_arg_string(
+            &sqlite,
+            "graft_config_set",
+            "files.inline_text_threshold -- 16 B"
+        ),
+        "files.inline_text_threshold = 16 B\n"
+    );
+
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE app_notes (
+              id INTEGER PRIMARY KEY,
+              body TEXT NOT NULL
+            );
+            INSERT INTO app_notes (id, body) VALUES (1, 'alpha');
+            "#,
+        )
+        .unwrap();
+
+    let external_path = temp_dir.path().join("external.db");
+    {
+        let external = Connection::open(&external_path).unwrap();
+        external
+            .execute_batch(
+                r#"
+                PRAGMA page_size=4096;
+                CREATE TABLE external_notes (
+                  id INTEGER PRIMARY KEY,
+                  body TEXT NOT NULL
+                );
+                INSERT INTO external_notes (id, body) VALUES (1, 'outside');
+                "#,
+            )
+            .unwrap();
+    }
+
+    let assets = temp_dir.path().join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    std::fs::write(assets.join("note.txt"), "feature note").unwrap();
+    std::fs::write(assets.join("model.bin"), b"large merge payload").unwrap();
+
+    assert!(pragma_arg_string(&sqlite, "graft_add", "--all").contains("Added 4 paths"));
+    let base_commit: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_commit",
+        "base app state",
+    ))
+    .expect("graft_json_commit should return commit JSON");
+    let base_id = base_commit["commit"]["id"].as_str().unwrap();
+    assert_eq!(base_commit["head"], base_id);
+    assert_eq!(base_commit["branch"], "main");
+
+    let removed_external: Value =
+        serde_json::from_str(&pragma_arg_string(&sqlite, "graft_json_rm", "external.db"))
+            .expect("graft_json_rm should return path action JSON");
+    assert_eq!(removed_external["operation"], "rm");
+    assert_eq!(removed_external["current_head"], base_id);
+    assert_eq!(removed_external["current_branch"], "main");
+    assert_eq!(
+        removed_external["paths"],
+        serde_json::json!([
+            { "path": "external.db", "kind": "sqlite_database", "storage": "sqlite_snapshot", "action": "staged" }
+        ])
+    );
+    assert!(!external_path.exists());
+
+    let removed_note: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_rm",
+        "assets/note.txt",
+    ))
+    .expect("graft_json_rm should return path action JSON");
+    assert_eq!(removed_note["operation"], "rm");
+    assert_eq!(removed_note["current_head"], base_id);
+    assert_eq!(removed_note["current_branch"], "main");
+    assert_eq!(
+        removed_note["paths"],
+        serde_json::json!([
+            { "path": "assets/note.txt", "kind": "text_file", "storage": "inline", "action": "staged" }
+        ])
+    );
+    assert!(!assets.join("note.txt").exists());
+
+    let removed_model: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_rm",
+        "assets/model.bin",
+    ))
+    .expect("graft_json_rm should return path action JSON");
+    assert_eq!(removed_model["operation"], "rm");
+    assert_eq!(removed_model["current_head"], base_id);
+    assert_eq!(removed_model["current_branch"], "main");
+    assert_eq!(
+        removed_model["paths"],
+        serde_json::json!([
+            { "path": "assets/model.bin", "kind": "text_file", "storage": "external", "action": "staged" }
+        ])
+    );
+    assert!(!assets.join("model.bin").exists());
+
+    let removed_current: Value =
+        serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_rm"))
+            .expect("graft_json_rm should return current database path action JSON");
+    assert_eq!(removed_current["operation"], "rm");
+    assert_eq!(removed_current["current_head"], base_id);
+    assert_eq!(removed_current["current_branch"], "main");
+    assert_eq!(
+        removed_current["paths"],
+        serde_json::json!([
+            { "path": "app.db", "kind": "sqlite_database", "storage": "sqlite_snapshot", "action": "staged" }
+        ])
+    );
+
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["dirty"], false);
+    assert_eq!(
+        status["staged_changes"],
+        serde_json::json!([
+            { "path": "app.db", "change": "deleted", "kind": "sqlite_database", "storage": "sqlite_snapshot" },
+            { "path": "assets/model.bin", "change": "deleted", "kind": "text_file", "storage": "external" },
+            { "path": "assets/note.txt", "change": "deleted", "kind": "text_file", "storage": "inline" },
+            { "path": "external.db", "change": "deleted", "kind": "sqlite_database", "storage": "sqlite_snapshot" }
+        ])
+    );
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_json_commit_reports_database_file_and_large_file_changes() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE app_notes (
+              id INTEGER PRIMARY KEY,
+              body TEXT NOT NULL
+            );
+            INSERT INTO app_notes (id, body) VALUES (1, 'alpha');
+            "#,
+        )
+        .unwrap();
+
+    assert_eq!(pragma_query_string(&sqlite, "graft_add"), "Added app.db");
+    let base: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_commit",
+        "base app state",
+    ))
+    .expect("graft_json_commit should return commit JSON");
+    assert_eq!(base["operation"], "commit");
+    assert_eq!(base["commit"]["message"], "base app state");
+    assert!(
+        base["commit"]["id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty())
+    );
+    assert_eq!(base["head"], base["commit"]["id"]);
+    assert_eq!(base["branch"], "main");
+    assert_eq!(base["current_head"], base["commit"]["id"]);
+    assert_eq!(base["current_branch"], "main");
+    assert_eq!(base["commit"]["parents"], serde_json::json!([]));
+    assert_eq!(
+        base["paths"],
+        serde_json::json!([
+            { "path": "app.db", "change": "added", "kind": "sqlite_database", "storage": "sqlite_snapshot" }
+        ])
+    );
+
+    assert_eq!(
+        pragma_arg_string(
+            &sqlite,
+            "graft_config_set",
+            "files.inline_text_threshold -- 16 B"
+        ),
+        "files.inline_text_threshold = 16 B\n"
+    );
+    sqlite
+        .execute("INSERT INTO app_notes (id, body) VALUES (2, 'beta')", [])
+        .unwrap();
+    let assets = temp_dir.path().join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    std::fs::write(assets.join("note.txt"), "feature note").unwrap();
+    std::fs::write(assets.join("model.bin"), b"large merge payload").unwrap();
+
+    let added: Value = serde_json::from_str(&pragma_arg_string(&sqlite, "graft_json_add", "--all"))
+        .expect("graft_json_add should return staged path JSON");
+    assert_eq!(
+        added["paths"],
+        serde_json::json!([
+            { "path": "app.db", "change": "modified", "kind": "sqlite_database", "storage": "sqlite_snapshot" },
+            { "path": "assets/model.bin", "change": "added", "kind": "text_file", "storage": "external" },
+            { "path": "assets/note.txt", "change": "added", "kind": "text_file", "storage": "inline" }
+        ])
+    );
+
+    let feature: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_commit",
+        "feature app state",
+    ))
+    .expect("graft_json_commit should return commit JSON");
+    assert_eq!(feature["operation"], "commit");
+    assert_eq!(feature["commit"]["message"], "feature app state");
+    assert!(
+        feature["commit"]["id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty())
+    );
+    assert_eq!(feature["head"], feature["commit"]["id"]);
+    assert_eq!(feature["branch"], "main");
+    assert_eq!(feature["current_head"], feature["commit"]["id"]);
+    assert_eq!(feature["current_branch"], "main");
+    assert_eq!(
+        feature["commit"]["parents"],
+        serde_json::json!([base["commit"]["id"].as_str().unwrap()])
+    );
+    assert_eq!(feature["paths"], added["paths"]);
+
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["current_head"], feature["commit"]["id"]);
+    assert_eq!(status["current_branch"], "main");
+    assert_eq!(status["dirty"], false);
+    assert_eq!(
+        status["counts"],
+        serde_json::json!({ "unstaged": 0, "staged": 0, "conflicted": 0 })
+    );
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_json_switch_branch_reports_materialized_path_actions() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+    assert_eq!(
+        pragma_arg_string(
+            &sqlite,
+            "graft_config_set",
+            "files.inline_text_threshold -- 16 B"
+        ),
+        "files.inline_text_threshold = 16 B\n"
+    );
+
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE app_notes (
+              id INTEGER PRIMARY KEY,
+              body TEXT NOT NULL
+            );
+            INSERT INTO app_notes (id, body) VALUES (1, 'main');
+            "#,
+        )
+        .unwrap();
+    let assets = temp_dir.path().join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    std::fs::write(assets.join("note.txt"), "main note").unwrap();
+
+    assert!(pragma_arg_string(&sqlite, "graft_add", "--all").contains("Added 2 paths"));
+    let main: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_commit",
+        "main state",
+    ))
+    .expect("graft_json_commit should return commit JSON");
+    let main_id = main["commit"]["id"].as_str().unwrap();
+    assert_eq!(main["head"], main_id);
+    assert_eq!(main["branch"], "main");
+
+    let created: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_switch_create",
+        "feature/assets",
+    ))
+    .expect("graft_json_switch_create should return switch JSON");
+    assert_eq!(created["operation"], "switch_create");
+    assert_eq!(created["current_head"], main_id);
+    assert_eq!(created["current_branch"], "feature/assets");
+    assert_eq!(created["branch"], "feature/assets");
+    assert_eq!(created["target"], main_id);
+    assert_eq!(created["head"], main_id);
+
+    sqlite
+        .execute("INSERT INTO app_notes (id, body) VALUES (2, 'feature')", [])
+        .unwrap();
+    std::fs::write(assets.join("note.txt"), "feature note").unwrap();
+    std::fs::write(assets.join("model.bin"), b"large feature payload").unwrap();
+    assert!(pragma_arg_string(&sqlite, "graft_add", "--all").contains("Added 3 paths"));
+    let feature: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_commit",
+        "feature state",
+    ))
+    .expect("graft_json_commit should return commit JSON");
+    let feature_id = feature["commit"]["id"].as_str().unwrap();
+    assert_eq!(feature["head"], feature_id);
+    assert_eq!(feature["branch"], "feature/assets");
+
+    let switched_main: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_switch_branch",
+        "main",
+    ))
+    .expect("graft_json_switch_branch should return switch JSON");
+    assert_eq!(
+        switched_main,
+        serde_json::json!({
+            "operation": "switch_branch",
+            "current_head": main_id,
+            "current_branch": "main",
+            "head": main_id,
+            "branch": "main",
+            "target": main_id,
+            "paths": [
+                { "path": "app.db", "kind": "sqlite_database", "storage": "sqlite_snapshot", "action": "checked_out" },
+                { "path": "assets/model.bin", "kind": "text_file", "storage": "external", "action": "removed" },
+                { "path": "assets/note.txt", "kind": "text_file", "storage": "inline", "action": "checked_out" }
+            ]
+        })
+    );
+    assert!(!assets.join("model.bin").exists());
+    assert_eq!(
+        std::fs::read_to_string(assets.join("note.txt")).unwrap(),
+        "main note"
+    );
+    let count: i64 = sqlite
+        .query_row("SELECT COUNT(*) FROM app_notes", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 1);
+
+    let switched_feature: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_switch_branch",
+        "feature/assets",
+    ))
+    .expect("graft_json_switch_branch should return switch JSON");
+    assert_eq!(
+        switched_feature,
+        serde_json::json!({
+            "operation": "switch_branch",
+            "current_head": feature_id,
+            "current_branch": "feature/assets",
+            "head": feature_id,
+            "branch": "feature/assets",
+            "target": feature_id,
+            "paths": [
+                { "path": "app.db", "kind": "sqlite_database", "storage": "sqlite_snapshot", "action": "checked_out" },
+                { "path": "assets/model.bin", "kind": "text_file", "storage": "external", "action": "checked_out" },
+                { "path": "assets/note.txt", "kind": "text_file", "storage": "inline", "action": "checked_out" }
+            ]
+        })
+    );
+    assert_eq!(
+        std::fs::read_to_string(assets.join("model.bin")).unwrap(),
+        "large feature payload"
+    );
+    assert_eq!(
+        std::fs::read_to_string(assets.join("note.txt")).unwrap(),
+        "feature note"
+    );
+    let count: i64 = sqlite
+        .query_row("SELECT COUNT(*) FROM app_notes", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 2);
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_json_reset_hard_reports_path_actions() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE reset_paths (
+              id INTEGER PRIMARY KEY,
+              body TEXT NOT NULL
+            );
+            INSERT INTO reset_paths (id, body) VALUES (1, 'base');
+            "#,
+        )
+        .unwrap();
+
+    let assets = temp_dir.path().join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    std::fs::write(assets.join("note.txt"), "base note").unwrap();
+
+    assert!(pragma_arg_string(&sqlite, "graft_add", "--all").contains("Added 2 paths"));
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "base reset paths").contains("base"));
+
+    assert_eq!(
+        pragma_arg_string(
+            &sqlite,
+            "graft_config_set",
+            "files.inline_text_threshold -- 16 B"
+        ),
+        "files.inline_text_threshold = 16 B\n"
+    );
+    sqlite
+        .execute("INSERT INTO reset_paths (id, body) VALUES (2, 'next')", [])
+        .unwrap();
+    std::fs::write(assets.join("note.txt"), "next note").unwrap();
+    std::fs::write(assets.join("model.bin"), b"large reset payload").unwrap();
+    assert!(pragma_arg_string(&sqlite, "graft_add", "--all").contains("Added 3 paths"));
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "next reset paths").contains("next"));
+
+    let reset: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_reset",
+        "--hard HEAD~1",
+    ))
+    .expect("graft_json_reset should return hard reset path JSON");
+    assert_eq!(reset["operation"], "reset");
+    assert_eq!(reset["mode"], "hard");
+    assert_eq!(reset["current_head"], reset["target"]);
+    assert_eq!(reset["current_branch"], "main");
+    assert_eq!(reset["head"], reset["target"]);
+    assert_eq!(reset["branch"], "main");
+    assert_eq!(
+        reset["paths"],
+        serde_json::json!([
+            { "path": "app.db", "kind": "sqlite_database", "storage": "sqlite_snapshot", "action": "checked_out" },
+            { "path": "assets/model.bin", "kind": "text_file", "storage": "external", "action": "removed" },
+            { "path": "assets/note.txt", "kind": "text_file", "storage": "inline", "action": "checked_out" }
+        ])
+    );
+    let reset_count: i64 = sqlite
+        .query_row("SELECT COUNT(*) FROM reset_paths", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(reset_count, 1);
+    assert_eq!(
+        std::fs::read_to_string(assets.join("note.txt")).unwrap(),
+        "base note"
+    );
+    assert!(!assets.join("model.bin").exists());
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_pragmas_add_regular_file_directory() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+
+    let assets = temp_dir.path().join("assets");
+    let nested = assets.join("nested");
+    let private = assets.join("private");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::create_dir_all(&private).unwrap();
+    std::fs::create_dir_all(assets.join(".graft")).unwrap();
+    std::fs::write(
+        temp_dir.path().join(".graftignore"),
+        "assets/private/\nassets/ignored.txt\n*.tmp\n.graftignore\n",
+    )
+    .unwrap();
+    std::fs::write(assets.join("readme.md"), "asset notes").unwrap();
+    std::fs::write(nested.join("config.json"), r#"{"accent":"blue"}"#).unwrap();
+    std::fs::write(assets.join("ignored.txt"), "ignored").unwrap();
+    std::fs::write(assets.join("scratch.tmp"), "ignored").unwrap();
+    std::fs::write(private.join("secret.txt"), "ignored").unwrap();
+    std::fs::write(assets.join("cache.db-wal"), "sidecar").unwrap();
+    std::fs::write(assets.join(".graft").join("ignored.txt"), "ignored").unwrap();
+
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    let unstaged = status["unstaged"].as_array().unwrap();
+    assert!(unstaged.iter().any(|path| path == "assets/readme.md"));
+    assert!(
+        unstaged
+            .iter()
+            .any(|path| path == "assets/nested/config.json")
+    );
+    assert!(!unstaged.iter().any(|path| path == "assets/cache.db-wal"));
+    assert!(!unstaged.iter().any(|path| path == "assets/ignored.txt"));
+    assert!(!unstaged.iter().any(|path| path == "assets/scratch.tmp"));
+    assert!(
+        !unstaged
+            .iter()
+            .any(|path| path == "assets/private/secret.txt")
+    );
+    assert!(
+        !unstaged
+            .iter()
+            .any(|path| path == "assets/.graft/ignored.txt")
+    );
+
+    let added = pragma_arg_string(&sqlite, "graft_add", "assets");
+    assert_eq!(
+        added,
+        "Added 2 paths\n  assets/nested/config.json\n  assets/readme.md"
+    );
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["dirty"], false);
+    assert_eq!(status["staged"][0], "assets/nested/config.json");
+    assert_eq!(status["staged"][1], "assets/readme.md");
+
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "add assets").contains("add assets"));
+    let show = pragma_arg_string(&sqlite, "graft_show", "HEAD");
+    assert!(show.contains("assets/nested/config.json"));
+    assert!(show.contains("assets/readme.md"));
+    assert!(!show.contains("assets/cache.db-wal"));
+
+    std::fs::write(assets.join("readme.md"), "asset notes changed").unwrap();
+    std::fs::write(nested.join("config.json"), r#"{"accent":"green"}"#).unwrap();
+
+    let worktree_diff = pragma_arg_string(&sqlite, "graft_diff", "-- assets/");
+    assert!(worktree_diff.contains("modified: assets/nested/config.json"));
+    assert!(worktree_diff.contains("modified: assets/readme.md"));
+    assert!(!worktree_diff.contains("assets/cache.db-wal"));
+
+    let rev_worktree_diff = pragma_arg_string(&sqlite, "graft_diff", "HEAD -- assets");
+    assert!(rev_worktree_diff.contains("modified: assets/nested/config.json"));
+    assert!(rev_worktree_diff.contains("modified: assets/readme.md"));
+
+    let json_diff: Value =
+        serde_json::from_str(&pragma_arg_string(&sqlite, "graft_json_diff", "-- assets/"))
+            .expect("graft_json_diff should return repo diff JSON");
+    let artifact_paths = json_diff["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|artifact| artifact["path"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        artifact_paths,
+        vec!["assets/nested/config.json", "assets/readme.md"]
+    );
+    assert_eq!(
+        json_diff["paths"],
+        serde_json::json!([
+            { "path": "assets/nested/config.json", "change": "modified", "kind": "text_file", "storage": "inline" },
+            { "path": "assets/readme.md", "change": "modified", "kind": "text_file", "storage": "inline" }
+        ])
+    );
+    assert!(
+        json_diff["artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|artifact| artifact["kind"] == "text_file" && artifact["storage"] == "inline")
+    );
+
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_add", "assets"),
+        "Added 2 paths\n  assets/nested/config.json\n  assets/readme.md"
+    );
+    let staged_diff = pragma_arg_string(&sqlite, "graft_diff", "--staged -- assets/");
+    assert!(staged_diff.contains("modified: assets/nested/config.json"));
+    assert!(staged_diff.contains("modified: assets/readme.md"));
+    let outside_diff = pragma_arg_string(&sqlite, "graft_diff", "--staged -- asset");
+    assert!(outside_diff.contains("No changes."));
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_pragmas_add_regular_file_uses_configured_inline_text_threshold() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_config_get", "files.inline_text_threshold"),
+        "files.inline_text_threshold = 1 MB\n"
+    );
+    let set_config: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_config_set",
+        "files.inline_text_threshold -- 4 B",
+    ))
+    .expect("graft_json_config_set should return config mutation JSON");
+    assert_eq!(set_config["operation"], "config_set");
+    assert_eq!(set_config["current_branch"], "main");
+    assert!(set_config.get("current_head").is_none());
+    assert_eq!(set_config["entry"]["key"], "files.inline_text_threshold");
+    assert_eq!(set_config["entry"]["value"], "4 B");
+    let config: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_config_get",
+        "files.inline_text_threshold",
+    ))
+    .expect("graft_json_config_get should return config entry JSON");
+    assert!(config.get("current_head").is_none());
+    assert_eq!(config["current_branch"], "main");
+    assert_eq!(config["key"], "files.inline_text_threshold");
+    assert_eq!(config["value"], "4 B");
+    let config_list = pragma_query_string(&sqlite, "graft_config_list");
+    assert!(config_list.contains("files.inline_text_threshold = 4 B"));
+    assert!(config_list.contains("merge.default_semantic_keys = "));
+    let config_list: Value =
+        serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_config_list"))
+            .expect("graft_json_config_list should return config entries JSON");
+    assert_eq!(config_list[0]["key"], "files.inline_text_threshold");
+    assert_eq!(config_list[0]["value"], "4 B");
+    let config_list_with_status: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_config_list",
+        "--with-status",
+    ))
+    .expect("graft_json_config_list --with-status should return config entries JSON");
+    assert!(config_list_with_status.get("current_head").is_none());
+    assert_eq!(config_list_with_status["current_branch"], "main");
+    assert_eq!(config_list_with_status["entries"], config_list);
+
+    let repo = Repository::open(temp_dir.path()).unwrap();
+    assert_eq!(
+        repo.config().unwrap().files.inline_text_threshold.as_u64(),
+        4
+    );
+
+    let assets = temp_dir.path().join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    std::fs::write(assets.join("model.bin"), b"configured large payload").unwrap();
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert!(
+        status["unstaged_changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|change| {
+                change["path"] == "assets/model.bin"
+                    && change["change"] == "untracked"
+                    && change["kind"] == "text_file"
+                    && change["storage"] == "external"
+            })
+    );
+
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_add", "assets"),
+        "Added assets/model.bin"
+    );
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["staged_changes"][0]["path"], "assets/model.bin");
+    assert_eq!(status["staged_changes"][0]["change"], "added");
+    assert_eq!(status["staged_changes"][0]["kind"], "text_file");
+    assert_eq!(status["staged_changes"][0]["storage"], "external");
+    let diff: Value =
+        serde_json::from_str(&pragma_arg_string(&sqlite, "graft_json_diff", "--staged"))
+            .expect("graft_json_diff should return staged repo diff JSON");
+    assert_eq!(
+        diff["paths"],
+        serde_json::json!([
+            { "path": "assets/model.bin", "change": "added", "kind": "text_file", "storage": "external" }
+        ])
+    );
+    assert_eq!(diff["artifacts"][0]["path"], "assets/model.bin");
+    assert_eq!(diff["artifacts"][0]["change"], "added");
+    assert_eq!(diff["artifacts"][0]["kind"], "text_file");
+    assert_eq!(diff["artifacts"][0]["storage"], "external");
+    let row_diff: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_diff",
+        "--rows --staged",
+    ))
+    .expect("graft_json_diff --rows should retain large-file path summary");
+    assert_eq!(
+        row_diff["paths"],
+        serde_json::json!([
+            { "path": "assets/model.bin", "change": "added", "kind": "text_file", "storage": "external" }
+        ])
+    );
+    assert_eq!(row_diff["files"], serde_json::json!([]));
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "add model").contains("add model"));
+    let log: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_log"))
+        .expect("graft_json_log should return repo commit JSON");
+    assert_eq!(log[0]["changes"][0]["path"], "assets/model.bin");
+    assert_eq!(log[0]["changes"][0]["change"], "added");
+    assert_eq!(log[0]["changes"][0]["kind"], "text_file");
+    assert_eq!(log[0]["changes"][0]["storage"], "external");
+    let show = pragma_arg_string(&sqlite, "graft_show", "HEAD");
+    assert!(show.contains("assets/model.bin"));
+    assert!(show.contains("external payload"));
+
+    let ls_files = pragma_query_string(&sqlite, "graft_ls_files");
+    assert!(ls_files.contains("assets/model.bin (text file, external, 24 byte(s))"));
+    let ls_files: Value =
+        serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_ls_files"))
+            .expect("graft_json_ls_files should return tracked path JSON");
+    assert_eq!(ls_files["current_head"], log[0]["id"]);
+    assert_eq!(ls_files["current_branch"], "main");
+    assert_eq!(ls_files["stage"], false);
+    assert_eq!(ls_files["paths"][0]["path"], "assets/model.bin");
+    assert_eq!(ls_files["paths"][0]["kind"], "text_file");
+    assert_eq!(ls_files["paths"][0]["storage"], "external");
+    assert_eq!(ls_files["paths"][0]["size"], 24);
+    let ls_details = pragma_arg_string(&sqlite, "graft_ls_files", "--details --kind text_file");
+    assert!(ls_details.contains("assets/model.bin (text file, external, 24 byte(s)"));
+    assert!(ls_details.contains("payload present"));
+    let ls_details: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_ls_files",
+        "--details --kind text_file",
+    ))
+    .expect("graft_json_ls_files --details should return tracked path details");
+    assert_eq!(ls_details["current_head"], log[0]["id"]);
+    assert_eq!(ls_details["current_branch"], "main");
+    assert_eq!(ls_details["stage"], false);
+    assert_eq!(ls_details["details"], true);
+    assert_eq!(ls_details["kind"], "text_file");
+    assert_eq!(ls_details["paths"][0]["path"], "assets/model.bin");
+    assert_eq!(ls_details["paths"][0]["kind"], "text_file");
+    assert_eq!(ls_details["paths"][0]["storage"], "external");
+    assert_eq!(ls_details["paths"][0]["size"], 24);
+    assert_eq!(ls_details["paths"][0]["object_present"], true);
+    assert_eq!(ls_details["paths"][0]["external_payload_present"], true);
+    assert_eq!(ls_details["paths"][0]["oid"].as_str().unwrap().len(), 64);
+    assert_eq!(
+        ls_details["paths"][0]["content_hash"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+
+    let checkout: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_checkout",
+        "HEAD -- assets/model.bin",
+    ))
+    .expect("graft_json_checkout should return large-file checkout JSON");
+    assert_eq!(checkout["current_head"], ls_files["current_head"]);
+    assert_eq!(checkout["current_branch"], "main");
+    assert_eq!(checkout["path"], "assets/model.bin");
+    assert_eq!(
+        checkout["path_details"],
+        serde_json::json!([
+            { "path": "assets/model.bin", "kind": "text_file", "storage": "external" }
+        ])
+    );
+
+    std::fs::write(assets.join("model.bin"), b"changed large payload").unwrap();
+    let restored: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_restore",
+        "assets/model.bin",
+    ))
+    .expect("graft_json_restore should return large-file restore JSON");
+    assert_eq!(restored["operation"], "restore");
+    assert_eq!(restored["current_head"], ls_files["current_head"]);
+    assert_eq!(restored["current_branch"], "main");
+    assert_eq!(restored["staged"], false);
+    assert_eq!(restored["path"], "assets/model.bin");
+    assert_eq!(
+        restored["path_details"],
+        serde_json::json!([
+            { "path": "assets/model.bin", "kind": "text_file", "storage": "external" }
+        ])
+    );
+    assert_eq!(
+        std::fs::read(assets.join("model.bin")).unwrap(),
+        b"configured large payload"
+    );
+
+    let audit: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_audit"))
+        .expect("graft_json_audit should return repo audit JSON");
+    assert_eq!(audit["current_head"], ls_files["current_head"]);
+    assert_eq!(audit["current_branch"], "main");
+    assert_eq!(audit["artifacts"], 1);
+    assert_eq!(audit["external_payloads"], 1);
+    assert!(
+        audit
+            .get("issues")
+            .is_none_or(|issues| issues.as_array().unwrap().is_empty())
+    );
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_config_unset", "files.inline_text_threshold"),
+        "files.inline_text_threshold = 1 MB\n"
+    );
+    let config: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_config_get",
+        "files.inline_text_threshold",
+    ))
+    .expect("graft_json_config_get should return reset config entry JSON");
+    assert_eq!(config["current_head"], ls_files["current_head"]);
+    assert_eq!(config["current_branch"], "main");
+    assert_eq!(config["value"], "1 MB");
+
+    let head = repo.resolve_revision("HEAD").unwrap();
+    let commit = repo.read_commit(&head).unwrap();
+    let state = commit.artifacts.get("assets/model.bin").unwrap();
+    let content_hash = state.content_hash().as_str();
+    std::fs::remove_file(
+        repo.file_store_dir()
+            .join(&content_hash[..2])
+            .join(&content_hash[2..]),
+    )
+    .unwrap();
+
+    let audit = pragma_query_string(&sqlite, "graft_audit");
+    assert!(audit.contains("missing external payload"));
+    assert!(audit.contains("assets/model.bin"));
+    let missing_details: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_ls_files",
+        "--details --kind text_file",
+    ))
+    .expect("graft_json_ls_files --details should expose missing payloads");
+    assert_eq!(
+        missing_details["paths"][0]["content_hash"],
+        ls_details["paths"][0]["content_hash"]
+    );
+    assert_eq!(missing_details["paths"][0]["object_present"], true);
+    assert_eq!(
+        missing_details["paths"][0]["external_payload_present"],
+        false
+    );
+    let audit: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_audit"))
+        .expect("graft_json_audit should return repo audit JSON");
+    assert_eq!(audit["current_head"], ls_files["current_head"]);
+    assert_eq!(audit["current_branch"], "main");
+    assert_eq!(audit["issues"][0]["kind"], "missing_external_payload");
+    assert_eq!(audit["issues"][0]["path"], "assets/model.bin");
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_merge_large_file_conflicts_report_path_kind() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+    assert_eq!(
+        pragma_arg_string(
+            &sqlite,
+            "graft_config_set",
+            "files.inline_text_threshold -- 4 B"
+        ),
+        "files.inline_text_threshold = 4 B\n"
+    );
+
+    let assets = temp_dir.path().join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    std::fs::write(assets.join("model.bin"), b"base large payload").unwrap();
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_add", "assets/model.bin"),
+        "Added assets/model.bin"
+    );
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "base model").contains("base"));
+
+    assert!(
+        pragma_arg_string(&sqlite, "graft_branch_create", "feature/model")
+            .contains("feature/model")
+    );
+    assert!(
+        pragma_arg_string(&sqlite, "graft_switch_branch", "feature/model")
+            .contains("feature/model")
+    );
+    std::fs::write(assets.join("model.bin"), b"feature large payload").unwrap();
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_add", "assets/model.bin"),
+        "Added assets/model.bin"
+    );
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "feature model").contains("feature"));
+
+    assert!(pragma_arg_string(&sqlite, "graft_switch_branch", "main").contains("main"));
+    std::fs::write(assets.join("model.bin"), b"main large payload").unwrap();
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_add", "assets/model.bin"),
+        "Added assets/model.bin"
+    );
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "main model").contains("main"));
+
+    let merge = pragma_arg_string(&sqlite, "graft_merge", "feature/model");
+    assert!(merge.contains("Unmerged paths:"), "{merge}");
+    assert!(merge.contains("assets/model.bin"), "{merge}");
+
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["conflicted_changes"][0]["path"], "assets/model.bin");
+    assert_eq!(status["conflicted_changes"][0]["kind"], "text_file");
+    assert_eq!(status["conflicted_changes"][0]["storage"], "external");
+
+    let conflicts: Value =
+        serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_conflicts"))
+            .expect("graft_json_conflicts should return conflict artifact JSON");
+    assert_eq!(conflicts["current_head"], status["head_target"]);
+    assert_eq!(conflicts["current_branch"], "main");
+    assert_eq!(
+        conflicts["paths"],
+        serde_json::json!([
+            {
+                "path": "assets/model.bin",
+                "kind": "text_file",
+                "storage": "external",
+                "status": "unresolved",
+                "total": 1,
+                "unresolved": 1,
+                "resolved": 0
+            }
+        ])
+    );
+    assert_eq!(conflicts["conflicts"][0]["path"], "assets/model.bin");
+    assert_eq!(conflicts["conflicts"][0]["path_kind"], "text_file");
+    assert_eq!(conflicts["conflicts"][0]["storage"], "external");
+    assert_eq!(conflicts["conflicts"][0]["kind"], "file");
+
+    let staged: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_ls_files",
+        "--stage",
+    ))
+    .expect("graft_json_ls_files --stage should return index stage JSON");
+    assert_eq!(staged["current_head"], status["head_target"]);
+    assert_eq!(staged["current_branch"], "main");
+    assert_eq!(staged["stage"], true);
+    let staged = staged["paths"].as_array().unwrap();
+    assert_eq!(staged.len(), 3);
+    assert_eq!(
+        staged
+            .iter()
+            .map(|entry| entry["stage"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["base", "ours", "theirs"]
+    );
+    assert!(staged.iter().all(|entry| {
+        entry["path"] == "assets/model.bin"
+            && entry["kind"] == "text_file"
+            && entry["storage"] == "external"
+            && entry["mode"] == "regular"
+            && entry["size"].as_u64().unwrap() > 4
+            && entry["oid"].as_str().unwrap().len() == 64
+    }));
+
+    let staged_text = pragma_arg_string(&sqlite, "graft_ls_files", "--stage");
+    assert!(staged_text.contains("base 100644"));
+    assert!(staged_text.contains("ours 100644"));
+    assert!(staged_text.contains("theirs 100644"));
+    assert!(staged_text.contains("assets/model.bin (text file, external"));
+
+    let resolved: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_resolve_conflict",
+        "--theirs assets/model.bin",
+    ))
+    .expect("graft_json_resolve_conflict should resolve external payload conflict");
+    assert_eq!(resolved["operation"], "resolve_conflict");
+    assert_eq!(resolved["current_head"], status["head_target"]);
+    assert_eq!(resolved["current_branch"], "main");
+    assert_eq!(resolved["path"], "assets/model.bin");
+    assert_eq!(resolved["path_kind"], "text_file");
+    assert_eq!(resolved["storage"], "external");
+    assert_eq!(resolved["resolution"], "theirs");
+    assert_eq!(resolved["remaining_conflicts"], 0);
+    assert_eq!(
+        std::fs::read_to_string(assets.join("model.bin")).unwrap(),
+        "feature large payload"
+    );
+
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["conflicted"].as_array().unwrap().len(), 0);
+    assert_eq!(
+        status["staged_changes"],
+        serde_json::json!([
+            { "path": "assets/model.bin", "change": "modified", "kind": "text_file", "storage": "external" }
+        ])
+    );
+
+    let continued = pragma_arg_string(&sqlite, "graft_merge_continue", "merge model");
+    assert!(continued.contains("Merge commit"));
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["merge_head"], Value::Null);
+    assert_eq!(status["staged"].as_array().unwrap().len(), 0);
+
+    let show: Value = serde_json::from_str(&pragma_arg_string(&sqlite, "graft_json_show", "HEAD"))
+        .expect("graft_json_show should return merge commit JSON");
+    assert_eq!(show["current_head"], status["head_target"]);
+    assert_eq!(show["current_branch"], "main");
+    assert_eq!(show["message"], "merge model");
+    assert_eq!(show["parents"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        show["changes"],
+        serde_json::json!([
+            { "path": "assets/model.bin", "change": "modified", "kind": "text_file", "storage": "external" }
+        ])
+    );
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_pragmas_add_ignored_regular_files_requires_force() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+
+    std::fs::write(
+        temp_dir.path().join(".graftignore"),
+        "*.tmp\nignored/\n.graftignore\n",
+    )
+    .unwrap();
+    std::fs::write(temp_dir.path().join("secret.tmp"), "local scratch").unwrap();
+    let ignored = temp_dir.path().join("ignored");
+    std::fs::create_dir_all(&ignored).unwrap();
+    std::fs::write(ignored.join("note.txt"), "ignored note").unwrap();
+
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    let unstaged = status["unstaged"].as_array().unwrap();
+    assert!(!unstaged.iter().any(|path| path == "secret.tmp"));
+    assert!(!unstaged.iter().any(|path| path == "ignored/note.txt"));
+
+    let file_err = pragma_arg_error(&sqlite, "graft_add", "secret.tmp");
+    assert!(file_err.contains("path `secret.tmp` is ignored"));
+    assert!(file_err.contains("--force"));
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_add", "--force -- secret.tmp"),
+        "Added secret.tmp"
+    );
+
+    let dir_err = pragma_arg_error(&sqlite, "graft_add", "ignored");
+    assert!(dir_err.contains("path `ignored` is ignored"));
+    assert!(dir_err.contains("--force"));
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_add", "--force -- ignored"),
+        "Added ignored/note.txt"
+    );
+
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["staged"][0], "ignored/note.txt");
+    assert_eq!(status["staged"][1], "secret.tmp");
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_pragmas_remove_regular_file_directory() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+
+    let assets = temp_dir.path().join("assets");
+    let nested = assets.join("nested");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(assets.join("readme.md"), "asset notes").unwrap();
+    std::fs::write(nested.join("config.json"), r#"{"accent":"blue"}"#).unwrap();
+
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_add", "assets"),
+        "Added 2 paths\n  assets/nested/config.json\n  assets/readme.md"
+    );
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "add assets").contains("add assets"));
+
+    let removed = pragma_arg_string(&sqlite, "graft_rm", "assets");
+    assert_eq!(
+        removed,
+        "Removed 2 paths\n  assets/nested/config.json\n  assets/readme.md"
+    );
+    assert!(!assets.join("readme.md").exists());
+    assert!(!nested.join("config.json").exists());
+
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["dirty"], false);
+    assert_eq!(status["staged"][0], "assets/nested/config.json");
+    assert_eq!(status["staged"][1], "assets/readme.md");
+
+    let diff = pragma_arg_string(&sqlite, "graft_diff", "--staged");
+    assert!(diff.contains("deleted: assets/nested/config.json"));
+    assert!(diff.contains("deleted: assets/readme.md"));
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "remove assets").contains("remove assets"));
+
+    let repo = graft::repo::Repository::discover_for_file(&db_path).unwrap();
+    assert!(
+        repo.head_artifact(assets.join("readme.md"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        repo.head_artifact(nested.join("config.json"))
+            .unwrap()
+            .is_none()
+    );
+
+    let scratch = temp_dir.path().join("scratch");
+    std::fs::create_dir_all(&scratch).unwrap();
+    std::fs::write(scratch.join("draft.txt"), "draft").unwrap();
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_add", "scratch"),
+        "Added scratch/draft.txt"
+    );
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_rm", "scratch"),
+        "Removed scratch/draft.txt"
+    );
+    assert!(!scratch.join("draft.txt").exists());
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["dirty"], false);
+    assert_eq!(status["staged"].as_array().unwrap().len(), 0);
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_pragmas_checkout_and_restore_regular_file_directory() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+
+    let assets = temp_dir.path().join("assets");
+    let nested = assets.join("nested");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(assets.join("readme.md"), "asset notes v1").unwrap();
+    std::fs::write(nested.join("config.json"), r#"{"accent":"blue"}"#).unwrap();
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_add", "assets"),
+        "Added 2 paths\n  assets/nested/config.json\n  assets/readme.md"
+    );
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "assets v1").contains("assets v1"));
+
+    std::fs::write(assets.join("readme.md"), "asset notes v2").unwrap();
+    std::fs::write(nested.join("config.json"), r#"{"accent":"green"}"#).unwrap();
+    std::fs::write(assets.join("new.txt"), "new in v2").unwrap();
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_add", "assets"),
+        "Added 3 paths\n  assets/nested/config.json\n  assets/new.txt\n  assets/readme.md"
+    );
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "assets v2").contains("assets v2"));
+    let status_before_checkout: Value =
+        serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+            .expect("graft_json_status should return repo status JSON");
+
+    let checkout: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_checkout",
+        "HEAD~1 -- assets/",
+    ))
+    .expect("graft_json_checkout should return checkout JSON");
+    assert_eq!(
+        checkout["current_head"],
+        status_before_checkout["head_target"]
+    );
+    assert_eq!(checkout["current_branch"], "main");
+    assert_eq!(checkout["head"], status_before_checkout["head_target"]);
+    assert_eq!(checkout["branch"], "main");
+    assert_ne!(checkout["target"], checkout["head"]);
+    assert_eq!(
+        checkout["paths"],
+        serde_json::json!([
+            "assets/nested/config.json",
+            "assets/new.txt",
+            "assets/readme.md"
+        ])
+    );
+    assert_eq!(
+        checkout["path_details"],
+        serde_json::json!([
+            { "path": "assets/nested/config.json", "kind": "text_file", "storage": "inline" },
+            { "path": "assets/new.txt", "kind": "text_file", "storage": "inline" },
+            { "path": "assets/readme.md", "kind": "text_file", "storage": "inline" }
+        ])
+    );
+    assert_eq!(
+        std::fs::read_to_string(assets.join("readme.md")).unwrap(),
+        "asset notes v1"
+    );
+    assert_eq!(
+        std::fs::read_to_string(nested.join("config.json")).unwrap(),
+        r#"{"accent":"blue"}"#
+    );
+    assert!(!assets.join("new.txt").exists());
+
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["dirty"], false);
+    assert_eq!(status["staged"][0], "assets/nested/config.json");
+    assert_eq!(status["staged"][1], "assets/new.txt");
+    assert_eq!(status["staged"][2], "assets/readme.md");
+    let staged_diff = pragma_arg_string(&sqlite, "graft_diff", "--staged -- assets/");
+    assert!(staged_diff.contains("modified: assets/nested/config.json"));
+    assert!(staged_diff.contains("deleted: assets/new.txt"));
+    assert!(staged_diff.contains("modified: assets/readme.md"));
+
+    let restored: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_restore",
+        "--staged assets/",
+    ))
+    .expect("graft_json_restore should return directory restore JSON");
+    assert_eq!(restored["operation"], "restore");
+    assert_eq!(
+        restored["current_head"],
+        status_before_checkout["head_target"]
+    );
+    assert_eq!(restored["current_branch"], "main");
+    assert_eq!(restored["staged"], true);
+    assert_eq!(
+        restored["paths"],
+        serde_json::json!([
+            "assets/nested/config.json",
+            "assets/new.txt",
+            "assets/readme.md"
+        ])
+    );
+    assert_eq!(
+        restored["path_details"],
+        serde_json::json!([
+            { "path": "assets/nested/config.json", "kind": "text_file", "storage": "inline" },
+            { "path": "assets/new.txt", "kind": "text_file", "storage": "inline" },
+            { "path": "assets/readme.md", "kind": "text_file", "storage": "inline" }
+        ])
+    );
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["staged"].as_array().unwrap().len(), 0);
+    assert!(
+        status["unstaged_changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|change| { change["path"] == "assets/new.txt" && change["change"] == "deleted" })
+    );
+
+    let restored = pragma_arg_string(&sqlite, "graft_restore", "assets/");
+    assert_eq!(
+        restored,
+        "Restored 3 paths\n  assets/nested/config.json\n  assets/new.txt\n  assets/readme.md"
+    );
+    assert_eq!(
+        std::fs::read_to_string(assets.join("readme.md")).unwrap(),
+        "asset notes v2"
+    );
+    assert_eq!(
+        std::fs::read_to_string(nested.join("config.json")).unwrap(),
+        r#"{"accent":"green"}"#
+    );
+    assert_eq!(
+        std::fs::read_to_string(assets.join("new.txt")).unwrap(),
+        "new in v2"
+    );
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["dirty"], false);
+    assert_eq!(status["staged"].as_array().unwrap().len(), 0);
+    assert_eq!(status["unstaged"].as_array().unwrap().len(), 0);
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_checkout_path_rejects_untracked_file_overwrite() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+
+    let assets = temp_dir.path().join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    std::fs::write(assets.join("conflict.txt"), "tracked content").unwrap();
+    std::fs::write(assets.join("keep.txt"), "kept content").unwrap();
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_add", "assets"),
+        "Added 2 paths\n  assets/conflict.txt\n  assets/keep.txt"
+    );
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "assets v1").contains("assets v1"));
+
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_rm", "assets"),
+        "Removed 2 paths\n  assets/conflict.txt\n  assets/keep.txt"
+    );
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "remove assets").contains("remove assets"));
+
+    std::fs::create_dir_all(&assets).unwrap();
+    std::fs::write(assets.join("conflict.txt"), "local draft").unwrap();
+
+    let err = pragma_arg_error(&sqlite, "graft_checkout", "HEAD~1 -- assets/conflict.txt");
+    assert!(
+        err.contains("untracked paths would be overwritten: assets/conflict.txt"),
+        "{err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(assets.join("conflict.txt")).unwrap(),
+        "local draft"
+    );
+
+    let err = pragma_arg_error(&sqlite, "graft_checkout", "HEAD~1 -- assets/");
+    assert!(
+        err.contains("untracked paths would be overwritten: assets/conflict.txt"),
+        "{err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(assets.join("conflict.txt")).unwrap(),
+        "local draft"
+    );
+    assert!(
+        !assets.join("keep.txt").exists(),
+        "directory checkout should not partially restore other paths"
+    );
+
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["dirty"], true);
+    assert_eq!(status["unstaged_changes"][0]["path"], "assets/conflict.txt");
+    assert_eq!(status["unstaged_changes"][0]["change"], "untracked");
+    assert_eq!(status["unstaged_changes"][0]["kind"], "text_file");
+    assert_eq!(status["unstaged_changes"][0]["storage"], "inline");
 
     runtime.shutdown().unwrap();
 }
@@ -1853,6 +4601,7 @@ fn test_repo_diff_physical_sqlite_worktree_path() {
     .expect("graft_json_diff should return repo diff JSON");
     assert_eq!(json_diff["files"][0]["path"], "external.db");
     assert_eq!(json_diff["files"][0]["change"], "modified");
+    assert_eq!(json_diff["files"][0]["kind"], "sqlite_database");
 
     std::fs::remove_file(&external_db).unwrap();
     let deleted_diff = pragma_arg_string(&sqlite, "graft_diff", "-- external.db");
@@ -1900,6 +4649,9 @@ fn test_repo_rm_removes_and_stages_physical_sqlite_file() {
     let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
         .expect("graft_json_status should return repo status JSON");
     assert_eq!(status["staged"][0], "external.db");
+    assert_eq!(status["staged_changes"][0]["path"], "external.db");
+    assert_eq!(status["staged_changes"][0]["change"], "deleted");
+    assert_eq!(status["staged_changes"][0]["kind"], "sqlite_database");
     assert!(
         status["unstaged_changes"].as_array().is_none_or(|changes| {
             !changes.iter().any(|change| change["path"] == "external.db")
@@ -1965,8 +4717,19 @@ fn test_repo_checkout_path_materializes_physical_sqlite_file() {
     std::fs::remove_file(&external_db).unwrap();
     assert!(!external_db.exists());
 
-    let checkout = pragma_arg_string(&sqlite, "graft_checkout", "HEAD~1 -- external.db");
-    assert!(checkout.contains("Checked out external.db"));
+    let checkout: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_checkout",
+        "HEAD~1 -- external.db",
+    ))
+    .expect("graft_json_checkout should return checkout JSON");
+    assert_eq!(checkout["path"], "external.db");
+    assert_eq!(
+        checkout["path_details"],
+        serde_json::json!([
+            { "path": "external.db", "kind": "sqlite_database", "storage": "sqlite_snapshot" }
+        ])
+    );
     assert!(external_db.exists());
 
     let restored = Connection::open(&external_db).unwrap();
@@ -2731,8 +5494,21 @@ fn test_repo_restore_physical_sqlite_worktree_file_from_index_and_revision() {
     assert_eq!(status["unstaged"][0], "external.db");
     assert_eq!(status["staged"][0], "external.db");
 
-    let restored = pragma_arg_string(&sqlite, "graft_restore", "--staged external.db");
-    assert_eq!(restored, "Restored external.db");
+    let restored: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_restore",
+        "--staged external.db",
+    ))
+    .expect("graft_json_restore should return SQLite restore JSON");
+    assert_eq!(restored["operation"], "restore");
+    assert_eq!(restored["staged"], true);
+    assert_eq!(restored["path"], "external.db");
+    assert_eq!(
+        restored["path_details"],
+        serde_json::json!([
+            { "path": "external.db", "kind": "sqlite_database", "storage": "sqlite_snapshot" }
+        ])
+    );
     assert_eq!(external_value(&external_db), "v1");
     let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
         .expect("graft_json_status should return repo status JSON");
@@ -2944,13 +5720,24 @@ fn test_repo_pull_non_fast_forward_enters_merge_state() {
     pragma_query_string(&clone, "graft_add");
     assert!(pragma_arg_string(&clone, "graft_commit", "local row").contains("local row"));
 
-    let pull = pragma_arg_string(&clone, "graft_pull", "origin main");
-    assert!(pull.contains("Fetched origin/main"));
-    assert!(pull.contains("Unmerged paths:"));
-    assert!(pull.contains("app.db"));
+    let pull: Value =
+        serde_json::from_str(&pragma_arg_string(&clone, "graft_json_pull", "origin main"))
+            .expect("graft_json_pull should return conflicted path JSON");
+    assert_eq!(pull["operation"], "pull");
+    assert_eq!(pull["current_branch"], "main");
+    assert_eq!(pull["merge"]["status"], "merged");
+    assert_eq!(pull["merge"]["conflicted"], serde_json::json!(["app.db"]));
+    assert_eq!(
+        pull["paths"],
+        serde_json::json!([
+            { "path": "app.db", "kind": "sqlite_database", "storage": "sqlite_snapshot", "action": "conflicted" }
+        ])
+    );
 
     let status: Value = serde_json::from_str(&pragma_query_string(&clone, "graft_json_status"))
         .expect("graft_json_status should return repo status JSON");
+    assert_eq!(pull["current_head"], status["head_target"]);
+    assert_ne!(pull["current_head"], pull["head"]);
     assert!(status["merge_head"].as_str().is_some());
     assert_eq!(status["conflicted"][0], "app.db");
     let clone_count: i64 = clone
@@ -2967,6 +5754,449 @@ fn test_repo_pull_non_fast_forward_enters_merge_state() {
 
     source_runtime.shutdown().unwrap();
     clone_runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_json_pull_reports_materialized_paths() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let source_db = temp_dir.path().join("source/app.db");
+    let clone_db = temp_dir.path().join("clone/app.db");
+    std::fs::create_dir_all(source_db.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(clone_db.parent().unwrap()).unwrap();
+    let remote_dir = temp_dir.path().join("remote");
+
+    let mut source_runtime = GraftTestRuntime::with_memory_remote();
+    let source = source_runtime.open_sqlite(source_db.to_str().unwrap(), None);
+    let mut clone_runtime = GraftTestRuntime::with_memory_remote();
+    let clone = clone_runtime.open_sqlite(clone_db.to_str().unwrap(), None);
+
+    assert!(pragma_query_string(&source, "graft_init").contains(".graft"));
+    assert!(pragma_query_string(&clone, "graft_init").contains(".graft"));
+    assert!(
+        pragma_arg_string(
+            &source,
+            "graft_remote_add",
+            format!("origin fs://{}", remote_dir.display()),
+        )
+        .contains("origin")
+    );
+    assert!(
+        pragma_arg_string(
+            &clone,
+            "graft_remote_add",
+            format!("origin fs://{}", remote_dir.display()),
+        )
+        .contains("origin")
+    );
+
+    assert_eq!(
+        pragma_arg_string(
+            &source,
+            "graft_config_set",
+            "files.inline_text_threshold -- 4 B"
+        ),
+        "files.inline_text_threshold = 4 B\n"
+    );
+    source
+        .execute_batch(
+            r#"
+            CREATE TABLE pull_paths (id INTEGER PRIMARY KEY, body TEXT NOT NULL);
+            INSERT INTO pull_paths (body) VALUES ('remote');
+            "#,
+        )
+        .unwrap();
+    let assets = source_db.parent().unwrap().join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    std::fs::write(assets.join("note.txt"), "v1").unwrap();
+    std::fs::write(assets.join("model.bin"), b"large pull payload").unwrap();
+
+    assert!(pragma_arg_string(&source, "graft_add", "--all").contains("Added 3 paths"));
+    assert!(pragma_arg_string(&source, "graft_commit", "pull paths").contains("pull"));
+    assert!(pragma_arg_string(&source, "graft_push", "origin main").contains("origin/main"));
+
+    let pull: Value =
+        serde_json::from_str(&pragma_arg_string(&clone, "graft_json_pull", "origin main"))
+            .expect("graft_json_pull should return materialized path JSON");
+    assert_eq!(pull["operation"], "pull");
+    assert_eq!(pull["current_head"], pull["head"]);
+    assert_eq!(pull["current_branch"], "main");
+    assert_eq!(pull["merge"]["status"], "fast_forward");
+    assert_eq!(
+        pull["paths"],
+        serde_json::json!([
+            { "path": "app.db", "kind": "sqlite_database", "storage": "sqlite_snapshot", "action": "checked_out" },
+            { "path": "assets/model.bin", "kind": "text_file", "storage": "external", "action": "checked_out" },
+            { "path": "assets/note.txt", "kind": "text_file", "storage": "inline", "action": "checked_out" }
+        ])
+    );
+    let clone_count: i64 = clone
+        .query_row("SELECT COUNT(*) FROM pull_paths", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(clone_count, 1);
+    let clone_assets = clone_db.parent().unwrap().join("assets");
+    assert_eq!(
+        std::fs::read_to_string(clone_assets.join("note.txt")).unwrap(),
+        "v1"
+    );
+    assert_eq!(
+        std::fs::read(clone_assets.join("model.bin")).unwrap(),
+        b"large pull payload"
+    );
+
+    source_runtime.shutdown().unwrap();
+    clone_runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_json_audit_repair_hydrates_missing_external_payload() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let source_db = temp_dir.path().join("source/app.db");
+    let clone_db = temp_dir.path().join("clone/app.db");
+    std::fs::create_dir_all(source_db.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(clone_db.parent().unwrap()).unwrap();
+    let remote_dir = temp_dir.path().join("remote");
+
+    let mut source_runtime = GraftTestRuntime::with_memory_remote();
+    let source = source_runtime.open_sqlite(source_db.to_str().unwrap(), None);
+    let mut clone_runtime = GraftTestRuntime::with_memory_remote();
+    let clone = clone_runtime.open_sqlite(clone_db.to_str().unwrap(), None);
+
+    assert!(pragma_query_string(&source, "graft_init").contains(".graft"));
+    assert!(pragma_query_string(&clone, "graft_init").contains(".graft"));
+    assert!(
+        pragma_arg_string(
+            &source,
+            "graft_remote_add",
+            format!("origin fs://{}", remote_dir.display()),
+        )
+        .contains("origin")
+    );
+    assert!(
+        pragma_arg_string(
+            &clone,
+            "graft_remote_add",
+            format!("origin fs://{}", remote_dir.display()),
+        )
+        .contains("origin")
+    );
+
+    assert_eq!(
+        pragma_arg_string(
+            &source,
+            "graft_config_set",
+            "files.inline_text_threshold -- 4 B"
+        ),
+        "files.inline_text_threshold = 4 B\n"
+    );
+    let assets = source_db.parent().unwrap().join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    std::fs::write(assets.join("model.bin"), b"large repair payload").unwrap();
+
+    let added: Value = serde_json::from_str(&pragma_arg_string(&source, "graft_json_add", "--all"))
+        .expect("graft_json_add --all should return staged path JSON");
+    assert!(
+        added["paths"].as_array().unwrap().iter().any(|path| {
+            path["path"] == "assets/model.bin"
+                && path["change"] == "added"
+                && path["kind"] == "text_file"
+                && path["storage"] == "external"
+        }),
+        "add --all should stage the external payload artifact: {added}"
+    );
+    assert!(pragma_arg_string(&source, "graft_commit", "track repair payload").contains("track"));
+    assert!(pragma_arg_string(&source, "graft_push", "origin main").contains("origin/main"));
+    assert!(pragma_arg_string(&clone, "graft_pull", "origin main").contains("Fast-forward"));
+
+    let clone_repo = Repository::discover_for_file(&clone_db).unwrap();
+    let head = clone_repo.resolve_revision("HEAD").unwrap();
+    let commit = clone_repo.read_commit(&head).unwrap();
+    let state = commit.artifacts.get("assets/model.bin").unwrap();
+    let content_hash = state.content_hash().as_str();
+    let payload_path = clone_repo
+        .file_store_dir()
+        .join(&content_hash[..2])
+        .join(&content_hash[2..]);
+    std::fs::remove_file(&payload_path).unwrap();
+
+    let broken: Value = serde_json::from_str(&pragma_query_string(&clone, "graft_json_audit"))
+        .expect("graft_json_audit should report missing external payload");
+    assert_eq!(broken["issues"][0]["kind"], "missing_external_payload");
+    assert_eq!(broken["issues"][0]["path"], "assets/model.bin");
+
+    let repaired: Value = serde_json::from_str(&pragma_arg_string(
+        &clone,
+        "graft_json_audit",
+        "--repair origin",
+    ))
+    .expect("graft_json_audit --repair should return repair JSON");
+    assert_eq!(repaired["operation"], "audit_repair");
+    assert_eq!(repaired["remote"], "origin");
+    assert_eq!(repaired["fetched_objects"], 0);
+    assert_eq!(repaired["fetched_external_payloads"], 1);
+    assert_eq!(
+        repaired["before"]["issues"][0]["kind"],
+        "missing_external_payload"
+    );
+    assert!(
+        repaired["after"]
+            .get("issues")
+            .is_none_or(|issues| issues.as_array().unwrap().is_empty())
+    );
+    assert_eq!(
+        std::fs::read(payload_path).unwrap(),
+        b"large repair payload"
+    );
+
+    let clean: Value = serde_json::from_str(&pragma_query_string(&clone, "graft_json_audit"))
+        .expect("graft_json_audit should be clean after repair");
+    assert!(
+        clean
+            .get("issues")
+            .is_none_or(|issues| issues.as_array().unwrap().is_empty())
+    );
+
+    source_runtime.shutdown().unwrap();
+    clone_runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_json_lfs_fetch_hydrates_missing_external_payload_for_head() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let source_db = temp_dir.path().join("source/app.db");
+    let clone_db = temp_dir.path().join("clone/app.db");
+    std::fs::create_dir_all(source_db.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(clone_db.parent().unwrap()).unwrap();
+    let remote_dir = temp_dir.path().join("remote");
+
+    let mut source_runtime = GraftTestRuntime::with_memory_remote();
+    let source = source_runtime.open_sqlite(source_db.to_str().unwrap(), None);
+    let mut clone_runtime = GraftTestRuntime::with_memory_remote();
+    let clone = clone_runtime.open_sqlite(clone_db.to_str().unwrap(), None);
+
+    assert!(pragma_query_string(&source, "graft_init").contains(".graft"));
+    assert!(pragma_query_string(&clone, "graft_init").contains(".graft"));
+    assert!(
+        pragma_arg_string(
+            &source,
+            "graft_remote_add",
+            format!("origin fs://{}", remote_dir.display()),
+        )
+        .contains("origin")
+    );
+    assert!(
+        pragma_arg_string(
+            &clone,
+            "graft_remote_add",
+            format!("origin fs://{}", remote_dir.display()),
+        )
+        .contains("origin")
+    );
+
+    assert_eq!(
+        pragma_arg_string(
+            &source,
+            "graft_config_set",
+            "files.inline_text_threshold -- 4 B"
+        ),
+        "files.inline_text_threshold = 4 B\n"
+    );
+    let assets = source_db.parent().unwrap().join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    let payload = b"external lfs fetch payload";
+    std::fs::write(assets.join("model.bin"), payload).unwrap();
+    assert!(pragma_arg_string(&source, "graft_add", "--all").contains("Added"));
+    assert!(pragma_arg_string(&source, "graft_commit", "track lfs payload").contains("track"));
+    assert!(pragma_arg_string(&source, "graft_push", "origin main").contains("origin/main"));
+    assert!(pragma_arg_string(&clone, "graft_pull", "origin main").contains("Fast-forward"));
+
+    let clone_repo = Repository::discover_for_file(&clone_db).unwrap();
+    let head = clone_repo.resolve_revision("HEAD").unwrap();
+    let commit = clone_repo.read_commit(&head).unwrap();
+    let state = commit.artifacts.get("assets/model.bin").unwrap();
+    let content_hash = state.content_hash().as_str();
+    let payload_path = clone_repo
+        .file_store_dir()
+        .join(&content_hash[..2])
+        .join(&content_hash[2..]);
+    std::fs::remove_file(&payload_path).unwrap();
+    assert!(!payload_path.exists());
+
+    let missing_status: Value =
+        serde_json::from_str(&pragma_arg_string(&clone, "graft_json_lfs_status", "HEAD"))
+            .expect("graft_json_lfs_status should report missing payloads");
+    assert_eq!(missing_status["operation"], "lfs_status");
+    assert_eq!(missing_status["current_head"], head);
+    assert_eq!(missing_status["current_branch"], "main");
+    assert_eq!(missing_status["target"], head);
+    assert_eq!(missing_status["external_payloads"], 1);
+    assert_eq!(missing_status["present_payloads"], 0);
+    assert_eq!(missing_status["missing_payloads"], 1);
+    assert_eq!(missing_status["invalid_payloads"], 0);
+    assert_eq!(missing_status["missing_bytes"], payload.len() as u64);
+    assert_eq!(missing_status["files"][0]["status"], "missing");
+    assert_eq!(missing_status["files"][0]["content_hash"], content_hash);
+
+    let fetched: Value = serde_json::from_str(&pragma_arg_string(
+        &clone,
+        "graft_json_lfs_fetch",
+        "--remote origin HEAD",
+    ))
+    .expect("graft_json_lfs_fetch should return fetch JSON");
+    assert_eq!(fetched["operation"], "lfs_fetch");
+    assert_eq!(fetched["current_head"], head);
+    assert_eq!(fetched["current_branch"], "main");
+    assert_eq!(fetched["remote"], "origin");
+    assert_eq!(fetched["target"], head);
+    assert_eq!(fetched["external_payloads"], 1);
+    assert_eq!(fetched["already_present_payloads"], 0);
+    assert_eq!(fetched["fetched_payloads"], 1);
+    assert_eq!(fetched["fetched_bytes"], payload.len() as u64);
+    assert_eq!(fetched["files"][0]["content_hash"], content_hash);
+    assert_eq!(fetched["files"][0]["size"], payload.len() as u64);
+    assert_eq!(fetched["files"][0]["status"], "fetched");
+    assert_eq!(
+        fetched["files"][0]["paths"],
+        serde_json::json!(["assets/model.bin"])
+    );
+    assert!(
+        fetched["files"][0]["store_path"]
+            .as_str()
+            .unwrap()
+            .starts_with("store/files/")
+    );
+    assert_eq!(std::fs::read(&payload_path).unwrap(), payload);
+
+    let present_status_text = pragma_arg_string(&clone, "graft_lfs_status", "HEAD");
+    assert!(present_status_text.contains("1 present, 0 missing, 0 invalid"));
+    let present_status: Value =
+        serde_json::from_str(&pragma_arg_string(&clone, "graft_json_lfs_status", "HEAD"))
+            .expect("graft_json_lfs_status should report present payloads");
+    assert_eq!(present_status["present_payloads"], 1);
+    assert_eq!(present_status["missing_payloads"], 0);
+    assert_eq!(present_status["invalid_payloads"], 0);
+    assert_eq!(present_status["present_bytes"], payload.len() as u64);
+    assert_eq!(present_status["files"][0]["status"], "present");
+
+    let present_text = pragma_arg_string(&clone, "graft_lfs_fetch", "--remote origin HEAD");
+    assert!(present_text.contains("External payloads already present"));
+    let present: Value = serde_json::from_str(&pragma_arg_string(
+        &clone,
+        "graft_json_lfs_fetch",
+        "--remote origin HEAD",
+    ))
+    .expect("graft_json_lfs_fetch should report present payloads");
+    assert_eq!(present["already_present_payloads"], 1);
+    assert_eq!(present["fetched_payloads"], 0);
+    assert_eq!(present["fetched_bytes"], 0);
+    assert_eq!(present["files"][0]["status"], "present");
+
+    source_runtime.shutdown().unwrap();
+    clone_runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_json_lfs_prune_removes_unreferenced_large_file_payloads() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+    assert_eq!(
+        pragma_arg_string(
+            &sqlite,
+            "graft_config_set",
+            "files.inline_text_threshold -- 4 B"
+        ),
+        "files.inline_text_threshold = 4 B\n"
+    );
+
+    let assets = temp_dir.path().join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    std::fs::write(assets.join("model.bin"), b"large tracked payload").unwrap();
+    let added: Value = serde_json::from_str(&pragma_arg_string(&sqlite, "graft_json_add", "--all"))
+        .expect("graft_json_add --all should return staged paths");
+    assert!(
+        added["paths"].as_array().unwrap().iter().any(|path| {
+            path["path"] == "assets/model.bin"
+                && path["change"] == "added"
+                && path["kind"] == "text_file"
+                && path["storage"] == "external"
+        }),
+        "external payload should be staged: {added}"
+    );
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "track model").contains("track"));
+
+    let repo = Repository::discover_for_file(&db_path).unwrap();
+    let head = repo.resolve_revision("HEAD").unwrap();
+    let commit = repo.read_commit(&head).unwrap();
+    let tracked = commit.artifacts.get("assets/model.bin").unwrap();
+    let tracked_payload = repo
+        .file_store_dir()
+        .join(&tracked.content_hash().as_str()[..2])
+        .join(&tracked.content_hash().as_str()[2..]);
+
+    let orphan_bytes = b"orphan prune payload";
+    let orphan = graft::repo::object::ObjectId::for_bytes(orphan_bytes);
+    let orphan_path = repo
+        .file_store_dir()
+        .join(&orphan.as_str()[..2])
+        .join(&orphan.as_str()[2..]);
+    std::fs::create_dir_all(orphan_path.parent().unwrap()).unwrap();
+    std::fs::write(&orphan_path, orphan_bytes).unwrap();
+
+    let dry_text = pragma_query_string(&sqlite, "graft_lfs_prune");
+    assert!(dry_text.contains("Would prune 1 external payload"));
+    assert!(orphan_path.exists());
+    let dry_run: Value =
+        serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_lfs_prune"))
+            .expect("graft_json_lfs_prune should return dry-run JSON");
+    assert_eq!(dry_run["operation"], "lfs_prune");
+    assert_eq!(dry_run["current_head"], head);
+    assert_eq!(dry_run["current_branch"], "main");
+    assert_eq!(dry_run["dry_run"], true);
+    assert_eq!(dry_run["referenced_payloads"], 1);
+    assert_eq!(dry_run["candidate_payloads"], 1);
+    assert_eq!(dry_run["candidate_bytes"], orphan_bytes.len() as u64);
+    assert_eq!(dry_run["pruned_payloads"], 0);
+    assert_eq!(dry_run["files"][0]["content_hash"], orphan.to_string());
+    assert!(
+        dry_run["files"][0]["path"]
+            .as_str()
+            .unwrap()
+            .starts_with("store/files/")
+    );
+
+    let forced: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_lfs_prune",
+        "--force",
+    ))
+    .expect("graft_json_lfs_prune --force should return prune JSON");
+    assert_eq!(forced["operation"], "lfs_prune");
+    assert_eq!(forced["dry_run"], false);
+    assert_eq!(forced["candidate_payloads"], 1);
+    assert_eq!(forced["pruned_payloads"], 1);
+    assert_eq!(forced["pruned_bytes"], orphan_bytes.len() as u64);
+    assert!(!orphan_path.exists());
+    assert!(tracked_payload.exists());
+
+    let clean: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_lfs_prune"))
+        .expect("graft_json_lfs_prune should be clean after force prune");
+    assert_eq!(clean["dry_run"], true);
+    assert_eq!(clean["candidate_payloads"], 0);
+    assert_eq!(clean["pruned_payloads"], 0);
+
+    runtime.shutdown().unwrap();
 }
 
 #[test]
@@ -3124,6 +6354,18 @@ fn test_repo_fetch_async_job_updates_remote_tracking_refs() {
     assert_eq!(status["kind"], "fetch");
     assert_eq!(status["state"], "done");
 
+    let json_status: Value =
+        serde_json::from_str(&pragma_arg_string(&clone, "graft_json_job_status", &job_id))
+            .expect("graft_json_job_status should return JSON");
+    assert_eq!(json_status["kind"], "fetch");
+    assert_eq!(json_status["state"], "done");
+    assert_eq!(json_status["result_format"], "text");
+    assert!(
+        json_status["result"]
+            .as_str()
+            .is_some_and(|result| result.contains("Fetched origin/main"))
+    );
+
     let result = pragma_arg_string(&clone, "graft_job_result", &job_id);
     assert!(result.contains("Fetched origin/main"));
 
@@ -3166,6 +6408,8 @@ fn test_repo_json_pragmas_cover_eidos_sync_commands() {
     let branches: Value =
         serde_json::from_str(&pragma_arg_string(&source, "graft_json_branch", "--all"))
             .expect("graft_json_branch should return JSON");
+    assert_eq!(branches["current_branch"], "main");
+    assert_eq!(branches["current_head"], branches["branches"][0]["target"]);
     assert_eq!(branches["branches"][0]["name"], "main");
     assert_eq!(branches["branches"][0]["current"], true);
 
@@ -3174,6 +6418,15 @@ fn test_repo_json_pragmas_cover_eidos_sync_commands() {
         .expect("graft_json_tags should return JSON");
     assert_eq!(tags[0]["name"], "v-json");
     assert_eq!(tags[0]["annotated"], false);
+    let tags_with_status: Value = serde_json::from_str(&pragma_arg_string(
+        &source,
+        "graft_json_tags",
+        "--with-status",
+    ))
+    .expect("graft_json_tags --with-status should return JSON");
+    assert_eq!(tags_with_status["current_head"], branches["current_head"]);
+    assert_eq!(tags_with_status["current_branch"], "main");
+    assert_eq!(tags_with_status["tags"], tags);
 
     let volumes: Value = serde_json::from_str(&pragma_query_string(
         &source,
@@ -3215,6 +6468,8 @@ fn test_repo_json_pragmas_cover_eidos_sync_commands() {
     ))
     .expect("graft_json_push should return JSON");
     assert_eq!(push["operation"], "push");
+    assert_eq!(push["current_head"], branches["current_head"]);
+    assert_eq!(push["current_branch"], "main");
     assert_eq!(push["branches"][0]["remote"], "origin");
     assert_eq!(push["branches"][0]["remote_branch"], "main");
 
@@ -3231,13 +6486,46 @@ fn test_repo_json_pragmas_cover_eidos_sync_commands() {
     );
     assert!(pragma_arg_string(&clone, "graft_branch_upstream", "origin/main").contains("main"));
 
-    let job_id = pragma_arg_string(&clone, "graft_json_fetch_async", "origin main");
-    let status = wait_for_job_done(&clone, &job_id);
+    let sync_fetch: Value = serde_json::from_str(&pragma_arg_string(
+        &clone,
+        "graft_json_fetch",
+        "origin main",
+    ))
+    .expect("graft_json_fetch should return JSON");
+    assert_eq!(sync_fetch["operation"], "fetch");
+    assert!(sync_fetch.get("current_head").is_none());
+    assert_eq!(sync_fetch["current_branch"], "main");
+    assert_eq!(sync_fetch["branches"][0]["branch"], "main");
+
+    let legacy_job_id = pragma_arg_string(&clone, "graft_json_fetch_async", "origin main");
+    assert!(legacy_job_id.starts_with("graft-job-"));
+    let legacy_status = wait_for_job_done(&clone, &legacy_job_id);
+    assert_eq!(legacy_status["state"], "done");
+
+    let job_start: Value = serde_json::from_str(&pragma_arg_string(
+        &clone,
+        "graft_json_fetch_async",
+        "--with-status origin main",
+    ))
+    .expect("graft_json_fetch_async --with-status should return JSON");
+    assert!(job_start["id"].as_str().is_some());
+    assert_eq!(job_start["kind"], "fetch");
+    assert_eq!(job_start["result_format"], "json");
+    let job_id = job_start["id"].as_str().unwrap().to_string();
+    let status = wait_for_json_job_done(&clone, &job_id);
     assert_eq!(status["state"], "done");
+    assert_eq!(status["kind"], "fetch");
+    assert_eq!(status["result_format"], "json");
+    assert_eq!(status["result"]["operation"], "fetch");
+    assert!(status["result"].get("current_head").is_none());
+    assert_eq!(status["result"]["current_branch"], "main");
+    assert_eq!(status["result"]["branches"][0]["branch"], "main");
     let fetch: Value =
         serde_json::from_str(&pragma_arg_string(&clone, "graft_json_job_result", &job_id))
             .expect("graft_json_job_result should return fetch JSON");
     assert_eq!(fetch["operation"], "fetch");
+    assert!(fetch.get("current_head").is_none());
+    assert_eq!(fetch["current_branch"], "main");
     assert_eq!(fetch["branches"][0]["branch"], "main");
 
     let pull: Value =
@@ -3264,6 +6552,8 @@ fn test_repo_json_pragmas_cover_eidos_sync_commands() {
     .expect("graft_json_reset should return JSON");
     assert_eq!(reset["operation"], "reset");
     assert_eq!(reset["mode"], "hard");
+    assert_eq!(reset["current_head"], reset["target"]);
+    assert_eq!(reset["current_branch"], "main");
     let reset_count: i64 = clone
         .query_row("SELECT COUNT(*) FROM repo_json", [], |row| row.get(0))
         .unwrap();
@@ -3274,9 +6564,419 @@ fn test_repo_json_pragmas_cover_eidos_sync_commands() {
             .expect("graft_json_checkout should return JSON");
     assert_eq!(checkout["operation"], "checkout");
     assert!(checkout["target"].as_str().is_some());
+    assert_eq!(checkout["current_head"], checkout["target"]);
+    assert_eq!(checkout["current_branch"], Value::Null);
+    assert_eq!(checkout["head"], checkout["target"]);
+    assert_eq!(checkout["branch"], Value::Null);
 
     source_runtime.shutdown().unwrap();
     clone_runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_json_branch_mutations_report_branch_info() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_path.to_str().unwrap(), None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE branch_json (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+            INSERT INTO branch_json (name) VALUES ('base');
+            "#,
+        )
+        .unwrap();
+    assert_eq!(pragma_query_string(&sqlite, "graft_add"), "Added app.db");
+    let base_commit: Value =
+        serde_json::from_str(&pragma_arg_string(&sqlite, "graft_json_commit", "base"))
+            .expect("graft_json_commit should return JSON");
+    let base_id = base_commit["commit"]["id"]
+        .as_str()
+        .expect("commit id should be present")
+        .to_string();
+
+    let renamed_current: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_branch_rename",
+        "main trunk",
+    ))
+    .expect("graft_json_branch_rename should return JSON");
+    assert_eq!(renamed_current["operation"], "branch_rename");
+    assert_eq!(renamed_current["current_head"], base_id);
+    assert_eq!(renamed_current["current_branch"], "trunk");
+    assert_eq!(renamed_current["old_branch"], "main");
+    assert_eq!(renamed_current["branch"]["name"], "trunk");
+    assert_eq!(renamed_current["branch"]["target"], base_id);
+    assert_eq!(renamed_current["branch"]["current"], true);
+    assert_eq!(renamed_current["branch"]["upstream"], Value::Null);
+
+    let created: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_branch_create",
+        "feature/app",
+    ))
+    .expect("graft_json_branch_create should return JSON");
+    assert_eq!(created["operation"], "branch_create");
+    assert_eq!(created["current_head"], base_id);
+    assert_eq!(created["current_branch"], "trunk");
+    assert_eq!(created["branch"]["name"], "feature/app");
+    assert_eq!(created["branch"]["target"], base_id);
+    assert_eq!(created["branch"]["current"], false);
+    assert_eq!(created["branch"]["upstream"], Value::Null);
+    assert!(created.get("old_branch").is_none());
+
+    let renamed: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_branch_rename",
+        "feature/app topic/app",
+    ))
+    .expect("graft_json_branch_rename should return JSON");
+    assert_eq!(renamed["operation"], "branch_rename");
+    assert_eq!(renamed["current_head"], base_id);
+    assert_eq!(renamed["current_branch"], "trunk");
+    assert_eq!(renamed["old_branch"], "feature/app");
+    assert_eq!(renamed["branch"]["name"], "topic/app");
+    assert_eq!(renamed["branch"]["target"], base_id);
+    assert_eq!(renamed["branch"]["current"], false);
+    assert_eq!(renamed["branch"]["upstream"], Value::Null);
+
+    assert!(pragma_arg_string(&sqlite, "graft_remote_add", "origin memory").contains("origin"));
+    let upstream: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_branch_upstream",
+        "topic/app origin/main",
+    ))
+    .expect("graft_json_branch_upstream should return JSON");
+    assert_eq!(upstream["operation"], "branch_upstream");
+    assert_eq!(upstream["current_head"], base_id);
+    assert_eq!(upstream["current_branch"], "trunk");
+    assert_eq!(upstream["branch"]["name"], "topic/app");
+    assert_eq!(upstream["branch"]["target"], base_id);
+    assert_eq!(
+        upstream["branch"]["upstream"],
+        serde_json::json!({ "remote": "origin", "branch": "main" })
+    );
+    assert!(upstream.get("old_branch").is_none());
+
+    let unset: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_branch_unset_upstream",
+        "topic/app",
+    ))
+    .expect("graft_json_branch_unset_upstream should return JSON");
+    assert_eq!(unset["operation"], "branch_unset_upstream");
+    assert_eq!(unset["current_head"], base_id);
+    assert_eq!(unset["current_branch"], "trunk");
+    assert_eq!(unset["branch"]["name"], "topic/app");
+    assert_eq!(unset["branch"]["target"], base_id);
+    assert_eq!(unset["branch"]["upstream"], Value::Null);
+
+    let deleted: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_branch_delete",
+        "topic/app",
+    ))
+    .expect("graft_json_branch_delete should return JSON");
+    assert_eq!(deleted["operation"], "branch_delete");
+    assert_eq!(deleted["current_head"], base_id);
+    assert_eq!(deleted["current_branch"], "trunk");
+    assert_eq!(deleted["branch"]["name"], "topic/app");
+    assert_eq!(deleted["branch"]["target"], base_id);
+    assert_eq!(deleted["branch"]["current"], false);
+    assert_eq!(deleted["branch"]["upstream"], Value::Null);
+    assert!(deleted.get("old_branch").is_none());
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_json_tag_mutations_report_tag_info() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_path.to_str().unwrap(), None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE tag_json (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+            INSERT INTO tag_json (name) VALUES ('base');
+            "#,
+        )
+        .unwrap();
+    assert_eq!(pragma_query_string(&sqlite, "graft_add"), "Added app.db");
+    let base_commit: Value =
+        serde_json::from_str(&pragma_arg_string(&sqlite, "graft_json_commit", "base"))
+            .expect("graft_json_commit should return JSON");
+    let base_id = base_commit["commit"]["id"]
+        .as_str()
+        .expect("commit id should be present")
+        .to_string();
+
+    let created: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_tag_create",
+        "v-app HEAD",
+    ))
+    .expect("graft_json_tag_create should return JSON");
+    assert_eq!(created["operation"], "tag_create");
+    assert_eq!(created["current_head"], base_id);
+    assert_eq!(created["current_branch"], "main");
+    assert_eq!(created["tag"]["name"], "v-app");
+    assert_eq!(created["tag"]["object"], base_id);
+    assert_eq!(created["tag"]["target"], base_id);
+    assert_eq!(created["tag"]["annotated"], false);
+    assert!(created["tag"].get("message").is_none());
+
+    let annotated: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_tag_create",
+        "--annotated v-release HEAD -- release 1.0",
+    ))
+    .expect("annotated graft_json_tag_create should return JSON");
+    assert_eq!(annotated["operation"], "tag_create");
+    assert_eq!(annotated["current_head"], base_id);
+    assert_eq!(annotated["current_branch"], "main");
+    assert_eq!(annotated["tag"]["name"], "v-release");
+    assert_eq!(annotated["tag"]["target"], base_id);
+    assert_eq!(annotated["tag"]["annotated"], true);
+    assert_eq!(annotated["tag"]["message"], "release 1.0");
+    assert_ne!(
+        annotated["tag"]["object"].as_str(),
+        Some(base_id.as_str()),
+        "annotated tags should point refs at tag objects"
+    );
+
+    let tags: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_tags"))
+        .expect("graft_json_tags should return JSON");
+    assert!(
+        tags.as_array()
+            .unwrap()
+            .iter()
+            .any(|tag| tag["name"] == "v-app" && tag["annotated"] == false)
+    );
+    assert!(
+        tags.as_array()
+            .unwrap()
+            .iter()
+            .any(|tag| tag["name"] == "v-release" && tag["message"] == "release 1.0")
+    );
+
+    let deleted_annotated: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_tag_delete",
+        "v-release",
+    ))
+    .expect("graft_json_tag_delete should return JSON");
+    assert_eq!(deleted_annotated["operation"], "tag_delete");
+    assert_eq!(deleted_annotated["current_head"], base_id);
+    assert_eq!(deleted_annotated["current_branch"], "main");
+    assert_eq!(deleted_annotated["tag"]["name"], "v-release");
+    assert_eq!(deleted_annotated["tag"]["target"], base_id);
+    assert_eq!(deleted_annotated["tag"]["annotated"], true);
+    assert_eq!(deleted_annotated["tag"]["message"], "release 1.0");
+
+    let deleted_lightweight: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_tag_delete",
+        "v-app",
+    ))
+    .expect("graft_json_tag_delete should return JSON");
+    assert_eq!(deleted_lightweight["operation"], "tag_delete");
+    assert_eq!(deleted_lightweight["current_head"], base_id);
+    assert_eq!(deleted_lightweight["current_branch"], "main");
+    assert_eq!(deleted_lightweight["tag"]["name"], "v-app");
+    assert_eq!(deleted_lightweight["tag"]["object"], base_id);
+    assert_eq!(deleted_lightweight["tag"]["target"], base_id);
+    assert_eq!(deleted_lightweight["tag"]["annotated"], false);
+
+    let tags: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_tags"))
+        .expect("graft_json_tags should return JSON");
+    assert_eq!(tags, serde_json::json!([]));
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_json_remote_management_reports_structured_results() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let remote_a = temp_dir.path().join("remote-a");
+    let remote_b = temp_dir.path().join("remote-b");
+    let remote_a_url = format!("fs://{}", remote_a.display());
+    let remote_b_url = format!("fs://{}", remote_b.display());
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_path.to_str().unwrap(), None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE remote_json (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+            INSERT INTO remote_json (name) VALUES ('base');
+            "#,
+        )
+        .unwrap();
+    assert_eq!(pragma_query_string(&sqlite, "graft_add"), "Added app.db");
+    let base_commit: Value =
+        serde_json::from_str(&pragma_arg_string(&sqlite, "graft_json_commit", "base"))
+            .expect("graft_json_commit should return JSON");
+    let base_id = base_commit["commit"]["id"]
+        .as_str()
+        .expect("commit id should be present")
+        .to_string();
+    assert_eq!(base_commit["head"], base_id);
+    assert_eq!(base_commit["branch"], "main");
+
+    let added: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_remote_add",
+        format!("origin {remote_a_url}"),
+    ))
+    .expect("graft_json_remote_add should return JSON");
+    assert_eq!(added["operation"], "remote_add");
+    assert_eq!(added["current_head"], base_id);
+    assert_eq!(added["current_branch"], "main");
+    assert_eq!(added["remote"]["name"], "origin");
+    assert_eq!(added["remote"]["url"].as_str(), Some(remote_a_url.as_str()));
+    assert_eq!(added["remote"]["config"]["type"], "fs");
+    assert_eq!(
+        added["remote"]["config"]["root"].as_str(),
+        Some(remote_a.to_str().unwrap())
+    );
+    assert!(added.get("old_name").is_none());
+
+    let remotes: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_remotes"))
+        .expect("graft_json_remotes should return JSON");
+    assert_eq!(remotes["current_head"], base_id);
+    assert_eq!(remotes["current_branch"], "main");
+    assert_eq!(remotes["remotes"][0]["name"], "origin");
+    assert_eq!(
+        remotes["remotes"][0]["url"].as_str(),
+        Some(remote_a_url.as_str())
+    );
+
+    let got_url: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_remote_get_url",
+        "origin",
+    ))
+    .expect("graft_json_remote_get_url should return JSON");
+    assert_eq!(got_url["operation"], "remote_get_url");
+    assert_eq!(got_url["current_head"], base_id);
+    assert_eq!(got_url["current_branch"], "main");
+    assert_eq!(
+        got_url["remote"]["url"].as_str(),
+        Some(remote_a_url.as_str())
+    );
+
+    let push: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_push",
+        "origin main",
+    ))
+    .expect("graft_json_push should return JSON");
+    assert_eq!(push["operation"], "push");
+    assert_eq!(push["current_head"], base_id);
+    assert_eq!(push["current_branch"], "main");
+    assert_eq!(push["branches"][0]["remote"], "origin");
+    assert_eq!(push["branches"][0]["remote_branch"], "main");
+
+    let ls_remote: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_ls_remote",
+        "origin",
+    ))
+    .expect("graft_json_ls_remote should return JSON");
+    assert_eq!(ls_remote["operation"], "ls_remote");
+    assert_eq!(ls_remote["current_head"], base_id);
+    assert_eq!(ls_remote["current_branch"], "main");
+    assert_eq!(ls_remote["remote"], "origin");
+    assert!(
+        ls_remote["refs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reference| reference["branch"] == "main"
+                && reference["remote"] == "origin"
+                && reference["head"].as_str().is_some())
+    );
+
+    let updated: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_remote_set_url",
+        format!("origin {remote_b_url}"),
+    ))
+    .expect("graft_json_remote_set_url should return JSON");
+    assert_eq!(updated["operation"], "remote_set_url");
+    assert_eq!(updated["current_head"], base_id);
+    assert_eq!(updated["current_branch"], "main");
+    assert_eq!(updated["remote"]["name"], "origin");
+    assert_eq!(
+        updated["remote"]["url"].as_str(),
+        Some(remote_b_url.as_str())
+    );
+
+    let renamed: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_remote_rename",
+        "origin upstream",
+    ))
+    .expect("graft_json_remote_rename should return JSON");
+    assert_eq!(renamed["operation"], "remote_rename");
+    assert_eq!(renamed["current_head"], base_id);
+    assert_eq!(renamed["current_branch"], "main");
+    assert_eq!(renamed["old_name"], "origin");
+    assert_eq!(renamed["remote"]["name"], "upstream");
+    assert_eq!(
+        renamed["remote"]["url"].as_str(),
+        Some(remote_b_url.as_str())
+    );
+
+    let pruned: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_remote_prune",
+        "upstream",
+    ))
+    .expect("graft_json_remote_prune should return JSON");
+    assert_eq!(pruned["operation"], "remote_prune");
+    assert_eq!(pruned["current_head"], base_id);
+    assert_eq!(pruned["current_branch"], "main");
+    assert_eq!(pruned["remote"], "upstream");
+    assert_eq!(pruned["branches"], serde_json::json!(["main"]));
+
+    let removed: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_remote_remove",
+        "upstream",
+    ))
+    .expect("graft_json_remote_remove should return JSON");
+    assert_eq!(removed["operation"], "remote_remove");
+    assert_eq!(removed["current_head"], base_id);
+    assert_eq!(removed["current_branch"], "main");
+    assert_eq!(removed["remote"]["name"], "upstream");
+    assert_eq!(
+        removed["remote"]["url"].as_str(),
+        Some(remote_b_url.as_str())
+    );
+
+    let remotes: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_remotes"))
+        .expect("graft_json_remotes should return JSON");
+    assert_eq!(remotes["current_head"], base_id);
+    assert_eq!(remotes["current_branch"], "main");
+    assert_eq!(remotes["remotes"], serde_json::json!([]));
+
+    runtime.shutdown().unwrap();
 }
 
 #[test]
@@ -3637,14 +7337,28 @@ fn test_repo_diff_matrix_on_physical_database_path() {
     let json_worktree_diff: Value =
         serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_diff"))
             .expect("graft_json_diff should return repo worktree diff JSON");
+    let current_head = json_worktree_diff["current_head"]
+        .as_str()
+        .expect("graft_json_diff should include current_head")
+        .to_string();
+    assert_eq!(json_worktree_diff["current_branch"], "main");
     assert_eq!(json_worktree_diff["from"], "index");
     assert_eq!(json_worktree_diff["to"], "worktree");
+    assert_eq!(
+        json_worktree_diff["paths"],
+        serde_json::json!([
+            { "path": "app.db", "change": "modified", "kind": "sqlite_database", "storage": "sqlite_snapshot" }
+        ])
+    );
     assert_eq!(json_worktree_diff["files"][0]["path"], "app.db");
     assert_eq!(json_worktree_diff["files"][0]["change"], "modified");
+    assert_eq!(json_worktree_diff["files"][0]["kind"], "sqlite_database");
 
     let json_worktree_row_diff: Value =
         serde_json::from_str(&pragma_arg_string(&sqlite, "graft_json_diff", "--rows"))
             .expect("graft_json_diff --rows should return repo row diff JSON");
+    assert_eq!(json_worktree_row_diff["current_head"], current_head);
+    assert_eq!(json_worktree_row_diff["current_branch"], "main");
     assert_eq!(json_worktree_row_diff["from"], "index");
     assert_eq!(json_worktree_row_diff["to"], "worktree");
     assert_repo_row_diff_json(&json_worktree_row_diff);
@@ -3667,9 +7381,18 @@ fn test_repo_diff_matrix_on_physical_database_path() {
     let json_staged_diff: Value =
         serde_json::from_str(&pragma_arg_string(&sqlite, "graft_json_diff", "--staged"))
             .expect("graft_json_diff should return repo staged diff JSON");
+    assert_eq!(json_staged_diff["current_head"], current_head);
+    assert_eq!(json_staged_diff["current_branch"], "main");
     assert_eq!(json_staged_diff["to"], "index");
+    assert_eq!(
+        json_staged_diff["paths"],
+        serde_json::json!([
+            { "path": "app.db", "change": "modified", "kind": "sqlite_database", "storage": "sqlite_snapshot" }
+        ])
+    );
     assert_eq!(json_staged_diff["files"][0]["path"], "app.db");
     assert_eq!(json_staged_diff["files"][0]["change"], "modified");
+    assert_eq!(json_staged_diff["files"][0]["kind"], "sqlite_database");
 
     let json_staged_row_diff: Value = serde_json::from_str(&pragma_arg_string(
         &sqlite,
@@ -3677,6 +7400,8 @@ fn test_repo_diff_matrix_on_physical_database_path() {
         "--rows --staged",
     ))
     .expect("graft_json_diff --rows should return repo staged row diff JSON");
+    assert_eq!(json_staged_row_diff["current_head"], current_head);
+    assert_eq!(json_staged_row_diff["current_branch"], "main");
     assert_eq!(json_staged_row_diff["to"], "index");
     assert_repo_row_diff_json(&json_staged_row_diff);
 
@@ -3693,6 +7418,11 @@ fn test_repo_diff_matrix_on_physical_database_path() {
         "--rows HEAD~1 HEAD -- app.db",
     ))
     .expect("graft_json_diff --rows should return repo revision row diff JSON");
+    assert_eq!(
+        json_revision_row_diff["current_head"],
+        json_revision_row_diff["to"]
+    );
+    assert_eq!(json_revision_row_diff["current_branch"], "main");
     assert_repo_row_diff_json(&json_revision_row_diff);
 
     runtime.shutdown().unwrap();
@@ -3847,6 +7577,148 @@ fn test_repo_checkout_path_restores_database_and_stages_it() {
 }
 
 #[test]
+fn test_repo_json_merge_reports_fast_forward_paths() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE merge_paths (
+              id INTEGER PRIMARY KEY,
+              body TEXT NOT NULL
+            );
+            INSERT INTO merge_paths (id, body) VALUES (1, 'base');
+            "#,
+        )
+        .unwrap();
+    assert!(pragma_query_string(&sqlite, "graft_add").contains("Added app.db"));
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "base merge paths").contains("base"));
+
+    assert!(
+        pragma_arg_string(&sqlite, "graft_branch_create", "feature/merge-paths")
+            .contains("feature/merge-paths")
+    );
+    assert!(
+        pragma_arg_string(&sqlite, "graft_switch_branch", "feature/merge-paths")
+            .contains("feature/merge-paths")
+    );
+    assert_eq!(
+        pragma_arg_string(
+            &sqlite,
+            "graft_config_set",
+            "files.inline_text_threshold -- 16 B"
+        ),
+        "files.inline_text_threshold = 16 B\n"
+    );
+    let threshold: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_config_get",
+        "files.inline_text_threshold",
+    ))
+    .expect("graft_json_config_get should return config JSON");
+    assert_eq!(threshold["key"], "files.inline_text_threshold");
+    assert_eq!(threshold["value"], "16 B");
+    assert_eq!(threshold["current_branch"], "feature/merge-paths");
+    assert!(threshold["current_head"].as_str().is_some());
+    sqlite
+        .execute(
+            "INSERT INTO merge_paths (id, body) VALUES (2, 'feature')",
+            [],
+        )
+        .unwrap();
+    let assets = temp_dir.path().join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    std::fs::write(assets.join("note.txt"), "feature note").unwrap();
+    std::fs::write(assets.join("model.bin"), b"large merge payload").unwrap();
+    assert!(pragma_arg_string(&sqlite, "graft_add", "--all").contains("Added 3 paths"));
+    let staged: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_ls_files",
+        "--stage",
+    ))
+    .expect("graft_json_ls_files --stage should return staged path JSON");
+    assert_eq!(staged["current_branch"], "feature/merge-paths");
+    assert_eq!(staged["stage"], true);
+    let staged_paths = staged["paths"].as_array().unwrap();
+    assert_eq!(staged_paths.len(), 3);
+    assert_eq!(staged_paths[0]["path"], "app.db");
+    assert_eq!(staged_paths[0]["stage"], "normal");
+    assert_eq!(staged_paths[0]["kind"], "sqlite_database");
+    assert_eq!(staged_paths[0]["storage"], "sqlite_snapshot");
+    assert_eq!(staged_paths[0]["mode"], "sqlite_database");
+    assert_eq!(staged_paths[0]["page_count"], 2);
+    assert_eq!(staged_paths[1]["path"], "assets/model.bin");
+    assert_eq!(staged_paths[1]["stage"], "normal");
+    assert_eq!(staged_paths[1]["kind"], "text_file");
+    assert_eq!(staged_paths[1]["storage"], "external");
+    assert_eq!(staged_paths[1]["mode"], "regular");
+    assert_eq!(staged_paths[1]["size"], 19);
+    assert_eq!(staged_paths[2]["path"], "assets/note.txt");
+    assert_eq!(staged_paths[2]["stage"], "normal");
+    assert_eq!(staged_paths[2]["kind"], "text_file");
+    assert_eq!(staged_paths[2]["storage"], "inline");
+    assert_eq!(staged_paths[2]["mode"], "regular");
+    assert_eq!(staged_paths[2]["size"], 12);
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "feature merge paths").contains("feature"));
+    let tracked: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_ls_files"))
+        .expect("graft_json_ls_files should return tracked path JSON");
+    assert_eq!(tracked["current_branch"], "feature/merge-paths");
+    assert_eq!(tracked["stage"], false);
+    assert_eq!(
+        tracked["paths"],
+        serde_json::json!([
+            { "path": "app.db", "kind": "sqlite_database", "storage": "sqlite_snapshot", "page_count": 2 },
+            { "path": "assets/model.bin", "kind": "text_file", "storage": "external", "size": 19 },
+            { "path": "assets/note.txt", "kind": "text_file", "storage": "inline", "size": 12 }
+        ])
+    );
+
+    assert!(pragma_arg_string(&sqlite, "graft_switch_branch", "main").contains("main"));
+    let merge: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_merge",
+        "feature/merge-paths",
+    ))
+    .expect("graft_json_merge should return fast-forward path JSON");
+    assert_eq!(merge["operation"], "merge");
+    assert_eq!(merge["status"], "fast_forward");
+    assert_eq!(merge["current_head"], merge["to"]);
+    assert_eq!(merge["current_branch"], "main");
+    assert_eq!(merge["head"], merge["to"]);
+    assert_eq!(merge["branch"], "main");
+    assert_eq!(
+        merge["paths"],
+        serde_json::json!([
+            { "path": "app.db", "kind": "sqlite_database", "storage": "sqlite_snapshot", "action": "checked_out" },
+            { "path": "assets/model.bin", "kind": "text_file", "storage": "external", "action": "checked_out" },
+            { "path": "assets/note.txt", "kind": "text_file", "storage": "inline", "action": "checked_out" }
+        ])
+    );
+    let count: i64 = sqlite
+        .query_row("SELECT COUNT(*) FROM merge_paths", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 2);
+    assert_eq!(
+        std::fs::read_to_string(assets.join("note.txt")).unwrap(),
+        "feature note"
+    );
+    assert_eq!(
+        std::fs::read(assets.join("model.bin")).unwrap(),
+        b"large merge payload"
+    );
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
 fn test_repo_merge_conflict_records_index_stages() {
     graft_test::ensure_test_env();
 
@@ -3892,13 +7764,54 @@ fn test_repo_merge_conflict_records_index_stages() {
     let commit = pragma_arg_string(&sqlite, "graft_commit", "main row");
     assert!(commit.contains("main row"));
 
-    let merge = pragma_arg_string(&sqlite, "graft_merge", "feature/search");
-    assert!(merge.contains("Unmerged paths:"));
-    assert!(merge.contains("app.db"));
+    let merge: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_merge",
+        "feature/search",
+    ))
+    .expect("graft_json_merge should return conflicted path JSON");
+    assert_eq!(merge["operation"], "merge");
+    assert_eq!(merge["status"], "merged");
+    assert_eq!(merge["branch"], "main");
+    assert_eq!(merge["conflicted"], serde_json::json!(["app.db"]));
+    assert_eq!(
+        merge["paths"],
+        serde_json::json!([
+            { "path": "app.db", "kind": "sqlite_database", "storage": "sqlite_snapshot", "action": "conflicted" }
+        ])
+    );
 
     let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
         .expect("graft_json_status should return repo status JSON");
+    assert_eq!(merge["current_head"], status["head_target"]);
+    assert_eq!(merge["current_branch"], "main");
+    assert_eq!(merge["head"], status["head_target"]);
     assert_eq!(status["conflicted"][0], "app.db");
+    assert_eq!(status["dirty"], false);
+    assert_eq!(status["has_unstaged_changes"], false);
+    assert_eq!(status["has_staged_changes"], false);
+    assert_eq!(status["has_conflicts"], true);
+    assert_eq!(status["work_in_progress"], true);
+    assert_eq!(
+        status["counts"],
+        serde_json::json!({ "unstaged": 0, "staged": 0, "conflicted": 1 })
+    );
+    assert_eq!(
+        status["paths"],
+        serde_json::json!([
+            {
+                "path": "app.db",
+                "kind": "sqlite_database",
+                "storage": "sqlite_snapshot",
+                "index_status": "unmerged",
+                "worktree_status": "unmerged",
+                "code": "UU",
+                "conflicted": true
+            }
+        ])
+    );
+    assert_eq!(status["conflicted_changes"][0]["path"], "app.db");
+    assert_eq!(status["conflicted_changes"][0]["kind"], "sqlite_database");
     assert_eq!(status["conflict_analysis"]["path"], "app.db");
     assert_eq!(status["conflict_analysis"]["available"], true);
     assert_eq!(status["conflict_analysis"]["can_auto_merge"], false);
@@ -3934,7 +7847,23 @@ fn test_repo_merge_conflict_records_index_stages() {
         serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_conflicts"))
             .expect("graft_json_conflicts should return conflict artifact JSON");
     assert_eq!(conflicts["merge_head"], status["merge_head"]);
+    assert_eq!(
+        conflicts["paths"],
+        serde_json::json!([
+            {
+                "path": "app.db",
+                "kind": "sqlite_database",
+                "storage": "sqlite_snapshot",
+                "status": "unresolved",
+                "total": 1,
+                "unresolved": 1,
+                "resolved": 0
+            }
+        ])
+    );
     assert_eq!(conflicts["conflicts"][0]["kind"], "row");
+    assert_eq!(conflicts["conflicts"][0]["path_kind"], "sqlite_database");
+    assert_eq!(conflicts["conflicts"][0]["storage"], "sqlite_snapshot");
     assert_eq!(conflicts["conflicts"][0]["reason"], "row_conflict");
     assert_eq!(conflicts["conflicts"][0]["status"], "unresolved");
     assert_eq!(conflicts["conflicts"][0]["path"], "app.db");
@@ -3958,8 +7887,21 @@ fn test_repo_merge_conflict_records_index_stages() {
     );
     assert!(output.is_none());
 
-    let abort = pragma_query_string(&sqlite, "graft_merge_abort");
-    assert!(abort.contains("Aborted merge"));
+    let abort: Value =
+        serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_merge_abort"))
+            .expect("graft_json_merge_abort should return abort JSON");
+    assert_eq!(abort["operation"], "merge_abort");
+    assert_eq!(abort["target"], status["head_target"]);
+    assert_eq!(abort["current_head"], abort["target"]);
+    assert_eq!(abort["current_branch"], "main");
+    assert_eq!(abort["head"], abort["target"]);
+    assert_eq!(abort["branch"], "main");
+    assert_eq!(
+        abort["paths"],
+        serde_json::json!([
+            { "path": "app.db", "kind": "sqlite_database", "storage": "sqlite_snapshot", "action": "checked_out" }
+        ])
+    );
     let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
         .expect("graft_json_status should return repo status JSON");
     assert_eq!(status["conflicted"].as_array().unwrap().len(), 0);
@@ -4330,14 +8272,34 @@ fn test_repo_merge_continue_creates_merge_commit_after_resolution() {
     .expect("graft_json_resolve_conflict should return resolve JSON");
     assert_eq!(resolved["operation"], "resolve_conflict");
     assert_eq!(resolved["path"], "app.db");
+    assert_eq!(resolved["path_kind"], "sqlite_database");
+    assert_eq!(resolved["storage"], "sqlite_snapshot");
     assert_eq!(resolved["resolution"], "manual");
     assert_eq!(resolved["remaining_conflicts"], 0);
-    let continued = pragma_arg_string(&sqlite, "graft_merge_continue", "merge feature");
-    assert!(continued.contains("Merge commit"));
-    assert!(continued.contains("merge feature"));
+    let continued: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_merge_continue",
+        "merge feature",
+    ))
+    .expect("graft_json_merge_continue should return merge commit JSON");
+    assert_eq!(continued["operation"], "merge_continue");
+    assert_eq!(continued["commit"]["message"], "merge feature");
+    assert_eq!(continued["commit"]["parents"].as_array().unwrap().len(), 2);
+    assert_eq!(continued["current_head"], continued["commit"]["id"]);
+    assert_eq!(continued["current_branch"], "main");
+    assert_eq!(continued["head"], continued["commit"]["id"]);
+    assert_eq!(continued["branch"], "main");
+    assert_eq!(
+        continued["paths"],
+        serde_json::json!([
+            { "path": "app.db", "change": "modified", "kind": "sqlite_database", "storage": "sqlite_snapshot" }
+        ])
+    );
 
     let show: Value = serde_json::from_str(&pragma_arg_string(&sqlite, "graft_json_show", "HEAD"))
         .expect("graft_json_show should return repo commit JSON");
+    assert_eq!(show["current_head"], continued["commit"]["id"]);
+    assert_eq!(show["current_branch"], "main");
     assert_eq!(show["message"], "merge feature");
     assert_eq!(show["parents"].as_array().unwrap().len(), 2);
 
@@ -4439,6 +8401,12 @@ fn test_repo_resolve_materializes_physical_sqlite_conflict_side() {
     let conflicts = pragma_query_string(&sqlite, "graft_conflicts");
     assert!(conflicts.contains("external.db"));
     assert!(conflicts.contains("--theirs [path]"));
+    let conflicts: Value =
+        serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_conflicts"))
+            .expect("graft_json_conflicts should return conflict artifact JSON");
+    assert_eq!(conflicts["conflicts"][0]["path"], "external.db");
+    assert_eq!(conflicts["conflicts"][0]["path_kind"], "sqlite_database");
+    assert_eq!(conflicts["conflicts"][0]["storage"], "sqlite_snapshot");
 
     let resolved = pragma_arg_string(&sqlite, "graft_resolve", "--theirs external.db");
     assert_eq!(resolved, "Resolved external.db using theirs");
@@ -4829,17 +8797,23 @@ fn test_repo_row_auto_merge_resolves_sqlite_sequence_internal_state() {
     pragma_query_string(&sqlite, "graft_add");
     assert!(pragma_arg_string(&sqlite, "graft_commit", "base auto docs").contains("base"));
 
-    let repo = graft::repo::Repository::discover_for_file(&db_path).unwrap();
-    let mut config = repo.config().unwrap();
-    config
-        .merge
-        .internal_resolvers
-        .insert("sqlite_sequence".to_string(), "sequence_max".to_string());
-    repo.write_config(&config).unwrap();
     assert_eq!(
-        repo.config().unwrap().merge.internal_resolvers["sqlite_sequence"],
-        "sequence_max"
+        pragma_arg_string(
+            &sqlite,
+            "graft_config_set",
+            "merge.internal_resolvers.sqlite_sequence -- sequence_max"
+        ),
+        "merge.internal_resolvers.sqlite_sequence = sequence_max\n"
     );
+    let config: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_config_get",
+        "merge.internal_resolvers.sqlite_sequence",
+    ))
+    .expect("graft_json_config_get should return internal resolver config JSON");
+    assert_eq!(config["key"], "merge.internal_resolvers.sqlite_sequence");
+    assert_eq!(config["value"], "sequence_max");
+    let repo = graft::repo::Repository::discover_for_file(&db_path).unwrap();
 
     assert!(
         pragma_arg_string(&sqlite, "graft_branch_create", "feature/auto-sequence")
@@ -5069,17 +9043,22 @@ fn test_repo_row_auto_merge_applies_compatible_add_column_schema_change() {
     let sqlite = runtime.open_sqlite(db_name, None);
 
     assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
-    let repo = graft::repo::Repository::discover_for_file(&db_path).unwrap();
-    let mut config = repo.config().unwrap();
-    config.merge.schema_resolvers.insert(
-        "add_column".to_string(),
-        "alter_table_add_column".to_string(),
-    );
-    repo.write_config(&config).unwrap();
     assert_eq!(
-        repo.config().unwrap().merge.schema_resolvers["add_column"],
-        "alter_table_add_column"
+        pragma_arg_string(
+            &sqlite,
+            "graft_config_set",
+            "merge.schema_resolvers.add_column -- alter_table_add_column"
+        ),
+        "merge.schema_resolvers.add_column = alter_table_add_column\n"
     );
+    let config: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_config_get",
+        "merge.schema_resolvers.add_column",
+    ))
+    .expect("graft_json_config_get should return schema resolver config JSON");
+    assert_eq!(config["key"], "merge.schema_resolvers.add_column");
+    assert_eq!(config["value"], "alter_table_add_column");
 
     sqlite
         .execute_batch(
@@ -5918,13 +9897,28 @@ fn test_repo_row_auto_merge_uses_configured_semantic_key_policy() {
     pragma_query_string(&sqlite, "graft_add");
     assert!(pragma_arg_string(&sqlite, "graft_commit", "base policy table").contains("base"));
 
-    let repo = graft::repo::Repository::discover_for_file(&db_path).unwrap();
-    let mut config = repo.config().unwrap();
-    config
-        .merge
-        .semantic_keys
-        .insert("policy_entities".to_string(), vec!["name".to_string()]);
-    repo.write_config(&config).unwrap();
+    assert_eq!(
+        pragma_arg_string(
+            &sqlite,
+            "graft_config_set",
+            "merge.semantic_keys.policy_entities -- name"
+        ),
+        "merge.semantic_keys.policy_entities = name\n"
+    );
+    let config: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_config_get",
+        "merge.semantic_keys.policy_entities",
+    ))
+    .expect("graft_json_config_get should return semantic key config JSON");
+    assert_eq!(config["key"], "merge.semantic_keys.policy_entities");
+    assert_eq!(config["value"], "name");
+    let config_list: Value =
+        serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_config_list"))
+            .expect("graft_json_config_list should return config entries JSON");
+    assert!(config_list.as_array().unwrap().iter().any(|entry| {
+        entry["key"] == "merge.semantic_keys.policy_entities" && entry["value"] == "name"
+    }));
 
     assert!(
         pragma_arg_string(&sqlite, "graft_branch_create", "feature/policy-key").contains("feature")
@@ -5974,6 +9968,20 @@ fn test_repo_row_auto_merge_uses_configured_semantic_key_policy() {
 
     let continued = pragma_arg_string(&sqlite, "graft_merge_continue", "merge policy key");
     assert!(continued.contains("Merge commit"));
+    let config: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_config_unset",
+        "merge.semantic_keys.policy_entities",
+    ))
+    .expect("graft_json_config_unset should return semantic key config JSON");
+    assert_eq!(config["operation"], "config_unset");
+    assert_eq!(config["current_branch"], "main");
+    assert!(config["current_head"].as_str().is_some());
+    assert_eq!(
+        config["entry"]["key"],
+        "merge.semantic_keys.policy_entities"
+    );
+    assert_eq!(config["entry"]["value"], "");
 
     runtime.shutdown().unwrap();
 }
@@ -6003,13 +10011,25 @@ fn test_repo_row_merge_detects_configured_semantic_key_insert_conflict() {
     pragma_query_string(&sqlite, "graft_add");
     assert!(pragma_arg_string(&sqlite, "graft_commit", "base semantic conflict").contains("base"));
 
-    let repo = graft::repo::Repository::discover_for_file(&db_path).unwrap();
-    let mut config = repo.config().unwrap();
-    config.merge.semantic_keys.insert(
-        "policy_conflict_entities".to_string(),
-        vec!["entity_id".to_string()],
+    assert_eq!(
+        pragma_arg_string(
+            &sqlite,
+            "graft_config_set",
+            "merge.semantic_keys.policy_conflict_entities -- entity_id"
+        ),
+        "merge.semantic_keys.policy_conflict_entities = entity_id\n"
     );
-    repo.write_config(&config).unwrap();
+    let config: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_config_get",
+        "merge.semantic_keys.policy_conflict_entities",
+    ))
+    .expect("graft_json_config_get should return semantic key config JSON");
+    assert_eq!(
+        config["key"],
+        "merge.semantic_keys.policy_conflict_entities"
+    );
+    assert_eq!(config["value"], "entity_id");
 
     assert!(
         pragma_arg_string(&sqlite, "graft_branch_create", "feature/semantic-conflict")
@@ -6092,10 +10112,14 @@ fn test_repo_row_merge_detects_default_semantic_key_insert_conflict() {
     pragma_query_string(&sqlite, "graft_add");
     assert!(pragma_arg_string(&sqlite, "graft_commit", "base default key").contains("base"));
 
-    let repo = graft::repo::Repository::discover_for_file(&db_path).unwrap();
-    let mut config = repo.config().unwrap();
-    config.merge.default_semantic_keys = vec!["_id".to_string()];
-    repo.write_config(&config).unwrap();
+    assert_eq!(
+        pragma_arg_string(
+            &sqlite,
+            "graft_config_set",
+            "merge.default_semantic_keys -- _id"
+        ),
+        "merge.default_semantic_keys = _id\n"
+    );
 
     assert!(
         pragma_arg_string(&sqlite, "graft_branch_create", "feature/default-semantic")
@@ -6171,10 +10195,22 @@ fn test_repo_row_merge_reports_semantic_key_on_rowid_update_conflict() {
     pragma_query_string(&sqlite, "graft_add");
     assert!(pragma_arg_string(&sqlite, "graft_commit", "base update key").contains("base"));
 
-    let repo = graft::repo::Repository::discover_for_file(&db_path).unwrap();
-    let mut config = repo.config().unwrap();
-    config.merge.default_semantic_keys = vec!["_id".to_string()];
-    repo.write_config(&config).unwrap();
+    assert_eq!(
+        pragma_arg_string(
+            &sqlite,
+            "graft_config_set",
+            "merge.default_semantic_keys -- _id"
+        ),
+        "merge.default_semantic_keys = _id\n"
+    );
+    let config: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_config_get",
+        "merge.default_semantic_keys",
+    ))
+    .expect("graft_json_config_get should return default semantic key config JSON");
+    assert_eq!(config["key"], "merge.default_semantic_keys");
+    assert_eq!(config["value"], "_id");
 
     assert!(
         pragma_arg_string(&sqlite, "graft_branch_create", "feature/update-semantic")
@@ -6255,13 +10291,25 @@ fn test_repo_row_merge_analysis_reports_parser_limitations() {
     pragma_query_string(&sqlite, "graft_add");
     assert!(pragma_arg_string(&sqlite, "graft_commit", "base limited merge").contains("base"));
 
-    let repo = graft::repo::Repository::discover_for_file(&db_path).unwrap();
-    let mut config = repo.config().unwrap();
-    config.merge.generated_columns.insert(
-        "generated_merge_surface".to_string(),
-        vec!["body_len".to_string()],
+    assert_eq!(
+        pragma_arg_string(
+            &sqlite,
+            "graft_config_set",
+            "merge.generated_columns.generated_merge_surface -- body_len"
+        ),
+        "merge.generated_columns.generated_merge_surface = body_len\n"
     );
-    repo.write_config(&config).unwrap();
+    let config: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_config_get",
+        "merge.generated_columns.generated_merge_surface",
+    ))
+    .expect("graft_json_config_get should return generated columns config JSON");
+    assert_eq!(
+        config["key"],
+        "merge.generated_columns.generated_merge_surface"
+    );
+    assert_eq!(config["value"], "body_len");
 
     assert!(
         pragma_arg_string(&sqlite, "graft_branch_create", "feature/limited-analysis")
@@ -6908,8 +10956,15 @@ fn assert_repo_row_diff_text(diff: &str) {
 }
 
 fn assert_repo_row_diff_json(diff: &Value) {
+    assert_eq!(
+        diff["paths"],
+        serde_json::json!([
+            { "path": "app.db", "change": "modified", "kind": "sqlite_database", "storage": "sqlite_snapshot" }
+        ])
+    );
     assert_eq!(diff["files"][0]["path"], "app.db");
     assert_eq!(diff["files"][0]["change"], "modified");
+    assert_eq!(diff["files"][0]["kind"], "sqlite_database");
     assert_eq!(diff["files"][0]["row_diff_available"], true);
     assert_eq!(diff["files"][0]["logical_status"], "logical_changes");
     assert!(
@@ -7001,6 +11056,21 @@ fn wait_for_job_done(conn: &Connection, job_id: &str) -> Value {
     for _ in 0..100 {
         let status: Value =
             serde_json::from_str(&pragma_arg_string(conn, "graft_job_status", job_id)).unwrap();
+        match status["state"].as_str() {
+            Some("done") => return status,
+            Some("failed") => panic!("job failed: {status}"),
+            Some("running") => std::thread::sleep(std::time::Duration::from_millis(10)),
+            other => panic!("unexpected job state {other:?}: {status}"),
+        }
+    }
+    panic!("job `{job_id}` did not finish in time")
+}
+
+fn wait_for_json_job_done(conn: &Connection, job_id: &str) -> Value {
+    for _ in 0..100 {
+        let status: Value =
+            serde_json::from_str(&pragma_arg_string(conn, "graft_json_job_status", job_id))
+                .unwrap();
         match status["state"].as_str() {
             Some("done") => return status,
             Some("failed") => panic!("job failed: {status}"),

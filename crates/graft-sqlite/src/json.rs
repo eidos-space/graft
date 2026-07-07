@@ -95,7 +95,17 @@ pub struct JsonRowDiffResult {
 pub struct JsonRepoRowDiffResult {
     pub from: String,
     pub to: String,
+    pub paths: Vec<JsonRepoPathDiff>,
     pub files: Vec<JsonRepoRowDiffFile>,
+}
+
+/// Path-level repository diff summary shared by default and row diff surfaces.
+#[derive(Debug, Clone, Serialize)]
+pub struct JsonRepoPathDiff {
+    pub path: String,
+    pub change: String,
+    pub kind: String,
+    pub storage: String,
 }
 
 /// Row-level changes for one repository file.
@@ -103,6 +113,8 @@ pub struct JsonRepoRowDiffResult {
 pub struct JsonRepoRowDiffFile {
     pub path: String,
     pub change: String,
+    pub kind: String,
+    pub storage: String,
     pub row_diff_available: bool,
     pub logical_status: String,
     pub capabilities: Vec<String>,

@@ -19,11 +19,15 @@ use graft::core::{
 };
 use graft::remote::{Remote, RemoteConfig};
 use graft::repo::{
-    BranchInfo, BranchUpstream, CheckoutPlan, CommitFileState, CommitObject, CommitTableSummary,
-    FetchAllOutcome, FetchOutcome, Head, MergeOutcome, MergePlan, PullOutcome, PushAllOutcome,
-    PushOutcome, RemoteBranchRef, RemoteInfo, RemotePruneOutcome, RepoDiff, RepoFileChange,
-    RepoLogRange, RepoSnapshot, RepoStatus, RepoStorageCommit, RepoWorktreeChangeKind, Repository,
-    ResetMode, ResetOutcome, TagInfo,
+    BranchInfo, BranchUpstream, CheckoutPlan, CommitArtifactState, CommitFileState, CommitObject,
+    CommitTableSummary, FetchAllOutcome, FetchOutcome, Head, MergeOutcome, MergePlan, PullOutcome,
+    PushAllOutcome, PushOutcome, RemoteBranchRef, RemoteInfo, RemotePruneOutcome,
+    RepoArtifactAudit, RepoArtifactAuditIssueKind, RepoArtifactRepairOutcome, RepoConfigEntry,
+    RepoDiff, RepoFileChange, RepoLargeFileFetchOutcome, RepoLargeFileFetchStatus,
+    RepoLargeFilePruneOutcome, RepoLargeFileStatusOutcome, RepoLargeFileStatusState, RepoLogRange,
+    RepoPathStorage, RepoSnapshot, RepoStatus, RepoStorageCommit, RepoTrackedPath,
+    RepoTrackedPathDetail, RepoTrackedPathEntry, RepoTrackedPathKind, RepoWorktreeChangeKind,
+    Repository, ResetMode, ResetOutcome, TagInfo,
 };
 use graft::{
     rt::runtime::Runtime, volume::AheadStatus, volume_reader::VolumeRead,
@@ -123,7 +127,7 @@ impl AsyncJobRegistry {
         let id = format!("graft-job-{}", NEXT_JOB_ID.fetch_add(1, Ordering::Relaxed));
         self.jobs
             .lock()
-            .insert(id.clone(), AsyncJob::running("fetch"));
+            .insert(id.clone(), AsyncJob::running("fetch", format));
 
         let job_id = id.clone();
         std::thread::spawn(move || {
@@ -162,6 +166,12 @@ impl AsyncJobRegistry {
         Ok(job.status_json(id))
     }
 
+    fn json_status(&self, id: &str) -> Result<String, ErrCtx> {
+        let jobs = self.jobs.lock();
+        let job = jobs.get(id).ok_or_else(|| unknown_job(id))?;
+        Ok(job.json_status(id))
+    }
+
     fn result(&self, id: &str) -> Result<String, ErrCtx> {
         let jobs = self.jobs.lock();
         let job = jobs.get(id).ok_or_else(|| unknown_job(id))?;
@@ -187,6 +197,15 @@ enum AsyncJobResultFormat {
     Json,
 }
 
+impl AsyncJobResultFormat {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Json => "json",
+        }
+    }
+}
+
 fn unknown_job(id: &str) -> ErrCtx {
     ErrCtx::PragmaErr(format!("unknown job `{id}`").into())
 }
@@ -194,15 +213,17 @@ fn unknown_job(id: &str) -> ErrCtx {
 #[derive(Debug, Clone)]
 struct AsyncJob {
     kind: &'static str,
+    format: AsyncJobResultFormat,
     state: AsyncJobState,
     result: Option<String>,
     error: Option<String>,
 }
 
 impl AsyncJob {
-    fn running(kind: &'static str) -> Self {
+    fn running(kind: &'static str, format: AsyncJobResultFormat) -> Self {
         Self {
             kind,
+            format,
             state: AsyncJobState::Running,
             result: None,
             error: None,
@@ -231,6 +252,24 @@ impl AsyncJob {
         })
         .to_string()
     }
+
+    fn json_status(&self, id: &str) -> String {
+        let result = match (&self.result, self.format) {
+            (Some(result), AsyncJobResultFormat::Json) => serde_json::from_str(result)
+                .unwrap_or_else(|_| serde_json::Value::String(result.clone())),
+            (Some(result), AsyncJobResultFormat::Text) => serde_json::Value::String(result.clone()),
+            (None, _) => serde_json::Value::Null,
+        };
+        serde_json::json!({
+            "id": id,
+            "kind": self.kind,
+            "state": self.state.as_str(),
+            "result_format": self.format.as_str(),
+            "result": result,
+            "error": self.error,
+        })
+        .to_string()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -254,8 +293,16 @@ fn to_json<T: Serialize>(value: &T) -> Result<String, ErrCtx> {
     serde_json::to_string(value).map_err(|e| ErrCtx::PragmaErr(format!("JSON error: {e}").into()))
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct JsonBranchList {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_branch: Option<String>,
     branches: Vec<BranchInfo>,
     remote_branches: Vec<RemoteBranchRef>,
 }
@@ -263,6 +310,10 @@ struct JsonBranchList {
 #[derive(Debug, Clone, Serialize)]
 struct JsonFetchCommandOutcome {
     operation: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_branch: Option<String>,
     remote: String,
     branches: Vec<FetchOutcome>,
     commits: usize,
@@ -294,24 +345,13 @@ impl FetchCommandOutcome {
     }
 }
 
-impl Serialize for FetchCommandOutcome {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        JsonFetchCommandOutcome {
-            operation: "fetch",
-            remote: self.remote(),
-            branches: self.branches(),
-            commits: self.commits(),
-        }
-        .serialize(serializer)
-    }
-}
-
 #[derive(Debug, Clone, Serialize)]
 struct JsonPushCommandOutcome {
     operation: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_branch: Option<String>,
     remote: String,
     branches: Vec<PushOutcome>,
     commits: usize,
@@ -348,52 +388,465 @@ impl PushCommandOutcome {
     }
 }
 
-impl Serialize for PushCommandOutcome {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        JsonPushCommandOutcome {
-            operation: "push",
-            remote: self.remote(),
-            branches: self.branches(),
-            commits: self.commits(),
-            forced: self.forced(),
-        }
-        .serialize(serializer)
-    }
-}
-
 #[derive(Debug, Clone, Serialize)]
 struct JsonPullCommandOutcome {
     operation: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_head: Option<String>,
+    current_branch: Option<String>,
     #[serde(flatten)]
     outcome: PullOutcome,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    paths: Vec<JsonPathAction>,
     #[serde(skip_serializing_if = "Option::is_none")]
     conflict_analysis: Option<JsonRowMergeAnalysis>,
 }
 
+#[derive(Debug, Clone)]
+struct RepoPullCommandOutcome {
+    outcome: PullOutcome,
+    current_head: Option<String>,
+    current_branch: Option<String>,
+    paths: Vec<JsonPathAction>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct JsonMergeCommandOutcome {
+    operation: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    head: Option<String>,
+    branch: Option<String>,
+    #[serde(flatten)]
+    outcome: MergeOutcome,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    paths: Vec<JsonPathAction>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    conflict_analysis: Option<JsonRowMergeAnalysis>,
+}
+
+#[derive(Debug)]
+struct RepoMergeCommandOutcome {
+    outcome: MergeOutcome,
+    branch: Option<String>,
+    paths: Vec<JsonPathAction>,
+    row_auto_merge: Option<RowAutoMergeResult>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct JsonMergeAbortCommandOutcome {
+    operation: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_branch: Option<String>,
+    head: String,
+    branch: Option<String>,
+    target: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    paths: Vec<JsonPathAction>,
+}
+
+#[derive(Debug)]
+struct RepoMergeAbortCommandOutcome {
+    target: String,
+    branch: Option<String>,
+    paths: Vec<JsonPathAction>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct JsonMergeContinueCommandOutcome {
+    operation: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_branch: Option<String>,
+    head: String,
+    branch: Option<String>,
+    commit: JsonCommitSummary,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    paths: Vec<crate::json::JsonRepoPathDiff>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct JsonCommitOutcome {
+    operation: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_branch: Option<String>,
+    head: String,
+    branch: Option<String>,
+    commit: JsonCommitSummary,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    paths: Vec<crate::json::JsonRepoPathDiff>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct JsonCommitSummary {
+    id: String,
+    message: String,
+    parents: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct RepoCommitOutcome {
+    commit: CommitObject,
+    branch: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct JsonRepoStatus {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<&'static str>,
     #[serde(flatten)]
     status: RepoStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     conflict_analysis: Option<JsonRowMergeAnalysis>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StatusSpec {
+    pub(crate) kind: Option<RepoTrackedPathKind>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct JsonLsFilesOutcome<T> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_branch: Option<String>,
+    stage: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    details: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    others: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<&'static str>,
+    paths: Vec<T>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LsFilesSpec {
+    pub(crate) stage: bool,
+    pub(crate) details: bool,
+    pub(crate) others: bool,
+    pub(crate) kind: Option<RepoTrackedPathKind>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct JsonInitOutcome {
+    operation: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_branch: Option<String>,
+    graft_dir: String,
+    worktree: String,
+    path: String,
+    kind: &'static str,
+    preserved_contents: bool,
+}
+
+#[derive(Debug, Clone)]
+struct RepoInitOutcome {
+    graft_dir: PathBuf,
+    worktree: PathBuf,
+    path: String,
+    preserved_contents: bool,
+    current_head: Option<String>,
+    current_branch: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct JsonAddOutcome {
+    operation: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<&'static str>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    paths: Vec<crate::json::JsonRepoPathDiff>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct JsonRemoveOutcome {
+    operation: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_branch: Option<String>,
+    cached: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    paths: Vec<JsonPathAction>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct JsonSwitchOutcome {
+    operation: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    head: Option<String>,
+    branch: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    paths: Vec<JsonPathAction>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct JsonBranchMutationOutcome {
+    operation: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_branch: Option<String>,
+    branch: BranchInfo,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    old_branch: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct JsonTagMutationOutcome {
+    operation: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_branch: Option<String>,
+    tag: TagInfo,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct JsonTagListOutcome {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_branch: Option<String>,
+    tags: Vec<TagInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct JsonRemoteInfo {
+    name: String,
+    config: RemoteConfig,
+    url: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct JsonRemoteList {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_branch: Option<String>,
+    remotes: Vec<JsonRemoteInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct JsonRemoteMutationOutcome {
+    operation: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_branch: Option<String>,
+    remote: JsonRemoteInfo,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    old_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct JsonCloneOutcome {
+    operation: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_branch: Option<String>,
+    remote: JsonRemoteInfo,
+    branch: String,
+    head: String,
+    commits: usize,
+    graft_dir: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    paths: Vec<JsonPathAction>,
+}
+
+#[derive(Debug)]
+struct RepoCloneOutcome {
+    remote: RemoteInfo,
+    current_head: Option<String>,
+    current_branch: Option<String>,
+    branch: String,
+    head: String,
+    commits: usize,
+    graft_dir: PathBuf,
+    paths: Vec<JsonPathAction>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct JsonRemotePruneCommandOutcome {
+    operation: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_branch: Option<String>,
+    #[serde(flatten)]
+    outcome: RemotePruneOutcome,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct JsonConfigEntryOutcome {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_branch: Option<String>,
+    #[serde(flatten)]
+    entry: RepoConfigEntry,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct JsonConfigListOutcome {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_branch: Option<String>,
+    entries: Vec<RepoConfigEntry>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct JsonConfigMutationOutcome {
+    operation: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_branch: Option<String>,
+    entry: RepoConfigEntry,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct JsonLsRemoteOutcome {
+    operation: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_branch: Option<String>,
+    remote: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default_branch: Option<String>,
+    refs: Vec<RemoteBranchRef>,
+}
+
+#[derive(Debug)]
+struct RepoSwitchOutcome {
+    branch: String,
+    target: Option<String>,
+    paths: Vec<JsonPathAction>,
+}
+
+#[derive(Debug)]
+struct RepoSwitchCreateOutcome {
+    branch: BranchInfo,
+    paths: Vec<JsonPathAction>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct JsonCheckoutOutcome {
     operation: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_branch: Option<String>,
+    head: Option<String>,
+    branch: Option<String>,
     target: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    path_details: Vec<JsonPathDetail>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct JsonPathDetail {
+    path: String,
+    kind: &'static str,
+    storage: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct JsonRestoreOutcome {
+    operation: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
+    staged: bool,
+    all: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    path_details: Vec<JsonPathDetail>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct JsonExportOutcome {
+    operation: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
+    path: String,
+    kind: &'static str,
+    output: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
 struct JsonResetCommandOutcome {
     operation: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_branch: Option<String>,
+    head: String,
+    branch: Option<String>,
     #[serde(flatten)]
     outcome: ResetOutcome,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    paths: Vec<JsonPathAction>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct JsonPathAction {
+    path: String,
+    kind: &'static str,
+    storage: &'static str,
+    action: &'static str,
+}
+
+#[derive(Debug, Clone)]
+struct RepoResetCommandOutcome {
+    outcome: ResetOutcome,
+    branch: Option<String>,
+    paths: Vec<JsonPathAction>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -509,14 +962,32 @@ struct JsonSchemaColumnChange {
 #[derive(Debug, Clone, Serialize)]
 struct JsonConflictList {
     #[serde(skip_serializing_if = "Option::is_none")]
+    current_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     merge_head: Option<String>,
+    paths: Vec<JsonConflictPath>,
     conflicts: Vec<JsonConflictArtifact>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct JsonConflictPath {
+    path: String,
+    kind: &'static str,
+    storage: &'static str,
+    status: &'static str,
+    total: usize,
+    unresolved: usize,
+    resolved: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
 struct JsonConflictArtifact {
     id: String,
     path: String,
+    path_kind: &'static str,
+    storage: &'static str,
     kind: &'static str,
     reason: &'static str,
     status: &'static str,
@@ -561,9 +1032,22 @@ struct JsonConflictArtifact {
 #[derive(Debug, Clone, Serialize)]
 struct JsonResolveConflictOutcome {
     operation: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_branch: Option<String>,
     path: String,
+    path_kind: &'static str,
+    storage: &'static str,
     resolution: &'static str,
     remaining_conflicts: usize,
+}
+
+#[derive(Debug, Clone)]
+struct RepoResolveConflictOutcome {
+    path: String,
+    path_kind: RepoTrackedPathKind,
+    path_storage: RepoPathStorage,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -583,6 +1067,91 @@ struct JsonVolumeAudit {
     needs_hydrate: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     checksum: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct JsonRepoArtifactAudit {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_branch: Option<String>,
+    #[serde(flatten)]
+    audit: RepoArtifactAudit,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct JsonRepoArtifactRepair {
+    operation: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_branch: Option<String>,
+    #[serde(flatten)]
+    outcome: RepoArtifactRepairOutcome,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct JsonLargeFilePruneOutcome {
+    operation: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_branch: Option<String>,
+    #[serde(flatten)]
+    outcome: RepoLargeFilePruneOutcome,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct JsonLargeFileFetchOutcome {
+    operation: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_branch: Option<String>,
+    #[serde(flatten)]
+    outcome: RepoLargeFileFetchOutcome,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct JsonLargeFileStatusOutcome {
+    operation: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_branch: Option<String>,
+    #[serde(flatten)]
+    outcome: RepoLargeFileStatusOutcome,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct JsonRepoDiffOutcome<T> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<&'static str>,
+    #[serde(flatten)]
+    diff: T,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct JsonRepoShowOutcome {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_branch: Option<String>,
+    #[serde(flatten)]
+    commit: CommitObject,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct JsonRepoLogOutcome {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_branch: Option<String>,
+    commits: Vec<CommitObject>,
 }
 
 /// Helper to create pragma errors concisely
@@ -627,9 +1196,34 @@ pub enum DiffMode {
     Rows,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JsonLogMode {
+    LegacyArray,
+    WithStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JsonConfigListMode {
+    LegacyArray,
+    WithStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JsonTagsMode {
+    LegacyArray,
+    WithStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JsonFetchAsyncMode {
+    LegacyId,
+    WithStatus,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RepoDiffSpec {
     mode: DiffMode,
+    kind: Option<RepoTrackedPathKind>,
     target: RepoDiffTarget,
 }
 
@@ -653,6 +1247,42 @@ pub(crate) enum RepoDiffTarget {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RepoAddSpec {
+    path: Option<PathBuf>,
+    force: bool,
+    all: bool,
+    kind: Option<RepoTrackedPathKind>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RepoRemoveSpec {
+    path: Option<PathBuf>,
+    cached: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RepoAuditSpec {
+    repair: bool,
+    remote: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LargeFilePruneSpec {
+    dry_run: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LargeFileFetchSpec {
+    remote: Option<String>,
+    rev: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LargeFileStatusSpec {
+    rev: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RepoCheckoutSpec {
     Detach { rev: String, force: bool },
     Path { rev: String, path: String },
@@ -662,7 +1292,9 @@ pub(crate) enum RepoCheckoutSpec {
 pub(crate) struct RepoRestoreSpec {
     source: Option<String>,
     staged: bool,
-    path: PathBuf,
+    all: bool,
+    kind: Option<RepoTrackedPathKind>,
+    path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -710,6 +1342,12 @@ pub(crate) struct RepoResolveSpec {
     row: Option<RepoResolveRowSpec>,
 }
 
+enum RepoConflictSideState {
+    SqliteDatabase(CommitFileState),
+    Artifact(CommitArtifactState),
+    Deleted,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RepoResolveRowSpec {
     table: String,
@@ -732,8 +1370,8 @@ pub(crate) enum GraftPragma {
     /// `pragma graft_tags;`
     Tags,
 
-    /// `pragma graft_json_tags;`
-    JsonTags,
+    /// `pragma graft_json_tags [= "--with-status"];`
+    JsonTags { mode: JsonTagsMode },
 
     /// `pragma graft_debug_volume_tags;`
     VolumeTags,
@@ -757,17 +1395,23 @@ pub(crate) enum GraftPragma {
     /// `pragma graft_json_checkout = "[--force] rev [-- path]";`
     JsonRepoCheckout { spec: RepoCheckoutSpec },
 
-    /// `pragma graft_restore = "[--source rev] path";`
+    /// `pragma graft_restore = "[--source rev] path|--staged --all [--kind kind]";`
     Restore { spec: RepoRestoreSpec },
+
+    /// `pragma graft_json_restore = "[--source rev] path|--staged --all [--kind kind]";`
+    JsonRestore { spec: RepoRestoreSpec },
 
     /// `pragma graft_export = "[--source rev] --output output.db [-- path]";`
     Export { spec: RepoExportSpec },
 
+    /// `pragma graft_json_export = "[--source rev] --output output.db [-- path]";`
+    JsonExport { spec: RepoExportSpec },
+
     /// `pragma graft_debug_volume_info;`
     VolumeInfo,
 
-    /// `pragma graft_status;`
-    Status,
+    /// `pragma graft_status [= "[--kind kind]"];`
+    Status { spec: StatusSpec },
 
     /// `pragma graft_debug_volume_status;`
     VolumeStatus,
@@ -775,20 +1419,35 @@ pub(crate) enum GraftPragma {
     /// `pragma graft_init;`
     RepoInit,
 
+    /// `pragma graft_json_init;`
+    JsonRepoInit,
+
     /// `pragma graft_clone = "remote-uri [branch]";`
     RepoClone { spec: RepoCloneSpec },
 
-    /// `pragma graft_json_status;`
-    JsonStatus,
+    /// `pragma graft_json_clone = "remote-uri [branch]";`
+    JsonRepoClone { spec: RepoCloneSpec },
 
-    /// `pragma graft_add;`
-    Add { path: Option<PathBuf> },
+    /// `pragma graft_json_status [= "[--kind kind]"];`
+    JsonStatus { spec: StatusSpec },
 
-    /// `pragma graft_rm;`
-    Remove { path: Option<PathBuf> },
+    /// `pragma graft_add = "[--all|-A] [--kind kind]|[--force] [path]";`
+    Add { spec: RepoAddSpec },
+
+    /// `pragma graft_json_add = "[--all|-A] [--kind kind]|[--force] [path]";`
+    JsonAdd { spec: RepoAddSpec },
+
+    /// `pragma graft_rm = "[--cached] [path]";`
+    Remove { spec: RepoRemoveSpec },
+
+    /// `pragma graft_json_rm = "[--cached] [path]";`
+    JsonRemove { spec: RepoRemoveSpec },
 
     /// `pragma graft_commit = "message";`
     Commit { message: String },
+
+    /// `pragma graft_json_commit = "message";`
+    JsonCommit { message: String },
 
     /// `pragma graft_branch [= "-r|--remote|-a|--all"];`
     Branch { mode: BranchListMode },
@@ -802,11 +1461,27 @@ pub(crate) enum GraftPragma {
         start_point: Option<String>,
     },
 
+    /// `pragma graft_json_branch_create = "name [start-point]";`
+    JsonBranchCreate {
+        name: String,
+        start_point: Option<String>,
+    },
+
     /// `pragma graft_branch_delete = "[--force] name";`
     BranchDelete { name: String, force: bool },
 
+    /// `pragma graft_json_branch_delete = "[--force] name";`
+    JsonBranchDelete { name: String, force: bool },
+
     /// `pragma graft_branch_rename = "[--force] [old] new";`
     BranchRename {
+        old: Option<String>,
+        new: String,
+        force: bool,
+    },
+
+    /// `pragma graft_json_branch_rename = "[--force] [old] new";`
+    JsonBranchRename {
         old: Option<String>,
         new: String,
         force: bool,
@@ -819,8 +1494,18 @@ pub(crate) enum GraftPragma {
         remote_branch: String,
     },
 
+    /// `pragma graft_json_branch_upstream = "[branch] remote/branch";`
+    JsonBranchUpstream {
+        branch: Option<String>,
+        remote: String,
+        remote_branch: String,
+    },
+
     /// `pragma graft_branch_unset_upstream [= "branch"];`
     BranchUnsetUpstream { branch: Option<String> },
+
+    /// `pragma graft_json_branch_unset_upstream [= "branch"];`
+    JsonBranchUnsetUpstream { branch: Option<String> },
 
     /// `pragma graft_tag_create = "name [rev]";`
     /// `pragma graft_tag_create = "--annotated name [rev] -- message";`
@@ -830,11 +1515,25 @@ pub(crate) enum GraftPragma {
         message: Option<String>,
     },
 
+    /// `pragma graft_json_tag_create = "name [rev]";`
+    /// `pragma graft_json_tag_create = "--annotated name [rev] -- message";`
+    JsonTagCreate {
+        name: String,
+        target: Option<String>,
+        message: Option<String>,
+    },
+
     /// `pragma graft_tag_delete = "name";`
     TagDelete { name: String },
 
+    /// `pragma graft_json_tag_delete = "name";`
+    JsonTagDelete { name: String },
+
     /// `pragma graft_switch_branch = "[--force] name";`
     SwitchBranch { name: String, force: bool },
+
+    /// `pragma graft_json_switch_branch = "[--force] name";`
+    JsonSwitchBranch { name: String, force: bool },
 
     /// `pragma graft_switch_create = "[--force] name [start-point]";`
     SwitchCreate {
@@ -843,14 +1542,30 @@ pub(crate) enum GraftPragma {
         force: bool,
     },
 
+    /// `pragma graft_json_switch_create = "[--force] name [start-point]";`
+    JsonSwitchCreate {
+        name: String,
+        start_point: Option<String>,
+        force: bool,
+    },
+
     /// `pragma graft_merge = "rev";`
     Merge { rev: String },
+
+    /// `pragma graft_json_merge = "rev";`
+    JsonMerge { rev: String },
 
     /// `pragma graft_merge_abort;`
     MergeAbort,
 
+    /// `pragma graft_json_merge_abort;`
+    JsonMergeAbort,
+
     /// `pragma graft_merge_continue = "message";`
     MergeContinue { message: String },
+
+    /// `pragma graft_json_merge_continue = "message";`
+    JsonMergeContinue { message: String },
 
     /// `pragma graft_conflicts;`
     Conflicts,
@@ -867,26 +1582,50 @@ pub(crate) enum GraftPragma {
     /// `pragma graft_remote_add = "name remote-uri";`
     RemoteAdd { name: String, config: RemoteConfig },
 
+    /// `pragma graft_json_remote_add = "name remote-uri";`
+    JsonRemoteAdd { name: String, config: RemoteConfig },
+
     /// `pragma graft_remote_remove = "name";`
     RemoteRemove { name: String },
+
+    /// `pragma graft_json_remote_remove = "name";`
+    JsonRemoteRemove { name: String },
 
     /// `pragma graft_remote_rename = "old new";`
     RemoteRename { old: String, new: String },
 
+    /// `pragma graft_json_remote_rename = "old new";`
+    JsonRemoteRename { old: String, new: String },
+
     /// `pragma graft_remote_get_url = "name";`
     RemoteGetUrl { name: String },
+
+    /// `pragma graft_json_remote_get_url = "name";`
+    JsonRemoteGetUrl { name: String },
 
     /// `pragma graft_remote_set_url = "name remote-uri";`
     RemoteSetUrl { name: String, config: RemoteConfig },
 
+    /// `pragma graft_json_remote_set_url = "name remote-uri";`
+    JsonRemoteSetUrl { name: String, config: RemoteConfig },
+
     /// `pragma graft_remote_prune = "name";`
     RemotePrune { name: String },
+
+    /// `pragma graft_json_remote_prune = "name";`
+    JsonRemotePrune { name: String },
 
     /// `pragma graft_ls_remote = "name";`
     LsRemote { name: String },
 
+    /// `pragma graft_json_ls_remote = "name";`
+    JsonLsRemote { name: String },
+
     /// `pragma graft_remotes;`
     Remotes,
+
+    /// `pragma graft_json_remotes;`
+    JsonRemotes,
 
     /// `pragma graft_debug_volume_snapshot;`
     VolumeSnapshot,
@@ -921,10 +1660,14 @@ pub(crate) enum GraftPragma {
         branch: Option<String>,
         refspec: Option<String>,
         all: bool,
+        mode: JsonFetchAsyncMode,
     },
 
     /// `pragma graft_job_status = "job-id";`
     JobStatus { id: String },
+
+    /// `pragma graft_json_job_status = "job-id";`
+    JsonJobStatus { id: String },
 
     /// `pragma graft_job_result = "job-id";`
     JobResult { id: String },
@@ -981,6 +1724,69 @@ pub(crate) enum GraftPragma {
     /// `pragma graft_debug_volume_json_audit;`
     VolumeJsonAudit,
 
+    /// `pragma graft_audit [= "[--repair [remote]]"];`
+    RepoAudit { spec: RepoAuditSpec },
+
+    /// `pragma graft_json_audit [= "[--repair [remote]]"];`
+    JsonRepoAudit { spec: RepoAuditSpec },
+
+    /// `pragma graft_payload_fetch [= "[--remote remote] [rev]"];`
+    LargeFileFetch { spec: LargeFileFetchSpec },
+
+    /// `pragma graft_json_payload_fetch [= "[--remote remote] [rev]"];`
+    JsonLargeFileFetch {
+        spec: LargeFileFetchSpec,
+        operation: &'static str,
+    },
+
+    /// `pragma graft_payload_status [= "[rev]"];`
+    LargeFileStatus { spec: LargeFileStatusSpec },
+
+    /// `pragma graft_json_payload_status [= "[rev]"];`
+    JsonLargeFileStatus {
+        spec: LargeFileStatusSpec,
+        operation: &'static str,
+    },
+
+    /// `pragma graft_payload_prune [= "[--dry-run|--force]"];`
+    LargeFilePrune { spec: LargeFilePruneSpec },
+
+    /// `pragma graft_json_payload_prune [= "[--dry-run|--force]"];`
+    JsonLargeFilePrune {
+        spec: LargeFilePruneSpec,
+        operation: &'static str,
+    },
+
+    /// `pragma graft_ls_files [= "[--stage|--details|--others] [--kind kind]"];`
+    LsFiles { spec: LsFilesSpec },
+
+    /// `pragma graft_json_ls_files [= "[--stage|--details|--others] [--kind kind]"];`
+    JsonLsFiles { spec: LsFilesSpec },
+
+    /// `pragma graft_config_get = "key";`
+    ConfigGet { key: String },
+
+    /// `pragma graft_json_config_get = "key";`
+    JsonConfigGet { key: String },
+
+    /// `pragma graft_config_list;`
+    ConfigList,
+
+    /// `pragma graft_json_config_list [= "--with-status"];`
+    JsonConfigList { mode: JsonConfigListMode },
+
+    /// `pragma graft_config_set = "key -- value";`
+    ConfigSet { key: String, value: String },
+
+    /// `pragma graft_json_config_set = "key -- value";`
+    JsonConfigSet { key: String, value: String },
+
+    /// `pragma graft_config_unset = "key";`
+    ConfigUnset { key: String },
+
+    /// `pragma graft_json_config_unset = "key";`
+    JsonConfigUnset { key: String },
+
     /// `pragma graft_debug_volume_hydrate;`
     VolumeHydrate,
 
@@ -1036,7 +1842,7 @@ pub(crate) enum GraftPragma {
     /// mode: omitted=default (page + table level), "rows"=row-level detailed comparison
     VolumeDiff { from: LSN, to: LSN, mode: DiffMode },
 
-    /// `pragma graft_diff = "[--staged] [rev] [rev] [-- path]";`
+    /// `pragma graft_diff = "[--rows] [--kind kind] [--staged] [rev] [rev] [-- path]";`
     /// Compare repository commits by revision syntax
     RepoDiff { spec: RepoDiffSpec },
 
@@ -1045,15 +1851,15 @@ pub(crate) enum GraftPragma {
     Show { target: String },
 
     // JSON output variants (non-breaking additions)
-    /// `pragma graft_json_log;`
-    /// Repository commit history as JSON array
-    JsonLog,
+    /// `pragma graft_json_log [= "--with-status"];`
+    /// Repository commit history as JSON array, or app-facing JSON object with status
+    JsonLog { mode: JsonLogMode },
 
     /// `pragma graft_debug_volume_json_diff = "from_lsn,to_lsn[,mode]";`
     /// Legacy Volume diff as JSON. mode: omitted=summary, "rows"=row-level detail
     VolumeJsonDiff { from: LSN, to: LSN, mode: DiffMode },
 
-    /// `pragma graft_json_diff = "[--staged] [rev] [rev] [-- path]";`
+    /// `pragma graft_json_diff = "[--rows] [--kind kind] [--staged] [rev] [rev] [-- path]";`
     /// Repository diff as JSON
     JsonRepoDiff { spec: RepoDiffSpec },
 
@@ -1102,7 +1908,7 @@ impl TryFrom<&Pragma<'_>> for GraftPragma {
                 "debug_volume_list" => Ok(GraftPragma::VolumeList),
                 "debug_volume_json_list" => Ok(GraftPragma::VolumeJsonList),
                 "tags" => Ok(GraftPragma::Tags),
-                "json_tags" => Ok(GraftPragma::JsonTags),
+                "json_tags" => Ok(GraftPragma::JsonTags { mode: parse_json_tags_arg(p.arg)? }),
                 "debug_volume_tags" => Ok(GraftPragma::VolumeTags),
                 "debug_volume_clone" => {
                     let remote = p.arg.map(parse_or_fail).transpose()?;
@@ -1124,10 +1930,20 @@ impl TryFrom<&Pragma<'_>> for GraftPragma {
                     let spec = parse_repo_restore_arg(arg)?;
                     Ok(GraftPragma::Restore { spec })
                 }
+                "json_restore" => {
+                    let arg = p.require_arg()?;
+                    let spec = parse_repo_restore_arg(arg)?;
+                    Ok(GraftPragma::JsonRestore { spec })
+                }
                 "export" => {
                     let arg = p.require_arg()?;
                     let spec = parse_repo_export_arg(arg)?;
                     Ok(GraftPragma::Export { spec })
+                }
+                "json_export" => {
+                    let arg = p.require_arg()?;
+                    let spec = parse_repo_export_arg(arg)?;
+                    Ok(GraftPragma::JsonExport { spec })
                 }
                 "debug_volume_new" => Ok(GraftPragma::VolumeSwitch {
                     vid: VolumeId::random(),
@@ -1148,17 +1964,27 @@ impl TryFrom<&Pragma<'_>> for GraftPragma {
                     })
                 }
                 "debug_volume_info" => Ok(GraftPragma::VolumeInfo),
-                "status" => Ok(GraftPragma::Status),
+                "status" => Ok(GraftPragma::Status { spec: parse_status_arg(p.arg)? }),
                 "debug_volume_status" => Ok(GraftPragma::VolumeStatus),
                 "init" => Ok(GraftPragma::RepoInit),
+                "json_init" => Ok(GraftPragma::JsonRepoInit),
                 "clone" => {
                     let spec = parse_repo_clone_arg(p.require_arg()?)?;
                     Ok(GraftPragma::RepoClone { spec })
                 }
-                "json_status" => Ok(GraftPragma::JsonStatus),
-                "add" => Ok(GraftPragma::Add { path: p.arg.map(PathBuf::from) }),
-                "rm" => Ok(GraftPragma::Remove { path: p.arg.map(PathBuf::from) }),
+                "json_clone" => {
+                    let spec = parse_repo_clone_arg(p.require_arg()?)?;
+                    Ok(GraftPragma::JsonRepoClone { spec })
+                }
+                "json_status" => Ok(GraftPragma::JsonStatus { spec: parse_status_arg(p.arg)? }),
+                "add" => Ok(GraftPragma::Add { spec: parse_repo_add_arg(p.arg)? }),
+                "json_add" => Ok(GraftPragma::JsonAdd { spec: parse_repo_add_arg(p.arg)? }),
+                "rm" => Ok(GraftPragma::Remove { spec: parse_repo_remove_arg(p.arg)? }),
+                "json_rm" => Ok(GraftPragma::JsonRemove { spec: parse_repo_remove_arg(p.arg)? }),
                 "commit" => Ok(GraftPragma::Commit { message: p.require_arg()?.to_string() }),
+                "json_commit" => {
+                    Ok(GraftPragma::JsonCommit { message: p.require_arg()?.to_string() })
+                }
                 "branch" => Ok(GraftPragma::Branch { mode: parse_branch_list_mode(p.arg)? }),
                 "json_branch" => {
                     Ok(GraftPragma::JsonBranch { mode: parse_branch_list_mode(p.arg)? })
@@ -1167,39 +1993,79 @@ impl TryFrom<&Pragma<'_>> for GraftPragma {
                     let (name, start_point) = parse_branch_create_arg(p.require_arg()?)?;
                     Ok(GraftPragma::BranchCreate { name, start_point })
                 }
+                "json_branch_create" => {
+                    let (name, start_point) = parse_branch_create_arg(p.require_arg()?)?;
+                    Ok(GraftPragma::JsonBranchCreate { name, start_point })
+                }
                 "branch_delete" => {
                     let (name, force) = parse_branch_delete_arg(p.require_arg()?)?;
                     Ok(GraftPragma::BranchDelete { name, force })
                 }
+                "json_branch_delete" => {
+                    let (name, force) = parse_branch_delete_arg(p.require_arg()?)?;
+                    Ok(GraftPragma::JsonBranchDelete { name, force })
+                }
                 "branch_rename" => {
                     let (old, new, force) = parse_branch_rename_arg(p.require_arg()?)?;
                     Ok(GraftPragma::BranchRename { old, new, force })
+                }
+                "json_branch_rename" => {
+                    let (old, new, force) = parse_branch_rename_arg(p.require_arg()?)?;
+                    Ok(GraftPragma::JsonBranchRename { old, new, force })
                 }
                 "branch_upstream" => {
                     let (branch, remote, remote_branch) =
                         parse_branch_upstream_arg(p.require_arg()?)?;
                     Ok(GraftPragma::BranchUpstream { branch, remote, remote_branch })
                 }
+                "json_branch_upstream" => {
+                    let (branch, remote, remote_branch) =
+                        parse_branch_upstream_arg(p.require_arg()?)?;
+                    Ok(GraftPragma::JsonBranchUpstream { branch, remote, remote_branch })
+                }
                 "branch_unset_upstream" => {
                     Ok(GraftPragma::BranchUnsetUpstream { branch: p.arg.map(str::to_string) })
+                }
+                "json_branch_unset_upstream" => {
+                    Ok(GraftPragma::JsonBranchUnsetUpstream { branch: p.arg.map(str::to_string) })
                 }
                 "tag_create" => {
                     let (name, target, message) = parse_tag_create_arg(p.require_arg()?)?;
                     Ok(GraftPragma::TagCreate { name, target, message })
                 }
+                "json_tag_create" => {
+                    let (name, target, message) = parse_tag_create_arg(p.require_arg()?)?;
+                    Ok(GraftPragma::JsonTagCreate { name, target, message })
+                }
                 "tag_delete" => Ok(GraftPragma::TagDelete { name: p.require_arg()?.to_string() }),
+                "json_tag_delete" => {
+                    Ok(GraftPragma::JsonTagDelete { name: p.require_arg()?.to_string() })
+                }
                 "switch_branch" => {
                     let (name, force) = parse_switch_branch_arg(p.require_arg()?)?;
                     Ok(GraftPragma::SwitchBranch { name, force })
+                }
+                "json_switch_branch" => {
+                    let (name, force) = parse_switch_branch_arg(p.require_arg()?)?;
+                    Ok(GraftPragma::JsonSwitchBranch { name, force })
                 }
                 "switch_create" => {
                     let (name, start_point, force) = parse_switch_create_arg(p.require_arg()?)?;
                     Ok(GraftPragma::SwitchCreate { name, start_point, force })
                 }
+                "json_switch_create" => {
+                    let (name, start_point, force) = parse_switch_create_arg(p.require_arg()?)?;
+                    Ok(GraftPragma::JsonSwitchCreate { name, start_point, force })
+                }
                 "merge" => Ok(GraftPragma::Merge { rev: p.require_arg()?.to_string() }),
+                "json_merge" => Ok(GraftPragma::JsonMerge { rev: p.require_arg()?.to_string() }),
                 "merge_abort" => Ok(GraftPragma::MergeAbort),
+                "json_merge_abort" => Ok(GraftPragma::JsonMergeAbort),
                 "merge_continue" => {
                     Ok(GraftPragma::MergeContinue { message: p.require_arg()?.to_string() })
+                }
+                "json_merge_continue" => {
+                    Ok(GraftPragma::JsonMergeContinue { message: p.require_arg()?.to_string() })
                 }
                 "conflicts" => Ok(GraftPragma::Conflicts),
                 "json_conflicts" => Ok(GraftPragma::JsonConflicts),
@@ -1213,25 +2079,50 @@ impl TryFrom<&Pragma<'_>> for GraftPragma {
                     let (name, config) = parse_remote_add(p.require_arg()?)?;
                     Ok(GraftPragma::RemoteAdd { name, config })
                 }
+                "json_remote_add" => {
+                    let (name, config) = parse_remote_add(p.require_arg()?)?;
+                    Ok(GraftPragma::JsonRemoteAdd { name, config })
+                }
                 "remote_remove" => {
                     Ok(GraftPragma::RemoteRemove { name: p.require_arg()?.to_string() })
+                }
+                "json_remote_remove" => {
+                    Ok(GraftPragma::JsonRemoteRemove { name: p.require_arg()?.to_string() })
                 }
                 "remote_rename" => {
                     let (old, new) = parse_remote_rename(p.require_arg()?)?;
                     Ok(GraftPragma::RemoteRename { old, new })
                 }
+                "json_remote_rename" => {
+                    let (old, new) = parse_remote_rename(p.require_arg()?)?;
+                    Ok(GraftPragma::JsonRemoteRename { old, new })
+                }
                 "remote_get_url" => {
                     Ok(GraftPragma::RemoteGetUrl { name: p.require_arg()?.to_string() })
+                }
+                "json_remote_get_url" => {
+                    Ok(GraftPragma::JsonRemoteGetUrl { name: p.require_arg()?.to_string() })
                 }
                 "remote_set_url" => {
                     let (name, config) = parse_remote_add(p.require_arg()?)?;
                     Ok(GraftPragma::RemoteSetUrl { name, config })
                 }
+                "json_remote_set_url" => {
+                    let (name, config) = parse_remote_add(p.require_arg()?)?;
+                    Ok(GraftPragma::JsonRemoteSetUrl { name, config })
+                }
                 "remote_prune" => {
                     Ok(GraftPragma::RemotePrune { name: p.require_arg()?.to_string() })
                 }
+                "json_remote_prune" => {
+                    Ok(GraftPragma::JsonRemotePrune { name: p.require_arg()?.to_string() })
+                }
                 "ls_remote" => Ok(GraftPragma::LsRemote { name: p.require_arg()?.to_string() }),
+                "json_ls_remote" => {
+                    Ok(GraftPragma::JsonLsRemote { name: p.require_arg()?.to_string() })
+                }
                 "remotes" => Ok(GraftPragma::Remotes),
+                "json_remotes" => Ok(GraftPragma::JsonRemotes),
                 "debug_volume_snapshot" => Ok(GraftPragma::VolumeSnapshot),
                 "fetch" => {
                     let arg = parse_remote_branch_arg(p.arg)?;
@@ -1258,14 +2149,17 @@ impl TryFrom<&Pragma<'_>> for GraftPragma {
                     Ok(GraftPragma::FetchAsync { remote, branch, refspec, all })
                 }
                 "json_fetch_async" => {
-                    let arg = parse_remote_branch_arg(p.arg)?;
+                    let (arg, mode) = parse_json_fetch_async_arg(p.arg)?;
                     if arg.force {
                         return Err(pragma_fail("json_fetch_async does not support --force"));
                     }
                     let RemoteBranchArg { remote, branch, refspec, all, .. } = arg;
-                    Ok(GraftPragma::JsonFetchAsync { remote, branch, refspec, all })
+                    Ok(GraftPragma::JsonFetchAsync { remote, branch, refspec, all, mode })
                 }
                 "job_status" => Ok(GraftPragma::JobStatus { id: p.require_arg()?.to_string() }),
+                "json_job_status" => {
+                    Ok(GraftPragma::JsonJobStatus { id: p.require_arg()?.to_string() })
+                }
                 "job_result" => Ok(GraftPragma::JobResult { id: p.require_arg()?.to_string() }),
                 "json_job_result" => {
                     Ok(GraftPragma::JsonJobResult { id: p.require_arg()?.to_string() })
@@ -1301,6 +2195,69 @@ impl TryFrom<&Pragma<'_>> for GraftPragma {
                 "debug_volume_push" => Ok(GraftPragma::VolumePush),
                 "debug_volume_audit" => Ok(GraftPragma::VolumeAudit),
                 "debug_volume_json_audit" => Ok(GraftPragma::VolumeJsonAudit),
+                "audit" => Ok(GraftPragma::RepoAudit { spec: parse_repo_audit_arg(p.arg)? }),
+                "json_audit" => {
+                    Ok(GraftPragma::JsonRepoAudit { spec: parse_repo_audit_arg(p.arg)? })
+                }
+                "lfs_fetch" | "payload_fetch" => {
+                    Ok(GraftPragma::LargeFileFetch { spec: parse_lfs_fetch_arg(p.arg)? })
+                }
+                "json_lfs_fetch" => Ok(GraftPragma::JsonLargeFileFetch {
+                    spec: parse_lfs_fetch_arg(p.arg)?,
+                    operation: "lfs_fetch",
+                }),
+                "json_payload_fetch" => Ok(GraftPragma::JsonLargeFileFetch {
+                    spec: parse_lfs_fetch_arg(p.arg)?,
+                    operation: "payload_fetch",
+                }),
+                "lfs_status" | "payload_status" => {
+                    Ok(GraftPragma::LargeFileStatus { spec: parse_lfs_status_arg(p.arg)? })
+                }
+                "json_lfs_status" => Ok(GraftPragma::JsonLargeFileStatus {
+                    spec: parse_lfs_status_arg(p.arg)?,
+                    operation: "lfs_status",
+                }),
+                "json_payload_status" => Ok(GraftPragma::JsonLargeFileStatus {
+                    spec: parse_lfs_status_arg(p.arg)?,
+                    operation: "payload_status",
+                }),
+                "lfs_prune" | "payload_prune" => {
+                    Ok(GraftPragma::LargeFilePrune { spec: parse_lfs_prune_arg(p.arg)? })
+                }
+                "json_lfs_prune" => Ok(GraftPragma::JsonLargeFilePrune {
+                    spec: parse_lfs_prune_arg(p.arg)?,
+                    operation: "lfs_prune",
+                }),
+                "json_payload_prune" => Ok(GraftPragma::JsonLargeFilePrune {
+                    spec: parse_lfs_prune_arg(p.arg)?,
+                    operation: "payload_prune",
+                }),
+                "ls_files" => Ok(GraftPragma::LsFiles { spec: parse_ls_files_arg(p.arg)? }),
+                "json_ls_files" => {
+                    Ok(GraftPragma::JsonLsFiles { spec: parse_ls_files_arg(p.arg)? })
+                }
+                "config_get" => Ok(GraftPragma::ConfigGet { key: p.require_arg()?.to_string() }),
+                "json_config_get" => {
+                    Ok(GraftPragma::JsonConfigGet { key: p.require_arg()?.to_string() })
+                }
+                "config_list" => Ok(GraftPragma::ConfigList),
+                "json_config_list" => {
+                    Ok(GraftPragma::JsonConfigList { mode: parse_json_config_list_arg(p.arg)? })
+                }
+                "config_set" => {
+                    let (key, value) = parse_repo_config_set_arg(p.require_arg()?)?;
+                    Ok(GraftPragma::ConfigSet { key, value })
+                }
+                "json_config_set" => {
+                    let (key, value) = parse_repo_config_set_arg(p.require_arg()?)?;
+                    Ok(GraftPragma::JsonConfigSet { key, value })
+                }
+                "config_unset" => {
+                    Ok(GraftPragma::ConfigUnset { key: p.require_arg()?.to_string() })
+                }
+                "json_config_unset" => {
+                    Ok(GraftPragma::JsonConfigUnset { key: p.require_arg()?.to_string() })
+                }
                 "debug_volume_hydrate" => Ok(GraftPragma::VolumeHydrate),
                 "version" => Ok(GraftPragma::Version),
                 "debug_volume_import" => {
@@ -1346,7 +2303,7 @@ impl TryFrom<&Pragma<'_>> for GraftPragma {
                     Ok(GraftPragma::VolumeDiff { from, to, mode })
                 }
                 "show" => Ok(GraftPragma::Show { target: p.require_arg()?.to_string() }),
-                "json_log" => Ok(GraftPragma::JsonLog),
+                "json_log" => Ok(GraftPragma::JsonLog { mode: parse_json_log_arg(p.arg)? }),
                 "json_diff" => {
                     let spec = parse_repo_diff_arg(p.arg)?;
                     Ok(GraftPragma::JsonRepoDiff { spec })
@@ -1389,9 +2346,20 @@ impl GraftPragma {
                 let repo = repo_for_file(file)?;
                 Ok(Some(format_repo_tags(&repo.tags()?)?))
             }
-            GraftPragma::JsonTags => {
+            GraftPragma::JsonTags { mode } => {
                 let repo = repo_for_file(file)?;
-                Ok(Some(to_json(&repo.tags()?)?))
+                let tags = repo.tags()?;
+                match mode {
+                    JsonTagsMode::LegacyArray => Ok(Some(to_json(&tags)?)),
+                    JsonTagsMode::WithStatus => {
+                        let (current_head, current_branch) = repo_head_and_branch(&repo)?;
+                        Ok(Some(to_json(&JsonTagListOutcome {
+                            current_head,
+                            current_branch,
+                            tags,
+                        })?))
+                    }
+                }
             }
             GraftPragma::VolumeTags => Ok(Some(format_tags(&runtime, file)?)),
 
@@ -1447,8 +2415,16 @@ impl GraftPragma {
                     return pragma_err!("cannot restore while there is an open transaction");
                 }
                 let repo = repo_for_file(file)?;
-                let restored = restore_repo_path(&runtime, file, &repo, &spec)?;
-                Ok(Some(format!("Restored {restored}")))
+                let outcome = restore_repo_path(&runtime, file, &repo, &spec)?;
+                Ok(Some(format_restore_outcome(&outcome)))
+            }
+            GraftPragma::JsonRestore { spec } => {
+                if !file.is_idle() {
+                    return pragma_err!("cannot restore while there is an open transaction");
+                }
+                let repo = repo_for_file(file)?;
+                let outcome = restore_repo_path(&runtime, file, &repo, &spec)?;
+                Ok(Some(to_json(&outcome)?))
             }
 
             GraftPragma::Export { spec } => {
@@ -1461,6 +2437,23 @@ impl GraftPragma {
                     "Exported {exported} to {}",
                     spec.output.display()
                 )))
+            }
+            GraftPragma::JsonExport { spec } => {
+                if !file.is_idle() {
+                    return pragma_err!("cannot export while there is an open transaction");
+                }
+                let repo = repo_for_file(file)?;
+                let exported = export_repo_path(&runtime, file, &repo, &spec)?;
+                let (current_head, current_branch) = repo_head_and_branch(&repo)?;
+                Ok(Some(to_json(&JsonExportOutcome {
+                    operation: "export",
+                    current_head,
+                    current_branch,
+                    source: spec.source,
+                    path: exported,
+                    kind: repo_tracked_path_kind_json_label(RepoTrackedPathKind::SqliteDatabase),
+                    output: spec.output.display().to_string(),
+                })?))
             }
 
             GraftPragma::VolumeSwitch { vid, local, remote } => {
@@ -1478,146 +2471,129 @@ impl GraftPragma {
             }
 
             GraftPragma::VolumeInfo => Ok(Some(format_volume_info(&runtime, file)?)),
-            GraftPragma::Status => {
+            GraftPragma::Status { spec } => {
                 let repo = repo_for_file(file)?;
                 let status = repo_status_for_file(&runtime, file, &repo)?;
+                let status = filter_repo_status_by_kind(status, spec.kind);
                 Ok(Some(format_repo_status(&status)?))
             }
             GraftPragma::VolumeStatus => Ok(Some(format_volume_status(&runtime, file)?)),
 
             GraftPragma::RepoInit => {
-                if !file.is_idle() {
-                    return pragma_err!(
-                        "cannot initialize a repository while there is an open transaction"
-                    );
-                }
-                let repo = Repository::init_for_file(&file.tag)?;
-                let preserved_contents = file.attach_repo_preserving_contents(repo.clone())?;
-                if preserved_contents {
-                    repo.mark_dirty_path(&file.tag)?;
-                }
-                Ok(Some(format!(
-                    "Initialized empty Graft repository in {}",
-                    repo.graft_dir().display()
-                )))
+                let outcome = run_repo_init(file)?;
+                Ok(Some(format_repo_init_outcome(&outcome)))
+            }
+            GraftPragma::JsonRepoInit => {
+                let outcome = run_repo_init(file)?;
+                Ok(Some(to_json(&JsonInitOutcome {
+                    operation: "init",
+                    current_head: outcome.current_head,
+                    current_branch: outcome.current_branch,
+                    graft_dir: outcome.graft_dir.display().to_string(),
+                    worktree: outcome.worktree.display().to_string(),
+                    path: outcome.path,
+                    kind: repo_tracked_path_kind_json_label(RepoTrackedPathKind::SqliteDatabase),
+                    preserved_contents: outcome.preserved_contents,
+                })?))
             }
 
             GraftPragma::RepoClone { spec } => {
-                if !file.is_idle() {
-                    return pragma_err!("cannot clone while there is an open transaction");
-                }
-                if file.repo.is_some() || Repository::discover_for_file(&file.tag).is_ok() {
-                    return pragma_err!("cannot clone into an existing .graft repository");
-                }
-
-                let repo = Repository::init_for_file(&file.tag)?;
-                let graft_dir = repo.graft_dir().to_path_buf();
-                let mut attached = false;
-                let result = (|| {
-                    repo.remote_add("origin", spec.config)?;
-                    let branch = match spec.branch {
-                        Some(branch) => branch,
-                        None => repo
-                            .remote_default_branch("origin")?
-                            .unwrap_or(repo.default_branch()?),
-                    };
-                    let fetch = repo.fetch("origin", &branch)?;
-                    repo.branch_create(&branch, Some(&format!("refs/remotes/origin/{branch}")))?;
-                    repo.set_branch_upstream(&branch, "origin", &branch)?;
-                    let plan = repo.plan_switch_branch(&branch)?;
-                    file.attach_repo(repo.clone())?;
-                    attached = true;
-                    let runtime = file.runtime().clone();
-                    let remote = Arc::new(repo.remote_store("origin")?);
-                    let plan = prepare_repo_checkout_plan(&runtime, &plan, Some(remote.clone()))?;
-                    let previous_files = BTreeMap::new();
-                    repo.apply_switch_branch_plan(&branch, &plan)?;
-                    checkout_repo_plan(
-                        &runtime,
-                        file,
-                        &repo,
-                        &plan,
-                        &previous_files,
-                        Some(remote),
-                    )?;
-                    Ok(Some(format!(
-                        "Cloned origin/{} at {} into {}",
-                        fetch.branch,
-                        &fetch.head[..fetch.head.len().min(12)],
-                        repo.graft_dir().display()
-                    )))
-                })();
-                if result.is_err() && !attached {
-                    let _ = std::fs::remove_dir_all(graft_dir);
-                }
-                result
+                let outcome = run_repo_clone(file, spec)?;
+                Ok(Some(format!(
+                    "Cloned origin/{} at {} into {}",
+                    outcome.branch,
+                    &outcome.head[..outcome.head.len().min(12)],
+                    outcome.graft_dir.display()
+                )))
+            }
+            GraftPragma::JsonRepoClone { spec } => {
+                let outcome = run_repo_clone(file, spec)?;
+                Ok(Some(to_json(&JsonCloneOutcome {
+                    operation: "clone",
+                    current_head: outcome.current_head,
+                    current_branch: outcome.current_branch,
+                    remote: json_remote_info(outcome.remote),
+                    branch: outcome.branch,
+                    head: outcome.head,
+                    commits: outcome.commits,
+                    graft_dir: outcome.graft_dir.display().to_string(),
+                    paths: outcome.paths,
+                })?))
             }
 
-            GraftPragma::JsonStatus => {
+            GraftPragma::JsonStatus { spec } => {
                 let repo = repo_for_file(file)?;
                 let status = repo_status_for_file(&runtime, file, &repo)?;
+                let status = filter_repo_status_by_kind(status, spec.kind);
+                let kind = spec.kind.map(repo_tracked_path_kind_json_label);
+                let current_head = status.head_target.clone();
+                let current_branch = repo.current_branch()?;
                 let conflict_analysis =
                     current_file_status_row_merge_analysis_lossy(&runtime, file, &repo, None);
-                Ok(Some(
-                    serde_json::to_string(&JsonRepoStatus { status, conflict_analysis })
-                        .map_err(|e| ErrCtx::PragmaErr(format!("JSON error: {e}").into()))?,
-                ))
+                Ok(Some(to_json(&JsonRepoStatus {
+                    current_head,
+                    current_branch,
+                    kind,
+                    status,
+                    conflict_analysis,
+                })?))
             }
 
-            GraftPragma::Add { path } => {
-                if !file.is_idle() {
-                    return pragma_err!("cannot add while there is an open transaction");
-                }
+            GraftPragma::Add { spec } => {
+                let entries = run_repo_add(&runtime, file, &spec)?;
+                Ok(Some(format_added_entries(&entries)))
+            }
+            GraftPragma::JsonAdd { spec } => {
+                let entries = run_repo_add(&runtime, file, &spec)?;
                 let repo = repo_for_file(file)?;
-                let entry = if let Some(path) = path.as_deref() {
-                    let (key, physical_path) = repo_physical_path_arg(&repo, path)?;
-                    if key == repo.file_key(&file.tag)? {
-                        let state = current_repo_file_state(&runtime, file)?;
-                        repo.stage_file_state_path(&file.tag, state)?
-                    } else {
-                        stage_physical_sqlite_file(&runtime, &repo, &key, &physical_path)?
-                    }
-                } else {
-                    let state = current_repo_file_state(&runtime, file)?;
-                    repo.stage_file_state_path(&file.tag, state)?
-                };
-                Ok(Some(format!("Added {}", entry.path)))
+                let (current_head, current_branch) = repo_head_and_branch(&repo)?;
+                let kind = spec.kind.map(repo_tracked_path_kind_json_label);
+                Ok(Some(to_json(&JsonAddOutcome {
+                    operation: "add",
+                    current_head,
+                    current_branch,
+                    kind,
+                    paths: json_staged_entry_paths(&repo, &entries)?,
+                })?))
             }
 
-            GraftPragma::Remove { path } => {
-                if !file.is_idle() {
-                    return pragma_err!("cannot remove while there is an open transaction");
-                }
+            GraftPragma::Remove { spec } => {
+                let paths = run_repo_remove(&runtime, file, &spec)?;
+                Ok(Some(format_removed_paths(&paths)))
+            }
+            GraftPragma::JsonRemove { spec } => {
+                let paths = run_repo_remove(&runtime, file, &spec)?;
                 let repo = repo_for_file(file)?;
-                let current_key = repo.file_key(&file.tag)?;
-                let entry = if let Some(path) = path.as_deref() {
-                    let (key, physical_path) = repo_physical_path_arg(&repo, path)?;
-                    if key == current_key {
-                        let entry = repo.stage_file_removal(&file.tag)?;
-                        let volume = runtime.volume_open(None, None, None)?;
-                        file.switch_volume(&volume.vid)?;
-                        entry
-                    } else {
-                        remove_physical_sqlite_file(&repo, &key, &physical_path)?;
-                        repo.stage_file_removal(&physical_path)?
-                    }
-                } else {
-                    let entry = repo.stage_file_removal(&file.tag)?;
-                    let volume = runtime.volume_open(None, None, None)?;
-                    file.switch_volume(&volume.vid)?;
-                    entry
-                };
-                Ok(Some(format!("Removed {}", entry.path)))
+                let (current_head, current_branch) = repo_head_and_branch(&repo)?;
+                Ok(Some(to_json(&JsonRemoveOutcome {
+                    operation: "rm",
+                    current_head,
+                    current_branch,
+                    cached: spec.cached,
+                    paths,
+                })?))
             }
 
             GraftPragma::Commit { message } => {
-                if !file.is_idle() {
-                    return pragma_err!("cannot commit while there is an open transaction");
-                }
-                let repo = repo_for_file(file)?;
-                let tables = staged_commit_table_summary(&runtime, &repo)?;
-                let commit = repo.commit_staged_with_table_summary(message, tables)?;
+                let outcome = run_repo_commit(&runtime, file, message)?;
+                let commit = outcome.commit;
                 Ok(Some(format!("[{}] {}", &commit.id[..12], commit.message)))
+            }
+            GraftPragma::JsonCommit { message } => {
+                let outcome = run_repo_commit(&runtime, file, message)?;
+                let head = outcome.commit.id.clone();
+                let paths = json_commit_path_changes(&outcome.commit);
+                let repo = repo_for_file(file)?;
+                let (current_head, current_branch) = repo_head_and_branch(&repo)?;
+                Ok(Some(to_json(&JsonCommitOutcome {
+                    operation: "commit",
+                    current_head,
+                    current_branch,
+                    head,
+                    branch: outcome.branch,
+                    paths,
+                    commit: json_commit_summary(outcome.commit),
+                })?))
             }
 
             GraftPragma::Branch { mode } => {
@@ -1632,6 +2608,7 @@ impl GraftPragma {
             }
             GraftPragma::JsonBranch { mode } => {
                 let repo = repo_for_file(file)?;
+                let (current_head, current_branch) = repo_head_and_branch(&repo)?;
                 let branches = repo.branches()?;
                 let remote_branches = if mode.includes_remote() {
                     repo.remote_tracking_branches()?
@@ -1639,202 +2616,203 @@ impl GraftPragma {
                     Vec::new()
                 };
                 Ok(Some(to_json(&JsonBranchList {
+                    current_head,
+                    current_branch,
                     branches,
                     remote_branches,
                 })?))
             }
 
             GraftPragma::BranchCreate { name, start_point } => {
-                let repo = repo_for_file(file)?;
-                let branch = if start_point.is_some() || repo.status()?.head_target.is_some() {
-                    repo.branch_create(&name, start_point.as_deref())?
-                } else {
-                    repo.branch_create_unborn(&name)?
-                };
+                let branch = run_repo_branch_create(file, name, start_point)?;
                 Ok(Some(format_branch_created(&branch)))
+            }
+            GraftPragma::JsonBranchCreate { name, start_point } => {
+                let branch = run_repo_branch_create(file, name, start_point)?;
+                let outcome = json_branch_mutation_outcome(file, "branch_create", branch, None)?;
+                Ok(Some(to_json(&outcome)?))
             }
 
             GraftPragma::BranchDelete { name, force } => {
-                let repo = repo_for_file(file)?;
-                let branch = repo.branch_delete(&name, force)?;
+                let branch = run_repo_branch_delete(file, name, force)?;
                 Ok(Some(format_branch_deleted(&branch, force)))
+            }
+            GraftPragma::JsonBranchDelete { name, force } => {
+                let branch = run_repo_branch_delete(file, name, force)?;
+                let outcome = json_branch_mutation_outcome(file, "branch_delete", branch, None)?;
+                Ok(Some(to_json(&outcome)?))
             }
 
             GraftPragma::BranchRename { old, new, force } => {
-                let repo = repo_for_file(file)?;
-                let old = match old {
-                    Some(old) => old,
-                    None => repo.current_branch()?.ok_or_else(|| {
-                        ErrCtx::PragmaErr("cannot rename current branch in detached HEAD".into())
-                    })?,
-                };
-                let branch = repo.branch_rename(&old, &new, force)?;
+                let (old, branch) = run_repo_branch_rename(file, old, new, force)?;
                 Ok(Some(format_branch_renamed(&old, &branch, force)))
+            }
+            GraftPragma::JsonBranchRename { old, new, force } => {
+                let (old, branch) = run_repo_branch_rename(file, old, new, force)?;
+                let outcome =
+                    json_branch_mutation_outcome(file, "branch_rename", branch, Some(old))?;
+                Ok(Some(to_json(&outcome)?))
             }
 
             GraftPragma::BranchUpstream { branch, remote, remote_branch } => {
-                let repo = repo_for_file(file)?;
-                let branch = match branch {
-                    Some(branch) => branch,
-                    None => repo.current_branch()?.ok_or_else(|| {
-                        ErrCtx::PragmaErr("cannot set upstream in detached HEAD".into())
-                    })?,
-                };
-                let branch = repo.set_branch_upstream(&branch, &remote, &remote_branch)?;
+                let branch = run_repo_branch_upstream(file, branch, remote, remote_branch)?;
                 Ok(Some(format_branch_upstream(&branch)))
+            }
+            GraftPragma::JsonBranchUpstream { branch, remote, remote_branch } => {
+                let branch = run_repo_branch_upstream(file, branch, remote, remote_branch)?;
+                let outcome = json_branch_mutation_outcome(file, "branch_upstream", branch, None)?;
+                Ok(Some(to_json(&outcome)?))
             }
 
             GraftPragma::BranchUnsetUpstream { branch } => {
-                let repo = repo_for_file(file)?;
-                let branch = match branch {
-                    Some(branch) => branch,
-                    None => repo.current_branch()?.ok_or_else(|| {
-                        ErrCtx::PragmaErr("cannot unset upstream in detached HEAD".into())
-                    })?,
-                };
-                let branch = repo.unset_branch_upstream(&branch)?;
+                let branch = run_repo_branch_unset_upstream(file, branch)?;
                 Ok(Some(format_branch_upstream_unset(&branch)))
+            }
+            GraftPragma::JsonBranchUnsetUpstream { branch } => {
+                let branch = run_repo_branch_unset_upstream(file, branch)?;
+                let outcome =
+                    json_branch_mutation_outcome(file, "branch_unset_upstream", branch, None)?;
+                Ok(Some(to_json(&outcome)?))
             }
 
             GraftPragma::TagCreate { name, target, message } => {
-                let repo = repo_for_file(file)?;
-                let tag = match message {
-                    Some(message) => {
-                        repo.tag_create_annotated(&name, target.as_deref(), message)?
-                    }
-                    None => repo.tag_create(&name, target.as_deref())?,
-                };
+                let tag = run_repo_tag_create(file, name, target, message)?;
                 Ok(Some(format_tag_created(&tag)))
+            }
+            GraftPragma::JsonTagCreate { name, target, message } => {
+                let tag = run_repo_tag_create(file, name, target, message)?;
+                let outcome = json_tag_mutation_outcome(file, "tag_create", tag)?;
+                Ok(Some(to_json(&outcome)?))
             }
 
             GraftPragma::TagDelete { name } => {
-                let repo = repo_for_file(file)?;
-                let tag = repo.tag_delete(&name)?;
+                let tag = run_repo_tag_delete(file, name)?;
                 Ok(Some(format_tag_deleted(&tag)))
+            }
+            GraftPragma::JsonTagDelete { name } => {
+                let tag = run_repo_tag_delete(file, name)?;
+                let outcome = json_tag_mutation_outcome(file, "tag_delete", tag)?;
+                Ok(Some(to_json(&outcome)?))
             }
 
             GraftPragma::SwitchBranch { name, force } => {
-                if !file.is_idle() {
-                    return pragma_err!(
-                        "cannot switch branches while there is an open transaction"
-                    );
-                }
-                let repo = repo_for_file(file)?;
-                let plan = repo.plan_switch_branch(&name)?;
-                if repo_has_work_in_progress_for_file(&runtime, file, &repo)? {
-                    if force {
-                        repo.discard_work_in_progress()?;
-                    } else {
-                        return pragma_err!(
-                            "cannot switch branches with staged or unstaged changes"
-                        );
-                    }
-                }
-                verify_repo_checkout_plan(&runtime, &plan, None)?;
-                let previous_files = current_repo_files_for_checkout(&repo)?;
-                repo.apply_switch_branch_plan(&name, &plan)?;
-                checkout_repo_plan(&runtime, file, &repo, &plan, &previous_files, None)?;
+                run_repo_switch_branch(&runtime, file, name.clone(), force)?;
                 Ok(Some(format!("Switched to branch '{name}'")))
+            }
+            GraftPragma::JsonSwitchBranch { name, force } => {
+                let outcome = run_repo_switch_branch(&runtime, file, name, force)?;
+                let head = outcome.target.clone();
+                let repo = repo_for_file(file)?;
+                let (current_head, current_branch) = repo_head_and_branch(&repo)?;
+                Ok(Some(to_json(&JsonSwitchOutcome {
+                    operation: "switch_branch",
+                    current_head,
+                    current_branch,
+                    head,
+                    branch: outcome.branch,
+                    target: outcome.target,
+                    paths: outcome.paths,
+                })?))
             }
 
             GraftPragma::SwitchCreate { name, start_point, force } => {
-                if !file.is_idle() {
-                    return pragma_err!(
-                        "cannot switch branches while there is an open transaction"
-                    );
-                }
+                let outcome = run_repo_switch_create(&runtime, file, name, start_point, force)?;
+                Ok(Some(format_branch_created(&outcome.branch)))
+            }
+            GraftPragma::JsonSwitchCreate { name, start_point, force } => {
+                let outcome = run_repo_switch_create(&runtime, file, name, start_point, force)?;
+                let head = outcome.branch.target.clone();
                 let repo = repo_for_file(file)?;
-                let plan = repo.plan_switch_new_branch(&name, start_point.as_deref())?;
-                if repo_has_work_in_progress_for_file(&runtime, file, &repo)? {
-                    if force {
-                        repo.discard_work_in_progress()?;
-                    } else {
-                        return pragma_err!(
-                            "cannot switch branches with staged or unstaged changes"
-                        );
-                    }
-                }
-                verify_repo_checkout_plan(&runtime, &plan.checkout, None)?;
-                let previous_files = current_repo_files_for_checkout(&repo)?;
-                let branch = repo.apply_switch_new_branch_plan(&plan)?;
-                checkout_repo_plan(&runtime, file, &repo, &plan.checkout, &previous_files, None)?;
-                Ok(Some(format_branch_created(&branch)))
+                let (current_head, current_branch) = repo_head_and_branch(&repo)?;
+                Ok(Some(to_json(&JsonSwitchOutcome {
+                    operation: "switch_create",
+                    current_head,
+                    current_branch,
+                    head,
+                    branch: outcome.branch.name,
+                    target: outcome.branch.target,
+                    paths: outcome.paths,
+                })?))
             }
 
             GraftPragma::Merge { rev } => {
-                if !file.is_idle() {
-                    return pragma_err!("cannot merge while there is an open transaction");
-                }
+                let outcome = run_repo_merge(&runtime, file, &rev)?;
                 let repo = repo_for_file(file)?;
-                if repo_has_work_in_progress_for_file(&runtime, file, &repo)? {
-                    return pragma_err!("cannot merge with staged or unstaged changes");
-                }
-                clear_row_conflict_resolution_state(&repo)?;
-                let plan = repo.plan_merge_revision(&rev)?;
-                let plan = prepare_repo_merge_plan(&runtime, &plan, None)?;
-                let previous_files = current_repo_files_for_checkout(&repo)?;
-                let outcome = repo.apply_merge_plan(&plan)?;
-                checkout_merge_outcome(
-                    &runtime,
-                    file,
-                    &repo,
-                    &outcome,
-                    Some(&plan.checkout),
-                    &previous_files,
-                    None,
-                )?;
-                let row_auto_merge = match try_row_auto_merge_current_file_conflict(
-                    &runtime, file, &repo, &outcome, None,
-                ) {
-                    Ok(row_auto_merge) => row_auto_merge,
-                    Err(err) => {
-                        tracing::warn!("row-level auto-merge unavailable: {err}");
-                        None
-                    }
-                };
                 Ok(Some(format_merge_outcome_with_row_auto_merge(
                     &runtime,
                     file,
                     &repo,
-                    &outcome,
-                    row_auto_merge.as_ref(),
+                    &outcome.outcome,
+                    outcome.row_auto_merge.as_ref(),
                     None,
                 )?))
             }
+            GraftPragma::JsonMerge { rev } => {
+                let outcome = run_repo_merge(&runtime, file, &rev)?;
+                let repo = repo_for_file(file)?;
+                let conflict_analysis =
+                    current_file_status_row_merge_analysis_lossy(&runtime, file, &repo, None);
+                let head = merge_fast_forward_head(&outcome.outcome);
+                let (current_head, current_branch) = repo_head_and_branch(&repo)?;
+                Ok(Some(to_json(&JsonMergeCommandOutcome {
+                    operation: "merge",
+                    current_head,
+                    current_branch,
+                    head,
+                    branch: outcome.branch,
+                    outcome: outcome.outcome,
+                    paths: outcome.paths,
+                    conflict_analysis,
+                })?))
+            }
 
             GraftPragma::MergeAbort => {
-                if !file.is_idle() {
-                    return pragma_err!("cannot abort merge while there is an open transaction");
-                }
-                let repo = repo_for_file(file)?;
-                let plan = repo.plan_merge_abort()?;
-                let previous_files = current_repo_files_for_checkout(&repo)?;
-                let target = repo.apply_merge_abort_plan(&plan)?;
-                checkout_repo_plan(&runtime, file, &repo, &plan.checkout, &previous_files, None)?;
-                clear_row_conflict_resolution_state(&repo)?;
+                let outcome = run_repo_merge_abort(&runtime, file)?;
                 Ok(Some(format!(
                     "Aborted merge; reset HEAD to {}",
-                    &target[..target.len().min(12)]
+                    &outcome.target[..outcome.target.len().min(12)]
                 )))
+            }
+            GraftPragma::JsonMergeAbort => {
+                let outcome = run_repo_merge_abort(&runtime, file)?;
+                let head = outcome.target.clone();
+                let repo = repo_for_file(file)?;
+                let (current_head, current_branch) = repo_head_and_branch(&repo)?;
+                Ok(Some(to_json(&JsonMergeAbortCommandOutcome {
+                    operation: "merge_abort",
+                    current_head,
+                    current_branch,
+                    head,
+                    branch: outcome.branch,
+                    target: outcome.target,
+                    paths: outcome.paths,
+                })?))
             }
 
             GraftPragma::MergeContinue { message } => {
-                if !file.is_idle() {
-                    return pragma_err!("cannot continue merge while there is an open transaction");
-                }
-                let repo = repo_for_file(file)?;
-                if repo.status()?.merge_head.is_none() {
-                    return pragma_err!("no merge in progress");
-                }
-                try_row_auto_merge_current_file_status_conflict(&runtime, file, &repo, None)?;
-                let tables = staged_commit_table_summary(&runtime, &repo)?;
-                let commit = repo.commit_staged_with_table_summary(message, tables)?;
-                clear_row_conflict_resolution_state(&repo)?;
+                let outcome = run_repo_merge_continue(&runtime, file, message)?;
+                let commit = outcome.commit;
                 Ok(Some(format!(
                     "Merge commit [{}] {}",
                     &commit.id[..commit.id.len().min(12)],
                     commit.message
                 )))
+            }
+            GraftPragma::JsonMergeContinue { message } => {
+                let outcome = run_repo_merge_continue(&runtime, file, message)?;
+                let head = outcome.commit.id.clone();
+                let paths = json_commit_path_changes(&outcome.commit);
+                let repo = repo_for_file(file)?;
+                let (current_head, current_branch) = repo_head_and_branch(&repo)?;
+                Ok(Some(to_json(&JsonMergeContinueCommandOutcome {
+                    operation: "merge_continue",
+                    current_head,
+                    current_branch,
+                    head,
+                    branch: outcome.branch,
+                    paths,
+                    commit: json_commit_summary(outcome.commit),
+                })?))
             }
 
             GraftPragma::Conflicts => {
@@ -1856,10 +2834,10 @@ impl GraftPragma {
                 }
                 let repo = repo_for_file(file)?;
                 let side = spec.side;
-                let resolved_path = resolve_repo_conflict_for_file(&runtime, file, &repo, spec)?;
+                let outcome = resolve_repo_conflict_for_file(&runtime, file, &repo, spec)?;
                 Ok(Some(format!(
                     "Resolved {} using {}",
-                    resolved_path,
+                    outcome.path,
                     side.label()
                 )))
             }
@@ -1870,13 +2848,18 @@ impl GraftPragma {
                 }
                 let repo = repo_for_file(file)?;
                 let side = spec.side;
-                let resolved_path = resolve_repo_conflict_for_file(&runtime, file, &repo, spec)?;
+                let outcome = resolve_repo_conflict_for_file(&runtime, file, &repo, spec)?;
                 let remote = repo_default_remote_store(&repo);
                 let remaining_conflicts =
                     unresolved_conflict_artifact_count(&runtime, &repo, remote)?;
+                let (current_head, current_branch) = repo_head_and_branch(&repo)?;
                 Ok(Some(to_json(&JsonResolveConflictOutcome {
                     operation: "resolve_conflict",
-                    path: resolved_path,
+                    current_head,
+                    current_branch,
+                    path: outcome.path,
+                    path_kind: repo_tracked_path_kind_json_label(outcome.path_kind),
+                    storage: repo_path_storage_json_label(outcome.path_storage),
                     resolution: side.label(),
                     remaining_conflicts,
                 })?))
@@ -1887,11 +2870,23 @@ impl GraftPragma {
                 let remote = repo.remote_add(&name, config)?;
                 Ok(Some(format_remote(&remote)))
             }
+            GraftPragma::JsonRemoteAdd { name, config } => {
+                let repo = repo_for_file(file)?;
+                let remote = repo.remote_add(&name, config)?;
+                let outcome = json_remote_mutation_outcome(file, "remote_add", remote, None)?;
+                Ok(Some(to_json(&outcome)?))
+            }
 
             GraftPragma::RemoteRemove { name } => {
                 let repo = repo_for_file(file)?;
                 let remote = repo.remote_remove(&name)?;
                 Ok(Some(format!("Removed remote '{}'", remote.name)))
+            }
+            GraftPragma::JsonRemoteRemove { name } => {
+                let repo = repo_for_file(file)?;
+                let remote = repo.remote_remove(&name)?;
+                let outcome = json_remote_mutation_outcome(file, "remote_remove", remote, None)?;
+                Ok(Some(to_json(&outcome)?))
             }
 
             GraftPragma::RemoteRename { old, new } => {
@@ -1904,11 +2899,24 @@ impl GraftPragma {
                     remote_config_uri(&remote.config)
                 )))
             }
+            GraftPragma::JsonRemoteRename { old, new } => {
+                let repo = repo_for_file(file)?;
+                let remote = repo.remote_rename(&old, &new)?;
+                let outcome =
+                    json_remote_mutation_outcome(file, "remote_rename", remote, Some(old))?;
+                Ok(Some(to_json(&outcome)?))
+            }
 
             GraftPragma::RemoteGetUrl { name } => {
                 let repo = repo_for_file(file)?;
                 let remote = repo.remote_get_url(&name)?;
                 Ok(Some(remote_config_uri(&remote.config)))
+            }
+            GraftPragma::JsonRemoteGetUrl { name } => {
+                let repo = repo_for_file(file)?;
+                let remote = repo.remote_get_url(&name)?;
+                let outcome = json_remote_mutation_outcome(file, "remote_get_url", remote, None)?;
+                Ok(Some(to_json(&outcome)?))
             }
 
             GraftPragma::RemoteSetUrl { name, config } => {
@@ -1920,11 +2928,28 @@ impl GraftPragma {
                     remote_config_uri(&remote.config)
                 )))
             }
+            GraftPragma::JsonRemoteSetUrl { name, config } => {
+                let repo = repo_for_file(file)?;
+                let remote = repo.remote_set_url(&name, config)?;
+                let outcome = json_remote_mutation_outcome(file, "remote_set_url", remote, None)?;
+                Ok(Some(to_json(&outcome)?))
+            }
 
             GraftPragma::RemotePrune { name } => {
                 let repo = repo_for_file(file)?;
                 let outcome = repo.remote_prune(&name)?;
                 Ok(Some(format_remote_prune_outcome(&outcome)?))
+            }
+            GraftPragma::JsonRemotePrune { name } => {
+                let repo = repo_for_file(file)?;
+                let outcome = repo.remote_prune(&name)?;
+                let (current_head, current_branch) = repo_head_and_branch(&repo)?;
+                Ok(Some(to_json(&JsonRemotePruneCommandOutcome {
+                    operation: "remote_prune",
+                    current_head,
+                    current_branch,
+                    outcome,
+                })?))
             }
 
             GraftPragma::LsRemote { name } => {
@@ -1937,10 +2962,33 @@ impl GraftPragma {
                     &refs,
                 )?))
             }
+            GraftPragma::JsonLsRemote { name } => {
+                let repo = repo_for_file(file)?;
+                let default_branch = repo.remote_default_branch(&name)?;
+                let refs = repo.remote_branch_refs(&name)?;
+                let (current_head, current_branch) = repo_head_and_branch(&repo)?;
+                Ok(Some(to_json(&JsonLsRemoteOutcome {
+                    operation: "ls_remote",
+                    current_head,
+                    current_branch,
+                    remote: name,
+                    default_branch,
+                    refs,
+                })?))
+            }
 
             GraftPragma::Remotes => {
                 let repo = repo_for_file(file)?;
                 Ok(Some(format_remotes(&repo.remotes()?)?))
+            }
+            GraftPragma::JsonRemotes => {
+                let repo = repo_for_file(file)?;
+                let (current_head, current_branch) = repo_head_and_branch(&repo)?;
+                Ok(Some(to_json(&JsonRemoteList {
+                    current_head,
+                    current_branch,
+                    remotes: repo.remotes()?.into_iter().map(json_remote_info).collect(),
+                })?))
             }
 
             GraftPragma::VolumeSnapshot => {
@@ -1970,7 +3018,7 @@ impl GraftPragma {
                 );
                 Ok(Some(id))
             }
-            GraftPragma::JsonFetchAsync { remote, branch, refspec, all } => {
+            GraftPragma::JsonFetchAsync { remote, branch, refspec, all, mode } => {
                 repo_for_file(file)?;
                 let id = async_jobs().spawn_fetch(
                     PathBuf::from(file.tag.clone()),
@@ -1980,32 +3028,42 @@ impl GraftPragma {
                     all,
                     AsyncJobResultFormat::Json,
                 );
-                Ok(Some(id))
+                match mode {
+                    JsonFetchAsyncMode::LegacyId => Ok(Some(id)),
+                    JsonFetchAsyncMode::WithStatus => Ok(Some(async_jobs().json_status(&id)?)),
+                }
             }
             GraftPragma::JobStatus { id } => Ok(Some(async_jobs().status_json(&id)?)),
+            GraftPragma::JsonJobStatus { id } => Ok(Some(async_jobs().json_status(&id)?)),
             GraftPragma::JobResult { id } => Ok(Some(async_jobs().result(&id)?)),
             GraftPragma::JsonJobResult { id } => Ok(Some(async_jobs().result(&id)?)),
             GraftPragma::Pull { remote, branch, refspec, all } => {
                 let outcome = run_repo_pull(&runtime, file, remote, branch, refspec, all)?;
                 let repo = repo_for_file(file)?;
-                let checkout_remote = Arc::new(repo.remote_store(&outcome.remote)?);
+                let checkout_remote = Arc::new(repo.remote_store(&outcome.outcome.remote)?);
                 Ok(Some(format_pull_outcome_with_row_analysis(
                     &runtime,
                     file,
                     &repo,
-                    &outcome,
+                    &outcome.outcome,
                     Some(checkout_remote),
                 )?))
             }
             GraftPragma::JsonPull { remote, branch, refspec, all } => {
                 let outcome = run_repo_pull(&runtime, file, remote, branch, refspec, all)?;
                 let repo = repo_for_file(file)?;
-                let remote = repo.remote_store(&outcome.remote).ok().map(Arc::new);
+                let remote = repo
+                    .remote_store(&outcome.outcome.remote)
+                    .ok()
+                    .map(Arc::new);
                 let conflict_analysis =
                     current_file_status_row_merge_analysis_lossy(&runtime, file, &repo, remote);
                 Ok(Some(to_json(&JsonPullCommandOutcome {
                     operation: "pull",
-                    outcome,
+                    current_head: outcome.current_head,
+                    current_branch: outcome.current_branch,
+                    outcome: outcome.outcome,
+                    paths: outcome.paths,
                     conflict_analysis,
                 })?))
             }
@@ -2018,7 +3076,7 @@ impl GraftPragma {
             GraftPragma::JsonPush { remote, branch, refspec, all, force } => {
                 let repo = repo_for_file(file)?;
                 let outcome = run_repo_push(&runtime, &repo, remote, branch, refspec, all, force)?;
-                Ok(Some(to_json(&outcome)?))
+                Ok(Some(to_json(&json_push_command_outcome(&repo, &outcome)?)?))
             }
             GraftPragma::VolumeFetch => Ok(Some(fetch_or_pull(&runtime, file, false)?)),
             GraftPragma::VolumePull => Ok(Some(fetch_or_pull(&runtime, file, true)?)),
@@ -2026,6 +3084,229 @@ impl GraftPragma {
 
             GraftPragma::VolumeAudit => Ok(Some(format_volume_audit(&runtime, file)?)),
             GraftPragma::VolumeJsonAudit => Ok(Some(to_json(&json_volume_audit(&runtime, file)?)?)),
+            GraftPragma::RepoAudit { spec } => {
+                let repo = repo_for_file(file)?;
+                if spec.repair {
+                    let remote = repo_default_remote(&repo, spec.remote.clone())?;
+                    let outcome = repo.repair_artifacts_from_remote(&remote)?;
+                    Ok(Some(format_repo_artifact_repair(&outcome)?))
+                } else {
+                    Ok(Some(format_repo_artifact_audit(&repo.audit_artifacts()?)?))
+                }
+            }
+            GraftPragma::JsonRepoAudit { spec } => {
+                let repo = repo_for_file(file)?;
+                let (current_head, current_branch) = repo_head_and_branch(&repo)?;
+                if spec.repair {
+                    let remote = repo_default_remote(&repo, spec.remote.clone())?;
+                    let outcome = repo.repair_artifacts_from_remote(&remote)?;
+                    Ok(Some(to_json(&JsonRepoArtifactRepair {
+                        operation: "audit_repair",
+                        current_head,
+                        current_branch,
+                        outcome,
+                    })?))
+                } else {
+                    Ok(Some(to_json(&JsonRepoArtifactAudit {
+                        current_head,
+                        current_branch,
+                        audit: repo.audit_artifacts()?,
+                    })?))
+                }
+            }
+            GraftPragma::LargeFileFetch { spec } => {
+                let repo = repo_for_file(file)?;
+                let remote = repo_default_remote(&repo, spec.remote.clone())?;
+                let outcome = repo.fetch_large_file_payloads(&remote, spec.rev.as_deref())?;
+                Ok(Some(format_large_file_fetch_outcome(&outcome)?))
+            }
+            GraftPragma::JsonLargeFileFetch { spec, operation } => {
+                let repo = repo_for_file(file)?;
+                let (current_head, current_branch) = repo_head_and_branch(&repo)?;
+                let remote = repo_default_remote(&repo, spec.remote.clone())?;
+                let outcome = repo.fetch_large_file_payloads(&remote, spec.rev.as_deref())?;
+                Ok(Some(to_json(&JsonLargeFileFetchOutcome {
+                    operation,
+                    current_head,
+                    current_branch,
+                    outcome,
+                })?))
+            }
+            GraftPragma::LargeFileStatus { spec } => {
+                let repo = repo_for_file(file)?;
+                let outcome = repo.large_file_payloads_status(spec.rev.as_deref())?;
+                Ok(Some(format_large_file_status_outcome(&outcome)?))
+            }
+            GraftPragma::JsonLargeFileStatus { spec, operation } => {
+                let repo = repo_for_file(file)?;
+                let (current_head, current_branch) = repo_head_and_branch(&repo)?;
+                let outcome = repo.large_file_payloads_status(spec.rev.as_deref())?;
+                Ok(Some(to_json(&JsonLargeFileStatusOutcome {
+                    operation,
+                    current_head,
+                    current_branch,
+                    outcome,
+                })?))
+            }
+            GraftPragma::LargeFilePrune { spec } => {
+                let repo = repo_for_file(file)?;
+                let outcome = repo.prune_large_file_payloads(spec.dry_run)?;
+                Ok(Some(format_large_file_prune_outcome(&outcome)?))
+            }
+            GraftPragma::JsonLargeFilePrune { spec, operation } => {
+                let repo = repo_for_file(file)?;
+                let (current_head, current_branch) = repo_head_and_branch(&repo)?;
+                let outcome = repo.prune_large_file_payloads(spec.dry_run)?;
+                Ok(Some(to_json(&JsonLargeFilePruneOutcome {
+                    operation,
+                    current_head,
+                    current_branch,
+                    outcome,
+                })?))
+            }
+            GraftPragma::LsFiles { spec } => {
+                let repo = repo_for_file(file)?;
+                if spec.others {
+                    let paths = filter_tracked_paths_by_kind(repo.untracked_paths()?, spec.kind);
+                    Ok(Some(format_repo_untracked_paths(&paths)?))
+                } else if spec.stage {
+                    let paths = filter_tracked_path_entries_by_kind(
+                        repo.tracked_path_entries()?,
+                        spec.kind,
+                    );
+                    Ok(Some(format_repo_tracked_path_entries(&paths)?))
+                } else if spec.details {
+                    let paths = filter_tracked_path_details_by_kind(
+                        repo.tracked_path_details()?,
+                        spec.kind,
+                    );
+                    Ok(Some(format_repo_tracked_path_details(&paths)?))
+                } else {
+                    let paths = filter_tracked_paths_by_kind(repo.tracked_paths()?, spec.kind);
+                    Ok(Some(format_repo_tracked_paths(&paths)?))
+                }
+            }
+            GraftPragma::JsonLsFiles { spec } => {
+                let repo = repo_for_file(file)?;
+                let (current_head, current_branch) = repo_head_and_branch(&repo)?;
+                let kind = spec.kind.map(repo_tracked_path_kind_json_label);
+                if spec.others {
+                    let paths = filter_tracked_paths_by_kind(repo.untracked_paths()?, spec.kind);
+                    Ok(Some(to_json(&JsonLsFilesOutcome {
+                        current_head,
+                        current_branch,
+                        stage: spec.stage,
+                        details: spec.details,
+                        others: spec.others,
+                        kind,
+                        paths,
+                    })?))
+                } else if spec.stage {
+                    let paths = filter_tracked_path_entries_by_kind(
+                        repo.tracked_path_entries()?,
+                        spec.kind,
+                    );
+                    Ok(Some(to_json(&JsonLsFilesOutcome {
+                        current_head,
+                        current_branch,
+                        stage: spec.stage,
+                        details: spec.details,
+                        others: spec.others,
+                        kind,
+                        paths,
+                    })?))
+                } else if spec.details {
+                    let paths = filter_tracked_path_details_by_kind(
+                        repo.tracked_path_details()?,
+                        spec.kind,
+                    );
+                    Ok(Some(to_json(&JsonLsFilesOutcome {
+                        current_head,
+                        current_branch,
+                        stage: spec.stage,
+                        details: spec.details,
+                        others: spec.others,
+                        kind,
+                        paths,
+                    })?))
+                } else {
+                    let paths = filter_tracked_paths_by_kind(repo.tracked_paths()?, spec.kind);
+                    Ok(Some(to_json(&JsonLsFilesOutcome {
+                        current_head,
+                        current_branch,
+                        stage: spec.stage,
+                        details: spec.details,
+                        others: spec.others,
+                        kind,
+                        paths,
+                    })?))
+                }
+            }
+            GraftPragma::ConfigGet { key } => {
+                let repo = repo_for_file(file)?;
+                Ok(Some(format_repo_config_entry(&repo.config_get(&key)?)?))
+            }
+            GraftPragma::JsonConfigGet { key } => {
+                let repo = repo_for_file(file)?;
+                let entry = repo.config_get(&key)?;
+                let (current_head, current_branch) = repo_head_and_branch(&repo)?;
+                Ok(Some(to_json(&JsonConfigEntryOutcome {
+                    current_head,
+                    current_branch,
+                    entry,
+                })?))
+            }
+            GraftPragma::ConfigList => {
+                let repo = repo_for_file(file)?;
+                Ok(Some(format_repo_config_entries(&repo.config_list()?)?))
+            }
+            GraftPragma::JsonConfigList { mode } => {
+                let repo = repo_for_file(file)?;
+                let entries = repo.config_list()?;
+                match mode {
+                    JsonConfigListMode::LegacyArray => Ok(Some(to_json(&entries)?)),
+                    JsonConfigListMode::WithStatus => {
+                        let (current_head, current_branch) = repo_head_and_branch(&repo)?;
+                        Ok(Some(to_json(&JsonConfigListOutcome {
+                            current_head,
+                            current_branch,
+                            entries,
+                        })?))
+                    }
+                }
+            }
+            GraftPragma::ConfigSet { key, value } => {
+                let repo = repo_for_file(file)?;
+                Ok(Some(format_repo_config_entry(
+                    &repo.config_set(&key, &value)?,
+                )?))
+            }
+            GraftPragma::JsonConfigSet { key, value } => {
+                let repo = repo_for_file(file)?;
+                let entry = repo.config_set(&key, &value)?;
+                let (current_head, current_branch) = repo_head_and_branch(&repo)?;
+                Ok(Some(to_json(&JsonConfigMutationOutcome {
+                    operation: "config_set",
+                    current_head,
+                    current_branch,
+                    entry,
+                })?))
+            }
+            GraftPragma::ConfigUnset { key } => {
+                let repo = repo_for_file(file)?;
+                Ok(Some(format_repo_config_entry(&repo.config_unset(&key)?)?))
+            }
+            GraftPragma::JsonConfigUnset { key } => {
+                let repo = repo_for_file(file)?;
+                let entry = repo.config_unset(&key)?;
+                let (current_head, current_branch) = repo_head_and_branch(&repo)?;
+                Ok(Some(to_json(&JsonConfigMutationOutcome {
+                    operation: "config_unset",
+                    current_head,
+                    current_branch,
+                    entry,
+                })?))
+            }
 
             GraftPragma::VolumeHydrate => {
                 let snapshot = file.snapshot_or_latest()?;
@@ -2116,15 +3397,23 @@ impl GraftPragma {
 
                 Ok(Some(format!(
                     "Reset HEAD to {} ({})",
-                    &outcome.target[..outcome.target.len().min(12)],
+                    &outcome.outcome.target[..outcome.outcome.target.len().min(12)],
                     reset_mode_label(mode)
                 )))
             }
             GraftPragma::JsonReset { rev, mode } => {
                 let outcome = run_repo_reset(&runtime, file, &rev, mode)?;
+                let head = outcome.outcome.target.clone();
+                let repo = repo_for_file(file)?;
+                let (current_head, current_branch) = repo_head_and_branch(&repo)?;
                 Ok(Some(to_json(&JsonResetCommandOutcome {
                     operation: "reset",
-                    outcome,
+                    current_head,
+                    current_branch,
+                    head,
+                    branch: outcome.branch,
+                    outcome: outcome.outcome,
+                    paths: outcome.paths,
                 })?))
             }
 
@@ -2168,11 +3457,20 @@ impl GraftPragma {
                 Ok(Some(format_repo_show(&commit)?))
             }
 
-            GraftPragma::JsonLog => {
+            GraftPragma::JsonLog { mode } => {
                 let repo = repo_for_file(file)?;
-                Ok(Some(serde_json::to_string(&repo.log()?).map_err(|e| {
-                    ErrCtx::PragmaErr(format!("JSON error: {e}").into())
-                })?))
+                let commits = repo.log()?;
+                match mode {
+                    JsonLogMode::LegacyArray => Ok(Some(to_json(&commits)?)),
+                    JsonLogMode::WithStatus => {
+                        let (current_head, current_branch) = repo_head_and_branch(&repo)?;
+                        Ok(Some(to_json(&JsonRepoLogOutcome {
+                            current_head,
+                            current_branch,
+                            commits,
+                        })?))
+                    }
+                }
             }
 
             GraftPragma::VolumeJsonDiff { from, to, mode } => {
@@ -2300,18 +3598,24 @@ impl GraftPragma {
                     return pragma_err!("cannot diff while there is an open transaction");
                 }
                 let mode = spec.mode;
+                let kind = spec.kind.map(repo_tracked_path_kind_json_label);
                 let repo = repo_for_file(file)?;
                 let diff = repo_diff_for_spec(&runtime, file, &repo, spec)?;
+                let (current_head, current_branch) = repo_head_and_branch(&repo)?;
                 match mode {
-                    DiffMode::Default => {
-                        Ok(Some(serde_json::to_string(&diff).map_err(|e| {
-                            ErrCtx::PragmaErr(format!("JSON error: {e}").into())
-                        })?))
-                    }
+                    DiffMode::Default => Ok(Some(to_json(&JsonRepoDiffOutcome {
+                        current_head,
+                        current_branch,
+                        kind,
+                        diff,
+                    })?)),
                     DiffMode::Rows => {
                         let rows = json_repo_row_diff(&runtime, &repo, &diff)?;
-                        Ok(Some(serde_json::to_string(&rows).map_err(|e| {
-                            ErrCtx::PragmaErr(format!("JSON error: {e}").into())
+                        Ok(Some(to_json(&JsonRepoDiffOutcome {
+                            current_head,
+                            current_branch,
+                            kind,
+                            diff: rows,
                         })?))
                     }
                 }
@@ -2323,8 +3627,11 @@ impl GraftPragma {
                 }
                 let repo = repo_for_file(file)?;
                 let commit = repo.show_revision(&target)?;
-                Ok(Some(serde_json::to_string(&commit).map_err(|e| {
-                    ErrCtx::PragmaErr(format!("JSON error: {e}").into())
+                let (current_head, current_branch) = repo_head_and_branch(&repo)?;
+                Ok(Some(to_json(&JsonRepoShowOutcome {
+                    current_head,
+                    current_branch,
+                    commit,
                 })?))
             }
 
@@ -2388,6 +3695,34 @@ macro_rules! pluralize {
     };
 }
 
+fn run_repo_init(file: &mut VolFile) -> Result<RepoInitOutcome, ErrCtx> {
+    if !file.is_idle() {
+        return pragma_err!("cannot initialize a repository while there is an open transaction");
+    }
+    let repo = Repository::init_for_file(&file.tag)?;
+    let preserved_contents = file.attach_repo_preserving_contents(repo.clone())?;
+    if preserved_contents {
+        repo.mark_dirty_path(&file.tag)?;
+    }
+    let path = repo.file_key(&file.tag)?;
+    let (current_head, current_branch) = repo_head_and_branch(&repo)?;
+    Ok(RepoInitOutcome {
+        graft_dir: repo.graft_dir().to_path_buf(),
+        worktree: repo.worktree().to_path_buf(),
+        path,
+        preserved_contents,
+        current_head,
+        current_branch,
+    })
+}
+
+fn format_repo_init_outcome(outcome: &RepoInitOutcome) -> String {
+    format!(
+        "Initialized empty Graft repository in {}",
+        outcome.graft_dir.display()
+    )
+}
+
 fn repo_for_file(file: &mut VolFile) -> Result<Repository, ErrCtx> {
     if let Some(repo) = &file.repo {
         return Ok(repo.clone());
@@ -2401,6 +3736,65 @@ fn repo_for_file(file: &mut VolFile) -> Result<Repository, ErrCtx> {
     let repo = Repository::discover_for_file(&file.tag)?;
     file.repo = Some(repo.clone());
     Ok(repo)
+}
+
+fn run_repo_clone(file: &mut VolFile, spec: RepoCloneSpec) -> Result<RepoCloneOutcome, ErrCtx> {
+    if !file.is_idle() {
+        return pragma_err!("cannot clone while there is an open transaction");
+    }
+    if file.repo.is_some() || Repository::discover_for_file(&file.tag).is_ok() {
+        return pragma_err!("cannot clone into an existing .graft repository");
+    }
+
+    let repo = Repository::init_for_file(&file.tag)?;
+    let graft_dir = repo.graft_dir().to_path_buf();
+    let mut attached = false;
+    let result = (|| {
+        let remote_info = repo.remote_add("origin", spec.config)?;
+        let branch = match spec.branch {
+            Some(branch) => branch,
+            None => repo
+                .remote_default_branch("origin")?
+                .unwrap_or(repo.default_branch()?),
+        };
+        let fetch = repo.fetch("origin", &branch)?;
+        repo.branch_create(&branch, Some(&format!("refs/remotes/origin/{branch}")))?;
+        repo.set_branch_upstream(&branch, "origin", &branch)?;
+        let plan = repo.plan_switch_branch(&branch)?;
+        file.attach_repo(repo.clone())?;
+        attached = true;
+        let runtime = file.runtime().clone();
+        let remote = Arc::new(repo.remote_store("origin")?);
+        let plan = prepare_repo_checkout_plan(&runtime, &plan, Some(remote.clone()))?;
+        let previous_files = BTreeMap::new();
+        let previous_artifacts = BTreeMap::new();
+        let paths = checkout_plan_path_actions(&plan, &previous_files, &previous_artifacts);
+        repo.apply_switch_branch_plan(&branch, &plan)?;
+        checkout_repo_plan(
+            &runtime,
+            file,
+            &repo,
+            &plan,
+            &previous_files,
+            &previous_artifacts,
+            Some(remote),
+        )?;
+        let (current_head, current_branch) = repo_head_and_branch(&repo)?;
+        Ok(RepoCloneOutcome {
+            remote: remote_info,
+            current_head,
+            current_branch,
+            branch: fetch.branch,
+            head: fetch.head,
+            commits: fetch.commits,
+            graft_dir: graft_dir.clone(),
+            paths,
+        })
+    })();
+    if result.is_err() && !attached {
+        let _ = std::fs::remove_dir_all(graft_dir);
+    }
+    result
 }
 
 fn run_repo_fetch(
@@ -2422,7 +3816,7 @@ fn run_repo_fetch_json(
     all: bool,
 ) -> Result<String, ErrCtx> {
     let outcome = run_repo_fetch_outcome(repo, remote, branch, refspec, all)?;
-    to_json(&outcome)
+    to_json(&json_fetch_command_outcome(repo, &outcome)?)
 }
 
 fn run_repo_fetch_outcome(
@@ -2460,6 +3854,389 @@ fn format_fetch_command_outcome(outcome: &FetchCommandOutcome) -> Result<String,
     }
 }
 
+fn json_fetch_command_outcome(
+    repo: &Repository,
+    outcome: &FetchCommandOutcome,
+) -> Result<JsonFetchCommandOutcome, ErrCtx> {
+    let (current_head, current_branch) = repo_head_and_branch(repo)?;
+    Ok(JsonFetchCommandOutcome {
+        operation: "fetch",
+        current_head,
+        current_branch,
+        remote: outcome.remote(),
+        branches: outcome.branches(),
+        commits: outcome.commits(),
+    })
+}
+
+fn run_repo_merge_abort(
+    runtime: &Runtime,
+    file: &mut VolFile,
+) -> Result<RepoMergeAbortCommandOutcome, ErrCtx> {
+    if !file.is_idle() {
+        return pragma_err!("cannot abort merge while there is an open transaction");
+    }
+    let repo = repo_for_file(file)?;
+    let plan = repo.plan_merge_abort()?;
+    let previous_files = current_repo_files_for_checkout(&repo)?;
+    let previous_artifacts = current_repo_artifacts_for_checkout(&repo)?;
+    let paths = checkout_plan_path_actions(&plan.checkout, &previous_files, &previous_artifacts);
+    let target = repo.apply_merge_abort_plan(&plan)?;
+    checkout_repo_plan(
+        runtime,
+        file,
+        &repo,
+        &plan.checkout,
+        &previous_files,
+        &previous_artifacts,
+        None,
+    )?;
+    clear_row_conflict_resolution_state(&repo)?;
+    let branch = repo.current_branch()?;
+    Ok(RepoMergeAbortCommandOutcome { target, branch, paths })
+}
+
+fn run_repo_merge_continue(
+    runtime: &Runtime,
+    file: &mut VolFile,
+    message: String,
+) -> Result<RepoCommitOutcome, ErrCtx> {
+    if !file.is_idle() {
+        return pragma_err!("cannot continue merge while there is an open transaction");
+    }
+    let repo = repo_for_file(file)?;
+    if repo.status()?.merge_head.is_none() {
+        return pragma_err!("no merge in progress");
+    }
+    try_row_auto_merge_current_file_status_conflict(runtime, file, &repo, None)?;
+    let tables = staged_commit_table_summary(runtime, &repo)?;
+    let commit = repo.commit_staged_with_table_summary(message, tables)?;
+    clear_row_conflict_resolution_state(&repo)?;
+    let branch = repo.current_branch()?;
+    Ok(RepoCommitOutcome { commit, branch })
+}
+
+fn run_repo_commit(
+    runtime: &Runtime,
+    file: &mut VolFile,
+    message: String,
+) -> Result<RepoCommitOutcome, ErrCtx> {
+    if !file.is_idle() {
+        return pragma_err!("cannot commit while there is an open transaction");
+    }
+    let repo = repo_for_file(file)?;
+    let tables = staged_commit_table_summary(runtime, &repo)?;
+    let commit = repo.commit_staged_with_table_summary(message, tables)?;
+    let branch = repo.current_branch()?;
+    Ok(RepoCommitOutcome { commit, branch })
+}
+
+fn run_repo_branch_create(
+    file: &mut VolFile,
+    name: String,
+    start_point: Option<String>,
+) -> Result<BranchInfo, ErrCtx> {
+    let repo = repo_for_file(file)?;
+    if start_point.is_some() || repo.status()?.head_target.is_some() {
+        repo.branch_create(&name, start_point.as_deref())
+            .map_err(Into::into)
+    } else {
+        repo.branch_create_unborn(&name).map_err(Into::into)
+    }
+}
+
+fn run_repo_branch_delete(
+    file: &mut VolFile,
+    name: String,
+    force: bool,
+) -> Result<BranchInfo, ErrCtx> {
+    let repo = repo_for_file(file)?;
+    repo.branch_delete(&name, force).map_err(Into::into)
+}
+
+fn run_repo_branch_rename(
+    file: &mut VolFile,
+    old: Option<String>,
+    new: String,
+    force: bool,
+) -> Result<(String, BranchInfo), ErrCtx> {
+    let repo = repo_for_file(file)?;
+    let old = match old {
+        Some(old) => old,
+        None => repo.current_branch()?.ok_or_else(|| {
+            ErrCtx::PragmaErr("cannot rename current branch in detached HEAD".into())
+        })?,
+    };
+    let branch = repo.branch_rename(&old, &new, force)?;
+    Ok((old, branch))
+}
+
+fn run_repo_branch_upstream(
+    file: &mut VolFile,
+    branch: Option<String>,
+    remote: String,
+    remote_branch: String,
+) -> Result<BranchInfo, ErrCtx> {
+    let repo = repo_for_file(file)?;
+    let branch = current_or_named_branch(&repo, branch, "set upstream")?;
+    repo.set_branch_upstream(&branch, &remote, &remote_branch)
+        .map_err(Into::into)
+}
+
+fn run_repo_branch_unset_upstream(
+    file: &mut VolFile,
+    branch: Option<String>,
+) -> Result<BranchInfo, ErrCtx> {
+    let repo = repo_for_file(file)?;
+    let branch = current_or_named_branch(&repo, branch, "unset upstream")?;
+    repo.unset_branch_upstream(&branch).map_err(Into::into)
+}
+
+fn current_or_named_branch(
+    repo: &Repository,
+    branch: Option<String>,
+    action: &'static str,
+) -> Result<String, ErrCtx> {
+    match branch {
+        Some(branch) => Ok(branch),
+        None => repo
+            .current_branch()?
+            .ok_or_else(|| ErrCtx::PragmaErr(format!("cannot {action} in detached HEAD").into())),
+    }
+}
+
+fn json_branch_mutation_outcome(
+    file: &mut VolFile,
+    operation: &'static str,
+    branch: BranchInfo,
+    old_branch: Option<String>,
+) -> Result<JsonBranchMutationOutcome, ErrCtx> {
+    let repo = repo_for_file(file)?;
+    let (current_head, current_branch) = repo_head_and_branch(&repo)?;
+    Ok(JsonBranchMutationOutcome {
+        operation,
+        current_head,
+        current_branch,
+        branch,
+        old_branch,
+    })
+}
+
+fn json_tag_mutation_outcome(
+    file: &mut VolFile,
+    operation: &'static str,
+    tag: TagInfo,
+) -> Result<JsonTagMutationOutcome, ErrCtx> {
+    let repo = repo_for_file(file)?;
+    let (current_head, current_branch) = repo_head_and_branch(&repo)?;
+    Ok(JsonTagMutationOutcome {
+        operation,
+        current_head,
+        current_branch,
+        tag,
+    })
+}
+
+fn json_remote_mutation_outcome(
+    file: &mut VolFile,
+    operation: &'static str,
+    remote: RemoteInfo,
+    old_name: Option<String>,
+) -> Result<JsonRemoteMutationOutcome, ErrCtx> {
+    let repo = repo_for_file(file)?;
+    let (current_head, current_branch) = repo_head_and_branch(&repo)?;
+    Ok(JsonRemoteMutationOutcome {
+        operation,
+        current_head,
+        current_branch,
+        remote: json_remote_info(remote),
+        old_name,
+    })
+}
+
+fn run_repo_tag_create(
+    file: &mut VolFile,
+    name: String,
+    target: Option<String>,
+    message: Option<String>,
+) -> Result<TagInfo, ErrCtx> {
+    let repo = repo_for_file(file)?;
+    match message {
+        Some(message) => repo
+            .tag_create_annotated(&name, target.as_deref(), message)
+            .map_err(Into::into),
+        None => repo
+            .tag_create(&name, target.as_deref())
+            .map_err(Into::into),
+    }
+}
+
+fn run_repo_tag_delete(file: &mut VolFile, name: String) -> Result<TagInfo, ErrCtx> {
+    let repo = repo_for_file(file)?;
+    repo.tag_delete(&name).map_err(Into::into)
+}
+
+fn run_repo_switch_branch(
+    runtime: &Runtime,
+    file: &mut VolFile,
+    name: String,
+    force: bool,
+) -> Result<RepoSwitchOutcome, ErrCtx> {
+    if !file.is_idle() {
+        return pragma_err!("cannot switch branches while there is an open transaction");
+    }
+    let repo = repo_for_file(file)?;
+    let plan = repo.plan_switch_branch(&name)?;
+    prepare_repo_switch_checkout(runtime, file, &repo, &plan, force)?;
+    let previous_files = current_repo_files_for_checkout(&repo)?;
+    let previous_artifacts = current_repo_artifacts_for_checkout(&repo)?;
+    let paths = checkout_plan_path_actions(&plan, &previous_files, &previous_artifacts);
+    repo.apply_switch_branch_plan(&name, &plan)?;
+    checkout_repo_plan(
+        runtime,
+        file,
+        &repo,
+        &plan,
+        &previous_files,
+        &previous_artifacts,
+        None,
+    )?;
+    Ok(RepoSwitchOutcome { branch: name, target: plan.target, paths })
+}
+
+fn run_repo_switch_create(
+    runtime: &Runtime,
+    file: &mut VolFile,
+    name: String,
+    start_point: Option<String>,
+    force: bool,
+) -> Result<RepoSwitchCreateOutcome, ErrCtx> {
+    if !file.is_idle() {
+        return pragma_err!("cannot switch branches while there is an open transaction");
+    }
+    let repo = repo_for_file(file)?;
+    let plan = repo.plan_switch_new_branch(&name, start_point.as_deref())?;
+    prepare_repo_switch_checkout(runtime, file, &repo, &plan.checkout, force)?;
+    let previous_files = current_repo_files_for_checkout(&repo)?;
+    let previous_artifacts = current_repo_artifacts_for_checkout(&repo)?;
+    let paths = checkout_plan_path_actions(&plan.checkout, &previous_files, &previous_artifacts);
+    let branch = repo.apply_switch_new_branch_plan(&plan)?;
+    checkout_repo_plan(
+        runtime,
+        file,
+        &repo,
+        &plan.checkout,
+        &previous_files,
+        &previous_artifacts,
+        None,
+    )?;
+    Ok(RepoSwitchCreateOutcome { branch, paths })
+}
+
+fn prepare_repo_switch_checkout(
+    runtime: &Runtime,
+    file: &mut VolFile,
+    repo: &Repository,
+    plan: &CheckoutPlan,
+    force: bool,
+) -> Result<(), ErrCtx> {
+    if repo_has_work_in_progress_for_file(runtime, file, repo)? {
+        if force {
+            repo.discard_work_in_progress()?;
+        } else {
+            return pragma_err!("cannot switch branches with staged or unstaged changes");
+        }
+    }
+    if !force {
+        ensure_checkout_plan_preserves_untracked_paths(runtime, file, repo, plan)?;
+    }
+    verify_repo_checkout_plan(runtime, plan, None)
+}
+
+fn json_commit_summary(commit: CommitObject) -> JsonCommitSummary {
+    let parents = if commit.parents.is_empty() {
+        commit.parent.into_iter().collect()
+    } else {
+        commit.parents
+    };
+    JsonCommitSummary {
+        id: commit.id,
+        message: commit.message,
+        parents,
+    }
+}
+
+fn json_commit_path_changes(commit: &CommitObject) -> Vec<crate::json::JsonRepoPathDiff> {
+    commit
+        .changes
+        .iter()
+        .map(|change| crate::json::JsonRepoPathDiff {
+            path: change.path.clone(),
+            change: repo_file_change_label(change.change).to_string(),
+            kind: repo_tracked_path_kind_json_label(change.kind).to_string(),
+            storage: repo_path_storage_json_label(change.storage).to_string(),
+        })
+        .collect()
+}
+
+fn run_repo_merge(
+    runtime: &Runtime,
+    file: &mut VolFile,
+    rev: &str,
+) -> Result<RepoMergeCommandOutcome, ErrCtx> {
+    if !file.is_idle() {
+        return pragma_err!("cannot merge while there is an open transaction");
+    }
+    let repo = repo_for_file(file)?;
+    if repo_has_work_in_progress_for_file(runtime, file, &repo)? {
+        return pragma_err!("cannot merge with staged or unstaged changes");
+    }
+    clear_row_conflict_resolution_state(&repo)?;
+    let plan = repo.plan_merge_revision(rev)?;
+    let plan = prepare_repo_merge_plan(runtime, &plan, None)?;
+    ensure_checkout_plan_preserves_untracked_paths(runtime, file, &repo, &plan.checkout)?;
+    let previous_files = current_repo_files_for_checkout(&repo)?;
+    let previous_artifacts = current_repo_artifacts_for_checkout(&repo)?;
+    let mut outcome = repo.apply_merge_plan(&plan)?;
+    checkout_merge_outcome(
+        runtime,
+        file,
+        &repo,
+        &outcome,
+        Some(&plan.checkout),
+        &previous_files,
+        &previous_artifacts,
+        None,
+    )?;
+    let row_auto_merge =
+        match try_row_auto_merge_current_file_conflict(runtime, file, &repo, &outcome, None) {
+            Ok(row_auto_merge) => row_auto_merge,
+            Err(err) => {
+                tracing::warn!("row-level auto-merge unavailable: {err}");
+                None
+            }
+        };
+    if let Some(row_auto_merge) = &row_auto_merge {
+        outcome = merge_outcome_with_row_auto_merge(&outcome, &row_auto_merge.key);
+    }
+    let paths = merge_path_actions(
+        &repo,
+        &outcome,
+        Some(&plan.checkout),
+        &previous_files,
+        &previous_artifacts,
+    )?;
+    let branch = repo.current_branch()?;
+    Ok(RepoMergeCommandOutcome { outcome, branch, paths, row_auto_merge })
+}
+
+fn merge_fast_forward_head(outcome: &MergeOutcome) -> Option<String> {
+    match outcome {
+        MergeOutcome::FastForward { to, .. } => Some(to.clone()),
+        MergeOutcome::AlreadyUpToDate { .. } | MergeOutcome::Merged { .. } => None,
+    }
+}
+
 fn run_repo_pull(
     runtime: &Runtime,
     file: &mut VolFile,
@@ -2467,7 +4244,7 @@ fn run_repo_pull(
     branch: Option<String>,
     refspec: Option<String>,
     all: bool,
-) -> Result<PullOutcome, ErrCtx> {
+) -> Result<RepoPullCommandOutcome, ErrCtx> {
     let repo = repo_for_file(file)?;
     if all {
         return pragma_err!("pull does not support --all; fetch --all first, then pull one branch");
@@ -2492,7 +4269,9 @@ fn run_repo_pull(
     };
     let checkout_remote = Arc::new(repo.remote_store(&remote)?);
     plan.merge = prepare_repo_merge_plan(runtime, &plan.merge, Some(checkout_remote.clone()))?;
+    ensure_checkout_plan_preserves_untracked_paths(runtime, file, &repo, &plan.merge.checkout)?;
     let previous_files = current_repo_files_for_checkout(&repo)?;
+    let previous_artifacts = current_repo_artifacts_for_checkout(&repo)?;
     clear_row_conflict_resolution_state(&repo)?;
     let mut outcome = repo.apply_pull_plan(&plan)?;
     checkout_merge_outcome(
@@ -2502,6 +4281,7 @@ fn run_repo_pull(
         &outcome.merge,
         Some(&plan.merge.checkout),
         &previous_files,
+        &previous_artifacts,
         Some(checkout_remote.clone()),
     )?;
     if let Ok(Some(row_auto_merge)) = try_row_auto_merge_current_file_conflict(
@@ -2513,7 +4293,22 @@ fn run_repo_pull(
     ) {
         outcome.merge = merge_outcome_with_row_auto_merge(&outcome.merge, &row_auto_merge.key);
     }
-    Ok(outcome)
+    let paths = merge_path_actions(
+        &repo,
+        &outcome.merge,
+        Some(&plan.merge.checkout),
+        &previous_files,
+        &previous_artifacts,
+    )?;
+    let status = repo.status()?;
+    let current_head = status.head_target;
+    let current_branch = repo.current_branch()?;
+    Ok(RepoPullCommandOutcome {
+        outcome,
+        current_head,
+        current_branch,
+        paths,
+    })
 }
 
 fn run_repo_push(
@@ -2579,6 +4374,22 @@ fn format_push_command_outcome(outcome: &PushCommandOutcome) -> Result<String, E
     }
 }
 
+fn json_push_command_outcome(
+    repo: &Repository,
+    outcome: &PushCommandOutcome,
+) -> Result<JsonPushCommandOutcome, ErrCtx> {
+    let (current_head, current_branch) = repo_head_and_branch(repo)?;
+    Ok(JsonPushCommandOutcome {
+        operation: "push",
+        current_head,
+        current_branch,
+        remote: outcome.remote(),
+        branches: outcome.branches(),
+        commits: outcome.commits(),
+        forced: outcome.forced(),
+    })
+}
+
 fn run_repo_checkout(
     runtime: &Runtime,
     file: &mut VolFile,
@@ -2598,40 +4409,305 @@ fn run_repo_checkout(
                     return pragma_err!("cannot checkout with staged or unstaged changes");
                 }
             }
+            if !force {
+                ensure_checkout_plan_preserves_untracked_paths(runtime, file, &repo, &plan)?;
+            }
             verify_repo_checkout_plan(runtime, &plan, None)?;
             let previous_files = current_repo_files_for_checkout(&repo)?;
+            let previous_artifacts = current_repo_artifacts_for_checkout(&repo)?;
             let id = repo.apply_detach_plan(&rev, &plan)?;
-            checkout_repo_plan(runtime, file, &repo, &plan, &previous_files, None)?;
+            checkout_repo_plan(
+                runtime,
+                file,
+                &repo,
+                &plan,
+                &previous_files,
+                &previous_artifacts,
+                None,
+            )?;
+            let (current_head, current_branch) = repo_head_and_branch(&repo)?;
             Ok(JsonCheckoutOutcome {
                 operation: "checkout",
+                current_head: current_head.clone(),
+                current_branch: current_branch.clone(),
+                head: current_head,
+                branch: current_branch,
                 target: id,
                 path: None,
+                paths: Vec::new(),
+                path_details: Vec::new(),
             })
         }
         RepoCheckoutSpec::Path { rev, path } => {
             let path = repo_path_arg(&repo, &path)?;
-            let current_key = repo.file_key(&file.tag)?;
-            let physical_path = repo.worktree().join(&path);
-            let plan = repo.plan_checkout_file_key_from_revision(&rev, path)?;
+            checkout_repo_path_from_revision(runtime, file, &repo, &rev, &path)
+        }
+    }
+}
+
+fn checkout_repo_path_from_revision(
+    runtime: &Runtime,
+    file: &mut VolFile,
+    repo: &Repository,
+    rev: &str,
+    path: &str,
+) -> Result<JsonCheckoutOutcome, ErrCtx> {
+    match checkout_repo_key_from_revision(runtime, file, repo, rev, path) {
+        Ok((target, path_detail)) => {
+            let path = path_detail.path.clone();
+            let (current_head, current_branch) = repo_head_and_branch(repo)?;
+            Ok(JsonCheckoutOutcome {
+                operation: "checkout",
+                current_head: current_head.clone(),
+                current_branch: current_branch.clone(),
+                head: current_head,
+                branch: current_branch,
+                target,
+                path: Some(path),
+                paths: Vec::new(),
+                path_details: vec![path_detail],
+            })
+        }
+        Err(ErrCtx::Repo(graft::repo::RepoErr::PathNotFoundInRevision { .. })) => {
+            let keys = checkout_keys_for_revision_pathspec(repo, rev, path)?;
+            if keys.is_empty() {
+                return Err(ErrCtx::Repo(graft::repo::RepoErr::PathNotFoundInRevision {
+                    path: path.to_string(),
+                    rev: rev.to_string(),
+                }));
+            }
+            let target = repo.resolve_revision(rev)?;
+            let mut checkout_keys = BTreeSet::new();
+            for key in &keys {
+                if revision_has_repo_key(repo, &target, key)? {
+                    checkout_keys.insert(key.clone());
+                }
+            }
+            ensure_checkout_keys_preserve_untracked_paths(runtime, file, repo, &checkout_keys)?;
+            let mut checked_out = Vec::with_capacity(keys.len());
+            let mut path_details = Vec::with_capacity(keys.len());
+            for key in keys {
+                if revision_has_repo_key(repo, &target, &key)? {
+                    let (_, path_detail) =
+                        checkout_repo_key_from_revision(runtime, file, repo, rev, &key)?;
+                    checked_out.push(path_detail.path.clone());
+                    path_details.push(path_detail);
+                } else {
+                    let path_detail = current_key_path_detail(repo, &key)?;
+                    stage_checkout_deletion_for_key(runtime, file, repo, &key)?;
+                    checked_out.push(path_detail.path.clone());
+                    path_details.push(path_detail);
+                }
+            }
+            let (current_head, current_branch) = repo_head_and_branch(repo)?;
+            Ok(JsonCheckoutOutcome {
+                operation: "checkout",
+                current_head: current_head.clone(),
+                current_branch: current_branch.clone(),
+                head: current_head,
+                branch: current_branch,
+                target,
+                path: None,
+                paths: checked_out,
+                path_details,
+            })
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn checkout_repo_key_from_revision(
+    runtime: &Runtime,
+    file: &mut VolFile,
+    repo: &Repository,
+    rev: &str,
+    key: &str,
+) -> Result<(String, JsonPathDetail), ErrCtx> {
+    let current_key = repo.file_key(&file.tag)?;
+    match repo.plan_checkout_file_key_from_revision(rev, key.to_string()) {
+        Ok(plan) => {
+            ensure_checkout_key_preserves_untracked_path(runtime, file, repo, &plan.path)?;
             hydrate_repo_file_state(runtime, &plan.state, None)?;
             let outcome = repo.apply_checkout_file_plan(&plan)?;
             if outcome.path == current_key {
                 checkout_repo_file_state(runtime, file, &outcome.state, None)?;
             } else {
-                checkout_repo_file_state_to_path(
+                checkout_repo_file_state_to_key(
                     runtime,
-                    &repo,
+                    repo,
+                    &outcome.path,
                     &outcome.state,
-                    &physical_path,
                     None,
                 )?;
             }
-            Ok(JsonCheckoutOutcome {
-                operation: "checkout",
-                target: outcome.target,
-                path: Some(outcome.path),
-            })
+            Ok((
+                outcome.target,
+                json_path_detail(
+                    outcome.path,
+                    RepoTrackedPathKind::SqliteDatabase,
+                    RepoPathStorage::SqliteSnapshot,
+                ),
+            ))
         }
+        Err(graft::repo::RepoErr::PathNotFoundInRevision { .. }) => {
+            let plan = repo.plan_checkout_artifact_key_from_revision(rev, key.to_string())?;
+            ensure_checkout_key_preserves_untracked_path(runtime, file, repo, &plan.path)?;
+            let outcome = repo.apply_checkout_artifact_plan(&plan)?;
+            if outcome.path == current_key {
+                let volume = runtime.volume_open(None, None, None)?;
+                file.switch_volume(&volume.vid)?;
+            }
+            repo.materialize_artifact_key(&outcome.path, &outcome.state)?;
+            Ok((
+                outcome.target,
+                json_path_detail(
+                    outcome.path,
+                    artifact_checkout_path_kind(&outcome.state),
+                    artifact_checkout_path_storage(&outcome.state),
+                ),
+            ))
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn json_path_detail(
+    path: String,
+    kind: RepoTrackedPathKind,
+    storage: RepoPathStorage,
+) -> JsonPathDetail {
+    JsonPathDetail {
+        path,
+        kind: repo_tracked_path_kind_json_label(kind),
+        storage: repo_path_storage_json_label(storage),
+    }
+}
+
+fn artifact_checkout_path_kind(state: &CommitArtifactState) -> RepoTrackedPathKind {
+    match state {
+        CommitArtifactState::File { kind, .. } | CommitArtifactState::LargeFile { kind, .. } => {
+            *kind
+        }
+    }
+}
+
+fn artifact_checkout_path_storage(state: &CommitArtifactState) -> RepoPathStorage {
+    match state {
+        CommitArtifactState::File { .. } => RepoPathStorage::Inline,
+        CommitArtifactState::LargeFile { .. } => RepoPathStorage::External,
+    }
+}
+
+fn current_key_path_detail(repo: &Repository, key: &str) -> Result<JsonPathDetail, ErrCtx> {
+    if repo.index_files()?.contains_key(key) {
+        return Ok(json_path_detail(
+            key.to_string(),
+            RepoTrackedPathKind::SqliteDatabase,
+            RepoPathStorage::SqliteSnapshot,
+        ));
+    }
+
+    if let Some(state) = repo.index_artifacts()?.get(key) {
+        return Ok(json_path_detail(
+            key.to_string(),
+            artifact_checkout_path_kind(state),
+            artifact_checkout_path_storage(state),
+        ));
+    }
+    match repo.show_revision("HEAD") {
+        Ok(commit) => {
+            if commit.files.contains_key(key) {
+                return Ok(json_path_detail(
+                    key.to_string(),
+                    RepoTrackedPathKind::SqliteDatabase,
+                    RepoPathStorage::SqliteSnapshot,
+                ));
+            }
+            if let Some(state) = commit.artifacts.get(key) {
+                return Ok(json_path_detail(
+                    key.to_string(),
+                    artifact_checkout_path_kind(state),
+                    artifact_checkout_path_storage(state),
+                ));
+            }
+        }
+        Err(graft::repo::RepoErr::UnbornHead) => {}
+        Err(err) => return Err(err.into()),
+    }
+
+    Ok(json_path_detail(
+        key.to_string(),
+        RepoTrackedPathKind::BinaryFile,
+        RepoPathStorage::Inline,
+    ))
+}
+
+fn checkout_keys_for_revision_pathspec(
+    repo: &Repository,
+    rev: &str,
+    filter: &str,
+) -> Result<Vec<String>, ErrCtx> {
+    let target = repo.resolve_revision(rev)?;
+    let commit = repo.read_commit(&target)?;
+    let mut keys = BTreeSet::new();
+    keys.extend(
+        commit
+            .files
+            .keys()
+            .chain(commit.artifacts.keys())
+            .filter(|key| repo_key_matches_filter(key, filter))
+            .cloned(),
+    );
+    keys.extend(
+        repo.index_files()?
+            .keys()
+            .chain(repo.index_artifacts()?.keys())
+            .filter(|key| repo_key_matches_filter(key, filter))
+            .cloned(),
+    );
+    Ok(keys.into_iter().collect())
+}
+
+fn revision_has_repo_key(repo: &Repository, target: &str, key: &str) -> Result<bool, ErrCtx> {
+    let commit = repo.read_commit(target)?;
+    Ok(commit.files.contains_key(key) || commit.artifacts.contains_key(key))
+}
+
+fn stage_checkout_deletion_for_key(
+    runtime: &Runtime,
+    file: &mut VolFile,
+    repo: &Repository,
+    key: &str,
+) -> Result<(), ErrCtx> {
+    let current_key = repo.file_key(&file.tag)?;
+    if key == current_key {
+        if head_has_repo_key(repo, key)? {
+            repo.stage_file_removal_key(key)?;
+        } else if repo.index_has_key(key)? {
+            repo.restore_index_key_from_head(key)?;
+        } else {
+            repo.stage_file_removal_key(key)?;
+        }
+        let volume = runtime.volume_open(None, None, None)?;
+        file.switch_volume(&volume.vid)?;
+    } else {
+        remove_materialized_repo_file(repo, key)?;
+        if head_has_repo_key(repo, key)? {
+            repo.stage_file_removal_key(key)?;
+        } else if repo.index_has_key(key)? {
+            repo.restore_index_key_from_head(key)?;
+        } else {
+            repo.stage_file_removal_key(key)?;
+        }
+    }
+    Ok(())
+}
+
+fn head_has_repo_key(repo: &Repository, key: &str) -> Result<bool, ErrCtx> {
+    match repo.show_revision("HEAD") {
+        Ok(commit) => Ok(commit.files.contains_key(key) || commit.artifacts.contains_key(key)),
+        Err(graft::repo::RepoErr::UnbornHead) => Ok(false),
+        Err(err) => Err(err.into()),
     }
 }
 
@@ -2642,6 +4718,18 @@ fn format_checkout_outcome(outcome: &JsonCheckoutOutcome) -> String {
             path,
             &outcome.target[..outcome.target.len().min(12)]
         ),
+        None if !outcome.paths.is_empty() => {
+            let mut output = format!(
+                "Checked out {} paths from {}",
+                outcome.paths.len(),
+                &outcome.target[..outcome.target.len().min(12)]
+            );
+            for path in &outcome.paths {
+                output.push_str("\n  ");
+                output.push_str(path);
+            }
+            output
+        }
         None => format!(
             "HEAD detached at {}",
             &outcome.target[..outcome.target.len().min(12)]
@@ -2654,7 +4742,7 @@ fn run_repo_reset(
     file: &mut VolFile,
     rev: &str,
     mode: ResetMode,
-) -> Result<ResetOutcome, ErrCtx> {
+) -> Result<RepoResetCommandOutcome, ErrCtx> {
     if !file.is_idle() {
         return pragma_err!("cannot reset while there is an open transaction");
     }
@@ -2684,6 +4772,16 @@ fn run_repo_reset(
     } else {
         BTreeMap::new()
     };
+    let previous_artifacts = if matches!(mode, ResetMode::Hard) {
+        current_repo_artifacts_for_checkout(&repo)?
+    } else {
+        BTreeMap::new()
+    };
+    let reset_paths = if matches!(mode, ResetMode::Hard) {
+        checkout_plan_path_actions(&plan.checkout, &previous_files, &previous_artifacts)
+    } else {
+        Vec::new()
+    };
     let outcome = repo.apply_reset_plan(&plan)?;
 
     match mode {
@@ -2711,11 +4809,190 @@ fn run_repo_reset(
             }
         }
         ResetMode::Hard => {
-            checkout_repo_plan(runtime, file, &repo, &plan.checkout, &previous_files, None)?;
+            checkout_repo_plan(
+                runtime,
+                file,
+                &repo,
+                &plan.checkout,
+                &previous_files,
+                &previous_artifacts,
+                None,
+            )?;
         }
     }
 
-    Ok(outcome)
+    let branch = repo.current_branch()?;
+    Ok(RepoResetCommandOutcome { outcome, branch, paths: reset_paths })
+}
+
+fn checkout_plan_path_actions(
+    plan: &CheckoutPlan,
+    previous_files: &BTreeMap<String, CommitFileState>,
+    previous_artifacts: &BTreeMap<String, graft::repo::CommitArtifactState>,
+) -> Vec<JsonPathAction> {
+    let mut paths = BTreeMap::new();
+    for path in plan.files.keys() {
+        paths.insert(
+            path.clone(),
+            json_path_action(
+                path.clone(),
+                RepoTrackedPathKind::SqliteDatabase,
+                RepoPathStorage::SqliteSnapshot,
+                "checked_out",
+            ),
+        );
+    }
+    for (path, state) in &plan.artifacts {
+        paths.insert(
+            path.clone(),
+            json_path_action(
+                path.clone(),
+                artifact_checkout_path_kind(state),
+                artifact_checkout_path_storage(state),
+                "checked_out",
+            ),
+        );
+    }
+    for path in previous_files.keys() {
+        if plan.files.contains_key(path) || plan.artifacts.contains_key(path) {
+            continue;
+        }
+        paths.insert(
+            path.clone(),
+            json_path_action(
+                path.clone(),
+                RepoTrackedPathKind::SqliteDatabase,
+                RepoPathStorage::SqliteSnapshot,
+                "removed",
+            ),
+        );
+    }
+    for (path, state) in previous_artifacts {
+        if plan.files.contains_key(path) || plan.artifacts.contains_key(path) {
+            continue;
+        }
+        paths.insert(
+            path.clone(),
+            json_path_action(
+                path.clone(),
+                artifact_checkout_path_kind(state),
+                artifact_checkout_path_storage(state),
+                "removed",
+            ),
+        );
+    }
+    paths.into_values().collect()
+}
+
+fn merge_path_actions(
+    repo: &Repository,
+    outcome: &MergeOutcome,
+    fast_forward_plan: Option<&CheckoutPlan>,
+    previous_files: &BTreeMap<String, CommitFileState>,
+    previous_artifacts: &BTreeMap<String, graft::repo::CommitArtifactState>,
+) -> Result<Vec<JsonPathAction>, ErrCtx> {
+    let mut paths = BTreeMap::new();
+    match outcome {
+        MergeOutcome::FastForward { .. } => {
+            if let Some(plan) = fast_forward_plan {
+                return Ok(checkout_plan_path_actions(
+                    plan,
+                    previous_files,
+                    previous_artifacts,
+                ));
+            }
+        }
+        MergeOutcome::Merged { staged, conflicted, .. } => {
+            let materialized = conflicted.is_empty();
+            let index = repo.read_index()?;
+            let stage0_entries = index
+                .stage0_entries()
+                .map(|entry| (entry.path.clone(), entry.clone()))
+                .collect::<BTreeMap<_, _>>();
+            for path in staged {
+                let Some(entry) = stage0_entries.get(path) else {
+                    continue;
+                };
+                let action = if materialized {
+                    "checked_out"
+                } else {
+                    "staged"
+                };
+                let path_action = if entry.file.is_some() {
+                    json_path_action(
+                        path.clone(),
+                        RepoTrackedPathKind::SqliteDatabase,
+                        RepoPathStorage::SqliteSnapshot,
+                        action,
+                    )
+                } else if let Some(state) = &entry.artifact {
+                    json_path_action(
+                        path.clone(),
+                        artifact_checkout_path_kind(state),
+                        artifact_checkout_path_storage(state),
+                        action,
+                    )
+                } else {
+                    let (kind, storage) =
+                        previous_path_descriptor(path, previous_files, previous_artifacts);
+                    json_path_action(
+                        path.clone(),
+                        kind,
+                        storage,
+                        if materialized { "removed" } else { "staged" },
+                    )
+                };
+                paths.insert(path.clone(), path_action);
+            }
+            for path in conflicted {
+                paths.insert(
+                    path.clone(),
+                    json_path_action(
+                        path.clone(),
+                        conflict_path_kind(repo, path)?,
+                        conflict_path_storage(repo, path)?,
+                        "conflicted",
+                    ),
+                );
+            }
+        }
+        MergeOutcome::AlreadyUpToDate { .. } => {}
+    }
+    Ok(paths.into_values().collect())
+}
+
+fn previous_path_descriptor(
+    path: &str,
+    previous_files: &BTreeMap<String, CommitFileState>,
+    previous_artifacts: &BTreeMap<String, graft::repo::CommitArtifactState>,
+) -> (RepoTrackedPathKind, RepoPathStorage) {
+    if previous_files.contains_key(path) {
+        (
+            RepoTrackedPathKind::SqliteDatabase,
+            RepoPathStorage::SqliteSnapshot,
+        )
+    } else if let Some(state) = previous_artifacts.get(path) {
+        (
+            artifact_checkout_path_kind(state),
+            artifact_checkout_path_storage(state),
+        )
+    } else {
+        (RepoTrackedPathKind::BinaryFile, RepoPathStorage::Inline)
+    }
+}
+
+fn json_path_action(
+    path: String,
+    kind: RepoTrackedPathKind,
+    storage: RepoPathStorage,
+    action: &'static str,
+) -> JsonPathAction {
+    JsonPathAction {
+        path,
+        kind: repo_tracked_path_kind_json_label(kind),
+        storage: repo_path_storage_json_label(storage),
+        action,
+    }
 }
 
 fn checkout_repo_head(
@@ -2739,6 +5016,7 @@ fn checkout_repo_plan(
     repo: &Repository,
     plan: &CheckoutPlan,
     previous_files: &BTreeMap<String, CommitFileState>,
+    previous_artifacts: &BTreeMap<String, graft::repo::CommitArtifactState>,
     remote: Option<Arc<Remote>>,
 ) -> Result<(), ErrCtx> {
     let key = repo.file_key(&file.tag)?;
@@ -2760,8 +5038,9 @@ fn checkout_repo_plan(
             remote.clone(),
         )?;
     }
+    repo.materialize_artifact_checkout(&plan.artifacts, previous_artifacts, &plan.files)?;
     for path in previous_files.keys() {
-        if path == &key || plan.files.contains_key(path) {
+        if path == &key || plan.files.contains_key(path) || plan.artifacts.contains_key(path) {
             continue;
         }
         remove_materialized_repo_file(repo, path)?;
@@ -2779,17 +5058,23 @@ fn current_repo_files_for_checkout(
     }
 }
 
+fn current_repo_artifacts_for_checkout(
+    repo: &Repository,
+) -> Result<BTreeMap<String, graft::repo::CommitArtifactState>, ErrCtx> {
+    match repo.index_artifacts() {
+        Ok(artifacts) => Ok(artifacts),
+        Err(graft::repo::RepoErr::UnresolvedConflicts) => Ok(BTreeMap::new()),
+        Err(err) => Err(err.into()),
+    }
+}
+
 fn remove_materialized_repo_file(repo: &Repository, key: &str) -> Result<(), ErrCtx> {
     let path = repo.worktree().join(key);
     match std::fs::symlink_metadata(&path) {
         Ok(metadata) => {
             if !metadata.file_type().is_file() {
                 return Err(ErrCtx::PragmaErr(
-                    format!(
-                        "path `{}` is not a regular SQLite database file",
-                        path.display()
-                    )
-                    .into(),
+                    format!("path `{}` is not a regular file", path.display()).into(),
                 ));
             }
             std::fs::remove_file(path)?;
@@ -2800,36 +5085,145 @@ fn remove_materialized_repo_file(repo: &Repository, key: &str) -> Result<(), Err
     Ok(())
 }
 
+enum RestoredRepoPathState {
+    File(CommitFileState),
+    Artifact(CommitArtifactState),
+}
+
 fn restore_repo_path(
     runtime: &Runtime,
     file: &mut VolFile,
     repo: &Repository,
     spec: &RepoRestoreSpec,
-) -> Result<String, ErrCtx> {
-    let (key, physical_path) = repo_physical_path_arg(repo, &spec.path)?;
-    if spec.staged {
-        if let Some(source) = &spec.source {
-            repo.restore_index_path_from_revision(source, &physical_path)?;
-        } else {
-            repo.restore_index_path_from_head(&physical_path)?;
+) -> Result<JsonRestoreOutcome, ErrCtx> {
+    if spec.all {
+        return restore_repo_staged_all(runtime, file, repo, spec);
+    }
+
+    let path = spec.path.as_deref().ok_or_else(|| {
+        ErrCtx::PragmaErr("restore requires a path unless --staged --all is used".into())
+    })?;
+    let (key, physical_path) = repo_physical_path_arg(repo, path)?;
+    let is_directory = std::fs::symlink_metadata(&physical_path)
+        .map(|metadata| metadata.file_type().is_dir())
+        .unwrap_or(false);
+    if is_directory {
+        return restore_repo_directory(runtime, file, repo, spec, &key);
+    }
+
+    match restore_repo_key(runtime, file, repo, spec, &key) {
+        Ok(restored) => json_restore_outcome(repo, spec, vec![restored]),
+        Err(ErrCtx::PragmaErr(_)) | Err(ErrCtx::Repo(graft::repo::RepoErr::PathNotTracked(_))) => {
+            let keys = restore_keys_for_pathspec(repo, spec, &key)?;
+            if keys.is_empty() {
+                restore_repo_key(runtime, file, repo, spec, &key)
+                    .and_then(|restored| json_restore_outcome(repo, spec, vec![restored]))
+            } else {
+                restore_repo_keys(runtime, file, repo, spec, keys)
+            }
         }
-        update_worktree_state_after_index_restore(runtime, file, repo, &physical_path)?;
-        return Ok(key);
+        Err(err) => Err(err),
+    }
+}
+
+fn restore_repo_staged_all(
+    runtime: &Runtime,
+    file: &mut VolFile,
+    repo: &Repository,
+    spec: &RepoRestoreSpec,
+) -> Result<JsonRestoreOutcome, ErrCtx> {
+    let status = repo_status_for_file(runtime, file, repo)?;
+    let keys = status
+        .staged_changes
+        .into_iter()
+        .filter(|change| spec.kind.is_none_or(|kind| change.kind == kind))
+        .map(|change| change.path)
+        .collect();
+    restore_repo_keys(runtime, file, repo, spec, keys)
+}
+
+fn restore_repo_directory(
+    runtime: &Runtime,
+    file: &mut VolFile,
+    repo: &Repository,
+    spec: &RepoRestoreSpec,
+    key: &str,
+) -> Result<JsonRestoreOutcome, ErrCtx> {
+    let keys = restore_keys_for_pathspec(repo, spec, key)?;
+    if keys.is_empty() {
+        return Err(ErrCtx::Repo(graft::repo::RepoErr::PathNotTracked(
+            if key.is_empty() {
+                ".".to_string()
+            } else {
+                key.to_string()
+            },
+        )));
+    }
+    restore_repo_keys(runtime, file, repo, spec, keys)
+}
+
+fn restore_repo_keys(
+    runtime: &Runtime,
+    file: &mut VolFile,
+    repo: &Repository,
+    spec: &RepoRestoreSpec,
+    keys: Vec<String>,
+) -> Result<JsonRestoreOutcome, ErrCtx> {
+    let mut restored = Vec::with_capacity(keys.len());
+    for key in keys {
+        restored.push(restore_repo_key(runtime, file, repo, spec, &key)?);
+    }
+    json_restore_outcome(repo, spec, restored)
+}
+
+fn restore_repo_key(
+    runtime: &Runtime,
+    file: &mut VolFile,
+    repo: &Repository,
+    spec: &RepoRestoreSpec,
+    key: &str,
+) -> Result<JsonPathDetail, ErrCtx> {
+    if spec.staged {
+        let restored = restore_key_path_detail(repo, spec, key)?;
+        if let Some(source) = &spec.source {
+            repo.restore_index_key_from_revision(source, key)?;
+        } else {
+            repo.restore_index_key_from_head(key)?;
+        }
+        update_worktree_state_after_index_restore_key(runtime, file, repo, key)?;
+        return Ok(restored);
     }
 
     let restored = if let Some(source) = &spec.source {
-        repo.file_from_revision(source, &physical_path)?
+        let source_commit = repo.show_revision(source)?;
+        if let Some(state) = source_commit.files.get(key).cloned() {
+            Some(RestoredRepoPathState::File(state))
+        } else {
+            source_commit
+                .artifacts
+                .get(key)
+                .cloned()
+                .map(RestoredRepoPathState::Artifact)
+        }
     } else {
-        repo.index_file(&physical_path)?
+        if let Some(state) = repo.index_files()?.get(key).cloned() {
+            Some(RestoredRepoPathState::File(state))
+        } else {
+            repo.index_artifacts()?
+                .get(key)
+                .cloned()
+                .map(RestoredRepoPathState::Artifact)
+        }
     };
 
     if restored.is_none() {
         let can_restore_deletion = if spec.source.is_some() {
-            repo.index_file(&physical_path)?.is_some()
-                || repo.index_has_entry(&physical_path)?
-                || repo.head_file(&physical_path)?.is_some()
+            repo.index_files()?.contains_key(key)
+                || repo.index_artifacts()?.contains_key(key)
+                || repo.index_has_key(key)?
+                || head_has_repo_key(repo, key)?
         } else {
-            repo.index_has_entry(&physical_path)?
+            repo.index_has_key(key)?
         };
         if !can_restore_deletion {
             return Err(ErrCtx::PragmaErr(
@@ -2838,22 +5232,206 @@ fn restore_repo_path(
         }
     }
 
+    let path_detail = restored_repo_path_detail(repo, key, restored.as_ref())?;
     let current_key = repo.file_key(&file.tag)?;
     if key == current_key {
-        if let Some(state) = &restored {
+        if let Some(RestoredRepoPathState::File(state)) = &restored {
             checkout_repo_file_state(runtime, file, state, None)?;
+        } else if let Some(RestoredRepoPathState::Artifact(state)) = &restored {
+            let volume = runtime.volume_open(None, None, None)?;
+            file.switch_volume(&volume.vid)?;
+            repo.materialize_artifact_key(&key, state)?;
         } else {
             let volume = runtime.volume_open(None, None, None)?;
             file.switch_volume(&volume.vid)?;
         }
-    } else if let Some(state) = &restored {
-        checkout_repo_file_state_to_path(runtime, repo, state, &physical_path, None)?;
+    } else if let Some(RestoredRepoPathState::File(state)) = &restored {
+        checkout_repo_file_state_to_key(runtime, repo, key, state, None)?;
+    } else if let Some(RestoredRepoPathState::Artifact(state)) = &restored {
+        repo.materialize_artifact_key(key, state)?;
     } else {
-        remove_materialized_repo_file(repo, &key)?;
+        remove_materialized_repo_file(repo, key)?;
     }
 
-    update_restored_worktree_state(runtime, repo, &physical_path, restored.as_ref())?;
-    Ok(key)
+    update_restored_worktree_state_key(runtime, repo, key, restored.as_ref())?;
+    Ok(path_detail)
+}
+
+fn json_restore_outcome(
+    repo: &Repository,
+    spec: &RepoRestoreSpec,
+    path_details: Vec<JsonPathDetail>,
+) -> Result<JsonRestoreOutcome, ErrCtx> {
+    let paths = path_details
+        .iter()
+        .map(|path| path.path.clone())
+        .collect::<Vec<_>>();
+    let path = match paths.as_slice() {
+        [path] => Some(path.clone()),
+        _ => None,
+    };
+    let (current_head, current_branch) = repo_head_and_branch(repo)?;
+    Ok(JsonRestoreOutcome {
+        operation: "restore",
+        current_head,
+        current_branch,
+        source: spec.source.clone(),
+        staged: spec.staged,
+        all: spec.all,
+        kind: spec.kind.map(repo_tracked_path_kind_json_label),
+        path,
+        paths: if path_details.len() == 1 {
+            Vec::new()
+        } else {
+            paths
+        },
+        path_details,
+    })
+}
+
+fn format_restore_outcome(outcome: &JsonRestoreOutcome) -> String {
+    let restored = match &outcome.path {
+        Some(path) => path.clone(),
+        None => format_repo_path_list(
+            outcome.path_details.len(),
+            outcome
+                .path_details
+                .iter()
+                .map(|path| path.path.clone())
+                .collect(),
+        ),
+    };
+    format!("Restored {restored}")
+}
+
+fn restored_repo_path_detail(
+    repo: &Repository,
+    key: &str,
+    restored: Option<&RestoredRepoPathState>,
+) -> Result<JsonPathDetail, ErrCtx> {
+    match restored {
+        Some(RestoredRepoPathState::File(_)) => Ok(json_path_detail(
+            key.to_string(),
+            RepoTrackedPathKind::SqliteDatabase,
+            RepoPathStorage::SqliteSnapshot,
+        )),
+        Some(RestoredRepoPathState::Artifact(state)) => Ok(json_path_detail(
+            key.to_string(),
+            artifact_checkout_path_kind(state),
+            artifact_checkout_path_storage(state),
+        )),
+        None => current_key_path_detail(repo, key),
+    }
+}
+
+fn restore_key_path_detail(
+    repo: &Repository,
+    spec: &RepoRestoreSpec,
+    key: &str,
+) -> Result<JsonPathDetail, ErrCtx> {
+    if let Some(source) = &spec.source {
+        let source_commit = repo.show_revision(source)?;
+        if source_commit.files.contains_key(key) {
+            return Ok(json_path_detail(
+                key.to_string(),
+                RepoTrackedPathKind::SqliteDatabase,
+                RepoPathStorage::SqliteSnapshot,
+            ));
+        }
+        if let Some(state) = source_commit.artifacts.get(key) {
+            return Ok(json_path_detail(
+                key.to_string(),
+                artifact_checkout_path_kind(state),
+                artifact_checkout_path_storage(state),
+            ));
+        }
+        return current_key_path_detail(repo, key);
+    }
+
+    if spec.staged {
+        match repo.show_revision("HEAD") {
+            Ok(head) => {
+                if head.files.contains_key(key) {
+                    return Ok(json_path_detail(
+                        key.to_string(),
+                        RepoTrackedPathKind::SqliteDatabase,
+                        RepoPathStorage::SqliteSnapshot,
+                    ));
+                }
+                if let Some(state) = head.artifacts.get(key) {
+                    return Ok(json_path_detail(
+                        key.to_string(),
+                        artifact_checkout_path_kind(state),
+                        artifact_checkout_path_storage(state),
+                    ));
+                }
+            }
+            Err(graft::repo::RepoErr::UnbornHead) => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    current_key_path_detail(repo, key)
+}
+
+fn restore_keys_for_pathspec(
+    repo: &Repository,
+    spec: &RepoRestoreSpec,
+    filter: &str,
+) -> Result<Vec<String>, ErrCtx> {
+    let mut keys = BTreeSet::new();
+
+    if let Some(source) = &spec.source {
+        let source_commit = repo.show_revision(source)?;
+        keys.extend(
+            source_commit
+                .files
+                .keys()
+                .chain(source_commit.artifacts.keys())
+                .filter(|key| repo_key_matches_filter(key, filter))
+                .cloned(),
+        );
+    } else if spec.staged {
+        if let Ok(head) = repo.show_revision("HEAD") {
+            keys.extend(
+                head.files
+                    .keys()
+                    .chain(head.artifacts.keys())
+                    .filter(|key| repo_key_matches_filter(key, filter))
+                    .cloned(),
+            );
+        }
+    }
+
+    keys.extend(
+        repo.index_files()?
+            .keys()
+            .chain(repo.index_artifacts()?.keys())
+            .filter(|key| repo_key_matches_filter(key, filter))
+            .cloned(),
+    );
+    keys.extend(
+        repo.read_index()?
+            .stage0_entries()
+            .filter(|entry| repo_key_matches_filter(&entry.path, filter))
+            .map(|entry| entry.path.clone()),
+    );
+
+    Ok(keys.into_iter().collect())
+}
+
+fn format_repo_path_list(count: usize, paths: Vec<String>) -> String {
+    match paths.as_slice() {
+        [path] => path.clone(),
+        _ => {
+            let mut output = format!("{count} paths");
+            for path in paths {
+                output.push_str("\n  ");
+                output.push_str(&path);
+            }
+            output
+        }
+    }
 }
 
 fn export_repo_path(
@@ -2889,52 +5467,56 @@ fn export_repo_path(
     Ok(key)
 }
 
-fn update_worktree_state_after_index_restore(
+fn update_worktree_state_after_index_restore_key(
     runtime: &Runtime,
     file: &VolFile,
     repo: &Repository,
-    path: &Path,
+    key: &str,
 ) -> Result<(), ErrCtx> {
-    if repo.file_key(path)? != repo.file_key(&file.tag)? {
-        repo.clear_dirty_path(path)?;
+    if key != repo.file_key(&file.tag)? {
+        repo.clear_dirty_key(key)?;
         return Ok(());
     }
 
     let worktree_state = current_repo_file_state(runtime, file)?;
-    let index_state = repo.index_file(path)?;
+    let index_state = repo.index_files()?.get(key).cloned();
     let matches_index = match index_state.as_ref() {
         Some(index_state) => repo_file_state_content_eq(runtime, &worktree_state, index_state)?,
         None => false,
     };
     if matches_index {
-        repo.clear_dirty_path(path)?;
+        repo.clear_dirty_key(key)?;
     } else {
-        repo.mark_dirty_path(path)?;
+        repo.mark_dirty_key(key.to_string())?;
     }
     Ok(())
 }
 
-fn update_restored_worktree_state(
+fn update_restored_worktree_state_key(
     runtime: &Runtime,
     repo: &Repository,
-    path: &Path,
-    restored: Option<&CommitFileState>,
+    key: &str,
+    restored: Option<&RestoredRepoPathState>,
 ) -> Result<(), ErrCtx> {
-    let index_state = repo.index_file(path)?;
-    let matches_index = match (restored, index_state.as_ref()) {
-        (Some(restored), Some(index_state)) => {
+    let index_state = repo.index_files()?.get(key).cloned();
+    let index_artifact = repo.index_artifacts()?.get(key).cloned();
+    let matches_index = match (restored, index_state.as_ref(), index_artifact.as_ref()) {
+        (Some(RestoredRepoPathState::File(restored)), Some(index_state), None) => {
             repo_file_state_content_eq(runtime, restored, index_state)?
         }
-        (None, None) => true,
+        (Some(RestoredRepoPathState::Artifact(restored)), None, Some(index_artifact)) => {
+            restored == index_artifact
+        }
+        (None, None, None) => true,
         _ => false,
     };
 
     if matches_index {
-        repo.clear_dirty_path(path)?;
+        repo.clear_dirty_key(key)?;
     } else if restored.is_none() {
-        repo.mark_deleted_path(path)?;
+        repo.mark_deleted_key(key.to_string())?;
     } else {
-        repo.mark_dirty_path(path)?;
+        repo.mark_dirty_key(key.to_string())?;
     }
     Ok(())
 }
@@ -2964,6 +5546,30 @@ fn checkout_repo_file_state_to_path(
     remote: Option<Arc<Remote>>,
 ) -> Result<(), ErrCtx> {
     let key = repo.file_key(path)?;
+    let path = repo.worktree().join(key);
+    if let Ok(metadata) = std::fs::symlink_metadata(&path)
+        && !metadata.file_type().is_file()
+    {
+        return Err(ErrCtx::PragmaErr(
+            format!(
+                "path `{}` is not a regular SQLite database file",
+                path.display()
+            )
+            .into(),
+        ));
+    }
+
+    hydrate_repo_file_state(runtime, state, remote)?;
+    write_repo_file_state_to_path(runtime, state, &path)
+}
+
+fn checkout_repo_file_state_to_key(
+    runtime: &Runtime,
+    repo: &Repository,
+    key: &str,
+    state: &CommitFileState,
+    remote: Option<Arc<Remote>>,
+) -> Result<(), ErrCtx> {
     let path = repo.worktree().join(key);
     if let Ok(metadata) = std::fs::symlink_metadata(&path)
         && !metadata.file_type().is_file()
@@ -3082,12 +5688,21 @@ fn checkout_merge_outcome(
     outcome: &MergeOutcome,
     fast_forward_plan: Option<&CheckoutPlan>,
     previous_files: &BTreeMap<String, CommitFileState>,
+    previous_artifacts: &BTreeMap<String, graft::repo::CommitArtifactState>,
     remote: Option<Arc<Remote>>,
 ) -> Result<(), ErrCtx> {
     match outcome {
         MergeOutcome::FastForward { .. } => {
             if let Some(plan) = fast_forward_plan {
-                checkout_repo_plan(runtime, file, repo, plan, previous_files, remote)?;
+                checkout_repo_plan(
+                    runtime,
+                    file,
+                    repo,
+                    plan,
+                    previous_files,
+                    previous_artifacts,
+                    remote,
+                )?;
             } else {
                 checkout_repo_head(runtime, file, repo, remote)?;
             }
@@ -3103,6 +5718,8 @@ fn checkout_merge_outcome(
                 if entry.path == key {
                     if let Some(state) = &entry.file {
                         checkout_repo_file_state(runtime, file, state, remote.clone())?;
+                    } else if let Some(state) = &entry.artifact {
+                        repo.materialize_artifact_key(&entry.path, state)?;
                     } else {
                         let volume = runtime.volume_open(None, None, None)?;
                         file.switch_volume(&volume.vid)?;
@@ -3115,6 +5732,8 @@ fn checkout_merge_outcome(
                         &repo.worktree().join(&entry.path),
                         remote.clone(),
                     )?;
+                } else if let Some(state) = &entry.artifact {
+                    repo.materialize_artifact_key(&entry.path, state)?;
                 } else {
                     remove_materialized_repo_file(repo, &entry.path)?;
                 }
@@ -4003,24 +6622,40 @@ fn parse_repo_diff_arg(arg: Option<&str>) -> Result<RepoDiffSpec, PragmaErr> {
     let Some(arg) = arg else {
         return Ok(RepoDiffSpec {
             mode: DiffMode::Default,
+            kind: None,
             target: RepoDiffTarget::Worktree { path: None },
         });
     };
-    let raw_parts: Vec<&str> = arg.split_whitespace().collect();
+    let raw_parts = split_pragma_words(arg)?;
     let mut mode = DiffMode::Default;
+    let mut kind = None;
     let mut parts = Vec::new();
     let mut in_path = false;
-    for part in raw_parts {
+    let mut index = 0;
+    while index < raw_parts.len() {
+        let part = &raw_parts[index];
         if !in_path && part == "--" {
             in_path = true;
-            parts.push(part);
+            parts.push(part.as_str());
+            index += 1;
         } else if !in_path && part == "--rows" {
             if mode == DiffMode::Rows {
                 return Err(pragma_fail("`--rows` may only be specified once"));
             }
             mode = DiffMode::Rows;
+            index += 1;
+        } else if !in_path && part == "--kind" {
+            if kind.is_some() {
+                return Err(pragma_fail("diff accepts --kind only once"));
+            }
+            let Some(value) = raw_parts.get(index + 1) else {
+                return Err(pragma_fail("diff --kind requires a value"));
+            };
+            kind = Some(parse_repo_tracked_path_kind_arg(value)?);
+            index += 2;
         } else {
-            parts.push(part);
+            parts.push(part.as_str());
+            index += 1;
         }
     }
     let target = match parts.as_slice() {
@@ -4053,7 +6688,7 @@ fn parse_repo_diff_arg(arg: Option<&str>) -> Result<RepoDiffSpec, PragmaErr> {
             ));
         }
     };
-    Ok(RepoDiffSpec { mode, target })
+    Ok(RepoDiffSpec { mode, kind, target })
 }
 
 fn parse_volume_diff_arg(arg: &str) -> Result<(LSN, LSN, DiffMode), PragmaErr> {
@@ -4084,6 +6719,442 @@ fn parse_debug_diff_lsn_arg(arg: &str) -> Result<(LogRef, LogRef), PragmaErr> {
     }
 }
 
+fn parse_repo_add_arg(arg: Option<&str>) -> Result<RepoAddSpec, PragmaErr> {
+    let Some(arg) = arg else {
+        return Ok(RepoAddSpec {
+            path: None,
+            force: false,
+            all: false,
+            kind: None,
+        });
+    };
+    let arg = arg.trim();
+    if arg.is_empty() {
+        return Ok(RepoAddSpec {
+            path: None,
+            force: false,
+            all: false,
+            kind: None,
+        });
+    }
+
+    if arg.split_whitespace().any(|part| part == "--kind") {
+        let parts = split_pragma_words(arg)?;
+        let mut all = false;
+        let mut kind = None;
+        let mut index = 0;
+        while index < parts.len() {
+            match parts[index].as_str() {
+                "--all" | "-A" => {
+                    if all {
+                        return Err(pragma_fail("add accepts --all only once"));
+                    }
+                    all = true;
+                    index += 1;
+                }
+                "--kind" => {
+                    if kind.is_some() {
+                        return Err(pragma_fail("add accepts --kind only once"));
+                    }
+                    let Some(value) = parts.get(index + 1) else {
+                        return Err(pragma_fail("add --kind requires a value"));
+                    };
+                    kind = Some(parse_repo_tracked_path_kind_arg(value)?);
+                    index += 2;
+                }
+                value => {
+                    return Err(pragma_fail(format!(
+                        "unknown add argument `{value}`; `--kind` may only be used with `--all`"
+                    )));
+                }
+            }
+        }
+        if !all {
+            return Err(pragma_fail("add --kind requires --all"));
+        }
+        return Ok(RepoAddSpec {
+            path: None,
+            force: false,
+            all: true,
+            kind,
+        });
+    }
+
+    if arg == "--all" || arg == "-A" {
+        return Ok(RepoAddSpec {
+            path: None,
+            force: false,
+            all: true,
+            kind: None,
+        });
+    }
+
+    for flag in ["--force", "-f"] {
+        if arg == flag {
+            return Ok(RepoAddSpec {
+                path: None,
+                force: true,
+                all: false,
+                kind: None,
+            });
+        }
+        if let Some(path) = arg.strip_prefix(&format!("{flag} -- ")) {
+            return Ok(RepoAddSpec {
+                path: Some(PathBuf::from(path)),
+                force: true,
+                all: false,
+                kind: None,
+            });
+        }
+        if let Some(path) = arg.strip_prefix(&format!("{flag} ")) {
+            if path == "--all" || path == "-A" {
+                return Err(pragma_fail(
+                    "argument must be in the form: `[--all|-A]` or `[--force] [path]`",
+                ));
+            }
+            return Ok(RepoAddSpec {
+                path: Some(PathBuf::from(path)),
+                force: true,
+                all: false,
+                kind: None,
+            });
+        }
+    }
+
+    if arg.starts_with('-') {
+        return Err(pragma_fail(
+            "argument must be in the form: `[--all|-A]` or `[--force] [path]`",
+        ));
+    }
+
+    Ok(RepoAddSpec {
+        path: Some(PathBuf::from(arg)),
+        force: false,
+        all: false,
+        kind: None,
+    })
+}
+
+fn parse_repo_remove_arg(arg: Option<&str>) -> Result<RepoRemoveSpec, PragmaErr> {
+    let Some(arg) = arg else {
+        return Ok(RepoRemoveSpec { path: None, cached: false });
+    };
+    let parts = split_pragma_words(arg.trim())?;
+    if parts.is_empty() {
+        return Ok(RepoRemoveSpec { path: None, cached: false });
+    }
+
+    let mut cached = false;
+    let mut path = Vec::new();
+    let mut index = 0;
+    let mut in_path = false;
+    while index < parts.len() {
+        if in_path {
+            path.push(parts[index].clone());
+            index += 1;
+            continue;
+        }
+        match parts[index].as_str() {
+            "--" => {
+                in_path = true;
+                index += 1;
+            }
+            "--cached" => {
+                if cached {
+                    return Err(pragma_fail("rm accepts --cached only once"));
+                }
+                cached = true;
+                index += 1;
+            }
+            value if value.starts_with('-') && path.is_empty() => {
+                return Err(pragma_fail(format!("unknown rm argument `{value}`")));
+            }
+            _ => {
+                path.extend(parts[index..].iter().cloned());
+                break;
+            }
+        }
+    }
+
+    Ok(RepoRemoveSpec {
+        path: (!path.is_empty()).then(|| PathBuf::from(path.join(" "))),
+        cached,
+    })
+}
+
+fn parse_repo_audit_arg(arg: Option<&str>) -> Result<RepoAuditSpec, PragmaErr> {
+    let Some(arg) = arg else {
+        return Ok(RepoAuditSpec { repair: false, remote: None });
+    };
+    let parts = split_pragma_words(arg.trim())?;
+    if parts.is_empty() {
+        return Ok(RepoAuditSpec { repair: false, remote: None });
+    }
+
+    let mut repair = false;
+    let mut remote = None;
+    let mut index = 0;
+    while index < parts.len() {
+        match parts[index].as_str() {
+            "--repair" => {
+                if repair {
+                    return Err(pragma_fail("audit accepts --repair only once"));
+                }
+                repair = true;
+                index += 1;
+            }
+            value if value.starts_with('-') => {
+                return Err(pragma_fail(format!("unknown audit argument `{value}`")));
+            }
+            value => {
+                if remote.is_some() {
+                    return Err(pragma_fail("audit --repair accepts at most one remote"));
+                }
+                remote = Some(value.to_string());
+                index += 1;
+            }
+        }
+    }
+
+    if remote.is_some() && !repair {
+        return Err(pragma_fail("audit remote requires --repair"));
+    }
+
+    Ok(RepoAuditSpec { repair, remote })
+}
+
+fn parse_lfs_fetch_arg(arg: Option<&str>) -> Result<LargeFileFetchSpec, PragmaErr> {
+    let Some(arg) = arg else {
+        return Ok(LargeFileFetchSpec { remote: None, rev: None });
+    };
+    let parts = split_pragma_words(arg.trim())?;
+    if parts.is_empty() {
+        return Ok(LargeFileFetchSpec { remote: None, rev: None });
+    }
+
+    let mut remote = None;
+    let mut rev = None;
+    let mut index = 0;
+    while index < parts.len() {
+        match parts[index].as_str() {
+            "--remote" => {
+                if remote.is_some() {
+                    return Err(pragma_fail("payload fetch accepts --remote only once"));
+                }
+                let Some(value) = parts.get(index + 1) else {
+                    return Err(pragma_fail("payload fetch --remote requires a remote name"));
+                };
+                if value.starts_with('-') {
+                    return Err(pragma_fail("payload fetch --remote requires a remote name"));
+                }
+                remote = Some(value.clone());
+                index += 2;
+            }
+            value if value.starts_with('-') => {
+                return Err(pragma_fail(format!(
+                    "unknown payload fetch argument `{value}`"
+                )));
+            }
+            value => {
+                if rev.is_some() {
+                    return Err(pragma_fail("payload fetch accepts at most one revision"));
+                }
+                rev = Some(value.to_string());
+                index += 1;
+            }
+        }
+    }
+
+    Ok(LargeFileFetchSpec { remote, rev })
+}
+
+fn parse_lfs_status_arg(arg: Option<&str>) -> Result<LargeFileStatusSpec, PragmaErr> {
+    let Some(arg) = arg else {
+        return Ok(LargeFileStatusSpec { rev: None });
+    };
+    let parts = split_pragma_words(arg.trim())?;
+    if parts.is_empty() {
+        return Ok(LargeFileStatusSpec { rev: None });
+    }
+    if parts.len() > 1 {
+        return Err(pragma_fail("payload status accepts at most one revision"));
+    }
+    let rev = &parts[0];
+    if rev.starts_with('-') {
+        return Err(pragma_fail(format!(
+            "unknown payload status argument `{rev}`"
+        )));
+    }
+    Ok(LargeFileStatusSpec { rev: Some(rev.to_string()) })
+}
+
+fn parse_lfs_prune_arg(arg: Option<&str>) -> Result<LargeFilePruneSpec, PragmaErr> {
+    let Some(arg) = arg else {
+        return Ok(LargeFilePruneSpec { dry_run: true });
+    };
+    let parts = split_pragma_words(arg.trim())?;
+    if parts.is_empty() {
+        return Ok(LargeFilePruneSpec { dry_run: true });
+    }
+
+    let mut dry_run = None;
+    for part in parts {
+        match part.as_str() {
+            "--dry-run" => {
+                if dry_run.replace(true).is_some() {
+                    return Err(pragma_fail("payload prune accepts only one mode flag"));
+                }
+            }
+            "--force" => {
+                if dry_run.replace(false).is_some() {
+                    return Err(pragma_fail("payload prune accepts only one mode flag"));
+                }
+            }
+            value => {
+                return Err(pragma_fail(format!(
+                    "unknown payload prune argument `{value}`; expected `--dry-run` or `--force`"
+                )));
+            }
+        }
+    }
+
+    Ok(LargeFilePruneSpec { dry_run: dry_run.unwrap_or(true) })
+}
+
+fn parse_status_arg(arg: Option<&str>) -> Result<StatusSpec, PragmaErr> {
+    let Some(arg) = arg else {
+        return Ok(StatusSpec { kind: None });
+    };
+    let parts = split_pragma_words(arg)?;
+    let mut kind = None;
+    let mut index = 0;
+    while index < parts.len() {
+        match parts[index].as_str() {
+            "--kind" => {
+                if kind.is_some() {
+                    return Err(pragma_fail("status accepts --kind only once"));
+                }
+                let Some(value) = parts.get(index + 1) else {
+                    return Err(pragma_fail("status --kind requires a value"));
+                };
+                kind = Some(parse_repo_tracked_path_kind_arg(value)?);
+                index += 2;
+            }
+            value => {
+                return Err(pragma_fail(format!(
+                    "unknown status argument `{value}`; expected `--kind <kind>`"
+                )));
+            }
+        }
+    }
+    Ok(StatusSpec { kind })
+}
+
+fn parse_ls_files_arg(arg: Option<&str>) -> Result<LsFilesSpec, PragmaErr> {
+    let Some(arg) = arg else {
+        return Ok(LsFilesSpec {
+            stage: false,
+            details: false,
+            others: false,
+            kind: None,
+        });
+    };
+    let parts = split_pragma_words(arg)?;
+    let mut stage = false;
+    let mut details = false;
+    let mut others = false;
+    let mut kind = None;
+    let mut index = 0;
+    while index < parts.len() {
+        match parts[index].as_str() {
+            "--stage" | "-s" => {
+                if stage {
+                    return Err(pragma_fail("ls-files accepts --stage only once"));
+                }
+                stage = true;
+                index += 1;
+            }
+            "--details" => {
+                if details {
+                    return Err(pragma_fail("ls-files accepts --details only once"));
+                }
+                details = true;
+                index += 1;
+            }
+            "--others" => {
+                if others {
+                    return Err(pragma_fail("ls-files accepts --others only once"));
+                }
+                others = true;
+                index += 1;
+            }
+            "--kind" => {
+                if kind.is_some() {
+                    return Err(pragma_fail("ls-files accepts --kind only once"));
+                }
+                let Some(value) = parts.get(index + 1) else {
+                    return Err(pragma_fail("ls-files --kind requires a value"));
+                };
+                kind = Some(parse_repo_tracked_path_kind_arg(value)?);
+                index += 2;
+            }
+            value => {
+                return Err(pragma_fail(format!(
+                    "unknown ls-files argument `{value}`; expected `--stage`, `--details`, `--others`, or `--kind <kind>`"
+                )));
+            }
+        }
+    }
+    if stage && details {
+        return Err(pragma_fail(
+            "ls-files --details cannot be used with --stage",
+        ));
+    }
+    if others && stage {
+        return Err(pragma_fail("ls-files --others cannot be used with --stage"));
+    }
+    if others && details {
+        return Err(pragma_fail(
+            "ls-files --others cannot be used with --details",
+        ));
+    }
+    Ok(LsFilesSpec { stage, details, others, kind })
+}
+
+fn parse_repo_tracked_path_kind_arg(value: &str) -> Result<RepoTrackedPathKind, PragmaErr> {
+    match value {
+        "sqlite" | "sqlite_database" | "sqlite-database" | "database" | "db" => {
+            Ok(RepoTrackedPathKind::SqliteDatabase)
+        }
+        "text" | "text_file" | "text-file" => Ok(RepoTrackedPathKind::TextFile),
+        "binary" | "binary_file" | "binary-file" => Ok(RepoTrackedPathKind::BinaryFile),
+        _ => Err(pragma_fail(
+            "--kind must be one of sqlite_database, text_file, or binary_file",
+        )),
+    }
+}
+
+fn parse_repo_config_set_arg(arg: &str) -> Result<(String, String), PragmaErr> {
+    let arg = arg.trim();
+    if let Some((key, value)) = arg.split_once(" --") {
+        return config_set_parts(key, value);
+    }
+
+    let mut parts = arg.splitn(2, char::is_whitespace);
+    let key = parts.next().unwrap_or_default();
+    let value = parts.next().unwrap_or_default();
+    config_set_parts(key, value)
+}
+
+fn config_set_parts(key: &str, value: &str) -> Result<(String, String), PragmaErr> {
+    let key = key.trim();
+    let value = value.trim();
+    if key.is_empty() || value.is_empty() {
+        return Err(pragma_fail("argument must be in the form: `key -- value`"));
+    }
+    Ok((key.to_string(), value.to_string()))
+}
+
 fn parse_repo_checkout_arg(arg: &str) -> Result<RepoCheckoutSpec, PragmaErr> {
     let parts: Vec<&str> = arg.split_whitespace().collect();
     match parts.as_slice() {
@@ -4102,76 +7173,93 @@ fn parse_repo_checkout_arg(arg: &str) -> Result<RepoCheckoutSpec, PragmaErr> {
 }
 
 fn parse_repo_restore_arg(arg: &str) -> Result<RepoRestoreSpec, PragmaErr> {
-    let parts: Vec<&str> = arg.split_whitespace().collect();
-    match parts.as_slice() {
-        [
-            "--staged" | "--cached",
-            "--source" | "-s",
-            source,
-            "--",
-            path @ ..,
-        ]
-        | [
-            "--source" | "-s",
-            source,
-            "--staged" | "--cached",
-            "--",
-            path @ ..,
-        ] if !path.is_empty() => Ok(RepoRestoreSpec {
-            source: Some((*source).to_string()),
-            staged: true,
-            path: PathBuf::from(path.join(" ")),
-        }),
-        [
-            "--staged" | "--cached",
-            "--source" | "-s",
-            source,
-            path @ ..,
-        ]
-        | [
-            "--source" | "-s",
-            source,
-            "--staged" | "--cached",
-            path @ ..,
-        ] if !path.is_empty() => Ok(RepoRestoreSpec {
-            source: Some((*source).to_string()),
-            staged: true,
-            path: PathBuf::from(path.join(" ")),
-        }),
-        ["--staged" | "--cached", "--", path @ ..] if !path.is_empty() => Ok(RepoRestoreSpec {
-            source: None,
-            staged: true,
-            path: PathBuf::from(path.join(" ")),
-        }),
-        ["--staged" | "--cached", path @ ..] if !path.is_empty() => Ok(RepoRestoreSpec {
-            source: None,
-            staged: true,
-            path: PathBuf::from(path.join(" ")),
-        }),
-        ["--source" | "-s", source, "--", path @ ..] if !path.is_empty() => Ok(RepoRestoreSpec {
-            source: Some((*source).to_string()),
-            staged: false,
-            path: PathBuf::from(path.join(" ")),
-        }),
-        ["--source" | "-s", source, path @ ..] if !path.is_empty() => Ok(RepoRestoreSpec {
-            source: Some((*source).to_string()),
-            staged: false,
-            path: PathBuf::from(path.join(" ")),
-        }),
-        ["--", path @ ..] if !path.is_empty() => Ok(RepoRestoreSpec {
-            source: None,
-            staged: false,
-            path: PathBuf::from(path.join(" ")),
-        }),
-        path @ [_first, ..] => Ok(RepoRestoreSpec {
-            source: None,
-            staged: false,
-            path: PathBuf::from(path.join(" ")),
-        }),
-        _ => Err(pragma_fail(
-            "argument must be in the form: `[--staged] [--source rev] path`",
-        )),
+    let parts = split_pragma_words(arg)?;
+    let mut source = None;
+    let mut staged = false;
+    let mut all = false;
+    let mut kind = None;
+    let mut path = Vec::new();
+    let mut index = 0;
+    let mut in_path = false;
+
+    while index < parts.len() {
+        if in_path {
+            path.push(parts[index].clone());
+            index += 1;
+            continue;
+        }
+
+        match parts[index].as_str() {
+            "--" => {
+                in_path = true;
+                index += 1;
+            }
+            "--staged" | "--cached" => {
+                if staged {
+                    return Err(pragma_fail("restore accepts --staged only once"));
+                }
+                staged = true;
+                index += 1;
+            }
+            "--source" | "-s" => {
+                if source.is_some() {
+                    return Err(pragma_fail("restore accepts --source only once"));
+                }
+                let Some(value) = parts.get(index + 1) else {
+                    return Err(pragma_fail("restore --source requires a revision"));
+                };
+                source = Some(value.clone());
+                index += 2;
+            }
+            "--all" | "-A" => {
+                if all {
+                    return Err(pragma_fail("restore accepts --all only once"));
+                }
+                all = true;
+                index += 1;
+            }
+            "--kind" => {
+                if kind.is_some() {
+                    return Err(pragma_fail("restore accepts --kind only once"));
+                }
+                let Some(value) = parts.get(index + 1) else {
+                    return Err(pragma_fail("restore --kind requires a value"));
+                };
+                kind = Some(parse_repo_tracked_path_kind_arg(value)?);
+                index += 2;
+            }
+            value if value.starts_with('-') && path.is_empty() => {
+                return Err(pragma_fail(format!("unknown restore argument `{value}`")));
+            }
+            _ => {
+                path.extend(parts[index..].iter().cloned());
+                break;
+            }
+        }
     }
+
+    if all {
+        if !staged {
+            return Err(pragma_fail("restore --all requires --staged"));
+        }
+        if !path.is_empty() {
+            return Err(pragma_fail("restore --all does not accept a path"));
+        }
+    } else if kind.is_some() {
+        return Err(pragma_fail("restore --kind requires --all"));
+    } else if path.is_empty() {
+        return Err(pragma_fail(
+            "argument must be in the form: `[--staged] [--source rev] path` or `--staged --all [--kind kind]`",
+        ));
+    }
+
+    Ok(RepoRestoreSpec {
+        source,
+        staged,
+        all,
+        kind,
+        path: (!path.is_empty()).then(|| PathBuf::from(path.join(" "))),
+    })
 }
 
 fn split_pragma_words(arg: &str) -> Result<Vec<String>, PragmaErr> {
@@ -4233,6 +7321,76 @@ fn split_pragma_words(arg: &str) -> Result<Vec<String>, PragmaErr> {
         words.push(current);
     }
     Ok(words)
+}
+
+fn parse_json_log_arg(arg: Option<&str>) -> Result<JsonLogMode, PragmaErr> {
+    let Some(arg) = arg else {
+        return Ok(JsonLogMode::LegacyArray);
+    };
+    let words = split_pragma_words(arg)?;
+    match words.as_slice() {
+        [] => Ok(JsonLogMode::LegacyArray),
+        [flag] if flag == "--with-status" => Ok(JsonLogMode::WithStatus),
+        _ => Err(pragma_fail(
+            "argument must be empty or in the form: `--with-status`",
+        )),
+    }
+}
+
+fn parse_json_config_list_arg(arg: Option<&str>) -> Result<JsonConfigListMode, PragmaErr> {
+    let Some(arg) = arg else {
+        return Ok(JsonConfigListMode::LegacyArray);
+    };
+    let words = split_pragma_words(arg)?;
+    match words.as_slice() {
+        [] => Ok(JsonConfigListMode::LegacyArray),
+        [flag] if flag == "--with-status" => Ok(JsonConfigListMode::WithStatus),
+        _ => Err(pragma_fail(
+            "argument must be empty or in the form: `--with-status`",
+        )),
+    }
+}
+
+fn parse_json_tags_arg(arg: Option<&str>) -> Result<JsonTagsMode, PragmaErr> {
+    let Some(arg) = arg else {
+        return Ok(JsonTagsMode::LegacyArray);
+    };
+    let words = split_pragma_words(arg)?;
+    match words.as_slice() {
+        [] => Ok(JsonTagsMode::LegacyArray),
+        [flag] if flag == "--with-status" => Ok(JsonTagsMode::WithStatus),
+        _ => Err(pragma_fail(
+            "argument must be empty or in the form: `--with-status`",
+        )),
+    }
+}
+
+fn parse_json_fetch_async_arg(
+    arg: Option<&str>,
+) -> Result<(RemoteBranchArg, JsonFetchAsyncMode), PragmaErr> {
+    let Some(arg) = arg else {
+        return Ok((parse_remote_branch_arg(None)?, JsonFetchAsyncMode::LegacyId));
+    };
+
+    let mut mode = JsonFetchAsyncMode::LegacyId;
+    let mut remote_words = Vec::new();
+    for word in split_pragma_words(arg)? {
+        if word == "--with-status" {
+            if mode == JsonFetchAsyncMode::WithStatus {
+                return Err(pragma_fail("argument contains duplicate `--with-status`"));
+            }
+            mode = JsonFetchAsyncMode::WithStatus;
+        } else {
+            remote_words.push(word);
+        }
+    }
+
+    let remote_arg = if remote_words.is_empty() {
+        None
+    } else {
+        Some(remote_words.join(" "))
+    };
+    Ok((parse_remote_branch_arg(remote_arg.as_deref())?, mode))
 }
 
 fn parse_repo_export_arg(arg: &str) -> Result<RepoExportSpec, PragmaErr> {
@@ -4526,9 +7684,19 @@ fn repo_path_arg(repo: &Repository, path: &str) -> Result<String, ErrCtx> {
     }
     let path_obj = Path::new(path);
     if path_obj.is_absolute() {
-        return Ok(repo.file_key(path_obj)?);
+        return Ok(normalize_repo_path_filter(&repo.file_key(path_obj)?));
     }
-    Ok(path.trim_start_matches("./").replace('\\', "/"))
+    Ok(normalize_repo_path_filter(path))
+}
+
+fn normalize_repo_path_filter(path: &str) -> String {
+    let path = path.trim().trim_start_matches("./").replace('\\', "/");
+    let path = path.trim_end_matches('/');
+    if path == "." {
+        String::new()
+    } else {
+        path.to_string()
+    }
 }
 
 fn repo_physical_path_arg(repo: &Repository, path: &Path) -> Result<(String, PathBuf), ErrCtx> {
@@ -4539,6 +7707,626 @@ fn repo_physical_path_arg(repo: &Repository, path: &Path) -> Result<(String, Pat
     };
     let key = repo.file_key(&physical_path)?;
     Ok((key.clone(), repo.worktree().join(key)))
+}
+
+fn repo_input_path(repo: &Repository, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        repo.worktree().join(path)
+    }
+}
+
+fn run_repo_add(
+    runtime: &Runtime,
+    file: &mut VolFile,
+    spec: &RepoAddSpec,
+) -> Result<Vec<graft::repo::index::IndexEntry>, ErrCtx> {
+    if !file.is_idle() {
+        return pragma_err!("cannot add while there is an open transaction");
+    }
+    let repo = repo_for_file(file)?;
+    if spec.all {
+        stage_repo_add_all(runtime, file, &repo, spec.kind)
+    } else if let Some(path) = spec.path.as_deref() {
+        stage_repo_add_path(runtime, file, &repo, path, spec.force)
+    } else {
+        let state = current_repo_file_state(runtime, file)?;
+        Ok(vec![repo.stage_file_state_path(&file.tag, state)?])
+    }
+}
+
+fn json_staged_entry_paths(
+    repo: &Repository,
+    entries: &[graft::repo::index::IndexEntry],
+) -> Result<Vec<crate::json::JsonRepoPathDiff>, ErrCtx> {
+    let head = repo_head_commit(repo)?;
+    entries
+        .iter()
+        .map(|entry| {
+            let (kind, storage, change) =
+                staged_entry_kind_storage_and_change(head.as_ref(), entry);
+            Ok(crate::json::JsonRepoPathDiff {
+                path: entry.path.clone(),
+                change: repo_file_change_label(change).to_string(),
+                kind: repo_tracked_path_kind_json_label(kind).to_string(),
+                storage: repo_path_storage_json_label(storage).to_string(),
+            })
+        })
+        .collect()
+}
+
+fn filter_tracked_paths_by_kind(
+    paths: Vec<RepoTrackedPath>,
+    kind: Option<RepoTrackedPathKind>,
+) -> Vec<RepoTrackedPath> {
+    match kind {
+        Some(kind) => paths.into_iter().filter(|path| path.kind == kind).collect(),
+        None => paths,
+    }
+}
+
+fn filter_tracked_path_details_by_kind(
+    paths: Vec<RepoTrackedPathDetail>,
+    kind: Option<RepoTrackedPathKind>,
+) -> Vec<RepoTrackedPathDetail> {
+    match kind {
+        Some(kind) => paths.into_iter().filter(|path| path.kind == kind).collect(),
+        None => paths,
+    }
+}
+
+fn filter_tracked_path_entries_by_kind(
+    paths: Vec<RepoTrackedPathEntry>,
+    kind: Option<RepoTrackedPathKind>,
+) -> Vec<RepoTrackedPathEntry> {
+    match kind {
+        Some(kind) => paths.into_iter().filter(|path| path.kind == kind).collect(),
+        None => paths,
+    }
+}
+
+fn filter_repo_status_by_kind(
+    mut status: RepoStatus,
+    kind: Option<RepoTrackedPathKind>,
+) -> RepoStatus {
+    let Some(kind) = kind else {
+        return status;
+    };
+    status.unstaged_changes.retain(|change| change.kind == kind);
+    status.staged_changes.retain(|change| change.kind == kind);
+    status
+        .conflicted_changes
+        .retain(|change| change.kind == kind);
+    status.unstaged = status
+        .unstaged_changes
+        .iter()
+        .map(|change| change.path.clone())
+        .collect();
+    status.staged = status
+        .staged_changes
+        .iter()
+        .map(|change| change.path.clone())
+        .collect();
+    status.conflicted = status
+        .conflicted_changes
+        .iter()
+        .map(|change| change.path.clone())
+        .collect();
+    status.refresh_summary_flags();
+    status
+}
+
+fn repo_head_commit(repo: &Repository) -> Result<Option<CommitObject>, ErrCtx> {
+    match repo.show_revision("HEAD") {
+        Ok(commit) => Ok(Some(commit)),
+        Err(graft::repo::RepoErr::UnbornHead) => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn repo_head_and_branch(repo: &Repository) -> Result<(Option<String>, Option<String>), ErrCtx> {
+    let status = repo.status()?;
+    let branch = repo.current_branch()?;
+    Ok((status.head_target, branch))
+}
+
+fn staged_entry_kind_storage_and_change(
+    head: Option<&CommitObject>,
+    entry: &graft::repo::index::IndexEntry,
+) -> (RepoTrackedPathKind, RepoPathStorage, RepoFileChange) {
+    if entry.file.is_some() {
+        let change = if head.is_some_and(|commit| commit.files.contains_key(&entry.path)) {
+            RepoFileChange::Modified
+        } else {
+            RepoFileChange::Added
+        };
+        return (
+            RepoTrackedPathKind::SqliteDatabase,
+            RepoPathStorage::SqliteSnapshot,
+            change,
+        );
+    }
+
+    if let Some(artifact) = &entry.artifact {
+        let change = if head.is_some_and(|commit| commit.artifacts.contains_key(&entry.path)) {
+            RepoFileChange::Modified
+        } else {
+            RepoFileChange::Added
+        };
+        return (
+            artifact_checkout_path_kind(artifact),
+            artifact_checkout_path_storage(artifact),
+            change,
+        );
+    }
+
+    if head.is_some_and(|commit| commit.files.contains_key(&entry.path)) {
+        return (
+            RepoTrackedPathKind::SqliteDatabase,
+            RepoPathStorage::SqliteSnapshot,
+            RepoFileChange::Deleted,
+        );
+    }
+
+    if let Some(artifact) = head.and_then(|commit| commit.artifacts.get(&entry.path)) {
+        return (
+            artifact_checkout_path_kind(artifact),
+            artifact_checkout_path_storage(artifact),
+            RepoFileChange::Deleted,
+        );
+    }
+
+    (
+        RepoTrackedPathKind::BinaryFile,
+        RepoPathStorage::Inline,
+        RepoFileChange::Deleted,
+    )
+}
+
+fn stage_repo_add_path(
+    runtime: &Runtime,
+    file: &VolFile,
+    repo: &Repository,
+    path: &Path,
+    force: bool,
+) -> Result<Vec<graft::repo::index::IndexEntry>, ErrCtx> {
+    let physical_path = repo_input_path(repo, path);
+    let metadata = std::fs::metadata(&physical_path)?;
+    let current_key = repo.file_key(&file.tag)?;
+
+    if metadata.is_dir() {
+        let directory = std::fs::canonicalize(&physical_path)?;
+        if !directory.starts_with(repo.worktree()) {
+            return Err(ErrCtx::Repo(graft::repo::RepoErr::PathOutsideWorktree {
+                path: directory,
+                worktree: repo.worktree().to_path_buf(),
+            }));
+        }
+        if !force && repo.is_ignored_worktree_path(&directory)? {
+            return ignored_add_path_error(repo, &directory);
+        }
+
+        let mut paths = BTreeSet::new();
+        collect_repo_add_directory_files(repo, &directory, force, &mut paths)?;
+        let mut entries = Vec::with_capacity(paths.len());
+        for key in paths {
+            let physical_path = repo.worktree().join(&key);
+            entries.push(stage_repo_add_file(
+                runtime,
+                file,
+                repo,
+                &current_key,
+                &key,
+                &physical_path,
+            )?);
+        }
+        return Ok(entries);
+    }
+
+    if !metadata.is_file() {
+        return Err(ErrCtx::PragmaErr(
+            format!(
+                "path `{}` is not a regular file or directory",
+                physical_path.display()
+            )
+            .into(),
+        ));
+    }
+
+    let (key, physical_path) = repo_physical_path_arg(repo, path)?;
+    if !force && repo.is_ignored_worktree_path(&physical_path)? {
+        return ignored_add_path_error(repo, &physical_path);
+    }
+    Ok(vec![stage_repo_add_file(
+        runtime,
+        file,
+        repo,
+        &current_key,
+        &key,
+        &physical_path,
+    )?])
+}
+
+fn stage_repo_add_all(
+    runtime: &Runtime,
+    file: &mut VolFile,
+    repo: &Repository,
+    kind: Option<RepoTrackedPathKind>,
+) -> Result<Vec<graft::repo::index::IndexEntry>, ErrCtx> {
+    let status = repo_status_for_file(runtime, file, repo)?;
+    let current_key = repo.file_key(&file.tag)?;
+    let mut entries = Vec::with_capacity(status.unstaged_changes.len());
+
+    for change in status.unstaged_changes {
+        if kind.is_some_and(|kind| change.kind != kind) {
+            continue;
+        }
+        match change.change {
+            RepoWorktreeChangeKind::Modified | RepoWorktreeChangeKind::Untracked => {
+                let physical_path = repo.worktree().join(&change.path);
+                entries.push(stage_repo_add_file(
+                    runtime,
+                    file,
+                    repo,
+                    &current_key,
+                    &change.path,
+                    &physical_path,
+                )?);
+            }
+            RepoWorktreeChangeKind::Deleted => {
+                let entry = repo.stage_file_removal_key(&change.path)?;
+                if change.path == current_key {
+                    let volume = runtime.volume_open(None, None, None)?;
+                    file.switch_volume(&volume.vid)?;
+                }
+                entries.push(entry);
+            }
+        }
+    }
+
+    Ok(entries)
+}
+
+fn stage_repo_add_file(
+    runtime: &Runtime,
+    file: &VolFile,
+    repo: &Repository,
+    current_key: &str,
+    key: &str,
+    physical_path: &Path,
+) -> Result<graft::repo::index::IndexEntry, ErrCtx> {
+    if key == current_key {
+        let state = current_repo_file_state(runtime, file)?;
+        repo.stage_file_state_path(&file.tag, state)
+            .map_err(Into::into)
+    } else if is_sqlite_database_path(physical_path)? {
+        stage_physical_sqlite_file(runtime, repo, key, physical_path)
+    } else {
+        repo.stage_artifact_path(physical_path).map_err(Into::into)
+    }
+}
+
+fn collect_repo_add_directory_files(
+    repo: &Repository,
+    dir: &Path,
+    force: bool,
+    out: &mut BTreeSet<String>,
+) -> Result<(), ErrCtx> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            if entry.file_name() == graft::repo::GRAFT_DIR {
+                continue;
+            }
+            if !force && repo.is_ignored_worktree_path(&path)? {
+                continue;
+            }
+            collect_repo_add_directory_files(repo, &path, force, out)?;
+        } else if file_type.is_file()
+            && (force || !repo.is_ignored_worktree_path(&path)?)
+            && !is_sqlite_sidecar_path(&path)
+        {
+            out.insert(repo.file_key(&path)?);
+        }
+    }
+    Ok(())
+}
+
+fn ignored_add_path_error<T>(repo: &Repository, path: &Path) -> Result<T, ErrCtx> {
+    let key = repo.file_key(path)?;
+    Err(ErrCtx::PragmaErr(
+        format!("path `{key}` is ignored; use `--force` to add it").into(),
+    ))
+}
+
+fn format_added_entries(entries: &[graft::repo::index::IndexEntry]) -> String {
+    match entries {
+        [entry] => format!("Added {}", entry.path),
+        entries => {
+            let mut output = format!("Added {} paths", entries.len());
+            for entry in entries {
+                output.push_str("\n  ");
+                output.push_str(&entry.path);
+            }
+            output
+        }
+    }
+}
+
+fn run_repo_remove(
+    runtime: &Runtime,
+    file: &mut VolFile,
+    spec: &RepoRemoveSpec,
+) -> Result<Vec<JsonPathAction>, ErrCtx> {
+    if !file.is_idle() {
+        return pragma_err!("cannot remove while there is an open transaction");
+    }
+    let repo = repo_for_file(file)?;
+    if let Some(path) = spec.path.as_deref() {
+        stage_repo_remove_path(runtime, file, &repo, path, spec.cached)
+    } else {
+        let key = repo.file_key(&file.tag)?;
+        Ok(vec![stage_repo_remove_key(
+            runtime,
+            file,
+            &repo,
+            &key,
+            spec.cached,
+        )?])
+    }
+}
+
+fn stage_repo_remove_path(
+    runtime: &Runtime,
+    file: &mut VolFile,
+    repo: &Repository,
+    path: &Path,
+    cached: bool,
+) -> Result<Vec<JsonPathAction>, ErrCtx> {
+    let physical_path = repo_input_path(repo, path);
+    match std::fs::symlink_metadata(&physical_path) {
+        Ok(metadata) if metadata.is_dir() => {
+            let directory_key = repo_directory_key(repo, &physical_path)?;
+            let removed = stage_repo_remove_directory(runtime, file, repo, &directory_key, cached)?;
+            if removed.is_empty() {
+                Err(ErrCtx::Repo(graft::repo::RepoErr::PathNotTracked(
+                    if directory_key.is_empty() {
+                        ".".to_string()
+                    } else {
+                        directory_key
+                    },
+                )))
+            } else {
+                Ok(removed)
+            }
+        }
+        Ok(metadata) if metadata.is_file() => {
+            let (key, _) = repo_physical_path_arg(repo, path)?;
+            Ok(vec![stage_repo_remove_key(
+                runtime, file, repo, &key, cached,
+            )?])
+        }
+        Ok(_) => Err(ErrCtx::PragmaErr(
+            format!(
+                "path `{}` is not a regular file or directory",
+                physical_path.display()
+            )
+            .into(),
+        )),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let key = repo.file_key(&physical_path)?;
+            Ok(vec![stage_repo_remove_key(
+                runtime, file, repo, &key, cached,
+            )?])
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn stage_repo_remove_directory(
+    runtime: &Runtime,
+    file: &mut VolFile,
+    repo: &Repository,
+    directory_key: &str,
+    cached: bool,
+) -> Result<Vec<JsonPathAction>, ErrCtx> {
+    let keys = tracked_repo_keys_under_directory(repo, directory_key)?;
+    let mut removed = Vec::with_capacity(keys.len());
+    for key in keys {
+        removed.push(stage_repo_remove_key(runtime, file, repo, &key, cached)?);
+    }
+    Ok(removed)
+}
+
+fn tracked_repo_keys_under_directory(
+    repo: &Repository,
+    directory_key: &str,
+) -> Result<Vec<String>, ErrCtx> {
+    let mut keys = BTreeSet::new();
+    for key in repo
+        .index_files()?
+        .keys()
+        .chain(repo.index_artifacts()?.keys())
+    {
+        if repo_key_is_under_directory(key, directory_key) {
+            keys.insert(key.clone());
+        }
+    }
+    Ok(keys.into_iter().collect())
+}
+
+fn repo_key_is_under_directory(key: &str, directory_key: &str) -> bool {
+    directory_key.is_empty()
+        || key == directory_key
+        || key
+            .strip_prefix(directory_key)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn repo_directory_key(repo: &Repository, path: &Path) -> Result<String, ErrCtx> {
+    let directory = std::fs::canonicalize(path)?;
+    if !directory.starts_with(repo.worktree()) {
+        return Err(ErrCtx::Repo(graft::repo::RepoErr::PathOutsideWorktree {
+            path: directory,
+            worktree: repo.worktree().to_path_buf(),
+        }));
+    }
+    let relative = directory.strip_prefix(repo.worktree()).map_err(|_| {
+        ErrCtx::Repo(graft::repo::RepoErr::PathOutsideWorktree {
+            path: directory.clone(),
+            worktree: repo.worktree().to_path_buf(),
+        })
+    })?;
+    relative
+        .to_str()
+        .map(|path| path.replace('\\', "/"))
+        .ok_or_else(|| ErrCtx::Repo(graft::repo::RepoErr::NonUtf8Path(relative.to_path_buf())))
+}
+
+fn stage_repo_remove_key(
+    runtime: &Runtime,
+    file: &mut VolFile,
+    repo: &Repository,
+    key: &str,
+    cached: bool,
+) -> Result<JsonPathAction, ErrCtx> {
+    if cached {
+        return stage_repo_remove_cached_key(repo, key);
+    }
+
+    let current_key = repo.file_key(&file.tag)?;
+    if key == current_key {
+        let physical_path = repo.worktree().join(key);
+        let action = if repo.head_file(&file.tag)?.is_some() {
+            let entry = repo.stage_file_removal(&file.tag)?;
+            json_path_action(
+                entry.path,
+                RepoTrackedPathKind::SqliteDatabase,
+                RepoPathStorage::SqliteSnapshot,
+                "staged",
+            )
+        } else if let Some(artifact) = repo.head_artifact(&file.tag)? {
+            let entry = repo.stage_file_removal(&file.tag)?;
+            json_path_action(
+                entry.path,
+                artifact_checkout_path_kind(&artifact),
+                artifact_checkout_path_storage(&artifact),
+                "staged",
+            )
+        } else if repo.index_has_entry(&physical_path)? {
+            let (kind, storage) = index_path_descriptor(repo, key)?;
+            let path = repo.restore_index_path_from_head(&physical_path)?;
+            json_path_action(path, kind, storage, "removed")
+        } else {
+            return Err(ErrCtx::Repo(graft::repo::RepoErr::PathNotTracked(
+                key.to_string(),
+            )));
+        };
+        let volume = runtime.volume_open(None, None, None)?;
+        file.switch_volume(&volume.vid)?;
+        return Ok(action);
+    }
+
+    let physical_path = repo.worktree().join(key);
+    if repo.head_file(&physical_path)?.is_some() {
+        remove_physical_sqlite_file(repo, key, &physical_path)?;
+        let entry = repo.stage_file_removal(&physical_path)?;
+        return Ok(json_path_action(
+            entry.path,
+            RepoTrackedPathKind::SqliteDatabase,
+            RepoPathStorage::SqliteSnapshot,
+            "staged",
+        ));
+    }
+    if let Some(artifact) = repo.head_artifact(&physical_path)? {
+        remove_physical_artifact_file(&physical_path)?;
+        let entry = repo.stage_file_removal(&physical_path)?;
+        return Ok(json_path_action(
+            entry.path,
+            artifact_checkout_path_kind(&artifact),
+            artifact_checkout_path_storage(&artifact),
+            "staged",
+        ));
+    }
+    if repo.index_has_entry(&physical_path)? {
+        let (kind, storage) = index_path_descriptor(repo, key)?;
+        remove_physical_artifact_file(&physical_path)?;
+        let path = repo.restore_index_path_from_head(&physical_path)?;
+        return Ok(json_path_action(path, kind, storage, "removed"));
+    }
+
+    Err(ErrCtx::Repo(graft::repo::RepoErr::PathNotTracked(
+        key.to_string(),
+    )))
+}
+
+fn stage_repo_remove_cached_key(repo: &Repository, key: &str) -> Result<JsonPathAction, ErrCtx> {
+    let physical_path = repo.worktree().join(key);
+    if repo.head_file(&physical_path)?.is_some() {
+        let entry = repo.stage_file_removal_key(key)?;
+        return Ok(json_path_action(
+            entry.path,
+            RepoTrackedPathKind::SqliteDatabase,
+            RepoPathStorage::SqliteSnapshot,
+            "staged",
+        ));
+    }
+
+    if let Some(artifact) = repo.head_artifact(&physical_path)? {
+        let entry = repo.stage_file_removal_key(key)?;
+        return Ok(json_path_action(
+            entry.path,
+            artifact_checkout_path_kind(&artifact),
+            artifact_checkout_path_storage(&artifact),
+            "staged",
+        ));
+    }
+
+    if repo.index_has_key(key)? {
+        let (kind, storage) = index_path_descriptor(repo, key)?;
+        let path = repo.restore_index_key_from_head(key)?;
+        return Ok(json_path_action(path, kind, storage, "removed"));
+    }
+
+    Err(ErrCtx::Repo(graft::repo::RepoErr::PathNotTracked(
+        key.to_string(),
+    )))
+}
+
+fn index_path_descriptor(
+    repo: &Repository,
+    key: &str,
+) -> Result<(RepoTrackedPathKind, RepoPathStorage), ErrCtx> {
+    if repo.index_files()?.contains_key(key) {
+        return Ok((
+            RepoTrackedPathKind::SqliteDatabase,
+            RepoPathStorage::SqliteSnapshot,
+        ));
+    }
+    if let Some(artifact) = repo.index_artifacts()?.get(key) {
+        return Ok((
+            artifact_checkout_path_kind(artifact),
+            artifact_checkout_path_storage(artifact),
+        ));
+    }
+    Ok((RepoTrackedPathKind::BinaryFile, RepoPathStorage::Inline))
+}
+
+fn format_removed_paths(paths: &[JsonPathAction]) -> String {
+    match paths {
+        [path] => format!("Removed {}", path.path),
+        paths => {
+            let mut output = format!("Removed {} paths", paths.len());
+            for path in paths {
+                output.push_str("\n  ");
+                output.push_str(&path.path);
+            }
+            output
+        }
+    }
 }
 
 fn remove_physical_sqlite_file(repo: &Repository, key: &str, path: &Path) -> Result<(), ErrCtx> {
@@ -4557,6 +8345,23 @@ fn remove_physical_sqlite_file(repo: &Repository, key: &str, path: &Path) -> Res
                         path.display()
                     )
                     .into(),
+                ));
+            }
+            std::fs::remove_file(path)?;
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+
+    Ok(())
+}
+
+fn remove_physical_artifact_file(path: &Path) -> Result<(), ErrCtx> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() {
+                return Err(ErrCtx::PragmaErr(
+                    format!("path `{}` is not a regular file", path.display()).into(),
                 ));
             }
             std::fs::remove_file(path)?;
@@ -4676,18 +8481,25 @@ fn repo_diff_for_spec(
     repo: &Repository,
     spec: RepoDiffSpec,
 ) -> Result<RepoDiff, ErrCtx> {
-    match spec.target {
+    let kind = spec.kind;
+    let mut diff = match spec.target {
         RepoDiffTarget::Worktree { path } => {
             let path = repo_diff_path(repo, path.as_deref())?;
             let current_key = repo.file_key(&file.tag)?;
             if let Some(path) = path.as_deref()
                 && path != current_key
             {
-                let (key, physical_path, state) =
-                    physical_worktree_file_state(runtime, repo, path)?;
-                let expected = repo.index_files()?.get(&key).cloned();
-                return match state {
-                    Some(state) => {
+                let (key, physical_path) = repo_physical_path_arg(repo, Path::new(path))?;
+                match std::fs::symlink_metadata(&physical_path) {
+                    Ok(metadata) if metadata.file_type().is_dir() => {
+                        repo_worktree_diff_for_filter(runtime, file, repo, None, &key)
+                    }
+                    Ok(metadata) if !metadata.file_type().is_file() => Err(ErrCtx::PragmaErr(
+                        format!("path `{}` is not a regular file", physical_path.display()).into(),
+                    )),
+                    Ok(_) if is_sqlite_database_path(&physical_path)? => {
+                        let state = import_physical_sqlite_file_state(runtime, &physical_path)?;
+                        let expected = repo.index_files()?.get(&key).cloned();
                         let state = if let Some(expected) = expected
                             && repo_file_state_content_eq(runtime, &state, &expected)?
                         {
@@ -4697,11 +8509,22 @@ fn repo_diff_for_spec(
                         };
                         Ok(repo.diff_worktree_file(&physical_path, state, Some(&key))?)
                     }
-                    None => Ok(repo.diff_worktree_file_removal(&physical_path, Some(&key))?),
-                };
+                    Ok(_) => Ok(repo.diff_worktree_artifact(&physical_path, Some(&key))?),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        if repo.index_artifact(&physical_path)?.is_some()
+                            || repo.head_artifact(&physical_path)?.is_some()
+                        {
+                            Ok(repo.diff_worktree_artifact_removal(&physical_path, Some(&key))?)
+                        } else {
+                            Ok(repo.diff_worktree_file_removal(&physical_path, Some(&key))?)
+                        }
+                    }
+                    Err(err) => Err(err.into()),
+                }
+            } else {
+                let state = current_repo_file_state(runtime, file)?;
+                Ok(repo.diff_worktree_file(&file.tag, state, path.as_deref())?)
             }
-            let state = current_repo_file_state(runtime, file)?;
-            Ok(repo.diff_worktree_file(&file.tag, state, path.as_deref())?)
         }
         RepoDiffTarget::Staged { path } => {
             let path = repo_diff_path(repo, path.as_deref())?;
@@ -4713,12 +8536,18 @@ fn repo_diff_for_spec(
             if let Some(path) = path.as_deref()
                 && path != current_key
             {
-                let (key, physical_path, state) =
-                    physical_worktree_file_state(runtime, repo, path)?;
-                let from_id = repo.resolve_revision(&rev)?;
-                let expected = repo.read_commit(&from_id)?.files.get(&key).cloned();
-                return match state {
-                    Some(state) => {
+                let (key, physical_path) = repo_physical_path_arg(repo, Path::new(path))?;
+                match std::fs::symlink_metadata(&physical_path) {
+                    Ok(metadata) if metadata.file_type().is_dir() => {
+                        repo_worktree_diff_for_filter(runtime, file, repo, Some(&rev), &key)
+                    }
+                    Ok(metadata) if !metadata.file_type().is_file() => Err(ErrCtx::PragmaErr(
+                        format!("path `{}` is not a regular file", physical_path.display()).into(),
+                    )),
+                    Ok(_) if is_sqlite_database_path(&physical_path)? => {
+                        let state = import_physical_sqlite_file_state(runtime, &physical_path)?;
+                        let from_id = repo.resolve_revision(&rev)?;
+                        let expected = repo.read_commit(&from_id)?.files.get(&key).cloned();
                         let state = if let Some(expected) = expected
                             && repo_file_state_content_eq(runtime, &state, &expected)?
                         {
@@ -4733,46 +8562,204 @@ fn repo_diff_for_spec(
                             Some(&key),
                         )?)
                     }
-                    None => Ok(repo.diff_revision_to_worktree_file_removal(
+                    Ok(_) => Ok(repo.diff_revision_to_worktree_artifact(
                         &rev,
                         &physical_path,
                         Some(&key),
                     )?),
-                };
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        if repo.artifact_from_revision(&rev, &physical_path)?.is_some() {
+                            Ok(repo.diff_revision_to_worktree_artifact_removal(
+                                &rev,
+                                &physical_path,
+                                Some(&key),
+                            )?)
+                        } else {
+                            Ok(repo.diff_revision_to_worktree_file_removal(
+                                &rev,
+                                &physical_path,
+                                Some(&key),
+                            )?)
+                        }
+                    }
+                    Err(err) => Err(err.into()),
+                }
+            } else {
+                let state = current_repo_file_state(runtime, file)?;
+                Ok(repo.diff_revision_to_worktree_file(&rev, &file.tag, state, path.as_deref())?)
             }
-            let state = current_repo_file_state(runtime, file)?;
-            Ok(repo.diff_revision_to_worktree_file(&rev, &file.tag, state, path.as_deref())?)
         }
         RepoDiffTarget::Revisions { from, to, path } => {
             let path = repo_diff_path(repo, path.as_deref())?;
             Ok(repo.diff_revisions(&from, &to, path.as_deref())?)
         }
-    }
+    }?;
+    filter_repo_diff_by_kind(&mut diff, kind);
+    Ok(diff)
 }
 
-fn physical_worktree_file_state(
+fn filter_repo_diff_by_kind(diff: &mut RepoDiff, kind: Option<RepoTrackedPathKind>) {
+    let Some(kind) = kind else {
+        return;
+    };
+    diff.files.retain(|file| file.kind == kind);
+    diff.artifacts.retain(|artifact| artifact.kind == kind);
+    diff.refresh_paths();
+}
+
+fn repo_worktree_diff_for_filter(
     runtime: &Runtime,
+    file: &VolFile,
     repo: &Repository,
-    path: &str,
-) -> Result<(String, PathBuf, Option<CommitFileState>), ErrCtx> {
-    let (key, physical_path) = repo_physical_path_arg(repo, Path::new(path))?;
-    match std::fs::symlink_metadata(&physical_path) {
-        Ok(metadata) => {
-            if !metadata.file_type().is_file() {
-                return Err(ErrCtx::PragmaErr(
-                    format!(
-                        "path `{}` is not a regular SQLite database file",
-                        physical_path.display()
-                    )
-                    .into(),
-                ));
-            }
-            let state = import_physical_sqlite_file_state(runtime, &physical_path)?;
-            Ok((key, physical_path, Some(state)))
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok((key, physical_path, None)),
-        Err(err) => Err(err.into()),
+    rev: Option<&str>,
+    filter: &str,
+) -> Result<RepoDiff, ErrCtx> {
+    let from = if let Some(rev) = rev {
+        repo.resolve_revision(rev)?
+    } else {
+        "index".to_string()
+    };
+    let mut diff = RepoDiff {
+        from: from.clone(),
+        to: "worktree".to_string(),
+        paths: Vec::new(),
+        files: Vec::new(),
+        artifacts: Vec::new(),
+    };
+    let current_key = repo.file_key(&file.tag)?;
+    let index_files = repo.index_files()?;
+    let index_artifacts = repo.index_artifacts()?;
+    let mut file_keys = BTreeSet::new();
+    let mut artifact_keys = BTreeSet::new();
+
+    if let Some(_) = rev {
+        let commit = repo.read_commit(&from)?;
+        file_keys.extend(
+            commit
+                .files
+                .keys()
+                .filter(|key| repo_key_matches_filter(key, filter))
+                .cloned(),
+        );
+        artifact_keys.extend(
+            commit
+                .artifacts
+                .keys()
+                .filter(|key| repo_key_matches_filter(key, filter))
+                .cloned(),
+        );
     }
+    file_keys.extend(
+        index_files
+            .keys()
+            .filter(|key| repo_key_matches_filter(key, filter))
+            .cloned(),
+    );
+    artifact_keys.extend(
+        index_artifacts
+            .keys()
+            .filter(|key| repo_key_matches_filter(key, filter))
+            .cloned(),
+    );
+    if repo_key_matches_filter(&current_key, filter) {
+        file_keys.insert(current_key.clone());
+    }
+
+    for key in file_keys {
+        let physical_path = repo.worktree().join(&key);
+        let path_diff = if key == current_key {
+            let state = current_repo_file_state(runtime, file)?;
+            if let Some(rev) = rev {
+                repo.diff_revision_to_worktree_file(rev, &file.tag, state, Some(&key))?
+            } else {
+                repo.diff_worktree_file(&file.tag, state, Some(&key))?
+            }
+        } else {
+            match std::fs::symlink_metadata(&physical_path) {
+                Ok(metadata) if metadata.file_type().is_file() => {
+                    if !is_sqlite_database_path(&physical_path)? {
+                        continue;
+                    }
+                    let state = import_physical_sqlite_file_state(runtime, &physical_path)?;
+                    let expected = if let Some(rev) = rev {
+                        let from_id = repo.resolve_revision(rev)?;
+                        repo.read_commit(&from_id)?.files.get(&key).cloned()
+                    } else {
+                        index_files.get(&key).cloned()
+                    };
+                    let state = if let Some(expected) = expected
+                        && repo_file_state_content_eq(runtime, &state, &expected)?
+                    {
+                        expected
+                    } else {
+                        state
+                    };
+                    if let Some(rev) = rev {
+                        repo.diff_revision_to_worktree_file(rev, &physical_path, state, Some(&key))?
+                    } else {
+                        repo.diff_worktree_file(&physical_path, state, Some(&key))?
+                    }
+                }
+                Ok(_) => continue,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    if let Some(rev) = rev {
+                        repo.diff_revision_to_worktree_file_removal(
+                            rev,
+                            &physical_path,
+                            Some(&key),
+                        )?
+                    } else {
+                        repo.diff_worktree_file_removal(&physical_path, Some(&key))?
+                    }
+                }
+                Err(err) => return Err(err.into()),
+            }
+        };
+        append_repo_diff(&mut diff, path_diff);
+    }
+
+    for key in artifact_keys {
+        let physical_path = repo.worktree().join(&key);
+        let path_diff = match std::fs::symlink_metadata(&physical_path) {
+            Ok(metadata) if metadata.file_type().is_file() => {
+                if let Some(rev) = rev {
+                    repo.diff_revision_to_worktree_artifact(rev, &physical_path, Some(&key))?
+                } else {
+                    repo.diff_worktree_artifact(&physical_path, Some(&key))?
+                }
+            }
+            Ok(_) => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                if let Some(rev) = rev {
+                    repo.diff_revision_to_worktree_artifact_removal(
+                        rev,
+                        &physical_path,
+                        Some(&key),
+                    )?
+                } else {
+                    repo.diff_worktree_artifact_removal(&physical_path, Some(&key))?
+                }
+            }
+            Err(err) => return Err(err.into()),
+        };
+        append_repo_diff(&mut diff, path_diff);
+    }
+
+    Ok(diff)
+}
+
+fn append_repo_diff(target: &mut RepoDiff, mut source: RepoDiff) {
+    target.files.append(&mut source.files);
+    target.artifacts.append(&mut source.artifacts);
+    target.refresh_paths();
+}
+
+fn repo_key_matches_filter(key: &str, filter: &str) -> bool {
+    filter.is_empty()
+        || key == filter
+        || key
+            .strip_prefix(filter)
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 fn repo_status_for_file(
@@ -4787,9 +8774,21 @@ fn repo_status_for_file(
         Err(graft::repo::RepoErr::UnresolvedConflicts) => return Ok(status),
         Err(err) => return Err(err.into()),
     };
+    let tracked_artifacts = match repo.index_artifacts() {
+        Ok(tracked) => tracked,
+        Err(graft::repo::RepoErr::UnresolvedConflicts) => return Ok(status),
+        Err(err) => return Err(err.into()),
+    };
+    for change in &mut status.unstaged_changes {
+        if change.path == current_key {
+            change.kind = RepoTrackedPathKind::SqliteDatabase;
+            change.storage = RepoPathStorage::SqliteSnapshot;
+        }
+    }
     status.unstaged_changes.retain(|change| {
         change.path == current_key
             || tracked.contains_key(&change.path)
+            || tracked_artifacts.contains_key(&change.path)
             || (change.change == RepoWorktreeChangeKind::Untracked
                 && should_report_untracked_status_path(repo))
     });
@@ -4828,7 +8827,12 @@ fn repo_status_for_file(
         if let Some(change) = change {
             status
                 .unstaged_changes
-                .push(graft::repo::RepoWorktreeChange { path: key, change });
+                .push(graft::repo::RepoWorktreeChange {
+                    path: key,
+                    change,
+                    kind: RepoTrackedPathKind::SqliteDatabase,
+                    storage: RepoPathStorage::SqliteSnapshot,
+                });
         }
     }
     status.unstaged_changes.sort_by(|a, b| a.path.cmp(&b.path));
@@ -4837,7 +8841,7 @@ fn repo_status_for_file(
         .iter()
         .map(|change| change.path.clone())
         .collect();
-    status.dirty = !status.unstaged_changes.is_empty();
+    status.refresh_summary_flags();
     Ok(status)
 }
 
@@ -4851,10 +8855,71 @@ fn repo_has_work_in_progress_for_file(
     repo: &Repository,
 ) -> Result<bool, ErrCtx> {
     let status = repo_status_for_file(runtime, file, repo)?;
-    Ok(status.dirty
+    let current_key = repo.file_key(&file.tag)?;
+    let has_blocking_unstaged = status.unstaged_changes.iter().any(|change| {
+        change.change != RepoWorktreeChangeKind::Untracked || change.path == current_key
+    });
+    Ok(has_blocking_unstaged
         || !status.staged.is_empty()
         || !status.conflicted.is_empty()
         || status.merge_head.is_some())
+}
+
+fn ensure_checkout_plan_preserves_untracked_paths(
+    runtime: &Runtime,
+    file: &VolFile,
+    repo: &Repository,
+    plan: &CheckoutPlan,
+) -> Result<(), ErrCtx> {
+    let keys = plan
+        .files
+        .keys()
+        .chain(plan.artifacts.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    ensure_checkout_keys_preserve_untracked_paths(runtime, file, repo, &keys)
+}
+
+fn ensure_checkout_key_preserves_untracked_path(
+    runtime: &Runtime,
+    file: &VolFile,
+    repo: &Repository,
+    key: &str,
+) -> Result<(), ErrCtx> {
+    let keys = BTreeSet::from([key.to_string()]);
+    ensure_checkout_keys_preserve_untracked_paths(runtime, file, repo, &keys)
+}
+
+fn ensure_checkout_keys_preserve_untracked_paths(
+    runtime: &Runtime,
+    file: &VolFile,
+    repo: &Repository,
+    keys: &BTreeSet<String>,
+) -> Result<(), ErrCtx> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let status = repo_status_for_file(runtime, file, repo)?;
+    let current_key = repo.file_key(&file.tag)?;
+    let overwritten = status
+        .unstaged_changes
+        .iter()
+        .filter(|change| {
+            change.change == RepoWorktreeChangeKind::Untracked
+                && change.path != current_key
+                && keys.contains(&change.path)
+        })
+        .map(|change| change.path.clone())
+        .collect::<Vec<_>>();
+
+    if overwritten.is_empty() {
+        return Ok(());
+    }
+
+    pragma_err!(format!(
+        "cannot checkout because untracked paths would be overwritten: {}",
+        overwritten.join(", ")
+    ))
 }
 
 fn repo_file_state_content_eq(
@@ -5019,13 +9084,25 @@ fn merge_table_summary(
 }
 
 fn is_sqlite_database_path(path: &Path) -> Result<bool, ErrCtx> {
-    let mut file = File::open(path)?;
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err.into()),
+    };
     let mut magic = [0_u8; SQLITE_DATABASE_MAGIC.len()];
     match file.read_exact(&mut magic) {
         Ok(()) => Ok(&magic == SQLITE_DATABASE_MAGIC),
         Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
         Err(err) => Err(err.into()),
     }
+}
+
+fn is_sqlite_sidecar_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.ends_with("-wal") || name.ends_with("-shm") || name.ends_with("-journal")
+        })
 }
 
 fn current_repo_file_state(runtime: &Runtime, file: &VolFile) -> Result<CommitFileState, ErrCtx> {
@@ -5066,26 +9143,40 @@ fn repo_snapshot_with_commit_hashes(
     Ok(RepoSnapshot { page_count: snapshot.page_count, ranges })
 }
 
-fn conflict_file_state(
+fn conflict_side_state(
     repo: &Repository,
-    path: &Path,
+    key: &str,
     side: ResolveSide,
-) -> Result<Option<CommitFileState>, ErrCtx> {
-    let key = repo.file_key(path)?;
+) -> Result<RepoConflictSideState, ErrCtx> {
     let Some(stage) = side.index_stage() else {
         return Err(ErrCtx::PragmaErr(
             "manual resolution does not have an index conflict stage".into(),
         ));
     };
     let index = repo.read_index()?;
-    index
+    if !index
+        .entries
+        .iter()
+        .any(|entry| entry.path == key && entry.stage != graft::repo::index::IndexStage::Normal)
+    {
+        return Err(ErrCtx::Repo(graft::repo::RepoErr::PathNotConflicted(
+            key.to_string(),
+        )));
+    }
+    let Some(entry) = index
         .entries
         .iter()
         .find(|entry| entry.path == key && entry.stage == stage)
-        .map(|entry| entry.file.clone())
-        .ok_or_else(|| {
-            ErrCtx::PragmaErr(format!("path `{key}` has no {} conflict stage", side.label()).into())
-        })
+    else {
+        return Ok(RepoConflictSideState::Deleted);
+    };
+    if let Some(file) = &entry.file {
+        Ok(RepoConflictSideState::SqliteDatabase(file.clone()))
+    } else if let Some(artifact) = &entry.artifact {
+        Ok(RepoConflictSideState::Artifact(artifact.clone()))
+    } else {
+        Ok(RepoConflictSideState::Deleted)
+    }
 }
 
 fn resolve_repo_conflict_for_file(
@@ -5093,12 +9184,13 @@ fn resolve_repo_conflict_for_file(
     file: &mut VolFile,
     repo: &Repository,
     spec: RepoResolveSpec,
-) -> Result<String, ErrCtx> {
+) -> Result<RepoResolveConflictOutcome, ErrCtx> {
     let path = spec.path.unwrap_or_else(|| PathBuf::from(&file.tag));
     let (key, physical_path) = repo_physical_path_arg(repo, &path)?;
+    let (path_kind, path_storage) = conflict_path_descriptor(repo, &key)?;
     let current_key = repo.file_key(&file.tag)?;
     if let Some(row) = spec.row.as_ref() {
-        return resolve_repo_row_conflict(
+        let path = resolve_repo_row_conflict(
             runtime,
             file,
             repo,
@@ -5107,7 +9199,8 @@ fn resolve_repo_conflict_for_file(
             &current_key,
             spec.side,
             row,
-        );
+        )?;
+        return Ok(RepoResolveConflictOutcome { path, path_kind, path_storage });
     }
     if matches!(spec.side, ResolveSide::Ours | ResolveSide::Theirs) {
         if let Some(state) = row_resolved_conflict_file_state(runtime, repo, &key, spec.side)? {
@@ -5118,27 +9211,67 @@ fn resolve_repo_conflict_for_file(
             }
             let entry = repo.resolve_file_conflict(&physical_path, Some(state))?;
             clear_row_conflict_resolution_state(repo)?;
-            return Ok(entry.path);
+            return Ok(RepoResolveConflictOutcome {
+                path: entry.path,
+                path_kind,
+                path_storage,
+            });
         }
     }
     let state = match spec.side {
         ResolveSide::Ours | ResolveSide::Theirs => {
-            let state = conflict_file_state(repo, &physical_path, spec.side)?;
-            if key == current_key {
-                if let Some(state) = &state {
-                    checkout_repo_file_state(runtime, file, state, None)?;
-                } else {
-                    let volume = runtime.volume_open(None, None, None)?;
-                    file.switch_volume(&volume.vid)?;
+            match conflict_side_state(repo, &key, spec.side)? {
+                RepoConflictSideState::SqliteDatabase(state) => {
+                    if key == current_key {
+                        checkout_repo_file_state(runtime, file, &state, None)?;
+                    } else {
+                        checkout_repo_file_state_to_path(
+                            runtime,
+                            repo,
+                            &state,
+                            &physical_path,
+                            None,
+                        )?;
+                    }
+                    Some(state)
                 }
-            } else if let Some(state) = &state {
-                checkout_repo_file_state_to_path(runtime, repo, state, &physical_path, None)?;
-            } else {
-                remove_materialized_repo_file(repo, &key)?;
+                RepoConflictSideState::Artifact(state) => {
+                    if key == current_key {
+                        let volume = runtime.volume_open(None, None, None)?;
+                        file.switch_volume(&volume.vid)?;
+                    }
+                    repo.materialize_artifact_key(&key, &state)?;
+                    let entry = repo.resolve_artifact_conflict(&physical_path, Some(state))?;
+                    clear_row_conflict_resolution_state(repo)?;
+                    return Ok(RepoResolveConflictOutcome {
+                        path: entry.path,
+                        path_kind,
+                        path_storage,
+                    });
+                }
+                RepoConflictSideState::Deleted => {
+                    if key == current_key {
+                        let volume = runtime.volume_open(None, None, None)?;
+                        file.switch_volume(&volume.vid)?;
+                    } else {
+                        remove_materialized_repo_file(repo, &key)?;
+                    }
+                    None
+                }
             }
-            state
         }
         ResolveSide::Manual if key == current_key => Some(current_repo_file_state(runtime, file)?),
+        ResolveSide::Manual
+            if physical_path.exists() && !is_sqlite_database_path(&physical_path)? =>
+        {
+            let entry = repo.resolve_artifact_conflict_from_path(&physical_path)?;
+            clear_row_conflict_resolution_state(repo)?;
+            return Ok(RepoResolveConflictOutcome {
+                path: entry.path,
+                path_kind,
+                path_storage,
+            });
+        }
         ResolveSide::Manual if physical_path.exists() => {
             Some(import_physical_sqlite_file_state(runtime, &physical_path)?)
         }
@@ -5146,7 +9279,11 @@ fn resolve_repo_conflict_for_file(
     };
     let entry = repo.resolve_file_conflict(&physical_path, state)?;
     clear_row_conflict_resolution_state(repo)?;
-    Ok(entry.path)
+    Ok(RepoResolveConflictOutcome {
+        path: entry.path,
+        path_kind,
+        path_storage,
+    })
 }
 
 fn resolve_repo_row_conflict(
@@ -5545,7 +9682,7 @@ fn format_repo_diff(diff: &RepoDiff) -> Result<String, ErrCtx> {
         &diff.from[..diff.from.len().min(12)],
         &diff.to[..diff.to.len().min(12)]
     )?;
-    if diff.files.is_empty() {
+    if diff.files.is_empty() && diff.artifacts.is_empty() {
         writeln!(&mut f, "No changes.")?;
         return Ok(f);
     }
@@ -5567,6 +9704,28 @@ fn format_repo_diff(diff: &RepoDiff) -> Result<String, ErrCtx> {
                 "  to:   {} page(s), {} range(s)",
                 to.snapshot.page_count,
                 to.snapshot.ranges.len()
+            )?;
+        }
+    }
+    for artifact in &diff.artifacts {
+        let change = repo_file_change_label(artifact.change);
+        writeln!(&mut f, "{change}: {}", artifact.path)?;
+        if let Some(from) = &artifact.from {
+            writeln!(
+                &mut f,
+                "  from: {} byte(s), {}, {}",
+                from.size(),
+                repo_artifact_state_label(from),
+                from.content_hash()
+            )?;
+        }
+        if let Some(to) = &artifact.to {
+            writeln!(
+                &mut f,
+                "  to:   {} byte(s), {}, {}",
+                to.size(),
+                repo_artifact_state_label(to),
+                to.content_hash()
             )?;
         }
     }
@@ -5611,6 +9770,14 @@ fn repo_file_change_label(change: RepoFileChange) -> &'static str {
         RepoFileChange::Added => "added",
         RepoFileChange::Deleted => "deleted",
         RepoFileChange::Modified => "modified",
+    }
+}
+
+fn repo_artifact_state_label(state: &CommitArtifactState) -> &'static str {
+    if state.is_large() {
+        "external payload"
+    } else {
+        "file"
     }
 }
 
@@ -5679,6 +9846,20 @@ fn format_repo_show(commit: &graft::repo::CommitObject) -> Result<String, ErrCtx
                 path,
                 state.snapshot.page_count,
                 state.snapshot.ranges.len()
+            )?;
+        }
+    }
+    if !commit.artifacts.is_empty() {
+        writeln!(&mut f)?;
+        writeln!(&mut f, "Artifacts:")?;
+        for (path, state) in &commit.artifacts {
+            writeln!(
+                &mut f,
+                "  {} ({} byte(s), {}, {})",
+                path,
+                state.size(),
+                repo_artifact_state_label(state),
+                state.content_hash()
             )?;
         }
     }
@@ -5752,6 +9933,424 @@ fn worktree_change_label(change: RepoWorktreeChangeKind) -> &'static str {
         RepoWorktreeChangeKind::Modified => "modified",
         RepoWorktreeChangeKind::Deleted => "deleted",
         RepoWorktreeChangeKind::Untracked => "untracked",
+    }
+}
+
+fn format_repo_artifact_audit(audit: &RepoArtifactAudit) -> Result<String, ErrCtx> {
+    let mut f = String::new();
+    if audit.ok() {
+        writeln!(&mut f, "Repository artifact payloads OK.")?;
+    } else {
+        writeln!(&mut f, "Repository artifact payload issues:")?;
+        for issue in &audit.issues {
+            writeln!(
+                &mut f,
+                "  {}: {} ({})",
+                repo_artifact_audit_issue_label(issue.kind),
+                issue.path,
+                issue.message
+            )?;
+        }
+    }
+    writeln!(&mut f, "Artifacts: {}", audit.artifacts)?;
+    writeln!(&mut f, "External payloads: {}", audit.external_payloads)?;
+    Ok(f)
+}
+
+fn format_repo_artifact_repair(outcome: &RepoArtifactRepairOutcome) -> Result<String, ErrCtx> {
+    let mut f = String::new();
+    writeln!(
+        &mut f,
+        "Repaired repository artifact payloads from {}.",
+        outcome.remote
+    )?;
+    writeln!(&mut f, "Fetched objects: {}", outcome.fetched_objects)?;
+    writeln!(
+        &mut f,
+        "Fetched external payloads: {}",
+        outcome.fetched_external_payloads
+    )?;
+    writeln!(&mut f, "Issues before: {}", outcome.before.issues.len())?;
+    writeln!(&mut f, "Issues after: {}", outcome.after.issues.len())?;
+    if !outcome.after.ok() {
+        writeln!(&mut f, "Remaining repository artifact payload issues:")?;
+        for issue in &outcome.after.issues {
+            writeln!(
+                &mut f,
+                "  {}: {} ({})",
+                repo_artifact_audit_issue_label(issue.kind),
+                issue.path,
+                issue.message
+            )?;
+        }
+    }
+    writeln!(&mut f, "Artifacts: {}", outcome.after.artifacts)?;
+    writeln!(
+        &mut f,
+        "External payloads: {}",
+        outcome.after.external_payloads
+    )?;
+    Ok(f)
+}
+
+fn format_large_file_fetch_outcome(outcome: &RepoLargeFileFetchOutcome) -> Result<String, ErrCtx> {
+    let mut f = String::new();
+    if outcome.external_payloads == 0 {
+        writeln!(
+            &mut f,
+            "No external payloads referenced by {}.",
+            outcome.target
+        )?;
+    } else if outcome.fetched_payloads == 0 {
+        writeln!(
+            &mut f,
+            "External payloads already present for {}.",
+            outcome.target
+        )?;
+    } else {
+        writeln!(
+            &mut f,
+            "Fetched {} external payload(s), {} byte(s), from {}.",
+            outcome.fetched_payloads, outcome.fetched_bytes, outcome.remote
+        )?;
+    }
+    writeln!(&mut f, "Remote: {}", outcome.remote)?;
+    writeln!(&mut f, "Target: {}", outcome.target)?;
+    writeln!(&mut f, "External payloads: {}", outcome.external_payloads)?;
+    writeln!(
+        &mut f,
+        "Already present: {}",
+        outcome.already_present_payloads
+    )?;
+    for file in &outcome.files {
+        writeln!(
+            &mut f,
+            "  {} ({}, {} byte(s), {}, paths: {})",
+            file.content_hash,
+            large_file_fetch_status_label(file.status),
+            file.size,
+            file.store_path,
+            file.paths.join(", ")
+        )?;
+    }
+    Ok(f)
+}
+
+fn large_file_fetch_status_label(status: RepoLargeFileFetchStatus) -> &'static str {
+    match status {
+        RepoLargeFileFetchStatus::Present => "present",
+        RepoLargeFileFetchStatus::Fetched => "fetched",
+    }
+}
+
+fn format_large_file_status_outcome(
+    outcome: &RepoLargeFileStatusOutcome,
+) -> Result<String, ErrCtx> {
+    let mut f = String::new();
+    if outcome.external_payloads == 0 {
+        writeln!(
+            &mut f,
+            "No external payloads referenced by {}.",
+            outcome.target
+        )?;
+    } else {
+        writeln!(
+            &mut f,
+            "External payloads for {}: {} present, {} missing, {} invalid.",
+            outcome.target,
+            outcome.present_payloads,
+            outcome.missing_payloads,
+            outcome.invalid_payloads
+        )?;
+    }
+    writeln!(&mut f, "External payloads: {}", outcome.external_payloads)?;
+    writeln!(&mut f, "Present bytes: {}", outcome.present_bytes)?;
+    writeln!(&mut f, "Missing bytes: {}", outcome.missing_bytes)?;
+    writeln!(&mut f, "Invalid bytes: {}", outcome.invalid_bytes)?;
+    for file in &outcome.files {
+        let message = file
+            .message
+            .as_ref()
+            .map(|message| format!(", {message}"))
+            .unwrap_or_default();
+        writeln!(
+            &mut f,
+            "  {} ({}, {} byte(s), {}, paths: {}{})",
+            file.content_hash,
+            large_file_status_state_label(file.status),
+            file.size,
+            file.store_path,
+            file.paths.join(", "),
+            message
+        )?;
+    }
+    Ok(f)
+}
+
+fn large_file_status_state_label(status: RepoLargeFileStatusState) -> &'static str {
+    match status {
+        RepoLargeFileStatusState::Present => "present",
+        RepoLargeFileStatusState::Missing => "missing",
+        RepoLargeFileStatusState::Invalid => "invalid",
+    }
+}
+
+fn format_large_file_prune_outcome(outcome: &RepoLargeFilePruneOutcome) -> Result<String, ErrCtx> {
+    let mut f = String::new();
+    if outcome.candidate_payloads == 0 {
+        writeln!(&mut f, "No unreferenced external payloads.")?;
+    } else if outcome.dry_run {
+        writeln!(
+            &mut f,
+            "Would prune {} external payload(s), {} byte(s).",
+            outcome.candidate_payloads, outcome.candidate_bytes
+        )?;
+    } else {
+        writeln!(
+            &mut f,
+            "Pruned {} external payload(s), {} byte(s).",
+            outcome.pruned_payloads, outcome.pruned_bytes
+        )?;
+    }
+    writeln!(
+        &mut f,
+        "Referenced external payloads: {}",
+        outcome.referenced_payloads
+    )?;
+    for file in &outcome.files {
+        writeln!(
+            &mut f,
+            "  {} ({} byte(s), {})",
+            file.content_hash, file.size, file.path
+        )?;
+    }
+    Ok(f)
+}
+
+fn repo_artifact_audit_issue_label(kind: RepoArtifactAuditIssueKind) -> &'static str {
+    match kind {
+        RepoArtifactAuditIssueKind::MissingObject => "missing object",
+        RepoArtifactAuditIssueKind::InvalidObject => "invalid object",
+        RepoArtifactAuditIssueKind::MissingExternalPayload => "missing external payload",
+        RepoArtifactAuditIssueKind::InvalidExternalPayload => "invalid external payload",
+    }
+}
+
+fn format_repo_tracked_paths(paths: &[RepoTrackedPath]) -> Result<String, ErrCtx> {
+    format_repo_path_inventory(paths, "No tracked paths.")
+}
+
+fn format_repo_untracked_paths(paths: &[RepoTrackedPath]) -> Result<String, ErrCtx> {
+    format_repo_path_inventory(paths, "No untracked paths.")
+}
+
+fn format_repo_path_inventory(
+    paths: &[RepoTrackedPath],
+    empty_message: &str,
+) -> Result<String, ErrCtx> {
+    let mut f = String::new();
+    if paths.is_empty() {
+        writeln!(&mut f, "{empty_message}")?;
+        return Ok(f);
+    }
+    for path in paths {
+        match path.kind {
+            RepoTrackedPathKind::SqliteDatabase => {
+                if let Some(page_count) = path.page_count {
+                    writeln!(
+                        &mut f,
+                        "{} (sqlite, {}, {page_count} page(s))",
+                        path.path,
+                        repo_path_storage_label(path.storage)
+                    )?;
+                } else {
+                    writeln!(
+                        &mut f,
+                        "{} (sqlite, {}, {} byte(s))",
+                        path.path,
+                        repo_path_storage_label(path.storage),
+                        path.size
+                            .map(|size| size.to_string())
+                            .unwrap_or_else(|| "?".to_string())
+                    )?;
+                }
+            }
+            RepoTrackedPathKind::TextFile | RepoTrackedPathKind::BinaryFile => writeln!(
+                &mut f,
+                "{} ({}, {}, {} byte(s))",
+                path.path,
+                repo_tracked_path_kind_label(path.kind),
+                repo_path_storage_label(path.storage),
+                path.size
+                    .map(|size| size.to_string())
+                    .unwrap_or_else(|| "?".to_string())
+            )?,
+        }
+    }
+    Ok(f)
+}
+
+fn format_repo_tracked_path_details(paths: &[RepoTrackedPathDetail]) -> Result<String, ErrCtx> {
+    let mut f = String::new();
+    if paths.is_empty() {
+        writeln!(&mut f, "No tracked paths.")?;
+        return Ok(f);
+    }
+    for path in paths {
+        match path.kind {
+            RepoTrackedPathKind::SqliteDatabase => writeln!(
+                &mut f,
+                "{} (sqlite, {}, {} page(s))",
+                path.path,
+                repo_path_storage_label(path.storage),
+                path.page_count
+                    .map(|count| count.to_string())
+                    .unwrap_or_else(|| "?".to_string())
+            )?,
+            RepoTrackedPathKind::TextFile | RepoTrackedPathKind::BinaryFile
+                if path.storage == RepoPathStorage::External =>
+            {
+                writeln!(
+                    &mut f,
+                    "{} ({}, {}, {} byte(s), oid {}, hash {}, object {}, payload {})",
+                    path.path,
+                    repo_tracked_path_kind_label(path.kind),
+                    repo_path_storage_label(path.storage),
+                    path.size
+                        .map(|size| size.to_string())
+                        .unwrap_or_else(|| "?".to_string()),
+                    option_object_id_label(path.oid.as_ref()),
+                    option_object_id_label(path.content_hash.as_ref()),
+                    presence_label(path.object_present),
+                    presence_label(path.external_payload_present)
+                )?
+            }
+            RepoTrackedPathKind::TextFile | RepoTrackedPathKind::BinaryFile => writeln!(
+                &mut f,
+                "{} ({}, {}, {} byte(s), oid {}, hash {}, object {})",
+                path.path,
+                repo_tracked_path_kind_label(path.kind),
+                repo_path_storage_label(path.storage),
+                path.size
+                    .map(|size| size.to_string())
+                    .unwrap_or_else(|| "?".to_string()),
+                option_object_id_label(path.oid.as_ref()),
+                option_object_id_label(path.content_hash.as_ref()),
+                presence_label(path.object_present)
+            )?,
+        }
+    }
+    Ok(f)
+}
+
+fn option_object_id_label(id: Option<&graft::repo::object::ObjectId>) -> String {
+    id.map(ToString::to_string)
+        .unwrap_or_else(|| "?".to_string())
+}
+
+fn presence_label(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "present",
+        Some(false) => "missing",
+        None => "n/a",
+    }
+}
+
+fn format_repo_tracked_path_entries(paths: &[RepoTrackedPathEntry]) -> Result<String, ErrCtx> {
+    let mut f = String::new();
+    if paths.is_empty() {
+        writeln!(&mut f, "No tracked paths.")?;
+        return Ok(f);
+    }
+    for path in paths {
+        let mode = path
+            .mode
+            .map(|mode| mode.to_string())
+            .unwrap_or_else(|| "------".to_string());
+        let oid = path
+            .oid
+            .as_ref()
+            .map(|oid| oid.short())
+            .unwrap_or("------------");
+        match path.kind {
+            RepoTrackedPathKind::SqliteDatabase => writeln!(
+                &mut f,
+                "{} {mode} {oid} {} (sqlite, {}, {} page(s))",
+                repo_index_stage_label(path.stage),
+                path.path,
+                repo_path_storage_label(path.storage),
+                path.page_count
+                    .map(|count| count.to_string())
+                    .unwrap_or_else(|| "?".to_string())
+            )?,
+            RepoTrackedPathKind::TextFile | RepoTrackedPathKind::BinaryFile => writeln!(
+                &mut f,
+                "{} {mode} {oid} {} ({}, {}, {} byte(s))",
+                repo_index_stage_label(path.stage),
+                path.path,
+                repo_tracked_path_kind_label(path.kind),
+                repo_path_storage_label(path.storage),
+                path.size
+                    .map(|size| size.to_string())
+                    .unwrap_or_else(|| "?".to_string())
+            )?,
+        }
+    }
+    Ok(f)
+}
+
+fn format_repo_config_entry(entry: &RepoConfigEntry) -> Result<String, ErrCtx> {
+    let mut f = String::new();
+    writeln!(&mut f, "{} = {}", entry.key, entry.value)?;
+    Ok(f)
+}
+
+fn format_repo_config_entries(entries: &[RepoConfigEntry]) -> Result<String, ErrCtx> {
+    let mut f = String::new();
+    for entry in entries {
+        writeln!(&mut f, "{} = {}", entry.key, entry.value)?;
+    }
+    Ok(f)
+}
+
+fn repo_tracked_path_kind_label(kind: RepoTrackedPathKind) -> &'static str {
+    match kind {
+        RepoTrackedPathKind::SqliteDatabase => "sqlite",
+        RepoTrackedPathKind::TextFile => "text file",
+        RepoTrackedPathKind::BinaryFile => "binary file",
+    }
+}
+
+fn repo_path_storage_label(storage: RepoPathStorage) -> &'static str {
+    match storage {
+        RepoPathStorage::SqliteSnapshot => "sqlite snapshot",
+        RepoPathStorage::Inline => "inline",
+        RepoPathStorage::External => "external",
+    }
+}
+
+fn repo_index_stage_label(stage: graft::repo::index::IndexStage) -> &'static str {
+    match stage {
+        graft::repo::index::IndexStage::Normal => "normal",
+        graft::repo::index::IndexStage::Base => "base",
+        graft::repo::index::IndexStage::Ours => "ours",
+        graft::repo::index::IndexStage::Theirs => "theirs",
+    }
+}
+
+fn repo_tracked_path_kind_json_label(kind: RepoTrackedPathKind) -> &'static str {
+    match kind {
+        RepoTrackedPathKind::SqliteDatabase => "sqlite_database",
+        RepoTrackedPathKind::TextFile => "text_file",
+        RepoTrackedPathKind::BinaryFile => "binary_file",
+    }
+}
+
+fn repo_path_storage_json_label(storage: RepoPathStorage) -> &'static str {
+    match storage {
+        RepoPathStorage::SqliteSnapshot => "sqlite_snapshot",
+        RepoPathStorage::Inline => "inline",
+        RepoPathStorage::External => "external",
     }
 }
 
@@ -6190,7 +10789,7 @@ fn format_current_file_row_merge_analysis(
         return Ok(Some(formatdoc!(
             "
             Row-level analysis for {key}:
-              unavailable: merge involves add/delete of this database path.
+              unavailable: merge involves add/delete of this tracked path.
             "
         )));
     };
@@ -6322,7 +10921,7 @@ fn current_file_row_merge_analysis(
             blocked_reasons: vec!["add_delete_conflict"],
             row_conflicts: vec![],
             schema_conflicts: vec![],
-            message: Some("merge involves add/delete of this database path".to_string()),
+            message: Some("merge involves add/delete of this tracked path".to_string()),
         }));
     };
 
@@ -6457,7 +11056,63 @@ fn repo_conflict_artifacts(
             &resolution_state,
         )?);
     }
-    Ok(JsonConflictList { merge_head: status.merge_head, conflicts })
+    let paths = json_conflict_paths(&conflicts);
+    let current_head = status.head_target.clone();
+    let current_branch = repo.current_branch()?;
+    Ok(JsonConflictList {
+        current_head,
+        current_branch,
+        merge_head: status.merge_head,
+        paths,
+        conflicts,
+    })
+}
+
+fn json_conflict_paths(conflicts: &[JsonConflictArtifact]) -> Vec<JsonConflictPath> {
+    #[derive(Clone, Copy)]
+    struct Counts {
+        kind: &'static str,
+        storage: &'static str,
+        total: usize,
+        unresolved: usize,
+        resolved: usize,
+    }
+
+    let mut by_path = BTreeMap::<String, Counts>::new();
+    for conflict in conflicts {
+        let entry = by_path.entry(conflict.path.clone()).or_insert(Counts {
+            kind: conflict.path_kind,
+            storage: conflict.storage,
+            total: 0,
+            unresolved: 0,
+            resolved: 0,
+        });
+        entry.kind = conflict.path_kind;
+        entry.storage = conflict.storage;
+        entry.total += 1;
+        if conflict.status == "resolved" {
+            entry.resolved += 1;
+        } else {
+            entry.unresolved += 1;
+        }
+    }
+
+    by_path
+        .into_iter()
+        .map(|(path, counts)| JsonConflictPath {
+            path,
+            kind: counts.kind,
+            storage: counts.storage,
+            status: if counts.unresolved == 0 {
+                "resolved"
+            } else {
+                "unresolved"
+            },
+            total: counts.total,
+            unresolved: counts.unresolved,
+            resolved: counts.resolved,
+        })
+        .collect()
 }
 
 fn unresolved_conflict_artifact_count(
@@ -6472,6 +11127,36 @@ fn unresolved_conflict_artifact_count(
         .count())
 }
 
+fn conflict_path_kind(repo: &Repository, key: &str) -> Result<RepoTrackedPathKind, ErrCtx> {
+    conflict_path_descriptor(repo, key).map(|(kind, _)| kind)
+}
+
+fn conflict_path_storage(repo: &Repository, key: &str) -> Result<RepoPathStorage, ErrCtx> {
+    conflict_path_descriptor(repo, key).map(|(_, storage)| storage)
+}
+
+fn conflict_path_descriptor(
+    repo: &Repository,
+    key: &str,
+) -> Result<(RepoTrackedPathKind, RepoPathStorage), ErrCtx> {
+    let index = repo.read_index()?;
+    for entry in index.entries.iter().filter(|entry| entry.path == key) {
+        if entry.file.is_some() {
+            return Ok((
+                RepoTrackedPathKind::SqliteDatabase,
+                RepoPathStorage::SqliteSnapshot,
+            ));
+        }
+        if let Some(artifact) = &entry.artifact {
+            return Ok((
+                artifact_checkout_path_kind(artifact),
+                artifact_checkout_path_storage(artifact),
+            ));
+        }
+    }
+    Ok((RepoTrackedPathKind::BinaryFile, RepoPathStorage::Inline))
+}
+
 fn repo_path_conflict_artifacts(
     runtime: &Runtime,
     repo: &Repository,
@@ -6479,12 +11164,17 @@ fn repo_path_conflict_artifacts(
     remote: Option<Arc<Remote>>,
     resolution_state: &RowConflictResolutionState,
 ) -> Result<Vec<JsonConflictArtifact>, ErrCtx> {
+    let (path_kind, path_storage) = conflict_path_descriptor(repo, key)?;
+    let path_kind_label = repo_tracked_path_kind_json_label(path_kind);
+    let path_storage_label = repo_path_storage_json_label(path_storage);
     let Some((base, ours, theirs)) = current_file_conflict_states(repo, key)? else {
         return Ok(vec![file_conflict_artifact(
             key,
+            path_kind_label,
+            path_storage_label,
             "file",
             "add_delete_conflict",
-            Some("merge involves add/delete of this database path".to_string()),
+            Some("merge involves add/delete of this tracked path".to_string()),
         )]);
     };
 
@@ -6511,6 +11201,8 @@ fn repo_path_conflict_artifacts(
             artifacts.push(JsonConflictArtifact {
                 id: format!("{}:row:{}:{}", key, conflict.table, conflict.rowid),
                 path: key.to_string(),
+                path_kind: "sqlite_database",
+                storage: path_storage_label,
                 kind: "row",
                 reason: conflict.reason.as_str(),
                 status: if resolution.is_some() {
@@ -6544,6 +11236,8 @@ fn repo_path_conflict_artifacts(
             artifacts.push(JsonConflictArtifact {
                 id: format!("{}:schema:{}:{}", key, conflict.entry_type, conflict.name),
                 path: key.to_string(),
+                path_kind: "sqlite_database",
+                storage: path_storage_label,
                 kind: "schema",
                 reason: conflict.reason.as_str(),
                 status: "unresolved",
@@ -6572,6 +11266,8 @@ fn repo_path_conflict_artifacts(
             artifacts.push(JsonConflictArtifact {
                 id: format!("{}:opaque:{}:{}", key, change.reason.as_str(), change.name),
                 path: key.to_string(),
+                path_kind: "sqlite_database",
+                storage: path_storage_label,
                 kind: "opaque",
                 reason: change.reason.as_str(),
                 status: "unresolved",
@@ -6599,6 +11295,8 @@ fn repo_path_conflict_artifacts(
         if artifacts.is_empty() && plan.apply_change_count() == 0 {
             artifacts.push(file_conflict_artifact(
                 key,
+                path_kind_label,
+                path_storage_label,
                 "file",
                 "no_applicable_changes",
                 Some("no row or schema conflict details were produced".to_string()),
@@ -6612,6 +11310,8 @@ fn repo_path_conflict_artifacts(
         Ok(artifacts) => Ok(artifacts),
         Err(err) => Ok(vec![file_conflict_artifact(
             key,
+            path_kind_label,
+            path_storage_label,
             "file",
             "analysis_error",
             Some(format!("row-level conflict analysis unavailable: {err}")),
@@ -6621,6 +11321,8 @@ fn repo_path_conflict_artifacts(
 
 fn file_conflict_artifact(
     key: &str,
+    path_kind: &'static str,
+    path_storage: &'static str,
     kind: &'static str,
     reason: &'static str,
     message: Option<String>,
@@ -6628,6 +11330,8 @@ fn file_conflict_artifact(
     JsonConflictArtifact {
         id: format!("{key}:{kind}:{reason}"),
         path: key.to_string(),
+        path_kind,
+        storage: path_storage,
         kind,
         reason,
         status: "unresolved",
@@ -6949,6 +11653,15 @@ fn row_auto_merge_sqlite_err(path: &Path, action: &str, err: rusqlite::Error) ->
         )
         .into(),
     )
+}
+
+fn json_remote_info(remote: RemoteInfo) -> JsonRemoteInfo {
+    let url = remote_config_uri(&remote.config);
+    JsonRemoteInfo {
+        name: remote.name,
+        config: remote.config,
+        url,
+    }
 }
 
 fn format_remote(remote: &RemoteInfo) -> String {
@@ -7645,15 +12358,29 @@ fn json_repo_row_diff(
     repo: &Repository,
     diff: &RepoDiff,
 ) -> Result<crate::json::JsonRepoRowDiffResult, ErrCtx> {
+    let paths = diff
+        .paths
+        .iter()
+        .map(|path| crate::json::JsonRepoPathDiff {
+            path: path.path.clone(),
+            change: repo_file_change_label(path.change).to_string(),
+            kind: repo_tracked_path_kind_json_label(path.kind).to_string(),
+            storage: repo_path_storage_json_label(path.storage).to_string(),
+        })
+        .collect();
     let files = diff
         .files
         .iter()
         .map(|file| {
             let change = repo_file_change_label(file.change).to_string();
+            let kind = repo_tracked_path_kind_json_label(file.kind).to_string();
+            let storage = repo_path_storage_json_label(file.storage).to_string();
             match repo_file_row_diff(runtime, repo, file) {
                 Ok(Some(row_diff)) => Ok(crate::json::JsonRepoRowDiffFile {
                     path: file.path.clone(),
                     change,
+                    kind,
+                    storage,
                     row_diff_available: true,
                     logical_status: row_diff.logical_status().as_str().to_string(),
                     capabilities: json_diff_capabilities(&row_diff),
@@ -7665,6 +12392,8 @@ fn json_repo_row_diff(
                 Ok(None) => Ok(crate::json::JsonRepoRowDiffFile {
                     path: file.path.clone(),
                     change: change.clone(),
+                    kind,
+                    storage,
                     row_diff_available: false,
                     logical_status: "row_diff_unavailable".to_string(),
                     capabilities: Vec::new(),
@@ -7678,6 +12407,8 @@ fn json_repo_row_diff(
                 Err(err) => Ok(crate::json::JsonRepoRowDiffFile {
                     path: file.path.clone(),
                     change: change.clone(),
+                    kind,
+                    storage,
                     row_diff_available: false,
                     logical_status: "row_diff_unavailable".to_string(),
                     capabilities: Vec::new(),
@@ -7695,6 +12426,7 @@ fn json_repo_row_diff(
     Ok(crate::json::JsonRepoRowDiffResult {
         from: diff.from.clone(),
         to: diff.to.clone(),
+        paths,
         files,
     })
 }
@@ -7973,6 +12705,7 @@ fn collect_btree_pages(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use graft::repo::{RepoConflictChange, RepoStagedChange, RepoStatusCounts, RepoWorktreeChange};
 
     #[test]
     fn legacy_volume_pragmas_are_debug_only() {
@@ -8011,7 +12744,25 @@ mod tests {
         let status = Pragma { name: "graft_status", arg: None };
         assert!(matches!(
             GraftPragma::try_from(&status).unwrap(),
-            GraftPragma::Status
+            GraftPragma::Status { spec: StatusSpec { kind: None } }
+        ));
+        let json_status = Pragma {
+            name: "graft_json_status",
+            arg: Some("--kind sqlite"),
+        };
+        assert!(matches!(
+            GraftPragma::try_from(&json_status).unwrap(),
+            GraftPragma::JsonStatus {
+                spec: StatusSpec {
+                    kind: Some(RepoTrackedPathKind::SqliteDatabase),
+                },
+            }
+        ));
+
+        let json_init = Pragma { name: "graft_json_init", arg: None };
+        assert!(matches!(
+            GraftPragma::try_from(&json_init).unwrap(),
+            GraftPragma::JsonRepoInit
         ));
 
         let remove = Pragma { name: "graft_rm", arg: Some("app.db") };
@@ -8019,6 +12770,99 @@ mod tests {
             GraftPragma::try_from(&remove).unwrap(),
             GraftPragma::Remove { .. }
         ));
+
+        let json_remove = Pragma {
+            name: "graft_json_rm",
+            arg: Some("app.db"),
+        };
+        assert!(matches!(
+            GraftPragma::try_from(&json_remove).unwrap(),
+            GraftPragma::JsonRemove { .. }
+        ));
+
+        let json_commit = Pragma {
+            name: "graft_json_commit",
+            arg: Some("message"),
+        };
+        assert!(matches!(
+            GraftPragma::try_from(&json_commit).unwrap(),
+            GraftPragma::JsonCommit { .. }
+        ));
+    }
+
+    #[test]
+    fn json_log_status_mode_is_opt_in() {
+        let legacy = Pragma { name: "graft_json_log", arg: None };
+        assert!(matches!(
+            GraftPragma::try_from(&legacy).unwrap(),
+            GraftPragma::JsonLog { mode: JsonLogMode::LegacyArray }
+        ));
+
+        let with_status = Pragma {
+            name: "graft_json_log",
+            arg: Some("--with-status"),
+        };
+        assert!(matches!(
+            GraftPragma::try_from(&with_status).unwrap(),
+            GraftPragma::JsonLog { mode: JsonLogMode::WithStatus }
+        ));
+
+        let invalid = Pragma {
+            name: "graft_json_log",
+            arg: Some("--status"),
+        };
+        assert!(GraftPragma::try_from(&invalid).is_err());
+    }
+
+    #[test]
+    fn json_config_list_status_mode_is_opt_in() {
+        let legacy = Pragma {
+            name: "graft_json_config_list",
+            arg: None,
+        };
+        assert!(matches!(
+            GraftPragma::try_from(&legacy).unwrap(),
+            GraftPragma::JsonConfigList { mode: JsonConfigListMode::LegacyArray }
+        ));
+
+        let with_status = Pragma {
+            name: "graft_json_config_list",
+            arg: Some("--with-status"),
+        };
+        assert!(matches!(
+            GraftPragma::try_from(&with_status).unwrap(),
+            GraftPragma::JsonConfigList { mode: JsonConfigListMode::WithStatus }
+        ));
+
+        let invalid = Pragma {
+            name: "graft_json_config_list",
+            arg: Some("--status"),
+        };
+        assert!(GraftPragma::try_from(&invalid).is_err());
+    }
+
+    #[test]
+    fn json_tags_status_mode_is_opt_in() {
+        let legacy = Pragma { name: "graft_json_tags", arg: None };
+        assert!(matches!(
+            GraftPragma::try_from(&legacy).unwrap(),
+            GraftPragma::JsonTags { mode: JsonTagsMode::LegacyArray }
+        ));
+
+        let with_status = Pragma {
+            name: "graft_json_tags",
+            arg: Some("--with-status"),
+        };
+        assert!(matches!(
+            GraftPragma::try_from(&with_status).unwrap(),
+            GraftPragma::JsonTags { mode: JsonTagsMode::WithStatus }
+        ));
+
+        let invalid = Pragma {
+            name: "graft_json_tags",
+            arg: Some("--status"),
+        };
+        assert!(GraftPragma::try_from(&invalid).is_err());
     }
 
     #[test]
@@ -8032,6 +12876,34 @@ mod tests {
             GraftPragma::FetchAsync { remote: Some(_), all: true, .. }
         ));
 
+        let json_fetch = Pragma {
+            name: "graft_json_fetch_async",
+            arg: Some("origin main"),
+        };
+        assert!(matches!(
+            GraftPragma::try_from(&json_fetch).unwrap(),
+            GraftPragma::JsonFetchAsync {
+                remote: Some(_),
+                branch: Some(_),
+                mode: JsonFetchAsyncMode::LegacyId,
+                ..
+            }
+        ));
+
+        let json_fetch_with_status = Pragma {
+            name: "graft_json_fetch_async",
+            arg: Some("--with-status --all origin"),
+        };
+        assert!(matches!(
+            GraftPragma::try_from(&json_fetch_with_status).unwrap(),
+            GraftPragma::JsonFetchAsync {
+                remote: Some(_),
+                all: true,
+                mode: JsonFetchAsyncMode::WithStatus,
+                ..
+            }
+        ));
+
         let status = Pragma {
             name: "graft_job_status",
             arg: Some("graft-job-1"),
@@ -8039,6 +12911,15 @@ mod tests {
         assert!(matches!(
             GraftPragma::try_from(&status).unwrap(),
             GraftPragma::JobStatus { .. }
+        ));
+
+        let json_status = Pragma {
+            name: "graft_json_job_status",
+            arg: Some("graft-job-1"),
+        };
+        assert!(matches!(
+            GraftPragma::try_from(&json_status).unwrap(),
+            GraftPragma::JsonJobStatus { .. }
         ));
 
         let result = Pragma {
@@ -8117,6 +12998,78 @@ mod tests {
     }
 
     #[test]
+    fn parse_json_remote_pragmas() {
+        let add = Pragma {
+            name: "graft_json_remote_add",
+            arg: Some("origin memory"),
+        };
+        assert!(matches!(
+            GraftPragma::try_from(&add).unwrap(),
+            GraftPragma::JsonRemoteAdd { name, config: RemoteConfig::Memory } if name == "origin"
+        ));
+
+        let remove = Pragma {
+            name: "graft_json_remote_remove",
+            arg: Some("origin"),
+        };
+        assert!(matches!(
+            GraftPragma::try_from(&remove).unwrap(),
+            GraftPragma::JsonRemoteRemove { name } if name == "origin"
+        ));
+
+        let rename = Pragma {
+            name: "graft_json_remote_rename",
+            arg: Some("origin upstream"),
+        };
+        assert!(matches!(
+            GraftPragma::try_from(&rename).unwrap(),
+            GraftPragma::JsonRemoteRename { old, new } if old == "origin" && new == "upstream"
+        ));
+
+        let get_url = Pragma {
+            name: "graft_json_remote_get_url",
+            arg: Some("origin"),
+        };
+        assert!(matches!(
+            GraftPragma::try_from(&get_url).unwrap(),
+            GraftPragma::JsonRemoteGetUrl { name } if name == "origin"
+        ));
+
+        let set_url = Pragma {
+            name: "graft_json_remote_set_url",
+            arg: Some("origin memory"),
+        };
+        assert!(matches!(
+            GraftPragma::try_from(&set_url).unwrap(),
+            GraftPragma::JsonRemoteSetUrl { name, config: RemoteConfig::Memory } if name == "origin"
+        ));
+
+        let prune = Pragma {
+            name: "graft_json_remote_prune",
+            arg: Some("origin"),
+        };
+        assert!(matches!(
+            GraftPragma::try_from(&prune).unwrap(),
+            GraftPragma::JsonRemotePrune { name } if name == "origin"
+        ));
+
+        let ls_remote = Pragma {
+            name: "graft_json_ls_remote",
+            arg: Some("origin"),
+        };
+        assert!(matches!(
+            GraftPragma::try_from(&ls_remote).unwrap(),
+            GraftPragma::JsonLsRemote { name } if name == "origin"
+        ));
+
+        let remotes = Pragma { name: "graft_json_remotes", arg: None };
+        assert!(matches!(
+            GraftPragma::try_from(&remotes).unwrap(),
+            GraftPragma::JsonRemotes
+        ));
+    }
+
+    #[test]
     fn parse_branch_list_mode_supports_remote_and_all() {
         assert_eq!(parse_branch_list_mode(None).unwrap(), BranchListMode::Local);
         assert_eq!(
@@ -8171,6 +13124,20 @@ mod tests {
         assert!(parse_repo_clone_arg("").is_err());
         assert!(parse_repo_clone_arg("--branch feature/search").is_err());
         assert!(parse_repo_clone_arg("memory feature/search extra").is_err());
+
+        let json_clone = Pragma {
+            name: "graft_json_clone",
+            arg: Some("--branch feature/search memory"),
+        };
+        assert!(matches!(
+            GraftPragma::try_from(&json_clone).unwrap(),
+            GraftPragma::JsonRepoClone {
+                spec: RepoCloneSpec {
+                    config: RemoteConfig::Memory,
+                    branch: Some(branch),
+                }
+            } if branch == "feature/search"
+        ));
     }
 
     #[test]
@@ -8258,6 +13225,7 @@ mod tests {
             parse_repo_diff_arg(Some("--rows")).unwrap(),
             RepoDiffSpec {
                 mode: DiffMode::Rows,
+                kind: None,
                 target: RepoDiffTarget::Worktree { path: None },
             }
         );
@@ -8265,13 +13233,23 @@ mod tests {
             parse_repo_diff_arg(Some("--rows --staged -- app.db")).unwrap(),
             RepoDiffSpec {
                 mode: DiffMode::Rows,
+                kind: None,
                 target: RepoDiffTarget::Staged { path: Some("app.db".to_string()) },
+            }
+        );
+        assert_eq!(
+            parse_repo_diff_arg(Some("--kind db --staged")).unwrap(),
+            RepoDiffSpec {
+                mode: DiffMode::Default,
+                kind: Some(RepoTrackedPathKind::SqliteDatabase),
+                target: RepoDiffTarget::Staged { path: None },
             }
         );
         assert_eq!(
             parse_repo_diff_arg(Some("--rows HEAD~1 HEAD -- app.db")).unwrap(),
             RepoDiffSpec {
                 mode: DiffMode::Rows,
+                kind: None,
                 target: RepoDiffTarget::Revisions {
                     from: "HEAD~1".to_string(),
                     to: "HEAD".to_string(),
@@ -8283,6 +13261,7 @@ mod tests {
             parse_repo_diff_arg(Some("HEAD -- --rows")).unwrap(),
             RepoDiffSpec {
                 mode: DiffMode::Default,
+                kind: None,
                 target: RepoDiffTarget::RevisionToWorktree {
                     rev: "HEAD".to_string(),
                     path: Some("--rows".to_string()),
@@ -8290,6 +13269,507 @@ mod tests {
             }
         );
         assert!(parse_repo_diff_arg(Some("--rows --rows")).is_err());
+        assert!(parse_repo_diff_arg(Some("--kind nope")).is_err());
+        assert!(parse_repo_diff_arg(Some("--kind db --kind text_file")).is_err());
+    }
+
+    #[test]
+    fn parse_repo_add_arg_supports_force() {
+        assert_eq!(
+            parse_repo_add_arg(None).unwrap(),
+            RepoAddSpec {
+                path: None,
+                force: false,
+                all: false,
+                kind: None,
+            }
+        );
+        assert_eq!(
+            parse_repo_add_arg(Some("--all")).unwrap(),
+            RepoAddSpec {
+                path: None,
+                force: false,
+                all: true,
+                kind: None,
+            }
+        );
+        assert_eq!(
+            parse_repo_add_arg(Some("-A")).unwrap(),
+            RepoAddSpec {
+                path: None,
+                force: false,
+                all: true,
+                kind: None,
+            }
+        );
+        assert_eq!(
+            parse_repo_add_arg(Some("--all --kind db")).unwrap(),
+            RepoAddSpec {
+                path: None,
+                force: false,
+                all: true,
+                kind: Some(RepoTrackedPathKind::SqliteDatabase),
+            }
+        );
+        assert_eq!(
+            parse_repo_add_arg(Some("--kind binary_file -A")).unwrap(),
+            RepoAddSpec {
+                path: None,
+                force: false,
+                all: true,
+                kind: Some(RepoTrackedPathKind::BinaryFile),
+            }
+        );
+        assert_eq!(
+            parse_repo_add_arg(Some("assets/readme.md")).unwrap(),
+            RepoAddSpec {
+                path: Some(PathBuf::from("assets/readme.md")),
+                force: false,
+                all: false,
+                kind: None,
+            }
+        );
+        assert_eq!(
+            parse_repo_add_arg(Some("--force -- assets/readme.md")).unwrap(),
+            RepoAddSpec {
+                path: Some(PathBuf::from("assets/readme.md")),
+                force: true,
+                all: false,
+                kind: None,
+            }
+        );
+        assert_eq!(
+            parse_repo_add_arg(Some("-f assets/readme.md")).unwrap(),
+            RepoAddSpec {
+                path: Some(PathBuf::from("assets/readme.md")),
+                force: true,
+                all: false,
+                kind: None,
+            }
+        );
+        assert!(parse_repo_add_arg(Some("--force --all")).is_err());
+        assert!(parse_repo_add_arg(Some("--kind db")).is_err());
+        assert!(parse_repo_add_arg(Some("--all --kind nope")).is_err());
+        assert!(parse_repo_add_arg(Some("--force --all --kind db")).is_err());
+        assert!(parse_repo_add_arg(Some("--unknown assets/readme.md")).is_err());
+    }
+
+    #[test]
+    fn parse_repo_remove_arg_supports_cached() {
+        assert_eq!(
+            parse_repo_remove_arg(None).unwrap(),
+            RepoRemoveSpec { path: None, cached: false }
+        );
+        assert_eq!(
+            parse_repo_remove_arg(Some("assets/readme.md")).unwrap(),
+            RepoRemoveSpec {
+                path: Some(PathBuf::from("assets/readme.md")),
+                cached: false,
+            }
+        );
+        assert_eq!(
+            parse_repo_remove_arg(Some("--cached")).unwrap(),
+            RepoRemoveSpec { path: None, cached: true }
+        );
+        assert_eq!(
+            parse_repo_remove_arg(Some("--cached -- assets/readme.md")).unwrap(),
+            RepoRemoveSpec {
+                path: Some(PathBuf::from("assets/readme.md")),
+                cached: true,
+            }
+        );
+        assert!(parse_repo_remove_arg(Some("--cached --cached")).is_err());
+        assert!(parse_repo_remove_arg(Some("--unknown assets/readme.md")).is_err());
+    }
+
+    #[test]
+    fn parse_repo_audit_arg_supports_repair() {
+        assert_eq!(
+            parse_repo_audit_arg(None).unwrap(),
+            RepoAuditSpec { repair: false, remote: None }
+        );
+        assert_eq!(
+            parse_repo_audit_arg(Some("")).unwrap(),
+            RepoAuditSpec { repair: false, remote: None }
+        );
+        assert_eq!(
+            parse_repo_audit_arg(Some("--repair")).unwrap(),
+            RepoAuditSpec { repair: true, remote: None }
+        );
+        assert_eq!(
+            parse_repo_audit_arg(Some("--repair origin")).unwrap(),
+            RepoAuditSpec {
+                repair: true,
+                remote: Some("origin".to_string()),
+            }
+        );
+        assert!(parse_repo_audit_arg(Some("origin")).is_err());
+        assert!(parse_repo_audit_arg(Some("--repair --repair")).is_err());
+        assert!(parse_repo_audit_arg(Some("--unknown")).is_err());
+    }
+
+    #[test]
+    fn parse_lfs_fetch_arg_supports_remote_and_revision() {
+        assert_eq!(
+            parse_lfs_fetch_arg(None).unwrap(),
+            LargeFileFetchSpec { remote: None, rev: None }
+        );
+        assert_eq!(
+            parse_lfs_fetch_arg(Some("")).unwrap(),
+            LargeFileFetchSpec { remote: None, rev: None }
+        );
+        assert_eq!(
+            parse_lfs_fetch_arg(Some("HEAD~1")).unwrap(),
+            LargeFileFetchSpec {
+                remote: None,
+                rev: Some("HEAD~1".to_string())
+            }
+        );
+        assert_eq!(
+            parse_lfs_fetch_arg(Some("--remote origin origin/main")).unwrap(),
+            LargeFileFetchSpec {
+                remote: Some("origin".to_string()),
+                rev: Some("origin/main".to_string())
+            }
+        );
+        assert!(parse_lfs_fetch_arg(Some("--remote")).is_err());
+        assert!(parse_lfs_fetch_arg(Some("--remote origin --remote upstream")).is_err());
+        assert!(parse_lfs_fetch_arg(Some("HEAD main")).is_err());
+        assert!(parse_lfs_fetch_arg(Some("--unknown")).is_err());
+    }
+
+    #[test]
+    fn parse_lfs_status_arg_supports_optional_revision() {
+        assert_eq!(
+            parse_lfs_status_arg(None).unwrap(),
+            LargeFileStatusSpec { rev: None }
+        );
+        assert_eq!(
+            parse_lfs_status_arg(Some("")).unwrap(),
+            LargeFileStatusSpec { rev: None }
+        );
+        assert_eq!(
+            parse_lfs_status_arg(Some("HEAD~1")).unwrap(),
+            LargeFileStatusSpec { rev: Some("HEAD~1".to_string()) }
+        );
+        assert!(parse_lfs_status_arg(Some("HEAD main")).is_err());
+        assert!(parse_lfs_status_arg(Some("--unknown")).is_err());
+    }
+
+    #[test]
+    fn parse_lfs_prune_arg_defaults_to_dry_run() {
+        assert_eq!(
+            parse_lfs_prune_arg(None).unwrap(),
+            LargeFilePruneSpec { dry_run: true }
+        );
+        assert_eq!(
+            parse_lfs_prune_arg(Some("")).unwrap(),
+            LargeFilePruneSpec { dry_run: true }
+        );
+        assert_eq!(
+            parse_lfs_prune_arg(Some("--dry-run")).unwrap(),
+            LargeFilePruneSpec { dry_run: true }
+        );
+        assert_eq!(
+            parse_lfs_prune_arg(Some("--force")).unwrap(),
+            LargeFilePruneSpec { dry_run: false }
+        );
+        assert!(parse_lfs_prune_arg(Some("--force --dry-run")).is_err());
+        assert!(parse_lfs_prune_arg(Some("--unknown")).is_err());
+    }
+
+    #[test]
+    fn payload_pragmas_alias_lfs_payload_pragmas() {
+        assert!(matches!(
+            GraftPragma::try_from(&Pragma {
+                name: "graft_payload_fetch",
+                arg: Some("--remote origin HEAD")
+            })
+            .unwrap(),
+            GraftPragma::LargeFileFetch { .. }
+        ));
+        assert!(matches!(
+            GraftPragma::try_from(&Pragma {
+                name: "graft_json_payload_status",
+                arg: Some("HEAD")
+            })
+            .unwrap(),
+            GraftPragma::JsonLargeFileStatus { .. }
+        ));
+        assert!(matches!(
+            GraftPragma::try_from(&Pragma {
+                name: "graft_payload_prune",
+                arg: Some("--dry-run")
+            })
+            .unwrap(),
+            GraftPragma::LargeFilePrune { .. }
+        ));
+    }
+
+    #[test]
+    fn parse_ls_files_arg_supports_stage() {
+        assert_eq!(
+            parse_ls_files_arg(None).unwrap(),
+            LsFilesSpec {
+                stage: false,
+                details: false,
+                others: false,
+                kind: None
+            }
+        );
+        assert_eq!(
+            parse_ls_files_arg(Some("")).unwrap(),
+            LsFilesSpec {
+                stage: false,
+                details: false,
+                others: false,
+                kind: None
+            }
+        );
+        assert_eq!(
+            parse_ls_files_arg(Some("--stage")).unwrap(),
+            LsFilesSpec {
+                stage: true,
+                details: false,
+                others: false,
+                kind: None
+            }
+        );
+        assert_eq!(
+            parse_ls_files_arg(Some("-s")).unwrap(),
+            LsFilesSpec {
+                stage: true,
+                details: false,
+                others: false,
+                kind: None
+            }
+        );
+        assert_eq!(
+            parse_ls_files_arg(Some("--kind sqlite")).unwrap(),
+            LsFilesSpec {
+                stage: false,
+                details: false,
+                others: false,
+                kind: Some(RepoTrackedPathKind::SqliteDatabase),
+            }
+        );
+        assert_eq!(
+            parse_ls_files_arg(Some("--stage --kind binary_file")).unwrap(),
+            LsFilesSpec {
+                stage: true,
+                details: false,
+                others: false,
+                kind: Some(RepoTrackedPathKind::BinaryFile),
+            }
+        );
+        assert_eq!(
+            parse_ls_files_arg(Some("--details --kind text")).unwrap(),
+            LsFilesSpec {
+                stage: false,
+                details: true,
+                others: false,
+                kind: Some(RepoTrackedPathKind::TextFile),
+            }
+        );
+        assert_eq!(
+            parse_ls_files_arg(Some("--others --kind binary")).unwrap(),
+            LsFilesSpec {
+                stage: false,
+                details: false,
+                others: true,
+                kind: Some(RepoTrackedPathKind::BinaryFile),
+            }
+        );
+        assert!(parse_ls_files_arg(Some("--kind binary -s")).is_ok());
+        assert!(parse_ls_files_arg(Some("--unknown")).is_err());
+        assert!(parse_ls_files_arg(Some("--kind nope")).is_err());
+        assert!(parse_ls_files_arg(Some("--stage --stage")).is_err());
+        assert!(parse_ls_files_arg(Some("--details --details")).is_err());
+        assert!(parse_ls_files_arg(Some("--others --others")).is_err());
+        assert!(parse_ls_files_arg(Some("--stage --details")).is_err());
+        assert!(parse_ls_files_arg(Some("--stage --others")).is_err());
+        assert!(parse_ls_files_arg(Some("--details --others")).is_err());
+    }
+
+    #[test]
+    fn parse_status_arg_supports_kind_filter() {
+        assert_eq!(parse_status_arg(None).unwrap(), StatusSpec { kind: None });
+        assert_eq!(
+            parse_status_arg(Some("")).unwrap(),
+            StatusSpec { kind: None }
+        );
+        assert_eq!(
+            parse_status_arg(Some("--kind db")).unwrap(),
+            StatusSpec {
+                kind: Some(RepoTrackedPathKind::SqliteDatabase)
+            }
+        );
+        assert_eq!(
+            parse_status_arg(Some("--kind binary_file")).unwrap(),
+            StatusSpec {
+                kind: Some(RepoTrackedPathKind::BinaryFile)
+            }
+        );
+        assert!(parse_status_arg(Some("--kind nope")).is_err());
+        assert!(parse_status_arg(Some("--kind text_file --kind binary_file")).is_err());
+        assert!(parse_status_arg(Some("--stage")).is_err());
+    }
+
+    #[test]
+    fn status_kind_filter_recomputes_paths_and_counts() {
+        let status = RepoStatus {
+            worktree: PathBuf::from("/repo"),
+            graft_dir: PathBuf::from("/repo/.graft"),
+            repository_format_version: 1,
+            head: Head::branch("main"),
+            head_target: Some("head".to_string()),
+            merge_head: None,
+            orig_head: None,
+            dirty: true,
+            has_unstaged_changes: true,
+            has_staged_changes: true,
+            has_conflicts: true,
+            work_in_progress: true,
+            counts: RepoStatusCounts { unstaged: 2, staged: 1, conflicted: 1 },
+            paths: Vec::new(),
+            unstaged: vec!["app.db".to_string(), "assets/readme.md".to_string()],
+            unstaged_changes: vec![
+                RepoWorktreeChange {
+                    path: "app.db".to_string(),
+                    change: RepoWorktreeChangeKind::Modified,
+                    kind: RepoTrackedPathKind::SqliteDatabase,
+                    storage: RepoPathStorage::SqliteSnapshot,
+                },
+                RepoWorktreeChange {
+                    path: "assets/readme.md".to_string(),
+                    change: RepoWorktreeChangeKind::Modified,
+                    kind: RepoTrackedPathKind::TextFile,
+                    storage: RepoPathStorage::Inline,
+                },
+            ],
+            staged: vec!["app.db".to_string()],
+            staged_changes: vec![RepoStagedChange {
+                path: "app.db".to_string(),
+                change: RepoFileChange::Modified,
+                kind: RepoTrackedPathKind::SqliteDatabase,
+                storage: RepoPathStorage::SqliteSnapshot,
+            }],
+            conflicted: vec!["assets/model.bin".to_string()],
+            conflicted_changes: vec![RepoConflictChange {
+                path: "assets/model.bin".to_string(),
+                kind: RepoTrackedPathKind::BinaryFile,
+                storage: RepoPathStorage::External,
+            }],
+            branches: Vec::new(),
+            remotes: Vec::new(),
+            upstream: None,
+            upstream_status: None,
+            ahead: 0,
+            behind: 0,
+        };
+
+        let sqlite_status =
+            filter_repo_status_by_kind(status.clone(), Some(RepoTrackedPathKind::SqliteDatabase));
+        assert_eq!(sqlite_status.unstaged, vec!["app.db"]);
+        assert_eq!(sqlite_status.staged, vec!["app.db"]);
+        assert!(sqlite_status.conflicted.is_empty());
+        assert_eq!(sqlite_status.counts.unstaged, 1);
+        assert_eq!(sqlite_status.counts.staged, 1);
+        assert_eq!(sqlite_status.counts.conflicted, 0);
+        assert!(sqlite_status.has_unstaged_changes);
+        assert!(sqlite_status.has_staged_changes);
+        assert!(!sqlite_status.has_conflicts);
+        assert_eq!(sqlite_status.paths.len(), 1);
+        assert_eq!(
+            sqlite_status.paths[0].kind,
+            RepoTrackedPathKind::SqliteDatabase
+        );
+
+        let binary_status =
+            filter_repo_status_by_kind(status, Some(RepoTrackedPathKind::BinaryFile));
+        assert!(binary_status.unstaged.is_empty());
+        assert!(binary_status.staged.is_empty());
+        assert_eq!(binary_status.conflicted, vec!["assets/model.bin"]);
+        assert_eq!(binary_status.counts.conflicted, 1);
+        assert!(binary_status.has_conflicts);
+        assert_eq!(binary_status.paths.len(), 1);
+        assert_eq!(binary_status.paths[0].kind, RepoTrackedPathKind::BinaryFile);
+        assert_eq!(binary_status.paths[0].storage, RepoPathStorage::External);
+    }
+
+    #[test]
+    fn ls_files_kind_filter_selects_matching_path_kinds() {
+        let paths = vec![
+            RepoTrackedPath {
+                path: "app.db".to_string(),
+                kind: RepoTrackedPathKind::SqliteDatabase,
+                storage: RepoPathStorage::SqliteSnapshot,
+                size: None,
+                page_count: None,
+            },
+            RepoTrackedPath {
+                path: "assets/readme.md".to_string(),
+                kind: RepoTrackedPathKind::TextFile,
+                storage: RepoPathStorage::Inline,
+                size: Some(12),
+                page_count: None,
+            },
+            RepoTrackedPath {
+                path: "assets/model.bin".to_string(),
+                kind: RepoTrackedPathKind::BinaryFile,
+                storage: RepoPathStorage::External,
+                size: Some(4096),
+                page_count: None,
+            },
+        ];
+        let sqlite_paths =
+            filter_tracked_paths_by_kind(paths, Some(RepoTrackedPathKind::SqliteDatabase));
+        assert_eq!(sqlite_paths.len(), 1);
+        assert_eq!(sqlite_paths[0].path, "app.db");
+
+        let entries = vec![
+            RepoTrackedPathEntry {
+                path: "app.db".to_string(),
+                stage: graft::repo::index::IndexStage::Normal,
+                kind: RepoTrackedPathKind::SqliteDatabase,
+                storage: RepoPathStorage::SqliteSnapshot,
+                mode: None,
+                oid: None,
+                size: None,
+                page_count: None,
+            },
+            RepoTrackedPathEntry {
+                path: "assets/model.bin".to_string(),
+                stage: graft::repo::index::IndexStage::Normal,
+                kind: RepoTrackedPathKind::BinaryFile,
+                storage: RepoPathStorage::External,
+                mode: None,
+                oid: None,
+                size: Some(4096),
+                page_count: None,
+            },
+        ];
+        let binary_entries =
+            filter_tracked_path_entries_by_kind(entries, Some(RepoTrackedPathKind::BinaryFile));
+        assert_eq!(binary_entries.len(), 1);
+        assert_eq!(binary_entries[0].path, "assets/model.bin");
+    }
+
+    #[test]
+    fn parse_repo_config_set_arg_preserves_values_with_spaces() {
+        assert_eq!(
+            parse_repo_config_set_arg("files.inline_text_threshold -- 8 MB").unwrap(),
+            (
+                "files.inline_text_threshold".to_string(),
+                "8 MB".to_string()
+            )
+        );
+        assert_eq!(
+            parse_repo_config_set_arg("files.inline_text_threshold 4 B").unwrap(),
+            ("files.inline_text_threshold".to_string(), "4 B".to_string())
+        );
+        assert!(parse_repo_config_set_arg("files.inline_text_threshold -- ").is_err());
+        assert!(parse_repo_config_set_arg("").is_err());
     }
 
     #[test]
@@ -8315,6 +13795,44 @@ mod tests {
     }
 
     #[test]
+    fn parse_json_tag_pragmas() {
+        let create = Pragma {
+            name: "graft_json_tag_create",
+            arg: Some("v1.0 HEAD"),
+        };
+        assert!(matches!(
+            GraftPragma::try_from(&create).unwrap(),
+            GraftPragma::JsonTagCreate {
+                name,
+                target: Some(target),
+                message: None,
+            } if name == "v1.0" && target == "HEAD"
+        ));
+
+        let annotated = Pragma {
+            name: "graft_json_tag_create",
+            arg: Some("--annotated v1.0 HEAD -- release 1.0"),
+        };
+        assert!(matches!(
+            GraftPragma::try_from(&annotated).unwrap(),
+            GraftPragma::JsonTagCreate {
+                name,
+                target: Some(target),
+                message: Some(message),
+            } if name == "v1.0" && target == "HEAD" && message == "release 1.0"
+        ));
+
+        let delete = Pragma {
+            name: "graft_json_tag_delete",
+            arg: Some("v1.0"),
+        };
+        assert!(matches!(
+            GraftPragma::try_from(&delete).unwrap(),
+            GraftPragma::JsonTagDelete { name } if name == "v1.0"
+        ));
+    }
+
+    #[test]
     fn parse_checkout_and_switch_force_args() {
         assert_eq!(
             parse_repo_checkout_arg("--force HEAD~1").unwrap(),
@@ -8333,7 +13851,9 @@ mod tests {
             RepoRestoreSpec {
                 source: None,
                 staged: false,
-                path: PathBuf::from("external.db"),
+                all: false,
+                kind: None,
+                path: Some(PathBuf::from("external.db")),
             }
         );
         assert_eq!(
@@ -8341,7 +13861,9 @@ mod tests {
             RepoRestoreSpec {
                 source: Some("HEAD~1".to_string()),
                 staged: false,
-                path: PathBuf::from("external.db"),
+                all: false,
+                kind: None,
+                path: Some(PathBuf::from("external.db")),
             }
         );
         assert_eq!(
@@ -8349,7 +13871,9 @@ mod tests {
             RepoRestoreSpec {
                 source: None,
                 staged: true,
-                path: PathBuf::from("external.db"),
+                all: false,
+                kind: None,
+                path: Some(PathBuf::from("external.db")),
             }
         );
         assert_eq!(
@@ -8357,9 +13881,25 @@ mod tests {
             RepoRestoreSpec {
                 source: Some("HEAD".to_string()),
                 staged: true,
-                path: PathBuf::from("external.db"),
+                all: false,
+                kind: None,
+                path: Some(PathBuf::from("external.db")),
             }
         );
+        assert_eq!(
+            parse_repo_restore_arg("--staged --all --kind db").unwrap(),
+            RepoRestoreSpec {
+                source: None,
+                staged: true,
+                all: true,
+                kind: Some(RepoTrackedPathKind::SqliteDatabase),
+                path: None,
+            }
+        );
+        assert!(parse_repo_restore_arg("--all").is_err());
+        assert!(parse_repo_restore_arg("--kind db -- external.db").is_err());
+        assert!(parse_repo_restore_arg("--staged --all external.db").is_err());
+        assert!(parse_repo_restore_arg("--staged --all --kind nope").is_err());
         assert_eq!(
             parse_repo_export_arg("--output snapshot.db").unwrap(),
             RepoExportSpec {
@@ -8405,6 +13945,23 @@ mod tests {
         );
         assert!(parse_repo_export_arg("--source HEAD").is_err());
 
+        let json_export = Pragma {
+            name: "graft_json_export",
+            arg: Some("--source HEAD --output snapshot.db -- app.db"),
+        };
+        assert!(matches!(
+            GraftPragma::try_from(&json_export).unwrap(),
+            GraftPragma::JsonExport {
+                spec: RepoExportSpec {
+                    source: Some(source),
+                    path: Some(path),
+                    output,
+                }
+            } if source == "HEAD"
+                && path == PathBuf::from("app.db")
+                && output == PathBuf::from("snapshot.db")
+        ));
+
         assert_eq!(
             parse_switch_branch_arg("--force main").unwrap(),
             ("main".to_string(), true)
@@ -8433,5 +13990,77 @@ mod tests {
             parse_switch_create_arg("-f feature/search HEAD").unwrap(),
             ("feature/search".to_string(), Some("HEAD".to_string()), true)
         );
+        let json_switch_branch = Pragma {
+            name: "graft_json_switch_branch",
+            arg: Some("--force main"),
+        };
+        assert!(matches!(
+            GraftPragma::try_from(&json_switch_branch).unwrap(),
+            GraftPragma::JsonSwitchBranch { name, force: true } if name == "main"
+        ));
+        let json_switch_create = Pragma {
+            name: "graft_json_switch_create",
+            arg: Some("-f feature/search HEAD"),
+        };
+        assert!(matches!(
+            GraftPragma::try_from(&json_switch_create).unwrap(),
+            GraftPragma::JsonSwitchCreate {
+                name,
+                start_point: Some(start_point),
+                force: true,
+            } if name == "feature/search" && start_point == "HEAD"
+        ));
+        let json_branch_create = Pragma {
+            name: "graft_json_branch_create",
+            arg: Some("feature/search HEAD"),
+        };
+        assert!(matches!(
+            GraftPragma::try_from(&json_branch_create).unwrap(),
+            GraftPragma::JsonBranchCreate {
+                name,
+                start_point: Some(start_point),
+            } if name == "feature/search" && start_point == "HEAD"
+        ));
+        let json_branch_delete = Pragma {
+            name: "graft_json_branch_delete",
+            arg: Some("--force feature/search"),
+        };
+        assert!(matches!(
+            GraftPragma::try_from(&json_branch_delete).unwrap(),
+            GraftPragma::JsonBranchDelete { name, force: true } if name == "feature/search"
+        ));
+        let json_branch_rename = Pragma {
+            name: "graft_json_branch_rename",
+            arg: Some("feature/search feature/query"),
+        };
+        assert!(matches!(
+            GraftPragma::try_from(&json_branch_rename).unwrap(),
+            GraftPragma::JsonBranchRename {
+                old: Some(old),
+                new,
+                force: false,
+            } if old == "feature/search" && new == "feature/query"
+        ));
+        let json_branch_upstream = Pragma {
+            name: "graft_json_branch_upstream",
+            arg: Some("feature/query origin/main"),
+        };
+        assert!(matches!(
+            GraftPragma::try_from(&json_branch_upstream).unwrap(),
+            GraftPragma::JsonBranchUpstream {
+                branch: Some(branch),
+                remote,
+                remote_branch,
+            } if branch == "feature/query" && remote == "origin" && remote_branch == "main"
+        ));
+        let json_branch_unset_upstream = Pragma {
+            name: "graft_json_branch_unset_upstream",
+            arg: Some("feature/query"),
+        };
+        assert!(matches!(
+            GraftPragma::try_from(&json_branch_unset_upstream).unwrap(),
+            GraftPragma::JsonBranchUnsetUpstream { branch: Some(branch) }
+                if branch == "feature/query"
+        ));
     }
 }

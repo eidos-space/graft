@@ -22,17 +22,20 @@ use thiserror::Error;
 
 use crate::{
     core::{
-        LogId, VolumeId, commit_hash::CommitHash, lsn::LSN, lsn::LSNRangeExt, page_count::PageCount,
+        LogId, VolumeId, byte_unit::ByteUnit, commit_hash::CommitHash, lsn::LSN, lsn::LSNRangeExt,
+        page_count::PageCount,
     },
     remote::{RemoteConfig, RemoteErr},
     snapshot::Snapshot,
 };
 
 pub const GRAFT_DIR: &str = ".graft";
+pub const GRAFT_IGNORE_FILE: &str = ".graftignore";
 pub const REPOSITORY_FORMAT_VERSION: u32 = 2;
 pub const OBJECT_FORMAT: &str = "blake3";
 const NULL_OBJECT_ID: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 const REFLOG_ACTOR: &str = "Graft <graft@example.invalid>";
+const DEFAULT_LARGE_FILE_THRESHOLD: ByteUnit = ByteUnit::MB;
 
 const CONFIG_FILE: &str = "config.toml";
 const HEAD_FILE: &str = "HEAD";
@@ -44,12 +47,14 @@ const DIR_REFS_TAGS: &str = "refs/tags";
 const DIR_OBJECTS: &str = "objects";
 const DIR_OBJECTS_PACK: &str = "objects/pack";
 const DIR_STORE_FJALL: &str = "store/fjall";
+const DIR_STORE_FILES: &str = "store/files";
 const DIR_INDEX: &str = "index";
 const DIR_LOCKS: &str = "locks";
 const DIR_TMP: &str = "tmp";
 const DIR_LOGS_REFS: &str = "logs/refs";
 const DIR_LOGS_HEAD: &str = "logs/HEAD";
 const SQLITE_DATABASE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
+const CONTENT_CLASS_SAMPLE_BYTES: usize = 8192;
 const REMOTE_REF_READ_CONCURRENCY: usize = 5;
 const REMOTE_OBJECT_PACK_VERSION: u32 = 1;
 const REMOTE_OBJECT_PACK_MAGIC: &[u8] = b"graft-object-pack-v1\n";
@@ -179,6 +184,16 @@ pub enum RepoErr {
     #[error("invalid remote object `{path}`: {message}")]
     InvalidRemoteObject { path: String, message: String },
 
+    #[error("unknown repository config key `{0}`")]
+    UnknownConfigKey(String),
+
+    #[error("invalid repository config value `{value}` for `{key}`: {message}")]
+    InvalidConfigValue {
+        key: String,
+        value: String,
+        message: String,
+    },
+
     #[error(transparent)]
     Object(#[from] object::ObjectErr),
 
@@ -187,6 +202,30 @@ pub enum RepoErr {
 }
 
 pub type Result<T> = std::result::Result<T, RepoErr>;
+
+pub const CONFIG_KEY_FILES_INLINE_TEXT_THRESHOLD: &str = "files.inline_text_threshold";
+pub const CONFIG_KEY_FILES_EXTERNAL_PATHS: &str = "files.external_paths";
+pub const CONFIG_KEY_MERGE_DEFAULT_SEMANTIC_KEYS: &str = "merge.default_semantic_keys";
+pub const CONFIG_KEY_MERGE_SEMANTIC_KEYS_PREFIX: &str = "merge.semantic_keys.";
+pub const CONFIG_KEY_MERGE_GENERATED_COLUMNS_PREFIX: &str = "merge.generated_columns.";
+pub const CONFIG_KEY_MERGE_INTERNAL_RESOLVERS_PREFIX: &str = "merge.internal_resolvers.";
+pub const CONFIG_KEY_MERGE_SCHEMA_RESOLVERS_PREFIX: &str = "merge.schema_resolvers.";
+
+const DEFAULT_INTERNAL_RESOLVERS: &[(&str, &str)] = &[
+    ("index_btree", "reindex"),
+    ("sqlite_sequence", "sequence_max"),
+    ("sqlite_stat1", "rebuild"),
+    ("sqlite_stat2", "rebuild"),
+    ("sqlite_stat3", "rebuild"),
+    ("sqlite_stat4", "rebuild"),
+];
+const DEFAULT_SCHEMA_RESOLVERS: &[(&str, &str)] = &[("add_column", "alter_table_add_column")];
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RepoConfigEntry {
+    pub key: String,
+    pub value: String,
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RepoConfig {
@@ -197,6 +236,9 @@ pub struct RepoConfig {
 
     #[serde(default, skip_serializing_if = "MergeConfig::is_empty")]
     pub merge: MergeConfig,
+
+    #[serde(default, skip_serializing_if = "FileConfig::is_default")]
+    pub files: FileConfig,
 
     #[serde(default)]
     pub remotes: BTreeMap<String, RemoteConfig>,
@@ -229,6 +271,287 @@ impl Default for ExtensionsConfig {
     fn default() -> Self {
         Self { object_format: OBJECT_FORMAT.to_string() }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileConfig {
+    pub inline_text_threshold: ByteUnit,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub external_paths: Vec<String>,
+}
+
+impl FileConfig {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+impl Default for FileConfig {
+    fn default() -> Self {
+        Self {
+            inline_text_threshold: DEFAULT_LARGE_FILE_THRESHOLD,
+            external_paths: Vec::new(),
+        }
+    }
+}
+
+fn normalize_config_key(key: &str) -> Result<&str> {
+    let key = key.trim();
+    if key.is_empty() {
+        return Err(RepoErr::UnknownConfigKey(key.to_string()));
+    }
+    Ok(key)
+}
+
+fn config_entry(config: &RepoConfig, key: &str) -> Result<RepoConfigEntry> {
+    let value = if key == CONFIG_KEY_FILES_INLINE_TEXT_THRESHOLD {
+        config.files.inline_text_threshold.to_string()
+    } else if key == CONFIG_KEY_FILES_EXTERNAL_PATHS {
+        format_config_string_list(&config.files.external_paths)
+    } else if key == CONFIG_KEY_MERGE_DEFAULT_SEMANTIC_KEYS {
+        format_config_string_list(&config.merge.default_semantic_keys)
+    } else if let Some(table) = config_semantic_keys_table(key)? {
+        config
+            .merge
+            .semantic_keys
+            .get(table)
+            .map(|keys| format_config_string_list(keys))
+            .unwrap_or_default()
+    } else if let Some(table) = config_generated_columns_table(key)? {
+        config
+            .merge
+            .generated_columns
+            .get(table)
+            .map(|columns| format_config_string_list(columns))
+            .unwrap_or_default()
+    } else if let Some(subject) = config_internal_resolver_subject(config, key)? {
+        config
+            .merge
+            .internal_resolvers
+            .get(subject)
+            .cloned()
+            .or_else(|| default_internal_resolver(subject).map(str::to_string))
+            .unwrap_or_default()
+    } else if let Some(operation) = config_schema_resolver_operation(config, key)? {
+        config
+            .merge
+            .schema_resolvers
+            .get(operation)
+            .cloned()
+            .or_else(|| default_schema_resolver(operation).map(str::to_string))
+            .unwrap_or_default()
+    } else {
+        return Err(RepoErr::UnknownConfigKey(key.to_string()));
+    };
+    Ok(RepoConfigEntry { key: key.to_string(), value })
+}
+
+fn config_entries(config: &RepoConfig) -> Vec<RepoConfigEntry> {
+    let mut entries = vec![
+        RepoConfigEntry {
+            key: CONFIG_KEY_FILES_INLINE_TEXT_THRESHOLD.to_string(),
+            value: config.files.inline_text_threshold.to_string(),
+        },
+        RepoConfigEntry {
+            key: CONFIG_KEY_FILES_EXTERNAL_PATHS.to_string(),
+            value: format_config_string_list(&config.files.external_paths),
+        },
+        RepoConfigEntry {
+            key: CONFIG_KEY_MERGE_DEFAULT_SEMANTIC_KEYS.to_string(),
+            value: format_config_string_list(&config.merge.default_semantic_keys),
+        },
+    ];
+
+    entries.extend(
+        config
+            .merge
+            .semantic_keys
+            .iter()
+            .map(|(table, keys)| RepoConfigEntry {
+                key: format!("{CONFIG_KEY_MERGE_SEMANTIC_KEYS_PREFIX}{table}"),
+                value: format_config_string_list(keys),
+            }),
+    );
+    entries.extend(DEFAULT_INTERNAL_RESOLVERS.iter().map(|(subject, default)| {
+        RepoConfigEntry {
+            key: format!("{CONFIG_KEY_MERGE_INTERNAL_RESOLVERS_PREFIX}{subject}"),
+            value: config
+                .merge
+                .internal_resolvers
+                .get(*subject)
+                .cloned()
+                .unwrap_or_else(|| (*default).to_string()),
+        }
+    }));
+    entries.extend(DEFAULT_SCHEMA_RESOLVERS.iter().map(|(operation, default)| {
+        RepoConfigEntry {
+            key: format!("{CONFIG_KEY_MERGE_SCHEMA_RESOLVERS_PREFIX}{operation}"),
+            value: config
+                .merge
+                .schema_resolvers
+                .get(*operation)
+                .cloned()
+                .unwrap_or_else(|| (*default).to_string()),
+        }
+    }));
+    entries.extend(
+        config
+            .merge
+            .generated_columns
+            .iter()
+            .map(|(table, columns)| RepoConfigEntry {
+                key: format!("{CONFIG_KEY_MERGE_GENERATED_COLUMNS_PREFIX}{table}"),
+                value: format_config_string_list(columns),
+            }),
+    );
+
+    entries
+}
+
+fn config_semantic_keys_table(key: &str) -> Result<Option<&str>> {
+    config_key_suffix(key, CONFIG_KEY_MERGE_SEMANTIC_KEYS_PREFIX)
+}
+
+fn config_generated_columns_table(key: &str) -> Result<Option<&str>> {
+    config_key_suffix(key, CONFIG_KEY_MERGE_GENERATED_COLUMNS_PREFIX)
+}
+
+fn config_internal_resolver_subject<'a>(
+    config: &RepoConfig,
+    key: &'a str,
+) -> Result<Option<&'a str>> {
+    let Some(subject) = config_key_suffix(key, CONFIG_KEY_MERGE_INTERNAL_RESOLVERS_PREFIX)? else {
+        return Ok(None);
+    };
+    if default_internal_resolver(subject).is_some()
+        || config.merge.internal_resolvers.contains_key(subject)
+    {
+        Ok(Some(subject))
+    } else {
+        Err(RepoErr::UnknownConfigKey(key.to_string()))
+    }
+}
+
+fn config_schema_resolver_operation<'a>(
+    config: &RepoConfig,
+    key: &'a str,
+) -> Result<Option<&'a str>> {
+    let Some(operation) = config_key_suffix(key, CONFIG_KEY_MERGE_SCHEMA_RESOLVERS_PREFIX)? else {
+        return Ok(None);
+    };
+    if default_schema_resolver(operation).is_some()
+        || config.merge.schema_resolvers.contains_key(operation)
+    {
+        Ok(Some(operation))
+    } else {
+        Err(RepoErr::UnknownConfigKey(key.to_string()))
+    }
+}
+
+fn config_key_suffix<'a>(key: &'a str, prefix: &str) -> Result<Option<&'a str>> {
+    let Some(suffix) = key.strip_prefix(prefix) else {
+        return Ok(None);
+    };
+    if suffix.trim().is_empty() {
+        return Err(RepoErr::UnknownConfigKey(key.to_string()));
+    }
+    Ok(Some(suffix))
+}
+
+fn format_config_string_list(values: &[String]) -> String {
+    values.join(", ")
+}
+
+fn default_internal_resolver(subject: &str) -> Option<&'static str> {
+    DEFAULT_INTERNAL_RESOLVERS
+        .iter()
+        .find_map(|(candidate, resolver)| (*candidate == subject).then_some(*resolver))
+}
+
+fn default_schema_resolver(operation: &str) -> Option<&'static str> {
+    DEFAULT_SCHEMA_RESOLVERS
+        .iter()
+        .find_map(|(candidate, resolver)| (*candidate == operation).then_some(*resolver))
+}
+
+fn parse_config_byte_unit_value(key: &str, value: &str) -> Result<ByteUnit> {
+    let token_count = value.split_ascii_whitespace().count();
+    if token_count > 2 {
+        return Err(RepoErr::InvalidConfigValue {
+            key: key.to_string(),
+            value: value.to_string(),
+            message: "expected <number> [<unit>]".to_string(),
+        });
+    }
+
+    value
+        .parse::<ByteUnit>()
+        .map_err(|err| RepoErr::InvalidConfigValue {
+            key: key.to_string(),
+            value: value.to_string(),
+            message: err.to_string(),
+        })
+}
+
+fn parse_config_string_list_value(key: &str, value: &str) -> Result<Vec<String>> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut values = Vec::new();
+    let mut seen = BTreeSet::new();
+    for segment in value.split(',') {
+        let segment = segment.trim();
+        if segment.is_empty() {
+            return Err(RepoErr::InvalidConfigValue {
+                key: key.to_string(),
+                value: value.to_string(),
+                message: "expected comma or whitespace separated values".to_string(),
+            });
+        }
+        for item in segment.split_ascii_whitespace() {
+            if !seen.insert(item.to_string()) {
+                return Err(RepoErr::InvalidConfigValue {
+                    key: key.to_string(),
+                    value: value.to_string(),
+                    message: format!("duplicate value `{item}`"),
+                });
+            }
+            values.push(item.to_string());
+        }
+    }
+    Ok(values)
+}
+
+fn parse_config_internal_resolver_value(key: &str, subject: &str, value: &str) -> Result<String> {
+    let value = value.trim();
+    let Some(expected) = default_internal_resolver(subject) else {
+        return Err(RepoErr::UnknownConfigKey(key.to_string()));
+    };
+    if value != expected {
+        return Err(RepoErr::InvalidConfigValue {
+            key: key.to_string(),
+            value: value.to_string(),
+            message: format!("expected `{expected}` for `{subject}`"),
+        });
+    }
+    Ok(value.to_string())
+}
+
+fn parse_config_schema_resolver_value(key: &str, operation: &str, value: &str) -> Result<String> {
+    let value = value.trim();
+    let Some(expected) = default_schema_resolver(operation) else {
+        return Err(RepoErr::UnknownConfigKey(key.to_string()));
+    };
+    if value != expected {
+        return Err(RepoErr::InvalidConfigValue {
+            key: key.to_string(),
+            value: value.to_string(),
+            message: format!("expected `{expected}` for `{operation}`"),
+        });
+    }
+    Ok(value.to_string())
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -564,6 +887,10 @@ pub struct CommitObject {
 
     #[serde(default)]
     pub files: BTreeMap<String, CommitFileState>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub artifacts: BTreeMap<String, CommitArtifactState>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changes: Vec<CommitPathChange>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tables: Vec<CommitTableSummary>,
     #[serde(default, skip_serializing_if = "is_zero_usize")]
@@ -571,9 +898,171 @@ pub struct CommitObject {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitPathChange {
+    pub path: String,
+    pub change: RepoFileChange,
+    pub kind: RepoTrackedPathKind,
+    pub storage: RepoPathStorage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitFileState {
     pub volume: VolumeId,
     pub snapshot: RepoSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CommitArtifactState {
+    File {
+        kind: RepoTrackedPathKind,
+        oid: object::ObjectId,
+        content_hash: object::ObjectId,
+        size: u64,
+    },
+    LargeFile {
+        kind: RepoTrackedPathKind,
+        oid: object::ObjectId,
+        content_hash: object::ObjectId,
+        size: u64,
+    },
+}
+
+impl CommitArtifactState {
+    pub fn oid(&self) -> &object::ObjectId {
+        match self {
+            Self::File { oid, .. } | Self::LargeFile { oid, .. } => oid,
+        }
+    }
+
+    pub fn content_hash(&self) -> &object::ObjectId {
+        match self {
+            Self::File { content_hash, .. } | Self::LargeFile { content_hash, .. } => content_hash,
+        }
+    }
+
+    pub fn size(&self) -> u64 {
+        match self {
+            Self::File { size, .. } | Self::LargeFile { size, .. } => *size,
+        }
+    }
+
+    pub fn is_large(&self) -> bool {
+        matches!(self, Self::LargeFile { .. })
+    }
+}
+
+fn artifact_tracked_path_kind(state: &CommitArtifactState) -> RepoTrackedPathKind {
+    match state {
+        CommitArtifactState::File { kind, .. } | CommitArtifactState::LargeFile { kind, .. } => {
+            *kind
+        }
+    }
+}
+
+fn artifact_diff_kind(
+    before: Option<&CommitArtifactState>,
+    after: Option<&CommitArtifactState>,
+) -> RepoTrackedPathKind {
+    after
+        .or(before)
+        .map(artifact_tracked_path_kind)
+        .unwrap_or(RepoTrackedPathKind::BinaryFile)
+}
+
+fn artifact_tracked_path_storage(state: &CommitArtifactState) -> RepoPathStorage {
+    match state {
+        CommitArtifactState::File { .. } => RepoPathStorage::Inline,
+        CommitArtifactState::LargeFile { .. } => RepoPathStorage::External,
+    }
+}
+
+fn artifact_diff_storage(
+    before: Option<&CommitArtifactState>,
+    after: Option<&CommitArtifactState>,
+) -> RepoPathStorage {
+    after
+        .or(before)
+        .map(artifact_tracked_path_storage)
+        .unwrap_or(RepoPathStorage::Inline)
+}
+
+fn default_path_storage(kind: RepoTrackedPathKind) -> RepoPathStorage {
+    match kind {
+        RepoTrackedPathKind::SqliteDatabase => RepoPathStorage::SqliteSnapshot,
+        RepoTrackedPathKind::TextFile => RepoPathStorage::Inline,
+        RepoTrackedPathKind::BinaryFile => RepoPathStorage::External,
+    }
+}
+
+fn repo_path_kind_from_object_kind(kind: object::FileContentKind) -> RepoTrackedPathKind {
+    match kind {
+        object::FileContentKind::TextFile => RepoTrackedPathKind::TextFile,
+        object::FileContentKind::BinaryFile => RepoTrackedPathKind::BinaryFile,
+    }
+}
+
+fn object_kind_from_repo_path_kind(kind: RepoTrackedPathKind) -> object::FileContentKind {
+    match kind {
+        RepoTrackedPathKind::TextFile => object::FileContentKind::TextFile,
+        RepoTrackedPathKind::SqliteDatabase | RepoTrackedPathKind::BinaryFile => {
+            object::FileContentKind::BinaryFile
+        }
+    }
+}
+
+fn tracked_file_entry(
+    path: String,
+    stage: index::IndexStage,
+    file: &CommitFileState,
+) -> RepoTrackedPathEntry {
+    let blob = object::Object::Blob(object::BlobObject::SqliteSnapshot(sqlite_snapshot_blob(
+        file,
+    )));
+    RepoTrackedPathEntry {
+        path,
+        stage,
+        kind: RepoTrackedPathKind::SqliteDatabase,
+        storage: RepoPathStorage::SqliteSnapshot,
+        mode: Some(object::TreeEntryMode::SqliteDatabase),
+        oid: Some(blob.id()),
+        size: None,
+        page_count: Some(file.snapshot.page_count),
+    }
+}
+
+fn tracked_artifact_entry(
+    path: String,
+    stage: index::IndexStage,
+    artifact: &CommitArtifactState,
+) -> RepoTrackedPathEntry {
+    let kind = artifact_tracked_path_kind(artifact);
+    RepoTrackedPathEntry {
+        path,
+        stage,
+        kind,
+        storage: artifact_tracked_path_storage(artifact),
+        mode: Some(object::TreeEntryMode::Regular),
+        oid: Some(artifact.oid().clone()),
+        size: Some(artifact.size()),
+        page_count: None,
+    }
+}
+
+fn tracked_index_entry(entry: &index::IndexEntry) -> Option<RepoTrackedPathEntry> {
+    if let Some(file) = &entry.file {
+        let mut tracked = tracked_file_entry(entry.path.clone(), entry.stage, file);
+        tracked.mode = entry.mode;
+        tracked.oid = entry.oid.clone().or(tracked.oid);
+        Some(tracked)
+    } else if let Some(artifact) = &entry.artifact {
+        let mut tracked = tracked_artifact_entry(entry.path.clone(), entry.stage, artifact);
+        tracked.mode = entry.mode;
+        tracked.oid = entry.oid.clone().or(tracked.oid);
+        Some(tracked)
+    } else {
+        None
+    }
 }
 
 fn is_zero_usize(value: &usize) -> bool {
@@ -584,15 +1073,45 @@ fn is_zero_usize(value: &usize) -> bool {
 pub struct RepoDiff {
     pub from: String,
     pub to: String,
+    #[serde(default)]
+    pub paths: Vec<RepoPathDiff>,
     pub files: Vec<RepoFileDiff>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<RepoArtifactDiff>,
+}
+
+impl RepoDiff {
+    pub fn refresh_paths(&mut self) {
+        self.paths = repo_diff_paths(&self.files, &self.artifacts);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoPathDiff {
+    pub path: String,
+    pub change: RepoFileChange,
+    pub kind: RepoTrackedPathKind,
+    pub storage: RepoPathStorage,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoFileDiff {
     pub path: String,
     pub change: RepoFileChange,
+    pub kind: RepoTrackedPathKind,
+    pub storage: RepoPathStorage,
     pub from: Option<CommitFileState>,
     pub to: Option<CommitFileState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoArtifactDiff {
+    pub path: String,
+    pub change: RepoFileChange,
+    pub kind: RepoTrackedPathKind,
+    pub storage: RepoPathStorage,
+    pub from: Option<CommitArtifactState>,
+    pub to: Option<CommitArtifactState>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -641,9 +1160,26 @@ pub struct CheckoutFilePlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckoutArtifactOutcome {
+    pub target: String,
+    pub path: String,
+    pub state: CommitArtifactState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckoutArtifactPlan {
+    pub target: String,
+    pub path: String,
+    pub state: CommitArtifactState,
+    pub entry: index::IndexEntry,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckoutPlan {
     pub target: Option<String>,
     pub files: BTreeMap<String, CommitFileState>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub artifacts: BTreeMap<String, CommitArtifactState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -721,11 +1257,27 @@ pub struct RepoStatus {
     pub orig_head: Option<String>,
     pub dirty: bool,
     #[serde(default)]
+    pub has_unstaged_changes: bool,
+    #[serde(default)]
+    pub has_staged_changes: bool,
+    #[serde(default)]
+    pub has_conflicts: bool,
+    #[serde(default)]
+    pub work_in_progress: bool,
+    #[serde(default)]
+    pub counts: RepoStatusCounts,
+    #[serde(default)]
+    pub paths: Vec<RepoStatusPath>,
+    #[serde(default)]
     pub unstaged: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unstaged_changes: Vec<RepoWorktreeChange>,
     pub staged: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub staged_changes: Vec<RepoStagedChange>,
     pub conflicted: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicted_changes: Vec<RepoConflictChange>,
     pub branches: Vec<BranchInfo>,
     pub remotes: Vec<RemoteInfo>,
     pub upstream: Option<BranchUpstream>,
@@ -735,6 +1287,424 @@ pub struct RepoStatus {
     pub ahead: usize,
     #[serde(default)]
     pub behind: usize,
+}
+
+impl RepoStatus {
+    pub fn refresh_summary_flags(&mut self) {
+        self.counts = RepoStatusCounts::from_status_parts(
+            self.unstaged.len(),
+            self.unstaged_changes.len(),
+            self.staged.len(),
+            self.staged_changes.len(),
+            self.conflicted.len(),
+            self.conflicted_changes.len(),
+        );
+        self.has_unstaged_changes = self.counts.unstaged > 0;
+        self.has_staged_changes = self.counts.staged > 0;
+        self.has_conflicts = self.counts.conflicted > 0;
+        self.work_in_progress = self.has_unstaged_changes
+            || self.has_staged_changes
+            || self.has_conflicts
+            || self.merge_head.is_some();
+        self.dirty = self.has_unstaged_changes;
+        self.paths = Self::status_paths_from_changes(
+            &self.unstaged_changes,
+            &self.staged_changes,
+            &self.conflicted_changes,
+        );
+    }
+
+    fn status_paths_from_changes(
+        unstaged_changes: &[RepoWorktreeChange],
+        staged_changes: &[RepoStagedChange],
+        conflicted_changes: &[RepoConflictChange],
+    ) -> Vec<RepoStatusPath> {
+        #[derive(Default)]
+        struct Builder {
+            kind: Option<RepoTrackedPathKind>,
+            storage: Option<RepoPathStorage>,
+            unstaged_change: Option<RepoWorktreeChangeKind>,
+            staged_change: Option<RepoFileChange>,
+            conflicted: bool,
+        }
+
+        fn kind_priority(kind: RepoTrackedPathKind) -> u8 {
+            match kind {
+                RepoTrackedPathKind::TextFile => 1,
+                RepoTrackedPathKind::BinaryFile => 1,
+                RepoTrackedPathKind::SqliteDatabase => 3,
+            }
+        }
+
+        fn storage_priority(storage: RepoPathStorage) -> u8 {
+            match storage {
+                RepoPathStorage::Inline => 1,
+                RepoPathStorage::External => 2,
+                RepoPathStorage::SqliteSnapshot => 3,
+            }
+        }
+
+        fn record_kind(target: &mut Option<RepoTrackedPathKind>, kind: RepoTrackedPathKind) {
+            if target.is_none_or(|existing| kind_priority(kind) > kind_priority(existing)) {
+                *target = Some(kind);
+            }
+        }
+
+        fn record_storage(target: &mut Option<RepoPathStorage>, storage: RepoPathStorage) {
+            if target.is_none_or(|existing| storage_priority(storage) > storage_priority(existing))
+            {
+                *target = Some(storage);
+            }
+        }
+
+        let mut paths = BTreeMap::<String, Builder>::new();
+
+        for change in unstaged_changes {
+            let entry = paths.entry(change.path.clone()).or_default();
+            record_kind(&mut entry.kind, change.kind);
+            record_storage(&mut entry.storage, change.storage);
+            entry.unstaged_change = Some(change.change);
+        }
+
+        for change in staged_changes {
+            let entry = paths.entry(change.path.clone()).or_default();
+            record_kind(&mut entry.kind, change.kind);
+            record_storage(&mut entry.storage, change.storage);
+            entry.staged_change = Some(change.change);
+        }
+
+        for change in conflicted_changes {
+            let entry = paths.entry(change.path.clone()).or_default();
+            record_kind(&mut entry.kind, change.kind);
+            record_storage(&mut entry.storage, change.storage);
+            entry.conflicted = true;
+        }
+
+        paths
+            .into_iter()
+            .filter_map(|(path, entry)| {
+                entry.kind.map(|kind| {
+                    let index_status = if entry.conflicted {
+                        RepoStatusPathState::Unmerged
+                    } else {
+                        entry
+                            .staged_change
+                            .map(RepoStatusPathState::from_staged_change)
+                            .unwrap_or(RepoStatusPathState::None)
+                    };
+                    let worktree_status = if entry.conflicted {
+                        RepoStatusPathState::Unmerged
+                    } else {
+                        entry
+                            .unstaged_change
+                            .map(RepoStatusPathState::from_worktree_change)
+                            .unwrap_or(RepoStatusPathState::None)
+                    };
+                    let code = RepoStatusPathState::code(index_status, worktree_status);
+                    RepoStatusPath {
+                        path,
+                        kind,
+                        storage: entry.storage.unwrap_or_else(|| default_path_storage(kind)),
+                        index_status,
+                        worktree_status,
+                        code,
+                        unstaged_change: entry.unstaged_change,
+                        staged_change: entry.staged_change,
+                        conflicted: entry.conflicted,
+                    }
+                })
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoStatusCounts {
+    pub unstaged: usize,
+    pub staged: usize,
+    pub conflicted: usize,
+}
+
+impl RepoStatusCounts {
+    fn from_status_parts(
+        unstaged: usize,
+        unstaged_changes: usize,
+        staged: usize,
+        staged_changes: usize,
+        conflicted: usize,
+        conflicted_changes: usize,
+    ) -> Self {
+        Self {
+            unstaged: unstaged.max(unstaged_changes),
+            staged: staged.max(staged_changes),
+            conflicted: conflicted.max(conflicted_changes),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoStatusPath {
+    pub path: String,
+    pub kind: RepoTrackedPathKind,
+    pub storage: RepoPathStorage,
+    pub index_status: RepoStatusPathState,
+    pub worktree_status: RepoStatusPathState,
+    pub code: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unstaged_change: Option<RepoWorktreeChangeKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staged_change: Option<RepoFileChange>,
+    #[serde(default)]
+    pub conflicted: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepoStatusPathState {
+    None,
+    Added,
+    Modified,
+    Deleted,
+    Untracked,
+    Unmerged,
+}
+
+impl RepoStatusPathState {
+    fn from_staged_change(change: RepoFileChange) -> Self {
+        match change {
+            RepoFileChange::Added => Self::Added,
+            RepoFileChange::Deleted => Self::Deleted,
+            RepoFileChange::Modified => Self::Modified,
+        }
+    }
+
+    fn from_worktree_change(change: RepoWorktreeChangeKind) -> Self {
+        match change {
+            RepoWorktreeChangeKind::Deleted => Self::Deleted,
+            RepoWorktreeChangeKind::Modified => Self::Modified,
+            RepoWorktreeChangeKind::Untracked => Self::Untracked,
+        }
+    }
+
+    fn code(index: Self, worktree: Self) -> String {
+        if index == Self::Unmerged || worktree == Self::Unmerged {
+            return "UU".to_string();
+        }
+        if index == Self::None && worktree == Self::Untracked {
+            return "??".to_string();
+        }
+        format!("{}{}", index.index_code(), worktree.worktree_code())
+    }
+
+    fn index_code(self) -> char {
+        match self {
+            Self::Added => 'A',
+            Self::Deleted => 'D',
+            Self::Modified => 'M',
+            Self::None | Self::Untracked | Self::Unmerged => ' ',
+        }
+    }
+
+    fn worktree_code(self) -> char {
+        match self {
+            Self::Deleted => 'D',
+            Self::Modified => 'M',
+            Self::Untracked => '?',
+            Self::None | Self::Added | Self::Unmerged => ' ',
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoArtifactAudit {
+    pub artifacts: usize,
+    pub external_payloads: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub issues: Vec<RepoArtifactAuditIssue>,
+}
+
+impl RepoArtifactAudit {
+    pub fn ok(&self) -> bool {
+        self.issues.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoArtifactRepairOutcome {
+    pub remote: String,
+    pub fetched_objects: usize,
+    pub fetched_external_payloads: usize,
+    pub before: RepoArtifactAudit,
+    pub after: RepoArtifactAudit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoLargeFileFetchOutcome {
+    pub remote: String,
+    pub target: String,
+    pub external_payloads: usize,
+    pub already_present_payloads: usize,
+    pub fetched_payloads: usize,
+    pub fetched_bytes: u64,
+    pub files: Vec<RepoLargeFileFetchEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoLargeFileFetchEntry {
+    pub content_hash: object::ObjectId,
+    pub size: u64,
+    pub store_path: String,
+    pub status: RepoLargeFileFetchStatus,
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepoLargeFileFetchStatus {
+    Present,
+    Fetched,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoLargeFileStatusOutcome {
+    pub target: String,
+    pub external_payloads: usize,
+    pub present_payloads: usize,
+    pub missing_payloads: usize,
+    pub invalid_payloads: usize,
+    pub present_bytes: u64,
+    pub missing_bytes: u64,
+    pub invalid_bytes: u64,
+    pub files: Vec<RepoLargeFileStatusEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoLargeFileStatusEntry {
+    pub content_hash: object::ObjectId,
+    pub size: u64,
+    pub store_path: String,
+    pub status: RepoLargeFileStatusState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepoLargeFileStatusState {
+    Present,
+    Missing,
+    Invalid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoLargeFilePruneOutcome {
+    pub dry_run: bool,
+    pub referenced_payloads: usize,
+    pub candidate_payloads: usize,
+    pub candidate_bytes: u64,
+    pub pruned_payloads: usize,
+    pub pruned_bytes: u64,
+    pub files: Vec<RepoLargeFilePruneEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoLargeFilePruneEntry {
+    pub content_hash: object::ObjectId,
+    pub size: u64,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoArtifactAuditIssue {
+    pub path: String,
+    pub kind: RepoArtifactAuditIssueKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oid: Option<object::ObjectId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<object::ObjectId>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepoArtifactAuditIssueKind {
+    MissingObject,
+    InvalidObject,
+    MissingExternalPayload,
+    InvalidExternalPayload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoTrackedPath {
+    pub path: String,
+    pub kind: RepoTrackedPathKind,
+    pub storage: RepoPathStorage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_count: Option<PageCount>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoTrackedPathDetail {
+    pub path: String,
+    pub kind: RepoTrackedPathKind,
+    pub storage: RepoPathStorage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_count: Option<PageCount>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oid: Option<object::ObjectId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<object::ObjectId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_present: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_payload_present: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoTrackedPathEntry {
+    pub path: String,
+    pub stage: index::IndexStage,
+    pub kind: RepoTrackedPathKind,
+    pub storage: RepoPathStorage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<object::TreeEntryMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oid: Option<object::ObjectId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_count: Option<PageCount>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepoTrackedPathKind {
+    SqliteDatabase,
+    TextFile,
+    BinaryFile,
+}
+
+impl Display for RepoTrackedPathKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SqliteDatabase => f.write_str("sqlite_database"),
+            Self::TextFile => f.write_str("text_file"),
+            Self::BinaryFile => f.write_str("binary_file"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepoPathStorage {
+    SqliteSnapshot,
+    Inline,
+    External,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -761,6 +1731,23 @@ pub enum RepoUpstreamState {
 pub struct RepoWorktreeChange {
     pub path: String,
     pub change: RepoWorktreeChangeKind,
+    pub kind: RepoTrackedPathKind,
+    pub storage: RepoPathStorage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoStagedChange {
+    pub path: String,
+    pub change: RepoFileChange,
+    pub kind: RepoTrackedPathKind,
+    pub storage: RepoPathStorage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoConflictChange {
+    pub path: String,
+    pub kind: RepoTrackedPathKind,
+    pub storage: RepoPathStorage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -858,6 +1845,10 @@ impl Repository {
         self.graft_dir.join(DIR_STORE_FJALL)
     }
 
+    pub fn file_store_dir(&self) -> PathBuf {
+        self.graft_dir.join(DIR_STORE_FILES)
+    }
+
     pub fn object_store(&self) -> object::LooseObjectStore {
         object::LooseObjectStore::new(self.graft_dir.join("objects"))
     }
@@ -871,6 +1862,110 @@ impl Repository {
         let raw = toml::to_string_pretty(config)?;
         fs::write(self.config_path(), raw)?;
         Ok(())
+    }
+
+    pub fn config_get(&self, key: &str) -> Result<RepoConfigEntry> {
+        let config = self.config()?;
+        config_entry(&config, normalize_config_key(key)?)
+    }
+
+    pub fn config_list(&self) -> Result<Vec<RepoConfigEntry>> {
+        Ok(config_entries(&self.config()?))
+    }
+
+    pub fn config_set(&self, key: &str, value: &str) -> Result<RepoConfigEntry> {
+        let key = normalize_config_key(key)?;
+        let value = value.trim();
+        let mut config = self.config()?;
+
+        match key {
+            CONFIG_KEY_FILES_INLINE_TEXT_THRESHOLD => {
+                config.files.inline_text_threshold = parse_config_byte_unit_value(key, value)?;
+            }
+            CONFIG_KEY_FILES_EXTERNAL_PATHS => {
+                config.files.external_paths = parse_config_string_list_value(key, value)?
+                    .into_iter()
+                    .map(|path| normalize_repo_path(&path))
+                    .collect();
+            }
+            CONFIG_KEY_MERGE_DEFAULT_SEMANTIC_KEYS => {
+                config.merge.default_semantic_keys = parse_config_string_list_value(key, value)?;
+            }
+            _ => {
+                if let Some(table) = config_semantic_keys_table(key)? {
+                    let keys = parse_config_string_list_value(key, value)?;
+                    if keys.is_empty() {
+                        config.merge.semantic_keys.remove(table);
+                    } else {
+                        config.merge.semantic_keys.insert(table.to_string(), keys);
+                    }
+                } else if let Some(table) = config_generated_columns_table(key)? {
+                    let columns = parse_config_string_list_value(key, value)?;
+                    if columns.is_empty() {
+                        config.merge.generated_columns.remove(table);
+                    } else {
+                        config
+                            .merge
+                            .generated_columns
+                            .insert(table.to_string(), columns);
+                    }
+                } else if let Some(subject) = config_internal_resolver_subject(&config, key)? {
+                    let resolver = parse_config_internal_resolver_value(key, subject, value)?;
+                    config
+                        .merge
+                        .internal_resolvers
+                        .insert(subject.to_string(), resolver);
+                } else if let Some(operation) = config_schema_resolver_operation(&config, key)? {
+                    let resolver = parse_config_schema_resolver_value(key, operation, value)?;
+                    config
+                        .merge
+                        .schema_resolvers
+                        .insert(operation.to_string(), resolver);
+                } else {
+                    return Err(RepoErr::UnknownConfigKey(key.to_string()));
+                }
+            }
+        }
+
+        self.write_config(&config)?;
+        config_entry(&config, key)
+    }
+
+    pub fn config_unset(&self, key: &str) -> Result<RepoConfigEntry> {
+        let key = normalize_config_key(key)?;
+        let mut config = self.config()?;
+
+        match key {
+            CONFIG_KEY_FILES_INLINE_TEXT_THRESHOLD => {
+                config.files.inline_text_threshold = FileConfig::default().inline_text_threshold;
+            }
+            CONFIG_KEY_FILES_EXTERNAL_PATHS => {
+                config.files.external_paths.clear();
+            }
+            CONFIG_KEY_MERGE_DEFAULT_SEMANTIC_KEYS => {
+                config.merge.default_semantic_keys.clear();
+            }
+            _ => {
+                if let Some(table) = config_semantic_keys_table(key)? {
+                    config.merge.semantic_keys.remove(table);
+                } else if let Some(table) = config_generated_columns_table(key)? {
+                    config.merge.generated_columns.remove(table);
+                } else if let Some(subject) = config_internal_resolver_subject(&config, key)? {
+                    config.merge.internal_resolvers.remove(subject);
+                } else if let Some(operation) = config_schema_resolver_operation(&config, key)? {
+                    config.merge.schema_resolvers.remove(operation);
+                } else {
+                    return Err(RepoErr::UnknownConfigKey(key.to_string()));
+                }
+            }
+        }
+
+        self.write_config(&config)?;
+        config_entry(&config, key)
+    }
+
+    fn file_config(&self) -> Result<FileConfig> {
+        Ok(self.config()?.files)
     }
 
     pub fn head(&self) -> Result<Head> {
@@ -913,12 +2008,36 @@ impl Repository {
         let upstream_status = self.upstream_status(head_target.as_deref(), upstream.as_ref())?;
         let ahead = upstream_status.as_ref().map_or(0, |status| status.ahead);
         let behind = upstream_status.as_ref().map_or(0, |status| status.behind);
+        let merge_head = self.merge_head()?;
+        let orig_head = self.orig_head()?;
+        let staged_changes = self.staged_changes_for_index(&index)?;
+        let conflicted_changes = self.conflicted_changes_for_index(&index);
         let unstaged_changes = self.unstaged_changes_for_index(&index)?;
-        let unstaged = unstaged_changes
+        let unstaged: Vec<String> = unstaged_changes
             .iter()
             .map(|change| change.path.clone())
             .collect();
-        let dirty = !unstaged_changes.is_empty();
+        let staged = index.staged_paths();
+        let conflicted = index.conflicted_paths();
+        let counts = RepoStatusCounts::from_status_parts(
+            unstaged.len(),
+            unstaged_changes.len(),
+            staged.len(),
+            staged_changes.len(),
+            conflicted.len(),
+            conflicted_changes.len(),
+        );
+        let has_unstaged_changes = counts.unstaged > 0;
+        let has_staged_changes = counts.staged > 0;
+        let has_conflicts = counts.conflicted > 0;
+        let work_in_progress =
+            has_unstaged_changes || has_staged_changes || has_conflicts || merge_head.is_some();
+        let dirty = has_unstaged_changes;
+        let paths = RepoStatus::status_paths_from_changes(
+            &unstaged_changes,
+            &staged_changes,
+            &conflicted_changes,
+        );
 
         Ok(RepoStatus {
             worktree: self.worktree.clone(),
@@ -926,13 +2045,21 @@ impl Repository {
             repository_format_version: config.core.repository_format_version,
             head,
             head_target,
-            merge_head: self.merge_head()?,
-            orig_head: self.orig_head()?,
+            merge_head,
+            orig_head,
             dirty,
+            has_unstaged_changes,
+            has_staged_changes,
+            has_conflicts,
+            work_in_progress,
+            counts,
+            paths,
             unstaged,
             unstaged_changes,
-            staged: index.staged_paths(),
-            conflicted: index.conflicted_paths(),
+            staged,
+            staged_changes,
+            conflicted,
+            conflicted_changes,
             branches,
             remotes,
             upstream,
@@ -940,6 +2067,347 @@ impl Repository {
             ahead,
             behind,
         })
+    }
+
+    pub fn audit_artifacts(&self) -> Result<RepoArtifactAudit> {
+        let artifacts = self.index_artifacts()?;
+        let mut audit = RepoArtifactAudit {
+            artifacts: artifacts.len(),
+            external_payloads: artifacts.values().filter(|state| state.is_large()).count(),
+            issues: Vec::new(),
+        };
+
+        for (path, state) in artifacts {
+            self.audit_artifact_state(&path, &state, &mut audit);
+        }
+
+        Ok(audit)
+    }
+
+    pub fn repair_artifacts_from_remote(&self, remote: &str) -> Result<RepoArtifactRepairOutcome> {
+        validate_remote_name(remote)?;
+        let before = self.audit_artifacts()?;
+        let remote_store = self.remote_store(remote)?;
+        let artifacts = self.index_artifacts()?;
+        let mut pack_cache = RemoteObjectPackCache::default();
+        let mut fetched_objects = BTreeSet::new();
+        let mut fetched_external_payloads = BTreeSet::new();
+
+        for state in artifacts.values() {
+            self.repair_artifact_state_from_remote(
+                &remote_store,
+                state,
+                &mut pack_cache,
+                &mut fetched_objects,
+                &mut fetched_external_payloads,
+            )?;
+        }
+
+        let after = self.audit_artifacts()?;
+        Ok(RepoArtifactRepairOutcome {
+            remote: remote.to_string(),
+            fetched_objects: fetched_objects.len(),
+            fetched_external_payloads: fetched_external_payloads.len(),
+            before,
+            after,
+        })
+    }
+
+    pub fn fetch_large_file_payloads(
+        &self,
+        remote: &str,
+        rev: Option<&str>,
+    ) -> Result<RepoLargeFileFetchOutcome> {
+        validate_remote_name(remote)?;
+        let target = self.resolve_revision(rev.unwrap_or("HEAD"))?;
+        let commit = self.read_commit(&target)?;
+        let remote_store = self.remote_store(remote)?;
+        let mut files = BTreeMap::<object::ObjectId, RepoLargeFileFetchEntry>::new();
+
+        for (path, state) in &commit.artifacts {
+            let CommitArtifactState::LargeFile { content_hash, size, .. } = state else {
+                continue;
+            };
+            let entry =
+                files
+                    .entry(content_hash.clone())
+                    .or_insert_with(|| RepoLargeFileFetchEntry {
+                        content_hash: content_hash.clone(),
+                        size: *size,
+                        store_path: large_file_content_relative_path(content_hash),
+                        status: RepoLargeFileFetchStatus::Present,
+                        paths: Vec::new(),
+                    });
+            if entry.size != *size {
+                return Err(RepoErr::Object(object::ObjectErr::InvalidObject {
+                    kind: "large-file-pointer",
+                    message: "same content hash referenced with different sizes".to_string(),
+                }));
+            }
+            entry.paths.push(path.clone());
+        }
+
+        let mut already_present_payloads = 0;
+        let mut fetched_payloads = 0;
+        let mut fetched_bytes = 0;
+        for entry in files.values_mut() {
+            let present = self.large_file_content_path(&entry.content_hash).exists();
+            self.fetch_large_file_content(&remote_store, &entry.content_hash, entry.size)?;
+            if present {
+                already_present_payloads += 1;
+                entry.status = RepoLargeFileFetchStatus::Present;
+            } else {
+                fetched_payloads += 1;
+                fetched_bytes += entry.size;
+                entry.status = RepoLargeFileFetchStatus::Fetched;
+            }
+        }
+
+        Ok(RepoLargeFileFetchOutcome {
+            remote: remote.to_string(),
+            target,
+            external_payloads: files.len(),
+            already_present_payloads,
+            fetched_payloads,
+            fetched_bytes,
+            files: files.into_values().collect(),
+        })
+    }
+
+    pub fn large_file_payloads_status(
+        &self,
+        rev: Option<&str>,
+    ) -> Result<RepoLargeFileStatusOutcome> {
+        let target = self.resolve_revision(rev.unwrap_or("HEAD"))?;
+        let commit = self.read_commit(&target)?;
+        let mut files = BTreeMap::<object::ObjectId, RepoLargeFileStatusEntry>::new();
+
+        for (path, state) in &commit.artifacts {
+            let CommitArtifactState::LargeFile { content_hash, size, .. } = state else {
+                continue;
+            };
+            let entry =
+                files
+                    .entry(content_hash.clone())
+                    .or_insert_with(|| RepoLargeFileStatusEntry {
+                        content_hash: content_hash.clone(),
+                        size: *size,
+                        store_path: large_file_content_relative_path(content_hash),
+                        status: RepoLargeFileStatusState::Missing,
+                        message: None,
+                        paths: Vec::new(),
+                    });
+            if entry.size != *size {
+                return Err(RepoErr::Object(object::ObjectErr::InvalidObject {
+                    kind: "large-file-pointer",
+                    message: "same content hash referenced with different sizes".to_string(),
+                }));
+            }
+            entry.paths.push(path.clone());
+        }
+
+        let mut present_payloads = 0;
+        let mut missing_payloads = 0;
+        let mut invalid_payloads = 0;
+        let mut present_bytes = 0;
+        let mut missing_bytes = 0;
+        let mut invalid_bytes = 0;
+        for entry in files.values_mut() {
+            match fs::read(self.large_file_content_path(&entry.content_hash)) {
+                Ok(bytes) => {
+                    if let Err(err) =
+                        validate_large_file_content(&entry.content_hash, entry.size, &bytes)
+                    {
+                        entry.status = RepoLargeFileStatusState::Invalid;
+                        entry.message = Some(err.to_string());
+                        invalid_payloads += 1;
+                        invalid_bytes += entry.size;
+                    } else {
+                        entry.status = RepoLargeFileStatusState::Present;
+                        present_payloads += 1;
+                        present_bytes += entry.size;
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    entry.status = RepoLargeFileStatusState::Missing;
+                    entry.message =
+                        Some(format!("missing external payload {}", entry.content_hash));
+                    missing_payloads += 1;
+                    missing_bytes += entry.size;
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+
+        Ok(RepoLargeFileStatusOutcome {
+            target,
+            external_payloads: files.len(),
+            present_payloads,
+            missing_payloads,
+            invalid_payloads,
+            present_bytes,
+            missing_bytes,
+            invalid_bytes,
+            files: files.into_values().collect(),
+        })
+    }
+
+    pub fn prune_large_file_payloads(&self, dry_run: bool) -> Result<RepoLargeFilePruneOutcome> {
+        let referenced = self.referenced_large_file_payloads()?;
+        let mut files = Vec::new();
+        for payload in self.local_large_file_payloads()? {
+            if referenced.contains(&payload.content_hash) {
+                continue;
+            }
+            files.push(payload);
+        }
+
+        files.sort_by(|left, right| left.content_hash.cmp(&right.content_hash));
+        let candidate_payloads = files.len();
+        let candidate_bytes = files.iter().map(|file| file.size).sum();
+        let mut pruned_payloads = 0;
+        let mut pruned_bytes = 0;
+        if !dry_run {
+            for file in &files {
+                let path = self.graft_dir.join(&file.path);
+                fs::remove_file(&path)?;
+                remove_empty_parent_dirs(path.parent(), &self.file_store_dir())?;
+                pruned_payloads += 1;
+                pruned_bytes += file.size;
+            }
+        }
+
+        Ok(RepoLargeFilePruneOutcome {
+            dry_run,
+            referenced_payloads: referenced.len(),
+            candidate_payloads,
+            candidate_bytes,
+            pruned_payloads,
+            pruned_bytes,
+            files,
+        })
+    }
+
+    pub fn tracked_paths(&self) -> Result<Vec<RepoTrackedPath>> {
+        let files = self.index_files()?;
+        let artifacts = self.index_artifacts()?;
+        let mut paths = Vec::with_capacity(files.len() + artifacts.len());
+
+        for (path, file) in files {
+            paths.push(RepoTrackedPath {
+                path,
+                kind: RepoTrackedPathKind::SqliteDatabase,
+                storage: RepoPathStorage::SqliteSnapshot,
+                size: None,
+                page_count: Some(file.snapshot.page_count),
+            });
+        }
+        for (path, artifact) in artifacts {
+            let kind = artifact_tracked_path_kind(&artifact);
+            paths.push(RepoTrackedPath {
+                path,
+                kind,
+                storage: artifact_tracked_path_storage(&artifact),
+                size: Some(artifact.size()),
+                page_count: None,
+            });
+        }
+
+        paths.sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(paths)
+    }
+
+    pub fn untracked_paths(&self) -> Result<Vec<RepoTrackedPath>> {
+        let index = self.read_index()?;
+        self.untracked_paths_for_index(&index)
+    }
+
+    pub fn tracked_path_details(&self) -> Result<Vec<RepoTrackedPathDetail>> {
+        let files = self.index_files()?;
+        let artifacts = self.index_artifacts()?;
+        let mut paths = Vec::with_capacity(files.len() + artifacts.len());
+
+        for (path, file) in files {
+            paths.push(RepoTrackedPathDetail {
+                path,
+                kind: RepoTrackedPathKind::SqliteDatabase,
+                storage: RepoPathStorage::SqliteSnapshot,
+                size: None,
+                page_count: Some(file.snapshot.page_count),
+                oid: None,
+                content_hash: None,
+                object_present: None,
+                external_payload_present: None,
+            });
+        }
+        for (path, artifact) in artifacts {
+            let kind = artifact_tracked_path_kind(&artifact);
+            let external_payload_present = match &artifact {
+                CommitArtifactState::LargeFile { content_hash, .. } => {
+                    Some(self.large_file_content_path(content_hash).exists())
+                }
+                CommitArtifactState::File { .. } => None,
+            };
+            paths.push(RepoTrackedPathDetail {
+                path,
+                kind,
+                storage: artifact_tracked_path_storage(&artifact),
+                size: Some(artifact.size()),
+                page_count: None,
+                oid: Some(artifact.oid().clone()),
+                content_hash: Some(artifact.content_hash().clone()),
+                object_present: Some(self.object_store().path_for(artifact.oid()).exists()),
+                external_payload_present,
+            });
+        }
+
+        paths.sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(paths)
+    }
+
+    pub fn tracked_path_entries(&self) -> Result<Vec<RepoTrackedPathEntry>> {
+        let index = self.read_index()?;
+        let mut normal_entries = BTreeMap::<String, RepoTrackedPathEntry>::new();
+
+        for (path, file) in self.head_files()? {
+            normal_entries.insert(
+                path.clone(),
+                tracked_file_entry(path, index::IndexStage::Normal, &file),
+            );
+        }
+        for (path, artifact) in self.head_artifacts()? {
+            normal_entries.insert(
+                path.clone(),
+                tracked_artifact_entry(path, index::IndexStage::Normal, &artifact),
+            );
+        }
+
+        for path in index.conflicted_paths() {
+            normal_entries.remove(&path);
+        }
+
+        for entry in index.stage0_entries() {
+            if let Some(entry) = tracked_index_entry(entry) {
+                normal_entries.insert(entry.path.clone(), entry);
+            } else {
+                normal_entries.remove(&entry.path);
+            }
+        }
+
+        let mut entries = normal_entries.into_values().collect::<Vec<_>>();
+        entries.extend(
+            index
+                .entries
+                .iter()
+                .filter(|entry| entry.stage != index::IndexStage::Normal)
+                .filter_map(tracked_index_entry),
+        );
+        entries.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then_with(|| u8::from(left.stage).cmp(&u8::from(right.stage)))
+        });
+        Ok(entries)
     }
 
     fn upstream_status(
@@ -2183,6 +3651,9 @@ impl Repository {
         let base_files = self.files_for_commit(merge_base.as_deref())?;
         let ours_files = self.files_for_commit(Some(&head))?;
         let theirs_files = self.files_for_commit(Some(&target))?;
+        let base_artifacts = self.artifacts_for_commit(merge_base.as_deref())?;
+        let ours_artifacts = self.artifacts_for_commit(Some(&head))?;
+        let theirs_artifacts = self.artifacts_for_commit(Some(&target))?;
         let mut index = self.read_index()?;
         let mut staged = Vec::new();
         let mut conflicted = Vec::new();
@@ -2220,6 +3691,7 @@ impl Repository {
                         oid: None,
                         stage: index::IndexStage::Normal,
                         file: None,
+                        artifact: None,
                     });
                 }
                 staged.push(key.clone());
@@ -2227,6 +3699,50 @@ impl Repository {
             }
 
             self.stage_merge_conflict(key, base, ours, theirs, &mut index)?;
+            conflicted.push(key.clone());
+        }
+
+        let mut artifact_keys = BTreeMap::<String, ()>::new();
+        for key in base_artifacts
+            .keys()
+            .chain(ours_artifacts.keys())
+            .chain(theirs_artifacts.keys())
+        {
+            artifact_keys.insert(key.clone(), ());
+        }
+
+        for key in artifact_keys.keys() {
+            let base = base_artifacts.get(key);
+            let ours = ours_artifacts.get(key);
+            let theirs = theirs_artifacts.get(key);
+
+            if ours == theirs || base == theirs {
+                continue;
+            }
+
+            if base == ours {
+                index.remove_path(key);
+                if let Some(theirs) = theirs {
+                    index.stage(self.index_entry_for_artifact_state(
+                        key.clone(),
+                        index::IndexStage::Normal,
+                        theirs.clone(),
+                    ));
+                } else {
+                    index.stage(index::IndexEntry {
+                        path: key.clone(),
+                        mode: None,
+                        oid: None,
+                        stage: index::IndexStage::Normal,
+                        file: None,
+                        artifact: None,
+                    });
+                }
+                staged.push(key.clone());
+                continue;
+            }
+
+            self.stage_merge_artifact_conflict(key, base, ours, theirs, &mut index);
             conflicted.push(key.clone());
         }
 
@@ -2328,9 +3844,52 @@ impl Repository {
         self.stage_file_state(key, file)
     }
 
+    pub fn stage_artifact_path(&self, path: impl AsRef<Path>) -> Result<index::IndexEntry> {
+        let key = self.file_key(path)?;
+        let physical_path = self.worktree.join(&key);
+        let artifact = self.write_artifact_state_from_path(&key, &physical_path)?;
+        self.stage_artifact_state(key, artifact)
+    }
+
+    #[cfg(test)]
+    fn stage_artifact_path_with_inline_text_threshold(
+        &self,
+        path: impl AsRef<Path>,
+        inline_text_threshold: u64,
+    ) -> Result<index::IndexEntry> {
+        let key = self.file_key(path)?;
+        let physical_path = self.worktree.join(&key);
+        let config = FileConfig {
+            inline_text_threshold: ByteUnit::new(inline_text_threshold),
+            external_paths: Vec::new(),
+        };
+        let artifact =
+            self.write_artifact_state_from_path_with_file_config(&key, &physical_path, &config)?;
+        self.stage_artifact_state(key, artifact)
+    }
+
+    fn stage_artifact_state(
+        &self,
+        key: String,
+        artifact: CommitArtifactState,
+    ) -> Result<index::IndexEntry> {
+        let entry =
+            self.index_entry_for_artifact_state(key.clone(), index::IndexStage::Normal, artifact);
+        let mut index = self.read_index()?;
+        index.stage(entry.clone());
+        self.write_index(&index)?;
+        self.clear_dirty_key(&key)?;
+        Ok(entry)
+    }
+
     pub fn stage_file_removal(&self, path: impl AsRef<Path>) -> Result<index::IndexEntry> {
         let key = self.file_key(path)?;
-        if !self.head_files()?.contains_key(&key) {
+        self.stage_file_removal_key(key)
+    }
+
+    pub fn stage_file_removal_key(&self, key: impl Into<String>) -> Result<index::IndexEntry> {
+        let key = normalize_repo_path(&key.into());
+        if !self.head_files()?.contains_key(&key) && !self.head_artifacts()?.contains_key(&key) {
             return Err(RepoErr::PathNotTracked(key));
         }
         let entry = index::IndexEntry {
@@ -2339,6 +3898,7 @@ impl Repository {
             oid: None,
             stage: index::IndexStage::Normal,
             file: None,
+            artifact: None,
         };
         let mut index = self.read_index()?;
         index.stage(entry.clone());
@@ -2367,6 +3927,54 @@ impl Repository {
                 oid: None,
                 stage: index::IndexStage::Normal,
                 file: None,
+                artifact: None,
+            }
+        };
+        index.stage(entry.clone());
+        self.write_index(&index)?;
+        self.clear_dirty_key(&key)?;
+        Ok(entry)
+    }
+
+    pub fn resolve_artifact_conflict(
+        &self,
+        path: impl AsRef<Path>,
+        artifact: Option<CommitArtifactState>,
+    ) -> Result<index::IndexEntry> {
+        let key = self.file_key(path)?;
+        self.resolve_artifact_conflict_key(key, artifact)
+    }
+
+    pub fn resolve_artifact_conflict_from_path(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> Result<index::IndexEntry> {
+        let key = self.file_key(path)?;
+        let physical_path = self.worktree.join(&key);
+        let artifact = self.write_artifact_state_from_path(&key, &physical_path)?;
+        self.resolve_artifact_conflict_key(key, Some(artifact))
+    }
+
+    fn resolve_artifact_conflict_key(
+        &self,
+        key: String,
+        artifact: Option<CommitArtifactState>,
+    ) -> Result<index::IndexEntry> {
+        let mut index = self.read_index()?;
+        if !index.conflicted_paths().iter().any(|path| path == &key) {
+            return Err(RepoErr::PathNotConflicted(key));
+        }
+
+        let entry = if let Some(artifact) = artifact {
+            self.index_entry_for_artifact_state(key.clone(), index::IndexStage::Normal, artifact)
+        } else {
+            index::IndexEntry {
+                path: key.clone(),
+                mode: None,
+                oid: None,
+                stage: index::IndexStage::Normal,
+                file: None,
+                artifact: None,
             }
         };
         index.stage(entry.clone());
@@ -2391,7 +3999,24 @@ impl Repository {
             oid: Some(oid),
             stage,
             file: Some(file),
+            artifact: None,
         })
+    }
+
+    fn index_entry_for_artifact_state(
+        &self,
+        key: String,
+        stage: index::IndexStage,
+        artifact: CommitArtifactState,
+    ) -> index::IndexEntry {
+        index::IndexEntry {
+            path: key,
+            mode: Some(object::TreeEntryMode::Regular),
+            oid: Some(artifact.oid().clone()),
+            stage,
+            file: None,
+            artifact: Some(artifact),
+        }
     }
 
     pub fn commit_staged(&self, message: impl Into<String>) -> Result<CommitObject> {
@@ -2412,14 +4037,20 @@ impl Repository {
         }
 
         let mut files = self.head_files()?;
+        let mut artifacts = self.head_artifacts()?;
         for entry in index.stage0_entries() {
             if let Some(file) = &entry.file {
                 files.insert(entry.path.clone(), file.clone());
+                artifacts.remove(&entry.path);
+            } else if let Some(artifact) = &entry.artifact {
+                artifacts.insert(entry.path.clone(), artifact.clone());
+                files.remove(&entry.path);
             } else {
                 files.remove(&entry.path);
+                artifacts.remove(&entry.path);
             }
         }
-        let commit = self.commit_with_files(message, files, tables)?;
+        let commit = self.commit_with_files_and_artifacts(message, files, artifacts, tables)?;
         self.clear_index()?;
         Ok(commit)
     }
@@ -2442,6 +4073,16 @@ impl Repository {
         files: BTreeMap<String, CommitFileState>,
         tables: Vec<CommitTableSummary>,
     ) -> Result<CommitObject> {
+        self.commit_with_files_and_artifacts(message, files, BTreeMap::new(), tables)
+    }
+
+    fn commit_with_files_and_artifacts(
+        &self,
+        message: impl Into<String>,
+        files: BTreeMap<String, CommitFileState>,
+        artifacts: BTreeMap<String, CommitArtifactState>,
+        tables: Vec<CommitTableSummary>,
+    ) -> Result<CommitObject> {
         let head = self.head()?;
         let parents = self.commit_parents()?;
         let parent = parents.first().cloned();
@@ -2449,8 +4090,10 @@ impl Repository {
         let message = message.into();
         let tables = normalize_commit_table_summary(tables);
         let changed_tables = tables.len();
+        let changes =
+            self.commit_changes(parents.first().map(String::as_str), &files, &artifacts)?;
         let object_store = self.object_store();
-        let tree = self.write_tree_object(&object_store, &files)?;
+        let tree = self.write_tree_object(&object_store, &files, &artifacts)?;
         let commit_object = self.canonical_commit_object(
             tree.clone(),
             &parents,
@@ -2467,6 +4110,8 @@ impl Repository {
             message,
             timestamp_ms,
             files,
+            artifacts,
+            changes,
             tables,
             changed_tables,
         };
@@ -2483,6 +4128,31 @@ impl Repository {
 
         self.clear_merge_state()?;
         Ok(commit)
+    }
+
+    fn commit_changes(
+        &self,
+        parent: Option<&str>,
+        files: &BTreeMap<String, CommitFileState>,
+        artifacts: &BTreeMap<String, CommitArtifactState>,
+    ) -> Result<Vec<CommitPathChange>> {
+        let Some(parent) = parent else {
+            return Ok(commit_path_changes(
+                &BTreeMap::new(),
+                files,
+                &BTreeMap::new(),
+                artifacts,
+            ));
+        };
+        let Some((parent_files, parent_artifacts)) = self.commit_tree_state(parent)? else {
+            return Ok(Vec::new());
+        };
+        Ok(commit_path_changes(
+            &parent_files,
+            files,
+            &parent_artifacts,
+            artifacts,
+        ))
     }
 
     pub fn log(&self) -> Result<Vec<CommitObject>> {
@@ -2559,11 +4229,13 @@ impl Repository {
         let from_commit = self.read_commit(&from_id)?;
         let to_commit = self.read_commit(&to_id)?;
 
-        Ok(diff_file_maps(
+        Ok(diff_repo_maps(
             from_id,
             to_id,
             &from_commit.files,
             &to_commit.files,
+            &from_commit.artifacts,
+            &to_commit.artifacts,
             path,
         ))
     }
@@ -2572,11 +4244,15 @@ impl Repository {
         let from = self.head_target()?.unwrap_or_else(|| "HEAD".to_string());
         let head_files = self.head_files()?;
         let index_files = self.index_files()?;
-        Ok(diff_file_maps(
+        let head_artifacts = self.head_artifacts()?;
+        let index_artifacts = self.index_artifacts()?;
+        Ok(diff_repo_maps(
             from,
             "index",
             &head_files,
             &index_files,
+            &head_artifacts,
+            &index_artifacts,
             path,
         ))
     }
@@ -2587,13 +4263,18 @@ impl Repository {
         state: CommitFileState,
         filter: Option<&str>,
     ) -> Result<RepoDiff> {
+        let key = self.file_key(path)?;
         let mut worktree_files = self.index_files()?;
-        worktree_files.insert(self.file_key(path)?, state);
-        Ok(diff_file_maps(
+        worktree_files.insert(key.clone(), state);
+        let mut worktree_artifacts = self.index_artifacts()?;
+        worktree_artifacts.remove(&key);
+        Ok(diff_repo_maps(
             "index",
             "worktree",
             &self.index_files()?,
             &worktree_files,
+            &self.index_artifacts()?,
+            &worktree_artifacts,
             filter,
         ))
     }
@@ -2605,11 +4286,58 @@ impl Repository {
     ) -> Result<RepoDiff> {
         let mut worktree_files = self.index_files()?;
         worktree_files.remove(&self.file_key(path)?);
-        Ok(diff_file_maps(
+        Ok(diff_repo_maps(
             "index",
             "worktree",
             &self.index_files()?,
             &worktree_files,
+            &self.index_artifacts()?,
+            &self.index_artifacts()?,
+            filter,
+        ))
+    }
+
+    pub fn diff_worktree_artifact(
+        &self,
+        path: impl AsRef<Path>,
+        filter: Option<&str>,
+    ) -> Result<RepoDiff> {
+        let key = self.file_key(path)?;
+        let artifact = self.write_artifact_state_from_path(&key, &self.worktree.join(&key))?;
+        let index_files = self.index_files()?;
+        let mut worktree_files = index_files.clone();
+        worktree_files.remove(&key);
+        let index_artifacts = self.index_artifacts()?;
+        let mut worktree_artifacts = index_artifacts.clone();
+        worktree_artifacts.insert(key, artifact);
+        Ok(diff_repo_maps(
+            "index",
+            "worktree",
+            &index_files,
+            &worktree_files,
+            &index_artifacts,
+            &worktree_artifacts,
+            filter,
+        ))
+    }
+
+    pub fn diff_worktree_artifact_removal(
+        &self,
+        path: impl AsRef<Path>,
+        filter: Option<&str>,
+    ) -> Result<RepoDiff> {
+        let key = self.file_key(path)?;
+        let index_files = self.index_files()?;
+        let index_artifacts = self.index_artifacts()?;
+        let mut worktree_artifacts = index_artifacts.clone();
+        worktree_artifacts.remove(&key);
+        Ok(diff_repo_maps(
+            "index",
+            "worktree",
+            &index_files,
+            &index_files,
+            &index_artifacts,
+            &worktree_artifacts,
             filter,
         ))
     }
@@ -2622,14 +4350,21 @@ impl Repository {
         filter: Option<&str>,
     ) -> Result<RepoDiff> {
         let from_id = self.resolve_revision(rev)?;
-        let from_files = self.read_commit(&from_id)?.files;
+        let from_commit = self.read_commit(&from_id)?;
+        let from_files = from_commit.files;
+        let from_artifacts = from_commit.artifacts;
         let mut worktree_files = from_files.clone();
-        worktree_files.insert(self.file_key(path)?, state);
-        Ok(diff_file_maps(
+        let key = self.file_key(path)?;
+        worktree_files.insert(key.clone(), state);
+        let mut worktree_artifacts = from_artifacts.clone();
+        worktree_artifacts.remove(&key);
+        Ok(diff_repo_maps(
             from_id,
             "worktree",
             &from_files,
             &worktree_files,
+            &from_artifacts,
+            &worktree_artifacts,
             filter,
         ))
     }
@@ -2641,14 +4376,68 @@ impl Repository {
         filter: Option<&str>,
     ) -> Result<RepoDiff> {
         let from_id = self.resolve_revision(rev)?;
-        let from_files = self.read_commit(&from_id)?.files;
+        let from_commit = self.read_commit(&from_id)?;
+        let from_files = from_commit.files;
+        let from_artifacts = from_commit.artifacts;
         let mut worktree_files = from_files.clone();
         worktree_files.remove(&self.file_key(path)?);
-        Ok(diff_file_maps(
+        Ok(diff_repo_maps(
             from_id,
             "worktree",
             &from_files,
             &worktree_files,
+            &from_artifacts,
+            &from_artifacts,
+            filter,
+        ))
+    }
+
+    pub fn diff_revision_to_worktree_artifact(
+        &self,
+        rev: &str,
+        path: impl AsRef<Path>,
+        filter: Option<&str>,
+    ) -> Result<RepoDiff> {
+        let from_id = self.resolve_revision(rev)?;
+        let from_commit = self.read_commit(&from_id)?;
+        let from_files = from_commit.files;
+        let from_artifacts = from_commit.artifacts;
+        let key = self.file_key(path)?;
+        let artifact = self.write_artifact_state_from_path(&key, &self.worktree.join(&key))?;
+        let mut worktree_files = from_files.clone();
+        worktree_files.remove(&key);
+        let mut worktree_artifacts = from_artifacts.clone();
+        worktree_artifacts.insert(key, artifact);
+        Ok(diff_repo_maps(
+            from_id,
+            "worktree",
+            &from_files,
+            &worktree_files,
+            &from_artifacts,
+            &worktree_artifacts,
+            filter,
+        ))
+    }
+
+    pub fn diff_revision_to_worktree_artifact_removal(
+        &self,
+        rev: &str,
+        path: impl AsRef<Path>,
+        filter: Option<&str>,
+    ) -> Result<RepoDiff> {
+        let from_id = self.resolve_revision(rev)?;
+        let from_commit = self.read_commit(&from_id)?;
+        let from_files = from_commit.files;
+        let from_artifacts = from_commit.artifacts;
+        let mut worktree_artifacts = from_artifacts.clone();
+        worktree_artifacts.remove(&self.file_key(path)?);
+        Ok(diff_repo_maps(
+            from_id,
+            "worktree",
+            &from_files,
+            &from_files,
+            &from_artifacts,
+            &worktree_artifacts,
             filter,
         ))
     }
@@ -2742,6 +4531,67 @@ impl Repository {
         })
     }
 
+    pub fn checkout_artifact_from_revision(
+        &self,
+        rev: &str,
+        path: impl AsRef<Path>,
+    ) -> Result<CheckoutArtifactOutcome> {
+        let path = self.file_key(path)?;
+        self.checkout_artifact_key_from_revision(rev, path)
+    }
+
+    pub fn checkout_artifact_key_from_revision(
+        &self,
+        rev: &str,
+        path: impl Into<String>,
+    ) -> Result<CheckoutArtifactOutcome> {
+        let plan = self.plan_checkout_artifact_key_from_revision(rev, path)?;
+        self.apply_checkout_artifact_plan(&plan)
+    }
+
+    pub fn plan_checkout_artifact_from_revision(
+        &self,
+        rev: &str,
+        path: impl AsRef<Path>,
+    ) -> Result<CheckoutArtifactPlan> {
+        let path = self.file_key(path)?;
+        self.plan_checkout_artifact_key_from_revision(rev, path)
+    }
+
+    pub fn plan_checkout_artifact_key_from_revision(
+        &self,
+        rev: &str,
+        path: impl Into<String>,
+    ) -> Result<CheckoutArtifactPlan> {
+        let target = self.resolve_revision(rev)?;
+        let path = normalize_repo_path(&path.into());
+        let commit = self.read_commit(&target)?;
+        let state = commit.artifacts.get(&path).cloned().ok_or_else(|| {
+            RepoErr::PathNotFoundInRevision { path: path.clone(), rev: rev.to_string() }
+        })?;
+        let entry = self.index_entry_for_artifact_state(
+            path.clone(),
+            index::IndexStage::Normal,
+            state.clone(),
+        );
+        Ok(CheckoutArtifactPlan { target, path, state, entry })
+    }
+
+    pub fn apply_checkout_artifact_plan(
+        &self,
+        plan: &CheckoutArtifactPlan,
+    ) -> Result<CheckoutArtifactOutcome> {
+        let mut index = self.read_index()?;
+        index.stage(plan.entry.clone());
+        self.write_index(&index)?;
+        self.clear_dirty_key(&plan.path)?;
+        Ok(CheckoutArtifactOutcome {
+            target: plan.target.clone(),
+            path: plan.path.clone(),
+            state: plan.state.clone(),
+        })
+    }
+
     pub fn reset(&self, rev: &str, mode: ResetMode) -> Result<ResetOutcome> {
         let plan = self.plan_reset(rev, mode)?;
         self.apply_reset_plan(&plan)
@@ -2780,7 +4630,8 @@ impl Repository {
         self.mark_dirty_key(key)
     }
 
-    fn mark_dirty_key(&self, key: String) -> Result<()> {
+    pub fn mark_dirty_key(&self, key: impl Into<String>) -> Result<()> {
+        let key = normalize_repo_path(&key.into());
         let mut state = self.read_worktree_state()?;
         let mut dirty = state.dirty.into_iter().collect::<BTreeSet<_>>();
         dirty.insert(key.clone());
@@ -2791,6 +4642,11 @@ impl Repository {
 
     pub fn mark_deleted_path(&self, path: impl AsRef<Path>) -> Result<()> {
         let key = self.file_key(path)?;
+        self.mark_deleted_key(key)
+    }
+
+    pub fn mark_deleted_key(&self, key: impl Into<String>) -> Result<()> {
+        let key = normalize_repo_path(&key.into());
         let mut state = self.read_worktree_state()?;
         state.dirty.retain(|path| path != &key);
         let mut deleted = state.deleted.into_iter().collect::<BTreeSet<_>>();
@@ -2804,10 +4660,11 @@ impl Repository {
         self.clear_dirty_key(&key)
     }
 
-    fn clear_dirty_key(&self, key: &str) -> Result<()> {
+    pub fn clear_dirty_key(&self, key: &str) -> Result<()> {
+        let key = normalize_repo_path(key);
         let mut state = self.read_worktree_state()?;
-        state.dirty.retain(|path| path != key);
-        state.deleted.retain(|path| path != key);
+        state.dirty.retain(|path| path != &key);
+        state.deleted.retain(|path| path != &key);
         self.write_worktree_state(&state)
     }
 
@@ -2859,13 +4716,32 @@ impl Repository {
             .and_then(|commit| commit.files.get(&key).cloned()))
     }
 
+    pub fn head_artifact(&self, path: impl AsRef<Path>) -> Result<Option<CommitArtifactState>> {
+        let key = self.file_key(path)?;
+        Ok(self
+            .head_target()?
+            .map(|commit| self.read_commit(&commit))
+            .transpose()?
+            .and_then(|commit| commit.artifacts.get(&key).cloned()))
+    }
+
     pub fn index_file(&self, path: impl AsRef<Path>) -> Result<Option<CommitFileState>> {
         let key = self.file_key(path)?;
         Ok(self.index_files()?.remove(&key))
     }
 
+    pub fn index_artifact(&self, path: impl AsRef<Path>) -> Result<Option<CommitArtifactState>> {
+        let key = self.file_key(path)?;
+        Ok(self.index_artifacts()?.remove(&key))
+    }
+
     pub fn index_has_entry(&self, path: impl AsRef<Path>) -> Result<bool> {
         let key = self.file_key(path)?;
+        self.index_has_key(key)
+    }
+
+    pub fn index_has_key(&self, key: impl Into<String>) -> Result<bool> {
+        let key = normalize_repo_path(&key.into());
         Ok(self
             .read_index()?
             .stage0_entries()
@@ -2874,12 +4750,18 @@ impl Repository {
 
     pub fn restore_index_path_from_head(&self, path: impl AsRef<Path>) -> Result<String> {
         let key = self.file_key(path)?;
+        self.restore_index_key_from_head(key)
+    }
+
+    pub fn restore_index_key_from_head(&self, key: impl Into<String>) -> Result<String> {
+        let key = normalize_repo_path(&key.into());
         let mut index = self.read_index()?;
         if index.conflicted_paths().iter().any(|path| path == &key) {
             return Err(RepoErr::UnresolvedConflicts);
         }
         let had_index_entry = index.entries.iter().any(|entry| entry.path == key);
-        let is_tracked_at_head = self.head_files()?.contains_key(&key);
+        let is_tracked_at_head =
+            self.head_files()?.contains_key(&key) || self.head_artifacts()?.contains_key(&key);
         if !had_index_entry && !is_tracked_at_head {
             return Err(RepoErr::PathNotTracked(key));
         }
@@ -2894,24 +4776,39 @@ impl Repository {
         path: impl AsRef<Path>,
     ) -> Result<String> {
         let key = self.file_key(path)?;
+        self.restore_index_key_from_revision(rev, key)
+    }
+
+    pub fn restore_index_key_from_revision(
+        &self,
+        rev: &str,
+        key: impl Into<String>,
+    ) -> Result<String> {
+        let key = normalize_repo_path(&key.into());
         let target = self.resolve_revision(rev)?;
-        let source_files = self.read_commit(&target)?.files;
+        let source_commit = self.read_commit(&target)?;
+        let source_files = source_commit.files;
+        let source_artifacts = source_commit.artifacts;
         let source_state = source_files.get(&key).cloned();
+        let source_artifact = source_artifacts.get(&key).cloned();
         let head_files = self.head_files()?;
+        let head_artifacts = self.head_artifacts()?;
         let head_state = head_files.get(&key);
-        let head_has_path = head_state.is_some();
+        let head_artifact = head_artifacts.get(&key);
+        let head_has_path = head_state.is_some() || head_artifact.is_some();
         let mut index = self.read_index()?;
         if index.conflicted_paths().iter().any(|path| path == &key) {
             return Err(RepoErr::UnresolvedConflicts);
         }
         let had_index_entry = index.entries.iter().any(|entry| entry.path == key);
 
-        if source_state.is_none() && !head_has_path && !had_index_entry {
+        if source_state.is_none() && source_artifact.is_none() && !head_has_path && !had_index_entry
+        {
             return Err(RepoErr::PathNotFoundInRevision { path: key, rev: rev.to_string() });
         }
 
         index.remove_path(&key);
-        if source_state.as_ref() == head_state {
+        if source_state.as_ref() == head_state && source_artifact.as_ref() == head_artifact {
             // Resetting the index to HEAD is represented by the absence of an index entry.
         } else if let Some(file) = source_state {
             index.stage(self.index_entry_for_state(
@@ -2919,6 +4816,12 @@ impl Repository {
                 index::IndexStage::Normal,
                 file,
             )?);
+        } else if let Some(artifact) = source_artifact {
+            index.stage(self.index_entry_for_artifact_state(
+                key.clone(),
+                index::IndexStage::Normal,
+                artifact,
+            ));
         } else if head_has_path {
             index.stage(index::IndexEntry {
                 path: key.clone(),
@@ -2926,6 +4829,7 @@ impl Repository {
                 oid: None,
                 stage: index::IndexStage::Normal,
                 file: None,
+                artifact: None,
             });
         }
         self.write_index(&index)?;
@@ -2940,6 +4844,66 @@ impl Repository {
         let target = self.resolve_revision(rev)?;
         let key = self.file_key(path)?;
         Ok(self.read_commit(&target)?.files.get(&key).cloned())
+    }
+
+    pub fn artifact_from_revision(
+        &self,
+        rev: &str,
+        path: impl AsRef<Path>,
+    ) -> Result<Option<CommitArtifactState>> {
+        let target = self.resolve_revision(rev)?;
+        let key = self.file_key(path)?;
+        Ok(self.read_commit(&target)?.artifacts.get(&key).cloned())
+    }
+
+    pub fn materialize_artifact_state(
+        &self,
+        path: impl AsRef<Path>,
+        state: &CommitArtifactState,
+    ) -> Result<()> {
+        let key = self.file_key(path)?;
+        self.materialize_artifact_key(&key, state)
+    }
+
+    pub fn materialize_artifact_key(&self, key: &str, state: &CommitArtifactState) -> Result<()> {
+        let path = self.worktree.join(key);
+        let bytes = self.artifact_bytes(state)?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        write_file_atomic(&path, &bytes)?;
+        Ok(())
+    }
+
+    pub fn materialize_artifact_checkout(
+        &self,
+        artifacts: &BTreeMap<String, CommitArtifactState>,
+        previous_artifacts: &BTreeMap<String, CommitArtifactState>,
+        replacement_files: &BTreeMap<String, CommitFileState>,
+    ) -> Result<()> {
+        for (path, state) in artifacts {
+            self.materialize_artifact_key(path, state)?;
+        }
+        for path in previous_artifacts.keys() {
+            if artifacts.contains_key(path) || replacement_files.contains_key(path) {
+                continue;
+            }
+            let physical_path = self.worktree.join(path);
+            if physical_path.is_file() {
+                fs::remove_file(&physical_path)?;
+                remove_empty_parent_dirs(physical_path.parent(), &self.worktree)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn artifact_path_matches_state(
+        &self,
+        path: impl AsRef<Path>,
+        expected: &CommitArtifactState,
+    ) -> Result<Option<bool>> {
+        let key = self.file_key(path)?;
+        artifact_file_matches(&self.worktree.join(key), expected)
     }
 
     pub fn file_key(&self, path: impl AsRef<Path>) -> Result<String> {
@@ -2966,6 +4930,30 @@ impl Repository {
             .ok_or_else(|| RepoErr::NonUtf8Path(relative.to_path_buf()))
     }
 
+    pub fn is_ignored_worktree_path(&self, path: impl AsRef<Path>) -> Result<bool> {
+        let path = path.as_ref();
+        let key = self.worktree_key_for_path(path)?;
+        let is_dir = path.is_dir();
+        Ok(self.ignore_rules()?.is_ignored(&key, is_dir))
+    }
+
+    fn worktree_key_for_path(&self, path: &Path) -> Result<String> {
+        let relative =
+            path.strip_prefix(&self.worktree)
+                .map_err(|_| RepoErr::PathOutsideWorktree {
+                    path: path.to_path_buf(),
+                    worktree: self.worktree.clone(),
+                })?;
+        relative
+            .to_str()
+            .map(|path| normalize_repo_path(path))
+            .ok_or_else(|| RepoErr::NonUtf8Path(relative.to_path_buf()))
+    }
+
+    fn ignore_rules(&self) -> Result<IgnoreRules> {
+        IgnoreRules::load(&self.worktree)
+    }
+
     fn create_layout(&self) -> Result<()> {
         for dir in [
             DIR_REFS_HEADS,
@@ -2974,6 +4962,7 @@ impl Repository {
             DIR_OBJECTS,
             DIR_OBJECTS_PACK,
             DIR_STORE_FJALL,
+            DIR_STORE_FILES,
             DIR_INDEX,
             DIR_LOCKS,
             DIR_TMP,
@@ -3139,6 +5128,22 @@ impl Repository {
         }
     }
 
+    fn commit_tree_state(
+        &self,
+        id: &str,
+    ) -> Result<
+        Option<(
+            BTreeMap<String, CommitFileState>,
+            BTreeMap<String, CommitArtifactState>,
+        )>,
+    > {
+        let id = object::ObjectId::from_str(id)?;
+        let Some(commit) = self.read_commit_object(&id)? else {
+            return Ok(None);
+        };
+        self.tree_state_from_object(&commit.tree).map(Some)
+    }
+
     fn commit_from_object(
         &self,
         id: &object::ObjectId,
@@ -3151,6 +5156,9 @@ impl Repository {
             .collect::<Vec<_>>();
         let tables = commit.tables;
         let changed_tables = tables.len();
+        let (files, artifacts) = self.tree_state_from_object(&commit.tree)?;
+        let changes =
+            self.commit_changes(parents.first().map(String::as_str), &files, &artifacts)?;
         Ok(CommitObject {
             id: id.to_string(),
             parent: parents.first().cloned(),
@@ -3158,16 +5166,21 @@ impl Repository {
             tree: Some(commit.tree.to_string()),
             message: commit.message,
             timestamp_ms: commit.committer.timestamp_ms,
-            files: self.files_from_tree_object(&commit.tree)?,
+            files,
+            artifacts,
+            changes,
             tables,
             changed_tables,
         })
     }
 
-    fn files_from_tree_object(
+    fn tree_state_from_object(
         &self,
         id: &object::ObjectId,
-    ) -> Result<BTreeMap<String, CommitFileState>> {
+    ) -> Result<(
+        BTreeMap<String, CommitFileState>,
+        BTreeMap<String, CommitArtifactState>,
+    )> {
         let object = self.object_store().read(id)?;
         let object::Object::Tree(tree) = object else {
             return Err(RepoErr::Object(object::ObjectErr::InvalidObject {
@@ -3177,24 +5190,36 @@ impl Repository {
         };
 
         let mut files = BTreeMap::new();
+        let mut artifacts = BTreeMap::new();
         for entry in tree.entries {
-            if entry.mode != object::TreeEntryMode::SqliteDatabase {
-                return Err(RepoErr::Object(object::ObjectErr::InvalidObject {
-                    kind: "tree",
-                    message: format!("entry `{}` has unsupported mode {}", entry.path, entry.mode),
-                }));
+            match entry.mode {
+                object::TreeEntryMode::SqliteDatabase => {
+                    let object = self.object_store().read(&entry.oid)?;
+                    let object::Object::Blob(object::BlobObject::SqliteSnapshot(blob)) = object
+                    else {
+                        return Err(RepoErr::Object(object::ObjectErr::InvalidObject {
+                            kind: "blob",
+                            message: format!(
+                                "tree entry `{}` is not a sqlite snapshot",
+                                entry.path
+                            ),
+                        }));
+                    };
+                    files.insert(entry.path, file_state_from_sqlite_snapshot_blob(blob));
+                }
+                object::TreeEntryMode::Regular => {
+                    let object = self.object_store().read(&entry.oid)?;
+                    let object::Object::Blob(blob) = object else {
+                        return Err(RepoErr::Object(object::ObjectErr::InvalidObject {
+                            kind: "blob",
+                            message: format!("tree entry `{}` is not a blob", entry.path),
+                        }));
+                    };
+                    artifacts.insert(entry.path, artifact_state_from_blob(entry.oid, blob)?);
+                }
             }
-
-            let object = self.object_store().read(&entry.oid)?;
-            let object::Object::Blob(object::BlobObject::SqliteSnapshot(blob)) = object else {
-                return Err(RepoErr::Object(object::ObjectErr::InvalidObject {
-                    kind: "blob",
-                    message: format!("tree entry `{}` is not a sqlite snapshot", entry.path),
-                }));
-            };
-            files.insert(entry.path, file_state_from_sqlite_snapshot_blob(blob));
         }
-        Ok(files)
+        Ok((files, artifacts))
     }
 
     pub fn read_index(&self) -> Result<index::Index> {
@@ -3216,11 +5241,32 @@ impl Repository {
         for entry in index.stage0_entries() {
             if let Some(file) = &entry.file {
                 files.insert(entry.path.clone(), file.clone());
+            } else if entry.artifact.is_some() {
+                files.remove(&entry.path);
             } else {
                 files.remove(&entry.path);
             }
         }
         Ok(files)
+    }
+
+    pub fn index_artifacts(&self) -> Result<BTreeMap<String, CommitArtifactState>> {
+        let index = self.read_index()?;
+        if index.has_conflicts() {
+            return Err(RepoErr::UnresolvedConflicts);
+        }
+
+        let mut artifacts = self.head_artifacts()?;
+        for entry in index.stage0_entries() {
+            if let Some(artifact) = &entry.artifact {
+                artifacts.insert(entry.path.clone(), artifact.clone());
+            } else if entry.file.is_some() {
+                artifacts.remove(&entry.path);
+            } else {
+                artifacts.remove(&entry.path);
+            }
+        }
+        Ok(artifacts)
     }
 
     fn files_for_worktree_status(
@@ -3231,6 +5277,8 @@ impl Repository {
         for entry in index.stage0_entries() {
             if let Some(file) = &entry.file {
                 files.insert(entry.path.clone(), file.clone());
+            } else if entry.artifact.is_some() {
+                files.remove(&entry.path);
             } else {
                 files.remove(&entry.path);
             }
@@ -3238,43 +5286,308 @@ impl Repository {
         Ok(files)
     }
 
+    fn artifacts_for_worktree_status(
+        &self,
+        index: &index::Index,
+    ) -> Result<BTreeMap<String, CommitArtifactState>> {
+        let mut artifacts = self.head_artifacts()?;
+        for entry in index.stage0_entries() {
+            if let Some(artifact) = &entry.artifact {
+                artifacts.insert(entry.path.clone(), artifact.clone());
+            } else if entry.file.is_some() {
+                artifacts.remove(&entry.path);
+            } else {
+                artifacts.remove(&entry.path);
+            }
+        }
+        Ok(artifacts)
+    }
+
+    fn staged_changes_for_index(&self, index: &index::Index) -> Result<Vec<RepoStagedChange>> {
+        let head_files = self.head_files()?;
+        let head_artifacts = self.head_artifacts()?;
+        let mut changes = Vec::new();
+
+        for entry in index.stage0_entries() {
+            let was_tracked =
+                head_files.contains_key(&entry.path) || head_artifacts.contains_key(&entry.path);
+            let (change, kind, storage) = if entry.file.is_some() {
+                (
+                    if was_tracked {
+                        RepoFileChange::Modified
+                    } else {
+                        RepoFileChange::Added
+                    },
+                    RepoTrackedPathKind::SqliteDatabase,
+                    RepoPathStorage::SqliteSnapshot,
+                )
+            } else if let Some(artifact) = &entry.artifact {
+                (
+                    if was_tracked {
+                        RepoFileChange::Modified
+                    } else {
+                        RepoFileChange::Added
+                    },
+                    artifact_tracked_path_kind(artifact),
+                    artifact_tracked_path_storage(artifact),
+                )
+            } else {
+                let (kind, storage) = if head_files.contains_key(&entry.path) {
+                    (
+                        RepoTrackedPathKind::SqliteDatabase,
+                        RepoPathStorage::SqliteSnapshot,
+                    )
+                } else if let Some(artifact) = head_artifacts.get(&entry.path) {
+                    (
+                        artifact_tracked_path_kind(artifact),
+                        artifact_tracked_path_storage(artifact),
+                    )
+                } else {
+                    (RepoTrackedPathKind::BinaryFile, RepoPathStorage::Inline)
+                };
+                (RepoFileChange::Deleted, kind, storage)
+            };
+
+            changes.push(RepoStagedChange {
+                path: entry.path.clone(),
+                change,
+                kind,
+                storage,
+            });
+        }
+
+        Ok(changes)
+    }
+
+    fn conflicted_changes_for_index(&self, index: &index::Index) -> Vec<RepoConflictChange> {
+        fn kind_priority(kind: RepoTrackedPathKind) -> u8 {
+            match kind {
+                RepoTrackedPathKind::TextFile => 1,
+                RepoTrackedPathKind::BinaryFile => 1,
+                RepoTrackedPathKind::SqliteDatabase => 3,
+            }
+        }
+
+        let mut by_path = BTreeMap::<String, (RepoTrackedPathKind, RepoPathStorage)>::new();
+
+        for entry in index
+            .entries
+            .iter()
+            .filter(|entry| entry.stage != index::IndexStage::Normal)
+        {
+            let (kind, storage) = if entry.file.is_some() {
+                (
+                    RepoTrackedPathKind::SqliteDatabase,
+                    RepoPathStorage::SqliteSnapshot,
+                )
+            } else if let Some(artifact) = &entry.artifact {
+                (
+                    artifact_tracked_path_kind(artifact),
+                    artifact_tracked_path_storage(artifact),
+                )
+            } else {
+                (RepoTrackedPathKind::BinaryFile, RepoPathStorage::Inline)
+            };
+            by_path
+                .entry(entry.path.clone())
+                .and_modify(|existing| {
+                    if kind_priority(kind) > kind_priority(existing.0) {
+                        *existing = (kind, storage);
+                    }
+                })
+                .or_insert((kind, storage));
+        }
+
+        by_path
+            .into_iter()
+            .map(|(path, (kind, storage))| RepoConflictChange { path, kind, storage })
+            .collect()
+    }
+
     fn unstaged_changes_for_index(&self, index: &index::Index) -> Result<Vec<RepoWorktreeChange>> {
         let tracked = self.files_for_worktree_status(index)?;
+        let tracked_artifacts = self.artifacts_for_worktree_status(index)?;
         let state = self.read_worktree_state()?;
-        let mut changes = BTreeMap::new();
+        let mut changes = BTreeMap::<
+            String,
+            (RepoWorktreeChangeKind, RepoTrackedPathKind, RepoPathStorage),
+        >::new();
         for path in state.dirty {
-            let change = if tracked.contains_key(&path) {
-                RepoWorktreeChangeKind::Modified
+            let (change, kind, storage) = if tracked.contains_key(&path) {
+                (
+                    RepoWorktreeChangeKind::Modified,
+                    RepoTrackedPathKind::SqliteDatabase,
+                    RepoPathStorage::SqliteSnapshot,
+                )
+            } else if let Some(artifact) = tracked_artifacts.get(&path) {
+                (
+                    RepoWorktreeChangeKind::Modified,
+                    artifact_tracked_path_kind(artifact),
+                    artifact_tracked_path_storage(artifact),
+                )
             } else {
-                RepoWorktreeChangeKind::Untracked
+                let (kind, storage) = self.worktree_path_descriptor(&path)?;
+                (RepoWorktreeChangeKind::Untracked, kind, storage)
             };
-            changes.insert(path, change);
+            changes.insert(path, (change, kind, storage));
         }
         for path in state.deleted {
             if tracked.contains_key(&path) {
-                changes.insert(path, RepoWorktreeChangeKind::Deleted);
+                changes.insert(
+                    path,
+                    (
+                        RepoWorktreeChangeKind::Deleted,
+                        RepoTrackedPathKind::SqliteDatabase,
+                        RepoPathStorage::SqliteSnapshot,
+                    ),
+                );
+            } else if let Some(artifact) = tracked_artifacts.get(&path) {
+                changes.insert(
+                    path,
+                    (
+                        RepoWorktreeChangeKind::Deleted,
+                        artifact_tracked_path_kind(artifact),
+                        artifact_tracked_path_storage(artifact),
+                    ),
+                );
             }
         }
-        for path in self.scan_untracked_sqlite_files()? {
-            if !tracked.contains_key(&path) {
-                changes
-                    .entry(path)
-                    .or_insert(RepoWorktreeChangeKind::Untracked);
+        for (path, expected) in &tracked_artifacts {
+            if changes.contains_key(path) {
+                continue;
             }
+            let physical_path = self.worktree.join(&path);
+            match artifact_file_matches(&physical_path, expected)? {
+                Some(true) => {}
+                Some(false) => {
+                    changes.insert(
+                        path.clone(),
+                        (
+                            RepoWorktreeChangeKind::Modified,
+                            artifact_tracked_path_kind(expected),
+                            artifact_tracked_path_storage(expected),
+                        ),
+                    );
+                }
+                None => {
+                    changes.insert(
+                        path.clone(),
+                        (
+                            RepoWorktreeChangeKind::Deleted,
+                            artifact_tracked_path_kind(expected),
+                            artifact_tracked_path_storage(expected),
+                        ),
+                    );
+                }
+            }
+        }
+        for path in self.untracked_paths_for_index(index)? {
+            changes.entry(path.path).or_insert((
+                RepoWorktreeChangeKind::Untracked,
+                path.kind,
+                path.storage,
+            ));
         }
         Ok(changes
             .into_iter()
-            .map(|(path, change)| RepoWorktreeChange { path, change })
+            .map(|(path, (change, kind, storage))| RepoWorktreeChange {
+                path,
+                change,
+                kind,
+                storage,
+            })
             .collect())
+    }
+
+    fn untracked_paths_for_index(&self, index: &index::Index) -> Result<Vec<RepoTrackedPath>> {
+        let tracked = self.files_for_worktree_status(index)?;
+        let tracked_artifacts = self.artifacts_for_worktree_status(index)?;
+        let mut paths = BTreeMap::<String, RepoTrackedPath>::new();
+
+        for path in self.scan_untracked_sqlite_files()? {
+            if !tracked.contains_key(&path) && !tracked_artifacts.contains_key(&path) {
+                let size = self.worktree_path_size(&path)?;
+                paths.insert(
+                    path.clone(),
+                    RepoTrackedPath {
+                        path,
+                        kind: RepoTrackedPathKind::SqliteDatabase,
+                        storage: RepoPathStorage::SqliteSnapshot,
+                        size,
+                        page_count: None,
+                    },
+                );
+            }
+        }
+
+        for path in self.scan_untracked_artifact_files()? {
+            if !tracked.contains_key(&path) && !tracked_artifacts.contains_key(&path) {
+                let (kind, storage) = self.worktree_path_descriptor(&path)?;
+                let size = self.worktree_path_size(&path)?;
+                paths.entry(path.clone()).or_insert(RepoTrackedPath {
+                    path,
+                    kind,
+                    storage,
+                    size,
+                    page_count: None,
+                });
+            }
+        }
+
+        Ok(paths.into_values().collect())
+    }
+
+    fn worktree_path_size(&self, key: &str) -> Result<Option<u64>> {
+        match fs::metadata(self.worktree.join(key)) {
+            Ok(metadata) => Ok(Some(metadata.len())),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    fn worktree_path_descriptor(
+        &self,
+        key: &str,
+    ) -> Result<(RepoTrackedPathKind, RepoPathStorage)> {
+        let path = self.worktree.join(key);
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((RepoTrackedPathKind::BinaryFile, RepoPathStorage::External));
+            }
+            Err(err) => return Err(err.into()),
+        };
+        if is_sqlite_database_file(&path)? {
+            return Ok((
+                RepoTrackedPathKind::SqliteDatabase,
+                RepoPathStorage::SqliteSnapshot,
+            ));
+        }
+        let kind = classify_artifact_path(&path)?;
+        let storage = artifact_storage_for_path(key, kind, metadata.len(), &self.file_config()?);
+        Ok((kind, storage))
     }
 
     fn scan_untracked_sqlite_files(&self) -> Result<Vec<String>> {
         let mut paths = BTreeSet::new();
-        self.collect_sqlite_worktree_files(&self.worktree, &mut paths)?;
+        let ignore = self.ignore_rules()?;
+        self.collect_sqlite_worktree_files(&self.worktree, &ignore, &mut paths)?;
         Ok(paths.into_iter().collect())
     }
 
-    fn collect_sqlite_worktree_files(&self, dir: &Path, out: &mut BTreeSet<String>) -> Result<()> {
+    fn scan_untracked_artifact_files(&self) -> Result<Vec<String>> {
+        let mut paths = BTreeSet::new();
+        let ignore = self.ignore_rules()?;
+        self.collect_artifact_worktree_files(&self.worktree, &ignore, &mut paths)?;
+        Ok(paths.into_iter().collect())
+    }
+
+    fn collect_sqlite_worktree_files(
+        &self,
+        dir: &Path,
+        ignore: &IgnoreRules,
+        out: &mut BTreeSet<String>,
+    ) -> Result<()> {
         if !dir.is_dir() {
             return Ok(());
         }
@@ -3287,18 +5600,55 @@ impl Repository {
                 if entry.file_name() == GRAFT_DIR {
                     continue;
                 }
-                self.collect_sqlite_worktree_files(&path, out)?;
-            } else if file_type.is_file() && is_sqlite_database_file(&path)? {
-                let relative = path.strip_prefix(&self.worktree).map_err(|_| {
-                    RepoErr::PathOutsideWorktree {
-                        path: path.clone(),
-                        worktree: self.worktree.clone(),
-                    }
-                })?;
-                let key = relative
-                    .to_str()
-                    .map(|path| path.replace('\\', "/"))
-                    .ok_or_else(|| RepoErr::NonUtf8Path(relative.to_path_buf()))?;
+                let key = self.worktree_key_for_path(&path)?;
+                if ignore.is_ignored(&key, true) {
+                    continue;
+                }
+                self.collect_sqlite_worktree_files(&path, ignore, out)?;
+            } else if file_type.is_file() {
+                let key = self.worktree_key_for_path(&path)?;
+                if ignore.is_ignored(&key, false) {
+                    continue;
+                }
+                if is_sqlite_database_file(&path)? {
+                    out.insert(key);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_artifact_worktree_files(
+        &self,
+        dir: &Path,
+        ignore: &IgnoreRules,
+        out: &mut BTreeSet<String>,
+    ) -> Result<()> {
+        if !dir.is_dir() {
+            return Ok(());
+        }
+
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                if entry.file_name() == GRAFT_DIR {
+                    continue;
+                }
+                let key = self.worktree_key_for_path(&path)?;
+                if ignore.is_ignored(&key, true) {
+                    continue;
+                }
+                self.collect_artifact_worktree_files(&path, ignore, out)?;
+            } else if file_type.is_file()
+                && !is_sqlite_sidecar_file(&path)
+                && !is_sqlite_database_file(&path)?
+            {
+                let key = self.worktree_key_for_path(&path)?;
+                if ignore.is_ignored(&key, false) {
+                    continue;
+                }
                 out.insert(key);
             }
         }
@@ -3311,9 +5661,19 @@ impl Repository {
             .map(Option::unwrap_or_default)
     }
 
+    fn artifacts_for_commit(
+        &self,
+        id: Option<&str>,
+    ) -> Result<BTreeMap<String, CommitArtifactState>> {
+        id.map(|id| self.read_commit(id).map(|commit| commit.artifacts))
+            .transpose()
+            .map(Option::unwrap_or_default)
+    }
+
     fn checkout_plan_for_target(&self, target: Option<String>) -> Result<CheckoutPlan> {
         let files = self.files_for_commit(target.as_deref())?;
-        Ok(CheckoutPlan { target, files })
+        let artifacts = self.artifacts_for_commit(target.as_deref())?;
+        Ok(CheckoutPlan { target, files, artifacts })
     }
 
     fn stage_merge_conflict(
@@ -3335,6 +5695,30 @@ impl Repository {
             }
         }
         Ok(())
+    }
+
+    fn stage_merge_artifact_conflict(
+        &self,
+        key: &str,
+        base: Option<&CommitArtifactState>,
+        ours: Option<&CommitArtifactState>,
+        theirs: Option<&CommitArtifactState>,
+        index: &mut index::Index,
+    ) {
+        index.remove_path(key);
+        for (stage, state) in [
+            (index::IndexStage::Base, base),
+            (index::IndexStage::Ours, ours),
+            (index::IndexStage::Theirs, theirs),
+        ] {
+            if let Some(state) = state {
+                index.stage(self.index_entry_for_artifact_state(
+                    key.to_string(),
+                    stage,
+                    state.clone(),
+                ));
+            }
+        }
     }
 
     fn write_index(&self, index: &index::Index) -> Result<()> {
@@ -3575,6 +5959,7 @@ impl Repository {
             .unwrap_or_default();
         let mut commits = Vec::new();
         let mut objects = BTreeMap::<object::ObjectId, Vec<u8>>::new();
+        let mut external_payloads = BTreeMap::<object::ObjectId, u64>::new();
         let mut stack = vec![head.to_string()];
         let mut seen = BTreeMap::<String, ()>::new();
         while let Some(id) = stack.pop() {
@@ -3608,7 +5993,12 @@ impl Repository {
             };
             let commit_id = object::ObjectId::from_str(&id)?;
             objects.insert(commit_id.clone(), bytes);
-            self.collect_object_graph_for_pack(&commit.tree, &remote_objects, &mut objects)?;
+            self.collect_object_graph_for_pack(
+                &commit.tree,
+                &remote_objects,
+                &mut objects,
+                &mut external_payloads,
+            )?;
             for parent in &commit.parents {
                 stack.push(parent.to_string());
             }
@@ -3616,6 +6006,7 @@ impl Repository {
         }
 
         let count = commits.len();
+        self.push_large_file_contents(remote, external_payloads)?;
         self.push_object_pack(remote, objects)?;
         Ok(count)
     }
@@ -3644,6 +6035,7 @@ impl Repository {
         id: &object::ObjectId,
         remote_objects: &BTreeSet<object::ObjectId>,
         objects: &mut BTreeMap<object::ObjectId, Vec<u8>>,
+        external_payloads: &mut BTreeMap<object::ObjectId, u64>,
     ) -> Result<()> {
         if remote_objects.contains(id) || objects.contains_key(id) {
             return Ok(());
@@ -3667,14 +6059,53 @@ impl Repository {
         objects.insert(id.clone(), bytes);
         match object {
             object::Object::Commit(commit) => {
-                self.collect_object_graph_for_pack(&commit.tree, remote_objects, objects)?;
+                self.collect_object_graph_for_pack(
+                    &commit.tree,
+                    remote_objects,
+                    objects,
+                    external_payloads,
+                )?;
             }
             object::Object::Tree(tree) => {
                 for entry in tree.entries {
-                    self.collect_object_graph_for_pack(&entry.oid, remote_objects, objects)?;
+                    self.collect_object_graph_for_pack(
+                        &entry.oid,
+                        remote_objects,
+                        objects,
+                        external_payloads,
+                    )?;
+                }
+            }
+            object::Object::Blob(object::BlobObject::LargeFilePointer(pointer)) => {
+                match external_payloads.insert(pointer.content_hash, pointer.size) {
+                    Some(size) if size != pointer.size => {
+                        return Err(RepoErr::Object(object::ObjectErr::InvalidObject {
+                            kind: "large-file-pointer",
+                            message: "same content hash referenced with different sizes"
+                                .to_string(),
+                        }));
+                    }
+                    _ => {}
                 }
             }
             object::Object::Blob(_) | object::Object::Tag(_) => {}
+        }
+        Ok(())
+    }
+
+    fn push_large_file_contents(
+        &self,
+        remote: &crate::remote::Remote,
+        external_payloads: BTreeMap<object::ObjectId, u64>,
+    ) -> Result<()> {
+        for (id, size) in external_payloads {
+            let bytes = self.read_large_file_content(&id, size)?;
+            let path = large_file_content_relative_path(&id);
+            match block_on_remote(remote.put_raw_if_not_exists(&path, bytes)) {
+                Ok(()) => {}
+                Err(RepoErr::Remote(err)) if err.precondition_failed() => {}
+                Err(err) => return Err(err),
+            }
         }
         Ok(())
     }
@@ -3757,6 +6188,9 @@ impl Repository {
                     self.fetch_object_graph(remote, &entry.oid, pack_cache)?;
                 }
             }
+            object::Object::Blob(object::BlobObject::LargeFilePointer(pointer)) => {
+                self.fetch_large_file_content(remote, &pointer.content_hash, pointer.size)?;
+            }
             object::Object::Blob(_) | object::Object::Tag(_) => {}
         }
         Ok(())
@@ -3776,12 +6210,155 @@ impl Repository {
         Ok(self.object_store().write_raw_validated(id, &bytes)?)
     }
 
+    fn fetch_large_file_content(
+        &self,
+        remote: &crate::remote::Remote,
+        id: &object::ObjectId,
+        size: u64,
+    ) -> Result<()> {
+        if self.large_file_content_path(id).exists() {
+            self.read_large_file_content(id, size)?;
+            return Ok(());
+        }
+
+        let path = large_file_content_relative_path(id);
+        let bytes = block_on_remote(remote.get_raw(&path))?.ok_or_else(|| {
+            RepoErr::InvalidRemoteObject {
+                path: path.clone(),
+                message: format!("missing external payload {id}"),
+            }
+        })?;
+        let bytes = bytes.to_vec();
+        validate_large_file_content(id, size, &bytes)?;
+        self.write_large_file_content(id, &bytes)?;
+        Ok(())
+    }
+
+    fn repair_artifact_state_from_remote(
+        &self,
+        remote: &crate::remote::Remote,
+        state: &CommitArtifactState,
+        pack_cache: &mut RemoteObjectPackCache,
+        fetched_objects: &mut BTreeSet<object::ObjectId>,
+        fetched_external_payloads: &mut BTreeSet<object::ObjectId>,
+    ) -> Result<()> {
+        let oid = state.oid();
+        let missing_object = match self.object_store().read(oid) {
+            Ok(_) => false,
+            Err(object::ObjectErr::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => true,
+            Err(_) => false,
+        };
+        if missing_object {
+            let object = self.fetch_remote_object(remote, oid, pack_cache)?;
+            validate_artifact_object_matches_state(state, &object)?;
+            fetched_objects.insert(oid.clone());
+        }
+
+        if let CommitArtifactState::LargeFile { content_hash, size, .. } = state
+            && !self.large_file_content_path(content_hash).exists()
+        {
+            self.fetch_large_file_content(remote, content_hash, *size)?;
+            fetched_external_payloads.insert(content_hash.clone());
+        }
+
+        Ok(())
+    }
+
+    fn referenced_large_file_payloads(&self) -> Result<BTreeSet<object::ObjectId>> {
+        let mut referenced = BTreeSet::new();
+        for entry in self.read_index()?.entries {
+            if let Some(artifact) = entry.artifact {
+                collect_large_file_payload_from_artifact(&artifact, &mut referenced);
+            }
+        }
+
+        let mut starts = BTreeSet::new();
+        if let Some(head) = self.head_target()? {
+            starts.insert(head);
+        }
+        for branch in self.branches()? {
+            if let Some(target) = branch.target {
+                starts.insert(target);
+            }
+        }
+        for branch in self.remote_tracking_branches()? {
+            starts.insert(branch.head);
+        }
+        for tag in self.tags()? {
+            starts.insert(tag.target);
+        }
+
+        let mut seen = BTreeSet::new();
+        for start in starts {
+            self.collect_reachable_large_file_payloads(&start, &mut seen, &mut referenced)?;
+        }
+        Ok(referenced)
+    }
+
+    fn collect_reachable_large_file_payloads(
+        &self,
+        start: &str,
+        seen: &mut BTreeSet<String>,
+        referenced: &mut BTreeSet<object::ObjectId>,
+    ) -> Result<()> {
+        let mut stack = vec![start.to_string()];
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            let commit = self.read_commit(&id)?;
+            for artifact in commit.artifacts.values() {
+                collect_large_file_payload_from_artifact(artifact, referenced);
+            }
+            for parent in commit_parent_ids(&commit) {
+                stack.push(parent);
+            }
+        }
+        Ok(())
+    }
+
+    fn local_large_file_payloads(&self) -> Result<Vec<RepoLargeFilePruneEntry>> {
+        let root = self.file_store_dir();
+        if !root.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut files = Vec::new();
+        for dir in fs::read_dir(&root)? {
+            let dir = dir?;
+            if !dir.file_type()?.is_dir() {
+                continue;
+            }
+            let fanout = dir.file_name().to_string_lossy().into_owned();
+            if fanout.len() != 2 || !fanout.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                continue;
+            }
+
+            for file in fs::read_dir(dir.path())? {
+                let file = file?;
+                if !file.file_type()?.is_file() {
+                    continue;
+                }
+                let suffix = file.file_name().to_string_lossy().into_owned();
+                if suffix.len() != 62 || !suffix.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    continue;
+                }
+                let content_hash = object::ObjectId::from_str(&format!("{fanout}{suffix}"))?;
+                let size = file.metadata()?.len();
+                let path = large_file_content_relative_path(&content_hash);
+                files.push(RepoLargeFilePruneEntry { content_hash, size, path });
+            }
+        }
+        Ok(files)
+    }
+
     fn write_tree_object(
         &self,
         object_store: &object::LooseObjectStore,
         files: &BTreeMap<String, CommitFileState>,
+        artifacts: &BTreeMap<String, CommitArtifactState>,
     ) -> Result<object::ObjectId> {
-        let mut entries = Vec::with_capacity(files.len());
+        let mut entries = Vec::with_capacity(files.len() + artifacts.len());
         for (path, state) in files {
             let blob = object::Object::Blob(object::BlobObject::SqliteSnapshot(
                 sqlite_snapshot_blob(state),
@@ -3790,6 +6367,13 @@ impl Repository {
             entries.push(object::TreeEntry {
                 mode: object::TreeEntryMode::SqliteDatabase,
                 oid,
+                path: path.clone(),
+            });
+        }
+        for (path, state) in artifacts {
+            entries.push(object::TreeEntry {
+                mode: object::TreeEntryMode::Regular,
+                oid: state.oid().clone(),
                 path: path.clone(),
             });
         }
@@ -3874,6 +6458,15 @@ impl Repository {
             .map(|commit| self.read_commit(&commit))
             .transpose()?
             .map(|commit| commit.files)
+            .unwrap_or_default())
+    }
+
+    fn head_artifacts(&self) -> Result<BTreeMap<String, CommitArtifactState>> {
+        Ok(self
+            .head_target()?
+            .map(|commit| self.read_commit(&commit))
+            .transpose()?
+            .map(|commit| commit.artifacts)
             .unwrap_or_default())
     }
 
@@ -4718,6 +7311,376 @@ fn file_state_from_sqlite_snapshot_blob(blob: object::SqliteSnapshotBlob) -> Com
     }
 }
 
+fn artifact_state_from_blob(
+    oid: object::ObjectId,
+    blob: object::BlobObject,
+) -> Result<CommitArtifactState> {
+    match blob {
+        object::BlobObject::File(blob) => {
+            let content_hash = object::ObjectId::for_bytes(&blob.bytes);
+            Ok(CommitArtifactState::File {
+                kind: repo_path_kind_from_object_kind(blob.kind),
+                oid,
+                content_hash,
+                size: blob.bytes.len() as u64,
+            })
+        }
+        object::BlobObject::LargeFilePointer(blob) => Ok(CommitArtifactState::LargeFile {
+            kind: repo_path_kind_from_object_kind(blob.kind),
+            oid,
+            content_hash: blob.content_hash,
+            size: blob.size,
+        }),
+        object::BlobObject::SqliteSnapshot(_) => {
+            Err(RepoErr::Object(object::ObjectErr::InvalidObject {
+                kind: "blob",
+                message: "sqlite snapshot cannot be used as a regular artifact".to_string(),
+            }))
+        }
+    }
+}
+
+fn validate_artifact_object_matches_state(
+    state: &CommitArtifactState,
+    object: &object::Object,
+) -> Result<()> {
+    match (state, object) {
+        (
+            CommitArtifactState::File { kind, content_hash, size, .. },
+            object::Object::Blob(object::BlobObject::File(blob)),
+        ) => {
+            let actual_hash = object::ObjectId::for_bytes(&blob.bytes);
+            if repo_path_kind_from_object_kind(blob.kind) == *kind
+                && &actual_hash == content_hash
+                && blob.bytes.len() as u64 == *size
+            {
+                Ok(())
+            } else {
+                Err(RepoErr::Object(object::ObjectErr::InvalidObject {
+                    kind: "blob",
+                    message: format!(
+                        "file blob metadata mismatch: expected kind {kind}, {size} byte(s), and hash {content_hash}, got kind {}, {} byte(s), and hash {actual_hash}",
+                        repo_path_kind_from_object_kind(blob.kind),
+                        blob.bytes.len()
+                    ),
+                }))
+            }
+        }
+        (
+            CommitArtifactState::LargeFile { kind, content_hash, size, .. },
+            object::Object::Blob(object::BlobObject::LargeFilePointer(pointer)),
+        ) => {
+            if repo_path_kind_from_object_kind(pointer.kind) == *kind
+                && &pointer.content_hash == content_hash
+                && pointer.size == *size
+            {
+                Ok(())
+            } else {
+                Err(RepoErr::Object(object::ObjectErr::InvalidObject {
+                    kind: "blob",
+                    message: format!(
+                        "large file pointer mismatch: expected kind {kind}, {size} byte(s), and hash {content_hash}, got kind {}, {} byte(s), and hash {}",
+                        repo_path_kind_from_object_kind(pointer.kind),
+                        pointer.size,
+                        pointer.content_hash
+                    ),
+                }))
+            }
+        }
+        (CommitArtifactState::File { .. }, _) => {
+            Err(RepoErr::Object(object::ObjectErr::InvalidObject {
+                kind: "blob",
+                message: "artifact object is not a file blob".to_string(),
+            }))
+        }
+        (CommitArtifactState::LargeFile { .. }, _) => {
+            Err(RepoErr::Object(object::ObjectErr::InvalidObject {
+                kind: "blob",
+                message: "artifact object is not a large file pointer".to_string(),
+            }))
+        }
+    }
+}
+
+fn collect_large_file_payload_from_artifact(
+    state: &CommitArtifactState,
+    out: &mut BTreeSet<object::ObjectId>,
+) {
+    if let CommitArtifactState::LargeFile { content_hash, .. } = state {
+        out.insert(content_hash.clone());
+    }
+}
+
+impl Repository {
+    fn write_artifact_state_from_path(
+        &self,
+        key: &str,
+        path: &Path,
+    ) -> Result<CommitArtifactState> {
+        self.write_artifact_state_from_path_with_file_config(key, path, &self.file_config()?)
+    }
+
+    fn write_artifact_state_from_path_with_file_config(
+        &self,
+        key: &str,
+        path: &Path,
+        config: &FileConfig,
+    ) -> Result<CommitArtifactState> {
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.file_type().is_file() {
+            return Err(RepoErr::Object(object::ObjectErr::InvalidObject {
+                kind: "file",
+                message: format!("path `{}` is not a regular file", path.display()),
+            }));
+        }
+
+        let bytes = fs::read(path)?;
+        let size = bytes.len() as u64;
+        let kind = classify_artifact_bytes(&bytes);
+        let object_kind = object_kind_from_repo_path_kind(kind);
+        let content_hash = object::ObjectId::for_bytes(&bytes);
+        if artifact_storage_for_path(key, kind, size, config) == RepoPathStorage::External {
+            self.write_large_file_content(&content_hash, &bytes)?;
+            let pointer = object::LargeFilePointerBlob {
+                kind: object_kind,
+                content_hash: content_hash.clone(),
+                size,
+            };
+            let oid = self.object_store().write(&object::Object::Blob(
+                object::BlobObject::LargeFilePointer(pointer),
+            ))?;
+            Ok(CommitArtifactState::LargeFile { kind, oid, content_hash, size })
+        } else {
+            let oid =
+                self.object_store()
+                    .write(&object::Object::Blob(object::BlobObject::File(
+                        object::FileBlob { kind: object_kind, bytes },
+                    )))?;
+            Ok(CommitArtifactState::File { kind, oid, content_hash, size })
+        }
+    }
+
+    fn write_large_file_content(&self, id: &object::ObjectId, bytes: &[u8]) -> Result<()> {
+        let path = self.large_file_content_path(id);
+        if path.exists() {
+            return Ok(());
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        write_file_atomic(&path, bytes)?;
+        Ok(())
+    }
+
+    fn large_file_content_path(&self, id: &object::ObjectId) -> PathBuf {
+        self.graft_dir.join(large_file_content_relative_path(id))
+    }
+
+    fn read_large_file_content(&self, id: &object::ObjectId, size: u64) -> Result<Vec<u8>> {
+        let bytes = fs::read(self.large_file_content_path(id))?;
+        validate_large_file_content(id, size, &bytes)?;
+        Ok(bytes)
+    }
+
+    fn artifact_bytes(&self, state: &CommitArtifactState) -> Result<Vec<u8>> {
+        match state {
+            CommitArtifactState::File { oid, .. } => {
+                let object = self.object_store().read(oid)?;
+                let object::Object::Blob(object::BlobObject::File(blob)) = object else {
+                    return Err(RepoErr::Object(object::ObjectErr::InvalidObject {
+                        kind: "blob",
+                        message: format!("artifact object {oid} is not a file blob"),
+                    }));
+                };
+                Ok(blob.bytes)
+            }
+            CommitArtifactState::LargeFile { content_hash, size, .. } => {
+                self.read_large_file_content(content_hash, *size)
+            }
+        }
+    }
+
+    fn audit_artifact_state(
+        &self,
+        path: &str,
+        state: &CommitArtifactState,
+        audit: &mut RepoArtifactAudit,
+    ) {
+        match state {
+            CommitArtifactState::File { kind, oid, content_hash, size } => {
+                match self.object_store().read(oid) {
+                    Ok(object::Object::Blob(object::BlobObject::File(blob))) => {
+                        let actual_hash = object::ObjectId::for_bytes(&blob.bytes);
+                        let actual_kind = repo_path_kind_from_object_kind(blob.kind);
+                        if actual_kind != *kind
+                            || &actual_hash != content_hash
+                            || blob.bytes.len() as u64 != *size
+                        {
+                            audit.issues.push(RepoArtifactAuditIssue {
+                                path: path.to_string(),
+                                kind: RepoArtifactAuditIssueKind::InvalidObject,
+                                oid: Some(oid.clone()),
+                                content_hash: Some(content_hash.clone()),
+                                message: format!(
+                                    "file blob metadata mismatch: expected kind {kind}, {size} byte(s), and hash {content_hash}, got kind {actual_kind}, {} byte(s), and hash {actual_hash}",
+                                    blob.bytes.len()
+                                ),
+                            });
+                        }
+                    }
+                    Ok(_) => audit.issues.push(RepoArtifactAuditIssue {
+                        path: path.to_string(),
+                        kind: RepoArtifactAuditIssueKind::InvalidObject,
+                        oid: Some(oid.clone()),
+                        content_hash: Some(content_hash.clone()),
+                        message: "artifact object is not a file blob".to_string(),
+                    }),
+                    Err(object::ObjectErr::Io(err))
+                        if err.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        audit.issues.push(RepoArtifactAuditIssue {
+                            path: path.to_string(),
+                            kind: RepoArtifactAuditIssueKind::MissingObject,
+                            oid: Some(oid.clone()),
+                            content_hash: Some(content_hash.clone()),
+                            message: format!("missing artifact object {oid}"),
+                        });
+                    }
+                    Err(err) => audit.issues.push(RepoArtifactAuditIssue {
+                        path: path.to_string(),
+                        kind: RepoArtifactAuditIssueKind::InvalidObject,
+                        oid: Some(oid.clone()),
+                        content_hash: Some(content_hash.clone()),
+                        message: err.to_string(),
+                    }),
+                }
+            }
+            CommitArtifactState::LargeFile { kind, oid, content_hash, size } => {
+                match self.object_store().read(oid) {
+                    Ok(object::Object::Blob(object::BlobObject::LargeFilePointer(pointer))) => {
+                        let actual_kind = repo_path_kind_from_object_kind(pointer.kind);
+                        if actual_kind != *kind
+                            || &pointer.content_hash != content_hash
+                            || pointer.size != *size
+                        {
+                            audit.issues.push(RepoArtifactAuditIssue {
+                                path: path.to_string(),
+                                kind: RepoArtifactAuditIssueKind::InvalidObject,
+                                oid: Some(oid.clone()),
+                                content_hash: Some(content_hash.clone()),
+                                message: format!(
+                                    "large file pointer mismatch: expected kind {kind}, {size} byte(s), and hash {content_hash}, got kind {actual_kind}, {} byte(s), and hash {}",
+                                    pointer.size,
+                                    pointer.content_hash
+                                ),
+                            });
+                        }
+                    }
+                    Ok(_) => audit.issues.push(RepoArtifactAuditIssue {
+                        path: path.to_string(),
+                        kind: RepoArtifactAuditIssueKind::InvalidObject,
+                        oid: Some(oid.clone()),
+                        content_hash: Some(content_hash.clone()),
+                        message: "artifact object is not a large file pointer".to_string(),
+                    }),
+                    Err(object::ObjectErr::Io(err))
+                        if err.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        audit.issues.push(RepoArtifactAuditIssue {
+                            path: path.to_string(),
+                            kind: RepoArtifactAuditIssueKind::MissingObject,
+                            oid: Some(oid.clone()),
+                            content_hash: Some(content_hash.clone()),
+                            message: format!("missing large file pointer object {oid}"),
+                        });
+                    }
+                    Err(err) => audit.issues.push(RepoArtifactAuditIssue {
+                        path: path.to_string(),
+                        kind: RepoArtifactAuditIssueKind::InvalidObject,
+                        oid: Some(oid.clone()),
+                        content_hash: Some(content_hash.clone()),
+                        message: err.to_string(),
+                    }),
+                }
+
+                match fs::read(self.large_file_content_path(content_hash)) {
+                    Ok(bytes) => {
+                        if let Err(err) = validate_large_file_content(content_hash, *size, &bytes) {
+                            audit.issues.push(RepoArtifactAuditIssue {
+                                path: path.to_string(),
+                                kind: RepoArtifactAuditIssueKind::InvalidExternalPayload,
+                                oid: Some(oid.clone()),
+                                content_hash: Some(content_hash.clone()),
+                                message: err.to_string(),
+                            });
+                        }
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        audit.issues.push(RepoArtifactAuditIssue {
+                            path: path.to_string(),
+                            kind: RepoArtifactAuditIssueKind::MissingExternalPayload,
+                            oid: Some(oid.clone()),
+                            content_hash: Some(content_hash.clone()),
+                            message: format!("missing external payload {content_hash}"),
+                        });
+                    }
+                    Err(err) => audit.issues.push(RepoArtifactAuditIssue {
+                        path: path.to_string(),
+                        kind: RepoArtifactAuditIssueKind::InvalidExternalPayload,
+                        oid: Some(oid.clone()),
+                        content_hash: Some(content_hash.clone()),
+                        message: err.to_string(),
+                    }),
+                }
+            }
+        }
+    }
+}
+
+fn large_file_content_relative_path(id: &object::ObjectId) -> String {
+    let raw = id.as_str();
+    format!("{DIR_STORE_FILES}/{}/{}", &raw[..2], &raw[2..])
+}
+
+fn validate_large_file_content(id: &object::ObjectId, size: u64, bytes: &[u8]) -> Result<()> {
+    if bytes.len() as u64 != size {
+        return Err(RepoErr::Object(object::ObjectErr::InvalidObject {
+            kind: "large-file",
+            message: format!(
+                "external payload {id} size mismatch: expected {size}, got {}",
+                bytes.len()
+            ),
+        }));
+    }
+    let actual = object::ObjectId::for_bytes(bytes);
+    if actual != *id {
+        return Err(RepoErr::Object(object::ObjectErr::ObjectIdMismatch {
+            expected: id.clone(),
+            actual,
+        }));
+    }
+    Ok(())
+}
+
+fn artifact_file_matches(path: &Path, expected: &CommitArtifactState) -> Result<Option<bool>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() {
+                return Ok(Some(false));
+            }
+            if metadata.len() != expected.size() {
+                return Ok(Some(false));
+            }
+            let bytes = fs::read(path)?;
+            Ok(Some(
+                object::ObjectId::for_bytes(&bytes) == *expected.content_hash(),
+            ))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
 fn validate_commit_file_state(state: &CommitFileState) -> Result<()> {
     for range in &state.snapshot.ranges {
         let expected_count = (range.start..=range.end).len();
@@ -4935,6 +7898,118 @@ fn worktree_for_file(path: &Path) -> &Path {
         .unwrap_or_else(|| Path::new("."))
 }
 
+#[derive(Debug, Clone, Default)]
+struct IgnoreRules {
+    patterns: Vec<IgnorePattern>,
+}
+
+impl IgnoreRules {
+    fn load(worktree: &Path) -> Result<Self> {
+        let path = worktree.join(GRAFT_IGNORE_FILE);
+        let raw = match fs::read_to_string(path) {
+            Ok(raw) => raw,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(err) => return Err(err.into()),
+        };
+        Ok(Self {
+            patterns: raw.lines().filter_map(IgnorePattern::parse).collect(),
+        })
+    }
+
+    fn is_ignored(&self, key: &str, is_dir: bool) -> bool {
+        !key.is_empty()
+            && self
+                .patterns
+                .iter()
+                .any(|pattern| pattern.matches(key, is_dir))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IgnorePattern {
+    pattern: String,
+    dir_only: bool,
+    anchored: bool,
+    has_slash: bool,
+}
+
+impl IgnorePattern {
+    fn parse(line: &str) -> Option<Self> {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with('!') {
+            return None;
+        }
+        let dir_only = line.ends_with('/');
+        let anchored = line.starts_with('/');
+        let pattern = line
+            .trim_start_matches('/')
+            .trim_end_matches('/')
+            .trim_start_matches("./");
+        let pattern = normalize_repo_path(pattern);
+        if pattern.is_empty() {
+            return None;
+        }
+        let has_slash = pattern.contains('/');
+        Some(Self { pattern, dir_only, anchored, has_slash })
+    }
+
+    fn matches(&self, key: &str, is_dir: bool) -> bool {
+        if self.anchored || self.has_slash {
+            return self.matches_anchored(key, is_dir);
+        }
+
+        let components = key.split('/').collect::<Vec<_>>();
+        for (index, component) in components.iter().enumerate() {
+            let component_is_dir = index + 1 < components.len() || is_dir;
+            if wildcard_match(&self.pattern, component) && (!self.dir_only || component_is_dir) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn matches_anchored(&self, key: &str, is_dir: bool) -> bool {
+        if wildcard_match(&self.pattern, key) && (!self.dir_only || is_dir) {
+            return true;
+        }
+        key.strip_prefix(&self.pattern)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+    }
+}
+
+fn wildcard_match(pattern: &str, text: &str) -> bool {
+    if !pattern.contains('*') {
+        return pattern == text;
+    }
+
+    let parts = pattern.split('*').collect::<Vec<_>>();
+    let mut rest = text;
+    if let Some(first) = parts.first().filter(|part| !part.is_empty()) {
+        let Some(stripped) = rest.strip_prefix(first) else {
+            return false;
+        };
+        rest = stripped;
+    }
+
+    for part in parts
+        .iter()
+        .skip(1)
+        .take(parts.len().saturating_sub(2))
+        .filter(|part| !part.is_empty())
+    {
+        let Some(index) = rest.find(part) else {
+            return false;
+        };
+        rest = &rest[index + part.len()..];
+    }
+
+    if let Some(last) = parts.last().filter(|part| !part.is_empty()) {
+        rest.ends_with(last)
+    } else {
+        true
+    }
+}
+
 fn remove_empty_parent_dirs(mut dir: Option<&Path>, root: &Path) -> Result<()> {
     while let Some(current) = dir {
         if current == root || !current.starts_with(root) {
@@ -5058,7 +8133,13 @@ fn split_revision_ops(rev: &str) -> Result<(&str, Vec<RevisionOp>)> {
 }
 
 fn normalize_repo_path(path: &str) -> String {
-    path.trim().trim_start_matches("./").replace('\\', "/")
+    let path = path.trim().trim_start_matches("./").replace('\\', "/");
+    let path = path.trim_end_matches('/');
+    if path == "." {
+        String::new()
+    } else {
+        path.to_string()
+    }
 }
 
 fn is_sqlite_database_file(path: &Path) -> Result<bool> {
@@ -5071,17 +8152,104 @@ fn is_sqlite_database_file(path: &Path) -> Result<bool> {
     }
 }
 
-fn diff_file_maps(
+fn classify_artifact_path(path: &Path) -> Result<RepoTrackedPathKind> {
+    let mut file = fs::File::open(path)?;
+    let mut sample = vec![0; CONTENT_CLASS_SAMPLE_BYTES];
+    let len = file.read(&mut sample)?;
+    sample.truncate(len);
+    Ok(classify_artifact_bytes(&sample))
+}
+
+fn classify_artifact_bytes(bytes: &[u8]) -> RepoTrackedPathKind {
+    if is_text_bytes(bytes) {
+        RepoTrackedPathKind::TextFile
+    } else {
+        RepoTrackedPathKind::BinaryFile
+    }
+}
+
+fn artifact_storage_for_path(
+    key: &str,
+    kind: RepoTrackedPathKind,
+    size: u64,
+    config: &FileConfig,
+) -> RepoPathStorage {
+    match kind {
+        RepoTrackedPathKind::SqliteDatabase => RepoPathStorage::SqliteSnapshot,
+        RepoTrackedPathKind::BinaryFile => RepoPathStorage::External,
+        RepoTrackedPathKind::TextFile => {
+            if config_path_patterns_match(&config.external_paths, key)
+                || size > config.inline_text_threshold.as_u64()
+            {
+                RepoPathStorage::External
+            } else {
+                RepoPathStorage::Inline
+            }
+        }
+    }
+}
+
+fn config_path_patterns_match(patterns: &[String], key: &str) -> bool {
+    patterns
+        .iter()
+        .any(|pattern| config_path_pattern_matches(pattern, key))
+}
+
+fn config_path_pattern_matches(pattern: &str, key: &str) -> bool {
+    let pattern = normalize_repo_path(pattern.trim().trim_start_matches("./"));
+    if pattern.is_empty() {
+        return false;
+    }
+    if wildcard_match(&pattern, key) {
+        return true;
+    }
+    pattern
+        .strip_suffix("/**")
+        .is_some_and(|prefix| key == prefix || key.starts_with(&format!("{prefix}/")))
+        || (!pattern.contains('*')
+            && key
+                .strip_prefix(&pattern)
+                .is_some_and(|suffix| suffix.starts_with('/')))
+}
+
+fn is_text_bytes(bytes: &[u8]) -> bool {
+    let sample = if bytes.len() > CONTENT_CLASS_SAMPLE_BYTES {
+        &bytes[..CONTENT_CLASS_SAMPLE_BYTES]
+    } else {
+        bytes
+    };
+    if sample.is_empty() {
+        return true;
+    }
+    if sample.contains(&0) || std::str::from_utf8(sample).is_err() {
+        return false;
+    }
+    sample
+        .iter()
+        .all(|byte| !byte.is_ascii_control() || matches!(*byte, b'\n' | b'\r' | b'\t'))
+}
+
+fn is_sqlite_sidecar_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.ends_with("-wal") || name.ends_with("-shm") || name.ends_with("-journal")
+        })
+}
+
+fn diff_repo_maps(
     from: impl Into<String>,
     to: impl Into<String>,
     from_files: &BTreeMap<String, CommitFileState>,
     to_files: &BTreeMap<String, CommitFileState>,
+    from_artifacts: &BTreeMap<String, CommitArtifactState>,
+    to_artifacts: &BTreeMap<String, CommitArtifactState>,
     path: Option<&str>,
 ) -> RepoDiff {
     let path = path.map(normalize_repo_path);
     let mut keys = BTreeMap::<String, ()>::new();
     for key in from_files.keys().chain(to_files.keys()) {
-        if path.as_ref().is_none_or(|path| path == key) {
+        if repo_path_matches_filter(key, path.as_deref()) {
             keys.insert(key.clone(), ());
         }
     }
@@ -5100,13 +8268,105 @@ fn diff_file_maps(
             files.push(RepoFileDiff {
                 path: key.clone(),
                 change,
+                kind: RepoTrackedPathKind::SqliteDatabase,
+                storage: RepoPathStorage::SqliteSnapshot,
                 from: before,
                 to: after,
             });
         }
     }
 
-    RepoDiff { from: from.into(), to: to.into(), files }
+    let mut artifact_keys = BTreeMap::<String, ()>::new();
+    for key in from_artifacts.keys().chain(to_artifacts.keys()) {
+        if repo_path_matches_filter(key, path.as_deref()) {
+            artifact_keys.insert(key.clone(), ());
+        }
+    }
+
+    let mut artifacts = Vec::new();
+    for key in artifact_keys.keys() {
+        let before = from_artifacts.get(key).cloned();
+        let after = to_artifacts.get(key).cloned();
+        let change = match (&before, &after) {
+            (None, Some(_)) => Some(RepoFileChange::Added),
+            (Some(_), None) => Some(RepoFileChange::Deleted),
+            (Some(before), Some(after)) if before != after => Some(RepoFileChange::Modified),
+            _ => None,
+        };
+        if let Some(change) = change {
+            artifacts.push(RepoArtifactDiff {
+                path: key.clone(),
+                change,
+                kind: artifact_diff_kind(before.as_ref(), after.as_ref()),
+                storage: artifact_diff_storage(before.as_ref(), after.as_ref()),
+                from: before,
+                to: after,
+            });
+        }
+    }
+
+    let paths = repo_diff_paths(&files, &artifacts);
+    RepoDiff {
+        from: from.into(),
+        to: to.into(),
+        paths,
+        files,
+        artifacts,
+    }
+}
+
+fn repo_diff_paths(files: &[RepoFileDiff], artifacts: &[RepoArtifactDiff]) -> Vec<RepoPathDiff> {
+    let mut paths = Vec::with_capacity(files.len() + artifacts.len());
+    paths.extend(files.iter().map(|file| RepoPathDiff {
+        path: file.path.clone(),
+        change: file.change,
+        kind: file.kind,
+        storage: file.storage,
+    }));
+    paths.extend(artifacts.iter().map(|artifact| RepoPathDiff {
+        path: artifact.path.clone(),
+        change: artifact.change,
+        kind: artifact.kind,
+        storage: artifact.storage,
+    }));
+    paths.sort_by(|left, right| left.path.cmp(&right.path));
+    paths
+}
+
+fn commit_path_changes(
+    from_files: &BTreeMap<String, CommitFileState>,
+    to_files: &BTreeMap<String, CommitFileState>,
+    from_artifacts: &BTreeMap<String, CommitArtifactState>,
+    to_artifacts: &BTreeMap<String, CommitArtifactState>,
+) -> Vec<CommitPathChange> {
+    let diff = diff_repo_maps(
+        "parent",
+        "commit",
+        from_files,
+        to_files,
+        from_artifacts,
+        to_artifacts,
+        None,
+    );
+    diff.paths
+        .into_iter()
+        .map(|path| CommitPathChange {
+            path: path.path,
+            change: path.change,
+            kind: path.kind,
+            storage: path.storage,
+        })
+        .collect()
+}
+
+fn repo_path_matches_filter(key: &str, path: Option<&str>) -> bool {
+    path.is_none_or(|path| {
+        path.is_empty()
+            || key == path
+            || key
+                .strip_prefix(path)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+    })
 }
 
 fn validate_remote_name(name: &str) -> Result<()> {
@@ -5204,6 +8464,10 @@ mod tests {
             OBJECT_FORMAT
         );
         assert_eq!(
+            repo.config().unwrap().files.inline_text_threshold,
+            ByteUnit::MB
+        );
+        assert_eq!(
             fs::read_to_string(repo.graft_dir().join(HEAD_FILE)).unwrap(),
             "ref: refs/heads/main\n"
         );
@@ -5217,6 +8481,442 @@ mod tests {
         assert_eq!(status.branches[0].name, "main");
         assert_eq!(status.branches[0].target, None);
         assert!(status.branches[0].current);
+    }
+
+    #[test]
+    fn config_get_set_manages_files_inline_text_threshold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+
+        assert_eq!(
+            repo.config_get(CONFIG_KEY_FILES_INLINE_TEXT_THRESHOLD)
+                .unwrap(),
+            RepoConfigEntry {
+                key: CONFIG_KEY_FILES_INLINE_TEXT_THRESHOLD.to_string(),
+                value: "1 MB".to_string()
+            }
+        );
+
+        assert_eq!(
+            repo.config_set(CONFIG_KEY_FILES_INLINE_TEXT_THRESHOLD, "4 B")
+                .unwrap(),
+            RepoConfigEntry {
+                key: CONFIG_KEY_FILES_INLINE_TEXT_THRESHOLD.to_string(),
+                value: "4 B".to_string()
+            }
+        );
+        assert_eq!(
+            repo.config().unwrap().files.inline_text_threshold,
+            ByteUnit::new(4)
+        );
+
+        let raw_config = fs::read_to_string(repo.graft_dir().join(CONFIG_FILE)).unwrap();
+        assert!(raw_config.contains("[files]"));
+        assert!(raw_config.contains("inline_text_threshold = \"4 B\""));
+
+        assert!(matches!(
+            repo.config_get("core.default_branch"),
+            Err(RepoErr::UnknownConfigKey(key)) if key == "core.default_branch"
+        ));
+        assert!(matches!(
+            repo.config_set(CONFIG_KEY_FILES_INLINE_TEXT_THRESHOLD, "4 B extra"),
+            Err(RepoErr::InvalidConfigValue { key, value, .. })
+                if key == CONFIG_KEY_FILES_INLINE_TEXT_THRESHOLD && value == "4 B extra"
+        ));
+        assert_eq!(
+            repo.config_unset(CONFIG_KEY_FILES_INLINE_TEXT_THRESHOLD)
+                .unwrap(),
+            RepoConfigEntry {
+                key: CONFIG_KEY_FILES_INLINE_TEXT_THRESHOLD.to_string(),
+                value: "1 MB".to_string()
+            }
+        );
+        assert_eq!(
+            repo.config().unwrap().files.inline_text_threshold,
+            ByteUnit::MB
+        );
+    }
+
+    #[test]
+    fn config_get_set_manages_files_external_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+
+        assert_eq!(
+            repo.config_get(CONFIG_KEY_FILES_EXTERNAL_PATHS).unwrap(),
+            RepoConfigEntry {
+                key: CONFIG_KEY_FILES_EXTERNAL_PATHS.to_string(),
+                value: String::new()
+            }
+        );
+
+        assert_eq!(
+            repo.config_set(
+                CONFIG_KEY_FILES_EXTERNAL_PATHS,
+                "assets/**, ./attachments/**"
+            )
+            .unwrap(),
+            RepoConfigEntry {
+                key: CONFIG_KEY_FILES_EXTERNAL_PATHS.to_string(),
+                value: "assets/**, attachments/**".to_string()
+            }
+        );
+        assert_eq!(
+            repo.config().unwrap().files.external_paths,
+            vec!["assets/**".to_string(), "attachments/**".to_string()]
+        );
+
+        let raw_config = fs::read_to_string(repo.graft_dir().join(CONFIG_FILE)).unwrap();
+        assert!(raw_config.contains("[files]"));
+        assert!(raw_config.contains("external_paths = ["));
+        assert!(raw_config.contains(r#""assets/**""#));
+        assert!(raw_config.contains(r#""attachments/**""#));
+
+        assert!(matches!(
+            repo.config_set(CONFIG_KEY_FILES_EXTERNAL_PATHS, "assets/** assets/**"),
+            Err(RepoErr::InvalidConfigValue { key, value, .. })
+                if key == CONFIG_KEY_FILES_EXTERNAL_PATHS && value == "assets/** assets/**"
+        ));
+        assert_eq!(
+            repo.config_unset(CONFIG_KEY_FILES_EXTERNAL_PATHS).unwrap(),
+            RepoConfigEntry {
+                key: CONFIG_KEY_FILES_EXTERNAL_PATHS.to_string(),
+                value: String::new()
+            }
+        );
+        assert!(repo.config().unwrap().files.external_paths.is_empty());
+    }
+
+    #[test]
+    fn config_get_set_manages_merge_semantic_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+
+        assert_eq!(
+            repo.config_get(CONFIG_KEY_MERGE_DEFAULT_SEMANTIC_KEYS)
+                .unwrap(),
+            RepoConfigEntry {
+                key: CONFIG_KEY_MERGE_DEFAULT_SEMANTIC_KEYS.to_string(),
+                value: String::new()
+            }
+        );
+        assert_eq!(
+            repo.config_set(CONFIG_KEY_MERGE_DEFAULT_SEMANTIC_KEYS, "_id, slug")
+                .unwrap(),
+            RepoConfigEntry {
+                key: CONFIG_KEY_MERGE_DEFAULT_SEMANTIC_KEYS.to_string(),
+                value: "_id, slug".to_string()
+            }
+        );
+        assert_eq!(
+            repo.config().unwrap().merge.default_semantic_keys,
+            vec!["_id".to_string(), "slug".to_string()]
+        );
+
+        let table_key = "merge.semantic_keys.policy_entities";
+        assert_eq!(
+            repo.config_get(table_key).unwrap(),
+            RepoConfigEntry {
+                key: table_key.to_string(),
+                value: String::new()
+            }
+        );
+        assert_eq!(
+            repo.config_set(table_key, "name entity_id").unwrap(),
+            RepoConfigEntry {
+                key: table_key.to_string(),
+                value: "name, entity_id".to_string()
+            }
+        );
+        assert_eq!(
+            repo.config().unwrap().merge.semantic_keys["policy_entities"],
+            vec!["name".to_string(), "entity_id".to_string()]
+        );
+
+        let raw_config = fs::read_to_string(repo.graft_dir().join(CONFIG_FILE)).unwrap();
+        assert!(raw_config.contains("[merge]"));
+        assert!(raw_config.contains("default_semantic_keys = ["));
+        assert!(raw_config.contains(r#""_id""#));
+        assert!(raw_config.contains(r#""slug""#));
+        assert!(raw_config.contains("[merge.semantic_keys]"));
+        assert!(raw_config.contains("policy_entities = ["));
+        assert!(raw_config.contains(r#""name""#));
+        assert!(raw_config.contains(r#""entity_id""#));
+
+        assert_eq!(repo.config_set(table_key, "").unwrap().value, "");
+        repo.config_set(table_key, "name").unwrap();
+        assert_eq!(
+            repo.config_unset(table_key).unwrap(),
+            RepoConfigEntry {
+                key: table_key.to_string(),
+                value: String::new()
+            }
+        );
+        assert!(
+            !repo
+                .config()
+                .unwrap()
+                .merge
+                .semantic_keys
+                .contains_key("policy_entities")
+        );
+        assert_eq!(
+            repo.config_unset(CONFIG_KEY_MERGE_DEFAULT_SEMANTIC_KEYS)
+                .unwrap(),
+            RepoConfigEntry {
+                key: CONFIG_KEY_MERGE_DEFAULT_SEMANTIC_KEYS.to_string(),
+                value: String::new()
+            }
+        );
+        assert!(
+            repo.config()
+                .unwrap()
+                .merge
+                .default_semantic_keys
+                .is_empty()
+        );
+
+        assert!(matches!(
+            repo.config_get("merge.semantic_keys."),
+            Err(RepoErr::UnknownConfigKey(key)) if key == "merge.semantic_keys."
+        ));
+        assert!(matches!(
+            repo.config_set(CONFIG_KEY_MERGE_DEFAULT_SEMANTIC_KEYS, "_id,,slug"),
+            Err(RepoErr::InvalidConfigValue { key, value, .. })
+                if key == CONFIG_KEY_MERGE_DEFAULT_SEMANTIC_KEYS && value == "_id,,slug"
+        ));
+        assert!(matches!(
+            repo.config_set(CONFIG_KEY_MERGE_DEFAULT_SEMANTIC_KEYS, "_id _id"),
+            Err(RepoErr::InvalidConfigValue { key, value, .. })
+                if key == CONFIG_KEY_MERGE_DEFAULT_SEMANTIC_KEYS && value == "_id _id"
+        ));
+    }
+
+    #[test]
+    fn config_get_set_manages_remaining_merge_policy_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+
+        let generated_key = "merge.generated_columns.generated_merge_surface";
+        assert_eq!(repo.config_get(generated_key).unwrap().value, "");
+        assert_eq!(
+            repo.config_set(generated_key, "body_len body_hash")
+                .unwrap(),
+            RepoConfigEntry {
+                key: generated_key.to_string(),
+                value: "body_len, body_hash".to_string()
+            }
+        );
+        assert_eq!(
+            repo.config().unwrap().merge.generated_columns["generated_merge_surface"],
+            vec!["body_len".to_string(), "body_hash".to_string()]
+        );
+        assert_eq!(repo.config_unset(generated_key).unwrap().value, "");
+        assert!(
+            !repo
+                .config()
+                .unwrap()
+                .merge
+                .generated_columns
+                .contains_key("generated_merge_surface")
+        );
+
+        let internal_key = "merge.internal_resolvers.sqlite_sequence";
+        assert_eq!(repo.config_get(internal_key).unwrap().value, "sequence_max");
+        assert_eq!(
+            repo.config_set(internal_key, "sequence_max").unwrap(),
+            RepoConfigEntry {
+                key: internal_key.to_string(),
+                value: "sequence_max".to_string()
+            }
+        );
+        assert_eq!(
+            repo.config().unwrap().merge.internal_resolvers["sqlite_sequence"],
+            "sequence_max"
+        );
+        assert_eq!(
+            repo.config_unset(internal_key).unwrap(),
+            RepoConfigEntry {
+                key: internal_key.to_string(),
+                value: "sequence_max".to_string()
+            }
+        );
+        assert!(
+            !repo
+                .config()
+                .unwrap()
+                .merge
+                .internal_resolvers
+                .contains_key("sqlite_sequence")
+        );
+        assert!(matches!(
+            repo.config_set(internal_key, "rebuild"),
+            Err(RepoErr::InvalidConfigValue { key, value, .. })
+                if key == internal_key && value == "rebuild"
+        ));
+        assert!(matches!(
+            repo.config_get("merge.internal_resolvers.unknown"),
+            Err(RepoErr::UnknownConfigKey(key)) if key == "merge.internal_resolvers.unknown"
+        ));
+
+        let schema_key = "merge.schema_resolvers.add_column";
+        assert_eq!(
+            repo.config_get(schema_key).unwrap().value,
+            "alter_table_add_column"
+        );
+        assert_eq!(
+            repo.config_set(schema_key, "alter_table_add_column")
+                .unwrap(),
+            RepoConfigEntry {
+                key: schema_key.to_string(),
+                value: "alter_table_add_column".to_string()
+            }
+        );
+        assert_eq!(
+            repo.config().unwrap().merge.schema_resolvers["add_column"],
+            "alter_table_add_column"
+        );
+        assert_eq!(
+            repo.config_unset(schema_key).unwrap(),
+            RepoConfigEntry {
+                key: schema_key.to_string(),
+                value: "alter_table_add_column".to_string()
+            }
+        );
+        assert!(
+            !repo
+                .config()
+                .unwrap()
+                .merge
+                .schema_resolvers
+                .contains_key("add_column")
+        );
+        assert!(matches!(
+            repo.config_set(schema_key, "manual"),
+            Err(RepoErr::InvalidConfigValue { key, value, .. })
+                if key == schema_key && value == "manual"
+        ));
+    }
+
+    #[test]
+    fn config_list_reports_effective_supported_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+
+        assert_eq!(
+            repo.config_list().unwrap(),
+            vec![
+                RepoConfigEntry {
+                    key: CONFIG_KEY_FILES_INLINE_TEXT_THRESHOLD.to_string(),
+                    value: "1 MB".to_string()
+                },
+                RepoConfigEntry {
+                    key: CONFIG_KEY_FILES_EXTERNAL_PATHS.to_string(),
+                    value: String::new()
+                },
+                RepoConfigEntry {
+                    key: CONFIG_KEY_MERGE_DEFAULT_SEMANTIC_KEYS.to_string(),
+                    value: String::new()
+                },
+                RepoConfigEntry {
+                    key: "merge.internal_resolvers.index_btree".to_string(),
+                    value: "reindex".to_string()
+                },
+                RepoConfigEntry {
+                    key: "merge.internal_resolvers.sqlite_sequence".to_string(),
+                    value: "sequence_max".to_string()
+                },
+                RepoConfigEntry {
+                    key: "merge.internal_resolvers.sqlite_stat1".to_string(),
+                    value: "rebuild".to_string()
+                },
+                RepoConfigEntry {
+                    key: "merge.internal_resolvers.sqlite_stat2".to_string(),
+                    value: "rebuild".to_string()
+                },
+                RepoConfigEntry {
+                    key: "merge.internal_resolvers.sqlite_stat3".to_string(),
+                    value: "rebuild".to_string()
+                },
+                RepoConfigEntry {
+                    key: "merge.internal_resolvers.sqlite_stat4".to_string(),
+                    value: "rebuild".to_string()
+                },
+                RepoConfigEntry {
+                    key: "merge.schema_resolvers.add_column".to_string(),
+                    value: "alter_table_add_column".to_string()
+                }
+            ]
+        );
+
+        repo.config_set(CONFIG_KEY_FILES_INLINE_TEXT_THRESHOLD, "8 MB")
+            .unwrap();
+        repo.config_set(CONFIG_KEY_MERGE_DEFAULT_SEMANTIC_KEYS, "_id slug")
+            .unwrap();
+        repo.config_set("merge.semantic_keys.documents", "doc_id")
+            .unwrap();
+        repo.config_set("merge.semantic_keys.assets", "asset_id")
+            .unwrap();
+        repo.config_set("merge.generated_columns.documents", "body_len")
+            .unwrap();
+
+        assert_eq!(
+            repo.config_list().unwrap(),
+            vec![
+                RepoConfigEntry {
+                    key: CONFIG_KEY_FILES_INLINE_TEXT_THRESHOLD.to_string(),
+                    value: "8 MB".to_string()
+                },
+                RepoConfigEntry {
+                    key: CONFIG_KEY_FILES_EXTERNAL_PATHS.to_string(),
+                    value: String::new()
+                },
+                RepoConfigEntry {
+                    key: CONFIG_KEY_MERGE_DEFAULT_SEMANTIC_KEYS.to_string(),
+                    value: "_id, slug".to_string()
+                },
+                RepoConfigEntry {
+                    key: "merge.semantic_keys.assets".to_string(),
+                    value: "asset_id".to_string()
+                },
+                RepoConfigEntry {
+                    key: "merge.semantic_keys.documents".to_string(),
+                    value: "doc_id".to_string()
+                },
+                RepoConfigEntry {
+                    key: "merge.internal_resolvers.index_btree".to_string(),
+                    value: "reindex".to_string()
+                },
+                RepoConfigEntry {
+                    key: "merge.internal_resolvers.sqlite_sequence".to_string(),
+                    value: "sequence_max".to_string()
+                },
+                RepoConfigEntry {
+                    key: "merge.internal_resolvers.sqlite_stat1".to_string(),
+                    value: "rebuild".to_string()
+                },
+                RepoConfigEntry {
+                    key: "merge.internal_resolvers.sqlite_stat2".to_string(),
+                    value: "rebuild".to_string()
+                },
+                RepoConfigEntry {
+                    key: "merge.internal_resolvers.sqlite_stat3".to_string(),
+                    value: "rebuild".to_string()
+                },
+                RepoConfigEntry {
+                    key: "merge.internal_resolvers.sqlite_stat4".to_string(),
+                    value: "rebuild".to_string()
+                },
+                RepoConfigEntry {
+                    key: "merge.schema_resolvers.add_column".to_string(),
+                    value: "alter_table_add_column".to_string()
+                },
+                RepoConfigEntry {
+                    key: "merge.generated_columns.documents".to_string(),
+                    value: "body_len".to_string()
+                }
+            ]
+        );
     }
 
     #[test]
@@ -5259,15 +8959,28 @@ mod tests {
     }
 
     #[test]
-    fn status_scans_physical_sqlite_files_as_untracked() {
+    fn status_scans_worktree_files_as_untracked() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = Repository::init(tmp.path()).unwrap();
         let nested = tmp.path().join("nested");
         fs::create_dir_all(&nested).unwrap();
+        let ignored_dir = tmp.path().join("ignored_dir");
+        fs::create_dir_all(&ignored_dir).unwrap();
 
+        fs::write(
+            tmp.path().join(GRAFT_IGNORE_FILE),
+            "*.tmp\nignored_dir/\nignored.db\n.graftignore\n",
+        )
+        .unwrap();
         write_sqlite_magic(tmp.path().join("app.db"));
+        fs::write(tmp.path().join("app.db-wal"), b"sqlite sidecar").unwrap();
+        write_sqlite_magic(tmp.path().join("ignored.db"));
+        fs::write(tmp.path().join("scratch.tmp"), b"ignored").unwrap();
+        fs::write(ignored_dir.join("notes.txt"), b"ignored").unwrap();
         fs::write(tmp.path().join("notes.txt"), b"not sqlite").unwrap();
         write_sqlite_magic(repo.graft_dir().join("ignored.db"));
+        fs::write(repo.graft_dir().join("ignored.txt"), b"ignored").unwrap();
+        fs::write(nested.join("config.json"), br#"{"theme":"dark"}"#).unwrap();
         write_sqlite_magic(nested.join("data.sqlite"));
 
         let status = repo.status().unwrap();
@@ -5278,12 +8991,95 @@ mod tests {
                 RepoWorktreeChange {
                     path: "app.db".to_string(),
                     change: RepoWorktreeChangeKind::Untracked,
+                    kind: RepoTrackedPathKind::SqliteDatabase,
+                    storage: RepoPathStorage::SqliteSnapshot,
+                },
+                RepoWorktreeChange {
+                    path: "nested/config.json".to_string(),
+                    change: RepoWorktreeChangeKind::Untracked,
+                    kind: RepoTrackedPathKind::TextFile,
+                    storage: RepoPathStorage::Inline,
                 },
                 RepoWorktreeChange {
                     path: "nested/data.sqlite".to_string(),
                     change: RepoWorktreeChangeKind::Untracked,
+                    kind: RepoTrackedPathKind::SqliteDatabase,
+                    storage: RepoPathStorage::SqliteSnapshot,
+                },
+                RepoWorktreeChange {
+                    path: "notes.txt".to_string(),
+                    change: RepoWorktreeChangeKind::Untracked,
+                    kind: RepoTrackedPathKind::TextFile,
+                    storage: RepoPathStorage::Inline,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn untracked_paths_lists_worktree_candidates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+        let mut config = repo.config().unwrap();
+        config.files.inline_text_threshold = ByteUnit::new(4);
+        repo.write_config(&config).unwrap();
+
+        let assets = tmp.path().join("assets");
+        let ignored_dir = tmp.path().join("ignored_dir");
+        fs::create_dir_all(&assets).unwrap();
+        fs::create_dir_all(&ignored_dir).unwrap();
+
+        fs::write(
+            tmp.path().join(GRAFT_IGNORE_FILE),
+            "*.tmp\nignored_dir/\nignored.db\n.graftignore\n",
+        )
+        .unwrap();
+        write_sqlite_magic(tmp.path().join("app.db"));
+        fs::write(tmp.path().join("app.db-wal"), b"sqlite sidecar").unwrap();
+        write_sqlite_magic(tmp.path().join("ignored.db"));
+        fs::write(tmp.path().join("scratch.tmp"), b"ignored").unwrap();
+        fs::write(ignored_dir.join("secret.txt"), b"ignored").unwrap();
+        fs::write(assets.join("model.bin"), b"large model payload").unwrap();
+        fs::write(assets.join("note.txt"), b"note").unwrap();
+        fs::write(repo.graft_dir().join("ignored.txt"), b"ignored").unwrap();
+
+        let paths = repo.untracked_paths().unwrap();
+
+        assert_eq!(
+            paths,
+            vec![
+                RepoTrackedPath {
+                    path: "app.db".to_string(),
+                    kind: RepoTrackedPathKind::SqliteDatabase,
+                    storage: RepoPathStorage::SqliteSnapshot,
+                    size: Some(SQLITE_DATABASE_MAGIC.len() as u64),
+                    page_count: None,
+                },
+                RepoTrackedPath {
+                    path: "assets/model.bin".to_string(),
+                    kind: RepoTrackedPathKind::TextFile,
+                    storage: RepoPathStorage::External,
+                    size: Some(19),
+                    page_count: None,
+                },
+                RepoTrackedPath {
+                    path: "assets/note.txt".to_string(),
+                    kind: RepoTrackedPathKind::TextFile,
+                    storage: RepoPathStorage::Inline,
+                    size: Some(4),
+                    page_count: None,
+                },
+            ]
+        );
+
+        repo.stage_artifact_path(assets.join("note.txt")).unwrap();
+        let paths = repo.untracked_paths().unwrap();
+        assert_eq!(
+            paths
+                .iter()
+                .map(|path| path.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["app.db", "assets/model.bin"]
         );
     }
 
@@ -5309,6 +9105,8 @@ mod tests {
             vec![RepoWorktreeChange {
                 path: "app.db".to_string(),
                 change: RepoWorktreeChangeKind::Modified,
+                kind: RepoTrackedPathKind::SqliteDatabase,
+                storage: RepoPathStorage::SqliteSnapshot,
             }]
         );
 
@@ -5320,6 +9118,8 @@ mod tests {
             vec![RepoWorktreeChange {
                 path: "app.db".to_string(),
                 change: RepoWorktreeChangeKind::Deleted,
+                kind: RepoTrackedPathKind::SqliteDatabase,
+                storage: RepoPathStorage::SqliteSnapshot,
             }]
         );
 
@@ -5332,6 +9132,8 @@ mod tests {
             vec![RepoWorktreeChange {
                 path: "notes.db".to_string(),
                 change: RepoWorktreeChangeKind::Untracked,
+                kind: RepoTrackedPathKind::TextFile,
+                storage: RepoPathStorage::Inline,
             }]
         );
         assert_eq!(status.unstaged, vec!["notes.db".to_string()]);
@@ -5589,6 +9391,378 @@ mod tests {
     }
 
     #[test]
+    fn stage_artifact_path_commits_regular_file_and_status_tracks_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+        let notes = tmp.path().join("notes.txt");
+        fs::write(&notes, b"hello app state").unwrap();
+
+        let entry = repo.stage_artifact_path(&notes).unwrap();
+        assert_eq!(entry.path, "notes.txt");
+        assert!(entry.file.is_none());
+        let state = entry.artifact.clone().expect("artifact staged");
+        assert_eq!(state.size(), 15);
+        assert_eq!(
+            *state.content_hash(),
+            object::ObjectId::for_bytes(b"hello app state")
+        );
+
+        let commit = repo.commit_staged("track notes").unwrap();
+        assert!(commit.files.is_empty());
+        assert_eq!(commit.artifacts.get("notes.txt"), Some(&state));
+        assert_eq!(repo.head_artifact(&notes).unwrap(), Some(state.clone()));
+        assert!(!repo.status().unwrap().dirty);
+
+        let object::Object::Tree(tree) = repo
+            .read_object(commit.tree.as_deref().expect("commit tree"))
+            .unwrap()
+        else {
+            panic!("commit tree should point at a tree object");
+        };
+        assert_eq!(tree.entries.len(), 1);
+        assert_eq!(tree.entries[0].mode, object::TreeEntryMode::Regular);
+
+        let object::Object::Blob(object::BlobObject::File(blob)) =
+            repo.read_object(tree.entries[0].oid.as_str()).unwrap()
+        else {
+            panic!("artifact tree entry should point at a file blob");
+        };
+        assert_eq!(blob.kind, object::FileContentKind::TextFile);
+        assert_eq!(blob.bytes, b"hello app state");
+
+        fs::write(&notes, b"changed").unwrap();
+        let status = repo.status().unwrap();
+        assert_eq!(
+            status.unstaged_changes,
+            vec![RepoWorktreeChange {
+                path: "notes.txt".to_string(),
+                change: RepoWorktreeChangeKind::Modified,
+                kind: RepoTrackedPathKind::TextFile,
+                storage: RepoPathStorage::Inline,
+            }]
+        );
+
+        fs::remove_file(&notes).unwrap();
+        let status = repo.status().unwrap();
+        assert_eq!(
+            status.unstaged_changes,
+            vec![RepoWorktreeChange {
+                path: "notes.txt".to_string(),
+                change: RepoWorktreeChangeKind::Deleted,
+                kind: RepoTrackedPathKind::TextFile,
+                storage: RepoPathStorage::Inline,
+            }]
+        );
+    }
+
+    #[test]
+    fn large_artifact_uses_pointer_blob_and_materializes_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+        let asset = tmp.path().join("asset.bin");
+        let bytes = b"large artifact payload";
+        fs::write(&asset, bytes).unwrap();
+
+        let entry = repo
+            .stage_artifact_path_with_inline_text_threshold(&asset, 4)
+            .unwrap();
+        let state = entry.artifact.clone().expect("artifact staged");
+        assert!(state.is_large());
+        assert_eq!(state.size(), bytes.len() as u64);
+        assert_eq!(*state.content_hash(), object::ObjectId::for_bytes(bytes));
+
+        let object::Object::Blob(object::BlobObject::LargeFilePointer(pointer)) =
+            repo.read_object(state.oid().as_str()).unwrap()
+        else {
+            panic!("large artifact should be represented by a pointer blob");
+        };
+        assert_eq!(pointer.kind, object::FileContentKind::TextFile);
+        assert_eq!(pointer.content_hash, object::ObjectId::for_bytes(bytes));
+        assert_eq!(pointer.size, bytes.len() as u64);
+
+        fs::remove_file(&asset).unwrap();
+        repo.materialize_artifact_state(&asset, &state).unwrap();
+        assert_eq!(fs::read(&asset).unwrap(), bytes);
+    }
+
+    #[test]
+    fn stage_artifact_path_uses_configured_inline_text_threshold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+        let mut config = repo.config().unwrap();
+        config.files.inline_text_threshold = ByteUnit::new(4);
+        repo.write_config(&config).unwrap();
+
+        let asset = tmp.path().join("asset.bin");
+        let bytes = b"configured large payload";
+        fs::write(&asset, bytes).unwrap();
+
+        let state = repo
+            .stage_artifact_path(&asset)
+            .unwrap()
+            .artifact
+            .expect("artifact staged");
+        assert!(state.is_large());
+        assert_eq!(state.size(), bytes.len() as u64);
+        assert_eq!(*state.content_hash(), object::ObjectId::for_bytes(bytes));
+
+        let diff = repo.diff_staged(None).unwrap();
+        assert_eq!(diff.artifacts.len(), 1);
+        assert_eq!(diff.artifacts[0].path, "asset.bin");
+        assert_eq!(diff.artifacts[0].change, RepoFileChange::Added);
+        assert_eq!(diff.artifacts[0].kind, RepoTrackedPathKind::TextFile);
+        assert_eq!(diff.artifacts[0].storage, RepoPathStorage::External);
+
+        let raw_config = fs::read_to_string(repo.graft_dir().join(CONFIG_FILE)).unwrap();
+        assert!(raw_config.contains("[files]"));
+        assert!(raw_config.contains("inline_text_threshold = \"4 B\""));
+    }
+
+    #[test]
+    fn stage_artifact_path_uses_kind_and_external_path_storage_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+        let mut config = repo.config().unwrap();
+        config.files.external_paths = vec!["assets/**".to_string()];
+        repo.write_config(&config).unwrap();
+
+        let assets = tmp.path().join("assets");
+        fs::create_dir_all(&assets).unwrap();
+        let icon = assets.join("icon.txt");
+        let tiny_png = tmp.path().join("tiny.png");
+        fs::write(&icon, b"small text asset").unwrap();
+        fs::write(&tiny_png, b"\x89PNG\r\n\x1a\n").unwrap();
+
+        let untracked = repo.untracked_paths().unwrap();
+        assert_eq!(
+            untracked
+                .iter()
+                .find(|path| path.path == "tiny.png")
+                .map(|path| (&path.kind, &path.storage)),
+            Some((&RepoTrackedPathKind::BinaryFile, &RepoPathStorage::External))
+        );
+
+        let icon_state = repo
+            .stage_artifact_path(&icon)
+            .unwrap()
+            .artifact
+            .expect("text asset staged");
+        assert_eq!(
+            artifact_tracked_path_kind(&icon_state),
+            RepoTrackedPathKind::TextFile
+        );
+        assert_eq!(
+            artifact_tracked_path_storage(&icon_state),
+            RepoPathStorage::External
+        );
+
+        let png_state = repo
+            .stage_artifact_path(&tiny_png)
+            .unwrap()
+            .artifact
+            .expect("binary asset staged");
+        assert_eq!(
+            artifact_tracked_path_kind(&png_state),
+            RepoTrackedPathKind::BinaryFile
+        );
+        assert_eq!(
+            artifact_tracked_path_storage(&png_state),
+            RepoPathStorage::External
+        );
+    }
+
+    #[test]
+    fn audit_artifacts_reports_missing_external_payloads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+        let asset = tmp.path().join("asset.bin");
+        let bytes = b"large artifact payload";
+        fs::write(&asset, bytes).unwrap();
+        let state = repo
+            .stage_artifact_path_with_inline_text_threshold(&asset, 4)
+            .unwrap()
+            .artifact
+            .expect("large artifact staged");
+        repo.commit_staged("track asset").unwrap();
+
+        let clean = repo.audit_artifacts().unwrap();
+        assert!(clean.ok());
+        assert_eq!(clean.artifacts, 1);
+        assert_eq!(clean.external_payloads, 1);
+
+        fs::remove_file(repo.large_file_content_path(state.content_hash())).unwrap();
+
+        let audit = repo.audit_artifacts().unwrap();
+        assert!(!audit.ok());
+        assert_eq!(audit.issues.len(), 1);
+        assert_eq!(audit.issues[0].path, "asset.bin");
+        assert_eq!(
+            audit.issues[0].kind,
+            RepoArtifactAuditIssueKind::MissingExternalPayload
+        );
+        assert_eq!(
+            audit.issues[0].content_hash,
+            Some(state.content_hash().clone())
+        );
+    }
+
+    #[test]
+    fn tracked_paths_lists_sqlite_files_and_artifacts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+        let volume = VolumeId::random();
+        let log = LogId::random();
+        let app = tmp.path().join("app.db");
+        let notes = tmp.path().join("notes.txt");
+        let model = tmp.path().join("model.bin");
+        fs::write(&notes, b"notes").unwrap();
+        fs::write(&model, b"large model payload").unwrap();
+
+        let snapshot = Snapshot::new(log, LSN::FIRST..=LSN::new(2), PageCount::new(3));
+        repo.stage_file(&app, volume, &snapshot).unwrap();
+        repo.stage_artifact_path(&notes).unwrap();
+        repo.stage_artifact_path_with_inline_text_threshold(&model, 4)
+            .unwrap();
+
+        let tracked = repo.tracked_paths().unwrap();
+        assert_eq!(tracked.len(), 3);
+        assert_eq!(tracked[0].path, "app.db");
+        assert_eq!(tracked[0].kind, RepoTrackedPathKind::SqliteDatabase);
+        assert_eq!(tracked[0].storage, RepoPathStorage::SqliteSnapshot);
+        assert_eq!(tracked[0].page_count, Some(PageCount::new(3)));
+        assert_eq!(tracked[1].path, "model.bin");
+        assert_eq!(tracked[1].kind, RepoTrackedPathKind::TextFile);
+        assert_eq!(tracked[1].storage, RepoPathStorage::External);
+        assert_eq!(tracked[1].size, Some(19));
+        assert_eq!(tracked[2].path, "notes.txt");
+        assert_eq!(tracked[2].kind, RepoTrackedPathKind::TextFile);
+        assert_eq!(tracked[2].storage, RepoPathStorage::Inline);
+        assert_eq!(tracked[2].size, Some(5));
+
+        let details = repo.tracked_path_details().unwrap();
+        assert_eq!(details.len(), 3);
+        assert_eq!(details[0].path, "app.db");
+        assert_eq!(details[0].kind, RepoTrackedPathKind::SqliteDatabase);
+        assert_eq!(details[0].storage, RepoPathStorage::SqliteSnapshot);
+        assert_eq!(details[0].page_count, Some(PageCount::new(3)));
+        assert_eq!(details[0].oid, None);
+        assert_eq!(details[1].path, "model.bin");
+        assert_eq!(details[1].kind, RepoTrackedPathKind::TextFile);
+        assert_eq!(details[1].storage, RepoPathStorage::External);
+        assert_eq!(details[1].size, Some(19));
+        assert!(details[1].oid.is_some());
+        assert_eq!(
+            details[1].content_hash,
+            Some(object::ObjectId::for_bytes(b"large model payload"))
+        );
+        assert_eq!(details[1].object_present, Some(true));
+        assert_eq!(details[1].external_payload_present, Some(true));
+        assert_eq!(details[2].path, "notes.txt");
+        assert_eq!(details[2].kind, RepoTrackedPathKind::TextFile);
+        assert_eq!(details[2].storage, RepoPathStorage::Inline);
+        assert_eq!(details[2].size, Some(5));
+        assert!(details[2].oid.is_some());
+        assert_eq!(
+            details[2].content_hash,
+            Some(object::ObjectId::for_bytes(b"notes"))
+        );
+        assert_eq!(details[2].object_present, Some(true));
+        assert_eq!(details[2].external_payload_present, None);
+
+        let entries = repo.tracked_path_entries().unwrap();
+        assert_eq!(entries.len(), 3);
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.stage == index::IndexStage::Normal)
+        );
+        assert_eq!(entries[0].path, "app.db");
+        assert_eq!(entries[0].mode, Some(object::TreeEntryMode::SqliteDatabase));
+        assert!(entries[0].oid.is_some());
+        assert_eq!(entries[1].path, "model.bin");
+        assert_eq!(entries[1].mode, Some(object::TreeEntryMode::Regular));
+        assert!(entries[1].oid.is_some());
+        assert_eq!(entries[2].path, "notes.txt");
+        assert_eq!(entries[2].mode, Some(object::TreeEntryMode::Regular));
+        assert!(entries[2].oid.is_some());
+    }
+
+    #[test]
+    fn checkout_artifact_from_revision_stages_path_without_moving_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+        let notes = tmp.path().join("notes.txt");
+
+        fs::write(&notes, b"first").unwrap();
+        let first_state = repo
+            .stage_artifact_path(&notes)
+            .unwrap()
+            .artifact
+            .expect("artifact staged");
+        let first = repo.commit_staged("first notes").unwrap();
+
+        fs::write(&notes, b"second").unwrap();
+        let second_state = repo
+            .stage_artifact_path(&notes)
+            .unwrap()
+            .artifact
+            .expect("artifact staged");
+        let second = repo.commit_staged("second notes").unwrap();
+
+        let outcome = repo
+            .checkout_artifact_from_revision("HEAD~1", &notes)
+            .unwrap();
+
+        assert_eq!(outcome.target, first.id);
+        assert_eq!(outcome.path, "notes.txt");
+        assert_eq!(outcome.state, first_state);
+        assert_eq!(repo.status().unwrap().head_target, Some(second.id));
+        let index = repo.read_index().unwrap();
+        let staged: Vec<_> = index.stage0_entries().collect();
+        assert_eq!(staged.len(), 1);
+        assert_eq!(staged[0].path, "notes.txt");
+        assert_eq!(staged[0].artifact, Some(first_state));
+        assert_eq!(repo.index_artifact(&notes).unwrap(), staged[0].artifact);
+        assert_eq!(repo.head_artifact(&notes).unwrap(), Some(second_state));
+    }
+
+    #[test]
+    fn restore_index_path_from_revision_handles_artifacts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+        let notes = tmp.path().join("notes.txt");
+
+        fs::write(&notes, b"first").unwrap();
+        let first_state = repo
+            .stage_artifact_path(&notes)
+            .unwrap()
+            .artifact
+            .expect("artifact staged");
+        repo.commit_staged("first notes").unwrap();
+
+        fs::write(&notes, b"second").unwrap();
+        let second_state = repo
+            .stage_artifact_path(&notes)
+            .unwrap()
+            .artifact
+            .expect("artifact staged");
+        repo.commit_staged("second notes").unwrap();
+
+        let restored = repo
+            .restore_index_path_from_revision("HEAD~1", &notes)
+            .unwrap();
+
+        assert_eq!(restored, "notes.txt");
+        assert_eq!(repo.index_artifact(&notes).unwrap(), Some(first_state));
+        assert_eq!(repo.head_artifact(&notes).unwrap(), Some(second_state));
+        let diff = repo.diff_staged(Some("notes.txt")).unwrap();
+        assert!(diff.files.is_empty());
+        assert_eq!(diff.artifacts.len(), 1);
+        assert_eq!(diff.artifacts[0].path, "notes.txt");
+        assert_eq!(diff.artifacts[0].change, RepoFileChange::Modified);
+    }
+
+    #[test]
     fn tree_id_changes_when_sqlite_snapshot_changes() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = Repository::init(tmp.path()).unwrap();
@@ -5780,11 +9954,68 @@ mod tests {
         assert_eq!(diff.files.len(), 1);
         assert_eq!(diff.files[0].path, "app.db");
         assert_eq!(diff.files[0].change, RepoFileChange::Modified);
+        assert_eq!(diff.files[0].kind, RepoTrackedPathKind::SqliteDatabase);
 
         let empty = repo
             .diff_revisions("HEAD~1", "HEAD", Some("missing.db"))
             .unwrap();
         assert!(empty.files.is_empty());
+    }
+
+    #[test]
+    fn diff_path_filter_matches_directory_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+        let volume = VolumeId::random();
+        let log = LogId::random();
+        let assets = tmp.path().join("assets");
+        let docs = tmp.path().join("docs");
+        fs::create_dir_all(&assets).unwrap();
+        fs::create_dir_all(&docs).unwrap();
+        let app = assets.join("app.db");
+        let asset_notes = assets.join("notes.txt");
+        let docs_notes = docs.join("notes.txt");
+        let first_snapshot =
+            Snapshot::new(log.clone(), LSN::FIRST..=LSN::new(2), PageCount::new(3));
+        let second_snapshot = Snapshot::new(log, LSN::FIRST..=LSN::new(4), PageCount::new(5));
+
+        fs::write(&asset_notes, b"asset notes v1").unwrap();
+        fs::write(&docs_notes, b"docs notes v1").unwrap();
+        repo.stage_file(&app, volume.clone(), &first_snapshot)
+            .unwrap();
+        repo.stage_artifact_path(&asset_notes).unwrap();
+        repo.stage_artifact_path(&docs_notes).unwrap();
+        let first = repo.commit_staged("first").unwrap();
+
+        fs::write(&asset_notes, b"asset notes v2").unwrap();
+        fs::write(&docs_notes, b"docs notes v2").unwrap();
+        repo.stage_file(&app, volume, &second_snapshot).unwrap();
+        repo.stage_artifact_path(&asset_notes).unwrap();
+        repo.stage_artifact_path(&docs_notes).unwrap();
+        let second = repo.commit_staged("second").unwrap();
+
+        let diff = repo
+            .diff_revisions(&first.id, &second.id, Some("assets"))
+            .unwrap();
+        assert_eq!(diff.files.len(), 1);
+        assert_eq!(diff.files[0].path, "assets/app.db");
+        assert_eq!(diff.files[0].kind, RepoTrackedPathKind::SqliteDatabase);
+        assert_eq!(diff.artifacts.len(), 1);
+        assert_eq!(diff.artifacts[0].path, "assets/notes.txt");
+        assert_eq!(diff.artifacts[0].kind, RepoTrackedPathKind::TextFile);
+        assert_eq!(diff.artifacts[0].storage, RepoPathStorage::Inline);
+
+        let slash_diff = repo
+            .diff_revisions(&first.id, &second.id, Some("assets/"))
+            .unwrap();
+        assert_eq!(slash_diff.files, diff.files);
+        assert_eq!(slash_diff.artifacts, diff.artifacts);
+
+        let exact_prefix_miss = repo
+            .diff_revisions(&first.id, &second.id, Some("asset"))
+            .unwrap();
+        assert!(exact_prefix_miss.files.is_empty());
+        assert!(exact_prefix_miss.artifacts.is_empty());
     }
 
     #[test]
@@ -6985,6 +11216,332 @@ mod tests {
             panic!("fetch should hydrate canonical tree object");
         };
         assert!(!clone.graft_dir().join("objects/commits").exists());
+    }
+
+    #[test]
+    fn push_and_fetch_roundtrip_large_artifact_payloads() {
+        let remote_dir = tempfile::tempdir().unwrap();
+        let remote = RemoteConfig::Fs {
+            root: remote_dir.path().to_string_lossy().into_owned(),
+        };
+
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = Repository::init(source_dir.path()).unwrap();
+        source.remote_add("origin", remote.clone()).unwrap();
+        let asset = source_dir.path().join("assets/model.bin");
+        fs::create_dir_all(asset.parent().unwrap()).unwrap();
+        let bytes = b"large model payload";
+        fs::write(&asset, bytes).unwrap();
+        let state = source
+            .stage_artifact_path_with_inline_text_threshold(&asset, 4)
+            .unwrap()
+            .artifact
+            .expect("large artifact staged");
+        assert!(state.is_large());
+        let commit = source.commit_staged("track model").unwrap();
+
+        let push = source.push("origin", "main").unwrap();
+        assert_eq!(push.head, commit.id);
+        assert_eq!(push.commits, 1);
+        assert_eq!(
+            fs::read(
+                remote_dir
+                    .path()
+                    .join(large_file_content_relative_path(state.content_hash()))
+            )
+            .unwrap(),
+            bytes
+        );
+
+        let clone_dir = tempfile::tempdir().unwrap();
+        let clone = Repository::init(clone_dir.path()).unwrap();
+        clone.remote_add("origin", remote).unwrap();
+        let fetch = clone.fetch("origin", "main").unwrap();
+        assert_eq!(fetch.head, commit.id);
+        assert_eq!(fetch.commits, 1);
+        let cloned_state = clone
+            .read_commit(&commit.id)
+            .unwrap()
+            .artifacts
+            .get("assets/model.bin")
+            .cloned()
+            .expect("fetched artifact state");
+        assert_eq!(cloned_state, state);
+        assert!(
+            clone
+                .file_store_dir()
+                .join(&state.content_hash().as_str()[..2])
+                .join(&state.content_hash().as_str()[2..])
+                .is_file()
+        );
+
+        let materialized = clone_dir.path().join("assets/model.bin");
+        clone
+            .materialize_artifact_key("assets/model.bin", &cloned_state)
+            .unwrap();
+        assert_eq!(fs::read(materialized).unwrap(), bytes);
+    }
+
+    #[test]
+    fn repair_artifacts_from_remote_hydrates_missing_large_artifact_parts() {
+        let remote_dir = tempfile::tempdir().unwrap();
+        let remote = RemoteConfig::Fs {
+            root: remote_dir.path().to_string_lossy().into_owned(),
+        };
+
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = Repository::init(source_dir.path()).unwrap();
+        source.remote_add("origin", remote.clone()).unwrap();
+        let asset = source_dir.path().join("assets/model.bin");
+        fs::create_dir_all(asset.parent().unwrap()).unwrap();
+        let bytes = b"large repair payload";
+        fs::write(&asset, bytes).unwrap();
+        let state = source
+            .stage_artifact_path_with_inline_text_threshold(&asset, 4)
+            .unwrap()
+            .artifact
+            .expect("large artifact staged");
+        let commit = source.commit_staged("track model").unwrap();
+        source.push("origin", "main").unwrap();
+
+        let clone_dir = tempfile::tempdir().unwrap();
+        let clone = Repository::init(clone_dir.path()).unwrap();
+        clone.remote_add("origin", remote).unwrap();
+        clone.fetch("origin", "main").unwrap();
+        let checkout = clone
+            .checkout_artifact_key_from_revision("origin/main", "assets/model.bin")
+            .unwrap();
+        assert_eq!(checkout.target, commit.id);
+
+        fs::remove_file(clone.object_store().path_for(state.oid())).unwrap();
+        fs::remove_file(clone.large_file_content_path(state.content_hash())).unwrap();
+        let broken = clone.audit_artifacts().unwrap();
+        assert_eq!(broken.issues.len(), 2);
+        assert!(broken.issues.iter().any(|issue| {
+            issue.path == "assets/model.bin"
+                && issue.kind == RepoArtifactAuditIssueKind::MissingObject
+        }));
+        assert!(broken.issues.iter().any(|issue| {
+            issue.path == "assets/model.bin"
+                && issue.kind == RepoArtifactAuditIssueKind::MissingExternalPayload
+        }));
+
+        let repaired = clone.repair_artifacts_from_remote("origin").unwrap();
+        assert_eq!(repaired.remote, "origin");
+        assert_eq!(repaired.fetched_objects, 1);
+        assert_eq!(repaired.fetched_external_payloads, 1);
+        assert_eq!(repaired.before, broken);
+        assert!(repaired.after.ok());
+
+        clone
+            .materialize_artifact_key("assets/model.bin", &state)
+            .unwrap();
+        assert_eq!(
+            fs::read(clone_dir.path().join("assets/model.bin")).unwrap(),
+            bytes
+        );
+    }
+
+    #[test]
+    fn fetch_large_file_payloads_hydrates_missing_payloads_for_revision() {
+        let remote_dir = tempfile::tempdir().unwrap();
+        let remote = RemoteConfig::Fs {
+            root: remote_dir.path().to_string_lossy().into_owned(),
+        };
+
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = Repository::init(source_dir.path()).unwrap();
+        source.remote_add("origin", remote.clone()).unwrap();
+        let asset = source_dir.path().join("assets/model.bin");
+        fs::create_dir_all(asset.parent().unwrap()).unwrap();
+        let bytes = b"external fetch payload";
+        fs::write(&asset, bytes).unwrap();
+        let state = source
+            .stage_artifact_path_with_inline_text_threshold(&asset, 4)
+            .unwrap()
+            .artifact
+            .expect("large artifact staged");
+        let commit = source.commit_staged("track model").unwrap();
+        source.push("origin", "main").unwrap();
+
+        let clone_dir = tempfile::tempdir().unwrap();
+        let clone = Repository::init(clone_dir.path()).unwrap();
+        clone.remote_add("origin", remote).unwrap();
+        clone.fetch("origin", "main").unwrap();
+        fs::remove_file(clone.large_file_content_path(state.content_hash())).unwrap();
+
+        let fetched = clone
+            .fetch_large_file_payloads("origin", Some("origin/main"))
+            .unwrap();
+        assert_eq!(fetched.remote, "origin");
+        assert_eq!(fetched.target, commit.id);
+        assert_eq!(fetched.external_payloads, 1);
+        assert_eq!(fetched.already_present_payloads, 0);
+        assert_eq!(fetched.fetched_payloads, 1);
+        assert_eq!(fetched.fetched_bytes, bytes.len() as u64);
+        assert_eq!(fetched.files[0].content_hash, *state.content_hash());
+        assert_eq!(fetched.files[0].size, bytes.len() as u64);
+        assert_eq!(fetched.files[0].status, RepoLargeFileFetchStatus::Fetched);
+        assert_eq!(fetched.files[0].paths, vec!["assets/model.bin"]);
+        assert_eq!(
+            fs::read(clone.large_file_content_path(state.content_hash())).unwrap(),
+            bytes
+        );
+
+        let present = clone
+            .fetch_large_file_payloads("origin", Some("origin/main"))
+            .unwrap();
+        assert_eq!(present.already_present_payloads, 1);
+        assert_eq!(present.fetched_payloads, 0);
+        assert_eq!(present.fetched_bytes, 0);
+        assert_eq!(present.files[0].status, RepoLargeFileFetchStatus::Present);
+    }
+
+    #[test]
+    fn large_file_payloads_status_reports_present_missing_and_invalid_payloads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+        let assets = tmp.path().join("assets");
+        fs::create_dir_all(&assets).unwrap();
+        fs::write(assets.join("present.bin"), b"large present payload").unwrap();
+        fs::write(assets.join("missing.bin"), b"large missing payload").unwrap();
+        fs::write(assets.join("invalid.bin"), b"large invalid payload").unwrap();
+
+        let present_state = repo
+            .stage_artifact_path_with_inline_text_threshold(assets.join("present.bin"), 4)
+            .unwrap()
+            .artifact
+            .expect("present artifact staged");
+        let missing_state = repo
+            .stage_artifact_path_with_inline_text_threshold(assets.join("missing.bin"), 4)
+            .unwrap()
+            .artifact
+            .expect("missing artifact staged");
+        let invalid_state = repo
+            .stage_artifact_path_with_inline_text_threshold(assets.join("invalid.bin"), 4)
+            .unwrap()
+            .artifact
+            .expect("invalid artifact staged");
+        let commit = repo.commit_staged("track payloads").unwrap();
+
+        fs::remove_file(repo.large_file_content_path(missing_state.content_hash())).unwrap();
+        fs::write(
+            repo.large_file_content_path(invalid_state.content_hash()),
+            b"corrupt payload",
+        )
+        .unwrap();
+
+        let status = repo.large_file_payloads_status(Some("HEAD")).unwrap();
+        assert_eq!(status.target, commit.id);
+        assert_eq!(status.external_payloads, 3);
+        assert_eq!(status.present_payloads, 1);
+        assert_eq!(status.missing_payloads, 1);
+        assert_eq!(status.invalid_payloads, 1);
+        assert_eq!(status.present_bytes, present_state.size());
+        assert_eq!(status.missing_bytes, missing_state.size());
+        assert_eq!(status.invalid_bytes, invalid_state.size());
+
+        let present = status
+            .files
+            .iter()
+            .find(|entry| entry.paths.iter().any(|path| path == "assets/present.bin"))
+            .unwrap();
+        assert_eq!(present.status, RepoLargeFileStatusState::Present);
+        assert_eq!(present.message, None);
+
+        let missing = status
+            .files
+            .iter()
+            .find(|entry| entry.paths.iter().any(|path| path == "assets/missing.bin"))
+            .unwrap();
+        assert_eq!(missing.status, RepoLargeFileStatusState::Missing);
+        assert!(
+            missing
+                .message
+                .as_deref()
+                .unwrap()
+                .contains("missing external payload")
+        );
+
+        let invalid = status
+            .files
+            .iter()
+            .find(|entry| entry.paths.iter().any(|path| path == "assets/invalid.bin"))
+            .unwrap();
+        assert_eq!(invalid.status, RepoLargeFileStatusState::Invalid);
+        assert!(
+            invalid
+                .message
+                .as_deref()
+                .unwrap()
+                .contains("external payload")
+        );
+    }
+
+    #[test]
+    fn prune_large_file_payloads_removes_only_unreferenced_payloads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+        let asset = tmp.path().join("assets/model.bin");
+        fs::create_dir_all(asset.parent().unwrap()).unwrap();
+
+        fs::write(&asset, b"large model v1").unwrap();
+        let first_state = repo
+            .stage_artifact_path_with_inline_text_threshold(&asset, 4)
+            .unwrap()
+            .artifact
+            .expect("first large artifact staged");
+        repo.commit_staged("track first model").unwrap();
+
+        fs::write(&asset, b"large model v2").unwrap();
+        let second_state = repo
+            .stage_artifact_path_with_inline_text_threshold(&asset, 4)
+            .unwrap()
+            .artifact
+            .expect("second large artifact staged");
+        repo.commit_staged("track second model").unwrap();
+
+        let staged = tmp.path().join("assets/staged.bin");
+        fs::write(&staged, b"large staged payload").unwrap();
+        let staged_state = repo
+            .stage_artifact_path_with_inline_text_threshold(&staged, 4)
+            .unwrap()
+            .artifact
+            .expect("staged large artifact");
+
+        let orphan_bytes = b"orphan large payload";
+        let orphan = object::ObjectId::for_bytes(orphan_bytes);
+        repo.write_large_file_content(&orphan, orphan_bytes)
+            .unwrap();
+
+        let dry_run = repo.prune_large_file_payloads(true).unwrap();
+        assert!(dry_run.dry_run);
+        assert_eq!(dry_run.referenced_payloads, 3);
+        assert_eq!(dry_run.candidate_payloads, 1);
+        assert_eq!(dry_run.candidate_bytes, orphan_bytes.len() as u64);
+        assert_eq!(dry_run.pruned_payloads, 0);
+        assert_eq!(dry_run.files[0].content_hash, orphan);
+        assert!(repo.large_file_content_path(&orphan).is_file());
+
+        let pruned = repo.prune_large_file_payloads(false).unwrap();
+        assert!(!pruned.dry_run);
+        assert_eq!(pruned.referenced_payloads, 3);
+        assert_eq!(pruned.candidate_payloads, 1);
+        assert_eq!(pruned.pruned_payloads, 1);
+        assert_eq!(pruned.pruned_bytes, orphan_bytes.len() as u64);
+        assert!(!repo.large_file_content_path(&orphan).exists());
+        assert!(
+            repo.large_file_content_path(first_state.content_hash())
+                .is_file()
+        );
+        assert!(
+            repo.large_file_content_path(second_state.content_hash())
+                .is_file()
+        );
+        assert!(
+            repo.large_file_content_path(staged_state.content_hash())
+                .is_file()
+        );
     }
 
     #[test]
