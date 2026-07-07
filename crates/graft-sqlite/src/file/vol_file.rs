@@ -328,7 +328,14 @@ impl VfsFile for VolFile {
                     let reader = writer.commit()?;
                     self.state = VolFileState::Shared { reader };
                     if let Some(repo) = &self.repo {
-                        repo.mark_dirty_path(&self.tag)?;
+                        let key = repo.file_key(&self.tag)?;
+                        if key != graft::repo::GRAFT_DIR
+                            && !key
+                                .strip_prefix(graft::repo::GRAFT_DIR)
+                                .is_some_and(|suffix| suffix.starts_with('/'))
+                        {
+                            repo.mark_dirty_key(key)?;
+                        }
                     }
 
                     // release the reserved lock

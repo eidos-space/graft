@@ -309,7 +309,8 @@ pub(super) fn repo_status_for_file(
         Err(err) => return Err(err.into()),
     };
     for change in &mut status.unstaged_changes {
-        if change.path == current_key {
+        if change.path == current_key || repo_key_volume_id(runtime, repo, &change.path)?.is_some()
+        {
             change.kind = RepoTrackedPathKind::SqliteDatabase;
             change.storage = RepoPathStorage::SqliteSnapshot;
         }
@@ -338,6 +339,20 @@ pub(super) fn repo_status_for_file(
                 .iter()
                 .any(|change| change.path == key)
         {
+            continue;
+        }
+
+        if let Some(state) = repo_file_state_for_key(runtime, repo, &key)? {
+            if !repo_file_state_content_eq(runtime, &state, &expected_state)? {
+                status
+                    .unstaged_changes
+                    .push(graft::repo::RepoWorktreeChange {
+                        path: key,
+                        change: RepoWorktreeChangeKind::Modified,
+                        kind: RepoTrackedPathKind::SqliteDatabase,
+                        storage: RepoPathStorage::SqliteSnapshot,
+                    });
+            }
             continue;
         }
 
@@ -653,6 +668,30 @@ pub(super) fn current_repo_file_state(
         volume: file.vid.clone(),
         snapshot: repo_snapshot_with_commit_hashes(runtime, &snapshot)?,
     })
+}
+
+pub(super) fn repo_file_state_for_key(
+    runtime: &Runtime,
+    repo: &Repository,
+    key: &str,
+) -> Result<Option<CommitFileState>, ErrCtx> {
+    let Some(volume) = repo_key_volume_id(runtime, repo, key)? else {
+        return Ok(None);
+    };
+    let snapshot = runtime.volume_snapshot(&volume)?;
+    Ok(Some(CommitFileState {
+        volume,
+        snapshot: repo_snapshot_with_commit_hashes(runtime, &snapshot)?,
+    }))
+}
+
+pub(super) fn repo_key_volume_id(
+    runtime: &Runtime,
+    repo: &Repository,
+    key: &str,
+) -> Result<Option<VolumeId>, ErrCtx> {
+    let tag = repo.worktree().join(key);
+    Ok(runtime.tag_get(&tag.to_string_lossy())?)
 }
 
 pub(super) fn repo_snapshot_with_commit_hashes(

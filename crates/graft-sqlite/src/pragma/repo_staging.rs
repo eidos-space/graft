@@ -285,6 +285,9 @@ pub(super) fn stage_repo_add_file(
         let state = current_repo_file_state(runtime, file)?;
         repo.stage_file_state_path(&file.tag, state)
             .map_err(Into::into)
+    } else if let Some(state) = repo_file_state_for_key(runtime, repo, key)? {
+        repo.stage_file_state_path(repo.worktree().join(key), state)
+            .map_err(Into::into)
     } else if is_sqlite_database_path(physical_path)? {
         stage_physical_sqlite_file(runtime, repo, key, physical_path)
     } else {

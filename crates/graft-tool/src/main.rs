@@ -33,7 +33,7 @@ enum Command {
         json: bool,
     },
 
-    /// Initialize a .graft repository next to a database path
+    /// Initialize a .graft repository in the current worktree
     Init(InitArgs),
 
     /// Execute SQL through the embedded Graft SQLite VFS
