@@ -1,4 +1,3 @@
-
 use super::*;
 use graft::repo::{RepoConflictChange, RepoStagedChange, RepoStatusCounts, RepoWorktreeChange};
 

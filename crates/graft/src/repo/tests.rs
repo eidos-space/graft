@@ -139,6 +139,47 @@ fn config_get_set_manages_files_external_paths() {
 }
 
 #[test]
+fn config_get_set_manages_worktree_materialize_sqlite() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = Repository::init(tmp.path()).unwrap();
+
+    assert_eq!(
+        repo.config_get(CONFIG_KEY_WORKTREE_MATERIALIZE_SQLITE)
+            .unwrap(),
+        RepoConfigEntry {
+            key: CONFIG_KEY_WORKTREE_MATERIALIZE_SQLITE.to_string(),
+            value: "true".to_string()
+        }
+    );
+    assert!(repo.config().unwrap().worktree.materialize_sqlite);
+
+    assert_eq!(
+        repo.config_set(CONFIG_KEY_WORKTREE_MATERIALIZE_SQLITE, "false")
+            .unwrap(),
+        RepoConfigEntry {
+            key: CONFIG_KEY_WORKTREE_MATERIALIZE_SQLITE.to_string(),
+            value: "false".to_string()
+        }
+    );
+    assert!(!repo.config().unwrap().worktree.materialize_sqlite);
+
+    assert_eq!(
+        repo.config_unset(CONFIG_KEY_WORKTREE_MATERIALIZE_SQLITE)
+            .unwrap(),
+        RepoConfigEntry {
+            key: CONFIG_KEY_WORKTREE_MATERIALIZE_SQLITE.to_string(),
+            value: "true".to_string()
+        }
+    );
+    assert!(repo.config().unwrap().worktree.materialize_sqlite);
+    assert!(matches!(
+        repo.config_set(CONFIG_KEY_WORKTREE_MATERIALIZE_SQLITE, "sometimes"),
+        Err(RepoErr::InvalidConfigValue { key, value, .. })
+            if key == CONFIG_KEY_WORKTREE_MATERIALIZE_SQLITE && value == "sometimes"
+    ));
+}
+
+#[test]
 fn config_get_set_manages_merge_semantic_keys() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = Repository::init(tmp.path()).unwrap();
@@ -366,6 +407,10 @@ fn config_list_reports_effective_supported_entries() {
                 value: String::new()
             },
             RepoConfigEntry {
+                key: CONFIG_KEY_WORKTREE_MATERIALIZE_SQLITE.to_string(),
+                value: "true".to_string()
+            },
+            RepoConfigEntry {
                 key: CONFIG_KEY_MERGE_DEFAULT_SEMANTIC_KEYS.to_string(),
                 value: String::new()
             },
@@ -421,6 +466,10 @@ fn config_list_reports_effective_supported_entries() {
             RepoConfigEntry {
                 key: CONFIG_KEY_FILES_EXTERNAL_PATHS.to_string(),
                 value: String::new()
+            },
+            RepoConfigEntry {
+                key: CONFIG_KEY_WORKTREE_MATERIALIZE_SQLITE.to_string(),
+                value: "true".to_string()
             },
             RepoConfigEntry {
                 key: CONFIG_KEY_MERGE_DEFAULT_SEMANTIC_KEYS.to_string(),

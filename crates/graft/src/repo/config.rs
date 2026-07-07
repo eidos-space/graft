@@ -11,6 +11,7 @@ use super::{
 
 pub const CONFIG_KEY_FILES_INLINE_TEXT_THRESHOLD: &str = "files.inline_text_threshold";
 pub const CONFIG_KEY_FILES_EXTERNAL_PATHS: &str = "files.external_paths";
+pub const CONFIG_KEY_WORKTREE_MATERIALIZE_SQLITE: &str = "worktree.materialize_sqlite";
 pub const CONFIG_KEY_MERGE_DEFAULT_SEMANTIC_KEYS: &str = "merge.default_semantic_keys";
 pub const CONFIG_KEY_MERGE_SEMANTIC_KEYS_PREFIX: &str = "merge.semantic_keys.";
 pub const CONFIG_KEY_MERGE_GENERATED_COLUMNS_PREFIX: &str = "merge.generated_columns.";
@@ -45,6 +46,9 @@ pub struct RepoConfig {
 
     #[serde(default, skip_serializing_if = "FileConfig::is_default")]
     pub files: FileConfig,
+
+    #[serde(default, skip_serializing_if = "WorktreeConfig::is_default")]
+    pub worktree: WorktreeConfig,
 
     #[serde(default)]
     pub remotes: BTreeMap<String, RemoteConfig>,
@@ -101,6 +105,23 @@ impl Default for FileConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeConfig {
+    pub materialize_sqlite: bool,
+}
+
+impl WorktreeConfig {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+impl Default for WorktreeConfig {
+    fn default() -> Self {
+        Self { materialize_sqlite: true }
+    }
+}
+
 pub(super) fn normalize_config_key(key: &str) -> Result<&str> {
     let key = key.trim();
     if key.is_empty() {
@@ -114,6 +135,8 @@ pub(super) fn config_entry(config: &RepoConfig, key: &str) -> Result<RepoConfigE
         config.files.inline_text_threshold.to_string()
     } else if key == CONFIG_KEY_FILES_EXTERNAL_PATHS {
         format_config_string_list(&config.files.external_paths)
+    } else if key == CONFIG_KEY_WORKTREE_MATERIALIZE_SQLITE {
+        config.worktree.materialize_sqlite.to_string()
     } else if key == CONFIG_KEY_MERGE_DEFAULT_SEMANTIC_KEYS {
         format_config_string_list(&config.merge.default_semantic_keys)
     } else if let Some(table) = config_semantic_keys_table(key)? {
@@ -161,6 +184,10 @@ pub(super) fn config_entries(config: &RepoConfig) -> Vec<RepoConfigEntry> {
         RepoConfigEntry {
             key: CONFIG_KEY_FILES_EXTERNAL_PATHS.to_string(),
             value: format_config_string_list(&config.files.external_paths),
+        },
+        RepoConfigEntry {
+            key: CONFIG_KEY_WORKTREE_MATERIALIZE_SQLITE.to_string(),
+            value: config.worktree.materialize_sqlite.to_string(),
         },
         RepoConfigEntry {
             key: CONFIG_KEY_MERGE_DEFAULT_SEMANTIC_KEYS.to_string(),
@@ -328,6 +355,18 @@ pub(super) fn parse_config_string_list_value(key: &str, value: &str) -> Result<V
         }
     }
     Ok(values)
+}
+
+pub(super) fn parse_config_bool_value(key: &str, value: &str) -> Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" => Ok(true),
+        "false" | "no" | "off" | "0" => Ok(false),
+        _ => Err(RepoErr::InvalidConfigValue {
+            key: key.to_string(),
+            value: value.to_string(),
+            message: "expected true or false".to_string(),
+        }),
+    }
 }
 
 pub(super) fn parse_config_internal_resolver_value(

@@ -10,6 +10,7 @@ use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use graft::{
     core::{LogId, SegmentId, VolumeId},
     remote::RemoteConfig,
+    repo::Repository,
     setup::GraftConfig,
 };
 use rusqlite::{
@@ -445,9 +446,6 @@ struct InitArgs {
     /// Emit JSON init output with repository metadata
     #[arg(long)]
     json: bool,
-
-    /// Database path
-    db: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -525,7 +523,7 @@ struct ExportArgs {
     #[arg(short, long)]
     output: PathBuf,
 
-    /// Optional repository-relative `SQLite` database path to export. Defaults to app.db.
+    /// Repository-relative `SQLite` database path to export when `--db` is not supplied.
     path: Option<PathBuf>,
 }
 
@@ -763,7 +761,7 @@ struct RemoteBranchArgs {
 #[command(version, about, long_about = None)]
 #[command(propagate_version = true)]
 struct Cli {
-    /// Database path used to enter the Graft repository. Defaults to app.db in the current project.
+    /// Database path used for SQLite-specific commands.
     #[arg(long, global = true, value_name = "PATH")]
     db: Option<PathBuf>,
 
@@ -800,12 +798,7 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
             }
         }
         Command::Init(args) => {
-            print_output(run_repo_pragma(
-                db_override,
-                args.db.as_deref(),
-                init_pragma(args.json),
-                None,
-            )?);
+            print_output(run_repo_init(args.json)?);
         }
         Command::Sql { sql } => print_output(run_sql(db_override, &sql)?),
         Command::Clone { json, branch_option, remote, branch } => {
@@ -882,6 +875,9 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
             }
         },
         Command::Add(args) => {
+            if db_override.is_none() && !args.all && args.path.is_none() {
+                bail!("add requires a path, --all, or --db <path>");
+            }
             let arg = repo_add_arg(args.all, args.force, args.kind, args.path.as_deref());
             print_output(run_repo_pragma(
                 db_override,
@@ -891,6 +887,9 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
             )?);
         }
         Command::Rm(args) => {
+            if db_override.is_none() && args.path.is_none() {
+                bail!("rm requires a path or --db <path>");
+            }
             let arg = repo_rm_arg(args.cached, args.path.as_deref());
             print_output(run_repo_pragma(
                 db_override,
@@ -942,6 +941,9 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
             )?);
         }
         Command::Export(args) => {
+            if db_override.is_none() && args.path.is_none() {
+                bail!("export requires a database path or --db <path>");
+            }
             let arg = repo_export_arg(args.source.as_deref(), &args.output, args.path.as_deref());
             let command_db = if db_override.is_none() {
                 args.path.as_deref()
@@ -1301,8 +1303,27 @@ fn run_repo_pragma(
     suffix: &str,
     arg: Option<&str>,
 ) -> Result<Option<String>> {
-    let db = resolve_cli_db(command_db.or(db_override))?;
+    let db = match command_db.or(db_override) {
+        Some(path) => resolve_cli_db(Some(path))?,
+        None => resolve_repo_control_db()?,
+    };
     run_pragma(&db, suffix, arg)
+}
+
+fn run_repo_init(json: bool) -> Result<Option<String>> {
+    let worktree = std::env::current_dir().context("failed to read current directory")?;
+    let repo = Repository::init(&worktree)?;
+    if json {
+        return Ok(Some(format!(
+            "{{\"operation\":\"init\",\"graft_dir\":\"{}\",\"worktree\":\"{}\"}}",
+            json_escape(&repo.graft_dir().display().to_string()),
+            json_escape(&repo.worktree().display().to_string())
+        )));
+    }
+    Ok(Some(format!(
+        "Initialized empty Graft repository in {}",
+        repo.graft_dir().display()
+    )))
 }
 
 fn run_sql(db_override: Option<&Path>, sql_parts: &[String]) -> Result<Option<String>> {
@@ -1321,35 +1342,82 @@ fn run_sql(db_override: Option<&Path>, sql_parts: &[String]) -> Result<Option<St
     }
 
     let db = resolve_cli_db(db_override)?;
-    if graft::repo::Repository::discover_for_file(&db).is_err() && !sql_initializes_repo(sql) {
+    if graft::repo::Repository::discover_for_file(&db).is_err() {
         bail!(
-            "not a Graft repository: run `graft init {}` first, or include `PRAGMA graft_init;` in the SQL batch",
+            "not a Graft repository: run `graft init` in the worktree before opening {}",
             db.display()
         );
     }
     execute_sql(&db, sql)
 }
 
-fn sql_initializes_repo(sql: &str) -> bool {
-    sql.split(';').any(|statement| {
-        statement
-            .trim_start()
-            .to_ascii_lowercase()
-            .starts_with("pragma graft_init")
-    })
-}
-
 fn resolve_cli_db(path: Option<&Path>) -> Result<PathBuf> {
     if let Some(path) = path {
-        return absolute_db_path(path);
+        let db = absolute_db_path(path)?;
+        ensure_db_parent_exists_in_repo(&db)?;
+        return Ok(db);
     }
 
+    bail!("SQLite command requires --db <path>")
+}
+
+fn ensure_db_parent_exists_in_repo(db: &Path) -> Result<()> {
+    let Some(parent) = db.parent() else {
+        return Ok(());
+    };
+    if parent.exists() {
+        return Ok(());
+    }
+
+    let mut existing = parent;
+    while !existing.exists() {
+        let Some(next) = existing.parent() else {
+            bail!(
+                "database parent directory does not exist: {}",
+                parent.display()
+            );
+        };
+        existing = next;
+    }
+
+    let repo = Repository::discover(existing).with_context(|| {
+        format!(
+            "database parent directory does not exist: {}",
+            parent.display()
+        )
+    })?;
+    if !db.starts_with(repo.worktree()) {
+        bail!(
+            "database path {} is outside Graft worktree {}",
+            db.display(),
+            repo.worktree().display()
+        );
+    }
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create database parent {}", parent.display()))?;
+    Ok(())
+}
+
+fn resolve_repo_control_db() -> Result<PathBuf> {
     let cwd = std::env::current_dir().context("failed to read current directory")?;
-    if let Ok(repo) = graft::repo::Repository::discover(&cwd) {
-        return Ok(repo.worktree().join("app.db"));
-    }
+    let repo = Repository::discover(&cwd)?;
+    Ok(repo.graft_dir().join("control.sqlite"))
+}
 
-    absolute_db_path(Path::new("app.db"))
+fn json_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if ch.is_control() => out.push_str(&format!("\\u{:04x}", ch as u32)),
+            ch => out.push(ch),
+        }
+    }
+    out
 }
 
 fn repo_config_set_arg(key: &str, value: &[String]) -> Result<String> {
@@ -1389,10 +1457,6 @@ fn config_unset_pragma(json: bool) -> &'static str {
     } else {
         "config_unset"
     }
-}
-
-fn init_pragma(json: bool) -> &'static str {
-    if json { "json_init" } else { "init" }
 }
 
 fn clone_pragma(json: bool) -> &'static str {
@@ -2918,34 +2982,31 @@ mod tests {
     }
 
     #[test]
-    fn init_command_runs_through_graft_vfs() {
+    fn init_command_initializes_current_directory() {
+        let _guard = CWD_LOCK.lock().unwrap();
+        let original_dir = std::env::current_dir().unwrap();
         let temp_dir = tempfile::tempdir().unwrap();
-        let db = temp_dir.path().join("app.db");
+        std::env::set_current_dir(temp_dir.path()).unwrap();
 
-        run_command(
-            Command::Init(InitArgs { json: false, db: Some(db.clone()) }),
-            None,
-        )
-        .unwrap();
+        let result = run_command(Command::Init(InitArgs { json: false }), None);
+        std::env::set_current_dir(original_dir).unwrap();
+        result.unwrap();
 
-        let repo = graft::repo::Repository::discover_for_file(&db).unwrap();
+        let repo = graft::repo::Repository::open(temp_dir.path()).unwrap();
         assert!(repo.graft_dir().join("config.toml").exists());
-        assert!(
-            repo.store_dir().read_dir().unwrap().next().is_some(),
-            "CLI init should initialize the repo-local storage via the SQLite pragma path"
-        );
+        assert!(!temp_dir.path().join("app.db").exists());
     }
 
     #[test]
     fn sql_command_runs_through_graft_vfs() {
         let temp_dir = tempfile::tempdir().unwrap();
         let db = temp_dir.path().join("app.db");
+        graft::repo::Repository::init(temp_dir.path()).unwrap();
 
         let output = run_sql(
             Some(&db),
             &[String::from(
-                "PRAGMA graft_init; \
-                 CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT); \
+                "CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT); \
                  INSERT INTO users(name) VALUES ('Alice'), ('Bob'); \
                  SELECT name FROM users ORDER BY id; \
                  PRAGMA graft_status;",
@@ -2953,16 +3014,49 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(
-            output.contains("Initialized empty Graft repository"),
-            "{output}"
-        );
         assert!(output.contains("name\nAlice\nBob\n"), "{output}");
         assert!(output.contains("untracked: app.db"), "{output}");
     }
 
     #[test]
-    fn sql_command_requires_graft_repo_unless_batch_initializes_one() {
+    fn sql_command_materializes_subdir_database_on_commit() {
+        let _guard = CWD_LOCK.lock().unwrap();
+        let original_dir = std::env::current_dir().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::env::set_current_dir(temp_dir.path()).unwrap();
+
+        let result = (|| -> Result<()> {
+            run_command(Command::Init(InitArgs { json: false }), None)?;
+            let output = run_sql(
+                Some(Path::new("sub-app/main.sqlite")),
+                &[String::from(
+                    "CREATE TABLE docs(id TEXT PRIMARY KEY, title TEXT); \
+                     INSERT INTO docs VALUES ('1', 'Hello'); \
+                     PRAGMA graft_add; \
+                     PRAGMA graft_json_commit = 'initial docs';",
+                )],
+            )?
+            .unwrap();
+            assert!(output.contains("\"materialized\""), "{output}");
+
+            let materialized = temp_dir.path().join("sub-app/main.sqlite");
+            assert!(materialized.exists());
+            let conn = Connection::open(materialized).unwrap();
+            let title: String = conn
+                .query_row("SELECT title FROM docs WHERE id = '1'", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(title, "Hello");
+            Ok(())
+        })();
+
+        std::env::set_current_dir(original_dir).unwrap();
+        result.unwrap();
+    }
+
+    #[test]
+    fn sql_command_requires_explicit_db_and_existing_graft_repo() {
         let temp_dir = tempfile::tempdir().unwrap();
         let db = temp_dir.path().join("app.db");
 
@@ -2976,22 +3070,9 @@ mod tests {
             err.to_string().contains("not a Graft repository"),
             "{err:#}"
         );
-    }
 
-    #[test]
-    fn init_without_db_defaults_to_app_db_in_current_directory() {
-        let _guard = CWD_LOCK.lock().unwrap();
-        let original_dir = std::env::current_dir().unwrap();
-        let temp_dir = tempfile::tempdir().unwrap();
-        std::env::set_current_dir(temp_dir.path()).unwrap();
-
-        let result = run_command(Command::Init(InitArgs { json: false, db: None }), None);
-        std::env::set_current_dir(original_dir).unwrap();
-        result.unwrap();
-
-        let db = temp_dir.path().join("app.db");
-        let repo = graft::repo::Repository::discover_for_file(&db).unwrap();
-        assert!(repo.graft_dir().join("config.toml").exists());
+        let err = run_sql(None, &[String::from("SELECT 1")]).unwrap_err();
+        assert!(err.to_string().contains("requires --db <path>"), "{err:#}");
     }
 
     #[test]
@@ -3061,13 +3142,12 @@ mod tests {
 
     #[test]
     fn parses_lifecycle_export_json_flags() {
-        let cli = Cli::try_parse_from(["graft", "init", "--json", "app.db"]).unwrap();
+        let cli = Cli::try_parse_from(["graft", "init", "--json"]).unwrap();
         let Command::Init(args) = cli.command else {
             panic!("expected init command");
         };
         assert!(args.json);
-        assert_eq!(args.db, Some(PathBuf::from("app.db")));
-        assert_eq!(init_pragma(args.json), "json_init");
+        assert!(Cli::try_parse_from(["graft", "init", "app.db"]).is_err());
 
         let cli = Cli::try_parse_from([
             "graft",
@@ -3429,12 +3509,12 @@ mod tests {
             .unwrap();
         let db = temp_dir.path().join("app.db");
         let output = temp_dir.path().join("snapshot.db");
+        graft::repo::Repository::init(temp_dir.path()).unwrap();
 
         run_sql(
             Some(&db),
             &[format!(
-                "PRAGMA graft_init; \
-                 CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT); \
+                "CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT); \
                  INSERT INTO users(name) VALUES ('Alice'), ('Bob'); \
                  PRAGMA graft_add; \
                  PRAGMA graft_commit = 'initial users'; \

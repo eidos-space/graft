@@ -11,8 +11,31 @@ pub(super) fn run_repo_commit(
     let repo = repo_for_file(file)?;
     let tables = staged_commit_table_summary(runtime, &repo)?;
     let commit = repo.commit_staged_with_table_summary(message, tables)?;
+    let materialized = materialize_commit_sqlite_files(runtime, &repo, &commit)?;
     let branch = repo.current_branch()?;
-    Ok(RepoCommitOutcome { commit, branch })
+    Ok(RepoCommitOutcome { commit, branch, materialized })
+}
+
+pub(super) fn materialize_commit_sqlite_files(
+    runtime: &Runtime,
+    repo: &Repository,
+    commit: &CommitObject,
+) -> Result<Vec<JsonPathAction>, ErrCtx> {
+    if !repo.config()?.worktree.materialize_sqlite {
+        return Ok(Vec::new());
+    }
+
+    let mut paths = Vec::with_capacity(commit.files.len());
+    for (key, state) in &commit.files {
+        checkout_repo_file_state_to_key(runtime, repo, key, state, None)?;
+        paths.push(json_path_action(
+            key.clone(),
+            RepoTrackedPathKind::SqliteDatabase,
+            RepoPathStorage::SqliteSnapshot,
+            "materialized",
+        ));
+    }
+    Ok(paths)
 }
 
 pub(super) fn json_commit_summary(commit: CommitObject) -> JsonCommitSummary {

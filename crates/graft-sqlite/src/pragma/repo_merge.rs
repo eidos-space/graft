@@ -42,9 +42,10 @@ pub(super) fn run_repo_merge_continue(
     try_row_auto_merge_current_file_status_conflict(runtime, file, &repo, None)?;
     let tables = staged_commit_table_summary(runtime, &repo)?;
     let commit = repo.commit_staged_with_table_summary(message, tables)?;
+    let materialized = materialize_commit_sqlite_files(runtime, &repo, &commit)?;
     clear_row_conflict_resolution_state(&repo)?;
     let branch = repo.current_branch()?;
-    Ok(RepoCommitOutcome { commit, branch })
+    Ok(RepoCommitOutcome { commit, branch, materialized })
 }
 
 pub(super) fn run_repo_merge(

@@ -172,6 +172,8 @@ pub(super) struct JsonMergeContinueCommandOutcome {
     pub(super) commit: JsonCommitSummary,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(super) paths: Vec<crate::json::JsonRepoPathDiff>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) materialized: Vec<JsonPathAction>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -186,6 +188,8 @@ pub(super) struct JsonCommitOutcome {
     pub(super) commit: JsonCommitSummary,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(super) paths: Vec<crate::json::JsonRepoPathDiff>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) materialized: Vec<JsonPathAction>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -199,6 +203,7 @@ pub(super) struct JsonCommitSummary {
 pub(super) struct RepoCommitOutcome {
     pub(super) commit: CommitObject,
     pub(super) branch: Option<String>,
+    pub(super) materialized: Vec<JsonPathAction>,
 }
 
 #[derive(Debug, Clone, Serialize)]

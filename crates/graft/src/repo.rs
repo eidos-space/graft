@@ -31,14 +31,15 @@ pub use config::{
     CONFIG_KEY_FILES_EXTERNAL_PATHS, CONFIG_KEY_FILES_INLINE_TEXT_THRESHOLD,
     CONFIG_KEY_MERGE_DEFAULT_SEMANTIC_KEYS, CONFIG_KEY_MERGE_GENERATED_COLUMNS_PREFIX,
     CONFIG_KEY_MERGE_INTERNAL_RESOLVERS_PREFIX, CONFIG_KEY_MERGE_SCHEMA_RESOLVERS_PREFIX,
-    CONFIG_KEY_MERGE_SEMANTIC_KEYS_PREFIX, FileConfig, MergeConfig, RepoConfig, RepoConfigEntry,
+    CONFIG_KEY_MERGE_SEMANTIC_KEYS_PREFIX, CONFIG_KEY_WORKTREE_MATERIALIZE_SQLITE, FileConfig,
+    MergeConfig, RepoConfig, RepoConfigEntry, WorktreeConfig,
 };
 pub use object::CommitTableSummary;
 
 use config::{
     config_entries, config_entry, config_generated_columns_table, config_internal_resolver_subject,
     config_schema_resolver_operation, config_semantic_keys_table, normalize_config_key,
-    parse_config_byte_unit_value, parse_config_internal_resolver_value,
+    parse_config_bool_value, parse_config_byte_unit_value, parse_config_internal_resolver_value,
     parse_config_schema_resolver_value, parse_config_string_list_value,
 };
 use refspec::{ParsedRefspec, parse_fetch_refspec, parse_push_refspec};

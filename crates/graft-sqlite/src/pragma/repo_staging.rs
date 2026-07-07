@@ -512,6 +512,7 @@ pub(super) fn stage_repo_remove_key(
         };
         let volume = runtime.volume_open(None, None, None)?;
         file.switch_volume(&volume.vid)?;
+        repo.clear_dirty_key(key)?;
         return Ok(action);
     }
 

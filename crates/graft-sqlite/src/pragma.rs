@@ -1341,6 +1341,7 @@ impl GraftPragma {
                     head,
                     branch: outcome.branch,
                     paths,
+                    materialized: outcome.materialized,
                     commit: json_commit_summary(outcome.commit),
                 })?))
             }
@@ -1560,6 +1561,7 @@ impl GraftPragma {
                     head,
                     branch: outcome.branch,
                     paths,
+                    materialized: outcome.materialized,
                     commit: json_commit_summary(outcome.commit),
                 })?))
             }

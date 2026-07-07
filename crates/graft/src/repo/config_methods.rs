@@ -36,6 +36,9 @@ impl Repository {
                     .map(|path| normalize_repo_path(&path))
                     .collect();
             }
+            CONFIG_KEY_WORKTREE_MATERIALIZE_SQLITE => {
+                config.worktree.materialize_sqlite = parse_config_bool_value(key, value)?;
+            }
             CONFIG_KEY_MERGE_DEFAULT_SEMANTIC_KEYS => {
                 config.merge.default_semantic_keys = parse_config_string_list_value(key, value)?;
             }
@@ -89,6 +92,9 @@ impl Repository {
             }
             CONFIG_KEY_FILES_EXTERNAL_PATHS => {
                 config.files.external_paths.clear();
+            }
+            CONFIG_KEY_WORKTREE_MATERIALIZE_SQLITE => {
+                config.worktree.materialize_sqlite = WorktreeConfig::default().materialize_sqlite;
             }
             CONFIG_KEY_MERGE_DEFAULT_SEMANTIC_KEYS => {
                 config.merge.default_semantic_keys.clear();

@@ -11,7 +11,9 @@ pub(super) fn repo_diff_for_spec(
         RepoDiffTarget::Worktree { path } => {
             let path = repo_diff_path(repo, path.as_deref())?;
             let current_key = repo.file_key(&file.tag)?;
-            if let Some(path) = path.as_deref()
+            if path.is_none() {
+                repo_worktree_diff_for_filter(runtime, file, repo, None, "")
+            } else if let Some(path) = path.as_deref()
                 && path != current_key
             {
                 let (key, physical_path) = repo_physical_path_arg(repo, Path::new(path))?;
@@ -58,7 +60,9 @@ pub(super) fn repo_diff_for_spec(
         RepoDiffTarget::RevisionToWorktree { rev, path } => {
             let path = repo_diff_path(repo, path.as_deref())?;
             let current_key = repo.file_key(&file.tag)?;
-            if let Some(path) = path.as_deref()
+            if path.is_none() {
+                repo_worktree_diff_for_filter(runtime, file, repo, Some(&rev), "")
+            } else if let Some(path) = path.as_deref()
                 && path != current_key
             {
                 let (key, physical_path) = repo_physical_path_arg(repo, Path::new(path))?;
@@ -152,8 +156,8 @@ pub(super) fn repo_worktree_diff_for_filter(
         artifacts: Vec::new(),
     };
     let current_key = repo.file_key(&file.tag)?;
-    let index_files = repo.index_files()?;
-    let index_artifacts = repo.index_artifacts()?;
+    let index_files = current_repo_files_for_checkout(repo)?;
+    let index_artifacts = current_repo_artifacts_for_checkout(repo)?;
     let mut file_keys = BTreeSet::new();
     let mut artifact_keys = BTreeSet::new();
 
@@ -186,7 +190,7 @@ pub(super) fn repo_worktree_diff_for_filter(
             .filter(|key| repo_key_matches_filter(key, filter))
             .cloned(),
     );
-    if repo_key_matches_filter(&current_key, filter) {
+    if !current_key.starts_with(".graft/") && repo_key_matches_filter(&current_key, filter) {
         file_keys.insert(current_key.clone());
     }
 
@@ -310,7 +314,17 @@ pub(super) fn repo_status_for_file(
             change.storage = RepoPathStorage::SqliteSnapshot;
         }
     }
+    let current_staged_deleted = status.staged_changes.iter().any(|change| {
+        change.path == current_key && change.change == graft::repo::RepoFileChange::Deleted
+    });
     status.unstaged_changes.retain(|change| {
+        if change.path == current_key
+            && change.change == RepoWorktreeChangeKind::Untracked
+            && current_staged_deleted
+        {
+            return false;
+        }
+
         change.path == current_key
             || tracked.contains_key(&change.path)
             || tracked_artifacts.contains_key(&change.path)
