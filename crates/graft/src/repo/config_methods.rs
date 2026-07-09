@@ -36,6 +36,18 @@ impl Repository {
                     .map(|path| normalize_repo_path(&path))
                     .collect();
             }
+            CONFIG_KEY_TRACK_DEFAULT_ROOTS => {
+                config.track.default_roots = parse_config_string_list_value(key, value)?
+                    .into_iter()
+                    .map(|path| normalize_repo_path(&path))
+                    .collect();
+            }
+            CONFIG_KEY_TRACK_USER_ROOTS => {
+                config.track.user_roots = parse_config_string_list_value(key, value)?
+                    .into_iter()
+                    .map(|path| normalize_repo_path(&path))
+                    .collect();
+            }
             CONFIG_KEY_WORKTREE_MATERIALIZE_SQLITE => {
                 config.worktree.materialize_sqlite = parse_config_bool_value(key, value)?;
             }
@@ -93,6 +105,12 @@ impl Repository {
             CONFIG_KEY_FILES_EXTERNAL_PATHS => {
                 config.files.external_paths.clear();
             }
+            CONFIG_KEY_TRACK_DEFAULT_ROOTS => {
+                config.track.default_roots.clear();
+            }
+            CONFIG_KEY_TRACK_USER_ROOTS => {
+                config.track.user_roots.clear();
+            }
             CONFIG_KEY_WORKTREE_MATERIALIZE_SQLITE => {
                 config.worktree.materialize_sqlite = WorktreeConfig::default().materialize_sqlite;
             }
@@ -120,5 +138,13 @@ impl Repository {
 
     pub(super) fn file_config(&self) -> Result<FileConfig> {
         Ok(self.config()?.files)
+    }
+
+    pub fn has_configured_track_roots(&self) -> Result<bool> {
+        Ok(self.config()?.track.has_roots())
+    }
+
+    pub(super) fn track_roots(&self) -> Result<Vec<String>> {
+        Ok(self.config()?.track.roots())
     }
 }

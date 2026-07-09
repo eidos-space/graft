@@ -68,6 +68,11 @@ pub(crate) struct RepoAddSpec {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RepoInitSpec {
+    pub(super) worktree: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RepoRemoveSpec {
     pub(super) path: Option<PathBuf>,
     pub(super) cached: bool,
@@ -121,6 +126,7 @@ pub(crate) struct RepoExportSpec {
 pub(crate) struct RepoCloneSpec {
     pub(super) config: RemoteConfig,
     pub(super) branch: Option<String>,
+    pub(super) worktree: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

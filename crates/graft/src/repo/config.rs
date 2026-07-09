@@ -11,6 +11,8 @@ use super::{
 
 pub const CONFIG_KEY_FILES_INLINE_TEXT_THRESHOLD: &str = "files.inline_text_threshold";
 pub const CONFIG_KEY_FILES_EXTERNAL_PATHS: &str = "files.external_paths";
+pub const CONFIG_KEY_TRACK_DEFAULT_ROOTS: &str = "track.default_roots";
+pub const CONFIG_KEY_TRACK_USER_ROOTS: &str = "track.user_roots";
 pub const CONFIG_KEY_WORKTREE_MATERIALIZE_SQLITE: &str = "worktree.materialize_sqlite";
 pub const CONFIG_KEY_MERGE_DEFAULT_SEMANTIC_KEYS: &str = "merge.default_semantic_keys";
 pub const CONFIG_KEY_MERGE_SEMANTIC_KEYS_PREFIX: &str = "merge.semantic_keys.";
@@ -46,6 +48,9 @@ pub struct RepoConfig {
 
     #[serde(default, skip_serializing_if = "FileConfig::is_default")]
     pub files: FileConfig,
+
+    #[serde(default, skip_serializing_if = "TrackConfig::is_default")]
+    pub track: TrackConfig,
 
     #[serde(default, skip_serializing_if = "WorktreeConfig::is_default")]
     pub worktree: WorktreeConfig,
@@ -105,6 +110,34 @@ impl Default for FileConfig {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrackConfig {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub default_roots: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub user_roots: Vec<String>,
+}
+
+impl TrackConfig {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+
+    pub fn roots(&self) -> Vec<String> {
+        self.default_roots
+            .iter()
+            .chain(self.user_roots.iter())
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    pub fn has_roots(&self) -> bool {
+        !self.default_roots.is_empty() || !self.user_roots.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorktreeConfig {
     pub materialize_sqlite: bool,
@@ -135,6 +168,10 @@ pub(super) fn config_entry(config: &RepoConfig, key: &str) -> Result<RepoConfigE
         config.files.inline_text_threshold.to_string()
     } else if key == CONFIG_KEY_FILES_EXTERNAL_PATHS {
         format_config_string_list(&config.files.external_paths)
+    } else if key == CONFIG_KEY_TRACK_DEFAULT_ROOTS {
+        format_config_string_list(&config.track.default_roots)
+    } else if key == CONFIG_KEY_TRACK_USER_ROOTS {
+        format_config_string_list(&config.track.user_roots)
     } else if key == CONFIG_KEY_WORKTREE_MATERIALIZE_SQLITE {
         config.worktree.materialize_sqlite.to_string()
     } else if key == CONFIG_KEY_MERGE_DEFAULT_SEMANTIC_KEYS {
@@ -184,6 +221,14 @@ pub(super) fn config_entries(config: &RepoConfig) -> Vec<RepoConfigEntry> {
         RepoConfigEntry {
             key: CONFIG_KEY_FILES_EXTERNAL_PATHS.to_string(),
             value: format_config_string_list(&config.files.external_paths),
+        },
+        RepoConfigEntry {
+            key: CONFIG_KEY_TRACK_DEFAULT_ROOTS.to_string(),
+            value: format_config_string_list(&config.track.default_roots),
+        },
+        RepoConfigEntry {
+            key: CONFIG_KEY_TRACK_USER_ROOTS.to_string(),
+            value: format_config_string_list(&config.track.user_roots),
         },
         RepoConfigEntry {
             key: CONFIG_KEY_WORKTREE_MATERIALIZE_SQLITE.to_string(),

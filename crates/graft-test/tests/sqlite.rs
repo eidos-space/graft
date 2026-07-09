@@ -1986,6 +1986,130 @@ fn test_repo_status_scans_physical_untracked_sqlite_files() {
 }
 
 #[test]
+fn test_repo_configured_track_roots_separate_app_defaults_from_user_space() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let space_dir = temp_dir.path().join("space");
+    let eidos_dir = space_dir.join(".eidos");
+    let files_dir = eidos_dir.join("files");
+    std::fs::create_dir_all(&files_dir).unwrap();
+    let db_path = eidos_dir.join("db.sqlite3");
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_path.to_str().unwrap(), None);
+
+    let init: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_init",
+        "--worktree ..",
+    ))
+    .expect("graft_json_init --worktree should return JSON");
+    let canonical_space = space_dir.canonicalize().unwrap();
+    assert_eq!(init["path"], ".eidos/db.sqlite3");
+    assert_eq!(
+        init["worktree"].as_str(),
+        Some(canonical_space.to_str().unwrap())
+    );
+    assert!(space_dir.join(".graft").is_dir());
+    assert!(!eidos_dir.join(".graft").exists());
+
+    assert_eq!(
+        pragma_arg_string(
+            &sqlite,
+            "graft_config_set",
+            "track.default_roots -- .eidos/db.sqlite3 .eidos/files/** .eidos/agent/sessions/**",
+        ),
+        "track.default_roots = .eidos/db.sqlite3, .eidos/files/**, .eidos/agent/sessions/**\n",
+    );
+    assert_eq!(
+        pragma_arg_string(
+            &sqlite,
+            "graft_config_set",
+            "files.external_paths -- .eidos/files/**",
+        ),
+        "files.external_paths = .eidos/files/**\n",
+    );
+
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE docs (id INTEGER PRIMARY KEY, title TEXT NOT NULL);
+            INSERT INTO docs (title) VALUES ('App state');
+            "#,
+        )
+        .unwrap();
+    std::fs::write(files_dir.join("logo.txt"), b"payload").unwrap();
+    std::fs::write(space_dir.join("notes.md"), b"# user note\n").unwrap();
+
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["dirty"], true);
+    let paths = status["paths"].as_array().unwrap();
+    assert!(
+        paths
+            .iter()
+            .any(|entry| entry["path"] == ".eidos/db.sqlite3"
+                && entry["kind"] == "sqlite_database"
+                && entry["storage"] == "sqlite_snapshot")
+    );
+    assert!(
+        paths
+            .iter()
+            .any(|entry| entry["path"] == ".eidos/files/logo.txt"
+                && entry["kind"] == "text_file"
+                && entry["storage"] == "external")
+    );
+    assert!(
+        !paths.iter().any(|entry| entry["path"] == "notes.md"),
+        "user-owned space content should not enter status until user roots include it"
+    );
+
+    let commit = pragma_arg_string(&sqlite, "graft_commit", "commit app private state");
+    assert!(commit.contains("commit app private state"));
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["dirty"], false);
+    assert_eq!(status["paths"], serde_json::json!([]));
+
+    let others: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_ls_files",
+        "--others",
+    ))
+    .expect("graft_json_ls_files --others should return path JSON");
+    assert!(
+        others["paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["path"] == "notes.md"),
+        "untracked user-owned content should still be discoverable"
+    );
+
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_config_set", "track.user_roots -- notes.md",),
+        "track.user_roots = notes.md\n",
+    );
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["dirty"], true);
+    let paths = status["paths"].as_array().unwrap();
+    assert!(paths.iter().any(|entry| entry["path"] == "notes.md"
+        && entry["kind"] == "text_file"
+        && entry["storage"] == "inline"));
+
+    let commit = pragma_arg_string(&sqlite, "graft_commit", "track user note");
+    assert!(commit.contains("track user note"));
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["dirty"], false);
+    assert_eq!(status["paths"], serde_json::json!([]));
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
 fn test_repo_ls_files_others_lists_untracked_worktree_candidates() {
     graft_test::ensure_test_env();
 

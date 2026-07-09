@@ -329,8 +329,7 @@ pub(super) fn repo_status_for_file(
         change.path == current_key
             || tracked.contains_key(&change.path)
             || tracked_artifacts.contains_key(&change.path)
-            || (change.change == RepoWorktreeChangeKind::Untracked
-                && should_report_untracked_status_path(repo))
+            || change.change == RepoWorktreeChangeKind::Untracked
     });
     for (key, expected_state) in tracked {
         if key == current_key
@@ -397,10 +396,6 @@ pub(super) fn repo_status_for_file(
         .collect();
     status.refresh_summary_flags();
     Ok(status)
-}
-
-pub(super) fn should_report_untracked_status_path(repo: &Repository) -> bool {
-    repo.worktree().file_name().and_then(|name| name.to_str()) != Some(".eidos")
 }
 
 pub(super) fn repo_has_work_in_progress_for_file(

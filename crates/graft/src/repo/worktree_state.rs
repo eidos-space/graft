@@ -795,6 +795,7 @@ impl Repository {
     ) -> Result<Vec<RepoWorktreeChange>> {
         let tracked = self.files_for_worktree_status(index)?;
         let tracked_artifacts = self.artifacts_for_worktree_status(index)?;
+        let track_roots = self.track_roots()?;
         let state = self.read_worktree_state()?;
         let mut changes = BTreeMap::<
             String,
@@ -814,6 +815,9 @@ impl Repository {
                     artifact_tracked_path_storage(artifact),
                 )
             } else {
+                if !track_roots.is_empty() && !config_path_patterns_match(&track_roots, &path) {
+                    continue;
+                }
                 let (kind, storage) = self.worktree_path_descriptor(&path)?;
                 (RepoWorktreeChangeKind::Untracked, kind, storage)
             };
@@ -869,7 +873,7 @@ impl Repository {
                 }
             }
         }
-        for path in self.untracked_paths_for_index(index)? {
+        for path in self.configured_untracked_paths_for_index(index)? {
             changes.entry(path.path).or_insert((
                 RepoWorktreeChangeKind::Untracked,
                 path.kind,
@@ -884,6 +888,21 @@ impl Repository {
                 kind,
                 storage,
             })
+            .collect())
+    }
+
+    pub(super) fn configured_untracked_paths_for_index(
+        &self,
+        index: &index::Index,
+    ) -> Result<Vec<RepoTrackedPath>> {
+        let paths = self.untracked_paths_for_index(index)?;
+        let roots = self.track_roots()?;
+        if roots.is_empty() {
+            return Ok(paths);
+        }
+        Ok(paths
+            .into_iter()
+            .filter(|path| config_path_patterns_match(&roots, &path.path))
             .collect())
     }
 

@@ -139,6 +139,69 @@ fn config_get_set_manages_files_external_paths() {
 }
 
 #[test]
+fn config_get_set_manages_track_roots() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = Repository::init(tmp.path()).unwrap();
+
+    assert_eq!(
+        repo.config_get(CONFIG_KEY_TRACK_DEFAULT_ROOTS).unwrap(),
+        RepoConfigEntry {
+            key: CONFIG_KEY_TRACK_DEFAULT_ROOTS.to_string(),
+            value: String::new()
+        }
+    );
+
+    assert_eq!(
+        repo.config_set(
+            CONFIG_KEY_TRACK_DEFAULT_ROOTS,
+            ".eidos/db.sqlite3, ./.eidos/files/**"
+        )
+        .unwrap(),
+        RepoConfigEntry {
+            key: CONFIG_KEY_TRACK_DEFAULT_ROOTS.to_string(),
+            value: ".eidos/db.sqlite3, .eidos/files/**".to_string()
+        }
+    );
+    assert_eq!(
+        repo.config_set(CONFIG_KEY_TRACK_USER_ROOTS, "notes.md docs/")
+            .unwrap(),
+        RepoConfigEntry {
+            key: CONFIG_KEY_TRACK_USER_ROOTS.to_string(),
+            value: "notes.md, docs".to_string()
+        }
+    );
+    assert_eq!(
+        repo.config().unwrap().track.default_roots,
+        vec![
+            ".eidos/db.sqlite3".to_string(),
+            ".eidos/files/**".to_string()
+        ]
+    );
+    assert_eq!(
+        repo.config().unwrap().track.user_roots,
+        vec!["notes.md".to_string(), "docs".to_string()]
+    );
+
+    let raw_config = fs::read_to_string(repo.graft_dir().join(CONFIG_FILE)).unwrap();
+    assert!(raw_config.contains("[track]"));
+    assert!(raw_config.contains("default_roots = ["));
+    assert!(raw_config.contains(r#"".eidos/db.sqlite3""#));
+    assert!(raw_config.contains(r#"".eidos/files/**""#));
+    assert!(raw_config.contains("user_roots = ["));
+    assert!(raw_config.contains(r#""notes.md""#));
+    assert!(raw_config.contains(r#""docs""#));
+
+    assert_eq!(
+        repo.config_unset(CONFIG_KEY_TRACK_DEFAULT_ROOTS).unwrap(),
+        RepoConfigEntry {
+            key: CONFIG_KEY_TRACK_DEFAULT_ROOTS.to_string(),
+            value: String::new()
+        }
+    );
+    assert!(repo.config().unwrap().track.default_roots.is_empty());
+}
+
+#[test]
 fn config_get_set_manages_worktree_materialize_sqlite() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = Repository::init(tmp.path()).unwrap();
@@ -612,6 +675,52 @@ fn status_scans_worktree_files_as_untracked() {
                 kind: RepoTrackedPathKind::TextFile,
                 storage: RepoPathStorage::Inline,
             },
+        ]
+    );
+}
+
+#[test]
+fn status_limits_untracked_paths_to_configured_track_roots() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = Repository::init(tmp.path()).unwrap();
+    repo.config_set(
+        CONFIG_KEY_TRACK_DEFAULT_ROOTS,
+        ".eidos/db.sqlite3 .eidos/files/** .eidos/agent/sessions/**",
+    )
+    .unwrap();
+
+    fs::create_dir_all(tmp.path().join(".eidos/files")).unwrap();
+    fs::create_dir_all(tmp.path().join(".eidos/agent/sessions")).unwrap();
+    write_sqlite_magic(tmp.path().join(".eidos/db.sqlite3"));
+    fs::write(tmp.path().join(".eidos/files/image.png"), b"png").unwrap();
+    fs::write(
+        tmp.path().join(".eidos/agent/sessions/history.jsonl"),
+        br#"{"event":"created"}"#,
+    )
+    .unwrap();
+    fs::write(tmp.path().join("notes.md"), b"user-owned note").unwrap();
+
+    let status = repo.status().unwrap();
+    assert_eq!(
+        status.unstaged,
+        vec![
+            ".eidos/agent/sessions/history.jsonl".to_string(),
+            ".eidos/db.sqlite3".to_string(),
+            ".eidos/files/image.png".to_string(),
+        ]
+    );
+
+    let all_candidates = repo.untracked_paths().unwrap();
+    assert_eq!(
+        all_candidates
+            .iter()
+            .map(|path| path.path.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            ".eidos/agent/sessions/history.jsonl",
+            ".eidos/db.sqlite3",
+            ".eidos/files/image.png",
+            "notes.md",
         ]
     );
 }

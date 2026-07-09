@@ -56,7 +56,7 @@ fn undocumented_repo_compat_pragmas_are_rejected() {
     let json_init = Pragma { name: "graft_json_init", arg: None };
     assert!(matches!(
         GraftPragma::try_from(&json_init).unwrap(),
-        GraftPragma::JsonRepoInit
+        GraftPragma::JsonRepoInit { .. }
     ));
 
     let remove = Pragma { name: "graft_rm", arg: Some("app.db") };
@@ -390,6 +390,7 @@ fn parse_repo_clone_arg_supports_default_branch_and_branch_flags() {
         RepoCloneSpec {
             config: RemoteConfig::Fs { root: "/srv/graft/app".to_string() },
             branch: None,
+            worktree: None,
         }
     );
     assert_eq!(
@@ -397,6 +398,7 @@ fn parse_repo_clone_arg_supports_default_branch_and_branch_flags() {
         RepoCloneSpec {
             config: RemoteConfig::Fs { root: "/srv/graft/app".to_string() },
             branch: Some("feature/search".to_string()),
+            worktree: None,
         }
     );
     assert_eq!(
@@ -404,6 +406,7 @@ fn parse_repo_clone_arg_supports_default_branch_and_branch_flags() {
         RepoCloneSpec {
             config: RemoteConfig::Memory,
             branch: Some("feature/search".to_string()),
+            worktree: None,
         }
     );
     assert_eq!(
@@ -411,6 +414,15 @@ fn parse_repo_clone_arg_supports_default_branch_and_branch_flags() {
         RepoCloneSpec {
             config: RemoteConfig::Memory,
             branch: Some("release/1.0".to_string()),
+            worktree: None,
+        }
+    );
+    assert_eq!(
+        parse_repo_clone_arg("--worktree .. --branch feature/search memory").unwrap(),
+        RepoCloneSpec {
+            config: RemoteConfig::Memory,
+            branch: Some("feature/search".to_string()),
+            worktree: Some(PathBuf::from("..")),
         }
     );
     assert!(parse_repo_clone_arg("").is_err());
@@ -427,6 +439,7 @@ fn parse_repo_clone_arg_supports_default_branch_and_branch_flags() {
             spec: RepoCloneSpec {
                 config: RemoteConfig::Memory,
                 branch: Some(branch),
+                worktree: None,
             }
         } if branch == "feature/search"
     ));

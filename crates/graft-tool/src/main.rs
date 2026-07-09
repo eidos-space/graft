@@ -3019,6 +3019,31 @@ mod tests {
     }
 
     #[test]
+    fn sql_status_reports_untracked_artifacts_in_eidos_worktree() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let eidos_dir = temp_dir.path().join(".eidos");
+        let files_dir = eidos_dir.join("files");
+        std::fs::create_dir_all(&files_dir).unwrap();
+        let db = eidos_dir.join("db.sqlite3");
+        graft::repo::Repository::init(&eidos_dir).unwrap();
+        std::fs::write(files_dir.join("icon.png"), b"\x89PNG\r\n\x1a\n").unwrap();
+
+        let output = run_sql(
+            Some(&db),
+            &[String::from(
+                "CREATE TABLE app_state(id INTEGER PRIMARY KEY); \
+                 PRAGMA graft_json_status;",
+            )],
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(output.contains(r#""path":"files/icon.png""#), "{output}");
+        assert!(output.contains(r#""kind":"binary_file""#), "{output}");
+        assert!(output.contains(r#""storage":"external""#), "{output}");
+    }
+
+    #[test]
     fn sql_command_materializes_subdir_database_on_commit() {
         let _guard = CWD_LOCK.lock().unwrap();
         let original_dir = std::env::current_dir().unwrap();

@@ -31,8 +31,9 @@ pub use config::{
     CONFIG_KEY_FILES_EXTERNAL_PATHS, CONFIG_KEY_FILES_INLINE_TEXT_THRESHOLD,
     CONFIG_KEY_MERGE_DEFAULT_SEMANTIC_KEYS, CONFIG_KEY_MERGE_GENERATED_COLUMNS_PREFIX,
     CONFIG_KEY_MERGE_INTERNAL_RESOLVERS_PREFIX, CONFIG_KEY_MERGE_SCHEMA_RESOLVERS_PREFIX,
-    CONFIG_KEY_MERGE_SEMANTIC_KEYS_PREFIX, CONFIG_KEY_WORKTREE_MATERIALIZE_SQLITE, FileConfig,
-    MergeConfig, RepoConfig, RepoConfigEntry, WorktreeConfig,
+    CONFIG_KEY_MERGE_SEMANTIC_KEYS_PREFIX, CONFIG_KEY_TRACK_DEFAULT_ROOTS,
+    CONFIG_KEY_TRACK_USER_ROOTS, CONFIG_KEY_WORKTREE_MATERIALIZE_SQLITE, FileConfig, MergeConfig,
+    RepoConfig, RepoConfigEntry, TrackConfig, WorktreeConfig,
 };
 pub use object::CommitTableSummary;
 
@@ -45,7 +46,8 @@ use config::{
 use refspec::{ParsedRefspec, parse_fetch_refspec, parse_push_refspec};
 use worktree::{
     IgnoreRules, artifact_storage_for_path, classify_artifact_bytes, classify_artifact_path,
-    is_sqlite_database_file, is_sqlite_sidecar_file, normalize_repo_path,
+    config_path_patterns_match, is_sqlite_database_file, is_sqlite_sidecar_file,
+    normalize_repo_path,
 };
 
 use serde::{Deserialize, Serialize};

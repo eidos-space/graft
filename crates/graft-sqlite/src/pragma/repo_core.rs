@@ -1,10 +1,16 @@
 use super::*;
 
-pub(super) fn run_repo_init(file: &mut VolFile) -> Result<RepoInitOutcome, ErrCtx> {
+pub(super) fn run_repo_init(
+    file: &mut VolFile,
+    spec: RepoInitSpec,
+) -> Result<RepoInitOutcome, ErrCtx> {
     if !file.is_idle() {
         return pragma_err!("cannot initialize a repository while there is an open transaction");
     }
-    let repo = Repository::init_for_file(&file.tag)?;
+    let repo = match spec.worktree {
+        Some(worktree) => Repository::init(resolve_repo_worktree_arg(file, &worktree)?)?,
+        None => Repository::init_for_file(&file.tag)?,
+    };
     let preserved_contents = file.attach_repo_preserving_contents(repo.clone())?;
     if preserved_contents {
         repo.mark_dirty_path(&file.tag)?;
@@ -19,6 +25,19 @@ pub(super) fn run_repo_init(file: &mut VolFile) -> Result<RepoInitOutcome, ErrCt
         current_head,
         current_branch,
     })
+}
+
+pub(super) fn resolve_repo_worktree_arg(
+    file: &VolFile,
+    worktree: &Path,
+) -> Result<PathBuf, ErrCtx> {
+    if worktree.is_absolute() {
+        return Ok(worktree.to_path_buf());
+    }
+    let parent = Path::new(&file.tag)
+        .parent()
+        .unwrap_or_else(|| Path::new("."));
+    Ok(parent.join(worktree))
 }
 
 pub(super) fn format_repo_init_outcome(outcome: &RepoInitOutcome) -> String {
@@ -54,7 +73,10 @@ pub(super) fn run_repo_clone(
         return pragma_err!("cannot clone into an existing .graft repository");
     }
 
-    let repo = Repository::init_for_file(&file.tag)?;
+    let repo = match spec.worktree.as_ref() {
+        Some(worktree) => Repository::init(resolve_repo_worktree_arg(file, worktree)?)?,
+        None => Repository::init_for_file(&file.tag)?,
+    };
     let graft_dir = repo.graft_dir().to_path_buf();
     let mut attached = false;
     let result = (|| {

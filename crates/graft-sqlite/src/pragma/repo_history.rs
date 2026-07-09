@@ -9,6 +9,9 @@ pub(super) fn run_repo_commit(
         return pragma_err!("cannot commit while there is an open transaction");
     }
     let repo = repo_for_file(file)?;
+    if repo.has_configured_track_roots()? {
+        stage_repo_add_all(runtime, file, &repo, None)?;
+    }
     let tables = staged_commit_table_summary(runtime, &repo)?;
     let commit = repo.commit_staged_with_table_summary(message, tables)?;
     let materialized = materialize_commit_sqlite_files(runtime, &repo, &commit)?;

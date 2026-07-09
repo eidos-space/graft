@@ -11,8 +11,8 @@ use super::{
     BranchListMode, DiffMode, JsonConfigListMode, JsonFetchAsyncMode, JsonLogMode, JsonTagsMode,
     LargeFileFetchSpec, LargeFilePruneSpec, LargeFileStatusSpec, LsFilesSpec, RepoAddSpec,
     RepoAuditSpec, RepoCheckoutSpec, RepoCloneSpec, RepoDiffSpec, RepoDiffTarget, RepoExportSpec,
-    RepoRemoveSpec, RepoResolveRowSpec, RepoResolveSpec, RepoRestoreSpec, ResolveSide, StatusSpec,
-    parse_or_fail, pragma_fail,
+    RepoInitSpec, RepoRemoveSpec, RepoResolveRowSpec, RepoResolveSpec, RepoRestoreSpec,
+    ResolveSide, StatusSpec, parse_or_fail, pragma_fail,
 };
 
 pub(super) fn parse_remote_add(arg: &str) -> Result<(String, RemoteConfig), PragmaErr> {
@@ -35,13 +35,23 @@ pub(super) fn parse_remote_rename(arg: &str) -> Result<(String, String), PragmaE
 
 pub(super) fn parse_repo_clone_arg(arg: &str) -> Result<RepoCloneSpec, PragmaErr> {
     let parts: Vec<&str> = arg.split_whitespace().collect();
-    let (uri, branch) = match parts.as_slice() {
-        [uri] => (*uri, None),
-        [uri, branch] => (*uri, Some(*branch)),
-        ["--branch" | "-b", branch, uri] => (*uri, Some(*branch)),
+    let (worktree, uri, branch) = match parts.as_slice() {
+        [uri] => (None, *uri, None),
+        [uri, branch] => (None, *uri, Some(*branch)),
+        ["--branch" | "-b", branch, uri] => (None, *uri, Some(*branch)),
+        ["--worktree", worktree, uri] => (Some(PathBuf::from(worktree)), *uri, None),
+        ["--worktree", worktree, uri, branch] => {
+            (Some(PathBuf::from(worktree)), *uri, Some(*branch))
+        }
+        ["--worktree", worktree, "--branch" | "-b", branch, uri] => {
+            (Some(PathBuf::from(worktree)), *uri, Some(*branch))
+        }
+        ["--branch" | "-b", branch, "--worktree", worktree, uri] => {
+            (Some(PathBuf::from(worktree)), *uri, Some(*branch))
+        }
         _ => {
             return Err(pragma_fail(
-                "argument must be in the form: `remote-uri [branch]` or `--branch branch remote-uri`",
+                "argument must be in the form: `[--worktree path] remote-uri [branch]` or `[--worktree path] --branch branch remote-uri`",
             ));
         }
     };
@@ -51,7 +61,24 @@ pub(super) fn parse_repo_clone_arg(arg: &str) -> Result<RepoCloneSpec, PragmaErr
     Ok(RepoCloneSpec {
         config: parse_remote_config_uri(uri)?,
         branch: branch.map(str::to_string),
+        worktree,
     })
+}
+
+pub(super) fn parse_repo_init_arg(arg: Option<&str>) -> Result<RepoInitSpec, PragmaErr> {
+    let Some(arg) = arg.map(str::trim).filter(|arg| !arg.is_empty()) else {
+        return Ok(RepoInitSpec { worktree: None });
+    };
+    let parts = split_pragma_words(arg)?;
+    if parts.len() == 1 {
+        Ok(RepoInitSpec { worktree: Some(PathBuf::from(&parts[0])) })
+    } else if parts.len() == 2 && parts[0] == "--worktree" {
+        Ok(RepoInitSpec { worktree: Some(PathBuf::from(&parts[1])) })
+    } else {
+        Err(pragma_fail(
+            "argument must be empty or in the form: `[--worktree] path`",
+        ))
+    }
 }
 
 pub(super) fn parse_remote_config_uri(uri: &str) -> Result<RemoteConfig, PragmaErr> {

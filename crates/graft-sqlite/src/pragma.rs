@@ -184,16 +184,16 @@ pub(crate) enum GraftPragma {
     /// `pragma graft_debug_volume_status;`
     VolumeStatus,
 
-    /// `pragma graft_init;`
-    RepoInit,
+    /// `pragma graft_init [= "[--worktree] path"];`
+    RepoInit { spec: RepoInitSpec },
 
-    /// `pragma graft_json_init;`
-    JsonRepoInit,
+    /// `pragma graft_json_init [= "[--worktree] path"];`
+    JsonRepoInit { spec: RepoInitSpec },
 
-    /// `pragma graft_clone = "remote-uri [branch]";`
+    /// `pragma graft_clone = "[--worktree path] remote-uri [branch]";`
     RepoClone { spec: RepoCloneSpec },
 
-    /// `pragma graft_json_clone = "remote-uri [branch]";`
+    /// `pragma graft_json_clone = "[--worktree path] remote-uri [branch]";`
     JsonRepoClone { spec: RepoCloneSpec },
 
     /// `pragma graft_json_status [= "[--kind kind]"];`
@@ -721,8 +721,8 @@ impl TryFrom<&Pragma<'_>> for GraftPragma {
                 "debug_volume_info" => Ok(GraftPragma::VolumeInfo),
                 "status" => Ok(GraftPragma::Status { spec: parse_status_arg(p.arg)? }),
                 "debug_volume_status" => Ok(GraftPragma::VolumeStatus),
-                "init" => Ok(GraftPragma::RepoInit),
-                "json_init" => Ok(GraftPragma::JsonRepoInit),
+                "init" => Ok(GraftPragma::RepoInit { spec: parse_repo_init_arg(p.arg)? }),
+                "json_init" => Ok(GraftPragma::JsonRepoInit { spec: parse_repo_init_arg(p.arg)? }),
                 "clone" => {
                     let spec = parse_repo_clone_arg(p.require_arg()?)?;
                     Ok(GraftPragma::RepoClone { spec })
@@ -1228,12 +1228,12 @@ impl GraftPragma {
             }
             GraftPragma::VolumeStatus => Ok(Some(format_volume_status(&runtime, file)?)),
 
-            GraftPragma::RepoInit => {
-                let outcome = run_repo_init(file)?;
+            GraftPragma::RepoInit { spec } => {
+                let outcome = run_repo_init(file, spec)?;
                 Ok(Some(format_repo_init_outcome(&outcome)))
             }
-            GraftPragma::JsonRepoInit => {
-                let outcome = run_repo_init(file)?;
+            GraftPragma::JsonRepoInit { spec } => {
+                let outcome = run_repo_init(file, spec)?;
                 Ok(Some(to_json(&JsonInitOutcome {
                     operation: "init",
                     current_head: outcome.current_head,
