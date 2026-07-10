@@ -1421,3 +1421,14 @@ fn parse_checkout_and_switch_force_args() {
             if branch == "feature/query"
     ));
 }
+
+#[test]
+fn batch_restore_plan_rejects_file_descendant_conflicts() {
+    let restored = BTreeSet::from(["notes".to_string()]);
+    let planned = BTreeSet::from(["notes".to_string(), "notes/today.md".to_string()]);
+    let error = validate_restore_plan_path_conflicts(&restored, &planned).unwrap_err();
+    assert!(error.to_string().contains("together with descendant"));
+
+    let restored = BTreeSet::from(["notes/today.md".to_string()]);
+    assert!(validate_restore_plan_path_conflicts(&restored, &planned).is_ok());
+}

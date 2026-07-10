@@ -702,9 +702,16 @@ pub(super) fn remove_materialized_repo_file(repo: &Repository, key: &str) -> Res
     Ok(())
 }
 
+#[derive(Clone)]
 pub(super) enum RestoredRepoPathState {
     File(CommitFileState),
     Artifact(CommitArtifactState),
+}
+
+pub(super) struct RepoRestoreKeyPlan {
+    key: String,
+    restored: Option<RestoredRepoPathState>,
+    path_detail: JsonPathDetail,
 }
 
 pub(super) fn restore_repo_path(
@@ -789,11 +796,254 @@ pub(super) fn restore_repo_keys(
     spec: &RepoRestoreSpec,
     keys: Vec<String>,
 ) -> Result<JsonRestoreOutcome, ErrCtx> {
-    let mut restored = Vec::with_capacity(keys.len());
-    for key in keys {
-        restored.push(restore_repo_key(runtime, file, repo, spec, &key)?);
+    if spec.staged {
+        for key in &keys {
+            restore_key_path_detail(repo, spec, key)?;
+        }
+        let mut restored = Vec::with_capacity(keys.len());
+        for key in keys {
+            restored.push(restore_repo_key(runtime, file, repo, spec, &key)?);
+        }
+        return json_restore_outcome(repo, spec, restored);
     }
-    json_restore_outcome(repo, spec, restored)
+
+    let plan = plan_restore_repo_keys(repo, spec, keys)?;
+    preflight_restore_repo_keys(runtime, file, repo, &plan)?;
+    // Individual replacements are atomic, but filesystems do not provide a cross-path
+    // transaction. A new OS I/O error during apply can therefore leave a restored prefix.
+    for entry in &plan {
+        apply_restored_repo_key(runtime, file, repo, &entry.key, entry.restored.as_ref())?;
+    }
+    for entry in &plan {
+        update_restored_worktree_state_key(runtime, repo, &entry.key, entry.restored.as_ref())?;
+    }
+    json_restore_outcome(
+        repo,
+        spec,
+        plan.into_iter().map(|entry| entry.path_detail).collect(),
+    )
+}
+
+pub(super) fn plan_restore_repo_keys(
+    repo: &Repository,
+    spec: &RepoRestoreSpec,
+    keys: Vec<String>,
+) -> Result<Vec<RepoRestoreKeyPlan>, ErrCtx> {
+    let index_files = repo.index_files()?;
+    let index_artifacts = repo.index_artifacts()?;
+    let index_keys = repo
+        .read_index()?
+        .stage0_entries()
+        .map(|entry| entry.path.clone())
+        .collect::<BTreeSet<_>>();
+    let (source_files, source_artifacts) = if let Some(source) = &spec.source {
+        let commit = repo.show_revision(source)?;
+        (commit.files, commit.artifacts)
+    } else {
+        (index_files.clone(), index_artifacts.clone())
+    };
+    let (head_files, head_artifacts) = match repo.show_revision("HEAD") {
+        Ok(commit) => (commit.files, commit.artifacts),
+        Err(graft::repo::RepoErr::UnbornHead) => (BTreeMap::new(), BTreeMap::new()),
+        Err(err) => return Err(err.into()),
+    };
+    let plan_keys = keys.iter().cloned().collect::<BTreeSet<_>>();
+    let restored_keys = source_files
+        .keys()
+        .chain(source_artifacts.keys())
+        .filter(|key| plan_keys.contains(*key))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    validate_restore_plan_path_conflicts(&restored_keys, &plan_keys)?;
+
+    keys.into_iter()
+        .map(|key| {
+            let restored = source_files
+                .get(&key)
+                .cloned()
+                .map(RestoredRepoPathState::File)
+                .or_else(|| {
+                    source_artifacts
+                        .get(&key)
+                        .cloned()
+                        .map(RestoredRepoPathState::Artifact)
+                });
+            if restored.is_none()
+                && !can_plan_restore_deletion(
+                    spec,
+                    &key,
+                    &index_files,
+                    &index_artifacts,
+                    &index_keys,
+                    &head_files,
+                    &head_artifacts,
+                )
+            {
+                return Err(ErrCtx::PragmaErr(
+                    format!("path `{key}` is not tracked").into(),
+                ));
+            }
+            let path_detail = restored_repo_path_detail(repo, &key, restored.as_ref())?;
+            Ok(RepoRestoreKeyPlan { key, restored, path_detail })
+        })
+        .collect()
+}
+
+pub(super) fn validate_restore_plan_path_conflicts(
+    restored_keys: &BTreeSet<String>,
+    plan_keys: &BTreeSet<String>,
+) -> Result<(), ErrCtx> {
+    for parent in restored_keys {
+        if let Some(descendant) = plan_keys
+            .iter()
+            .find(|key| *key != parent && repo_key_matches_filter(key, parent))
+        {
+            return pragma_err!(format!(
+                "cannot restore file `{parent}` together with descendant `{descendant}`"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn can_plan_restore_deletion(
+    spec: &RepoRestoreSpec,
+    key: &str,
+    index_files: &BTreeMap<String, CommitFileState>,
+    index_artifacts: &BTreeMap<String, CommitArtifactState>,
+    index_keys: &BTreeSet<String>,
+    head_files: &BTreeMap<String, CommitFileState>,
+    head_artifacts: &BTreeMap<String, CommitArtifactState>,
+) -> bool {
+    if spec.source.is_none() {
+        return index_keys.contains(key);
+    }
+    index_files.contains_key(key)
+        || index_artifacts.contains_key(key)
+        || index_keys.contains(key)
+        || head_files.contains_key(key)
+        || head_artifacts.contains_key(key)
+}
+
+pub(super) fn preflight_restore_repo_keys(
+    runtime: &Runtime,
+    file: &VolFile,
+    repo: &Repository,
+    plan: &[RepoRestoreKeyPlan],
+) -> Result<(), ErrCtx> {
+    for entry in plan {
+        preflight_restore_repo_key_path(repo, &entry.key)?;
+    }
+    ensure_restore_keys_preserve_untracked_paths(file, repo, plan)?;
+    for entry in plan {
+        match &entry.restored {
+            Some(RestoredRepoPathState::File(state)) => {
+                hydrate_repo_file_state(runtime, state, None)?;
+            }
+            Some(RestoredRepoPathState::Artifact(state)) => {
+                repo.verify_artifact_state(state)?;
+            }
+            None => {}
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn preflight_restore_repo_key_path(repo: &Repository, key: &str) -> Result<(), ErrCtx> {
+    graft::repo::validate_repo_path_identity(key)?;
+    let components = Path::new(key).components().collect::<Vec<_>>();
+    if components.is_empty()
+        || components
+            .iter()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return pragma_err!(format!("path `{key}` is not a valid repository file path"));
+    }
+
+    let mut physical_path = repo.worktree().to_path_buf();
+    for (index, component) in components.iter().enumerate() {
+        physical_path.push(component.as_os_str());
+        let is_target = index + 1 == components.len();
+        match std::fs::symlink_metadata(&physical_path) {
+            Ok(metadata) if is_target && metadata.file_type().is_file() => {}
+            Ok(metadata) if !is_target && metadata.file_type().is_dir() => {}
+            Ok(_) if is_target => {
+                return pragma_err!(format!(
+                    "path `{}` is not a regular file",
+                    physical_path.display()
+                ));
+            }
+            Ok(_) => {
+                return pragma_err!(format!(
+                    "path ancestor `{}` is not a directory",
+                    physical_path.display()
+                ));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn ensure_restore_keys_preserve_untracked_paths(
+    file: &VolFile,
+    repo: &Repository,
+    plan: &[RepoRestoreKeyPlan],
+) -> Result<(), ErrCtx> {
+    let tracked = repo
+        .index_files()?
+        .into_keys()
+        .chain(repo.index_artifacts()?.into_keys())
+        .collect::<BTreeSet<_>>();
+    let current_key = repo.file_key(&file.tag)?;
+    let overwritten = plan
+        .iter()
+        .filter(|entry| {
+            entry.key != current_key
+                && !tracked.contains(&entry.key)
+                && std::fs::symlink_metadata(repo.worktree().join(&entry.key))
+                    .is_ok_and(|metadata| metadata.file_type().is_file())
+        })
+        .map(|entry| entry.key.clone())
+        .collect::<Vec<_>>();
+    if overwritten.is_empty() {
+        return Ok(());
+    }
+    pragma_err!(format!(
+        "cannot restore because untracked paths would be overwritten: {}",
+        overwritten.join(", ")
+    ))
+}
+
+pub(super) fn apply_restored_repo_key(
+    runtime: &Runtime,
+    file: &mut VolFile,
+    repo: &Repository,
+    key: &str,
+    restored: Option<&RestoredRepoPathState>,
+) -> Result<(), ErrCtx> {
+    let current_key = repo.file_key(&file.tag)?;
+    if key == current_key {
+        if let Some(RestoredRepoPathState::File(state)) = restored {
+            checkout_repo_file_state(runtime, file, state, None)?;
+        } else if let Some(RestoredRepoPathState::Artifact(state)) = restored {
+            let volume = runtime.volume_open(None, None, None)?;
+            file.switch_volume(&volume.vid)?;
+            repo.materialize_artifact_key(key, state)?;
+        } else {
+            let volume = runtime.volume_open(None, None, None)?;
+            file.switch_volume(&volume.vid)?;
+        }
+    } else if let Some(RestoredRepoPathState::File(state)) = restored {
+        checkout_repo_file_state_to_key(runtime, repo, key, state, None)?;
+    } else if let Some(RestoredRepoPathState::Artifact(state)) = restored {
+        repo.materialize_artifact_key(key, state)?;
+    } else {
+        remove_materialized_repo_file(repo, key)?;
+    }
+    Ok(())
 }
 
 pub(super) fn restore_repo_key(
@@ -853,26 +1103,7 @@ pub(super) fn restore_repo_key(
     }
 
     let path_detail = restored_repo_path_detail(repo, key, restored.as_ref())?;
-    let current_key = repo.file_key(&file.tag)?;
-    if key == current_key {
-        if let Some(RestoredRepoPathState::File(state)) = &restored {
-            checkout_repo_file_state(runtime, file, state, None)?;
-        } else if let Some(RestoredRepoPathState::Artifact(state)) = &restored {
-            let volume = runtime.volume_open(None, None, None)?;
-            file.switch_volume(&volume.vid)?;
-            repo.materialize_artifact_key(&key, state)?;
-        } else {
-            let volume = runtime.volume_open(None, None, None)?;
-            file.switch_volume(&volume.vid)?;
-        }
-    } else if let Some(RestoredRepoPathState::File(state)) = &restored {
-        checkout_repo_file_state_to_key(runtime, repo, key, state, None)?;
-    } else if let Some(RestoredRepoPathState::Artifact(state)) = &restored {
-        repo.materialize_artifact_key(key, state)?;
-    } else {
-        remove_materialized_repo_file(repo, key)?;
-    }
-
+    apply_restored_repo_key(runtime, file, repo, key, restored.as_ref())?;
     update_restored_worktree_state_key(runtime, repo, key, restored.as_ref())?;
     Ok(path_detail)
 }

@@ -251,6 +251,10 @@ impl Repository {
         Ok(())
     }
 
+    pub fn verify_artifact_state(&self, state: &CommitArtifactState) -> Result<()> {
+        self.artifact_bytes(state).map(|_| ())
+    }
+
     pub fn materialize_artifact_checkout(
         &self,
         artifacts: &BTreeMap<String, CommitArtifactState>,

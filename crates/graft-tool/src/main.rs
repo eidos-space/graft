@@ -200,7 +200,12 @@ enum Command {
         path: Option<PathBuf>,
     },
 
-    /// Restore a worktree database path from the index or a revision
+    /// Restore worktree paths from the index or a revision
+    ///
+    /// Multi-path restores preflight known path and payload failures before changing files or the
+    /// index. They are not cross-path transactions: an unexpected operating-system I/O failure
+    /// after apply begins can leave a subset of worktree paths, staged entries, or restore-status
+    /// metadata updated. Correct the failure and rerun the same restore command.
     Restore {
         /// Emit JSON restore output with current repository state
         #[arg(long)]
