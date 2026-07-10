@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 
 use graft::{
-    core::{logref::LogRef, lsn::LSN},
+    core::{byte_unit::ByteUnit, logref::LogRef, lsn::LSN},
     remote::RemoteConfig,
-    repo::{RepoTrackedPathKind, ResetMode},
+    repo::{DEFAULT_TEXT_DIFF_CONTENT_LIMIT, RepoTrackedPathKind, ResetMode},
 };
 use sqlite_plugin::vfs::PragmaErr;
 
@@ -11,8 +11,8 @@ use super::{
     BranchListMode, DiffMode, JsonConfigListMode, JsonFetchAsyncMode, JsonLogMode, JsonTagsMode,
     LargeFileFetchSpec, LargeFilePruneSpec, LargeFileStatusSpec, LsFilesSpec, RepoAddSpec,
     RepoAuditSpec, RepoCheckoutSpec, RepoCloneSpec, RepoDiffSpec, RepoDiffTarget, RepoExportSpec,
-    RepoRemoveSpec, RepoResolveRowSpec, RepoResolveSpec, RepoRestoreSpec, ResolveSide, StatusSpec,
-    parse_or_fail, pragma_fail,
+    RepoRemoveSpec, RepoResolveRowSpec, RepoResolveSpec, RepoRestoreSpec, RepoTextContentSpec,
+    ResolveSide, StatusSpec, parse_or_fail, pragma_fail,
 };
 
 pub(super) fn parse_remote_add(arg: &str) -> Result<(String, RemoteConfig), PragmaErr> {
@@ -277,12 +277,15 @@ pub(super) fn parse_repo_diff_arg(arg: Option<&str>) -> Result<RepoDiffSpec, Pra
             mode: DiffMode::Default,
             kind: None,
             target: RepoDiffTarget::Worktree { path: None },
+            content: None,
         });
     };
     reject_ambiguous_posix_path_escape(arg)?;
     let raw_parts = split_pragma_words(arg)?;
     let mut mode = DiffMode::Default;
     let mut kind = None;
+    let mut include_content = false;
+    let mut max_content_bytes = None;
     let mut parts = Vec::new();
     let mut in_path = false;
     let mut index = 0;
@@ -306,6 +309,29 @@ pub(super) fn parse_repo_diff_arg(arg: Option<&str>) -> Result<RepoDiffSpec, Pra
                 return Err(pragma_fail("diff --kind requires a value"));
             };
             kind = Some(parse_repo_tracked_path_kind_arg(value)?);
+            index += 2;
+        } else if !in_path && part == "--content" {
+            if include_content {
+                return Err(pragma_fail("diff accepts --content only once"));
+            }
+            include_content = true;
+            index += 1;
+        } else if !in_path && part == "--max-content-bytes" {
+            if max_content_bytes.is_some() {
+                return Err(pragma_fail("diff accepts --max-content-bytes only once"));
+            }
+            let Some(value) = raw_parts.get(index + 1) else {
+                return Err(pragma_fail("diff --max-content-bytes requires a value"));
+            };
+            let value = value
+                .parse::<u64>()
+                .map_err(|_| pragma_fail("diff --max-content-bytes must be a positive integer"))?;
+            if value == 0 {
+                return Err(pragma_fail(
+                    "diff --max-content-bytes must be a positive integer",
+                ));
+            }
+            max_content_bytes = Some(value);
             index += 2;
         } else {
             parts.push(part.as_str());
@@ -342,7 +368,33 @@ pub(super) fn parse_repo_diff_arg(arg: Option<&str>) -> Result<RepoDiffSpec, Pra
             ));
         }
     };
-    Ok(RepoDiffSpec { mode, kind, target })
+    if max_content_bytes.is_some() && !include_content {
+        return Err(pragma_fail("diff --max-content-bytes requires --content"));
+    }
+    let content = if include_content {
+        if mode != DiffMode::Default {
+            return Err(pragma_fail("diff --content cannot be combined with --rows"));
+        }
+        if kind.is_some_and(|kind| kind != RepoTrackedPathKind::TextFile) {
+            return Err(pragma_fail("diff --content only supports text_file paths"));
+        }
+        if !matches!(
+            &target,
+            RepoDiffTarget::Revisions { path: Some(path), .. } if !path.is_empty()
+        ) {
+            return Err(pragma_fail(
+                "diff --content requires explicit from and to revisions and one path",
+            ));
+        }
+        Some(RepoTextContentSpec {
+            max_bytes: ByteUnit::new(
+                max_content_bytes.unwrap_or(DEFAULT_TEXT_DIFF_CONTENT_LIMIT.as_u64()),
+            ),
+        })
+    } else {
+        None
+    };
+    Ok(RepoDiffSpec { mode, kind, target, content })
 }
 
 pub(super) fn parse_volume_diff_arg(arg: &str) -> Result<(LSN, LSN, DiffMode), PragmaErr> {

@@ -32,6 +32,65 @@ impl Repository {
         ))
     }
 
+    pub fn diff_text_content(
+        &self,
+        artifact: &RepoArtifactDiff,
+        max_bytes: ByteUnit,
+    ) -> Result<RepoTextContentDiff> {
+        if artifact.kind != RepoTrackedPathKind::TextFile {
+            return Err(RepoErr::PathNotTextArtifact(artifact.path.clone()));
+        }
+        if artifact
+            .from
+            .iter()
+            .chain(artifact.to.iter())
+            .any(|state| state.kind() != RepoTrackedPathKind::TextFile)
+        {
+            return Err(RepoErr::PathNotTextArtifact(artifact.path.clone()));
+        }
+        if max_bytes == ByteUnit::ZERO {
+            return Err(RepoErr::InvalidTextDiffContentLimit);
+        }
+
+        Ok(RepoTextContentDiff {
+            path: artifact.path.clone(),
+            change: artifact.change,
+            kind: artifact.kind,
+            storage: artifact.storage,
+            before: self.text_content_state(artifact.from.as_ref(), max_bytes)?,
+            after: self.text_content_state(artifact.to.as_ref(), max_bytes)?,
+        })
+    }
+
+    fn text_content_state(
+        &self,
+        state: Option<&CommitArtifactState>,
+        max_bytes: ByteUnit,
+    ) -> Result<RepoTextContentState> {
+        let Some(state) = state else {
+            return Ok(RepoTextContentState::Absent);
+        };
+        let content_hash = state.content_hash().clone();
+        let size = state.size();
+        if size > max_bytes.as_u64() {
+            return Ok(RepoTextContentState::TooLarge { size, content_hash });
+        }
+
+        let bytes = match self.artifact_bytes(state) {
+            Ok(bytes) => bytes,
+            Err(RepoErr::Io(err))
+                if state.is_large() && err.kind() == std::io::ErrorKind::NotFound =>
+            {
+                return Ok(RepoTextContentState::MissingPayload { size, content_hash });
+            }
+            Err(err) => return Err(err),
+        };
+        match String::from_utf8(bytes) {
+            Ok(content) => Ok(RepoTextContentState::Utf8 { content, size, content_hash }),
+            Err(_) => Ok(RepoTextContentState::InvalidUtf8 { size, content_hash }),
+        }
+    }
+
     pub fn diff_staged(&self, path: Option<&str>) -> Result<RepoDiff> {
         let from = self.head_target()?.unwrap_or_else(|| "HEAD".to_string());
         let head_files = self.head_files()?;

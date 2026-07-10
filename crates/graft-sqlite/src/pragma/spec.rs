@@ -38,6 +38,12 @@ pub(crate) struct RepoDiffSpec {
     pub(super) mode: DiffMode,
     pub(super) kind: Option<RepoTrackedPathKind>,
     pub(super) target: RepoDiffTarget,
+    pub(super) content: Option<RepoTextContentSpec>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RepoTextContentSpec {
+    pub(super) max_bytes: ByteUnit,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

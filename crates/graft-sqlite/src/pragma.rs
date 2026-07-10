@@ -13,6 +13,7 @@ use std::{
 
 use graft::core::{
     LogId, PageIdx, VolumeId,
+    byte_unit::ByteUnit,
     logref::LogRef,
     lsn::{LSN, LSNRangeExt},
     page::{PAGESIZE, Page},
@@ -25,9 +26,9 @@ use graft::repo::{
     RepoArtifactAudit, RepoArtifactAuditIssueKind, RepoArtifactRepairOutcome, RepoConfigEntry,
     RepoDiff, RepoFileChange, RepoLargeFileFetchOutcome, RepoLargeFileFetchStatus,
     RepoLargeFilePruneOutcome, RepoLargeFileStatusOutcome, RepoLargeFileStatusState, RepoLogRange,
-    RepoPathStorage, RepoSnapshot, RepoStatus, RepoStorageCommit, RepoTrackedPath,
-    RepoTrackedPathDetail, RepoTrackedPathEntry, RepoTrackedPathKind, RepoWorktreeChangeKind,
-    Repository, ResetMode, ResetOutcome, TagInfo,
+    RepoPathStorage, RepoSnapshot, RepoStatus, RepoStorageCommit, RepoTextContentDiff,
+    RepoTrackedPath, RepoTrackedPathDetail, RepoTrackedPathEntry, RepoTrackedPathKind,
+    RepoWorktreeChangeKind, Repository, ResetMode, ResetOutcome, TagInfo,
 };
 use graft::{
     rt::runtime::Runtime, volume::AheadStatus, volume_reader::VolumeRead,
@@ -627,7 +628,7 @@ pub(crate) enum GraftPragma {
     /// Legacy Volume diff as JSON. mode: omitted=summary, "rows"=row-level detail
     VolumeJsonDiff { from: LSN, to: LSN, mode: DiffMode },
 
-    /// `pragma graft_json_diff = "[--rows] [--kind kind] [--staged] [rev] [rev] [-- path]";`
+    /// `pragma graft_json_diff = "[--rows] [--content [--max-content-bytes bytes]] [--kind kind] [--staged] [rev] [rev] [-- path]";`
     /// Repository diff as JSON
     JsonRepoDiff { spec: RepoDiffSpec },
 
@@ -2190,6 +2191,9 @@ impl GraftPragma {
                 if !file.is_idle() {
                     return pragma_err!("cannot diff while there is an open transaction");
                 }
+                if spec.content.is_some() {
+                    return pragma_err!("diff --content is only available through graft_json_diff");
+                }
                 let mode = spec.mode;
                 let repo = repo_for_file(file)?;
                 let diff = repo_diff_for_spec(&runtime, file, &repo, spec)?;
@@ -2351,15 +2355,30 @@ impl GraftPragma {
                 let mode = spec.mode;
                 let kind = spec.kind.map(repo_tracked_path_kind_json_label);
                 let repo = repo_for_file(file)?;
-                let diff = repo_diff_for_spec(&runtime, file, &repo, spec)?;
+                let content_request = match (&spec.content, &spec.target) {
+                    (Some(content), RepoDiffTarget::Revisions { path: Some(path), .. }) => {
+                        Some((repo_path_arg(&repo, path)?, content.max_bytes))
+                    }
+                    (Some(_), _) => unreachable!("content diff target is validated while parsing"),
+                    (None, _) => None,
+                };
+                let mut diff = repo_diff_for_spec(&runtime, file, &repo, spec)?;
                 let (current_head, current_branch) = repo_head_and_branch(&repo)?;
                 match mode {
-                    DiffMode::Default => Ok(Some(to_json(&JsonRepoDiffOutcome {
-                        current_head,
-                        current_branch,
-                        kind,
-                        diff,
-                    })?)),
+                    DiffMode::Default => {
+                        let content = content_request
+                            .map(|(path, max_bytes)| {
+                                repo_text_content_for_path(&repo, &mut diff, &path, max_bytes)
+                            })
+                            .transpose()?;
+                        Ok(Some(to_json(&JsonRepoDiffOutcome {
+                            current_head,
+                            current_branch,
+                            kind,
+                            diff,
+                            content,
+                        })?))
+                    }
                     DiffMode::Rows => {
                         let rows = json_repo_row_diff(&runtime, &repo, &diff)?;
                         Ok(Some(to_json(&JsonRepoDiffOutcome {
@@ -2367,6 +2386,7 @@ impl GraftPragma {
                             current_branch,
                             kind,
                             diff: rows,
+                            content: None,
                         })?))
                     }
                 }

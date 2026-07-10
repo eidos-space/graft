@@ -136,6 +136,29 @@ pub(super) fn filter_repo_diff_by_kind(diff: &mut RepoDiff, kind: Option<RepoTra
     diff.refresh_paths();
 }
 
+pub(super) fn repo_text_content_for_path(
+    repo: &Repository,
+    diff: &mut RepoDiff,
+    path: &str,
+    max_bytes: ByteUnit,
+) -> Result<RepoTextContentDiff, ErrCtx> {
+    let Some(artifact) = diff
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.path == path)
+        .cloned()
+    else {
+        return pragma_err!(format!(
+            "path `{path}` is not a changed text artifact in this comparison"
+        ));
+    };
+    let content = repo.diff_text_content(&artifact, max_bytes)?;
+    diff.files.clear();
+    diff.artifacts.retain(|artifact| artifact.path == path);
+    diff.refresh_paths();
+    Ok(content)
+}
+
 pub(super) fn repo_worktree_diff_for_filter(
     runtime: &Runtime,
     file: &VolFile,

@@ -1660,6 +1660,127 @@ fn diff_path_filter_matches_directory_prefix() {
 }
 
 #[test]
+fn diff_text_content_reports_utf8_and_absent_states_without_mutation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = Repository::init(tmp.path()).unwrap();
+    let anchor = tmp.path().join("anchor.txt");
+    let note = tmp.path().join("note.md");
+
+    fs::write(&anchor, "anchor").unwrap();
+    repo.stage_artifact_path(&anchor).unwrap();
+    let first = repo.commit_staged("anchor").unwrap();
+    fs::write(&note, "# Hello\n").unwrap();
+    repo.stage_artifact_path(&note).unwrap();
+    let second = repo.commit_staged("add note").unwrap();
+
+    let diff = repo
+        .diff_revisions(&first.id, &second.id, Some("note.md"))
+        .unwrap();
+    let before_status = repo.status().unwrap();
+    let content = repo
+        .diff_text_content(&diff.artifacts[0], ByteUnit::new(128))
+        .unwrap();
+
+    assert_eq!(content.before, RepoTextContentState::Absent);
+    assert!(matches!(
+        content.after,
+        RepoTextContentState::Utf8 { content, size: 8, .. } if content == "# Hello\n"
+    ));
+    let after_status = repo.status().unwrap();
+    assert_eq!(after_status.head_target, before_status.head_target);
+    assert_eq!(after_status.staged, before_status.staged);
+    assert_eq!(after_status.unstaged, before_status.unstaged);
+    assert_eq!(after_status.conflicted, before_status.conflicted);
+    assert_eq!(fs::read_to_string(&note).unwrap(), "# Hello\n");
+
+    fs::remove_file(&note).unwrap();
+    repo.stage_file_removal(&note).unwrap();
+    let third = repo.commit_staged("remove note").unwrap();
+    let deleted = repo
+        .diff_revisions(&second.id, &third.id, Some("note.md"))
+        .unwrap();
+    let deleted_content = repo
+        .diff_text_content(&deleted.artifacts[0], ByteUnit::new(128))
+        .unwrap();
+    assert!(matches!(
+        deleted_content.before,
+        RepoTextContentState::Utf8 { .. }
+    ));
+    assert_eq!(deleted_content.after, RepoTextContentState::Absent);
+}
+
+#[test]
+fn diff_text_content_bounds_and_reports_missing_external_payloads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = Repository::init(tmp.path()).unwrap();
+    let note = tmp.path().join("note.md");
+
+    fs::write(&note, "old external text").unwrap();
+    repo.stage_artifact_path_with_inline_text_threshold(&note, 1)
+        .unwrap();
+    let first = repo.commit_staged("old note").unwrap();
+    fs::write(&note, "new external text").unwrap();
+    repo.stage_artifact_path_with_inline_text_threshold(&note, 1)
+        .unwrap();
+    let second = repo.commit_staged("new note").unwrap();
+    let diff = repo
+        .diff_revisions(&first.id, &second.id, Some("note.md"))
+        .unwrap();
+
+    let bounded = repo
+        .diff_text_content(&diff.artifacts[0], ByteUnit::new(4))
+        .unwrap();
+    assert!(matches!(
+        bounded.before,
+        RepoTextContentState::TooLarge { size: 17, .. }
+    ));
+    assert!(matches!(
+        bounded.after,
+        RepoTextContentState::TooLarge { size: 17, .. }
+    ));
+
+    let before = diff.artifacts[0].from.as_ref().unwrap();
+    fs::remove_file(repo.large_file_content_path(before.content_hash())).unwrap();
+    let missing = repo
+        .diff_text_content(&diff.artifacts[0], ByteUnit::new(128))
+        .unwrap();
+    assert!(matches!(
+        missing.before,
+        RepoTextContentState::MissingPayload { .. }
+    ));
+    assert!(matches!(missing.after, RepoTextContentState::Utf8 { .. }));
+}
+
+#[test]
+fn diff_text_content_reports_invalid_full_utf8() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = Repository::init(tmp.path()).unwrap();
+    let anchor = tmp.path().join("anchor.txt");
+    let note = tmp.path().join("note.md");
+
+    fs::write(&anchor, "anchor").unwrap();
+    repo.stage_artifact_path(&anchor).unwrap();
+    let first = repo.commit_staged("anchor").unwrap();
+    let mut invalid = vec![b'a'; CONTENT_CLASS_SAMPLE_BYTES];
+    invalid.push(0xff);
+    fs::write(&note, invalid).unwrap();
+    repo.stage_artifact_path(&note).unwrap();
+    let second = repo.commit_staged("invalid note").unwrap();
+
+    let diff = repo
+        .diff_revisions(&first.id, &second.id, Some("note.md"))
+        .unwrap();
+    assert_eq!(diff.artifacts[0].kind, RepoTrackedPathKind::TextFile);
+    let content = repo
+        .diff_text_content(&diff.artifacts[0], ByteUnit::new(16 * 1024))
+        .unwrap();
+    assert!(matches!(
+        content.after,
+        RepoTextContentState::InvalidUtf8 { size: 8193, .. }
+    ));
+}
+
+#[test]
 fn diff_staged_and_worktree_file_reports_git_like_states() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = Repository::init(tmp.path()).unwrap();

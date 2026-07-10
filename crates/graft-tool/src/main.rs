@@ -1,5 +1,6 @@
 use std::{
     io::Read,
+    num::NonZeroU64,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
@@ -145,6 +146,18 @@ enum Command {
         /// Filter changed paths by kind
         #[arg(long, value_enum)]
         kind: Option<PathKind>,
+
+        /// Include bounded UTF-8 content for one changed text path
+        #[arg(
+            long,
+            requires_all = ["json", "from", "to", "path"],
+            conflicts_with_all = ["rows", "staged"]
+        )]
+        content: bool,
+
+        /// Maximum content bytes to read from each side
+        #[arg(long, requires = "content")]
+        max_content_bytes: Option<NonZeroU64>,
 
         /// Source revision, for example HEAD~1
         from: Option<String>,
@@ -907,16 +920,28 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
                 Some(&message),
             )?);
         }
-        Command::Diff { rows, staged, kind, from, to, path, json } => {
+        Command::Diff {
+            rows,
+            staged,
+            kind,
+            content,
+            max_content_bytes,
+            from,
+            to,
+            path,
+            json,
+        } => {
             let suffix = if json { "json_diff" } else { "diff" };
-            let arg = repo_diff_arg(
+            let arg = repo_diff_arg(RepoDiffArgSpec {
                 rows,
                 staged,
                 kind,
-                from.as_deref(),
-                to.as_deref(),
-                path.as_deref(),
-            )?;
+                content,
+                max_content_bytes,
+                from: from.as_deref(),
+                to: to.as_deref(),
+                path: path.as_deref(),
+            })?;
             print_output(run_repo_pragma(db_override, None, suffix, arg.as_deref())?);
         }
         Command::Show { rev, json } => {
@@ -1729,14 +1754,35 @@ fn push_pragma(json: bool) -> &'static str {
     if json { "json_push" } else { "push" }
 }
 
-fn repo_diff_arg(
+#[derive(Default)]
+struct RepoDiffArgSpec<'a> {
     rows: bool,
     staged: bool,
     kind: Option<PathKind>,
-    from: Option<&str>,
-    to: Option<&str>,
-    path: Option<&Path>,
-) -> Result<Option<String>> {
+    content: bool,
+    max_content_bytes: Option<NonZeroU64>,
+    from: Option<&'a str>,
+    to: Option<&'a str>,
+    path: Option<&'a Path>,
+}
+
+fn repo_diff_arg(spec: RepoDiffArgSpec<'_>) -> Result<Option<String>> {
+    let RepoDiffArgSpec {
+        rows,
+        staged,
+        kind,
+        content,
+        max_content_bytes,
+        from,
+        to,
+        path,
+    } = spec;
+    if max_content_bytes.is_some() && !content {
+        bail!("--max-content-bytes requires --content");
+    }
+    if content && (rows || staged || from.is_none() || to.is_none() || path.is_none()) {
+        bail!("--content requires JSON, explicit from and to revisions, and one path");
+    }
     let mut prefixes = Vec::new();
     if rows {
         prefixes.push("--rows".to_string());
@@ -1744,6 +1790,13 @@ fn repo_diff_arg(
     if let Some(kind) = kind {
         prefixes.push("--kind".to_string());
         prefixes.push(path_kind_arg(kind).to_string());
+    }
+    if content {
+        prefixes.push("--content".to_string());
+        if let Some(max_content_bytes) = max_content_bytes {
+            prefixes.push("--max-content-bytes".to_string());
+            prefixes.push(max_content_bytes.get().to_string());
+        }
     }
     let prefix = prefixes.join(" ");
     if staged {
@@ -2950,34 +3003,55 @@ mod tests {
         ])
         .unwrap();
 
-        let Command::Diff { rows, staged, kind, from, to, path, json } = cli.command else {
+        let Command::Diff {
+            rows,
+            staged,
+            kind,
+            content,
+            max_content_bytes,
+            from,
+            to,
+            path,
+            json,
+        } = cli.command
+        else {
             panic!("expected diff command");
         };
         assert!(rows);
         assert!(!staged);
         assert_eq!(kind, None);
+        assert!(!content);
+        assert_eq!(max_content_bytes, None);
         assert_eq!(from.as_deref(), Some("HEAD~1"));
         assert_eq!(to.as_deref(), Some("HEAD"));
         assert_eq!(path, Some(PathBuf::from("app.db")));
         assert!(json);
         assert_eq!(
-            repo_diff_arg(
+            repo_diff_arg(RepoDiffArgSpec {
                 rows,
                 staged,
                 kind,
-                from.as_deref(),
-                to.as_deref(),
-                path.as_deref()
-            )
+                content,
+                max_content_bytes,
+                from: from.as_deref(),
+                to: to.as_deref(),
+                path: path.as_deref(),
+            })
             .unwrap(),
             Some("--rows HEAD~1 HEAD -- app.db".to_string())
         );
         assert_eq!(
-            repo_diff_arg(true, true, None, Some("app.db"), None, None).unwrap(),
+            repo_diff_arg(RepoDiffArgSpec {
+                rows: true,
+                staged: true,
+                from: Some("app.db"),
+                ..Default::default()
+            })
+            .unwrap(),
             Some("--rows --staged -- app.db".to_string())
         );
         assert_eq!(
-            repo_diff_arg(true, false, None, None, None, None).unwrap(),
+            repo_diff_arg(RepoDiffArgSpec { rows: true, ..Default::default() }).unwrap(),
             Some("--rows".to_string())
         );
 
@@ -2990,27 +3064,130 @@ mod tests {
             "--staged",
         ])
         .unwrap();
-        let Command::Diff { rows, staged, kind, from, to, path, json } = cli.command else {
+        let Command::Diff {
+            rows,
+            staged,
+            kind,
+            content,
+            max_content_bytes,
+            from,
+            to,
+            path,
+            json,
+        } = cli.command
+        else {
             panic!("expected diff command");
         };
         assert!(!rows);
         assert!(staged);
         assert_eq!(kind, Some(PathKind::BinaryFile));
+        assert!(!content);
+        assert_eq!(max_content_bytes, None);
         assert_eq!(from, None);
         assert_eq!(to, None);
         assert_eq!(path, None);
         assert!(json);
         assert_eq!(
-            repo_diff_arg(
+            repo_diff_arg(RepoDiffArgSpec {
                 rows,
                 staged,
                 kind,
-                from.as_deref(),
-                to.as_deref(),
-                path.as_deref()
-            )
+                content,
+                max_content_bytes,
+                from: from.as_deref(),
+                to: to.as_deref(),
+                path: path.as_deref(),
+            })
             .unwrap(),
             Some("--kind binary_file --staged".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_bounded_single_path_text_content_diff() {
+        let cli = Cli::try_parse_from([
+            "graft",
+            "diff",
+            "--json",
+            "--content",
+            "--max-content-bytes",
+            "4096",
+            "HEAD~1",
+            "HEAD",
+            "--",
+            "notes/readme.md",
+        ])
+        .unwrap();
+        let Command::Diff {
+            rows,
+            staged,
+            kind,
+            content,
+            max_content_bytes,
+            from,
+            to,
+            path,
+            json,
+        } = cli.command
+        else {
+            panic!("expected diff command");
+        };
+
+        assert!(json);
+        assert!(content);
+        assert!(!rows);
+        assert!(!staged);
+        assert_eq!(kind, None);
+        assert_eq!(max_content_bytes.map(NonZeroU64::get), Some(4096));
+        assert_eq!(
+            repo_diff_arg(RepoDiffArgSpec {
+                rows,
+                staged,
+                kind,
+                content,
+                max_content_bytes,
+                from: from.as_deref(),
+                to: to.as_deref(),
+                path: path.as_deref(),
+            })
+            .unwrap(),
+            Some("--content --max-content-bytes 4096 HEAD~1 HEAD -- notes/readme.md".to_string())
+        );
+
+        assert!(
+            Cli::try_parse_from(["graft", "diff", "--content", "HEAD~1", "HEAD", "note.md",])
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["graft", "diff", "--json", "--content", "HEAD~1", "HEAD"])
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "graft",
+                "diff",
+                "--json",
+                "--rows",
+                "--content",
+                "HEAD~1",
+                "HEAD",
+                "note.md",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "graft",
+                "diff",
+                "--json",
+                "--content",
+                "--max-content-bytes",
+                "0",
+                "HEAD~1",
+                "HEAD",
+                "note.md",
+            ])
+            .is_err()
         );
     }
 

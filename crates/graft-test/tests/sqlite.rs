@@ -2304,6 +2304,36 @@ fn test_repo_pragmas_track_regular_file_artifacts() {
     );
     assert!(pragma_arg_string(&sqlite, "graft_commit", "notes v2").contains("notes v2"));
 
+    let status_before: Value =
+        serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status")).unwrap();
+    let content_diff: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_diff",
+        "--content HEAD~1 HEAD -- notes.txt",
+    ))
+    .expect("graft_json_diff --content should return text content JSON");
+    assert_eq!(content_diff["content"]["path"], "notes.txt");
+    assert_eq!(content_diff["content"]["change"], "modified");
+    assert_eq!(content_diff["content"]["kind"], "text_file");
+    assert_eq!(content_diff["content"]["before"]["state"], "utf8");
+    assert_eq!(content_diff["content"]["before"]["content"], "first note");
+    assert_eq!(content_diff["content"]["after"]["state"], "utf8");
+    assert_eq!(content_diff["content"]["after"]["content"], "second note");
+    assert_eq!(content_diff["paths"].as_array().unwrap().len(), 1);
+
+    let bounded: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_diff",
+        "--content --max-content-bytes 4 HEAD~1 HEAD -- notes.txt",
+    ))
+    .expect("graft_json_diff --content should enforce its byte limit");
+    assert_eq!(bounded["content"]["before"]["state"], "too_large");
+    assert_eq!(bounded["content"]["after"]["state"], "too_large");
+    assert_eq!(std::fs::read_to_string(&notes).unwrap(), "second note");
+    let status_after: Value =
+        serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status")).unwrap();
+    assert_eq!(status_after, status_before);
+
     std::fs::remove_file(&notes).unwrap();
     let checkout = pragma_arg_string(&sqlite, "graft_checkout", "HEAD~1 -- notes.txt");
     assert!(checkout.contains("Checked out notes.txt"));

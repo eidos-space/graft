@@ -517,6 +517,7 @@ fn parse_repo_diff_arg_supports_row_mode() {
             mode: DiffMode::Rows,
             kind: None,
             target: RepoDiffTarget::Worktree { path: None },
+            content: None,
         }
     );
     assert_eq!(
@@ -525,6 +526,7 @@ fn parse_repo_diff_arg_supports_row_mode() {
             mode: DiffMode::Rows,
             kind: None,
             target: RepoDiffTarget::Staged { path: Some("app.db".to_string()) },
+            content: None,
         }
     );
     assert_eq!(
@@ -533,6 +535,7 @@ fn parse_repo_diff_arg_supports_row_mode() {
             mode: DiffMode::Default,
             kind: Some(RepoTrackedPathKind::SqliteDatabase),
             target: RepoDiffTarget::Staged { path: None },
+            content: None,
         }
     );
     assert_eq!(
@@ -545,6 +548,7 @@ fn parse_repo_diff_arg_supports_row_mode() {
                 to: "HEAD".to_string(),
                 path: Some("app.db".to_string()),
             },
+            content: None,
         }
     );
     assert_eq!(
@@ -556,11 +560,54 @@ fn parse_repo_diff_arg_supports_row_mode() {
                 rev: "HEAD".to_string(),
                 path: Some("--rows".to_string()),
             },
+            content: None,
         }
     );
     assert!(parse_repo_diff_arg(Some("--rows --rows")).is_err());
     assert!(parse_repo_diff_arg(Some("--kind nope")).is_err());
     assert!(parse_repo_diff_arg(Some("--kind db --kind text_file")).is_err());
+}
+
+#[test]
+fn parse_repo_diff_arg_requires_bounded_single_path_content_mode() {
+    assert_eq!(
+        parse_repo_diff_arg(Some("--content HEAD~1 HEAD -- notes/readme.md")).unwrap(),
+        RepoDiffSpec {
+            mode: DiffMode::Default,
+            kind: None,
+            target: RepoDiffTarget::Revisions {
+                from: "HEAD~1".to_string(),
+                to: "HEAD".to_string(),
+                path: Some("notes/readme.md".to_string()),
+            },
+            content: Some(RepoTextContentSpec {
+                max_bytes: graft::repo::DEFAULT_TEXT_DIFF_CONTENT_LIMIT,
+            }),
+        }
+    );
+    assert_eq!(
+        parse_repo_diff_arg(Some(
+            "--content --max-content-bytes 4096 HEAD~1 HEAD -- notes/readme.md",
+        ))
+        .unwrap()
+        .content,
+        Some(RepoTextContentSpec { max_bytes: ByteUnit::new(4096) })
+    );
+
+    for invalid in [
+        "--content",
+        "--content HEAD~1",
+        "--content HEAD~1 HEAD",
+        "--rows --content HEAD~1 HEAD -- note.md",
+        "--content --kind db HEAD~1 HEAD -- note.md",
+        "--max-content-bytes 4 HEAD~1 HEAD -- note.md",
+        "--content --max-content-bytes 0 HEAD~1 HEAD -- note.md",
+    ] {
+        assert!(
+            parse_repo_diff_arg(Some(invalid)).is_err(),
+            "accepted {invalid}"
+        );
+    }
 }
 
 #[test]
