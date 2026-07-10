@@ -2709,9 +2709,8 @@ fn test_repo_add_stages_file_directory_topology_changes() {
 
     std::fs::remove_dir_all(&shape).unwrap();
     std::fs::write(&shape, "file topology again").unwrap();
-    let added: Value =
-        serde_json::from_str(&pragma_arg_string(&sqlite, "graft_json_add", "shape"))
-            .expect("adding a file should stage its conflicting tracked descendants");
+    let added: Value = serde_json::from_str(&pragma_arg_string(&sqlite, "graft_json_add", "shape"))
+        .expect("adding a file should stage its conflicting tracked descendants");
     assert_eq!(
         added["paths"],
         serde_json::json!([
@@ -2744,6 +2743,25 @@ fn test_repo_add_stages_file_directory_topology_changes() {
     let paths = tracked["paths"].as_array().unwrap();
     assert!(!paths.iter().any(|entry| entry["path"] == "shape"));
     assert!(paths.iter().any(|entry| entry["path"] == "shape/child.md"));
+
+    std::fs::remove_file(shape.join("child.md")).unwrap();
+    let added: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_add",
+        "shape/child.md",
+    ))
+    .expect("adding a deleted path should stage its removal");
+    assert_eq!(
+        added["paths"],
+        serde_json::json!([
+            { "path": "shape/child.md", "change": "deleted", "kind": "text_file", "storage": "inline" }
+        ])
+    );
+    pragma_arg_string(&sqlite, "graft_commit", "remove the selected child");
+    let tracked: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_ls_files"))
+        .expect("tracked paths should be valid JSON");
+    let paths = tracked["paths"].as_array().unwrap();
+    assert!(!paths.iter().any(|entry| entry["path"] == "shape/child.md"));
 
     runtime.shutdown().unwrap();
 }

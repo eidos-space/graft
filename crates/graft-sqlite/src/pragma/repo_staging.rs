@@ -182,7 +182,14 @@ pub(super) fn stage_repo_add_path(
         graft::repo::validate_repo_path_identity(path)?;
     }
     let physical_path = repo_input_path(repo, path);
-    let metadata = std::fs::metadata(&physical_path)?;
+    let metadata = match std::fs::metadata(&physical_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let key = repo.file_key(&physical_path)?;
+            return Ok(vec![repo.stage_file_removal_key(key)?]);
+        }
+        Err(err) => return Err(err.into()),
+    };
     let current_key = repo.file_key(&file.tag)?;
 
     if metadata.is_dir() {
