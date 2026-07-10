@@ -4981,6 +4981,144 @@ fn test_repo_restore_root_rejects_ignored_untracked_collision_before_mutation() 
 }
 
 #[test]
+fn test_repo_restore_root_changes_directory_to_file_topology() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_path.to_str().unwrap(), None);
+    pragma_query_string(&sqlite, "graft_init");
+
+    let shape = temp_dir.path().join("shape");
+    std::fs::write(&shape, "source file\n").unwrap();
+    pragma_arg_string(&sqlite, "graft_add", "--all");
+    pragma_arg_string(&sqlite, "graft_commit", "file topology");
+
+    std::fs::remove_file(&shape).unwrap();
+    std::fs::create_dir(&shape).unwrap();
+    std::fs::write(shape.join("child.md"), "current child\n").unwrap();
+    let repo = Repository::open(temp_dir.path()).unwrap();
+    repo.stage_file_removal_key("shape").unwrap();
+    repo.stage_artifact_path(shape.join("child.md")).unwrap();
+    repo.commit_staged("directory topology").unwrap();
+    std::fs::write(temp_dir.path().join("untracked.md"), "keep me\n").unwrap();
+
+    let head_before = repo.resolve_revision("HEAD").unwrap();
+    let index_before = repo.read_index().unwrap();
+    let restored: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_restore",
+        "--source HEAD~1 -- .",
+    ))
+    .unwrap();
+
+    assert_eq!(restored["current_head"], head_before);
+    assert_eq!(std::fs::read_to_string(&shape).unwrap(), "source file\n");
+    assert!(!shape.join("child.md").exists());
+    assert_eq!(
+        std::fs::read_to_string(temp_dir.path().join("untracked.md")).unwrap(),
+        "keep me\n"
+    );
+    assert_eq!(repo.read_index().unwrap(), index_before);
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_restore_root_changes_file_to_directory_topology() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_path.to_str().unwrap(), None);
+    pragma_query_string(&sqlite, "graft_init");
+
+    let shape = temp_dir.path().join("shape");
+    std::fs::create_dir(&shape).unwrap();
+    std::fs::write(shape.join("child.md"), "source child\n").unwrap();
+    pragma_arg_string(&sqlite, "graft_add", "--all");
+    pragma_arg_string(&sqlite, "graft_commit", "directory topology");
+
+    std::fs::remove_dir_all(&shape).unwrap();
+    std::fs::write(&shape, "current file\n").unwrap();
+    let repo = Repository::open(temp_dir.path()).unwrap();
+    repo.stage_file_removal_key("shape/child.md").unwrap();
+    repo.stage_artifact_path(&shape).unwrap();
+    repo.commit_staged("file topology").unwrap();
+
+    let head_before = repo.resolve_revision("HEAD").unwrap();
+    let index_before = repo.read_index().unwrap();
+    let restored: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_restore",
+        "--source HEAD~1 -- .",
+    ))
+    .unwrap();
+
+    assert_eq!(restored["current_head"], head_before);
+    assert!(shape.is_dir());
+    assert_eq!(
+        std::fs::read_to_string(shape.join("child.md")).unwrap(),
+        "source child\n"
+    );
+    assert_eq!(repo.read_index().unwrap(), index_before);
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_restore_root_preserves_ignored_untracked_descendant_on_topology_change() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_path.to_str().unwrap(), None);
+    pragma_query_string(&sqlite, "graft_init");
+
+    let shape = temp_dir.path().join("shape");
+    let anchor = temp_dir.path().join("a-anchor.md");
+    std::fs::write(&shape, "source file\n").unwrap();
+    std::fs::write(&anchor, "source anchor\n").unwrap();
+    std::fs::write(temp_dir.path().join(".graftignore"), "shape/private.md\n").unwrap();
+    pragma_arg_string(&sqlite, "graft_add", "--all");
+    pragma_arg_string(&sqlite, "graft_commit", "file topology");
+
+    std::fs::remove_file(&shape).unwrap();
+    std::fs::create_dir(&shape).unwrap();
+    std::fs::write(shape.join("child.md"), "current child\n").unwrap();
+    std::fs::write(&anchor, "current anchor\n").unwrap();
+    let repo = Repository::open(temp_dir.path()).unwrap();
+    repo.stage_file_removal_key("shape").unwrap();
+    repo.stage_artifact_path(shape.join("child.md")).unwrap();
+    repo.stage_artifact_path(&anchor).unwrap();
+    repo.commit_staged("directory topology").unwrap();
+    std::fs::write(shape.join("private.md"), "ignored private\n").unwrap();
+
+    let error = pragma_arg_error(&sqlite, "graft_json_restore", "--source HEAD~1 -- .");
+    assert!(
+        error.contains("untracked") && error.contains("shape/private.md"),
+        "{error}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&anchor).unwrap(),
+        "current anchor\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(shape.join("child.md")).unwrap(),
+        "current child\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(shape.join("private.md")).unwrap(),
+        "ignored private\n"
+    );
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
 fn test_repo_restore_root_rejects_late_directory_before_mutation() {
     graft_test::ensure_test_env();
 

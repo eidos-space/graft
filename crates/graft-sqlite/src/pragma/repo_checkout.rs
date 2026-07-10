@@ -734,22 +734,15 @@ pub(super) fn restore_repo_path(
     let is_directory = std::fs::symlink_metadata(&physical_path)
         .map(|metadata| metadata.file_type().is_dir())
         .unwrap_or(false);
-    if is_directory {
+    let pathspec_keys = restore_keys_for_pathspec(repo, spec, &key)?;
+    let changes_topology = pathspec_keys
+        .iter()
+        .any(|candidate| candidate != &key && repo_key_matches_filter(candidate, &key));
+    if is_directory || changes_topology {
         return restore_repo_directory(runtime, file, repo, spec, &key);
     }
 
-    match restore_repo_keys(runtime, file, repo, spec, vec![key.clone()]) {
-        Ok(outcome) => Ok(outcome),
-        Err(ErrCtx::PragmaErr(_)) | Err(ErrCtx::Repo(graft::repo::RepoErr::PathNotTracked(_))) => {
-            let keys = restore_keys_for_pathspec(repo, spec, &key)?;
-            if keys.is_empty() {
-                restore_repo_keys(runtime, file, repo, spec, vec![key])
-            } else {
-                restore_repo_keys(runtime, file, repo, spec, keys)
-            }
-        }
-        Err(err) => Err(err),
-    }
+    restore_repo_keys(runtime, file, repo, spec, vec![key])
 }
 
 pub(super) fn restore_repo_staged_all(
@@ -810,7 +803,29 @@ pub(super) fn restore_repo_keys(
     preflight_restore_repo_keys(runtime, file, repo, &plan)?;
     // Individual replacements are atomic, but filesystems do not provide a cross-path
     // transaction. A new OS I/O error during apply can therefore leave a restored prefix.
-    for entry in &plan {
+    let mut deletions = plan
+        .iter()
+        .filter(|entry| entry.restored.is_none())
+        .collect::<Vec<_>>();
+    deletions.sort_by(|left, right| {
+        restore_key_depth(&right.key)
+            .cmp(&restore_key_depth(&left.key))
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    for entry in deletions {
+        apply_restored_repo_key(runtime, file, repo, &entry.key, entry.restored.as_ref())?;
+    }
+    let mut restorations = plan
+        .iter()
+        .filter(|entry| entry.restored.is_some())
+        .collect::<Vec<_>>();
+    restorations.sort_by(|left, right| {
+        restore_key_depth(&left.key)
+            .cmp(&restore_key_depth(&right.key))
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    for entry in restorations {
+        prepare_restore_repo_key_target(repo, &entry.key)?;
         apply_restored_repo_key(runtime, file, repo, &entry.key, entry.restored.as_ref())?;
     }
     for entry in &plan {
@@ -853,7 +868,7 @@ pub(super) fn plan_restore_repo_keys(
         .filter(|key| plan_keys.contains(*key))
         .cloned()
         .collect::<BTreeSet<_>>();
-    validate_restore_plan_path_conflicts(&restored_keys, &plan_keys)?;
+    validate_restore_plan_path_conflicts(&restored_keys)?;
 
     keys.into_iter()
         .map(|key| {
@@ -890,10 +905,9 @@ pub(super) fn plan_restore_repo_keys(
 
 pub(super) fn validate_restore_plan_path_conflicts(
     restored_keys: &BTreeSet<String>,
-    plan_keys: &BTreeSet<String>,
 ) -> Result<(), ErrCtx> {
     for parent in restored_keys {
-        if let Some(descendant) = plan_keys
+        if let Some(descendant) = restored_keys
             .iter()
             .find(|key| *key != parent && repo_key_matches_filter(key, parent))
         {
@@ -931,8 +945,18 @@ pub(super) fn preflight_restore_repo_keys(
     repo: &Repository,
     plan: &[RepoRestoreKeyPlan],
 ) -> Result<(), ErrCtx> {
+    let planned_deletions = plan
+        .iter()
+        .filter(|entry| entry.restored.is_none())
+        .map(|entry| entry.key.clone())
+        .collect::<BTreeSet<_>>();
+    let restored_keys = plan
+        .iter()
+        .filter(|entry| entry.restored.is_some())
+        .map(|entry| entry.key.clone())
+        .collect::<BTreeSet<_>>();
     for entry in plan {
-        preflight_restore_repo_key_path(repo, &entry.key)?;
+        preflight_restore_repo_key_path(repo, entry, &planned_deletions, &restored_keys)?;
     }
     ensure_restore_keys_preserve_untracked_paths(file, repo, plan)?;
     for entry in plan {
@@ -949,7 +973,13 @@ pub(super) fn preflight_restore_repo_keys(
     Ok(())
 }
 
-pub(super) fn preflight_restore_repo_key_path(repo: &Repository, key: &str) -> Result<(), ErrCtx> {
+pub(super) fn preflight_restore_repo_key_path(
+    repo: &Repository,
+    entry: &RepoRestoreKeyPlan,
+    planned_deletions: &BTreeSet<String>,
+    restored_keys: &BTreeSet<String>,
+) -> Result<(), ErrCtx> {
+    let key = &entry.key;
     graft::repo::validate_repo_path_identity(key)?;
     let components = Path::new(key).components().collect::<Vec<_>>();
     if components.is_empty()
@@ -966,7 +996,24 @@ pub(super) fn preflight_restore_repo_key_path(repo: &Repository, key: &str) -> R
         let is_target = index + 1 == components.len();
         match std::fs::symlink_metadata(&physical_path) {
             Ok(metadata) if is_target && metadata.file_type().is_file() => {}
+            Ok(metadata)
+                if is_target && metadata.file_type().is_dir() && entry.restored.is_some() => {}
+            Ok(metadata)
+                if is_target
+                    && metadata.file_type().is_dir()
+                    && restored_keys
+                        .iter()
+                        .any(|restored| repo_key_matches_filter(restored, key)) => {}
             Ok(metadata) if !is_target && metadata.file_type().is_dir() => {}
+            Ok(metadata)
+                if !is_target
+                    && metadata.file_type().is_file()
+                    && planned_deletions.contains(
+                        &key.split('/').take(index + 1).collect::<Vec<_>>().join("/"),
+                    ) =>
+            {
+                return Ok(());
+            }
             Ok(_) if is_target => {
                 return pragma_err!(format!(
                     "path `{}` is not a regular file",
@@ -997,7 +1044,7 @@ pub(super) fn ensure_restore_keys_preserve_untracked_paths(
         .chain(repo.index_artifacts()?.into_keys())
         .collect::<BTreeSet<_>>();
     let current_key = repo.file_key(&file.tag)?;
-    let overwritten = plan
+    let mut overwritten = plan
         .iter()
         .filter(|entry| {
             entry.key != current_key
@@ -1006,14 +1053,103 @@ pub(super) fn ensure_restore_keys_preserve_untracked_paths(
                     .is_ok_and(|metadata| metadata.file_type().is_file())
         })
         .map(|entry| entry.key.clone())
-        .collect::<Vec<_>>();
+        .collect::<BTreeSet<_>>();
+    let planned_deletions = plan
+        .iter()
+        .filter(|entry| entry.restored.is_none())
+        .map(|entry| entry.key.clone())
+        .collect::<BTreeSet<_>>();
+    for entry in plan.iter().filter(|entry| entry.restored.is_some()) {
+        let path = repo.worktree().join(&entry.key);
+        if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_dir()) {
+            collect_restore_directory_collisions(
+                repo,
+                &path,
+                &tracked,
+                &planned_deletions,
+                &current_key,
+                &mut overwritten,
+            )?;
+        }
+    }
     if overwritten.is_empty() {
         return Ok(());
     }
     pragma_err!(format!(
         "cannot restore because untracked paths would be overwritten: {}",
-        overwritten.join(", ")
+        overwritten.into_iter().collect::<Vec<_>>().join(", ")
     ))
+}
+
+pub(super) fn collect_restore_directory_collisions(
+    repo: &Repository,
+    directory: &Path,
+    tracked: &BTreeSet<String>,
+    planned_deletions: &BTreeSet<String>,
+    current_key: &str,
+    collisions: &mut BTreeSet<String>,
+) -> Result<(), ErrCtx> {
+    for child in std::fs::read_dir(directory)? {
+        let child = child?;
+        let path = child.path();
+        let metadata = std::fs::symlink_metadata(&path)?;
+        let relative = path.strip_prefix(repo.worktree()).map_err(|_| {
+            graft::repo::RepoErr::PathOutsideWorktree {
+                path: path.clone(),
+                worktree: repo.worktree().to_path_buf(),
+            }
+        })?;
+        let key = relative
+            .to_str()
+            .ok_or_else(|| graft::repo::RepoErr::NonUtf8Path(relative.to_path_buf()))?
+            .replace('\\', "/");
+        graft::repo::validate_repo_path_identity(&key)?;
+        if metadata.file_type().is_dir() {
+            collect_restore_directory_collisions(
+                repo,
+                &path,
+                tracked,
+                planned_deletions,
+                current_key,
+                collisions,
+            )?;
+        } else if !metadata.file_type().is_file()
+            || !planned_deletions.contains(&key)
+            || (!tracked.contains(&key) && key != current_key)
+        {
+            collisions.insert(key);
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn restore_key_depth(key: &str) -> usize {
+    Path::new(key).components().count()
+}
+
+pub(super) fn prepare_restore_repo_key_target(repo: &Repository, key: &str) -> Result<(), ErrCtx> {
+    let path = repo.worktree().join(key);
+    if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_dir()) {
+        remove_empty_restore_directory(&path)?;
+    }
+    Ok(())
+}
+
+pub(super) fn remove_empty_restore_directory(directory: &Path) -> Result<(), ErrCtx> {
+    for child in std::fs::read_dir(directory)? {
+        let child = child?;
+        let path = child.path();
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if !metadata.file_type().is_dir() {
+            return pragma_err!(format!(
+                "cannot replace directory `{}` because it is not empty",
+                directory.display()
+            ));
+        }
+        remove_empty_restore_directory(&path)?;
+    }
+    std::fs::remove_dir(directory)?;
+    Ok(())
 }
 
 pub(super) fn apply_restored_repo_key(
@@ -1040,7 +1176,10 @@ pub(super) fn apply_restored_repo_key(
     } else if let Some(RestoredRepoPathState::Artifact(state)) = restored {
         repo.materialize_artifact_key(key, state)?;
     } else {
-        remove_materialized_repo_file(repo, key)?;
+        let path = repo.worktree().join(key);
+        if !std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_dir()) {
+            remove_materialized_repo_file(repo, key)?;
+        }
     }
     Ok(())
 }
