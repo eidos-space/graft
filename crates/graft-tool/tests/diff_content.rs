@@ -53,3 +53,75 @@ fn diff_content_cli_returns_bounded_read_only_json() {
     assert_eq!(status_after.unstaged, status_before.unstaged);
     assert_eq!(fs::read_to_string(note).unwrap(), "# After\n");
 }
+
+#[cfg(not(windows))]
+#[test]
+fn diff_content_cli_preserves_quotes_and_repeated_whitespace_in_path() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let repo = Repository::init(temp_dir.path()).unwrap();
+    let relative = "notes/it's  \"quoted\".md";
+    let note = temp_dir.path().join(relative);
+    fs::create_dir_all(note.parent().unwrap()).unwrap();
+
+    fs::write(&note, "# Before\n").unwrap();
+    repo.stage_artifact_path(&note).unwrap();
+    repo.commit_staged("before").unwrap();
+    fs::write(&note, "# After\n").unwrap();
+    repo.stage_artifact_path(&note).unwrap();
+    repo.commit_staged("after").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_graft"))
+        .current_dir(temp_dir.path())
+        .args([
+            "diff",
+            "--json",
+            "--content",
+            "HEAD~1",
+            "HEAD",
+            "--",
+            relative,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["content"]["path"], relative);
+    assert_eq!(json["content"]["before"]["content"], "# Before\n");
+    assert_eq!(json["content"]["after"]["content"], "# After\n");
+}
+
+#[cfg(not(windows))]
+#[test]
+fn restore_cli_preserves_quotes_and_repeated_whitespace_in_path() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let repo = Repository::init(temp_dir.path()).unwrap();
+    let relative = "notes/it's  \"quoted\".md";
+    let note = temp_dir.path().join(relative);
+    fs::create_dir_all(note.parent().unwrap()).unwrap();
+
+    fs::write(&note, "before\n").unwrap();
+    repo.stage_artifact_path(&note).unwrap();
+    repo.commit_staged("before").unwrap();
+    fs::write(&note, "after\n").unwrap();
+    repo.stage_artifact_path(&note).unwrap();
+    repo.commit_staged("after").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_graft"))
+        .current_dir(temp_dir.path())
+        .args(["restore", "--json", "--source", "HEAD~1", "--", relative])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["path"], relative);
+    assert!(json.get("paths").is_none());
+    assert_eq!(fs::read_to_string(note).unwrap(), "before\n");
+}

@@ -963,7 +963,7 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
             )?);
         }
         Command::Restore { json, source, staged, all, kind, path } => {
-            let arg = repo_restore_arg(source.as_deref(), staged, all, kind, path.as_deref());
+            let arg = repo_restore_arg(source.as_deref(), staged, all, kind, path.as_deref())?;
             print_output(run_repo_pragma(
                 db_override,
                 None,
@@ -1467,24 +1467,22 @@ fn config_get_pragma(json: bool) -> &'static str {
 }
 
 fn validate_command_repo_paths(command: &Command) -> Result<()> {
-    let path = match command {
-        Command::Add(args) => args.path.as_deref(),
-        Command::Rm(args) => args.path.as_deref(),
-        Command::Diff { staged: true, from: Some(path), .. } => Some(Path::new(path)),
-        Command::Diff { path, .. }
-        | Command::Checkout { path, .. }
-        | Command::Restore { path, .. }
-        | Command::Resolve { path, .. } => path.as_deref(),
-        Command::Export(args) => args.path.as_deref(),
-        _ => None,
+    let (path, lossless_serialization) = match command {
+        Command::Add(args) => (args.path.as_deref(), false),
+        Command::Rm(args) => (args.path.as_deref(), false),
+        Command::Diff { staged: true, from: Some(path), .. } => (Some(Path::new(path)), true),
+        Command::Diff { path, .. } | Command::Restore { path, .. } => (path.as_deref(), true),
+        Command::Checkout { path, .. } | Command::Resolve { path, .. } => (path.as_deref(), false),
+        Command::Export(args) => (args.path.as_deref(), false),
+        _ => (None, false),
     };
     if let Some(path) = path {
-        validate_cli_repo_path(path)?;
+        validate_cli_repo_path(path, lossless_serialization)?;
     }
     Ok(())
 }
 
-fn validate_cli_repo_path(path: &Path) -> Result<()> {
+fn validate_cli_repo_path(path: &Path, lossless_serialization: bool) -> Result<()> {
     let raw = path
         .to_str()
         .with_context(|| format!("repository path `{}` is not valid UTF-8", path.display()))?;
@@ -1499,6 +1497,9 @@ fn validate_cli_repo_path(path: &Path) -> Result<()> {
         }
     }
 
+    if lossless_serialization {
+        return Ok(());
+    }
     let normalized_whitespace = raw.split_whitespace().collect::<Vec<_>>().join(" ");
     if normalized_whitespace != raw || raw.contains('\'') || raw.contains('"') {
         bail!(
@@ -1815,20 +1816,23 @@ fn repo_diff_arg(spec: RepoDiffArgSpec<'_>) -> Result<Option<String>> {
         arg.push_str("--staged");
         if let Some(path) = from {
             arg.push_str(" -- ");
-            arg.push_str(path);
+            arg.push_str(&quote_pragma_path(Path::new(path))?);
         }
         return Ok(Some(arg));
     }
 
     let arg = match (from, to, path) {
         (None, None, None) => (!prefix.is_empty()).then_some(prefix),
-        (None, None, Some(path)) => Some(format!("{prefix} -- {}", path.display())),
+        (None, None, Some(path)) => Some(format!("{prefix} -- {}", quote_pragma_path(path)?)),
         (Some(from), None, None) => Some(format!("{prefix} {from}")),
-        (Some(from), None, Some(path)) => Some(format!("{prefix} {from} -- {}", path.display())),
-        (Some(from), Some(to), None) => Some(format!("{prefix} {from} {to}")),
-        (Some(from), Some(to), Some(path)) => {
-            Some(format!("{prefix} {from} {to} -- {}", path.display()))
+        (Some(from), None, Some(path)) => {
+            Some(format!("{prefix} {from} -- {}", quote_pragma_path(path)?))
         }
+        (Some(from), Some(to), None) => Some(format!("{prefix} {from} {to}")),
+        (Some(from), Some(to), Some(path)) => Some(format!(
+            "{prefix} {from} {to} -- {}",
+            quote_pragma_path(path)?
+        )),
         (None, Some(_), _) => unreachable!("clap cannot provide `to` without `from`"),
     };
     Ok(arg.map(|arg| arg.trim_start().to_string()))
@@ -1985,7 +1989,7 @@ fn repo_restore_arg(
     all: bool,
     kind: Option<PathKind>,
     path: Option<&Path>,
-) -> String {
+) -> Result<String> {
     if all {
         if !staged || path.is_some() {
             unreachable!("clap prevents --all without --staged or with a path");
@@ -2000,7 +2004,7 @@ fn repo_restore_arg(
             parts.push("--kind".to_string());
             parts.push(path_kind_arg(kind).to_string());
         }
-        return parts.join(" ");
+        return Ok(parts.join(" "));
     }
 
     if kind.is_some() {
@@ -2008,12 +2012,22 @@ fn repo_restore_arg(
     }
 
     let path = path.expect("clap requires a restore path unless --all is present");
-    match (source, staged) {
-        (Some(source), true) => format!("--staged --source {source} -- {}", path.display()),
-        (None, true) => format!("--staged -- {}", path.display()),
-        (Some(source), false) => format!("--source {source} -- {}", path.display()),
-        (None, false) => format!("-- {}", path.display()),
-    }
+    let path = quote_pragma_path(path)?;
+    Ok(match (source, staged) {
+        (Some(source), true) => format!("--staged --source {source} -- {path}"),
+        (None, true) => format!("--staged -- {path}"),
+        (Some(source), false) => format!("--source {source} -- {path}"),
+        (None, false) => format!("-- {path}"),
+    })
+}
+
+fn quote_pragma_path(path: &Path) -> Result<String> {
+    let raw = path
+        .to_str()
+        .with_context(|| format!("repository path `{}` is not valid UTF-8", path.display()))?;
+    #[cfg(not(windows))]
+    let raw = raw.replace('"', "\\\"");
+    Ok(format!("\"{raw}\""))
 }
 
 fn repo_export_arg(source: Option<&str>, output: &Path, path: Option<&Path>) -> String {
@@ -3043,7 +3057,7 @@ mod tests {
                 path: path.as_deref(),
             })
             .unwrap(),
-            Some("--rows HEAD~1 HEAD -- app.db".to_string())
+            Some("--rows HEAD~1 HEAD -- \"app.db\"".to_string())
         );
         assert_eq!(
             repo_diff_arg(RepoDiffArgSpec {
@@ -3053,7 +3067,7 @@ mod tests {
                 ..Default::default()
             })
             .unwrap(),
-            Some("--rows --staged -- app.db".to_string())
+            Some("--rows --staged -- \"app.db\"".to_string())
         );
         assert_eq!(
             repo_diff_arg(RepoDiffArgSpec { rows: true, ..Default::default() }).unwrap(),
@@ -3156,7 +3170,9 @@ mod tests {
                 path: path.as_deref(),
             })
             .unwrap(),
-            Some("--content --max-content-bytes 4096 HEAD~1 HEAD -- notes/readme.md".to_string())
+            Some(
+                "--content --max-content-bytes 4096 HEAD~1 HEAD -- \"notes/readme.md\"".to_string()
+            )
         );
 
         assert!(
@@ -3586,8 +3602,8 @@ mod tests {
         assert_eq!(kind, None);
         assert_eq!(path, Some(PathBuf::from("external.db")));
         assert_eq!(
-            repo_restore_arg(source.as_deref(), staged, all, kind, path.as_deref()),
-            "--source HEAD~1 -- external.db"
+            repo_restore_arg(source.as_deref(), staged, all, kind, path.as_deref()).unwrap(),
+            "--source HEAD~1 -- \"external.db\""
         );
 
         let cli = Cli::try_parse_from(["graft", "restore", "--staged", "external.db"]).unwrap();
@@ -3601,8 +3617,8 @@ mod tests {
         assert_eq!(kind, None);
         assert_eq!(path, Some(PathBuf::from("external.db")));
         assert_eq!(
-            repo_restore_arg(source.as_deref(), staged, all, kind, path.as_deref()),
-            "--staged -- external.db"
+            repo_restore_arg(source.as_deref(), staged, all, kind, path.as_deref()).unwrap(),
+            "--staged -- \"external.db\""
         );
 
         let cli = Cli::try_parse_from([
@@ -3624,8 +3640,8 @@ mod tests {
         assert_eq!(kind, None);
         assert_eq!(path, Some(PathBuf::from("external.db")));
         assert_eq!(
-            repo_restore_arg(source.as_deref(), staged, all, kind, path.as_deref()),
-            "--staged --source HEAD~1 -- external.db"
+            repo_restore_arg(source.as_deref(), staged, all, kind, path.as_deref()).unwrap(),
+            "--staged --source HEAD~1 -- \"external.db\""
         );
     }
 
@@ -3649,11 +3665,13 @@ mod tests {
         );
 
         let cli = Cli::try_parse_from(["graft", "restore", "my  note.md"]).unwrap();
-        let err = validate_command_repo_paths(&cli.command).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("CLI cannot serialize this path without changing it"),
-            "{err}"
+        validate_command_repo_paths(&cli.command).unwrap();
+        let Command::Restore { source, staged, all, kind, path, .. } = cli.command else {
+            panic!("expected restore command");
+        };
+        assert_eq!(
+            repo_restore_arg(source.as_deref(), staged, all, kind, path.as_deref()).unwrap(),
+            "-- \"my  note.md\""
         );
     }
 
@@ -3684,7 +3702,7 @@ mod tests {
         assert_eq!(kind, Some(PathKind::SqliteDatabase));
         assert_eq!(path, None);
         assert_eq!(
-            repo_restore_arg(source.as_deref(), staged, all, kind, path.as_deref()),
+            repo_restore_arg(source.as_deref(), staged, all, kind, path.as_deref()).unwrap(),
             "--staged --all --kind sqlite_database"
         );
 
@@ -3724,8 +3742,8 @@ mod tests {
         assert_eq!(kind, None);
         assert_eq!(path, Some(PathBuf::from("external.db")));
         assert_eq!(
-            repo_restore_arg(source.as_deref(), staged, all, kind, path.as_deref()),
-            "--staged -- external.db"
+            repo_restore_arg(source.as_deref(), staged, all, kind, path.as_deref()).unwrap(),
+            "--staged -- \"external.db\""
         );
         assert_eq!(restore_pragma(json), "json_restore");
 
