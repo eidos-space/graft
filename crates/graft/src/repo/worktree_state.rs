@@ -849,6 +849,19 @@ impl Repository {
                 continue;
             }
             let physical_path = self.worktree.join(&path);
+            if fs::symlink_metadata(&physical_path)
+                .is_ok_and(|metadata| !metadata.file_type().is_file())
+            {
+                changes.insert(
+                    path.clone(),
+                    (
+                        RepoWorktreeChangeKind::Deleted,
+                        artifact_tracked_path_kind(expected),
+                        artifact_tracked_path_storage(expected),
+                    ),
+                );
+                continue;
+            }
             match artifact_file_matches(&physical_path, expected)? {
                 Some(true) => {}
                 Some(false) => {

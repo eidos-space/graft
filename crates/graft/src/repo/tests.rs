@@ -1102,6 +1102,39 @@ fn stage_artifact_path_commits_regular_file_and_status_tracks_changes() {
 }
 
 #[test]
+fn status_treats_a_tracked_file_replaced_by_a_directory_as_deleted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = Repository::init(tmp.path()).unwrap();
+    let shape = tmp.path().join("shape");
+    fs::write(&shape, b"file topology").unwrap();
+    repo.stage_artifact_path(&shape).unwrap();
+    repo.commit_staged("track shape as a file").unwrap();
+
+    fs::remove_file(&shape).unwrap();
+    fs::create_dir(&shape).unwrap();
+    fs::write(shape.join("child.md"), b"directory topology").unwrap();
+
+    let status = repo.status().unwrap();
+    assert_eq!(
+        status.unstaged_changes,
+        vec![
+            RepoWorktreeChange {
+                path: "shape".to_string(),
+                change: RepoWorktreeChangeKind::Deleted,
+                kind: RepoTrackedPathKind::TextFile,
+                storage: RepoPathStorage::Inline,
+            },
+            RepoWorktreeChange {
+                path: "shape/child.md".to_string(),
+                change: RepoWorktreeChangeKind::Untracked,
+                kind: RepoTrackedPathKind::TextFile,
+                storage: RepoPathStorage::Inline,
+            },
+        ]
+    );
+}
+
+#[test]
 fn large_artifact_uses_pointer_blob_and_materializes_content() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = Repository::init(tmp.path()).unwrap();

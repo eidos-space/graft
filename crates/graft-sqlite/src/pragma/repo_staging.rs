@@ -202,6 +202,7 @@ pub(super) fn stage_repo_add_path(
         let mut entries = Vec::with_capacity(paths.len());
         for key in paths {
             let physical_path = repo.worktree().join(&key);
+            entries.extend(stage_repo_add_topology_removals(repo, &key)?);
             entries.push(stage_repo_add_file(
                 runtime,
                 file,
@@ -228,14 +229,44 @@ pub(super) fn stage_repo_add_path(
     if !force && repo.is_ignored_worktree_path(&physical_path)? {
         return ignored_add_path_error(repo, &physical_path);
     }
-    Ok(vec![stage_repo_add_file(
+    let mut entries = stage_repo_add_topology_removals(repo, &key)?;
+    entries.push(stage_repo_add_file(
         runtime,
         file,
         repo,
         &current_key,
         &key,
         &physical_path,
-    )?])
+    )?);
+    Ok(entries)
+}
+
+pub(super) fn stage_repo_add_topology_removals(
+    repo: &Repository,
+    key: &str,
+) -> Result<Vec<graft::repo::index::IndexEntry>, ErrCtx> {
+    let mut effective_keys = BTreeSet::new();
+    effective_keys.extend(repo.index_files()?.into_keys());
+    effective_keys.extend(repo.index_artifacts()?.into_keys());
+    let head = repo_head_commit(repo)?;
+    let mut removals = Vec::new();
+
+    for conflict in effective_keys.into_iter().filter(|candidate| {
+        candidate != key
+            && (repo_key_is_under_directory(candidate, key)
+                || repo_key_is_under_directory(key, candidate))
+    }) {
+        let tracked_at_head = head.as_ref().is_some_and(|commit| {
+            commit.files.contains_key(&conflict) || commit.artifacts.contains_key(&conflict)
+        });
+        if tracked_at_head {
+            removals.push(repo.stage_file_removal_key(conflict)?);
+        } else if repo.index_has_key(&conflict)? {
+            repo.restore_index_key_from_head(conflict)?;
+        }
+    }
+
+    Ok(removals)
 }
 
 pub(super) fn stage_repo_add_all(
