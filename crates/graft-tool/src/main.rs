@@ -779,6 +779,7 @@ fn run_cli(cli: Cli) -> Result<()> {
 }
 
 fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
+    validate_command_repo_paths(&command)?;
     match command {
         Command::Id { kind } => match kind {
             IdKind::Vid => println!("{}", VolumeId::random()),
@@ -1433,6 +1434,48 @@ fn config_get_pragma(json: bool) -> &'static str {
     } else {
         "config_get"
     }
+}
+
+fn validate_command_repo_paths(command: &Command) -> Result<()> {
+    let path = match command {
+        Command::Add(args) => args.path.as_deref(),
+        Command::Rm(args) => args.path.as_deref(),
+        Command::Diff { staged: true, from: Some(path), .. } => Some(Path::new(path)),
+        Command::Diff { path, .. }
+        | Command::Checkout { path, .. }
+        | Command::Restore { path, .. }
+        | Command::Resolve { path, .. } => path.as_deref(),
+        Command::Export(args) => args.path.as_deref(),
+        _ => None,
+    };
+    if let Some(path) = path {
+        validate_cli_repo_path(path)?;
+    }
+    Ok(())
+}
+
+fn validate_cli_repo_path(path: &Path) -> Result<()> {
+    let raw = path
+        .to_str()
+        .with_context(|| format!("repository path `{}` is not valid UTF-8", path.display()))?;
+    if !path.is_absolute() {
+        graft::repo::validate_repo_path_identity(raw)?;
+    } else {
+        #[cfg(not(windows))]
+        if raw.contains('\\') {
+            bail!(
+                "path `{raw}` has an unsupported repository identity: backslashes are not supported in POSIX repository paths"
+            );
+        }
+    }
+
+    let normalized_whitespace = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized_whitespace != raw || raw.contains('\'') || raw.contains('"') {
+        bail!(
+            "path `{raw}` has an unsupported repository identity: the CLI cannot serialize this path without changing it"
+        );
+    }
+    Ok(())
 }
 
 fn config_list_pragma(json: bool) -> (&'static str, Option<&'static str>) {
@@ -3401,6 +3444,47 @@ mod tests {
         assert_eq!(
             repo_restore_arg(source.as_deref(), staged, all, kind, path.as_deref()),
             "--staged --source HEAD~1 -- external.db"
+        );
+    }
+
+    #[test]
+    fn rejects_ambiguous_repo_paths_before_pragma_serialization() {
+        let cli = Cli::try_parse_from(["graft", "add", " note.md "]).unwrap();
+        let err = validate_command_repo_paths(&cli.command).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("path components must not start or end with whitespace"),
+            "{err}"
+        );
+
+        let cli =
+            Cli::try_parse_from(["graft", "restore", "--source", "HEAD", " note.md "]).unwrap();
+        let err = validate_command_repo_paths(&cli.command).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("path components must not start or end with whitespace"),
+            "{err}"
+        );
+
+        let cli = Cli::try_parse_from(["graft", "restore", "my  note.md"]).unwrap();
+        let err = validate_command_repo_paths(&cli.command).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("CLI cannot serialize this path without changing it"),
+            "{err}"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn rejects_posix_backslash_repo_path_before_pragma_serialization() {
+        let cli =
+            Cli::try_parse_from(["graft", "restore", "--source", "HEAD", "foo\\bar.md"]).unwrap();
+        let err = validate_command_repo_paths(&cli.command).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("backslashes are not supported in POSIX repository paths"),
+            "{err}"
         );
     }
 

@@ -2713,6 +2713,129 @@ fn test_repo_json_add_reports_staged_database_file_and_large_file_paths() {
 }
 
 #[test]
+fn test_repo_rejects_ambiguous_path_identity_before_add_or_restore_mutation() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_path.to_str().unwrap(), None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+
+    let plain_path = temp_dir.path().join("note.md");
+    std::fs::write(&plain_path, b"committed plain content").unwrap();
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_add", "note.md"),
+        "Added note.md"
+    );
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "track plain path").contains("track"));
+
+    std::fs::write(&plain_path, b"local plain draft").unwrap();
+    let spaced_path = temp_dir.path().join(" note.md ");
+    std::fs::write(&spaced_path, b"spaced content").unwrap();
+
+    let add_err = pragma_arg_error(&sqlite, "graft_json_add", "--all");
+    assert!(
+        add_err.contains("path components must not start or end with whitespace"),
+        "add --all must reject a path identity that would be normalized: {add_err}"
+    );
+
+    let restore_err = pragma_arg_error(
+        &sqlite,
+        "graft_json_restore",
+        "--source HEAD -- \" note.md \"",
+    );
+    assert!(
+        restore_err.contains("path components must not start or end with whitespace"),
+        "restore must reject the ambiguous explicit path before materialization: {restore_err}"
+    );
+    assert_eq!(std::fs::read(&plain_path).unwrap(), b"local plain draft");
+    assert_eq!(std::fs::read(&spaced_path).unwrap(), b"spaced content");
+
+    let repo = Repository::discover_for_file(&db_path).unwrap();
+    assert!(!repo.has_staged_changes().unwrap());
+
+    runtime.shutdown().unwrap();
+}
+
+#[cfg(not(windows))]
+#[test]
+fn test_repo_restore_rejects_posix_backslash_before_path_alias_mutation() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_path.to_str().unwrap(), None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+
+    let alias_target = temp_dir.path().join("foobar.md");
+    std::fs::write(&alias_target, b"committed content").unwrap();
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_add", "foobar.md"),
+        "Added foobar.md"
+    );
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "track alias target").contains("track"));
+    std::fs::write(&alias_target, b"local draft").unwrap();
+
+    let restore_err = pragma_arg_error(
+        &sqlite,
+        "graft_json_restore",
+        "--source HEAD -- foo\\bar.md",
+    );
+    assert!(
+        restore_err.contains("backslashes are not supported in POSIX repository paths"),
+        "restore must reject the raw path before the parser strips its backslash: {restore_err}"
+    );
+    assert_eq!(std::fs::read(&alias_target).unwrap(), b"local draft");
+
+    let checkout_err = pragma_arg_error(&sqlite, "graft_json_checkout", "HEAD -- foo\\bar.md");
+    assert!(
+        checkout_err.contains("backslashes are not supported in POSIX repository paths"),
+        "checkout must preserve the raw path until repository validation: {checkout_err}"
+    );
+    let resolve_err = pragma_arg_error(
+        &sqlite,
+        "graft_json_resolve_conflict",
+        "--manual foo\\bar.md",
+    );
+    assert!(
+        resolve_err.contains("backslashes are not supported in POSIX repository paths"),
+        "resolve must preserve the raw path until repository validation: {resolve_err}"
+    );
+    let remove_err = pragma_arg_error(&sqlite, "graft_json_rm", "foo\\bar.md");
+    assert!(
+        remove_err.contains("backslashes are not supported in POSIX repository paths"),
+        "remove must reject the raw path before its backslash is stripped: {remove_err}"
+    );
+    let add_err = pragma_arg_error(&sqlite, "graft_json_add", "foo\\bar.md");
+    assert!(
+        add_err.contains("backslashes are not supported in POSIX repository paths"),
+        "add must reject the unsupported physical path identity: {add_err}"
+    );
+    let export_path = temp_dir.path().join("snapshot.db");
+    let export_err = pragma_arg_error(
+        &sqlite,
+        "graft_json_export",
+        format!(
+            "--source HEAD --output {} -- foo\\bar.md",
+            export_path.display()
+        ),
+    );
+    assert!(
+        export_err.contains("backslashes are not supported in POSIX repository paths"),
+        "export must reject the raw path before its backslash is stripped: {export_err}"
+    );
+    assert!(!export_path.exists());
+    assert_eq!(std::fs::read(&alias_target).unwrap(), b"local draft");
+
+    let repo = Repository::discover_for_file(&db_path).unwrap();
+    assert!(!repo.has_staged_changes().unwrap());
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
 fn test_repo_json_diff_filters_by_path_kind() {
     graft_test::ensure_test_env();
 

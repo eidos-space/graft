@@ -45,8 +45,10 @@ use config::{
 use refspec::{ParsedRefspec, parse_fetch_refspec, parse_push_refspec};
 use worktree::{
     IgnoreRules, artifact_storage_for_path, classify_artifact_bytes, classify_artifact_path,
-    is_sqlite_database_file, is_sqlite_sidecar_file, normalize_repo_path,
+    is_sqlite_database_file, is_sqlite_sidecar_file, normalize_repo_path, normalize_repo_path_key,
 };
+
+pub use worktree::validate_repo_path_identity;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -184,6 +186,9 @@ pub enum RepoErr {
 
     #[error("path `{0}` is not valid UTF-8")]
     NonUtf8Path(PathBuf),
+
+    #[error("path `{path}` has an unsupported repository identity: {reason}")]
+    UnsupportedPathIdentity { path: String, reason: &'static str },
 
     #[error("path `{path}` does not exist in revision `{rev}`")]
     PathNotFoundInRevision { path: String, rev: String },

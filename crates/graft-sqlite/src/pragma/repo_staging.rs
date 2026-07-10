@@ -176,6 +176,11 @@ pub(super) fn stage_repo_add_path(
     path: &Path,
     force: bool,
 ) -> Result<Vec<graft::repo::index::IndexEntry>, ErrCtx> {
+    if !path.is_absolute()
+        && let Some(path) = path.to_str()
+    {
+        graft::repo::validate_repo_path_identity(path)?;
+    }
     let physical_path = repo_input_path(repo, path);
     let metadata = std::fs::metadata(&physical_path)?;
     let current_key = repo.file_key(&file.tag)?;

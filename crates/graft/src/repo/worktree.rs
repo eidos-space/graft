@@ -1,4 +1,4 @@
-use std::{fs, io::Read, path::Path};
+use std::{borrow::Cow, fs, io::Read, path::Path};
 
 use super::{
     CONTENT_CLASS_SAMPLE_BYTES, FileConfig, GRAFT_IGNORE_FILE, RepoPathStorage,
@@ -118,12 +118,51 @@ pub(super) fn wildcard_match(pattern: &str, text: &str) -> bool {
 }
 
 pub(super) fn normalize_repo_path(path: &str) -> String {
-    let path = path.trim().trim_start_matches("./").replace('\\', "/");
+    let path = path.trim().trim_start_matches("./");
+    let path = normalize_repo_path_separators(path);
     let path = path.trim_end_matches('/');
     if path == "." {
         String::new()
     } else {
         path.to_string()
+    }
+}
+
+pub fn validate_repo_path_identity(path: &str) -> Result<()> {
+    #[cfg(not(windows))]
+    if path.contains('\\') {
+        return Err(super::RepoErr::UnsupportedPathIdentity {
+            path: path.to_string(),
+            reason: "backslashes are not supported in POSIX repository paths",
+        });
+    }
+
+    let path = normalize_repo_path_separators(path);
+    if path
+        .split('/')
+        .any(|component| component.trim() != component)
+    {
+        return Err(super::RepoErr::UnsupportedPathIdentity {
+            path: path.into_owned(),
+            reason: "path components must not start or end with whitespace",
+        });
+    }
+    Ok(())
+}
+
+pub(super) fn normalize_repo_path_key(path: &str) -> Result<String> {
+    validate_repo_path_identity(path)?;
+    Ok(normalize_repo_path(path))
+}
+
+fn normalize_repo_path_separators(path: &str) -> Cow<'_, str> {
+    #[cfg(windows)]
+    {
+        Cow::Owned(path.replace('\\', "/"))
+    }
+    #[cfg(not(windows))]
+    {
+        Cow::Borrowed(path)
     }
 }
 

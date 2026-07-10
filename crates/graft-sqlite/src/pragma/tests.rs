@@ -1156,6 +1156,26 @@ fn parse_checkout_and_switch_force_args() {
         }
     );
     assert_eq!(
+        parse_repo_restore_arg("--source HEAD~1 -- \"notes/my draft.md\"").unwrap(),
+        RepoRestoreSpec {
+            source: Some("HEAD~1".to_string()),
+            staged: false,
+            all: false,
+            kind: None,
+            path: Some(PathBuf::from("notes/my draft.md")),
+        }
+    );
+    #[cfg(not(windows))]
+    assert!(parse_repo_restore_arg("--source HEAD~1 -- foo\\bar.md").is_err());
+    #[cfg(not(windows))]
+    assert_eq!(
+        parse_repo_checkout_arg("HEAD~1 -- foo\\bar.md").unwrap(),
+        RepoCheckoutSpec::Path {
+            rev: "HEAD~1".to_string(),
+            path: "foo\\bar.md".to_string(),
+        }
+    );
+    assert_eq!(
         parse_repo_restore_arg("--staged -- external.db").unwrap(),
         RepoRestoreSpec {
             source: None,
@@ -1197,6 +1217,8 @@ fn parse_checkout_and_switch_force_args() {
             output: PathBuf::from("snapshot.db"),
         }
     );
+    #[cfg(not(windows))]
+    assert!(parse_repo_export_arg("--output snapshot.db -- foo\\bar.md").is_err());
     assert_eq!(
         parse_repo_export_arg("--source HEAD~1 --output snapshot.db -- app.db").unwrap(),
         RepoExportSpec {

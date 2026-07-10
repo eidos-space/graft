@@ -295,7 +295,7 @@ impl Repository {
         path: impl Into<String>,
     ) -> Result<CheckoutFilePlan> {
         let target = self.resolve_revision(rev)?;
-        let path = normalize_repo_path(&path.into());
+        let path = normalize_repo_path_key(&path.into())?;
         let commit = self.read_commit(&target)?;
         let state =
             commit
@@ -356,7 +356,7 @@ impl Repository {
         path: impl Into<String>,
     ) -> Result<CheckoutArtifactPlan> {
         let target = self.resolve_revision(rev)?;
-        let path = normalize_repo_path(&path.into());
+        let path = normalize_repo_path_key(&path.into())?;
         let commit = self.read_commit(&target)?;
         let state = commit.artifacts.get(&path).cloned().ok_or_else(|| {
             RepoErr::PathNotFoundInRevision { path: path.clone(), rev: rev.to_string() }

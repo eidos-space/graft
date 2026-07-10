@@ -11,7 +11,6 @@ pub(super) fn repo_diff_path(
 }
 
 pub(super) fn repo_path_arg(repo: &Repository, path: &str) -> Result<String, ErrCtx> {
-    let path = path.trim();
     if path.is_empty() {
         return Ok(String::new());
     }
@@ -19,11 +18,14 @@ pub(super) fn repo_path_arg(repo: &Repository, path: &str) -> Result<String, Err
     if path_obj.is_absolute() {
         return Ok(normalize_repo_path_filter(&repo.file_key(path_obj)?));
     }
+    graft::repo::validate_repo_path_identity(path)?;
     Ok(normalize_repo_path_filter(path))
 }
 
 pub(super) fn normalize_repo_path_filter(path: &str) -> String {
-    let path = path.trim().trim_start_matches("./").replace('\\', "/");
+    let path = path.trim_start_matches("./");
+    #[cfg(windows)]
+    let path = path.replace('\\', "/");
     let path = path.trim_end_matches('/');
     if path == "." {
         String::new()

@@ -279,6 +279,7 @@ pub(super) fn parse_repo_diff_arg(arg: Option<&str>) -> Result<RepoDiffSpec, Pra
             target: RepoDiffTarget::Worktree { path: None },
         });
     };
+    reject_ambiguous_posix_path_escape(arg)?;
     let raw_parts = split_pragma_words(arg)?;
     let mut mode = DiffMode::Default;
     let mut kind = None;
@@ -492,6 +493,7 @@ pub(super) fn parse_repo_remove_arg(arg: Option<&str>) -> Result<RepoRemoveSpec,
     let Some(arg) = arg else {
         return Ok(RepoRemoveSpec { path: None, cached: false });
     };
+    reject_ambiguous_posix_path_escape(arg)?;
     let parts = split_pragma_words(arg.trim())?;
     if parts.is_empty() {
         return Ok(RepoRemoveSpec { path: None, cached: false });
@@ -828,6 +830,7 @@ pub(super) fn parse_repo_checkout_arg(arg: &str) -> Result<RepoCheckoutSpec, Pra
 }
 
 pub(super) fn parse_repo_restore_arg(arg: &str) -> Result<RepoRestoreSpec, PragmaErr> {
+    reject_ambiguous_posix_path_escape(arg)?;
     let parts = split_pragma_words(arg)?;
     let mut source = None;
     let mut staged = false;
@@ -933,7 +936,11 @@ pub(super) fn split_pragma_words(arg: &str) -> Result<Vec<String>, PragmaErr> {
         }
 
         if ch == '\\' {
-            escaped = true;
+            if cfg!(windows) {
+                current.push(ch);
+            } else {
+                escaped = true;
+            }
             in_word = true;
             continue;
         }
@@ -976,6 +983,26 @@ pub(super) fn split_pragma_words(arg: &str) -> Result<Vec<String>, PragmaErr> {
         words.push(current);
     }
     Ok(words)
+}
+
+fn reject_ambiguous_posix_path_escape(arg: &str) -> Result<(), PragmaErr> {
+    #[cfg(not(windows))]
+    {
+        let mut chars = arg.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch != '\\' {
+                continue;
+            }
+            let escaped = chars.peek().copied();
+            if escaped.is_some_and(|ch| ch.is_whitespace() || matches!(ch, '\'' | '"')) {
+                continue;
+            }
+            return Err(pragma_fail(
+                "backslashes are not supported in POSIX repository paths",
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn parse_json_log_arg(arg: Option<&str>) -> Result<JsonLogMode, PragmaErr> {
@@ -1051,6 +1078,7 @@ pub(super) fn parse_json_fetch_async_arg(
 }
 
 pub(super) fn parse_repo_export_arg(arg: &str) -> Result<RepoExportSpec, PragmaErr> {
+    reject_ambiguous_posix_path_escape(arg)?;
     let mut source = None;
     let mut output = None;
     let mut path = Vec::new();

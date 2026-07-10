@@ -89,7 +89,7 @@ impl Repository {
     }
 
     pub fn stage_file_removal_key(&self, key: impl Into<String>) -> Result<index::IndexEntry> {
-        let key = normalize_repo_path(&key.into());
+        let key = normalize_repo_path_key(&key.into())?;
         if !self.head_files()?.contains_key(&key) && !self.head_artifacts()?.contains_key(&key) {
             return Err(RepoErr::PathNotTracked(key));
         }

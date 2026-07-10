@@ -617,6 +617,54 @@ fn status_scans_worktree_files_as_untracked() {
 }
 
 #[test]
+fn status_rejects_paths_with_ambiguous_whitespace_identity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = Repository::init(tmp.path()).unwrap();
+    fs::write(tmp.path().join("note.md"), b"plain").unwrap();
+    fs::write(tmp.path().join(" note.md "), b"spaced").unwrap();
+
+    let err = repo.status().unwrap_err();
+
+    assert!(matches!(
+        err,
+        RepoErr::UnsupportedPathIdentity { path, reason }
+            if path == " note.md "
+                && reason == "path components must not start or end with whitespace"
+    ));
+    assert!(!repo.has_staged_changes().unwrap());
+}
+
+#[cfg(not(windows))]
+#[test]
+fn explicit_posix_backslash_path_cannot_alias_slash_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = Repository::init(tmp.path()).unwrap();
+    let slash_dir = tmp.path().join("foo");
+    fs::create_dir_all(&slash_dir).unwrap();
+    let slash_path = slash_dir.join("bar.md");
+    fs::write(&slash_path, b"committed slash content").unwrap();
+    repo.stage_artifact_path(&slash_path).unwrap();
+    repo.commit_staged("track slash path").unwrap();
+    fs::write(&slash_path, b"local slash draft").unwrap();
+
+    let backslash_path = tmp.path().join("foo\\bar.md");
+    fs::write(&backslash_path, b"backslash content").unwrap();
+    let err = repo
+        .plan_checkout_artifact_from_revision("HEAD", &backslash_path)
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        RepoErr::UnsupportedPathIdentity { path, reason }
+            if path == "foo\\bar.md"
+                && reason == "backslashes are not supported in POSIX repository paths"
+    ));
+    assert_eq!(fs::read(&slash_path).unwrap(), b"local slash draft");
+    assert_eq!(fs::read(&backslash_path).unwrap(), b"backslash content");
+    assert!(!repo.has_staged_changes().unwrap());
+}
+
+#[test]
 fn untracked_paths_lists_worktree_candidates() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = Repository::init(tmp.path()).unwrap();
