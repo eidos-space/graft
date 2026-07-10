@@ -122,6 +122,10 @@ pub(super) fn repo_diff_for_spec(
             let path = repo_diff_path(repo, path.as_deref())?;
             Ok(repo.diff_revisions(&from, &to, path.as_deref())?)
         }
+        RepoDiffTarget::Root { to, path } => {
+            let path = repo_diff_path(repo, path.as_deref())?;
+            Ok(repo.diff_root(&to, path.as_deref())?)
+        }
     }?;
     filter_repo_diff_by_kind(&mut diff, kind);
     Ok(diff)

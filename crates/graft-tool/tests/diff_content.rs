@@ -54,6 +54,71 @@ fn diff_content_cli_returns_bounded_read_only_json() {
     assert_eq!(fs::read_to_string(note).unwrap(), "# After\n");
 }
 
+#[test]
+fn root_diff_cli_reports_first_commit_metadata_and_content() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let repo = Repository::init(temp_dir.path()).unwrap();
+    let note = temp_dir.path().join("first.md");
+    let binary = temp_dir.path().join("image.bin");
+    fs::write(&note, "# First\n").unwrap();
+    fs::write(&binary, [0, 159, 146, 150]).unwrap();
+    repo.stage_artifact_path(&note).unwrap();
+    repo.stage_artifact_path(&binary).unwrap();
+    let first = repo.commit_staged("first").unwrap();
+    let status_before = repo.status().unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_graft"))
+        .current_dir(temp_dir.path())
+        .args(["diff", "--json", "--root", &first.id])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["from"], "root");
+    assert_eq!(json["to"], first.id);
+    assert_eq!(json["paths"][0]["path"], "first.md");
+    assert_eq!(json["paths"][0]["change"], "added");
+    assert_eq!(json["paths"][0]["kind"], "text_file");
+    assert_eq!(json["paths"][1]["path"], "image.bin");
+    assert_eq!(json["paths"][1]["change"], "added");
+    assert_eq!(json["paths"][1]["kind"], "binary_file");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_graft"))
+        .current_dir(temp_dir.path())
+        .args([
+            "diff",
+            "--json",
+            "--content",
+            "--max-content-bytes",
+            "128",
+            "--root",
+            &first.id,
+            "--",
+            "first.md",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["content"]["path"], "first.md");
+    assert_eq!(json["content"]["before"]["state"], "absent");
+    assert_eq!(json["content"]["after"]["state"], "utf8");
+    assert_eq!(json["content"]["after"]["content"], "# First\n");
+    let status_after = repo.status().unwrap();
+    assert_eq!(status_after.head_target, status_before.head_target);
+    assert_eq!(status_after.staged, status_before.staged);
+    assert_eq!(status_after.unstaged, status_before.unstaged);
+    assert_eq!(status_after.conflicted, status_before.conflicted);
+}
+
 #[cfg(not(windows))]
 #[test]
 fn diff_content_cli_preserves_quotes_and_repeated_whitespace_in_path() {

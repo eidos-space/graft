@@ -148,16 +148,16 @@ enum Command {
         kind: Option<PathKind>,
 
         /// Include bounded UTF-8 content for one changed text path
-        #[arg(
-            long,
-            requires_all = ["json", "from", "to", "path"],
-            conflicts_with_all = ["rows", "staged"]
-        )]
+        #[arg(long, requires = "json", conflicts_with_all = ["rows", "staged"])]
         content: bool,
 
         /// Maximum content bytes to read from each side
         #[arg(long, requires = "content")]
         max_content_bytes: Option<NonZeroU64>,
+
+        /// Compare the empty tree to this target revision
+        #[arg(long, value_name = "TO", conflicts_with = "staged")]
+        root: Option<String>,
 
         /// Source revision, for example HEAD~1
         from: Option<String>,
@@ -931,6 +931,7 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
             kind,
             content,
             max_content_bytes,
+            root,
             from,
             to,
             path,
@@ -943,6 +944,7 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
                 kind,
                 content,
                 max_content_bytes,
+                root: root.as_deref(),
                 from: from.as_deref(),
                 to: to.as_deref(),
                 path: path.as_deref(),
@@ -1470,6 +1472,7 @@ fn validate_command_repo_paths(command: &Command) -> Result<()> {
     let (path, lossless_serialization) = match command {
         Command::Add(args) => (args.path.as_deref(), false),
         Command::Rm(args) => (args.path.as_deref(), false),
+        Command::Diff { root: Some(_), from: Some(path), .. } => (Some(Path::new(path)), true),
         Command::Diff { staged: true, from: Some(path), .. } => (Some(Path::new(path)), true),
         Command::Diff { path, .. } | Command::Restore { path, .. } => (path.as_deref(), true),
         Command::Checkout { path, .. } | Command::Resolve { path, .. } => (path.as_deref(), false),
@@ -1767,6 +1770,7 @@ struct RepoDiffArgSpec<'a> {
     kind: Option<PathKind>,
     content: bool,
     max_content_bytes: Option<NonZeroU64>,
+    root: Option<&'a str>,
     from: Option<&'a str>,
     to: Option<&'a str>,
     path: Option<&'a Path>,
@@ -1779,6 +1783,7 @@ fn repo_diff_arg(spec: RepoDiffArgSpec<'_>) -> Result<Option<String>> {
         kind,
         content,
         max_content_bytes,
+        root,
         from,
         to,
         path,
@@ -1786,8 +1791,18 @@ fn repo_diff_arg(spec: RepoDiffArgSpec<'_>) -> Result<Option<String>> {
     if max_content_bytes.is_some() && !content {
         bail!("--max-content-bytes requires --content");
     }
-    if content && (rows || staged || from.is_none() || to.is_none() || path.is_none()) {
-        bail!("--content requires JSON, explicit from and to revisions, and one path");
+    if content
+        && (rows
+            || staged
+            || if root.is_some() {
+                from.is_none() || to.is_some() || path.is_some()
+            } else {
+                from.is_none() || to.is_none() || path.is_none()
+            })
+    {
+        bail!(
+            "--content requires JSON, an explicit revision comparison or --root target, and one path"
+        );
     }
     let mut prefixes = Vec::new();
     if rows {
@@ -1803,6 +1818,22 @@ fn repo_diff_arg(spec: RepoDiffArgSpec<'_>) -> Result<Option<String>> {
             prefixes.push("--max-content-bytes".to_string());
             prefixes.push(max_content_bytes.get().to_string());
         }
+    }
+    if let Some(root) = root {
+        if staged || to.is_some() || path.is_some() {
+            bail!("--root accepts one target revision and an optional path");
+        }
+        let mut arg = prefixes.join(" ");
+        if !arg.is_empty() {
+            arg.push(' ');
+        }
+        arg.push_str("--root ");
+        arg.push_str(root);
+        if let Some(path) = from {
+            arg.push_str(" -- ");
+            arg.push_str(&quote_pragma_path(Path::new(path))?);
+        }
+        return Ok(Some(arg));
     }
     let prefix = prefixes.join(" ");
     if staged {
@@ -3028,6 +3059,7 @@ mod tests {
             kind,
             content,
             max_content_bytes,
+            root,
             from,
             to,
             path,
@@ -3052,6 +3084,7 @@ mod tests {
                 kind,
                 content,
                 max_content_bytes,
+                root: root.as_deref(),
                 from: from.as_deref(),
                 to: to.as_deref(),
                 path: path.as_deref(),
@@ -3089,6 +3122,7 @@ mod tests {
             kind,
             content,
             max_content_bytes,
+            root,
             from,
             to,
             path,
@@ -3113,6 +3147,7 @@ mod tests {
                 kind,
                 content,
                 max_content_bytes,
+                root: root.as_deref(),
                 from: from.as_deref(),
                 to: to.as_deref(),
                 path: path.as_deref(),
@@ -3143,6 +3178,7 @@ mod tests {
             kind,
             content,
             max_content_bytes,
+            root,
             from,
             to,
             path,
@@ -3165,6 +3201,7 @@ mod tests {
                 kind,
                 content,
                 max_content_bytes,
+                root: root.as_deref(),
                 from: from.as_deref(),
                 to: to.as_deref(),
                 path: path.as_deref(),
@@ -3179,10 +3216,9 @@ mod tests {
             Cli::try_parse_from(["graft", "diff", "--content", "HEAD~1", "HEAD", "note.md",])
                 .is_err()
         );
-        assert!(
-            Cli::try_parse_from(["graft", "diff", "--json", "--content", "HEAD~1", "HEAD"])
-                .is_err()
-        );
+        let cli = Cli::try_parse_from(["graft", "diff", "--json", "--content", "HEAD~1", "HEAD"])
+            .unwrap();
+        assert!(run_command(cli.command, None).is_err());
         assert!(
             Cli::try_parse_from([
                 "graft",
@@ -3209,6 +3245,64 @@ mod tests {
                 "note.md",
             ])
             .is_err()
+        );
+    }
+
+    #[test]
+    fn parses_explicit_root_content_diff() {
+        let cli = Cli::try_parse_from([
+            "graft",
+            "diff",
+            "--json",
+            "--content",
+            "--max-content-bytes",
+            "4096",
+            "--root",
+            "HEAD",
+            "--",
+            "notes/first  draft.md",
+        ])
+        .unwrap();
+        let Command::Diff {
+            rows,
+            staged,
+            kind,
+            content,
+            max_content_bytes,
+            root,
+            from,
+            to,
+            path,
+            json,
+        } = cli.command
+        else {
+            panic!("expected diff command");
+        };
+        assert!(json);
+        assert!(content);
+        assert!(!rows);
+        assert!(!staged);
+        assert_eq!(root.as_deref(), Some("HEAD"));
+        assert_eq!(from.as_deref(), Some("notes/first  draft.md"));
+        assert_eq!(to, None);
+        assert_eq!(path, None);
+        assert_eq!(
+            repo_diff_arg(RepoDiffArgSpec {
+                rows,
+                staged,
+                kind,
+                content,
+                max_content_bytes,
+                root: root.as_deref(),
+                from: from.as_deref(),
+                to: to.as_deref(),
+                path: path.as_deref(),
+            })
+            .unwrap(),
+            Some(
+                "--content --max-content-bytes 4096 --root HEAD -- \"notes/first  draft.md\""
+                    .to_string()
+            )
         );
     }
 

@@ -1605,6 +1605,48 @@ fn diff_revisions_reports_changed_sqlite_paths() {
 }
 
 #[test]
+fn diff_root_reports_first_commit_paths_as_added() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = Repository::init(tmp.path()).unwrap();
+    let note = tmp.path().join("note.md");
+    let binary = tmp.path().join("image.bin");
+    fs::write(&note, "# First\n").unwrap();
+    fs::write(&binary, [0, 159, 146, 150]).unwrap();
+    repo.stage_artifact_path(&note).unwrap();
+    repo.stage_artifact_path(&binary).unwrap();
+    let first = repo.commit_staged("first").unwrap();
+
+    let diff = repo.diff_root(&first.id, None).unwrap();
+    assert_eq!(diff.from, "root");
+    assert_eq!(diff.to, first.id);
+    assert_eq!(diff.artifacts.len(), 2);
+    assert!(diff.artifacts.iter().all(|path| {
+        path.change == RepoFileChange::Added && path.from.is_none() && path.to.is_some()
+    }));
+    assert_eq!(
+        diff.paths
+            .iter()
+            .map(|path| (path.path.as_str(), path.kind))
+            .collect::<Vec<_>>(),
+        vec![
+            ("image.bin", RepoTrackedPathKind::BinaryFile),
+            ("note.md", RepoTrackedPathKind::TextFile),
+        ]
+    );
+
+    let note_only = repo.diff_root("HEAD", Some("note.md")).unwrap();
+    assert_eq!(note_only.artifacts.len(), 1);
+    let content = repo
+        .diff_text_content(&note_only.artifacts[0], ByteUnit::new(128))
+        .unwrap();
+    assert_eq!(content.before, RepoTextContentState::Absent);
+    assert!(matches!(
+        content.after,
+        RepoTextContentState::Utf8 { content, .. } if content == "# First\n"
+    ));
+}
+
+#[test]
 fn diff_path_filter_matches_directory_prefix() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = Repository::init(tmp.path()).unwrap();

@@ -63,6 +63,10 @@ pub(crate) enum RepoDiffTarget {
         to: String,
         path: Option<String>,
     },
+    Root {
+        to: String,
+        path: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

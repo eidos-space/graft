@@ -611,6 +611,46 @@ fn parse_repo_diff_arg_requires_bounded_single_path_content_mode() {
 }
 
 #[test]
+fn parse_repo_diff_arg_supports_explicit_root_comparisons() {
+    assert_eq!(
+        parse_repo_diff_arg(Some("--root HEAD")).unwrap(),
+        RepoDiffSpec {
+            mode: DiffMode::Default,
+            kind: None,
+            target: RepoDiffTarget::Root { to: "HEAD".to_string(), path: None },
+            content: None,
+        }
+    );
+    assert_eq!(
+        parse_repo_diff_arg(Some(
+            "--content --max-content-bytes 4096 --root HEAD -- \"notes/first  draft.md\"",
+        ))
+        .unwrap(),
+        RepoDiffSpec {
+            mode: DiffMode::Default,
+            kind: None,
+            target: RepoDiffTarget::Root {
+                to: "HEAD".to_string(),
+                path: Some("notes/first  draft.md".to_string()),
+            },
+            content: Some(RepoTextContentSpec { max_bytes: ByteUnit::new(4096) }),
+        }
+    );
+    for invalid in [
+        "--root",
+        "--root HEAD extra",
+        "--root HEAD --staged",
+        "--content --root HEAD",
+        "--root HEAD --root HEAD",
+    ] {
+        assert!(
+            parse_repo_diff_arg(Some(invalid)).is_err(),
+            "accepted {invalid}"
+        );
+    }
+}
+
+#[test]
 fn parse_repo_add_arg_supports_force() {
     assert_eq!(
         parse_repo_add_arg(None).unwrap(),

@@ -286,6 +286,7 @@ pub(super) fn parse_repo_diff_arg(arg: Option<&str>) -> Result<RepoDiffSpec, Pra
     let mut kind = None;
     let mut include_content = false;
     let mut max_content_bytes = None;
+    let mut root = None;
     let mut parts = Vec::new();
     let mut in_path = false;
     let mut index = 0;
@@ -333,39 +334,62 @@ pub(super) fn parse_repo_diff_arg(arg: Option<&str>) -> Result<RepoDiffSpec, Pra
             }
             max_content_bytes = Some(value);
             index += 2;
+        } else if !in_path && part == "--root" {
+            if root.is_some() {
+                return Err(pragma_fail("diff accepts --root only once"));
+            }
+            let Some(value) = raw_parts.get(index + 1) else {
+                return Err(pragma_fail("diff --root requires a target revision"));
+            };
+            root = Some(value.clone());
+            index += 2;
         } else {
             parts.push(part.as_str());
             index += 1;
         }
     }
-    let target = match parts.as_slice() {
-        [] => RepoDiffTarget::Worktree { path: None },
-        ["--", path @ ..] if !path.is_empty() => {
-            RepoDiffTarget::Worktree { path: Some(path.join(" ")) }
+    let target = if let Some(to) = root {
+        match parts.as_slice() {
+            [] => RepoDiffTarget::Root { to, path: None },
+            ["--", path @ ..] if !path.is_empty() => {
+                RepoDiffTarget::Root { to, path: Some(path.join(" ")) }
+            }
+            _ => {
+                return Err(pragma_fail(
+                    "diff --root accepts one target revision and an optional `-- path`",
+                ));
+            }
         }
-        ["--staged"] | ["--cached"] => RepoDiffTarget::Staged { path: None },
-        ["--staged", "--", path @ ..] | ["--cached", "--", path @ ..] if !path.is_empty() => {
-            RepoDiffTarget::Staged { path: Some(path.join(" ")) }
-        }
-        [rev] => RepoDiffTarget::RevisionToWorktree { rev: (*rev).to_string(), path: None },
-        [rev, "--", path @ ..] if !path.is_empty() => RepoDiffTarget::RevisionToWorktree {
-            rev: (*rev).to_string(),
-            path: Some(path.join(" ")),
-        },
-        [from, to] => RepoDiffTarget::Revisions {
-            from: (*from).to_string(),
-            to: (*to).to_string(),
-            path: None,
-        },
-        [from, to, "--", path @ ..] if !path.is_empty() => RepoDiffTarget::Revisions {
-            from: (*from).to_string(),
-            to: (*to).to_string(),
-            path: Some(path.join(" ")),
-        },
-        _ => {
-            return Err(pragma_fail(
-                "argument must be in the form: `[--rows] [--staged] [rev] [rev] [-- path]`",
-            ));
+    } else {
+        match parts.as_slice() {
+            [] => RepoDiffTarget::Worktree { path: None },
+            ["--", path @ ..] if !path.is_empty() => {
+                RepoDiffTarget::Worktree { path: Some(path.join(" ")) }
+            }
+            ["--staged"] | ["--cached"] => RepoDiffTarget::Staged { path: None },
+            ["--staged", "--", path @ ..] | ["--cached", "--", path @ ..] if !path.is_empty() => {
+                RepoDiffTarget::Staged { path: Some(path.join(" ")) }
+            }
+            [rev] => RepoDiffTarget::RevisionToWorktree { rev: (*rev).to_string(), path: None },
+            [rev, "--", path @ ..] if !path.is_empty() => RepoDiffTarget::RevisionToWorktree {
+                rev: (*rev).to_string(),
+                path: Some(path.join(" ")),
+            },
+            [from, to] => RepoDiffTarget::Revisions {
+                from: (*from).to_string(),
+                to: (*to).to_string(),
+                path: None,
+            },
+            [from, to, "--", path @ ..] if !path.is_empty() => RepoDiffTarget::Revisions {
+                from: (*from).to_string(),
+                to: (*to).to_string(),
+                path: Some(path.join(" ")),
+            },
+            _ => {
+                return Err(pragma_fail(
+                    "argument must be in the form: `[--rows] [--staged] [rev] [rev] [-- path]` or `--root rev [-- path]`",
+                ));
+            }
         }
     };
     if max_content_bytes.is_some() && !include_content {
@@ -380,10 +404,12 @@ pub(super) fn parse_repo_diff_arg(arg: Option<&str>) -> Result<RepoDiffSpec, Pra
         }
         if !matches!(
             &target,
-            RepoDiffTarget::Revisions { path: Some(path), .. } if !path.is_empty()
+            RepoDiffTarget::Revisions { path: Some(path), .. }
+                | RepoDiffTarget::Root { path: Some(path), .. }
+                if !path.is_empty()
         ) {
             return Err(pragma_fail(
-                "diff --content requires explicit from and to revisions and one path",
+                "diff --content requires explicit from and to revisions or --root target, and one path",
             ));
         }
         Some(RepoTextContentSpec {

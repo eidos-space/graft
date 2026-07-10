@@ -628,7 +628,7 @@ pub(crate) enum GraftPragma {
     /// Legacy Volume diff as JSON. mode: omitted=summary, "rows"=row-level detail
     VolumeJsonDiff { from: LSN, to: LSN, mode: DiffMode },
 
-    /// `pragma graft_json_diff = "[--rows] [--content [--max-content-bytes bytes]] [--kind kind] [--staged] [rev] [rev] [-- path]";`
+    /// `pragma graft_json_diff = "[--rows] [--content [--max-content-bytes bytes]] [--kind kind] [--staged] [rev] [rev] [-- path] | --root rev [-- path]";`
     /// Repository diff as JSON
     JsonRepoDiff { spec: RepoDiffSpec },
 
@@ -2356,9 +2356,11 @@ impl GraftPragma {
                 let kind = spec.kind.map(repo_tracked_path_kind_json_label);
                 let repo = repo_for_file(file)?;
                 let content_request = match (&spec.content, &spec.target) {
-                    (Some(content), RepoDiffTarget::Revisions { path: Some(path), .. }) => {
-                        Some((repo_path_arg(&repo, path)?, content.max_bytes))
-                    }
+                    (
+                        Some(content),
+                        RepoDiffTarget::Revisions { path: Some(path), .. }
+                        | RepoDiffTarget::Root { path: Some(path), .. },
+                    ) => Some((repo_path_arg(&repo, path)?, content.max_bytes)),
                     (Some(_), _) => unreachable!("content diff target is validated while parsing"),
                     (None, _) => None,
                 };

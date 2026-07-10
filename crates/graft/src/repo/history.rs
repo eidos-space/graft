@@ -32,6 +32,20 @@ impl Repository {
         ))
     }
 
+    pub fn diff_root(&self, to: &str, path: Option<&str>) -> Result<RepoDiff> {
+        let to_id = self.resolve_revision(to)?;
+        let to_commit = self.read_commit(&to_id)?;
+        Ok(diff_repo_maps(
+            "root",
+            to_id,
+            &BTreeMap::new(),
+            &to_commit.files,
+            &BTreeMap::new(),
+            &to_commit.artifacts,
+            path,
+        ))
+    }
+
     pub fn diff_text_content(
         &self,
         artifact: &RepoArtifactDiff,
