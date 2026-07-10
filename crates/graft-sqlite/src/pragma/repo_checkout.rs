@@ -713,6 +713,9 @@ pub(super) fn restore_repo_path(
     repo: &Repository,
     spec: &RepoRestoreSpec,
 ) -> Result<JsonRestoreOutcome, ErrCtx> {
+    if repo.read_index()?.has_conflicts() {
+        return Err(ErrCtx::Repo(graft::repo::RepoErr::UnresolvedConflicts));
+    }
     if spec.all {
         return restore_repo_staged_all(runtime, file, repo, spec);
     }

@@ -4118,6 +4118,28 @@ fn test_repo_merge_large_file_conflicts_report_path_kind() {
     assert!(staged_text.contains("theirs 100644"));
     assert!(staged_text.contains("assets/model.bin (text file, external"));
 
+    let artifact_before_restore = std::fs::read(assets.join("model.bin")).unwrap();
+    let restore_error = pragma_arg_error(
+        &sqlite,
+        "graft_json_restore",
+        "--source HEAD~1 -- assets/model.bin",
+    );
+    assert!(
+        restore_error.contains("unresolved index conflicts"),
+        "restore should reject a conflicted index before changing an artifact: {restore_error}"
+    );
+    assert_eq!(
+        std::fs::read(assets.join("model.bin")).unwrap(),
+        artifact_before_restore,
+        "a rejected restore must leave the worktree artifact unchanged"
+    );
+    let status_after_restore: Value =
+        serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+            .expect("graft_json_status should remain readable after rejected restore");
+    assert_eq!(status_after_restore["dirty"], false);
+    assert_eq!(status_after_restore["has_unstaged_changes"], false);
+    assert_eq!(status_after_restore["has_conflicts"], true);
+
     let resolved: Value = serde_json::from_str(&pragma_arg_string(
         &sqlite,
         "graft_json_resolve_conflict",
@@ -7875,6 +7897,32 @@ fn test_repo_merge_conflict_records_index_stages() {
     let theirs_row = conflicts["conflicts"][0]["theirs_row"].as_array().unwrap();
     assert!(ours_row.iter().any(|value| value == "Carol"));
     assert!(theirs_row.iter().any(|value| value == "Bob"));
+
+    let carol_before_restore: i64 = sqlite
+        .query_row(
+            "SELECT COUNT(*) FROM repo_merge WHERE name = 'Carol'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(carol_before_restore, 1);
+    let restore_error =
+        pragma_arg_error(&sqlite, "graft_json_restore", "--source HEAD~1 -- app.db");
+    assert!(
+        restore_error.contains("unresolved index conflicts"),
+        "restore should reject a conflicted index before changing the worktree: {restore_error}"
+    );
+    let carol_after_restore: i64 = sqlite
+        .query_row(
+            "SELECT COUNT(*) FROM repo_merge WHERE name = 'Carol'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        carol_after_restore, 1,
+        "a rejected restore must leave the worktree database unchanged"
+    );
 
     let mut output = None;
     let result = sqlite.pragma(None, "graft_commit", "merge feature", |row| {
