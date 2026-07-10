@@ -4472,6 +4472,124 @@ fn test_repo_pragmas_checkout_and_restore_regular_file_directory() {
 }
 
 #[test]
+fn test_repo_restore_regular_file_recreates_missing_parent_directories() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_path.to_str().unwrap(), None);
+    pragma_query_string(&sqlite, "graft_init");
+
+    let note = temp_dir.path().join("notes/archive/a.md");
+    std::fs::create_dir_all(note.parent().unwrap()).unwrap();
+    std::fs::write(&note, "first version").unwrap();
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_add", "notes/archive/a.md"),
+        "Added notes/archive/a.md"
+    );
+    pragma_arg_string(&sqlite, "graft_commit", "add archived note");
+
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_rm", "notes"),
+        "Removed notes/archive/a.md"
+    );
+    pragma_arg_string(&sqlite, "graft_commit", "remove notes");
+    std::fs::remove_dir_all(temp_dir.path().join("notes")).unwrap();
+    assert!(!temp_dir.path().join("notes").exists());
+
+    let restored: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_restore",
+        "--source HEAD~1 -- notes/archive/a.md",
+    ))
+    .expect("graft_json_restore should recreate missing parent directories");
+    assert_eq!(restored["path"], "notes/archive/a.md");
+    assert_eq!(std::fs::read_to_string(&note).unwrap(), "first version");
+
+    std::fs::remove_dir_all(temp_dir.path().join("notes")).unwrap();
+    let restored: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_restore",
+        &format!("--source HEAD~1 -- {}", note.display()),
+    ))
+    .expect("graft_json_restore should accept an absolute path inside the worktree");
+    assert_eq!(restored["path"], "notes/archive/a.md");
+    assert_eq!(std::fs::read_to_string(&note).unwrap(), "first version");
+
+    let traversal_error = pragma_arg_error(
+        &sqlite,
+        "graft_json_restore",
+        "--source HEAD~1 -- missing/../../outside/a.md",
+    );
+    assert!(
+        traversal_error.contains("outside repository worktree"),
+        "{traversal_error}"
+    );
+
+    let outside = tempfile::tempdir().unwrap();
+    let outside_note = outside.path().join("missing/a.md");
+    let outside_error = pragma_arg_error(
+        &sqlite,
+        "graft_json_restore",
+        &format!("--source HEAD~1 -- {}", outside_note.display()),
+    );
+    assert!(
+        outside_error.contains("outside repository worktree"),
+        "{outside_error}"
+    );
+    assert!(!outside_note.exists());
+
+    runtime.shutdown().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn test_repo_restore_missing_parent_rejects_symlink_escape() {
+    use std::os::unix::fs::symlink;
+
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_path.to_str().unwrap(), None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+
+    let tracked = temp_dir.path().join("escape/nested/a.md");
+    std::fs::create_dir_all(tracked.parent().unwrap()).unwrap();
+    std::fs::write(&tracked, "tracked version").unwrap();
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_add", "escape/nested/a.md"),
+        "Added escape/nested/a.md"
+    );
+    assert!(
+        pragma_arg_string(&sqlite, "graft_commit", "add escaped note").contains("add escaped note")
+    );
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_rm", "escape"),
+        "Removed escape/nested/a.md"
+    );
+    assert!(
+        pragma_arg_string(&sqlite, "graft_commit", "remove escaped note")
+            .contains("remove escaped note")
+    );
+
+    std::fs::remove_dir_all(temp_dir.path().join("escape")).unwrap();
+    symlink(outside.path(), temp_dir.path().join("escape")).unwrap();
+    let error = pragma_arg_error(
+        &sqlite,
+        "graft_json_restore",
+        "--source HEAD~1 -- escape/nested/a.md",
+    );
+    assert!(error.contains("outside repository worktree"), "{error}");
+    assert!(!outside.path().join("nested/a.md").exists());
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
 fn test_repo_checkout_path_rejects_untracked_file_overwrite() {
     graft_test::ensure_test_env();
 

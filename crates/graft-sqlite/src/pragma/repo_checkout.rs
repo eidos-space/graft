@@ -723,7 +723,7 @@ pub(super) fn restore_repo_path(
     let path = spec.path.as_deref().ok_or_else(|| {
         ErrCtx::PragmaErr("restore requires a path unless --staged --all is used".into())
     })?;
-    let (key, physical_path) = repo_physical_path_arg(repo, path)?;
+    let (key, physical_path) = repo_restore_path_arg(repo, path)?;
     let is_directory = std::fs::symlink_metadata(&physical_path)
         .map(|metadata| metadata.file_type().is_dir())
         .unwrap_or(false);
