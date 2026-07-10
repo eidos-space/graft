@@ -738,13 +738,12 @@ pub(super) fn restore_repo_path(
         return restore_repo_directory(runtime, file, repo, spec, &key);
     }
 
-    match restore_repo_key(runtime, file, repo, spec, &key) {
-        Ok(restored) => json_restore_outcome(repo, spec, vec![restored]),
+    match restore_repo_keys(runtime, file, repo, spec, vec![key.clone()]) {
+        Ok(outcome) => Ok(outcome),
         Err(ErrCtx::PragmaErr(_)) | Err(ErrCtx::Repo(graft::repo::RepoErr::PathNotTracked(_))) => {
             let keys = restore_keys_for_pathspec(repo, spec, &key)?;
             if keys.is_empty() {
-                restore_repo_key(runtime, file, repo, spec, &key)
-                    .and_then(|restored| json_restore_outcome(repo, spec, vec![restored]))
+                restore_repo_keys(runtime, file, repo, spec, vec![key])
             } else {
                 restore_repo_keys(runtime, file, repo, spec, keys)
             }

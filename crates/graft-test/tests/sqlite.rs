@@ -4857,6 +4857,71 @@ fn test_repo_restore_root_rejects_untracked_collision_before_mutation() {
 }
 
 #[test]
+fn test_repo_restore_single_file_rejects_untracked_collision_before_mutation() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_path.to_str().unwrap(), None);
+    pragma_query_string(&sqlite, "graft_init");
+
+    let collision = temp_dir.path().join("draft.md");
+    std::fs::write(&collision, "tracked source\n").unwrap();
+    pragma_arg_string(&sqlite, "graft_add", "--all");
+    pragma_arg_string(&sqlite, "graft_commit", "source version");
+    std::fs::remove_file(&collision).unwrap();
+    pragma_arg_string(&sqlite, "graft_add", "--all");
+    pragma_arg_string(&sqlite, "graft_commit", "current version");
+    std::fs::write(&collision, "untracked draft\n").unwrap();
+
+    let error = pragma_arg_error(&sqlite, "graft_json_restore", "--source HEAD~1 -- draft.md");
+    assert!(
+        error.contains("untracked paths would be overwritten: draft.md"),
+        "{error}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&collision).unwrap(),
+        "untracked draft\n"
+    );
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_restore_single_file_rejects_ignored_untracked_collision_before_mutation() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_path.to_str().unwrap(), None);
+    pragma_query_string(&sqlite, "graft_init");
+
+    let collision = temp_dir.path().join("draft.md");
+    std::fs::write(&collision, "tracked source\n").unwrap();
+    pragma_arg_string(&sqlite, "graft_add", "--all");
+    pragma_arg_string(&sqlite, "graft_commit", "source version");
+    std::fs::remove_file(&collision).unwrap();
+    std::fs::write(temp_dir.path().join(".graftignore"), "draft.md\n").unwrap();
+    pragma_arg_string(&sqlite, "graft_add", "--all");
+    pragma_arg_string(&sqlite, "graft_commit", "current version");
+    std::fs::write(&collision, "ignored draft\n").unwrap();
+
+    let error = pragma_arg_error(&sqlite, "graft_json_restore", "--source HEAD~1 -- draft.md");
+    assert!(
+        error.contains("untracked paths would be overwritten: draft.md"),
+        "{error}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&collision).unwrap(),
+        "ignored draft\n"
+    );
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
 fn test_repo_restore_root_rejects_ignored_untracked_collision_before_mutation() {
     graft_test::ensure_test_env();
 
