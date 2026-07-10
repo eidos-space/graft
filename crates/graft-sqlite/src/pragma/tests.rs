@@ -1226,6 +1226,8 @@ fn parse_checkout_and_switch_force_args() {
         parse_repo_restore_arg("external.db").unwrap(),
         RepoRestoreSpec {
             source: None,
+            expected_head: None,
+            require_clean: false,
             staged: false,
             all: false,
             kind: None,
@@ -1236,6 +1238,8 @@ fn parse_checkout_and_switch_force_args() {
         parse_repo_restore_arg("--source HEAD~1 -- external.db").unwrap(),
         RepoRestoreSpec {
             source: Some("HEAD~1".to_string()),
+            expected_head: None,
+            require_clean: false,
             staged: false,
             all: false,
             kind: None,
@@ -1246,6 +1250,8 @@ fn parse_checkout_and_switch_force_args() {
         parse_repo_restore_arg("--source HEAD~1 -- \"notes/my draft.md\"").unwrap(),
         RepoRestoreSpec {
             source: Some("HEAD~1".to_string()),
+            expected_head: None,
+            require_clean: false,
             staged: false,
             all: false,
             kind: None,
@@ -1266,6 +1272,8 @@ fn parse_checkout_and_switch_force_args() {
         parse_repo_restore_arg("--staged -- external.db").unwrap(),
         RepoRestoreSpec {
             source: None,
+            expected_head: None,
+            require_clean: false,
             staged: true,
             all: false,
             kind: None,
@@ -1276,6 +1284,8 @@ fn parse_checkout_and_switch_force_args() {
         parse_repo_restore_arg("--staged --source HEAD -- external.db").unwrap(),
         RepoRestoreSpec {
             source: Some("HEAD".to_string()),
+            expected_head: None,
+            require_clean: false,
             staged: true,
             all: false,
             kind: None,
@@ -1286,16 +1296,35 @@ fn parse_checkout_and_switch_force_args() {
         parse_repo_restore_arg("--staged --all --kind db").unwrap(),
         RepoRestoreSpec {
             source: None,
+            expected_head: None,
+            require_clean: false,
             staged: true,
             all: true,
             kind: Some(RepoTrackedPathKind::SqliteDatabase),
             path: None,
         }
     );
+    assert_eq!(
+        parse_repo_restore_arg(
+            "--source HEAD~1 --expected-head abc123 --require-clean -- external.db",
+        )
+        .unwrap(),
+        RepoRestoreSpec {
+            source: Some("HEAD~1".to_string()),
+            expected_head: Some("abc123".to_string()),
+            require_clean: true,
+            staged: false,
+            all: false,
+            kind: None,
+            path: Some(PathBuf::from("external.db")),
+        }
+    );
     assert!(parse_repo_restore_arg("--all").is_err());
     assert!(parse_repo_restore_arg("--kind db -- external.db").is_err());
     assert!(parse_repo_restore_arg("--staged --all external.db").is_err());
     assert!(parse_repo_restore_arg("--staged --all --kind nope").is_err());
+    assert!(parse_repo_restore_arg("--expected-head -- external.db").is_err());
+    assert!(parse_repo_restore_arg("--require-clean --require-clean -- external.db").is_err());
     assert_eq!(
         parse_repo_export_arg("--output snapshot.db").unwrap(),
         RepoExportSpec {

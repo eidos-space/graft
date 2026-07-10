@@ -4922,6 +4922,76 @@ fn test_repo_restore_single_file_rejects_ignored_untracked_collision_before_muta
 }
 
 #[test]
+fn test_repo_restore_checks_expected_head_and_clean_guard_before_mutation() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_path.to_str().unwrap(), None);
+    pragma_query_string(&sqlite, "graft_init");
+
+    let note = temp_dir.path().join("note.md");
+    std::fs::write(&note, "version one\n").unwrap();
+    pragma_arg_string(&sqlite, "graft_add", "--all");
+    pragma_arg_string(&sqlite, "graft_commit", "version one");
+    let repo = Repository::open(temp_dir.path()).unwrap();
+    let first = repo.resolve_revision("HEAD").unwrap();
+
+    std::fs::write(&note, "version two\n").unwrap();
+    pragma_arg_string(&sqlite, "graft_add", "--all");
+    pragma_arg_string(&sqlite, "graft_commit", "version two");
+    let second = repo.resolve_revision("HEAD").unwrap();
+    let index_before = repo.read_index().unwrap();
+    std::fs::write(&note, "local draft\n").unwrap();
+
+    let stale_error = pragma_arg_error(
+        &sqlite,
+        "graft_json_restore",
+        &format!("--source HEAD~1 --expected-head {first} -- note.md"),
+    );
+    assert!(stale_error.contains("HEAD changed"), "{stale_error}");
+    assert!(stale_error.contains(&first), "{stale_error}");
+    assert!(stale_error.contains(&second), "{stale_error}");
+    assert_eq!(std::fs::read_to_string(&note).unwrap(), "local draft\n");
+    assert_eq!(repo.resolve_revision("HEAD").unwrap(), second);
+    assert_eq!(repo.read_index().unwrap(), index_before);
+
+    let dirty_error = pragma_arg_error(
+        &sqlite,
+        "graft_json_restore",
+        &format!("--source HEAD~1 --expected-head {second} --require-clean -- note.md"),
+    );
+    assert!(
+        dirty_error.contains("staged or tracked worktree changes"),
+        "{dirty_error}"
+    );
+    assert_eq!(std::fs::read_to_string(&note).unwrap(), "local draft\n");
+    assert_eq!(repo.resolve_revision("HEAD").unwrap(), second);
+    assert_eq!(repo.read_index().unwrap(), index_before);
+
+    std::fs::write(&note, "version two\n").unwrap();
+    let untracked = temp_dir.path().join("scratch.md");
+    std::fs::write(&untracked, "keep untracked\n").unwrap();
+    let restored: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_restore",
+        &format!("--source HEAD~1 --expected-head {second} --require-clean -- note.md"),
+    ))
+    .unwrap();
+    assert_eq!(restored["path"], "note.md");
+    assert_eq!(std::fs::read_to_string(&note).unwrap(), "version one\n");
+    assert_eq!(
+        std::fs::read_to_string(&untracked).unwrap(),
+        "keep untracked\n"
+    );
+    assert_eq!(repo.resolve_revision("HEAD").unwrap(), second);
+    assert_eq!(repo.read_index().unwrap(), index_before);
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
 fn test_repo_restore_root_rejects_ignored_untracked_collision_before_mutation() {
     graft_test::ensure_test_env();
 

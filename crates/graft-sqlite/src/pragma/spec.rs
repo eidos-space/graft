@@ -114,6 +114,8 @@ pub(crate) enum RepoCheckoutSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RepoRestoreSpec {
     pub(super) source: Option<String>,
+    pub(super) expected_head: Option<String>,
+    pub(super) require_clean: bool,
     pub(super) staged: bool,
     pub(super) all: bool,
     pub(super) kind: Option<RepoTrackedPathKind>,

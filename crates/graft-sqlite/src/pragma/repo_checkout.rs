@@ -720,6 +720,19 @@ pub(super) fn restore_repo_path(
     repo: &Repository,
     spec: &RepoRestoreSpec,
 ) -> Result<JsonRestoreOutcome, ErrCtx> {
+    if let Some(expected_head) = &spec.expected_head {
+        let current_head = repo.resolve_revision("HEAD")?;
+        if &current_head != expected_head {
+            return pragma_err!(format!(
+                "cannot restore because HEAD changed: expected {expected_head}, found {current_head}"
+            ));
+        }
+    }
+    if spec.require_clean && repo_has_work_in_progress_for_file(runtime, file, repo)? {
+        return pragma_err!(
+            "cannot restore because the repository has staged or tracked worktree changes"
+        );
+    }
     if repo.read_index()?.has_conflicts() {
         return Err(ErrCtx::Repo(graft::repo::RepoErr::UnresolvedConflicts));
     }

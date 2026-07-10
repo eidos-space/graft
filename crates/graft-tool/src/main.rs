@@ -215,6 +215,14 @@ enum Command {
         #[arg(short = 's', long)]
         source: Option<String>,
 
+        /// Fail unless HEAD still equals this full object id
+        #[arg(long, value_name = "OID")]
+        expected_head: Option<String>,
+
+        /// Fail if staged or tracked worktree changes are present
+        #[arg(long)]
+        require_clean: bool,
+
         /// Restore the staged index entry from HEAD instead of touching the worktree
         #[arg(long, alias = "cached")]
         staged: bool,
@@ -964,8 +972,25 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
                 Some(&arg),
             )?);
         }
-        Command::Restore { json, source, staged, all, kind, path } => {
-            let arg = repo_restore_arg(source.as_deref(), staged, all, kind, path.as_deref())?;
+        Command::Restore {
+            json,
+            source,
+            expected_head,
+            require_clean,
+            staged,
+            all,
+            kind,
+            path,
+        } => {
+            let arg = repo_restore_arg(
+                source.as_deref(),
+                expected_head.as_deref(),
+                require_clean,
+                staged,
+                all,
+                kind,
+                path.as_deref(),
+            )?;
             print_output(run_repo_pragma(
                 db_override,
                 None,
@@ -2016,19 +2041,31 @@ fn repo_checkout_arg(force: bool, rev: &str, path: Option<&Path>) -> String {
 
 fn repo_restore_arg(
     source: Option<&str>,
+    expected_head: Option<&str>,
+    require_clean: bool,
     staged: bool,
     all: bool,
     kind: Option<PathKind>,
     path: Option<&Path>,
 ) -> Result<String> {
+    let mut parts = Vec::new();
+    if staged {
+        parts.push("--staged".to_string());
+    }
+    if let Some(source) = source {
+        parts.push("--source".to_string());
+        parts.push(source.to_string());
+    }
+    if let Some(expected_head) = expected_head {
+        parts.push("--expected-head".to_string());
+        parts.push(expected_head.to_string());
+    }
+    if require_clean {
+        parts.push("--require-clean".to_string());
+    }
     if all {
         if !staged || path.is_some() {
             unreachable!("clap prevents --all without --staged or with a path");
-        }
-        let mut parts = vec!["--staged".to_string()];
-        if let Some(source) = source {
-            parts.push("--source".to_string());
-            parts.push(source.to_string());
         }
         parts.push("--all".to_string());
         if let Some(kind) = kind {
@@ -2043,13 +2080,9 @@ fn repo_restore_arg(
     }
 
     let path = path.expect("clap requires a restore path unless --all is present");
-    let path = quote_pragma_path(path)?;
-    Ok(match (source, staged) {
-        (Some(source), true) => format!("--staged --source {source} -- {path}"),
-        (None, true) => format!("--staged -- {path}"),
-        (Some(source), false) => format!("--source {source} -- {path}"),
-        (None, false) => format!("-- {path}"),
-    })
+    parts.push("--".to_string());
+    parts.push(quote_pragma_path(path)?);
+    Ok(parts.join(" "))
 }
 
 fn quote_pragma_path(path: &Path) -> Result<String> {
@@ -3686,7 +3719,10 @@ mod tests {
     fn parses_restore_with_optional_source() {
         let cli =
             Cli::try_parse_from(["graft", "restore", "--source", "HEAD~1", "external.db"]).unwrap();
-        let Command::Restore { json, source, staged, all, kind, path } = cli.command else {
+        let Command::Restore {
+            json, source, staged, all, kind, path, ..
+        } = cli.command
+        else {
             panic!("expected restore command");
         };
         assert!(!json);
@@ -3696,12 +3732,24 @@ mod tests {
         assert_eq!(kind, None);
         assert_eq!(path, Some(PathBuf::from("external.db")));
         assert_eq!(
-            repo_restore_arg(source.as_deref(), staged, all, kind, path.as_deref()).unwrap(),
+            repo_restore_arg(
+                source.as_deref(),
+                None,
+                false,
+                staged,
+                all,
+                kind,
+                path.as_deref(),
+            )
+            .unwrap(),
             "--source HEAD~1 -- \"external.db\""
         );
 
         let cli = Cli::try_parse_from(["graft", "restore", "--staged", "external.db"]).unwrap();
-        let Command::Restore { json, source, staged, all, kind, path } = cli.command else {
+        let Command::Restore {
+            json, source, staged, all, kind, path, ..
+        } = cli.command
+        else {
             panic!("expected restore command");
         };
         assert!(!json);
@@ -3711,7 +3759,16 @@ mod tests {
         assert_eq!(kind, None);
         assert_eq!(path, Some(PathBuf::from("external.db")));
         assert_eq!(
-            repo_restore_arg(source.as_deref(), staged, all, kind, path.as_deref()).unwrap(),
+            repo_restore_arg(
+                source.as_deref(),
+                None,
+                false,
+                staged,
+                all,
+                kind,
+                path.as_deref(),
+            )
+            .unwrap(),
             "--staged -- \"external.db\""
         );
 
@@ -3724,7 +3781,10 @@ mod tests {
             "external.db",
         ])
         .unwrap();
-        let Command::Restore { json, source, staged, all, kind, path } = cli.command else {
+        let Command::Restore {
+            json, source, staged, all, kind, path, ..
+        } = cli.command
+        else {
             panic!("expected restore command");
         };
         assert!(!json);
@@ -3734,8 +3794,60 @@ mod tests {
         assert_eq!(kind, None);
         assert_eq!(path, Some(PathBuf::from("external.db")));
         assert_eq!(
-            repo_restore_arg(source.as_deref(), staged, all, kind, path.as_deref()).unwrap(),
+            repo_restore_arg(
+                source.as_deref(),
+                None,
+                false,
+                staged,
+                all,
+                kind,
+                path.as_deref(),
+            )
+            .unwrap(),
             "--staged --source HEAD~1 -- \"external.db\""
+        );
+
+        let expected = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let cli = Cli::try_parse_from([
+            "graft",
+            "restore",
+            "--source",
+            "HEAD~1",
+            "--expected-head",
+            expected,
+            "--require-clean",
+            "external.db",
+        ])
+        .unwrap();
+        let Command::Restore {
+            source,
+            expected_head,
+            require_clean,
+            staged,
+            all,
+            kind,
+            path,
+            ..
+        } = cli.command
+        else {
+            panic!("expected restore command");
+        };
+        assert_eq!(expected_head.as_deref(), Some(expected));
+        assert!(require_clean);
+        assert_eq!(
+            repo_restore_arg(
+                source.as_deref(),
+                expected_head.as_deref(),
+                require_clean,
+                staged,
+                all,
+                kind,
+                path.as_deref(),
+            )
+            .unwrap(),
+            format!(
+                "--source HEAD~1 --expected-head {expected} --require-clean -- \"external.db\""
+            )
         );
     }
 
@@ -3764,7 +3876,16 @@ mod tests {
             panic!("expected restore command");
         };
         assert_eq!(
-            repo_restore_arg(source.as_deref(), staged, all, kind, path.as_deref()).unwrap(),
+            repo_restore_arg(
+                source.as_deref(),
+                None,
+                false,
+                staged,
+                all,
+                kind,
+                path.as_deref(),
+            )
+            .unwrap(),
             "-- \"my  note.md\""
         );
     }
@@ -3786,7 +3907,10 @@ mod tests {
     fn parses_restore_staged_all_kind_filter() {
         let cli =
             Cli::try_parse_from(["graft", "restore", "--staged", "--all", "--kind", "db"]).unwrap();
-        let Command::Restore { json, source, staged, all, kind, path } = cli.command else {
+        let Command::Restore {
+            json, source, staged, all, kind, path, ..
+        } = cli.command
+        else {
             panic!("expected restore command");
         };
         assert!(!json);
@@ -3796,7 +3920,16 @@ mod tests {
         assert_eq!(kind, Some(PathKind::SqliteDatabase));
         assert_eq!(path, None);
         assert_eq!(
-            repo_restore_arg(source.as_deref(), staged, all, kind, path.as_deref()).unwrap(),
+            repo_restore_arg(
+                source.as_deref(),
+                None,
+                false,
+                staged,
+                all,
+                kind,
+                path.as_deref(),
+            )
+            .unwrap(),
             "--staged --all --kind sqlite_database"
         );
 
@@ -3826,7 +3959,10 @@ mod tests {
 
         let cli =
             Cli::try_parse_from(["graft", "restore", "--json", "--staged", "external.db"]).unwrap();
-        let Command::Restore { json, source, staged, all, kind, path } = cli.command else {
+        let Command::Restore {
+            json, source, staged, all, kind, path, ..
+        } = cli.command
+        else {
             panic!("expected restore command");
         };
         assert!(json);
@@ -3836,7 +3972,16 @@ mod tests {
         assert_eq!(kind, None);
         assert_eq!(path, Some(PathBuf::from("external.db")));
         assert_eq!(
-            repo_restore_arg(source.as_deref(), staged, all, kind, path.as_deref()).unwrap(),
+            repo_restore_arg(
+                source.as_deref(),
+                None,
+                false,
+                staged,
+                all,
+                kind,
+                path.as_deref(),
+            )
+            .unwrap(),
             "--staged -- \"external.db\""
         );
         assert_eq!(restore_pragma(json), "json_restore");

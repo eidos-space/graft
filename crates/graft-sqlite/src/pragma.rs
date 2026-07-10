@@ -164,10 +164,10 @@ pub(crate) enum GraftPragma {
     /// `pragma graft_json_checkout = "[--force] rev [-- path]";`
     JsonRepoCheckout { spec: RepoCheckoutSpec },
 
-    /// `pragma graft_restore = "[--source rev] path|--staged --all [--kind kind]";`
+    /// `pragma graft_restore = "[--source rev] [--expected-head oid] [--require-clean] path|--staged --all [--kind kind]";`
     Restore { spec: RepoRestoreSpec },
 
-    /// `pragma graft_json_restore = "[--source rev] path|--staged --all [--kind kind]";`
+    /// `pragma graft_json_restore = "[--source rev] [--expected-head oid] [--require-clean] path|--staged --all [--kind kind]";`
     JsonRestore { spec: RepoRestoreSpec },
 
     /// `pragma graft_export = "[--source rev] --output output.db [-- path]";`

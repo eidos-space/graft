@@ -911,6 +911,8 @@ pub(super) fn parse_repo_restore_arg(arg: &str) -> Result<RepoRestoreSpec, Pragm
     reject_ambiguous_posix_path_escape(arg)?;
     let parts = split_pragma_words(arg)?;
     let mut source = None;
+    let mut expected_head = None;
+    let mut require_clean = false;
     let mut staged = false;
     let mut all = false;
     let mut kind = None;
@@ -946,6 +948,26 @@ pub(super) fn parse_repo_restore_arg(arg: &str) -> Result<RepoRestoreSpec, Pragm
                 };
                 source = Some(value.clone());
                 index += 2;
+            }
+            "--expected-head" => {
+                if expected_head.is_some() {
+                    return Err(pragma_fail("restore accepts --expected-head only once"));
+                }
+                let Some(value) = parts.get(index + 1) else {
+                    return Err(pragma_fail("restore --expected-head requires an object id"));
+                };
+                if value.starts_with('-') {
+                    return Err(pragma_fail("restore --expected-head requires an object id"));
+                }
+                expected_head = Some(value.clone());
+                index += 2;
+            }
+            "--require-clean" => {
+                if require_clean {
+                    return Err(pragma_fail("restore accepts --require-clean only once"));
+                }
+                require_clean = true;
+                index += 1;
             }
             "--all" | "-A" => {
                 if all {
@@ -991,6 +1013,8 @@ pub(super) fn parse_repo_restore_arg(arg: &str) -> Result<RepoRestoreSpec, Pragm
 
     Ok(RepoRestoreSpec {
         source,
+        expected_head,
+        require_clean,
         staged,
         all,
         kind,
