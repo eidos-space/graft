@@ -2358,7 +2358,8 @@ impl GraftPragma {
                 let content_request = match (&spec.content, &spec.target) {
                     (
                         Some(content),
-                        RepoDiffTarget::Revisions { path: Some(path), .. }
+                        RepoDiffTarget::RevisionToWorktree { path: Some(path), .. }
+                        | RepoDiffTarget::Revisions { path: Some(path), .. }
                         | RepoDiffTarget::Root { path: Some(path), .. },
                     ) => Some((repo_path_arg(&repo, path)?, content.max_bytes)),
                     (Some(_), _) => unreachable!("content diff target is validated while parsing"),

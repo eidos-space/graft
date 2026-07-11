@@ -404,12 +404,13 @@ pub(super) fn parse_repo_diff_arg(arg: Option<&str>) -> Result<RepoDiffSpec, Pra
         }
         if !matches!(
             &target,
-            RepoDiffTarget::Revisions { path: Some(path), .. }
+            RepoDiffTarget::RevisionToWorktree { path: Some(path), .. }
+                | RepoDiffTarget::Revisions { path: Some(path), .. }
                 | RepoDiffTarget::Root { path: Some(path), .. }
                 if !path.is_empty()
         ) {
             return Err(pragma_fail(
-                "diff --content requires explicit from and to revisions or --root target, and one path",
+                "diff --content requires a source revision, an optional target revision, and one path",
             ));
         }
         Some(RepoTextContentSpec {
@@ -531,8 +532,9 @@ pub(super) fn parse_repo_add_arg(arg: Option<&str>) -> Result<RepoAddSpec, Pragm
             });
         }
         if let Some(path) = arg.strip_prefix(&format!("{flag} -- ")) {
+            let path = parse_delimited_repo_path(path, "add")?;
             return Ok(RepoAddSpec {
-                path: Some(PathBuf::from(path)),
+                path: Some(path),
                 force: true,
                 all: false,
                 kind: None,
@@ -553,6 +555,15 @@ pub(super) fn parse_repo_add_arg(arg: Option<&str>) -> Result<RepoAddSpec, Pragm
         }
     }
 
+    if let Some(path) = arg.strip_prefix("-- ") {
+        return Ok(RepoAddSpec {
+            path: Some(parse_delimited_repo_path(path, "add")?),
+            force: false,
+            all: false,
+            kind: None,
+        });
+    }
+
     if arg.starts_with('-') {
         return Err(pragma_fail(
             "argument must be in the form: `[--all|-A]` or `[--force] [path]`",
@@ -565,6 +576,16 @@ pub(super) fn parse_repo_add_arg(arg: Option<&str>) -> Result<RepoAddSpec, Pragm
         all: false,
         kind: None,
     })
+}
+
+fn parse_delimited_repo_path(value: &str, operation: &str) -> Result<PathBuf, PragmaErr> {
+    let parts = split_pragma_words(value)?;
+    match parts.as_slice() {
+        [path] if !path.is_empty() => Ok(PathBuf::from(path)),
+        _ => Err(pragma_fail(format!(
+            "{operation} accepts exactly one path after `--`"
+        ))),
+    }
 }
 
 pub(super) fn parse_repo_remove_arg(arg: Option<&str>) -> Result<RepoRemoveSpec, PragmaErr> {

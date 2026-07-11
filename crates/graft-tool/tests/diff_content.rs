@@ -55,6 +55,41 @@ fn diff_content_cli_returns_bounded_read_only_json() {
 }
 
 #[test]
+fn diff_content_cli_compares_a_revision_to_the_worktree() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let repo = Repository::init(temp_dir.path()).unwrap();
+    let note = temp_dir.path().join("note.md");
+
+    fs::write(&note, "# Committed\n").unwrap();
+    repo.stage_artifact_path(&note).unwrap();
+    repo.commit_staged("committed").unwrap();
+    fs::write(&note, "# Working tree\n").unwrap();
+    let status_before = repo.status().unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_graft"))
+        .current_dir(temp_dir.path())
+        .args(["diff", "--json", "--content", "HEAD", "--", "note.md"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["from"], status_before.head_target.unwrap());
+    assert_eq!(json["to"], "worktree");
+    assert_eq!(json["content"]["path"], "note.md");
+    assert_eq!(json["content"]["before"]["content"], "# Committed\n");
+    assert_eq!(json["content"]["after"]["content"], "# Working tree\n");
+
+    let status_after = repo.status().unwrap();
+    assert_eq!(status_after.staged, status_before.staged);
+    assert_eq!(status_after.unstaged, status_before.unstaged);
+    assert_eq!(fs::read_to_string(note).unwrap(), "# Working tree\n");
+}
+
+#[test]
 fn root_diff_cli_reports_first_commit_metadata_and_content() {
     let temp_dir = tempfile::tempdir().unwrap();
     let repo = Repository::init(temp_dir.path()).unwrap();
@@ -157,6 +192,32 @@ fn diff_content_cli_preserves_quotes_and_repeated_whitespace_in_path() {
     assert_eq!(json["content"]["path"], relative);
     assert_eq!(json["content"]["before"]["content"], "# Before\n");
     assert_eq!(json["content"]["after"]["content"], "# After\n");
+}
+
+#[cfg(not(windows))]
+#[test]
+fn add_cli_preserves_quotes_and_repeated_whitespace_in_path() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let repo = Repository::init(temp_dir.path()).unwrap();
+    let relative = "notes/it's  \"quoted\".md";
+    let note = temp_dir.path().join(relative);
+    fs::create_dir_all(note.parent().unwrap()).unwrap();
+    fs::write(&note, "# Draft\n").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_graft"))
+        .current_dir(temp_dir.path())
+        .args(["add", "--json", "--", relative])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["paths"][0]["path"], relative);
+    let status = repo.status().unwrap();
+    assert_eq!(status.staged[0], relative);
 }
 
 #[cfg(not(windows))]

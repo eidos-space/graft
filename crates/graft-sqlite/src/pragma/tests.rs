@@ -586,6 +586,20 @@ fn parse_repo_diff_arg_requires_bounded_single_path_content_mode() {
         }
     );
     assert_eq!(
+        parse_repo_diff_arg(Some("--content HEAD -- notes/readme.md")).unwrap(),
+        RepoDiffSpec {
+            mode: DiffMode::Default,
+            kind: None,
+            target: RepoDiffTarget::RevisionToWorktree {
+                rev: "HEAD".to_string(),
+                path: Some("notes/readme.md".to_string()),
+            },
+            content: Some(RepoTextContentSpec {
+                max_bytes: graft::repo::DEFAULT_TEXT_DIFF_CONTENT_LIMIT,
+            }),
+        }
+    );
+    assert_eq!(
         parse_repo_diff_arg(Some(
             "--content --max-content-bytes 4096 HEAD~1 HEAD -- notes/readme.md",
         ))
@@ -701,6 +715,15 @@ fn parse_repo_add_arg_supports_force() {
         parse_repo_add_arg(Some("assets/readme.md")).unwrap(),
         RepoAddSpec {
             path: Some(PathBuf::from("assets/readme.md")),
+            force: false,
+            all: false,
+            kind: None,
+        }
+    );
+    assert_eq!(
+        parse_repo_add_arg(Some("-- \"notes/it's  \\\"quoted\\\".md\"")).unwrap(),
+        RepoAddSpec {
+            path: Some(PathBuf::from("notes/it's  \"quoted\".md")),
             force: false,
             all: false,
             kind: None,

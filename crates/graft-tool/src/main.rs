@@ -905,7 +905,7 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
             if db_override.is_none() && !args.all && args.path.is_none() {
                 bail!("add requires a path, --all, or --db <path>");
             }
-            let arg = repo_add_arg(args.all, args.force, args.kind, args.path.as_deref());
+            let arg = repo_add_arg(args.all, args.force, args.kind, args.path.as_deref())?;
             print_output(run_repo_pragma(
                 db_override,
                 None,
@@ -1495,10 +1495,18 @@ fn config_get_pragma(json: bool) -> &'static str {
 
 fn validate_command_repo_paths(command: &Command) -> Result<()> {
     let (path, lossless_serialization) = match command {
-        Command::Add(args) => (args.path.as_deref(), false),
+        Command::Add(args) => (args.path.as_deref(), true),
         Command::Rm(args) => (args.path.as_deref(), false),
         Command::Diff { root: Some(_), from: Some(path), .. } => (Some(Path::new(path)), true),
         Command::Diff { staged: true, from: Some(path), .. } => (Some(Path::new(path)), true),
+        Command::Diff {
+            content: true,
+            root: None,
+            from: Some(_),
+            to: Some(path),
+            path: None,
+            ..
+        } => (Some(Path::new(path)), true),
         Command::Diff { path, .. } | Command::Restore { path, .. } => (path.as_deref(), true),
         Command::Checkout { path, .. } | Command::Resolve { path, .. } => (path.as_deref(), false),
         Command::Export(args) => (args.path.as_deref(), false),
@@ -1816,17 +1824,19 @@ fn repo_diff_arg(spec: RepoDiffArgSpec<'_>) -> Result<Option<String>> {
     if max_content_bytes.is_some() && !content {
         bail!("--max-content-bytes requires --content");
     }
+    let implicit_worktree_content_path =
+        content && root.is_none() && from.is_some() && to.is_some() && path.is_none();
     if content
         && (rows
             || staged
             || if root.is_some() {
                 from.is_none() || to.is_some() || path.is_some()
             } else {
-                from.is_none() || to.is_none() || path.is_none()
+                from.is_none() || (path.is_none() && !implicit_worktree_content_path)
             })
     {
         bail!(
-            "--content requires JSON, an explicit revision comparison or --root target, and one path"
+            "--content requires JSON, a source revision, an optional target revision, and one path"
         );
     }
     let mut prefixes = Vec::new();
@@ -1861,6 +1871,13 @@ fn repo_diff_arg(spec: RepoDiffArgSpec<'_>) -> Result<Option<String>> {
         return Ok(Some(arg));
     }
     let prefix = prefixes.join(" ");
+    if implicit_worktree_content_path {
+        return Ok(Some(format!(
+            "{prefix} {} -- {}",
+            from.expect("validated source revision"),
+            quote_pragma_path(Path::new(to.expect("implicit worktree content path")))?
+        )));
+    }
     if staged {
         if to.is_some() || path.is_some() {
             bail!("--staged accepts at most one optional path");
@@ -1996,7 +2013,7 @@ fn repo_add_arg(
     force: bool,
     kind: Option<PathKind>,
     path: Option<&Path>,
-) -> Option<String> {
+) -> Result<Option<String>> {
     if all {
         if force || path.is_some() {
             unreachable!("clap prevents --all with --force or path");
@@ -2006,19 +2023,19 @@ fn repo_add_arg(
             parts.push("--kind".to_string());
             parts.push(path_kind_arg(kind).to_string());
         }
-        return Some(parts.join(" "));
+        return Ok(Some(parts.join(" ")));
     }
 
     if kind.is_some() {
         unreachable!("clap prevents --kind without --all");
     }
 
-    match (force, path) {
+    Ok(match (force, path) {
         (false, None) => None,
-        (false, Some(path)) => Some(path.display().to_string()),
+        (false, Some(path)) => Some(format!("-- {}", quote_pragma_path(path)?)),
         (true, None) => Some("--force".to_string()),
-        (true, Some(path)) => Some(format!("--force -- {}", path.display())),
-    }
+        (true, Some(path)) => Some(format!("--force -- {}", quote_pragma_path(path)?)),
+    })
 }
 
 fn repo_rm_arg(cached: bool, path: Option<&Path>) -> Option<String> {
@@ -2573,8 +2590,21 @@ mod tests {
         assert!(!args.force);
         assert_eq!(args.kind, None);
         assert_eq!(
-            repo_add_arg(args.all, args.force, args.kind, args.path.as_deref()).as_deref(),
-            Some("external.db")
+            repo_add_arg(args.all, args.force, args.kind, args.path.as_deref())
+                .unwrap()
+                .as_deref(),
+            Some("-- \"external.db\"")
+        );
+        assert_eq!(
+            repo_add_arg(
+                false,
+                false,
+                None,
+                Some(Path::new("notes/it's  \"quoted\".md"))
+            )
+            .unwrap()
+            .as_deref(),
+            Some("-- \"notes/it's  \\\"quoted\\\".md\"")
         );
     }
 
@@ -2965,8 +2995,10 @@ mod tests {
         assert!(args.force);
         assert_eq!(args.kind, None);
         assert_eq!(
-            repo_add_arg(args.all, args.force, args.kind, args.path.as_deref()).as_deref(),
-            Some("--force -- external.db")
+            repo_add_arg(args.all, args.force, args.kind, args.path.as_deref())
+                .unwrap()
+                .as_deref(),
+            Some("--force -- \"external.db\"")
         );
     }
 
@@ -2983,7 +3015,9 @@ mod tests {
         assert_eq!(args.kind, None);
         assert_eq!(args.path, None);
         assert_eq!(
-            repo_add_arg(args.all, args.force, args.kind, args.path.as_deref()).as_deref(),
+            repo_add_arg(args.all, args.force, args.kind, args.path.as_deref())
+                .unwrap()
+                .as_deref(),
             Some("--all")
         );
 
@@ -3004,7 +3038,9 @@ mod tests {
         assert_eq!(args.kind, Some(PathKind::SqliteDatabase));
         assert_eq!(args.path, None);
         assert_eq!(
-            repo_add_arg(args.all, args.force, args.kind, args.path.as_deref()).as_deref(),
+            repo_add_arg(args.all, args.force, args.kind, args.path.as_deref())
+                .unwrap()
+                .as_deref(),
             Some("--all --kind sqlite_database")
         );
 
@@ -3052,7 +3088,9 @@ mod tests {
         assert!(args.all);
         assert_eq!(args.kind, None);
         assert_eq!(
-            repo_add_arg(args.all, args.force, args.kind, args.path.as_deref()).as_deref(),
+            repo_add_arg(args.all, args.force, args.kind, args.path.as_deref())
+                .unwrap()
+                .as_deref(),
             Some("--all")
         );
         assert_eq!(add_pragma(args.json), "json_add");
@@ -3278,6 +3316,56 @@ mod tests {
                 "note.md",
             ])
             .is_err()
+        );
+    }
+
+    #[test]
+    fn parses_single_path_worktree_text_content_diff() {
+        let cli = Cli::try_parse_from([
+            "graft",
+            "diff",
+            "--json",
+            "--content",
+            "HEAD",
+            "--",
+            "notes/readme.md",
+        ])
+        .unwrap();
+        let Command::Diff {
+            rows,
+            staged,
+            kind,
+            content,
+            max_content_bytes,
+            root,
+            from,
+            to,
+            path,
+            json,
+        } = cli.command
+        else {
+            panic!("expected diff command");
+        };
+
+        assert!(json);
+        assert!(content);
+        assert_eq!(from.as_deref(), Some("HEAD"));
+        assert_eq!(to.as_deref(), Some("notes/readme.md"));
+        assert_eq!(path, None);
+        assert_eq!(
+            repo_diff_arg(RepoDiffArgSpec {
+                rows,
+                staged,
+                kind,
+                content,
+                max_content_bytes,
+                root: root.as_deref(),
+                from: from.as_deref(),
+                to: to.as_deref(),
+                path: path.as_deref(),
+            })
+            .unwrap(),
+            Some("--content HEAD -- \"notes/readme.md\"".to_string())
         );
     }
 
