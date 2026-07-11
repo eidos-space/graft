@@ -8,11 +8,11 @@ use graft::{
 use sqlite_plugin::vfs::PragmaErr;
 
 use super::{
-    BranchListMode, DiffMode, JsonConfigListMode, JsonFetchAsyncMode, JsonLogMode, JsonTagsMode,
-    LargeFileFetchSpec, LargeFilePruneSpec, LargeFileStatusSpec, LsFilesSpec, RepoAddSpec,
-    RepoAuditSpec, RepoCheckoutSpec, RepoCloneSpec, RepoDiffSpec, RepoDiffTarget, RepoExportSpec,
-    RepoRemoveSpec, RepoResolveRowSpec, RepoResolveSpec, RepoRestoreSpec, RepoTextContentSpec,
-    ResolveSide, StatusSpec, parse_or_fail, pragma_fail,
+    BranchListMode, DiffMode, JsonConfigListMode, JsonFetchAsyncMode, JsonLogMode, JsonLogSpec,
+    JsonTagsMode, LargeFileFetchSpec, LargeFilePruneSpec, LargeFileStatusSpec, LsFilesSpec,
+    RepoAddSpec, RepoAuditSpec, RepoCheckoutSpec, RepoCloneSpec, RepoDiffSpec, RepoDiffTarget,
+    RepoExportSpec, RepoRemoveSpec, RepoResolveRowSpec, RepoResolveSpec, RepoRestoreSpec,
+    RepoTextContentSpec, ResolveSide, StatusSpec, parse_or_fail, pragma_fail,
 };
 
 pub(super) fn parse_remote_add(arg: &str) -> Result<(String, RemoteConfig), PragmaErr> {
@@ -1128,18 +1128,59 @@ fn reject_ambiguous_posix_path_escape(arg: &str) -> Result<(), PragmaErr> {
     Ok(())
 }
 
-pub(super) fn parse_json_log_arg(arg: Option<&str>) -> Result<JsonLogMode, PragmaErr> {
+pub(super) fn parse_json_log_arg(arg: Option<&str>) -> Result<JsonLogSpec, PragmaErr> {
     let Some(arg) = arg else {
-        return Ok(JsonLogMode::LegacyArray);
+        return Ok(JsonLogSpec {
+            mode: JsonLogMode::LegacyArray,
+            limit: None,
+            after: None,
+        });
     };
     let words = split_pragma_words(arg)?;
-    match words.as_slice() {
-        [] => Ok(JsonLogMode::LegacyArray),
-        [flag] if flag == "--with-status" => Ok(JsonLogMode::WithStatus),
-        _ => Err(pragma_fail(
-            "argument must be empty or in the form: `--with-status`",
-        )),
+    let mut mode = JsonLogMode::LegacyArray;
+    let mut limit = None;
+    let mut after = None;
+    let mut index = 0;
+    while index < words.len() {
+        match words[index].as_str() {
+            "--with-status" if mode == JsonLogMode::LegacyArray => {
+                mode = JsonLogMode::WithStatus;
+                index += 1;
+            }
+            "--limit" if limit.is_none() => {
+                let value = words
+                    .get(index + 1)
+                    .ok_or_else(|| pragma_fail("json_log --limit requires a positive integer"))?;
+                let parsed = value
+                    .parse::<usize>()
+                    .map_err(|_| pragma_fail("json_log --limit requires a positive integer"))?;
+                if parsed == 0 {
+                    return Err(pragma_fail("json_log --limit requires a positive integer"));
+                }
+                limit = Some(parsed);
+                index += 2;
+            }
+            "--after" if after.is_none() => {
+                after = Some(
+                    words
+                        .get(index + 1)
+                        .filter(|value| !value.starts_with("--"))
+                        .ok_or_else(|| pragma_fail("json_log --after requires a commit id"))?
+                        .clone(),
+                );
+                index += 2;
+            }
+            _ => {
+                return Err(pragma_fail(
+                    "argument must use: `[--with-status] [--limit n] [--after oid]`",
+                ));
+            }
+        }
     }
+    if after.is_some() && limit.is_none() {
+        return Err(pragma_fail("json_log --after requires --limit"));
+    }
+    Ok(JsonLogSpec { mode, limit, after })
 }
 
 pub(super) fn parse_json_config_list_arg(

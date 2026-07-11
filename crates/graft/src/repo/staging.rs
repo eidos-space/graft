@@ -357,10 +357,23 @@ impl Repository {
     }
 
     pub fn log(&self) -> Result<Vec<CommitObject>> {
+        self.log_page(usize::MAX, None).map(|(commits, _)| commits)
+    }
+
+    /// Walk repository history in display order and return one bounded page.
+    ///
+    /// `after` is an exact commit object id from a previous page. The walk
+    /// stops as soon as it can determine whether another page exists, so the
+    /// caller does not have to load and serialize the full repository log.
+    pub fn log_page(&self, limit: usize, after: Option<&str>) -> Result<(Vec<CommitObject>, bool)> {
+        if limit == 0 {
+            return Ok((Vec::new(), self.head_target()?.is_some()));
+        }
         let mut commits = vec![];
         let mut frontier = self.head_target()?.into_iter().collect::<Vec<_>>();
         let mut seen = BTreeSet::<String>::new();
         let mut cache = BTreeMap::<String, CommitObject>::new();
+        let mut after_seen = after.is_none();
 
         while let Some((idx, id)) = self.next_log_frontier_commit(&frontier, &seen, &mut cache)? {
             frontier.remove(idx);
@@ -375,10 +388,25 @@ impl Repository {
                     frontier.push(parent);
                 }
             }
+            if !after_seen {
+                if after == Some(commit.id.as_str()) {
+                    after_seen = true;
+                }
+                continue;
+            }
             commits.push(commit);
+            if commits.len() > limit {
+                commits.truncate(limit);
+                return Ok((commits, true));
+            }
         }
 
-        Ok(commits)
+        if !after_seen {
+            return Err(RepoErr::InvalidRevision(
+                after.unwrap_or_default().to_string(),
+            ));
+        }
+        Ok((commits, false))
     }
 
     pub(super) fn next_log_frontier_commit(

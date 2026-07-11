@@ -89,7 +89,13 @@ fn json_log_status_mode_is_opt_in() {
     let legacy = Pragma { name: "graft_json_log", arg: None };
     assert!(matches!(
         GraftPragma::try_from(&legacy).unwrap(),
-        GraftPragma::JsonLog { mode: JsonLogMode::LegacyArray }
+        GraftPragma::JsonLog {
+            spec: JsonLogSpec {
+                mode: JsonLogMode::LegacyArray,
+                limit: None,
+                after: None,
+            }
+        }
     ));
 
     let with_status = Pragma {
@@ -98,7 +104,28 @@ fn json_log_status_mode_is_opt_in() {
     };
     assert!(matches!(
         GraftPragma::try_from(&with_status).unwrap(),
-        GraftPragma::JsonLog { mode: JsonLogMode::WithStatus }
+        GraftPragma::JsonLog {
+            spec: JsonLogSpec {
+                mode: JsonLogMode::WithStatus,
+                limit: None,
+                after: None,
+            }
+        }
+    ));
+
+    let page = Pragma {
+        name: "graft_json_log",
+        arg: Some("--with-status --limit 25 --after abc123"),
+    };
+    assert!(matches!(
+        GraftPragma::try_from(&page).unwrap(),
+        GraftPragma::JsonLog {
+            spec: JsonLogSpec {
+                mode: JsonLogMode::WithStatus,
+                limit: Some(25),
+                after: Some(ref after),
+            }
+        } if after == "abc123"
     ));
 
     let invalid = Pragma {
@@ -106,6 +133,12 @@ fn json_log_status_mode_is_opt_in() {
         arg: Some("--status"),
     };
     assert!(GraftPragma::try_from(&invalid).is_err());
+
+    let cursor_without_limit = Pragma {
+        name: "graft_json_log",
+        arg: Some("--after abc123"),
+    };
+    assert!(GraftPragma::try_from(&cursor_without_limit).is_err());
 }
 
 #[test]

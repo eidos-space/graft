@@ -15,6 +15,13 @@ pub enum JsonLogMode {
     WithStatus,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JsonLogSpec {
+    pub mode: JsonLogMode,
+    pub limit: Option<usize>,
+    pub after: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JsonConfigListMode {
     LegacyArray,

@@ -600,6 +600,32 @@ fn test_repo_pragmas_on_physical_database_path() {
     assert_eq!(json_log_with_status["current_head"], json_log[0]["id"]);
     assert_eq!(json_log_with_status["current_branch"], "feature/search");
     assert_eq!(json_log_with_status["commits"], json_log);
+    assert_eq!(json_log_with_status["has_more"], false);
+
+    let first_page: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_log",
+        "--with-status --limit 1",
+    ))
+    .expect("bounded graft_json_log should return the first page");
+    assert_eq!(first_page["commits"].as_array().unwrap().len(), 1);
+    assert_eq!(first_page["commits"][0], json_log[0]);
+    assert_eq!(first_page["has_more"], true);
+    assert_eq!(first_page["next_cursor"], json_log[0]["id"]);
+
+    let second_page: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_log",
+        &format!(
+            "--with-status --limit 1 --after {}",
+            first_page["next_cursor"].as_str().unwrap()
+        ),
+    ))
+    .expect("bounded graft_json_log should resume after its cursor");
+    assert_eq!(second_page["commits"].as_array().unwrap().len(), 1);
+    assert_eq!(second_page["commits"][0], json_log[1]);
+    assert_eq!(second_page["has_more"], false);
+    assert!(second_page.get("next_cursor").is_none());
 
     let tag = pragma_arg_string(&sqlite, "graft_tag_create", "v-feature HEAD");
     assert!(tag.contains("Created tag 'v-feature'"));

@@ -559,6 +559,39 @@ fn commit_updates_current_branch_and_log() {
 }
 
 #[test]
+fn log_page_stops_after_a_bounded_window_and_resumes_after_cursor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = Repository::init(tmp.path()).unwrap();
+    let app = tmp.path().join("app.db");
+
+    repo.mark_dirty_path(&app).unwrap();
+    let first = repo.commit("first").unwrap();
+    repo.mark_dirty_path(&app).unwrap();
+    let second = repo.commit("second").unwrap();
+    repo.mark_dirty_path(&app).unwrap();
+    let third = repo.commit("third").unwrap();
+
+    let (first_page, has_more) = repo.log_page(2, None).unwrap();
+    assert_eq!(
+        first_page
+            .iter()
+            .map(|commit| &commit.id)
+            .collect::<Vec<_>>(),
+        vec![&third.id, &second.id]
+    );
+    assert!(has_more);
+
+    let (second_page, has_more) = repo.log_page(2, Some(&second.id)).unwrap();
+    assert_eq!(second_page, vec![first]);
+    assert!(!has_more);
+
+    assert!(matches!(
+        repo.log_page(1, Some("missing-commit")),
+        Err(RepoErr::InvalidRevision(rev)) if rev == "missing-commit"
+    ));
+}
+
+#[test]
 fn status_scans_worktree_files_as_untracked() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = Repository::init(tmp.path()).unwrap();

@@ -620,9 +620,9 @@ pub(crate) enum GraftPragma {
     Show { target: String },
 
     // JSON output variants (non-breaking additions)
-    /// `pragma graft_json_log [= "--with-status"];`
+    /// `pragma graft_json_log [= "--with-status [--limit n] [--after oid]"];`
     /// Repository commit history as JSON array, or app-facing JSON object with status
-    JsonLog { mode: JsonLogMode },
+    JsonLog { spec: JsonLogSpec },
 
     /// `pragma graft_debug_volume_json_diff = "from_lsn,to_lsn[,mode]";`
     /// Legacy Volume diff as JSON. mode: omitted=summary, "rows"=row-level detail
@@ -1059,7 +1059,7 @@ impl TryFrom<&Pragma<'_>> for GraftPragma {
                     Ok(GraftPragma::VolumeDiff { from, to, mode })
                 }
                 "show" => Ok(GraftPragma::Show { target: p.require_arg()?.to_string() }),
-                "json_log" => Ok(GraftPragma::JsonLog { mode: parse_json_log_arg(p.arg)? }),
+                "json_log" => Ok(GraftPragma::JsonLog { spec: parse_json_log_arg(p.arg)? }),
                 "json_diff" => {
                     let spec = parse_repo_diff_arg(p.arg)?;
                     Ok(GraftPragma::JsonRepoDiff { spec })
@@ -2212,17 +2212,25 @@ impl GraftPragma {
                 Ok(Some(format_repo_show(&commit)?))
             }
 
-            GraftPragma::JsonLog { mode } => {
+            GraftPragma::JsonLog { spec } => {
                 let repo = repo_for_file(file)?;
-                let commits = repo.log()?;
-                match mode {
+                let (commits, has_more) = match spec.limit {
+                    Some(limit) => repo.log_page(limit, spec.after.as_deref())?,
+                    None => (repo.log()?, false),
+                };
+                match spec.mode {
                     JsonLogMode::LegacyArray => Ok(Some(to_json(&commits)?)),
                     JsonLogMode::WithStatus => {
                         let (current_head, current_branch) = repo_head_and_branch(&repo)?;
+                        let next_cursor = has_more
+                            .then(|| commits.last().map(|commit| commit.id.clone()))
+                            .flatten();
                         Ok(Some(to_json(&JsonRepoLogOutcome {
                             current_head,
                             current_branch,
                             commits,
+                            next_cursor,
+                            has_more,
                         })?))
                     }
                 }

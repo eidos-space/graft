@@ -32,6 +32,14 @@ enum Command {
         /// Emit JSON history with current repository state
         #[arg(long)]
         json: bool,
+
+        /// Return at most this many commits
+        #[arg(long)]
+        limit: Option<usize>,
+
+        /// Continue after this exact commit id from the previous page
+        #[arg(long, requires = "limit")]
+        after: Option<String>,
     },
 
     /// Initialize a .graft repository in the current worktree
@@ -812,15 +820,17 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
             IdKind::Log => println!("{}", LogId::random()),
             IdKind::Sid => println!("{}", SegmentId::random()),
         },
-        Command::Log { json } => {
+        Command::Log { json, limit, after } => {
+            if limit == Some(0) {
+                bail!("log --limit must be greater than zero");
+            }
             if json {
-                print_output(run_repo_pragma(
-                    db_override,
-                    None,
-                    "json_log",
-                    Some("--with-status"),
-                )?);
+                let arg = repo_log_arg(limit, after.as_deref())?;
+                print_output(run_repo_pragma(db_override, None, "json_log", Some(&arg))?);
             } else {
+                if limit.is_some() || after.is_some() {
+                    bail!("log pagination requires --json");
+                }
                 print_output(run_repo_pragma(db_override, None, "log", None)?);
             }
         }
@@ -1491,6 +1501,19 @@ fn config_get_pragma(json: bool) -> &'static str {
     } else {
         "config_get"
     }
+}
+
+fn repo_log_arg(limit: Option<usize>, after: Option<&str>) -> Result<String> {
+    let mut parts = vec!["--with-status".to_string()];
+    if let Some(limit) = limit {
+        parts.push("--limit".to_string());
+        parts.push(limit.to_string());
+    }
+    if let Some(after) = after {
+        parts.push("--after".to_string());
+        parts.push(quote_pragma_path(Path::new(after))?);
+    }
+    Ok(parts.join(" "))
 }
 
 fn validate_command_repo_paths(command: &Command) -> Result<()> {
@@ -2409,20 +2432,43 @@ mod tests {
     fn parses_log_as_repository_history() {
         let cli = Cli::try_parse_from(["graft", "log"]).unwrap();
 
-        let Command::Log { json } = cli.command else {
+        let Command::Log { json, limit, after } = cli.command else {
             panic!("expected log command");
         };
         assert!(!json);
+        assert_eq!(limit, None);
+        assert_eq!(after, None);
     }
 
     #[test]
     fn parses_log_json_history() {
         let cli = Cli::try_parse_from(["graft", "log", "--json"]).unwrap();
 
-        let Command::Log { json } = cli.command else {
+        let Command::Log { json, limit, after } = cli.command else {
             panic!("expected log command");
         };
         assert!(json);
+        assert_eq!(limit, None);
+        assert_eq!(after, None);
+    }
+
+    #[test]
+    fn parses_log_json_pagination() {
+        let cli = Cli::try_parse_from([
+            "graft", "log", "--json", "--limit", "25", "--after", "abc123",
+        ])
+        .unwrap();
+
+        let Command::Log { json, limit, after } = cli.command else {
+            panic!("expected log command");
+        };
+        assert!(json);
+        assert_eq!(limit, Some(25));
+        assert_eq!(after.as_deref(), Some("abc123"));
+        assert_eq!(
+            repo_log_arg(limit, after.as_deref()).unwrap(),
+            "--with-status --limit 25 --after \"abc123\""
+        );
     }
 
     #[test]
