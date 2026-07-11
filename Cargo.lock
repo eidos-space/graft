@@ -980,7 +980,7 @@ dependencies = [
 
 [[package]]
 name = "graft"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "assert_matches",
  "bilrost",
@@ -1021,7 +1021,7 @@ dependencies = [
 
 [[package]]
 name = "graft-ext"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "config",
  "graft",
@@ -1035,7 +1035,7 @@ dependencies = [
 
 [[package]]
 name = "graft-sqlite"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "bytes",
  "enum_dispatch",
@@ -1055,7 +1055,7 @@ dependencies = [
 
 [[package]]
 name = "graft-test"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -1078,7 +1078,7 @@ dependencies = [
 
 [[package]]
 name = "graft-tool"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -1091,7 +1091,7 @@ dependencies = [
 
 [[package]]
 name = "graft-tracing"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "tracing",
  "tracing-subscriber",
