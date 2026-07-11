@@ -2793,6 +2793,93 @@ fn test_repo_add_stages_file_directory_topology_changes() {
 }
 
 #[test]
+fn test_repo_add_stages_deleted_paths_after_parent_directories_are_removed() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+    let notes = temp_dir.path().join("New folder");
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+
+    std::fs::create_dir_all(notes.join("nested")).unwrap();
+    std::fs::write(notes.join("readme.md"), "readme").unwrap();
+    std::fs::write(notes.join("nested/todo.md"), "todo").unwrap();
+    pragma_arg_string(&sqlite, "graft_add", "--all");
+    pragma_arg_string(&sqlite, "graft_commit", "track nested notes");
+
+    std::fs::remove_file(notes.join("readme.md")).unwrap();
+    pragma_arg_string(&sqlite, "graft_json_add", "-- \"New folder\"");
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("directory add status should be valid JSON");
+    assert_eq!(
+        status["staged_changes"],
+        serde_json::json!([
+            { "path": "New folder/readme.md", "change": "deleted", "kind": "text_file", "storage": "inline" }
+        ])
+    );
+    pragma_arg_string(&sqlite, "graft_restore", "--staged --all");
+
+    std::fs::remove_dir_all(&notes).unwrap();
+
+    let added: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_add",
+        "-- \"New folder/nested/todo.md\"",
+    ))
+    .expect("adding a deleted path should tolerate all missing parent directories");
+    assert_eq!(
+        added["paths"],
+        serde_json::json!([
+            { "path": "New folder/nested/todo.md", "change": "deleted", "kind": "text_file", "storage": "inline" }
+        ])
+    );
+
+    pragma_arg_string(&sqlite, "graft_restore", "--staged --all");
+    let added: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_add",
+        "-- \"New folder\"",
+    ))
+    .expect("adding a deleted directory should stage every tracked descendant");
+    assert_eq!(
+        added["paths"],
+        serde_json::json!([
+            { "path": "New folder/nested/todo.md", "change": "deleted", "kind": "text_file", "storage": "inline" },
+            { "path": "New folder/readme.md", "change": "deleted", "kind": "text_file", "storage": "inline" }
+        ])
+    );
+    pragma_arg_string(&sqlite, "graft_commit", "remove nested notes");
+
+    std::fs::create_dir_all(&notes).unwrap();
+    std::fs::write(notes.join("new.md"), "new staged note").unwrap();
+    pragma_arg_string(&sqlite, "graft_add", "-- \"New folder/new.md\"");
+    std::fs::remove_dir_all(&notes).unwrap();
+    let added: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_add",
+        "-- \"New folder\"",
+    ))
+    .expect("adding a deleted staged-add directory should clear the staged addition");
+    assert!(added["paths"].is_null());
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("staged-add deletion status should be valid JSON");
+    assert_eq!(
+        status["counts"],
+        serde_json::json!({
+            "unstaged": 0,
+            "staged": 0,
+            "conflicted": 0
+        })
+    );
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
 fn test_repo_json_add_reports_staged_database_file_and_large_file_paths() {
     graft_test::ensure_test_env();
 
