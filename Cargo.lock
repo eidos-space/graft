@@ -983,6 +983,7 @@ name = "graft"
 version = "0.5.3"
 dependencies = [
  "assert_matches",
+ "base64",
  "bilrost",
  "blake3",
  "bs58",

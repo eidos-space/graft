@@ -1135,6 +1135,33 @@ fn stage_artifact_path_commits_regular_file_and_status_tracks_changes() {
 }
 
 #[test]
+fn stage_artifact_path_handles_large_inline_text_with_compact_encoding() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = Repository::init(tmp.path()).unwrap();
+    let notes = tmp.path().join("long.md");
+    let bytes = "## Section\n\nParagraph 中文 content.\n"
+        .repeat(4_096)
+        .into_bytes();
+    assert!(bytes.len() < DEFAULT_LARGE_FILE_THRESHOLD.as_u64() as usize);
+    fs::write(&notes, &bytes).unwrap();
+
+    let state = repo
+        .stage_artifact_path(&notes)
+        .unwrap()
+        .artifact
+        .expect("large text artifact staged inline");
+    assert!(!state.is_large());
+
+    let object::Object::Blob(object::BlobObject::File(blob)) =
+        repo.read_object(state.oid().as_str()).unwrap()
+    else {
+        panic!("large inline text should point at a file blob");
+    };
+    assert_eq!(blob.kind, object::FileContentKind::TextFile);
+    assert_eq!(blob.bytes, bytes);
+}
+
+#[test]
 fn status_treats_a_tracked_file_replaced_by_a_directory_as_deleted() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = Repository::init(tmp.path()).unwrap();

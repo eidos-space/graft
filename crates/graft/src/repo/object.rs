@@ -5,6 +5,7 @@ use std::{
     str::FromStr,
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -231,7 +232,12 @@ impl BlobObject {
             Some("sqlite-snapshot-v1") => {
                 SqliteSnapshotBlob::decode(lines).map(Self::SqliteSnapshot)
             }
-            Some("file-blob-v1") => FileBlob::decode(lines).map(Self::File),
+            Some("file-blob-v1") => {
+                FileBlob::decode(lines, FileBlobEncoding::Base58).map(Self::File)
+            }
+            Some("file-blob-v2") => {
+                FileBlob::decode(lines, FileBlobEncoding::Base64).map(Self::File)
+            }
             Some("large-file-pointer-v1") => {
                 LargeFilePointerBlob::decode(lines).map(Self::LargeFilePointer)
             }
@@ -396,17 +402,21 @@ pub struct FileBlob {
 impl FileBlob {
     fn canonical_payload(&self) -> String {
         format!(
-            "file-blob-v1\nkind {}\nsize {}\ndata {}\n",
+            "file-blob-v2\nkind {}\nsize {}\nencoding base64\ndata {}\n",
             self.kind,
             self.bytes.len(),
-            bs58::encode(&self.bytes).into_string()
+            BASE64_STANDARD.encode(&self.bytes)
         )
     }
 
-    fn decode<'a>(lines: impl Iterator<Item = &'a str>) -> Result<Self> {
+    fn decode<'a>(
+        lines: impl Iterator<Item = &'a str>,
+        encoding: FileBlobEncoding,
+    ) -> Result<Self> {
         let mut kind = None;
         let mut size = None;
         let mut data = None;
+        let mut declared_encoding = None;
 
         for line in lines {
             let mut parts = line.splitn(2, ' ');
@@ -417,15 +427,34 @@ impl FileBlob {
                 Some("size") => {
                     size = Some(parse_field(parts.next(), "blob", "size")?);
                 }
+                Some("encoding") => {
+                    declared_encoding = Some(
+                        parts
+                            .next()
+                            .ok_or_else(|| missing("blob", "encoding"))?
+                            .to_string(),
+                    );
+                }
                 Some("data") => {
                     let raw = parts.next().ok_or_else(|| missing("blob", "data"))?;
-                    let bytes =
-                        bs58::decode(raw)
-                            .into_vec()
-                            .map_err(|err| ObjectErr::InvalidObject {
-                                kind: "blob",
-                                message: format!("invalid file data encoding: {err}"),
-                            })?;
+                    let bytes = match encoding {
+                        FileBlobEncoding::Base58 => {
+                            bs58::decode(raw).into_vec().map_err(|err| {
+                                ObjectErr::InvalidObject {
+                                    kind: "blob",
+                                    message: format!("invalid file data encoding: {err}"),
+                                }
+                            })?
+                        }
+                        FileBlobEncoding::Base64 => {
+                            BASE64_STANDARD
+                                .decode(raw)
+                                .map_err(|err| ObjectErr::InvalidObject {
+                                    kind: "blob",
+                                    message: format!("invalid file data encoding: {err}"),
+                                })?
+                        }
+                    };
                     data = Some(bytes);
                 }
                 Some("") => {}
@@ -436,6 +465,22 @@ impl FileBlob {
                     });
                 }
             }
+        }
+
+        match encoding {
+            FileBlobEncoding::Base58 if declared_encoding.is_some() => {
+                return Err(ObjectErr::InvalidObject {
+                    kind: "blob",
+                    message: "file-blob-v1 must not declare an encoding".to_string(),
+                });
+            }
+            FileBlobEncoding::Base64 if declared_encoding.as_deref() != Some("base64") => {
+                return Err(ObjectErr::InvalidObject {
+                    kind: "blob",
+                    message: "file-blob-v2 requires `encoding base64`".to_string(),
+                });
+            }
+            _ => {}
         }
 
         let bytes = data.ok_or_else(|| missing("blob", "data"))?;
@@ -455,6 +500,12 @@ impl FileBlob {
             bytes,
         })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileBlobEncoding {
+    Base58,
+    Base64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -917,7 +968,7 @@ impl LooseObjectStore {
 
     pub fn write_raw_validated(&self, id: &ObjectId, bytes: &[u8]) -> Result<Object> {
         let object = Object::decode(bytes)?;
-        let actual = object.id();
+        let actual = ObjectId::for_bytes(bytes);
         if &actual != id {
             return Err(ObjectErr::ObjectIdMismatch { expected: id.clone(), actual });
         }
@@ -928,7 +979,7 @@ impl LooseObjectStore {
     pub fn read(&self, id: &ObjectId) -> Result<Object> {
         let bytes = fs::read(self.path_for(id))?;
         let object = Object::decode(&bytes)?;
-        let actual = object.id();
+        let actual = ObjectId::for_bytes(&bytes);
         if &actual != id {
             return Err(ObjectErr::ObjectIdMismatch { expected: id.clone(), actual });
         }
@@ -1032,6 +1083,49 @@ fn missing(kind: &'static str, field: &str) -> ObjectErr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_blob_v2_roundtrips_large_text_in_linear_encoding() {
+        let bytes = "Markdown 中文内容\n".repeat(16_384).into_bytes();
+        let object = Object::Blob(BlobObject::File(FileBlob {
+            kind: FileContentKind::TextFile,
+            bytes: bytes.clone(),
+        }));
+
+        let canonical = object.canonical_bytes();
+        assert!(
+            canonical
+                .windows("file-blob-v2".len())
+                .any(|window| window == b"file-blob-v2")
+        );
+        assert!(canonical.len() < bytes.len() * 2);
+        assert_eq!(Object::decode(&canonical).unwrap(), object);
+    }
+
+    #[test]
+    fn file_blob_v1_remains_readable_with_its_original_object_id() {
+        let bytes = b"legacy text";
+        let payload = format!(
+            "file-blob-v1\nkind text_file\nsize {}\ndata {}\n",
+            bytes.len(),
+            bs58::encode(bytes).into_string()
+        );
+        let canonical = format!("graft-object 1 blob {}\0{}", payload.len(), payload);
+        let id = ObjectId::for_bytes(canonical.as_bytes());
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LooseObjectStore::new(tmp.path());
+
+        store
+            .write_raw_validated(&id, canonical.as_bytes())
+            .unwrap();
+        assert_eq!(
+            store.read(&id).unwrap(),
+            Object::Blob(BlobObject::File(FileBlob {
+                kind: FileContentKind::TextFile,
+                bytes: bytes.to_vec(),
+            }))
+        );
+    }
 
     #[test]
     fn object_id_changes_when_tree_changes() {

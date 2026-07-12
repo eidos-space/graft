@@ -495,7 +495,7 @@ impl Repository {
             return Ok(None);
         };
         let object = object::Object::decode(&bytes)?;
-        let actual = object.id();
+        let actual = object::ObjectId::for_bytes(&bytes);
         if actual != *id {
             return Err(RepoErr::Object(object::ObjectErr::ObjectIdMismatch {
                 expected: id.clone(),
