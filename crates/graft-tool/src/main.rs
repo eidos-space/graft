@@ -841,12 +841,8 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
         Command::Clone { json, branch_option, remote, branch } => {
             let branch = branch_option.as_deref().or(branch.as_deref());
             let arg = repo_clone_arg(&remote, branch);
-            print_output(run_repo_pragma(
-                db_override,
-                None,
-                clone_pragma(json),
-                Some(&arg),
-            )?);
+            let db = resolve_clone_db(db_override)?;
+            print_output(run_pragma(&db, clone_pragma(json), Some(&arg))?);
         }
         Command::Status { json, kind } => {
             let pragma = if json { "json_status" } else { "status" };
@@ -1470,6 +1466,14 @@ fn resolve_repo_control_db() -> Result<PathBuf> {
     let cwd = std::env::current_dir().context("failed to read current directory")?;
     let repo = Repository::discover(&cwd)?;
     Ok(repo.graft_dir().join("control.sqlite"))
+}
+
+fn resolve_clone_db(path: Option<&Path>) -> Result<PathBuf> {
+    if let Some(path) = path {
+        return resolve_cli_db(Some(path));
+    }
+    let cwd = std::env::current_dir().context("failed to read current directory")?;
+    Ok(cwd.join(".graft-clone.sqlite"))
 }
 
 fn json_escape(value: &str) -> String {
@@ -3639,6 +3643,24 @@ mod tests {
                 "main",
             ])
             .is_err()
+        );
+    }
+
+    #[test]
+    fn clone_defaults_its_database_tag_to_the_current_worktree() {
+        let _guard = CWD_LOCK.lock().unwrap();
+        let original_dir = std::env::current_dir().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::env::set_current_dir(temp_dir.path()).unwrap();
+
+        let result = resolve_clone_db(None);
+
+        std::env::set_current_dir(original_dir).unwrap();
+        assert_eq!(
+            result.unwrap(),
+            std::fs::canonicalize(temp_dir.path())
+                .unwrap()
+                .join(".graft-clone.sqlite")
         );
     }
 
