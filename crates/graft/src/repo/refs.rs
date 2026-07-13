@@ -896,7 +896,7 @@ impl Repository {
                     continue;
                 };
                 let object = object::Object::decode(&bytes)?;
-                let actual = object.id();
+                let actual = object::ObjectId::for_bytes(&bytes);
                 if actual != object_id {
                     return Err(RepoErr::Object(object::ObjectErr::ObjectIdMismatch {
                         expected: object_id,
@@ -935,7 +935,7 @@ impl Repository {
                 return Err(RepoErr::UnknownRevision(rev.to_string()));
             };
             let object = object::Object::decode(&bytes)?;
-            let actual = object.id();
+            let actual = object::ObjectId::for_bytes(&bytes);
             if actual != current {
                 return Err(RepoErr::Object(object::ObjectErr::ObjectIdMismatch {
                     expected: current,

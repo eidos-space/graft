@@ -1,4 +1,7 @@
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::{
+    panic::{AssertUnwindSafe, catch_unwind},
+    sync::{Mutex, MutexGuard},
+};
 
 use anyhow::Ok;
 use graft::{
@@ -9,8 +12,19 @@ use graft::{
 };
 use graft_test::GraftTestRuntime;
 
+// Precept faults are process-global. Keep these tests from consuming each
+// other's pending fault when the integration-test binary runs in parallel.
+static FAULT_STATE_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_fault_state() -> MutexGuard<'static, ()> {
+    FAULT_STATE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[test]
 fn test_snapshot_correct_after_pull() -> anyhow::Result<()> {
+    let _fault_state = lock_fault_state();
     graft_test::ensure_test_env();
 
     let remote = LogId::random();
@@ -62,6 +76,7 @@ fn test_snapshot_correct_after_pull() -> anyhow::Result<()> {
 
 #[test]
 fn test_latest_snapshot_correct_after_pull() -> anyhow::Result<()> {
+    let _fault_state = lock_fault_state();
     graft_test::ensure_test_env();
 
     let remote = LogId::random();

@@ -15,6 +15,13 @@ pub enum JsonLogMode {
     WithStatus,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JsonLogSpec {
+    pub mode: JsonLogMode,
+    pub limit: Option<usize>,
+    pub after: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JsonConfigListMode {
     LegacyArray,
@@ -38,6 +45,12 @@ pub(crate) struct RepoDiffSpec {
     pub(super) mode: DiffMode,
     pub(super) kind: Option<RepoTrackedPathKind>,
     pub(super) target: RepoDiffTarget,
+    pub(super) content: Option<RepoTextContentSpec>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RepoTextContentSpec {
+    pub(super) max_bytes: ByteUnit,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +67,10 @@ pub(crate) enum RepoDiffTarget {
     },
     Revisions {
         from: String,
+        to: String,
+        path: Option<String>,
+    },
+    Root {
         to: String,
         path: Option<String>,
     },
@@ -109,6 +126,8 @@ pub(crate) enum RepoCheckoutSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RepoRestoreSpec {
     pub(super) source: Option<String>,
+    pub(super) expected_head: Option<String>,
+    pub(super) require_clean: bool,
     pub(super) staged: bool,
     pub(super) all: bool,
     pub(super) kind: Option<RepoTrackedPathKind>,

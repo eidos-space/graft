@@ -600,6 +600,32 @@ fn test_repo_pragmas_on_physical_database_path() {
     assert_eq!(json_log_with_status["current_head"], json_log[0]["id"]);
     assert_eq!(json_log_with_status["current_branch"], "feature/search");
     assert_eq!(json_log_with_status["commits"], json_log);
+    assert_eq!(json_log_with_status["has_more"], false);
+
+    let first_page: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_log",
+        "--with-status --limit 1",
+    ))
+    .expect("bounded graft_json_log should return the first page");
+    assert_eq!(first_page["commits"].as_array().unwrap().len(), 1);
+    assert_eq!(first_page["commits"][0], json_log[0]);
+    assert_eq!(first_page["has_more"], true);
+    assert_eq!(first_page["next_cursor"], json_log[0]["id"]);
+
+    let second_page: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_log",
+        &format!(
+            "--with-status --limit 1 --after {}",
+            first_page["next_cursor"].as_str().unwrap()
+        ),
+    ))
+    .expect("bounded graft_json_log should resume after its cursor");
+    assert_eq!(second_page["commits"].as_array().unwrap().len(), 1);
+    assert_eq!(second_page["commits"][0], json_log[1]);
+    assert_eq!(second_page["has_more"], false);
+    assert!(second_page.get("next_cursor").is_none());
 
     let tag = pragma_arg_string(&sqlite, "graft_tag_create", "v-feature HEAD");
     assert!(tag.contains("Created tag 'v-feature'"));
@@ -2428,6 +2454,36 @@ fn test_repo_pragmas_track_regular_file_artifacts() {
     );
     assert!(pragma_arg_string(&sqlite, "graft_commit", "notes v2").contains("notes v2"));
 
+    let status_before: Value =
+        serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status")).unwrap();
+    let content_diff: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_diff",
+        "--content HEAD~1 HEAD -- notes.txt",
+    ))
+    .expect("graft_json_diff --content should return text content JSON");
+    assert_eq!(content_diff["content"]["path"], "notes.txt");
+    assert_eq!(content_diff["content"]["change"], "modified");
+    assert_eq!(content_diff["content"]["kind"], "text_file");
+    assert_eq!(content_diff["content"]["before"]["state"], "utf8");
+    assert_eq!(content_diff["content"]["before"]["content"], "first note");
+    assert_eq!(content_diff["content"]["after"]["state"], "utf8");
+    assert_eq!(content_diff["content"]["after"]["content"], "second note");
+    assert_eq!(content_diff["paths"].as_array().unwrap().len(), 1);
+
+    let bounded: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_diff",
+        "--content --max-content-bytes 4 HEAD~1 HEAD -- notes.txt",
+    ))
+    .expect("graft_json_diff --content should enforce its byte limit");
+    assert_eq!(bounded["content"]["before"]["state"], "too_large");
+    assert_eq!(bounded["content"]["after"]["state"], "too_large");
+    assert_eq!(std::fs::read_to_string(&notes).unwrap(), "second note");
+    let status_after: Value =
+        serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status")).unwrap();
+    assert_eq!(status_after, status_before);
+
     std::fs::remove_file(&notes).unwrap();
     let checkout = pragma_arg_string(&sqlite, "graft_checkout", "HEAD~1 -- notes.txt");
     assert!(checkout.contains("Checked out notes.txt"));
@@ -2760,6 +2816,194 @@ fn test_repo_pragmas_add_all_stages_database_and_file_changes() {
 }
 
 #[test]
+fn test_repo_add_stages_file_directory_topology_changes() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+    let shape = temp_dir.path().join("shape");
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+
+    std::fs::write(&shape, "file topology").unwrap();
+    pragma_arg_string(&sqlite, "graft_add", "--all");
+    pragma_arg_string(&sqlite, "graft_commit", "track shape as a file");
+
+    std::fs::remove_file(&shape).unwrap();
+    std::fs::create_dir(&shape).unwrap();
+    std::fs::write(shape.join("child.md"), "directory topology").unwrap();
+
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("file-to-directory status should be valid JSON");
+    assert_eq!(
+        status["unstaged_changes"],
+        serde_json::json!([
+            { "path": "shape", "change": "deleted", "kind": "text_file", "storage": "inline" },
+            { "path": "shape/child.md", "change": "untracked", "kind": "text_file", "storage": "inline" }
+        ])
+    );
+
+    let added: Value = serde_json::from_str(&pragma_arg_string(&sqlite, "graft_json_add", "--all"))
+        .expect("file-to-directory add --all should return staged paths");
+    assert_eq!(
+        added["paths"],
+        serde_json::json!([
+            { "path": "shape", "change": "deleted", "kind": "text_file", "storage": "inline" },
+            { "path": "shape/child.md", "change": "added", "kind": "text_file", "storage": "inline" }
+        ])
+    );
+    pragma_arg_string(&sqlite, "graft_commit", "track shape as a directory");
+
+    std::fs::remove_dir_all(&shape).unwrap();
+    std::fs::write(&shape, "file topology again").unwrap();
+    let added: Value = serde_json::from_str(&pragma_arg_string(&sqlite, "graft_json_add", "shape"))
+        .expect("adding a file should stage its conflicting tracked descendants");
+    assert_eq!(
+        added["paths"],
+        serde_json::json!([
+            { "path": "shape/child.md", "change": "deleted", "kind": "text_file", "storage": "inline" },
+            { "path": "shape", "change": "added", "kind": "text_file", "storage": "inline" }
+        ])
+    );
+    pragma_arg_string(&sqlite, "graft_commit", "track shape as a file again");
+
+    std::fs::remove_file(&shape).unwrap();
+    std::fs::create_dir(&shape).unwrap();
+    std::fs::write(shape.join("child.md"), "directory topology again").unwrap();
+    let added: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_add",
+        "shape/child.md",
+    ))
+    .expect("adding a child should stage its conflicting tracked ancestor");
+    assert_eq!(
+        added["paths"],
+        serde_json::json!([
+            { "path": "shape", "change": "deleted", "kind": "text_file", "storage": "inline" },
+            { "path": "shape/child.md", "change": "added", "kind": "text_file", "storage": "inline" }
+        ])
+    );
+    pragma_arg_string(&sqlite, "graft_commit", "track shape as a directory again");
+
+    let tracked: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_ls_files"))
+        .expect("tracked paths should be valid JSON");
+    let paths = tracked["paths"].as_array().unwrap();
+    assert!(!paths.iter().any(|entry| entry["path"] == "shape"));
+    assert!(paths.iter().any(|entry| entry["path"] == "shape/child.md"));
+
+    std::fs::remove_file(shape.join("child.md")).unwrap();
+    let added: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_add",
+        "shape/child.md",
+    ))
+    .expect("adding a deleted path should stage its removal");
+    assert_eq!(
+        added["paths"],
+        serde_json::json!([
+            { "path": "shape/child.md", "change": "deleted", "kind": "text_file", "storage": "inline" }
+        ])
+    );
+    pragma_arg_string(&sqlite, "graft_commit", "remove the selected child");
+    let tracked: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_ls_files"))
+        .expect("tracked paths should be valid JSON");
+    let paths = tracked["paths"].as_array().unwrap();
+    assert!(!paths.iter().any(|entry| entry["path"] == "shape/child.md"));
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_add_stages_deleted_paths_after_parent_directories_are_removed() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+    let notes = temp_dir.path().join("New folder");
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+
+    std::fs::create_dir_all(notes.join("nested")).unwrap();
+    std::fs::write(notes.join("readme.md"), "readme").unwrap();
+    std::fs::write(notes.join("nested/todo.md"), "todo").unwrap();
+    pragma_arg_string(&sqlite, "graft_add", "--all");
+    pragma_arg_string(&sqlite, "graft_commit", "track nested notes");
+
+    std::fs::remove_file(notes.join("readme.md")).unwrap();
+    pragma_arg_string(&sqlite, "graft_json_add", "-- \"New folder\"");
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("directory add status should be valid JSON");
+    assert_eq!(
+        status["staged_changes"],
+        serde_json::json!([
+            { "path": "New folder/readme.md", "change": "deleted", "kind": "text_file", "storage": "inline" }
+        ])
+    );
+    pragma_arg_string(&sqlite, "graft_restore", "--staged --all");
+
+    std::fs::remove_dir_all(&notes).unwrap();
+
+    let added: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_add",
+        "-- \"New folder/nested/todo.md\"",
+    ))
+    .expect("adding a deleted path should tolerate all missing parent directories");
+    assert_eq!(
+        added["paths"],
+        serde_json::json!([
+            { "path": "New folder/nested/todo.md", "change": "deleted", "kind": "text_file", "storage": "inline" }
+        ])
+    );
+
+    pragma_arg_string(&sqlite, "graft_restore", "--staged --all");
+    let added: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_add",
+        "-- \"New folder\"",
+    ))
+    .expect("adding a deleted directory should stage every tracked descendant");
+    assert_eq!(
+        added["paths"],
+        serde_json::json!([
+            { "path": "New folder/nested/todo.md", "change": "deleted", "kind": "text_file", "storage": "inline" },
+            { "path": "New folder/readme.md", "change": "deleted", "kind": "text_file", "storage": "inline" }
+        ])
+    );
+    pragma_arg_string(&sqlite, "graft_commit", "remove nested notes");
+
+    std::fs::create_dir_all(&notes).unwrap();
+    std::fs::write(notes.join("new.md"), "new staged note").unwrap();
+    pragma_arg_string(&sqlite, "graft_add", "-- \"New folder/new.md\"");
+    std::fs::remove_dir_all(&notes).unwrap();
+    let added: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_add",
+        "-- \"New folder\"",
+    ))
+    .expect("adding a deleted staged-add directory should clear the staged addition");
+    assert!(added["paths"].is_null());
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("staged-add deletion status should be valid JSON");
+    assert_eq!(
+        status["counts"],
+        serde_json::json!({
+            "unstaged": 0,
+            "staged": 0,
+            "conflicted": 0
+        })
+    );
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
 fn test_repo_json_add_reports_staged_database_file_and_large_file_paths() {
     graft_test::ensure_test_env();
 
@@ -2832,6 +3076,129 @@ fn test_repo_json_add_reports_staged_database_file_and_large_file_paths() {
         serde_json::json!({ "unstaged": 0, "staged": 3, "conflicted": 0 })
     );
     assert_eq!(status["staged_changes"], added["paths"]);
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_rejects_ambiguous_path_identity_before_add_or_restore_mutation() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_path.to_str().unwrap(), None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+
+    let plain_path = temp_dir.path().join("note.md");
+    std::fs::write(&plain_path, b"committed plain content").unwrap();
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_add", "note.md"),
+        "Added note.md"
+    );
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "track plain path").contains("track"));
+
+    std::fs::write(&plain_path, b"local plain draft").unwrap();
+    let spaced_path = temp_dir.path().join(" note.md ");
+    std::fs::write(&spaced_path, b"spaced content").unwrap();
+
+    let add_err = pragma_arg_error(&sqlite, "graft_json_add", "--all");
+    assert!(
+        add_err.contains("path components must not start or end with whitespace"),
+        "add --all must reject a path identity that would be normalized: {add_err}"
+    );
+
+    let restore_err = pragma_arg_error(
+        &sqlite,
+        "graft_json_restore",
+        "--source HEAD -- \" note.md \"",
+    );
+    assert!(
+        restore_err.contains("path components must not start or end with whitespace"),
+        "restore must reject the ambiguous explicit path before materialization: {restore_err}"
+    );
+    assert_eq!(std::fs::read(&plain_path).unwrap(), b"local plain draft");
+    assert_eq!(std::fs::read(&spaced_path).unwrap(), b"spaced content");
+
+    let repo = Repository::discover_for_file(&db_path).unwrap();
+    assert!(!repo.has_staged_changes().unwrap());
+
+    runtime.shutdown().unwrap();
+}
+
+#[cfg(not(windows))]
+#[test]
+fn test_repo_restore_rejects_posix_backslash_before_path_alias_mutation() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_path.to_str().unwrap(), None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+
+    let alias_target = temp_dir.path().join("foobar.md");
+    std::fs::write(&alias_target, b"committed content").unwrap();
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_add", "foobar.md"),
+        "Added foobar.md"
+    );
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "track alias target").contains("track"));
+    std::fs::write(&alias_target, b"local draft").unwrap();
+
+    let restore_err = pragma_arg_error(
+        &sqlite,
+        "graft_json_restore",
+        "--source HEAD -- foo\\bar.md",
+    );
+    assert!(
+        restore_err.contains("backslashes are not supported in POSIX repository paths"),
+        "restore must reject the raw path before the parser strips its backslash: {restore_err}"
+    );
+    assert_eq!(std::fs::read(&alias_target).unwrap(), b"local draft");
+
+    let checkout_err = pragma_arg_error(&sqlite, "graft_json_checkout", "HEAD -- foo\\bar.md");
+    assert!(
+        checkout_err.contains("backslashes are not supported in POSIX repository paths"),
+        "checkout must preserve the raw path until repository validation: {checkout_err}"
+    );
+    let resolve_err = pragma_arg_error(
+        &sqlite,
+        "graft_json_resolve_conflict",
+        "--manual foo\\bar.md",
+    );
+    assert!(
+        resolve_err.contains("backslashes are not supported in POSIX repository paths"),
+        "resolve must preserve the raw path until repository validation: {resolve_err}"
+    );
+    let remove_err = pragma_arg_error(&sqlite, "graft_json_rm", "foo\\bar.md");
+    assert!(
+        remove_err.contains("backslashes are not supported in POSIX repository paths"),
+        "remove must reject the raw path before its backslash is stripped: {remove_err}"
+    );
+    let add_err = pragma_arg_error(&sqlite, "graft_json_add", "foo\\bar.md");
+    assert!(
+        add_err.contains("backslashes are not supported in POSIX repository paths"),
+        "add must reject the unsupported physical path identity: {add_err}"
+    );
+    let export_path = temp_dir.path().join("snapshot.db");
+    let export_err = pragma_arg_error(
+        &sqlite,
+        "graft_json_export",
+        format!(
+            "--source HEAD --output {} -- foo\\bar.md",
+            export_path.display()
+        ),
+    );
+    assert!(
+        export_err.contains("backslashes are not supported in POSIX repository paths"),
+        "export must reject the raw path before its backslash is stripped: {export_err}"
+    );
+    assert!(!export_path.exists());
+    assert_eq!(std::fs::read(&alias_target).unwrap(), b"local draft");
+
+    let repo = Repository::discover_for_file(&db_path).unwrap();
+    assert!(!repo.has_staged_changes().unwrap());
 
     runtime.shutdown().unwrap();
 }
@@ -4242,6 +4609,28 @@ fn test_repo_merge_large_file_conflicts_report_path_kind() {
     assert!(staged_text.contains("theirs 100644"));
     assert!(staged_text.contains("assets/model.bin (text file, external"));
 
+    let artifact_before_restore = std::fs::read(assets.join("model.bin")).unwrap();
+    let restore_error = pragma_arg_error(
+        &sqlite,
+        "graft_json_restore",
+        "--source HEAD~1 -- assets/model.bin",
+    );
+    assert!(
+        restore_error.contains("unresolved index conflicts"),
+        "restore should reject a conflicted index before changing an artifact: {restore_error}"
+    );
+    assert_eq!(
+        std::fs::read(assets.join("model.bin")).unwrap(),
+        artifact_before_restore,
+        "a rejected restore must leave the worktree artifact unchanged"
+    );
+    let status_after_restore: Value =
+        serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+            .expect("graft_json_status should remain readable after rejected restore");
+    assert_eq!(status_after_restore["dirty"], false);
+    assert_eq!(status_after_restore["has_unstaged_changes"], false);
+    assert_eq!(status_after_restore["has_conflicts"], true);
+
     let resolved: Value = serde_json::from_str(&pragma_arg_string(
         &sqlite,
         "graft_json_resolve_conflict",
@@ -4569,6 +4958,792 @@ fn test_repo_pragmas_checkout_and_restore_regular_file_directory() {
     assert_eq!(status["dirty"], false);
     assert_eq!(status["staged"].as_array().unwrap().len(), 0);
     assert_eq!(status["unstaged"].as_array().unwrap().len(), 0);
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_restore_regular_file_recreates_missing_parent_directories() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_path.to_str().unwrap(), None);
+    pragma_query_string(&sqlite, "graft_init");
+
+    let note = temp_dir.path().join("notes/archive/a.md");
+    std::fs::create_dir_all(note.parent().unwrap()).unwrap();
+    std::fs::write(&note, "first version").unwrap();
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_add", "notes/archive/a.md"),
+        "Added notes/archive/a.md"
+    );
+    pragma_arg_string(&sqlite, "graft_commit", "add archived note");
+
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_rm", "notes"),
+        "Removed notes/archive/a.md"
+    );
+    pragma_arg_string(&sqlite, "graft_commit", "remove notes");
+    std::fs::remove_dir_all(temp_dir.path().join("notes")).unwrap();
+    assert!(!temp_dir.path().join("notes").exists());
+
+    let restored: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_restore",
+        "--source HEAD~1 -- notes/archive/a.md",
+    ))
+    .expect("graft_json_restore should recreate missing parent directories");
+    assert_eq!(restored["path"], "notes/archive/a.md");
+    assert_eq!(std::fs::read_to_string(&note).unwrap(), "first version");
+
+    std::fs::remove_dir_all(temp_dir.path().join("notes")).unwrap();
+    let restored: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_restore",
+        &format!("--source HEAD~1 -- {}", note.display()),
+    ))
+    .expect("graft_json_restore should accept an absolute path inside the worktree");
+    assert_eq!(restored["path"], "notes/archive/a.md");
+    assert_eq!(std::fs::read_to_string(&note).unwrap(), "first version");
+
+    let traversal_error = pragma_arg_error(
+        &sqlite,
+        "graft_json_restore",
+        "--source HEAD~1 -- missing/../../outside/a.md",
+    );
+    assert!(
+        traversal_error.contains("outside repository worktree"),
+        "{traversal_error}"
+    );
+
+    let outside = tempfile::tempdir().unwrap();
+    let outside_note = outside.path().join("missing/a.md");
+    let outside_error = pragma_arg_error(
+        &sqlite,
+        "graft_json_restore",
+        &format!("--source HEAD~1 -- {}", outside_note.display()),
+    );
+    assert!(
+        outside_error.contains("outside repository worktree"),
+        "{outside_error}"
+    );
+    assert!(!outside_note.exists());
+
+    runtime.shutdown().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn test_repo_restore_missing_parent_rejects_symlink_escape() {
+    use std::os::unix::fs::symlink;
+
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_path.to_str().unwrap(), None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+
+    let tracked = temp_dir.path().join("escape/nested/a.md");
+    std::fs::create_dir_all(tracked.parent().unwrap()).unwrap();
+    std::fs::write(&tracked, "tracked version").unwrap();
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_add", "escape/nested/a.md"),
+        "Added escape/nested/a.md"
+    );
+    assert!(
+        pragma_arg_string(&sqlite, "graft_commit", "add escaped note").contains("add escaped note")
+    );
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_rm", "escape"),
+        "Removed escape/nested/a.md"
+    );
+    assert!(
+        pragma_arg_string(&sqlite, "graft_commit", "remove escaped note")
+            .contains("remove escaped note")
+    );
+
+    std::fs::remove_dir_all(temp_dir.path().join("escape")).unwrap();
+    symlink(outside.path(), temp_dir.path().join("escape")).unwrap();
+    let error = pragma_arg_error(
+        &sqlite,
+        "graft_json_restore",
+        "--source HEAD~1 -- escape/nested/a.md",
+    );
+    assert!(error.contains("outside repository worktree"), "{error}");
+    assert!(!outside.path().join("nested/a.md").exists());
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_restore_root_preserves_head_index_and_history() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_path.to_str().unwrap(), None);
+    pragma_query_string(&sqlite, "graft_init");
+
+    let note = temp_dir.path().join("docs/note.md");
+    let asset = temp_dir.path().join("assets/image.bin");
+    let archived = temp_dir.path().join("archive/deep/gone.md");
+    std::fs::create_dir_all(note.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(asset.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(archived.parent().unwrap()).unwrap();
+    std::fs::write(&note, "note v1\n").unwrap();
+    std::fs::write(&asset, [0_u8, 1, 2, 255]).unwrap();
+    std::fs::write(&archived, "archived v1\n").unwrap();
+    pragma_arg_string(&sqlite, "graft_add", "--all");
+    let first: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_commit",
+        "first root version",
+    ))
+    .unwrap();
+    let first_id = first["commit"]["id"].as_str().unwrap();
+
+    std::fs::write(&note, "note v2\n").unwrap();
+    std::fs::write(&asset, [9_u8, 8, 7]).unwrap();
+    std::fs::remove_dir_all(temp_dir.path().join("archive")).unwrap();
+    std::fs::write(temp_dir.path().join("later.md"), "later\n").unwrap();
+    pragma_arg_string(&sqlite, "graft_add", "--all");
+    pragma_arg_string(&sqlite, "graft_commit", "second root version");
+
+    std::fs::write(&note, "staged note v3\n").unwrap();
+    std::fs::write(temp_dir.path().join("staged-only.md"), "staged\n").unwrap();
+    pragma_arg_string(&sqlite, "graft_add", "--all");
+    std::fs::write(temp_dir.path().join("untracked.md"), "keep untracked\n").unwrap();
+
+    let repo = Repository::open(temp_dir.path()).unwrap();
+    let head_before = repo.resolve_revision("HEAD").unwrap();
+    let index_before = repo.read_index().unwrap();
+    let history_before = pragma_query_string(&sqlite, "graft_json_log");
+    let restored: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_restore",
+        format!("--source {first_id} -- ."),
+    ))
+    .unwrap();
+
+    assert_eq!(restored["operation"], "restore");
+    assert_eq!(std::fs::read_to_string(&note).unwrap(), "note v1\n");
+    assert_eq!(std::fs::read(&asset).unwrap(), [0_u8, 1, 2, 255]);
+    assert_eq!(std::fs::read_to_string(&archived).unwrap(), "archived v1\n");
+    assert!(!temp_dir.path().join("later.md").exists());
+    assert!(!temp_dir.path().join("staged-only.md").exists());
+    assert_eq!(
+        std::fs::read_to_string(temp_dir.path().join("untracked.md")).unwrap(),
+        "keep untracked\n"
+    );
+    assert_eq!(repo.resolve_revision("HEAD").unwrap(), head_before);
+    assert_eq!(repo.read_index().unwrap(), index_before);
+    assert_eq!(
+        pragma_query_string(&sqlite, "graft_json_log"),
+        history_before
+    );
+
+    let status: Value =
+        serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status")).unwrap();
+    assert_eq!(status["current_head"], head_before);
+    assert_eq!(status["has_staged_changes"], true);
+    assert_eq!(status["has_unstaged_changes"], true);
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_restore_root_rejects_untracked_collision_before_mutation() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_path.to_str().unwrap(), None);
+    pragma_query_string(&sqlite, "graft_init");
+
+    let first = temp_dir.path().join("a-first.md");
+    let collision = temp_dir.path().join("z-collision.md");
+    std::fs::write(&first, "first v1\n").unwrap();
+    std::fs::write(&collision, "tracked source\n").unwrap();
+    pragma_arg_string(&sqlite, "graft_add", "--all");
+    pragma_arg_string(&sqlite, "graft_commit", "source version");
+
+    std::fs::write(&first, "first v2\n").unwrap();
+    std::fs::remove_file(&collision).unwrap();
+    pragma_arg_string(&sqlite, "graft_add", "--all");
+    pragma_arg_string(&sqlite, "graft_commit", "current version");
+    std::fs::write(&collision, "untracked draft\n").unwrap();
+
+    let error = pragma_arg_error(&sqlite, "graft_json_restore", "--source HEAD~1 -- .");
+    assert!(
+        error.contains("untracked paths would be overwritten"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read_to_string(&first).unwrap(), "first v2\n");
+    assert_eq!(
+        std::fs::read_to_string(&collision).unwrap(),
+        "untracked draft\n"
+    );
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_restore_single_file_rejects_untracked_collision_before_mutation() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_path.to_str().unwrap(), None);
+    pragma_query_string(&sqlite, "graft_init");
+
+    let collision = temp_dir.path().join("draft.md");
+    std::fs::write(&collision, "tracked source\n").unwrap();
+    pragma_arg_string(&sqlite, "graft_add", "--all");
+    pragma_arg_string(&sqlite, "graft_commit", "source version");
+    std::fs::remove_file(&collision).unwrap();
+    pragma_arg_string(&sqlite, "graft_add", "--all");
+    pragma_arg_string(&sqlite, "graft_commit", "current version");
+    std::fs::write(&collision, "untracked draft\n").unwrap();
+
+    let error = pragma_arg_error(&sqlite, "graft_json_restore", "--source HEAD~1 -- draft.md");
+    assert!(
+        error.contains("untracked paths would be overwritten: draft.md"),
+        "{error}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&collision).unwrap(),
+        "untracked draft\n"
+    );
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_restore_single_file_rejects_ignored_untracked_collision_before_mutation() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_path.to_str().unwrap(), None);
+    pragma_query_string(&sqlite, "graft_init");
+
+    let collision = temp_dir.path().join("draft.md");
+    std::fs::write(&collision, "tracked source\n").unwrap();
+    pragma_arg_string(&sqlite, "graft_add", "--all");
+    pragma_arg_string(&sqlite, "graft_commit", "source version");
+    std::fs::remove_file(&collision).unwrap();
+    std::fs::write(temp_dir.path().join(".graftignore"), "draft.md\n").unwrap();
+    pragma_arg_string(&sqlite, "graft_add", "--all");
+    pragma_arg_string(&sqlite, "graft_commit", "current version");
+    std::fs::write(&collision, "ignored draft\n").unwrap();
+
+    let error = pragma_arg_error(&sqlite, "graft_json_restore", "--source HEAD~1 -- draft.md");
+    assert!(
+        error.contains("untracked paths would be overwritten: draft.md"),
+        "{error}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&collision).unwrap(),
+        "ignored draft\n"
+    );
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_restore_checks_expected_head_and_clean_guard_before_mutation() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_path.to_str().unwrap(), None);
+    pragma_query_string(&sqlite, "graft_init");
+
+    let note = temp_dir.path().join("note.md");
+    std::fs::write(&note, "version one\n").unwrap();
+    pragma_arg_string(&sqlite, "graft_add", "--all");
+    pragma_arg_string(&sqlite, "graft_commit", "version one");
+    let repo = Repository::open(temp_dir.path()).unwrap();
+    let first = repo.resolve_revision("HEAD").unwrap();
+
+    std::fs::write(&note, "version two\n").unwrap();
+    pragma_arg_string(&sqlite, "graft_add", "--all");
+    pragma_arg_string(&sqlite, "graft_commit", "version two");
+    let second = repo.resolve_revision("HEAD").unwrap();
+    let index_before = repo.read_index().unwrap();
+    std::fs::write(&note, "local draft\n").unwrap();
+
+    let stale_error = pragma_arg_error(
+        &sqlite,
+        "graft_json_restore",
+        &format!("--source HEAD~1 --expected-head {first} -- note.md"),
+    );
+    assert!(stale_error.contains("HEAD changed"), "{stale_error}");
+    assert!(stale_error.contains(&first), "{stale_error}");
+    assert!(stale_error.contains(&second), "{stale_error}");
+    assert_eq!(std::fs::read_to_string(&note).unwrap(), "local draft\n");
+    assert_eq!(repo.resolve_revision("HEAD").unwrap(), second);
+    assert_eq!(repo.read_index().unwrap(), index_before);
+
+    let dirty_error = pragma_arg_error(
+        &sqlite,
+        "graft_json_restore",
+        &format!("--source HEAD~1 --expected-head {second} --require-clean -- note.md"),
+    );
+    assert!(
+        dirty_error.contains("staged or tracked worktree changes"),
+        "{dirty_error}"
+    );
+    assert_eq!(std::fs::read_to_string(&note).unwrap(), "local draft\n");
+    assert_eq!(repo.resolve_revision("HEAD").unwrap(), second);
+    assert_eq!(repo.read_index().unwrap(), index_before);
+
+    std::fs::write(&note, "version two\n").unwrap();
+    let untracked = temp_dir.path().join("scratch.md");
+    std::fs::write(&untracked, "keep untracked\n").unwrap();
+    let restored: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_restore",
+        &format!("--source HEAD~1 --expected-head {second} --require-clean -- note.md"),
+    ))
+    .unwrap();
+    assert_eq!(restored["path"], "note.md");
+    assert_eq!(std::fs::read_to_string(&note).unwrap(), "version one\n");
+    assert_eq!(
+        std::fs::read_to_string(&untracked).unwrap(),
+        "keep untracked\n"
+    );
+    assert_eq!(repo.resolve_revision("HEAD").unwrap(), second);
+    assert_eq!(repo.read_index().unwrap(), index_before);
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_restore_root_rejects_ignored_untracked_collision_before_mutation() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_path.to_str().unwrap(), None);
+    pragma_query_string(&sqlite, "graft_init");
+
+    let first = temp_dir.path().join("a-first.md");
+    let collision = temp_dir.path().join("z-collision.md");
+    let ignore = temp_dir.path().join(".graftignore");
+    std::fs::write(&first, "first v1\n").unwrap();
+    std::fs::write(&collision, "tracked source\n").unwrap();
+    pragma_arg_string(&sqlite, "graft_add", "--all");
+    pragma_arg_string(&sqlite, "graft_commit", "source version");
+
+    std::fs::write(&first, "first v2\n").unwrap();
+    std::fs::remove_file(&collision).unwrap();
+    std::fs::write(&ignore, "z-collision.md\n").unwrap();
+    pragma_arg_string(&sqlite, "graft_add", "--all");
+    pragma_arg_string(&sqlite, "graft_commit", "ignore removed path");
+    std::fs::write(&collision, "ignored local draft\n").unwrap();
+
+    let status: Value =
+        serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status")).unwrap();
+    assert!(
+        status
+            .get("unstaged_changes")
+            .and_then(Value::as_array)
+            .is_none_or(|changes| changes
+                .iter()
+                .all(|change| change["path"] != "z-collision.md"))
+    );
+    let repo = Repository::open(temp_dir.path()).unwrap();
+    let head_before = repo.resolve_revision("HEAD").unwrap();
+    let index_before = repo.read_index().unwrap();
+
+    let error = pragma_arg_error(&sqlite, "graft_json_restore", "--source HEAD~1 -- .");
+    assert!(
+        error.contains("untracked paths would be overwritten: z-collision.md"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read_to_string(&first).unwrap(), "first v2\n");
+    assert_eq!(
+        std::fs::read_to_string(&collision).unwrap(),
+        "ignored local draft\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&ignore).unwrap(),
+        "z-collision.md\n"
+    );
+    assert_eq!(repo.resolve_revision("HEAD").unwrap(), head_before);
+    assert_eq!(repo.read_index().unwrap(), index_before);
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_restore_root_changes_directory_to_file_topology() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_path.to_str().unwrap(), None);
+    pragma_query_string(&sqlite, "graft_init");
+
+    let shape = temp_dir.path().join("shape");
+    std::fs::write(&shape, "source file\n").unwrap();
+    pragma_arg_string(&sqlite, "graft_add", "--all");
+    pragma_arg_string(&sqlite, "graft_commit", "file topology");
+
+    std::fs::remove_file(&shape).unwrap();
+    std::fs::create_dir(&shape).unwrap();
+    std::fs::write(shape.join("child.md"), "current child\n").unwrap();
+    let repo = Repository::open(temp_dir.path()).unwrap();
+    repo.stage_file_removal_key("shape").unwrap();
+    repo.stage_artifact_path(shape.join("child.md")).unwrap();
+    repo.commit_staged("directory topology").unwrap();
+    std::fs::write(temp_dir.path().join("untracked.md"), "keep me\n").unwrap();
+
+    let head_before = repo.resolve_revision("HEAD").unwrap();
+    let index_before = repo.read_index().unwrap();
+    let restored: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_restore",
+        "--source HEAD~1 -- .",
+    ))
+    .unwrap();
+
+    assert_eq!(restored["current_head"], head_before);
+    assert_eq!(std::fs::read_to_string(&shape).unwrap(), "source file\n");
+    assert!(!shape.join("child.md").exists());
+    assert_eq!(
+        std::fs::read_to_string(temp_dir.path().join("untracked.md")).unwrap(),
+        "keep me\n"
+    );
+    assert_eq!(repo.read_index().unwrap(), index_before);
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_restore_root_changes_file_to_directory_topology() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_path.to_str().unwrap(), None);
+    pragma_query_string(&sqlite, "graft_init");
+
+    let shape = temp_dir.path().join("shape");
+    std::fs::create_dir(&shape).unwrap();
+    std::fs::write(shape.join("child.md"), "source child\n").unwrap();
+    pragma_arg_string(&sqlite, "graft_add", "--all");
+    pragma_arg_string(&sqlite, "graft_commit", "directory topology");
+
+    std::fs::remove_dir_all(&shape).unwrap();
+    std::fs::write(&shape, "current file\n").unwrap();
+    let repo = Repository::open(temp_dir.path()).unwrap();
+    repo.stage_file_removal_key("shape/child.md").unwrap();
+    repo.stage_artifact_path(&shape).unwrap();
+    repo.commit_staged("file topology").unwrap();
+
+    let head_before = repo.resolve_revision("HEAD").unwrap();
+    let index_before = repo.read_index().unwrap();
+    let restored: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_restore",
+        "--source HEAD~1 -- .",
+    ))
+    .unwrap();
+
+    assert_eq!(restored["current_head"], head_before);
+    assert!(shape.is_dir());
+    assert_eq!(
+        std::fs::read_to_string(shape.join("child.md")).unwrap(),
+        "source child\n"
+    );
+    assert_eq!(repo.read_index().unwrap(), index_before);
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_restore_root_preserves_ignored_untracked_descendant_on_topology_change() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_path.to_str().unwrap(), None);
+    pragma_query_string(&sqlite, "graft_init");
+
+    let shape = temp_dir.path().join("shape");
+    let anchor = temp_dir.path().join("a-anchor.md");
+    std::fs::write(&shape, "source file\n").unwrap();
+    std::fs::write(&anchor, "source anchor\n").unwrap();
+    std::fs::write(temp_dir.path().join(".graftignore"), "shape/private.md\n").unwrap();
+    pragma_arg_string(&sqlite, "graft_add", "--all");
+    pragma_arg_string(&sqlite, "graft_commit", "file topology");
+
+    std::fs::remove_file(&shape).unwrap();
+    std::fs::create_dir(&shape).unwrap();
+    std::fs::write(shape.join("child.md"), "current child\n").unwrap();
+    std::fs::write(&anchor, "current anchor\n").unwrap();
+    let repo = Repository::open(temp_dir.path()).unwrap();
+    repo.stage_file_removal_key("shape").unwrap();
+    repo.stage_artifact_path(shape.join("child.md")).unwrap();
+    repo.stage_artifact_path(&anchor).unwrap();
+    repo.commit_staged("directory topology").unwrap();
+    std::fs::write(shape.join("private.md"), "ignored private\n").unwrap();
+
+    let error = pragma_arg_error(&sqlite, "graft_json_restore", "--source HEAD~1 -- .");
+    assert!(
+        error.contains("untracked") && error.contains("shape/private.md"),
+        "{error}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&anchor).unwrap(),
+        "current anchor\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(shape.join("child.md")).unwrap(),
+        "current child\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(shape.join("private.md")).unwrap(),
+        "ignored private\n"
+    );
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_restore_root_rejects_late_directory_before_mutation() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_path.to_str().unwrap(), None);
+    pragma_query_string(&sqlite, "graft_init");
+
+    let first = temp_dir.path().join("a-first.md");
+    let blocked = temp_dir.path().join("z-current.md");
+    std::fs::write(&first, "first v1\n").unwrap();
+    pragma_arg_string(&sqlite, "graft_add", "--all");
+    pragma_arg_string(&sqlite, "graft_commit", "source version");
+
+    std::fs::write(&first, "first v2\n").unwrap();
+    std::fs::write(&blocked, "delete on restore\n").unwrap();
+    pragma_arg_string(&sqlite, "graft_add", "--all");
+    pragma_arg_string(&sqlite, "graft_commit", "current version");
+    std::fs::remove_file(&blocked).unwrap();
+    std::fs::create_dir(&blocked).unwrap();
+    std::fs::write(blocked.join("child.md"), "keep child\n").unwrap();
+
+    let error = pragma_arg_error(&sqlite, "graft_json_restore", "--source HEAD~1 -- .");
+    assert!(error.contains("is not a regular file"), "{error}");
+    assert_eq!(std::fs::read_to_string(&first).unwrap(), "first v2\n");
+    assert_eq!(
+        std::fs::read_to_string(blocked.join("child.md")).unwrap(),
+        "keep child\n"
+    );
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_restore_root_rejects_non_directory_ancestor_before_mutation() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_path.to_str().unwrap(), None);
+    pragma_query_string(&sqlite, "graft_init");
+
+    let first = temp_dir.path().join("a-first.md");
+    let parent = temp_dir.path().join("z-parent");
+    std::fs::write(&first, "first v1\n").unwrap();
+    std::fs::create_dir(&parent).unwrap();
+    std::fs::write(parent.join("child.md"), "source child\n").unwrap();
+    pragma_arg_string(&sqlite, "graft_add", "--all");
+    pragma_arg_string(&sqlite, "graft_commit", "source directory");
+
+    std::fs::write(&first, "first v2\n").unwrap();
+    pragma_arg_string(&sqlite, "graft_add", "--all");
+    pragma_arg_string(&sqlite, "graft_commit", "current version");
+    std::fs::remove_dir_all(&parent).unwrap();
+    std::fs::write(&parent, "current obstruction\n").unwrap();
+
+    let error = pragma_arg_error(&sqlite, "graft_json_restore", "--source HEAD~1 -- .");
+    assert!(error.contains("is not a directory"), "{error}");
+    assert_eq!(std::fs::read_to_string(&first).unwrap(), "first v2\n");
+    assert_eq!(
+        std::fs::read_to_string(&parent).unwrap(),
+        "current obstruction\n"
+    );
+
+    runtime.shutdown().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn test_repo_restore_root_rejects_symlink_write_and_delete_escape() {
+    use std::os::unix::fs::symlink;
+
+    fn run(source_has_escape: bool) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("app.db");
+        let mut runtime = GraftTestRuntime::with_memory_remote();
+        let sqlite = runtime.open_sqlite(db_path.to_str().unwrap(), None);
+        pragma_query_string(&sqlite, "graft_init");
+
+        let first = temp_dir.path().join("a-first.md");
+        let escape = temp_dir.path().join("z-escape");
+        std::fs::write(&first, "first v1\n").unwrap();
+        if source_has_escape {
+            std::fs::create_dir(&escape).unwrap();
+            std::fs::write(escape.join("file.md"), "source outside write\n").unwrap();
+        }
+        pragma_arg_string(&sqlite, "graft_add", "--all");
+        pragma_arg_string(&sqlite, "graft_commit", "source version");
+
+        std::fs::write(&first, "first v2\n").unwrap();
+        if source_has_escape {
+            std::fs::remove_dir_all(&escape).unwrap();
+        } else {
+            std::fs::create_dir(&escape).unwrap();
+            std::fs::write(escape.join("file.md"), "current tracked\n").unwrap();
+        }
+        pragma_arg_string(&sqlite, "graft_add", "--all");
+        pragma_arg_string(&sqlite, "graft_commit", "current version");
+
+        if escape.exists() {
+            std::fs::remove_dir_all(&escape).unwrap();
+        }
+        let outside_file = outside.path().join("file.md");
+        if !source_has_escape {
+            std::fs::write(&outside_file, "outside must stay\n").unwrap();
+        }
+        symlink(outside.path(), &escape).unwrap();
+
+        let error = pragma_arg_error(&sqlite, "graft_json_restore", "--source HEAD~1 -- .");
+        assert!(error.contains("is not a directory"), "{error}");
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "first v2\n");
+        if source_has_escape {
+            assert!(!outside_file.exists());
+        } else {
+            assert_eq!(
+                std::fs::read_to_string(&outside_file).unwrap(),
+                "outside must stay\n"
+            );
+        }
+
+        runtime.shutdown().unwrap();
+    }
+
+    graft_test::ensure_test_env();
+    run(true);
+    run(false);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_repo_restore_root_rejects_special_file_before_mutation() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_path.to_str().unwrap(), None);
+    pragma_query_string(&sqlite, "graft_init");
+
+    let first = temp_dir.path().join("a-first.md");
+    let special = temp_dir.path().join("z-current.sock");
+    std::fs::write(&first, "first v1\n").unwrap();
+    pragma_arg_string(&sqlite, "graft_add", "--all");
+    pragma_arg_string(&sqlite, "graft_commit", "source version");
+
+    std::fs::write(&first, "first v2\n").unwrap();
+    std::fs::write(&special, "tracked before socket\n").unwrap();
+    pragma_arg_string(&sqlite, "graft_add", "--all");
+    pragma_arg_string(&sqlite, "graft_commit", "current version");
+    std::fs::remove_file(&special).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(&special).unwrap();
+
+    let error = pragma_arg_error(&sqlite, "graft_json_restore", "--source HEAD~1 -- .");
+    assert!(error.contains("is not a regular file"), "{error}");
+    assert_eq!(std::fs::read_to_string(&first).unwrap(), "first v2\n");
+    assert!(special.exists());
+
+    drop(listener);
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_restore_root_preflights_missing_external_payload() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_path.to_str().unwrap(), None);
+    pragma_query_string(&sqlite, "graft_init");
+    pragma_arg_string(
+        &sqlite,
+        "graft_config_set",
+        "files.inline_text_threshold -- 4 B",
+    );
+
+    let first = temp_dir.path().join("a-first.md");
+    let payload_file = temp_dir.path().join("z-large.txt");
+    std::fs::write(&first, "first v1\n").unwrap();
+    std::fs::write(&payload_file, "external source payload\n").unwrap();
+    pragma_arg_string(&sqlite, "graft_add", "--all");
+    pragma_arg_string(&sqlite, "graft_commit", "source payload");
+
+    std::fs::write(&first, "first v2\n").unwrap();
+    std::fs::remove_file(&payload_file).unwrap();
+    pragma_arg_string(&sqlite, "graft_add", "--all");
+    pragma_arg_string(&sqlite, "graft_commit", "remove payload");
+
+    let repo = Repository::open(temp_dir.path()).unwrap();
+    let source = repo.show_revision("HEAD~1").unwrap();
+    let state = source.artifacts.get("z-large.txt").unwrap();
+    let content_hash = state.content_hash().as_str();
+    let stored_payload = repo
+        .file_store_dir()
+        .join(&content_hash[..2])
+        .join(&content_hash[2..]);
+    std::fs::remove_file(&stored_payload).unwrap();
+    let head_before = repo.resolve_revision("HEAD").unwrap();
+    let index_before = repo.read_index().unwrap();
+    let history_before = pragma_query_string(&sqlite, "graft_json_log");
+
+    let error = pragma_arg_error(&sqlite, "graft_json_restore", "--source HEAD~1 -- .");
+    assert!(
+        error.contains("No such file") || error.contains("not found"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read_to_string(&first).unwrap(), "first v2\n");
+    assert!(!payload_file.exists());
+    assert_eq!(repo.resolve_revision("HEAD").unwrap(), head_before);
+    assert_eq!(repo.read_index().unwrap(), index_before);
+    assert_eq!(
+        pragma_query_string(&sqlite, "graft_json_log"),
+        history_before
+    );
 
     runtime.shutdown().unwrap();
 }
@@ -7999,6 +9174,32 @@ fn test_repo_merge_conflict_records_index_stages() {
     let theirs_row = conflicts["conflicts"][0]["theirs_row"].as_array().unwrap();
     assert!(ours_row.iter().any(|value| value == "Carol"));
     assert!(theirs_row.iter().any(|value| value == "Bob"));
+
+    let carol_before_restore: i64 = sqlite
+        .query_row(
+            "SELECT COUNT(*) FROM repo_merge WHERE name = 'Carol'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(carol_before_restore, 1);
+    let restore_error =
+        pragma_arg_error(&sqlite, "graft_json_restore", "--source HEAD~1 -- app.db");
+    assert!(
+        restore_error.contains("unresolved index conflicts"),
+        "restore should reject a conflicted index before changing the worktree: {restore_error}"
+    );
+    let carol_after_restore: i64 = sqlite
+        .query_row(
+            "SELECT COUNT(*) FROM repo_merge WHERE name = 'Carol'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        carol_after_restore, 1,
+        "a rejected restore must leave the worktree database unchanged"
+    );
 
     let mut output = None;
     let result = sqlite.pragma(None, "graft_commit", "merge feature", |row| {

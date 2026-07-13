@@ -7,7 +7,7 @@ impl Repository {
     }
 
     pub fn mark_dirty_key(&self, key: impl Into<String>) -> Result<()> {
-        let key = normalize_repo_path(&key.into());
+        let key = normalize_repo_path_key(&key.into())?;
         let mut state = self.read_worktree_state()?;
         let mut dirty = state.dirty.into_iter().collect::<BTreeSet<_>>();
         dirty.insert(key.clone());
@@ -22,7 +22,7 @@ impl Repository {
     }
 
     pub fn mark_deleted_key(&self, key: impl Into<String>) -> Result<()> {
-        let key = normalize_repo_path(&key.into());
+        let key = normalize_repo_path_key(&key.into())?;
         let mut state = self.read_worktree_state()?;
         state.dirty.retain(|path| path != &key);
         let mut deleted = state.deleted.into_iter().collect::<BTreeSet<_>>();
@@ -37,7 +37,7 @@ impl Repository {
     }
 
     pub fn clear_dirty_key(&self, key: &str) -> Result<()> {
-        let key = normalize_repo_path(key);
+        let key = normalize_repo_path_key(key)?;
         let mut state = self.read_worktree_state()?;
         state.dirty.retain(|path| path != &key);
         state.deleted.retain(|path| path != &key);
@@ -117,7 +117,7 @@ impl Repository {
     }
 
     pub fn index_has_key(&self, key: impl Into<String>) -> Result<bool> {
-        let key = normalize_repo_path(&key.into());
+        let key = normalize_repo_path_key(&key.into())?;
         Ok(self
             .read_index()?
             .stage0_entries()
@@ -130,7 +130,7 @@ impl Repository {
     }
 
     pub fn restore_index_key_from_head(&self, key: impl Into<String>) -> Result<String> {
-        let key = normalize_repo_path(&key.into());
+        let key = normalize_repo_path_key(&key.into())?;
         let mut index = self.read_index()?;
         if index.conflicted_paths().iter().any(|path| path == &key) {
             return Err(RepoErr::UnresolvedConflicts);
@@ -160,7 +160,7 @@ impl Repository {
         rev: &str,
         key: impl Into<String>,
     ) -> Result<String> {
-        let key = normalize_repo_path(&key.into());
+        let key = normalize_repo_path_key(&key.into())?;
         let target = self.resolve_revision(rev)?;
         let source_commit = self.read_commit(&target)?;
         let source_files = source_commit.files;
@@ -251,6 +251,10 @@ impl Repository {
         Ok(())
     }
 
+    pub fn verify_artifact_state(&self, state: &CommitArtifactState) -> Result<()> {
+        self.artifact_bytes(state).map(|_| ())
+    }
+
     pub fn materialize_artifact_checkout(
         &self,
         artifacts: &BTreeMap<String, CommitArtifactState>,
@@ -300,10 +304,10 @@ impl Repository {
                     path: absolute.clone(),
                     worktree: self.worktree.clone(),
                 })?;
-        relative
+        let key = relative
             .to_str()
-            .map(|path| path.replace('\\', "/"))
-            .ok_or_else(|| RepoErr::NonUtf8Path(relative.to_path_buf()))
+            .ok_or_else(|| RepoErr::NonUtf8Path(relative.to_path_buf()))?;
+        normalize_repo_path_key(key)
     }
 
     pub fn is_ignored_worktree_path(&self, path: impl AsRef<Path>) -> Result<bool> {
@@ -320,10 +324,10 @@ impl Repository {
                     path: path.to_path_buf(),
                     worktree: self.worktree.clone(),
                 })?;
-        relative
+        let key = relative
             .to_str()
-            .map(|path| normalize_repo_path(path))
-            .ok_or_else(|| RepoErr::NonUtf8Path(relative.to_path_buf()))
+            .ok_or_else(|| RepoErr::NonUtf8Path(relative.to_path_buf()))?;
+        normalize_repo_path_key(key)
     }
 
     pub(super) fn ignore_rules(&self) -> Result<IgnoreRules> {
@@ -491,7 +495,7 @@ impl Repository {
             return Ok(None);
         };
         let object = object::Object::decode(&bytes)?;
-        let actual = object.id();
+        let actual = object::ObjectId::for_bytes(&bytes);
         if actual != *id {
             return Err(RepoErr::Object(object::ObjectErr::ObjectIdMismatch {
                 expected: id.clone(),
@@ -849,6 +853,19 @@ impl Repository {
                 continue;
             }
             let physical_path = self.worktree.join(&path);
+            if fs::symlink_metadata(&physical_path)
+                .is_ok_and(|metadata| !metadata.file_type().is_file())
+            {
+                changes.insert(
+                    path.clone(),
+                    (
+                        RepoWorktreeChangeKind::Deleted,
+                        artifact_tracked_path_kind(expected),
+                        artifact_tracked_path_storage(expected),
+                    ),
+                );
+                continue;
+            }
             match artifact_file_matches(&physical_path, expected)? {
                 Some(true) => {}
                 Some(false) => {

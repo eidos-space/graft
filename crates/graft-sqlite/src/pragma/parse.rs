@@ -1,18 +1,18 @@
 use std::path::PathBuf;
 
 use graft::{
-    core::{logref::LogRef, lsn::LSN},
+    core::{byte_unit::ByteUnit, logref::LogRef, lsn::LSN},
     remote::RemoteConfig,
-    repo::{RepoTrackedPathKind, ResetMode},
+    repo::{DEFAULT_TEXT_DIFF_CONTENT_LIMIT, RepoTrackedPathKind, ResetMode},
 };
 use sqlite_plugin::vfs::PragmaErr;
 
 use super::{
-    BranchListMode, DiffMode, JsonConfigListMode, JsonFetchAsyncMode, JsonLogMode, JsonTagsMode,
-    LargeFileFetchSpec, LargeFilePruneSpec, LargeFileStatusSpec, LsFilesSpec, RepoAddSpec,
-    RepoAuditSpec, RepoCheckoutSpec, RepoCloneSpec, RepoDiffSpec, RepoDiffTarget, RepoExportSpec,
-    RepoInitSpec, RepoRemoveSpec, RepoResolveRowSpec, RepoResolveSpec, RepoRestoreSpec,
-    ResolveSide, StatusSpec, parse_or_fail, pragma_fail,
+    BranchListMode, DiffMode, JsonConfigListMode, JsonFetchAsyncMode, JsonLogMode, JsonLogSpec,
+    JsonTagsMode, LargeFileFetchSpec, LargeFilePruneSpec, LargeFileStatusSpec, LsFilesSpec,
+    RepoAddSpec, RepoAuditSpec, RepoCheckoutSpec, RepoCloneSpec, RepoDiffSpec, RepoDiffTarget,
+    RepoExportSpec, RepoInitSpec, RepoRemoveSpec, RepoResolveRowSpec, RepoResolveSpec,
+    RepoRestoreSpec, RepoTextContentSpec, ResolveSide, StatusSpec, parse_or_fail, pragma_fail,
 };
 
 pub(super) fn parse_remote_add(arg: &str) -> Result<(String, RemoteConfig), PragmaErr> {
@@ -304,11 +304,16 @@ pub(super) fn parse_repo_diff_arg(arg: Option<&str>) -> Result<RepoDiffSpec, Pra
             mode: DiffMode::Default,
             kind: None,
             target: RepoDiffTarget::Worktree { path: None },
+            content: None,
         });
     };
+    reject_ambiguous_posix_path_escape(arg)?;
     let raw_parts = split_pragma_words(arg)?;
     let mut mode = DiffMode::Default;
     let mut kind = None;
+    let mut include_content = false;
+    let mut max_content_bytes = None;
+    let mut root = None;
     let mut parts = Vec::new();
     let mut in_path = false;
     let mut index = 0;
@@ -333,42 +338,117 @@ pub(super) fn parse_repo_diff_arg(arg: Option<&str>) -> Result<RepoDiffSpec, Pra
             };
             kind = Some(parse_repo_tracked_path_kind_arg(value)?);
             index += 2;
+        } else if !in_path && part == "--content" {
+            if include_content {
+                return Err(pragma_fail("diff accepts --content only once"));
+            }
+            include_content = true;
+            index += 1;
+        } else if !in_path && part == "--max-content-bytes" {
+            if max_content_bytes.is_some() {
+                return Err(pragma_fail("diff accepts --max-content-bytes only once"));
+            }
+            let Some(value) = raw_parts.get(index + 1) else {
+                return Err(pragma_fail("diff --max-content-bytes requires a value"));
+            };
+            let value = value
+                .parse::<u64>()
+                .map_err(|_| pragma_fail("diff --max-content-bytes must be a positive integer"))?;
+            if value == 0 {
+                return Err(pragma_fail(
+                    "diff --max-content-bytes must be a positive integer",
+                ));
+            }
+            max_content_bytes = Some(value);
+            index += 2;
+        } else if !in_path && part == "--root" {
+            if root.is_some() {
+                return Err(pragma_fail("diff accepts --root only once"));
+            }
+            let Some(value) = raw_parts.get(index + 1) else {
+                return Err(pragma_fail("diff --root requires a target revision"));
+            };
+            root = Some(value.clone());
+            index += 2;
         } else {
             parts.push(part.as_str());
             index += 1;
         }
     }
-    let target = match parts.as_slice() {
-        [] => RepoDiffTarget::Worktree { path: None },
-        ["--", path @ ..] if !path.is_empty() => {
-            RepoDiffTarget::Worktree { path: Some(path.join(" ")) }
+    let target = if let Some(to) = root {
+        match parts.as_slice() {
+            [] => RepoDiffTarget::Root { to, path: None },
+            ["--", path @ ..] if !path.is_empty() => {
+                RepoDiffTarget::Root { to, path: Some(path.join(" ")) }
+            }
+            _ => {
+                return Err(pragma_fail(
+                    "diff --root accepts one target revision and an optional `-- path`",
+                ));
+            }
         }
-        ["--staged"] | ["--cached"] => RepoDiffTarget::Staged { path: None },
-        ["--staged", "--", path @ ..] | ["--cached", "--", path @ ..] if !path.is_empty() => {
-            RepoDiffTarget::Staged { path: Some(path.join(" ")) }
-        }
-        [rev] => RepoDiffTarget::RevisionToWorktree { rev: (*rev).to_string(), path: None },
-        [rev, "--", path @ ..] if !path.is_empty() => RepoDiffTarget::RevisionToWorktree {
-            rev: (*rev).to_string(),
-            path: Some(path.join(" ")),
-        },
-        [from, to] => RepoDiffTarget::Revisions {
-            from: (*from).to_string(),
-            to: (*to).to_string(),
-            path: None,
-        },
-        [from, to, "--", path @ ..] if !path.is_empty() => RepoDiffTarget::Revisions {
-            from: (*from).to_string(),
-            to: (*to).to_string(),
-            path: Some(path.join(" ")),
-        },
-        _ => {
-            return Err(pragma_fail(
-                "argument must be in the form: `[--rows] [--staged] [rev] [rev] [-- path]`",
-            ));
+    } else {
+        match parts.as_slice() {
+            [] => RepoDiffTarget::Worktree { path: None },
+            ["--", path @ ..] if !path.is_empty() => {
+                RepoDiffTarget::Worktree { path: Some(path.join(" ")) }
+            }
+            ["--staged"] | ["--cached"] => RepoDiffTarget::Staged { path: None },
+            ["--staged", "--", path @ ..] | ["--cached", "--", path @ ..] if !path.is_empty() => {
+                RepoDiffTarget::Staged { path: Some(path.join(" ")) }
+            }
+            [rev] => RepoDiffTarget::RevisionToWorktree { rev: (*rev).to_string(), path: None },
+            [rev, "--", path @ ..] if !path.is_empty() => RepoDiffTarget::RevisionToWorktree {
+                rev: (*rev).to_string(),
+                path: Some(path.join(" ")),
+            },
+            [from, to] => RepoDiffTarget::Revisions {
+                from: (*from).to_string(),
+                to: (*to).to_string(),
+                path: None,
+            },
+            [from, to, "--", path @ ..] if !path.is_empty() => RepoDiffTarget::Revisions {
+                from: (*from).to_string(),
+                to: (*to).to_string(),
+                path: Some(path.join(" ")),
+            },
+            _ => {
+                return Err(pragma_fail(
+                    "argument must be in the form: `[--rows] [--staged] [rev] [rev] [-- path]` or `--root rev [-- path]`",
+                ));
+            }
         }
     };
-    Ok(RepoDiffSpec { mode, kind, target })
+    if max_content_bytes.is_some() && !include_content {
+        return Err(pragma_fail("diff --max-content-bytes requires --content"));
+    }
+    let content = if include_content {
+        if mode != DiffMode::Default {
+            return Err(pragma_fail("diff --content cannot be combined with --rows"));
+        }
+        if kind.is_some_and(|kind| kind != RepoTrackedPathKind::TextFile) {
+            return Err(pragma_fail("diff --content only supports text_file paths"));
+        }
+        if !matches!(
+            &target,
+            RepoDiffTarget::RevisionToWorktree { path: Some(path), .. }
+                | RepoDiffTarget::Revisions { path: Some(path), .. }
+                | RepoDiffTarget::Root { path: Some(path), .. }
+                if !path.is_empty()
+        ) {
+            return Err(pragma_fail(
+                "diff --content requires a source revision, an optional target revision, and one path",
+            ));
+        }
+        Some(RepoTextContentSpec {
+            max_bytes: ByteUnit::new(
+                max_content_bytes.unwrap_or(DEFAULT_TEXT_DIFF_CONTENT_LIMIT.as_u64()),
+            ),
+        })
+    } else {
+        None
+    };
+    Ok(RepoDiffSpec { mode, kind, target, content })
 }
 
 pub(super) fn parse_volume_diff_arg(arg: &str) -> Result<(LSN, LSN, DiffMode), PragmaErr> {
@@ -479,8 +559,9 @@ pub(super) fn parse_repo_add_arg(arg: Option<&str>) -> Result<RepoAddSpec, Pragm
             });
         }
         if let Some(path) = arg.strip_prefix(&format!("{flag} -- ")) {
+            let path = parse_delimited_repo_path(path, "add")?;
             return Ok(RepoAddSpec {
-                path: Some(PathBuf::from(path)),
+                path: Some(path),
                 force: true,
                 all: false,
                 kind: None,
@@ -501,6 +582,15 @@ pub(super) fn parse_repo_add_arg(arg: Option<&str>) -> Result<RepoAddSpec, Pragm
         }
     }
 
+    if let Some(path) = arg.strip_prefix("-- ") {
+        return Ok(RepoAddSpec {
+            path: Some(parse_delimited_repo_path(path, "add")?),
+            force: false,
+            all: false,
+            kind: None,
+        });
+    }
+
     if arg.starts_with('-') {
         return Err(pragma_fail(
             "argument must be in the form: `[--all|-A]` or `[--force] [path]`",
@@ -515,10 +605,21 @@ pub(super) fn parse_repo_add_arg(arg: Option<&str>) -> Result<RepoAddSpec, Pragm
     })
 }
 
+fn parse_delimited_repo_path(value: &str, operation: &str) -> Result<PathBuf, PragmaErr> {
+    let parts = split_pragma_words(value)?;
+    match parts.as_slice() {
+        [path] if !path.is_empty() => Ok(PathBuf::from(path)),
+        _ => Err(pragma_fail(format!(
+            "{operation} accepts exactly one path after `--`"
+        ))),
+    }
+}
+
 pub(super) fn parse_repo_remove_arg(arg: Option<&str>) -> Result<RepoRemoveSpec, PragmaErr> {
     let Some(arg) = arg else {
         return Ok(RepoRemoveSpec { path: None, cached: false });
     };
+    reject_ambiguous_posix_path_escape(arg)?;
     let parts = split_pragma_words(arg.trim())?;
     if parts.is_empty() {
         return Ok(RepoRemoveSpec { path: None, cached: false });
@@ -855,8 +956,11 @@ pub(super) fn parse_repo_checkout_arg(arg: &str) -> Result<RepoCheckoutSpec, Pra
 }
 
 pub(super) fn parse_repo_restore_arg(arg: &str) -> Result<RepoRestoreSpec, PragmaErr> {
+    reject_ambiguous_posix_path_escape(arg)?;
     let parts = split_pragma_words(arg)?;
     let mut source = None;
+    let mut expected_head = None;
+    let mut require_clean = false;
     let mut staged = false;
     let mut all = false;
     let mut kind = None;
@@ -892,6 +996,26 @@ pub(super) fn parse_repo_restore_arg(arg: &str) -> Result<RepoRestoreSpec, Pragm
                 };
                 source = Some(value.clone());
                 index += 2;
+            }
+            "--expected-head" => {
+                if expected_head.is_some() {
+                    return Err(pragma_fail("restore accepts --expected-head only once"));
+                }
+                let Some(value) = parts.get(index + 1) else {
+                    return Err(pragma_fail("restore --expected-head requires an object id"));
+                };
+                if value.starts_with('-') {
+                    return Err(pragma_fail("restore --expected-head requires an object id"));
+                }
+                expected_head = Some(value.clone());
+                index += 2;
+            }
+            "--require-clean" => {
+                if require_clean {
+                    return Err(pragma_fail("restore accepts --require-clean only once"));
+                }
+                require_clean = true;
+                index += 1;
             }
             "--all" | "-A" => {
                 if all {
@@ -937,6 +1061,8 @@ pub(super) fn parse_repo_restore_arg(arg: &str) -> Result<RepoRestoreSpec, Pragm
 
     Ok(RepoRestoreSpec {
         source,
+        expected_head,
+        require_clean,
         staged,
         all,
         kind,
@@ -960,7 +1086,11 @@ pub(super) fn split_pragma_words(arg: &str) -> Result<Vec<String>, PragmaErr> {
         }
 
         if ch == '\\' {
-            escaped = true;
+            if cfg!(windows) {
+                current.push(ch);
+            } else {
+                escaped = true;
+            }
             in_word = true;
             continue;
         }
@@ -1005,18 +1135,79 @@ pub(super) fn split_pragma_words(arg: &str) -> Result<Vec<String>, PragmaErr> {
     Ok(words)
 }
 
-pub(super) fn parse_json_log_arg(arg: Option<&str>) -> Result<JsonLogMode, PragmaErr> {
+fn reject_ambiguous_posix_path_escape(arg: &str) -> Result<(), PragmaErr> {
+    #[cfg(not(windows))]
+    {
+        let mut chars = arg.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch != '\\' {
+                continue;
+            }
+            let escaped = chars.peek().copied();
+            if escaped.is_some_and(|ch| ch.is_whitespace() || matches!(ch, '\'' | '"')) {
+                continue;
+            }
+            return Err(pragma_fail(
+                "backslashes are not supported in POSIX repository paths",
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn parse_json_log_arg(arg: Option<&str>) -> Result<JsonLogSpec, PragmaErr> {
     let Some(arg) = arg else {
-        return Ok(JsonLogMode::LegacyArray);
+        return Ok(JsonLogSpec {
+            mode: JsonLogMode::LegacyArray,
+            limit: None,
+            after: None,
+        });
     };
     let words = split_pragma_words(arg)?;
-    match words.as_slice() {
-        [] => Ok(JsonLogMode::LegacyArray),
-        [flag] if flag == "--with-status" => Ok(JsonLogMode::WithStatus),
-        _ => Err(pragma_fail(
-            "argument must be empty or in the form: `--with-status`",
-        )),
+    let mut mode = JsonLogMode::LegacyArray;
+    let mut limit = None;
+    let mut after = None;
+    let mut index = 0;
+    while index < words.len() {
+        match words[index].as_str() {
+            "--with-status" if mode == JsonLogMode::LegacyArray => {
+                mode = JsonLogMode::WithStatus;
+                index += 1;
+            }
+            "--limit" if limit.is_none() => {
+                let value = words
+                    .get(index + 1)
+                    .ok_or_else(|| pragma_fail("json_log --limit requires a positive integer"))?;
+                let parsed = value
+                    .parse::<usize>()
+                    .map_err(|_| pragma_fail("json_log --limit requires a positive integer"))?;
+                if parsed == 0 {
+                    return Err(pragma_fail("json_log --limit requires a positive integer"));
+                }
+                limit = Some(parsed);
+                index += 2;
+            }
+            "--after" if after.is_none() => {
+                after = Some(
+                    words
+                        .get(index + 1)
+                        .filter(|value| !value.starts_with("--"))
+                        .ok_or_else(|| pragma_fail("json_log --after requires a commit id"))?
+                        .clone(),
+                );
+                index += 2;
+            }
+            _ => {
+                return Err(pragma_fail(
+                    "argument must use: `[--with-status] [--limit n] [--after oid]`",
+                ));
+            }
+        }
     }
+    if after.is_some() && limit.is_none() {
+        return Err(pragma_fail("json_log --after requires --limit"));
+    }
+    Ok(JsonLogSpec { mode, limit, after })
 }
 
 pub(super) fn parse_json_config_list_arg(
@@ -1078,6 +1269,7 @@ pub(super) fn parse_json_fetch_async_arg(
 }
 
 pub(super) fn parse_repo_export_arg(arg: &str) -> Result<RepoExportSpec, PragmaErr> {
+    reject_ambiguous_posix_path_escape(arg)?;
     let mut source = None;
     let mut output = None;
     let mut path = Vec::new();

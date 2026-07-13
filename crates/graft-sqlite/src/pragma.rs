@@ -13,6 +13,7 @@ use std::{
 
 use graft::core::{
     LogId, PageIdx, VolumeId,
+    byte_unit::ByteUnit,
     logref::LogRef,
     lsn::{LSN, LSNRangeExt},
     page::{PAGESIZE, Page},
@@ -25,9 +26,9 @@ use graft::repo::{
     RepoArtifactAudit, RepoArtifactAuditIssueKind, RepoArtifactRepairOutcome, RepoConfigEntry,
     RepoDiff, RepoFileChange, RepoLargeFileFetchOutcome, RepoLargeFileFetchStatus,
     RepoLargeFilePruneOutcome, RepoLargeFileStatusOutcome, RepoLargeFileStatusState, RepoLogRange,
-    RepoPathStorage, RepoSnapshot, RepoStatus, RepoStorageCommit, RepoTrackedPath,
-    RepoTrackedPathDetail, RepoTrackedPathEntry, RepoTrackedPathKind, RepoWorktreeChangeKind,
-    Repository, ResetMode, ResetOutcome, TagInfo,
+    RepoPathStorage, RepoSnapshot, RepoStatus, RepoStorageCommit, RepoTextContentDiff,
+    RepoTrackedPath, RepoTrackedPathDetail, RepoTrackedPathEntry, RepoTrackedPathKind,
+    RepoWorktreeChangeKind, Repository, ResetMode, ResetOutcome, TagInfo,
 };
 use graft::{
     rt::runtime::Runtime, volume::AheadStatus, volume_reader::VolumeRead,
@@ -163,10 +164,10 @@ pub(crate) enum GraftPragma {
     /// `pragma graft_json_checkout = "[--force] rev [-- path]";`
     JsonRepoCheckout { spec: RepoCheckoutSpec },
 
-    /// `pragma graft_restore = "[--source rev] path|--staged --all [--kind kind]";`
+    /// `pragma graft_restore = "[--source rev] [--expected-head oid] [--require-clean] path|--staged --all [--kind kind]";`
     Restore { spec: RepoRestoreSpec },
 
-    /// `pragma graft_json_restore = "[--source rev] path|--staged --all [--kind kind]";`
+    /// `pragma graft_json_restore = "[--source rev] [--expected-head oid] [--require-clean] path|--staged --all [--kind kind]";`
     JsonRestore { spec: RepoRestoreSpec },
 
     /// `pragma graft_export = "[--source rev] --output output.db [-- path]";`
@@ -619,15 +620,15 @@ pub(crate) enum GraftPragma {
     Show { target: String },
 
     // JSON output variants (non-breaking additions)
-    /// `pragma graft_json_log [= "--with-status"];`
+    /// `pragma graft_json_log [= "--with-status [--limit n] [--after oid]"];`
     /// Repository commit history as JSON array, or app-facing JSON object with status
-    JsonLog { mode: JsonLogMode },
+    JsonLog { spec: JsonLogSpec },
 
     /// `pragma graft_debug_volume_json_diff = "from_lsn,to_lsn[,mode]";`
     /// Legacy Volume diff as JSON. mode: omitted=summary, "rows"=row-level detail
     VolumeJsonDiff { from: LSN, to: LSN, mode: DiffMode },
 
-    /// `pragma graft_json_diff = "[--rows] [--kind kind] [--staged] [rev] [rev] [-- path]";`
+    /// `pragma graft_json_diff = "[--rows] [--content [--max-content-bytes bytes]] [--kind kind] [--staged] [rev] [rev] [-- path] | --root rev [-- path]";`
     /// Repository diff as JSON
     JsonRepoDiff { spec: RepoDiffSpec },
 
@@ -1058,7 +1059,7 @@ impl TryFrom<&Pragma<'_>> for GraftPragma {
                     Ok(GraftPragma::VolumeDiff { from, to, mode })
                 }
                 "show" => Ok(GraftPragma::Show { target: p.require_arg()?.to_string() }),
-                "json_log" => Ok(GraftPragma::JsonLog { mode: parse_json_log_arg(p.arg)? }),
+                "json_log" => Ok(GraftPragma::JsonLog { spec: parse_json_log_arg(p.arg)? }),
                 "json_diff" => {
                     let spec = parse_repo_diff_arg(p.arg)?;
                     Ok(GraftPragma::JsonRepoDiff { spec })
@@ -2190,6 +2191,9 @@ impl GraftPragma {
                 if !file.is_idle() {
                     return pragma_err!("cannot diff while there is an open transaction");
                 }
+                if spec.content.is_some() {
+                    return pragma_err!("diff --content is only available through graft_json_diff");
+                }
                 let mode = spec.mode;
                 let repo = repo_for_file(file)?;
                 let diff = repo_diff_for_spec(&runtime, file, &repo, spec)?;
@@ -2208,17 +2212,25 @@ impl GraftPragma {
                 Ok(Some(format_repo_show(&commit)?))
             }
 
-            GraftPragma::JsonLog { mode } => {
+            GraftPragma::JsonLog { spec } => {
                 let repo = repo_for_file(file)?;
-                let commits = repo.log()?;
-                match mode {
+                let (commits, has_more) = match spec.limit {
+                    Some(limit) => repo.log_page(limit, spec.after.as_deref())?,
+                    None => (repo.log()?, false),
+                };
+                match spec.mode {
                     JsonLogMode::LegacyArray => Ok(Some(to_json(&commits)?)),
                     JsonLogMode::WithStatus => {
                         let (current_head, current_branch) = repo_head_and_branch(&repo)?;
+                        let next_cursor = has_more
+                            .then(|| commits.last().map(|commit| commit.id.clone()))
+                            .flatten();
                         Ok(Some(to_json(&JsonRepoLogOutcome {
                             current_head,
                             current_branch,
                             commits,
+                            next_cursor,
+                            has_more,
                         })?))
                     }
                 }
@@ -2351,15 +2363,33 @@ impl GraftPragma {
                 let mode = spec.mode;
                 let kind = spec.kind.map(repo_tracked_path_kind_json_label);
                 let repo = repo_for_file(file)?;
-                let diff = repo_diff_for_spec(&runtime, file, &repo, spec)?;
+                let content_request = match (&spec.content, &spec.target) {
+                    (
+                        Some(content),
+                        RepoDiffTarget::RevisionToWorktree { path: Some(path), .. }
+                        | RepoDiffTarget::Revisions { path: Some(path), .. }
+                        | RepoDiffTarget::Root { path: Some(path), .. },
+                    ) => Some((repo_path_arg(&repo, path)?, content.max_bytes)),
+                    (Some(_), _) => unreachable!("content diff target is validated while parsing"),
+                    (None, _) => None,
+                };
+                let mut diff = repo_diff_for_spec(&runtime, file, &repo, spec)?;
                 let (current_head, current_branch) = repo_head_and_branch(&repo)?;
                 match mode {
-                    DiffMode::Default => Ok(Some(to_json(&JsonRepoDiffOutcome {
-                        current_head,
-                        current_branch,
-                        kind,
-                        diff,
-                    })?)),
+                    DiffMode::Default => {
+                        let content = content_request
+                            .map(|(path, max_bytes)| {
+                                repo_text_content_for_path(&repo, &mut diff, &path, max_bytes)
+                            })
+                            .transpose()?;
+                        Ok(Some(to_json(&JsonRepoDiffOutcome {
+                            current_head,
+                            current_branch,
+                            kind,
+                            diff,
+                            content,
+                        })?))
+                    }
                     DiffMode::Rows => {
                         let rows = json_repo_row_diff(&runtime, &repo, &diff)?;
                         Ok(Some(to_json(&JsonRepoDiffOutcome {
@@ -2367,6 +2397,7 @@ impl GraftPragma {
                             current_branch,
                             kind,
                             diff: rows,
+                            content: None,
                         })?))
                     }
                 }

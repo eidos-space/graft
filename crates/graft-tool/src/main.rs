@@ -1,5 +1,6 @@
 use std::{
     io::Read,
+    num::NonZeroU64,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
@@ -31,6 +32,14 @@ enum Command {
         /// Emit JSON history with current repository state
         #[arg(long)]
         json: bool,
+
+        /// Return at most this many commits
+        #[arg(long)]
+        limit: Option<usize>,
+
+        /// Continue after this exact commit id from the previous page
+        #[arg(long, requires = "limit")]
+        after: Option<String>,
     },
 
     /// Initialize a .graft repository in the current worktree
@@ -146,6 +155,18 @@ enum Command {
         #[arg(long, value_enum)]
         kind: Option<PathKind>,
 
+        /// Include bounded UTF-8 content for one changed text path
+        #[arg(long, requires = "json", conflicts_with_all = ["rows", "staged"])]
+        content: bool,
+
+        /// Maximum content bytes to read from each side
+        #[arg(long, requires = "content")]
+        max_content_bytes: Option<NonZeroU64>,
+
+        /// Compare the empty tree to this target revision
+        #[arg(long, value_name = "TO", conflicts_with = "staged")]
+        root: Option<String>,
+
         /// Source revision, for example HEAD~1
         from: Option<String>,
 
@@ -187,7 +208,12 @@ enum Command {
         path: Option<PathBuf>,
     },
 
-    /// Restore a worktree database path from the index or a revision
+    /// Restore worktree paths from the index or a revision
+    ///
+    /// Multi-path restores preflight known path and payload failures before changing files or the
+    /// index. They are not cross-path transactions: an unexpected operating-system I/O failure
+    /// after apply begins can leave a subset of worktree paths, staged entries, or restore-status
+    /// metadata updated. Correct the failure and rerun the same restore command.
     Restore {
         /// Emit JSON restore output with current repository state
         #[arg(long)]
@@ -196,6 +222,14 @@ enum Command {
         /// Restore from this revision instead of the staged index
         #[arg(short = 's', long)]
         source: Option<String>,
+
+        /// Fail unless HEAD still equals this full object id
+        #[arg(long, value_name = "OID")]
+        expected_head: Option<String>,
+
+        /// Fail if staged or tracked worktree changes are present
+        #[arg(long)]
+        require_clean: bool,
 
         /// Restore the staged index entry from HEAD instead of touching the worktree
         #[arg(long, alias = "cached")]
@@ -779,21 +813,24 @@ fn run_cli(cli: Cli) -> Result<()> {
 }
 
 fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
+    validate_command_repo_paths(&command)?;
     match command {
         Command::Id { kind } => match kind {
             IdKind::Vid => println!("{}", VolumeId::random()),
             IdKind::Log => println!("{}", LogId::random()),
             IdKind::Sid => println!("{}", SegmentId::random()),
         },
-        Command::Log { json } => {
+        Command::Log { json, limit, after } => {
+            if limit == Some(0) {
+                bail!("log --limit must be greater than zero");
+            }
             if json {
-                print_output(run_repo_pragma(
-                    db_override,
-                    None,
-                    "json_log",
-                    Some("--with-status"),
-                )?);
+                let arg = repo_log_arg(limit, after.as_deref())?;
+                print_output(run_repo_pragma(db_override, None, "json_log", Some(&arg))?);
             } else {
+                if limit.is_some() || after.is_some() {
+                    bail!("log pagination requires --json");
+                }
                 print_output(run_repo_pragma(db_override, None, "log", None)?);
             }
         }
@@ -804,12 +841,8 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
         Command::Clone { json, branch_option, remote, branch } => {
             let branch = branch_option.as_deref().or(branch.as_deref());
             let arg = repo_clone_arg(&remote, branch);
-            print_output(run_repo_pragma(
-                db_override,
-                None,
-                clone_pragma(json),
-                Some(&arg),
-            )?);
+            let db = resolve_clone_db(db_override)?;
+            print_output(run_pragma(&db, clone_pragma(json), Some(&arg))?);
         }
         Command::Status { json, kind } => {
             let pragma = if json { "json_status" } else { "status" };
@@ -878,7 +911,7 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
             if db_override.is_none() && !args.all && args.path.is_none() {
                 bail!("add requires a path, --all, or --db <path>");
             }
-            let arg = repo_add_arg(args.all, args.force, args.kind, args.path.as_deref());
+            let arg = repo_add_arg(args.all, args.force, args.kind, args.path.as_deref())?;
             print_output(run_repo_pragma(
                 db_override,
                 None,
@@ -906,16 +939,30 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
                 Some(&message),
             )?);
         }
-        Command::Diff { rows, staged, kind, from, to, path, json } => {
+        Command::Diff {
+            rows,
+            staged,
+            kind,
+            content,
+            max_content_bytes,
+            root,
+            from,
+            to,
+            path,
+            json,
+        } => {
             let suffix = if json { "json_diff" } else { "diff" };
-            let arg = repo_diff_arg(
+            let arg = repo_diff_arg(RepoDiffArgSpec {
                 rows,
                 staged,
                 kind,
-                from.as_deref(),
-                to.as_deref(),
-                path.as_deref(),
-            )?;
+                content,
+                max_content_bytes,
+                root: root.as_deref(),
+                from: from.as_deref(),
+                to: to.as_deref(),
+                path: path.as_deref(),
+            })?;
             print_output(run_repo_pragma(db_override, None, suffix, arg.as_deref())?);
         }
         Command::Show { rev, json } => {
@@ -931,8 +978,25 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
                 Some(&arg),
             )?);
         }
-        Command::Restore { json, source, staged, all, kind, path } => {
-            let arg = repo_restore_arg(source.as_deref(), staged, all, kind, path.as_deref());
+        Command::Restore {
+            json,
+            source,
+            expected_head,
+            require_clean,
+            staged,
+            all,
+            kind,
+            path,
+        } => {
+            let arg = repo_restore_arg(
+                source.as_deref(),
+                expected_head.as_deref(),
+                require_clean,
+                staged,
+                all,
+                kind,
+                path.as_deref(),
+            )?;
             print_output(run_repo_pragma(
                 db_override,
                 None,
@@ -1404,6 +1468,14 @@ fn resolve_repo_control_db() -> Result<PathBuf> {
     Ok(repo.graft_dir().join("control.sqlite"))
 }
 
+fn resolve_clone_db(path: Option<&Path>) -> Result<PathBuf> {
+    if let Some(path) = path {
+        return resolve_cli_db(Some(path));
+    }
+    let cwd = std::env::current_dir().context("failed to read current directory")?;
+    Ok(cwd.join(".graft-clone.sqlite"))
+}
+
 fn json_escape(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for ch in value.chars() {
@@ -1433,6 +1505,71 @@ fn config_get_pragma(json: bool) -> &'static str {
     } else {
         "config_get"
     }
+}
+
+fn repo_log_arg(limit: Option<usize>, after: Option<&str>) -> Result<String> {
+    let mut parts = vec!["--with-status".to_string()];
+    if let Some(limit) = limit {
+        parts.push("--limit".to_string());
+        parts.push(limit.to_string());
+    }
+    if let Some(after) = after {
+        parts.push("--after".to_string());
+        parts.push(quote_pragma_path(Path::new(after))?);
+    }
+    Ok(parts.join(" "))
+}
+
+fn validate_command_repo_paths(command: &Command) -> Result<()> {
+    let (path, lossless_serialization) = match command {
+        Command::Add(args) => (args.path.as_deref(), true),
+        Command::Rm(args) => (args.path.as_deref(), false),
+        Command::Diff { root: Some(_), from: Some(path), .. } => (Some(Path::new(path)), true),
+        Command::Diff { staged: true, from: Some(path), .. } => (Some(Path::new(path)), true),
+        Command::Diff {
+            content: true,
+            root: None,
+            from: Some(_),
+            to: Some(path),
+            path: None,
+            ..
+        } => (Some(Path::new(path)), true),
+        Command::Diff { path, .. } | Command::Restore { path, .. } => (path.as_deref(), true),
+        Command::Checkout { path, .. } | Command::Resolve { path, .. } => (path.as_deref(), false),
+        Command::Export(args) => (args.path.as_deref(), false),
+        _ => (None, false),
+    };
+    if let Some(path) = path {
+        validate_cli_repo_path(path, lossless_serialization)?;
+    }
+    Ok(())
+}
+
+fn validate_cli_repo_path(path: &Path, lossless_serialization: bool) -> Result<()> {
+    let raw = path
+        .to_str()
+        .with_context(|| format!("repository path `{}` is not valid UTF-8", path.display()))?;
+    if !path.is_absolute() {
+        graft::repo::validate_repo_path_identity(raw)?;
+    } else {
+        #[cfg(not(windows))]
+        if raw.contains('\\') {
+            bail!(
+                "path `{raw}` has an unsupported repository identity: backslashes are not supported in POSIX repository paths"
+            );
+        }
+    }
+
+    if lossless_serialization {
+        return Ok(());
+    }
+    let normalized_whitespace = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized_whitespace != raw || raw.contains('\'') || raw.contains('"') {
+        bail!(
+            "path `{raw}` has an unsupported repository identity: the CLI cannot serialize this path without changing it"
+        );
+    }
+    Ok(())
 }
 
 fn config_list_pragma(json: bool) -> (&'static str, Option<&'static str>) {
@@ -1686,14 +1823,49 @@ fn push_pragma(json: bool) -> &'static str {
     if json { "json_push" } else { "push" }
 }
 
-fn repo_diff_arg(
+#[derive(Default)]
+struct RepoDiffArgSpec<'a> {
     rows: bool,
     staged: bool,
     kind: Option<PathKind>,
-    from: Option<&str>,
-    to: Option<&str>,
-    path: Option<&Path>,
-) -> Result<Option<String>> {
+    content: bool,
+    max_content_bytes: Option<NonZeroU64>,
+    root: Option<&'a str>,
+    from: Option<&'a str>,
+    to: Option<&'a str>,
+    path: Option<&'a Path>,
+}
+
+fn repo_diff_arg(spec: RepoDiffArgSpec<'_>) -> Result<Option<String>> {
+    let RepoDiffArgSpec {
+        rows,
+        staged,
+        kind,
+        content,
+        max_content_bytes,
+        root,
+        from,
+        to,
+        path,
+    } = spec;
+    if max_content_bytes.is_some() && !content {
+        bail!("--max-content-bytes requires --content");
+    }
+    let implicit_worktree_content_path =
+        content && root.is_none() && from.is_some() && to.is_some() && path.is_none();
+    if content
+        && (rows
+            || staged
+            || if root.is_some() {
+                from.is_none() || to.is_some() || path.is_some()
+            } else {
+                from.is_none() || (path.is_none() && !implicit_worktree_content_path)
+            })
+    {
+        bail!(
+            "--content requires JSON, a source revision, an optional target revision, and one path"
+        );
+    }
     let mut prefixes = Vec::new();
     if rows {
         prefixes.push("--rows".to_string());
@@ -1702,7 +1874,37 @@ fn repo_diff_arg(
         prefixes.push("--kind".to_string());
         prefixes.push(path_kind_arg(kind).to_string());
     }
+    if content {
+        prefixes.push("--content".to_string());
+        if let Some(max_content_bytes) = max_content_bytes {
+            prefixes.push("--max-content-bytes".to_string());
+            prefixes.push(max_content_bytes.get().to_string());
+        }
+    }
+    if let Some(root) = root {
+        if staged || to.is_some() || path.is_some() {
+            bail!("--root accepts one target revision and an optional path");
+        }
+        let mut arg = prefixes.join(" ");
+        if !arg.is_empty() {
+            arg.push(' ');
+        }
+        arg.push_str("--root ");
+        arg.push_str(root);
+        if let Some(path) = from {
+            arg.push_str(" -- ");
+            arg.push_str(&quote_pragma_path(Path::new(path))?);
+        }
+        return Ok(Some(arg));
+    }
     let prefix = prefixes.join(" ");
+    if implicit_worktree_content_path {
+        return Ok(Some(format!(
+            "{prefix} {} -- {}",
+            from.expect("validated source revision"),
+            quote_pragma_path(Path::new(to.expect("implicit worktree content path")))?
+        )));
+    }
     if staged {
         if to.is_some() || path.is_some() {
             bail!("--staged accepts at most one optional path");
@@ -1714,20 +1916,23 @@ fn repo_diff_arg(
         arg.push_str("--staged");
         if let Some(path) = from {
             arg.push_str(" -- ");
-            arg.push_str(path);
+            arg.push_str(&quote_pragma_path(Path::new(path))?);
         }
         return Ok(Some(arg));
     }
 
     let arg = match (from, to, path) {
         (None, None, None) => (!prefix.is_empty()).then_some(prefix),
-        (None, None, Some(path)) => Some(format!("{prefix} -- {}", path.display())),
+        (None, None, Some(path)) => Some(format!("{prefix} -- {}", quote_pragma_path(path)?)),
         (Some(from), None, None) => Some(format!("{prefix} {from}")),
-        (Some(from), None, Some(path)) => Some(format!("{prefix} {from} -- {}", path.display())),
-        (Some(from), Some(to), None) => Some(format!("{prefix} {from} {to}")),
-        (Some(from), Some(to), Some(path)) => {
-            Some(format!("{prefix} {from} {to} -- {}", path.display()))
+        (Some(from), None, Some(path)) => {
+            Some(format!("{prefix} {from} -- {}", quote_pragma_path(path)?))
         }
+        (Some(from), Some(to), None) => Some(format!("{prefix} {from} {to}")),
+        (Some(from), Some(to), Some(path)) => Some(format!(
+            "{prefix} {from} {to} -- {}",
+            quote_pragma_path(path)?
+        )),
         (None, Some(_), _) => unreachable!("clap cannot provide `to` without `from`"),
     };
     Ok(arg.map(|arg| arg.trim_start().to_string()))
@@ -1835,7 +2040,7 @@ fn repo_add_arg(
     force: bool,
     kind: Option<PathKind>,
     path: Option<&Path>,
-) -> Option<String> {
+) -> Result<Option<String>> {
     if all {
         if force || path.is_some() {
             unreachable!("clap prevents --all with --force or path");
@@ -1845,19 +2050,19 @@ fn repo_add_arg(
             parts.push("--kind".to_string());
             parts.push(path_kind_arg(kind).to_string());
         }
-        return Some(parts.join(" "));
+        return Ok(Some(parts.join(" ")));
     }
 
     if kind.is_some() {
         unreachable!("clap prevents --kind without --all");
     }
 
-    match (force, path) {
+    Ok(match (force, path) {
         (false, None) => None,
-        (false, Some(path)) => Some(path.display().to_string()),
+        (false, Some(path)) => Some(format!("-- {}", quote_pragma_path(path)?)),
         (true, None) => Some("--force".to_string()),
-        (true, Some(path)) => Some(format!("--force -- {}", path.display())),
-    }
+        (true, Some(path)) => Some(format!("--force -- {}", quote_pragma_path(path)?)),
+    })
 }
 
 fn repo_rm_arg(cached: bool, path: Option<&Path>) -> Option<String> {
@@ -1880,26 +2085,38 @@ fn repo_checkout_arg(force: bool, rev: &str, path: Option<&Path>) -> String {
 
 fn repo_restore_arg(
     source: Option<&str>,
+    expected_head: Option<&str>,
+    require_clean: bool,
     staged: bool,
     all: bool,
     kind: Option<PathKind>,
     path: Option<&Path>,
-) -> String {
+) -> Result<String> {
+    let mut parts = Vec::new();
+    if staged {
+        parts.push("--staged".to_string());
+    }
+    if let Some(source) = source {
+        parts.push("--source".to_string());
+        parts.push(source.to_string());
+    }
+    if let Some(expected_head) = expected_head {
+        parts.push("--expected-head".to_string());
+        parts.push(expected_head.to_string());
+    }
+    if require_clean {
+        parts.push("--require-clean".to_string());
+    }
     if all {
         if !staged || path.is_some() {
             unreachable!("clap prevents --all without --staged or with a path");
-        }
-        let mut parts = vec!["--staged".to_string()];
-        if let Some(source) = source {
-            parts.push("--source".to_string());
-            parts.push(source.to_string());
         }
         parts.push("--all".to_string());
         if let Some(kind) = kind {
             parts.push("--kind".to_string());
             parts.push(path_kind_arg(kind).to_string());
         }
-        return parts.join(" ");
+        return Ok(parts.join(" "));
     }
 
     if kind.is_some() {
@@ -1907,12 +2124,18 @@ fn repo_restore_arg(
     }
 
     let path = path.expect("clap requires a restore path unless --all is present");
-    match (source, staged) {
-        (Some(source), true) => format!("--staged --source {source} -- {}", path.display()),
-        (None, true) => format!("--staged -- {}", path.display()),
-        (Some(source), false) => format!("--source {source} -- {}", path.display()),
-        (None, false) => format!("-- {}", path.display()),
-    }
+    parts.push("--".to_string());
+    parts.push(quote_pragma_path(path)?);
+    Ok(parts.join(" "))
+}
+
+fn quote_pragma_path(path: &Path) -> Result<String> {
+    let raw = path
+        .to_str()
+        .with_context(|| format!("repository path `{}` is not valid UTF-8", path.display()))?;
+    #[cfg(not(windows))]
+    let raw = raw.replace('"', "\\\"");
+    Ok(format!("\"{raw}\""))
 }
 
 fn repo_export_arg(source: Option<&str>, output: &Path, path: Option<&Path>) -> String {
@@ -2213,20 +2436,43 @@ mod tests {
     fn parses_log_as_repository_history() {
         let cli = Cli::try_parse_from(["graft", "log"]).unwrap();
 
-        let Command::Log { json } = cli.command else {
+        let Command::Log { json, limit, after } = cli.command else {
             panic!("expected log command");
         };
         assert!(!json);
+        assert_eq!(limit, None);
+        assert_eq!(after, None);
     }
 
     #[test]
     fn parses_log_json_history() {
         let cli = Cli::try_parse_from(["graft", "log", "--json"]).unwrap();
 
-        let Command::Log { json } = cli.command else {
+        let Command::Log { json, limit, after } = cli.command else {
             panic!("expected log command");
         };
         assert!(json);
+        assert_eq!(limit, None);
+        assert_eq!(after, None);
+    }
+
+    #[test]
+    fn parses_log_json_pagination() {
+        let cli = Cli::try_parse_from([
+            "graft", "log", "--json", "--limit", "25", "--after", "abc123",
+        ])
+        .unwrap();
+
+        let Command::Log { json, limit, after } = cli.command else {
+            panic!("expected log command");
+        };
+        assert!(json);
+        assert_eq!(limit, Some(25));
+        assert_eq!(after.as_deref(), Some("abc123"));
+        assert_eq!(
+            repo_log_arg(limit, after.as_deref()).unwrap(),
+            "--with-status --limit 25 --after \"abc123\""
+        );
     }
 
     #[test]
@@ -2394,8 +2640,21 @@ mod tests {
         assert!(!args.force);
         assert_eq!(args.kind, None);
         assert_eq!(
-            repo_add_arg(args.all, args.force, args.kind, args.path.as_deref()).as_deref(),
-            Some("external.db")
+            repo_add_arg(args.all, args.force, args.kind, args.path.as_deref())
+                .unwrap()
+                .as_deref(),
+            Some("-- \"external.db\"")
+        );
+        assert_eq!(
+            repo_add_arg(
+                false,
+                false,
+                None,
+                Some(Path::new("notes/it's  \"quoted\".md"))
+            )
+            .unwrap()
+            .as_deref(),
+            Some("-- \"notes/it's  \\\"quoted\\\".md\"")
         );
     }
 
@@ -2786,8 +3045,10 @@ mod tests {
         assert!(args.force);
         assert_eq!(args.kind, None);
         assert_eq!(
-            repo_add_arg(args.all, args.force, args.kind, args.path.as_deref()).as_deref(),
-            Some("--force -- external.db")
+            repo_add_arg(args.all, args.force, args.kind, args.path.as_deref())
+                .unwrap()
+                .as_deref(),
+            Some("--force -- \"external.db\"")
         );
     }
 
@@ -2804,7 +3065,9 @@ mod tests {
         assert_eq!(args.kind, None);
         assert_eq!(args.path, None);
         assert_eq!(
-            repo_add_arg(args.all, args.force, args.kind, args.path.as_deref()).as_deref(),
+            repo_add_arg(args.all, args.force, args.kind, args.path.as_deref())
+                .unwrap()
+                .as_deref(),
             Some("--all")
         );
 
@@ -2825,7 +3088,9 @@ mod tests {
         assert_eq!(args.kind, Some(PathKind::SqliteDatabase));
         assert_eq!(args.path, None);
         assert_eq!(
-            repo_add_arg(args.all, args.force, args.kind, args.path.as_deref()).as_deref(),
+            repo_add_arg(args.all, args.force, args.kind, args.path.as_deref())
+                .unwrap()
+                .as_deref(),
             Some("--all --kind sqlite_database")
         );
 
@@ -2873,7 +3138,9 @@ mod tests {
         assert!(args.all);
         assert_eq!(args.kind, None);
         assert_eq!(
-            repo_add_arg(args.all, args.force, args.kind, args.path.as_deref()).as_deref(),
+            repo_add_arg(args.all, args.force, args.kind, args.path.as_deref())
+                .unwrap()
+                .as_deref(),
             Some("--all")
         );
         assert_eq!(add_pragma(args.json), "json_add");
@@ -2907,34 +3174,57 @@ mod tests {
         ])
         .unwrap();
 
-        let Command::Diff { rows, staged, kind, from, to, path, json } = cli.command else {
+        let Command::Diff {
+            rows,
+            staged,
+            kind,
+            content,
+            max_content_bytes,
+            root,
+            from,
+            to,
+            path,
+            json,
+        } = cli.command
+        else {
             panic!("expected diff command");
         };
         assert!(rows);
         assert!(!staged);
         assert_eq!(kind, None);
+        assert!(!content);
+        assert_eq!(max_content_bytes, None);
         assert_eq!(from.as_deref(), Some("HEAD~1"));
         assert_eq!(to.as_deref(), Some("HEAD"));
         assert_eq!(path, Some(PathBuf::from("app.db")));
         assert!(json);
         assert_eq!(
-            repo_diff_arg(
+            repo_diff_arg(RepoDiffArgSpec {
                 rows,
                 staged,
                 kind,
-                from.as_deref(),
-                to.as_deref(),
-                path.as_deref()
-            )
+                content,
+                max_content_bytes,
+                root: root.as_deref(),
+                from: from.as_deref(),
+                to: to.as_deref(),
+                path: path.as_deref(),
+            })
             .unwrap(),
-            Some("--rows HEAD~1 HEAD -- app.db".to_string())
+            Some("--rows HEAD~1 HEAD -- \"app.db\"".to_string())
         );
         assert_eq!(
-            repo_diff_arg(true, true, None, Some("app.db"), None, None).unwrap(),
-            Some("--rows --staged -- app.db".to_string())
+            repo_diff_arg(RepoDiffArgSpec {
+                rows: true,
+                staged: true,
+                from: Some("app.db"),
+                ..Default::default()
+            })
+            .unwrap(),
+            Some("--rows --staged -- \"app.db\"".to_string())
         );
         assert_eq!(
-            repo_diff_arg(true, false, None, None, None, None).unwrap(),
+            repo_diff_arg(RepoDiffArgSpec { rows: true, ..Default::default() }).unwrap(),
             Some("--rows".to_string())
         );
 
@@ -2947,27 +3237,243 @@ mod tests {
             "--staged",
         ])
         .unwrap();
-        let Command::Diff { rows, staged, kind, from, to, path, json } = cli.command else {
+        let Command::Diff {
+            rows,
+            staged,
+            kind,
+            content,
+            max_content_bytes,
+            root,
+            from,
+            to,
+            path,
+            json,
+        } = cli.command
+        else {
             panic!("expected diff command");
         };
         assert!(!rows);
         assert!(staged);
         assert_eq!(kind, Some(PathKind::BinaryFile));
+        assert!(!content);
+        assert_eq!(max_content_bytes, None);
         assert_eq!(from, None);
         assert_eq!(to, None);
         assert_eq!(path, None);
         assert!(json);
         assert_eq!(
-            repo_diff_arg(
+            repo_diff_arg(RepoDiffArgSpec {
                 rows,
                 staged,
                 kind,
-                from.as_deref(),
-                to.as_deref(),
-                path.as_deref()
-            )
+                content,
+                max_content_bytes,
+                root: root.as_deref(),
+                from: from.as_deref(),
+                to: to.as_deref(),
+                path: path.as_deref(),
+            })
             .unwrap(),
             Some("--kind binary_file --staged".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_bounded_single_path_text_content_diff() {
+        let cli = Cli::try_parse_from([
+            "graft",
+            "diff",
+            "--json",
+            "--content",
+            "--max-content-bytes",
+            "4096",
+            "HEAD~1",
+            "HEAD",
+            "--",
+            "notes/readme.md",
+        ])
+        .unwrap();
+        let Command::Diff {
+            rows,
+            staged,
+            kind,
+            content,
+            max_content_bytes,
+            root,
+            from,
+            to,
+            path,
+            json,
+        } = cli.command
+        else {
+            panic!("expected diff command");
+        };
+
+        assert!(json);
+        assert!(content);
+        assert!(!rows);
+        assert!(!staged);
+        assert_eq!(kind, None);
+        assert_eq!(max_content_bytes.map(NonZeroU64::get), Some(4096));
+        assert_eq!(
+            repo_diff_arg(RepoDiffArgSpec {
+                rows,
+                staged,
+                kind,
+                content,
+                max_content_bytes,
+                root: root.as_deref(),
+                from: from.as_deref(),
+                to: to.as_deref(),
+                path: path.as_deref(),
+            })
+            .unwrap(),
+            Some(
+                "--content --max-content-bytes 4096 HEAD~1 HEAD -- \"notes/readme.md\"".to_string()
+            )
+        );
+
+        assert!(
+            Cli::try_parse_from(["graft", "diff", "--content", "HEAD~1", "HEAD", "note.md",])
+                .is_err()
+        );
+        let cli = Cli::try_parse_from(["graft", "diff", "--json", "--content", "HEAD~1", "HEAD"])
+            .unwrap();
+        assert!(run_command(cli.command, None).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "graft",
+                "diff",
+                "--json",
+                "--rows",
+                "--content",
+                "HEAD~1",
+                "HEAD",
+                "note.md",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "graft",
+                "diff",
+                "--json",
+                "--content",
+                "--max-content-bytes",
+                "0",
+                "HEAD~1",
+                "HEAD",
+                "note.md",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn parses_single_path_worktree_text_content_diff() {
+        let cli = Cli::try_parse_from([
+            "graft",
+            "diff",
+            "--json",
+            "--content",
+            "HEAD",
+            "--",
+            "notes/readme.md",
+        ])
+        .unwrap();
+        let Command::Diff {
+            rows,
+            staged,
+            kind,
+            content,
+            max_content_bytes,
+            root,
+            from,
+            to,
+            path,
+            json,
+        } = cli.command
+        else {
+            panic!("expected diff command");
+        };
+
+        assert!(json);
+        assert!(content);
+        assert_eq!(from.as_deref(), Some("HEAD"));
+        assert_eq!(to.as_deref(), Some("notes/readme.md"));
+        assert_eq!(path, None);
+        assert_eq!(
+            repo_diff_arg(RepoDiffArgSpec {
+                rows,
+                staged,
+                kind,
+                content,
+                max_content_bytes,
+                root: root.as_deref(),
+                from: from.as_deref(),
+                to: to.as_deref(),
+                path: path.as_deref(),
+            })
+            .unwrap(),
+            Some("--content HEAD -- \"notes/readme.md\"".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_explicit_root_content_diff() {
+        let cli = Cli::try_parse_from([
+            "graft",
+            "diff",
+            "--json",
+            "--content",
+            "--max-content-bytes",
+            "4096",
+            "--root",
+            "HEAD",
+            "--",
+            "notes/first  draft.md",
+        ])
+        .unwrap();
+        let Command::Diff {
+            rows,
+            staged,
+            kind,
+            content,
+            max_content_bytes,
+            root,
+            from,
+            to,
+            path,
+            json,
+        } = cli.command
+        else {
+            panic!("expected diff command");
+        };
+        assert!(json);
+        assert!(content);
+        assert!(!rows);
+        assert!(!staged);
+        assert_eq!(root.as_deref(), Some("HEAD"));
+        assert_eq!(from.as_deref(), Some("notes/first  draft.md"));
+        assert_eq!(to, None);
+        assert_eq!(path, None);
+        assert_eq!(
+            repo_diff_arg(RepoDiffArgSpec {
+                rows,
+                staged,
+                kind,
+                content,
+                max_content_bytes,
+                root: root.as_deref(),
+                from: from.as_deref(),
+                to: to.as_deref(),
+                path: path.as_deref(),
+            })
+            .unwrap(),
+            Some(
+                "--content --max-content-bytes 4096 --root HEAD -- \"notes/first  draft.md\""
+                    .to_string()
+            )
         );
     }
 
@@ -3162,6 +3668,24 @@ mod tests {
                 "main",
             ])
             .is_err()
+        );
+    }
+
+    #[test]
+    fn clone_defaults_its_database_tag_to_the_current_worktree() {
+        let _guard = CWD_LOCK.lock().unwrap();
+        let original_dir = std::env::current_dir().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::env::set_current_dir(temp_dir.path()).unwrap();
+
+        let result = resolve_clone_db(None);
+
+        std::env::set_current_dir(original_dir).unwrap();
+        assert_eq!(
+            result.unwrap(),
+            std::fs::canonicalize(temp_dir.path())
+                .unwrap()
+                .join(".graft-clone.sqlite")
         );
     }
 
@@ -3376,7 +3900,10 @@ mod tests {
     fn parses_restore_with_optional_source() {
         let cli =
             Cli::try_parse_from(["graft", "restore", "--source", "HEAD~1", "external.db"]).unwrap();
-        let Command::Restore { json, source, staged, all, kind, path } = cli.command else {
+        let Command::Restore {
+            json, source, staged, all, kind, path, ..
+        } = cli.command
+        else {
             panic!("expected restore command");
         };
         assert!(!json);
@@ -3386,12 +3913,24 @@ mod tests {
         assert_eq!(kind, None);
         assert_eq!(path, Some(PathBuf::from("external.db")));
         assert_eq!(
-            repo_restore_arg(source.as_deref(), staged, all, kind, path.as_deref()),
-            "--source HEAD~1 -- external.db"
+            repo_restore_arg(
+                source.as_deref(),
+                None,
+                false,
+                staged,
+                all,
+                kind,
+                path.as_deref(),
+            )
+            .unwrap(),
+            "--source HEAD~1 -- \"external.db\""
         );
 
         let cli = Cli::try_parse_from(["graft", "restore", "--staged", "external.db"]).unwrap();
-        let Command::Restore { json, source, staged, all, kind, path } = cli.command else {
+        let Command::Restore {
+            json, source, staged, all, kind, path, ..
+        } = cli.command
+        else {
             panic!("expected restore command");
         };
         assert!(!json);
@@ -3401,8 +3940,17 @@ mod tests {
         assert_eq!(kind, None);
         assert_eq!(path, Some(PathBuf::from("external.db")));
         assert_eq!(
-            repo_restore_arg(source.as_deref(), staged, all, kind, path.as_deref()),
-            "--staged -- external.db"
+            repo_restore_arg(
+                source.as_deref(),
+                None,
+                false,
+                staged,
+                all,
+                kind,
+                path.as_deref(),
+            )
+            .unwrap(),
+            "--staged -- \"external.db\""
         );
 
         let cli = Cli::try_parse_from([
@@ -3414,7 +3962,10 @@ mod tests {
             "external.db",
         ])
         .unwrap();
-        let Command::Restore { json, source, staged, all, kind, path } = cli.command else {
+        let Command::Restore {
+            json, source, staged, all, kind, path, ..
+        } = cli.command
+        else {
             panic!("expected restore command");
         };
         assert!(!json);
@@ -3424,8 +3975,112 @@ mod tests {
         assert_eq!(kind, None);
         assert_eq!(path, Some(PathBuf::from("external.db")));
         assert_eq!(
-            repo_restore_arg(source.as_deref(), staged, all, kind, path.as_deref()),
-            "--staged --source HEAD~1 -- external.db"
+            repo_restore_arg(
+                source.as_deref(),
+                None,
+                false,
+                staged,
+                all,
+                kind,
+                path.as_deref(),
+            )
+            .unwrap(),
+            "--staged --source HEAD~1 -- \"external.db\""
+        );
+
+        let expected = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let cli = Cli::try_parse_from([
+            "graft",
+            "restore",
+            "--source",
+            "HEAD~1",
+            "--expected-head",
+            expected,
+            "--require-clean",
+            "external.db",
+        ])
+        .unwrap();
+        let Command::Restore {
+            source,
+            expected_head,
+            require_clean,
+            staged,
+            all,
+            kind,
+            path,
+            ..
+        } = cli.command
+        else {
+            panic!("expected restore command");
+        };
+        assert_eq!(expected_head.as_deref(), Some(expected));
+        assert!(require_clean);
+        assert_eq!(
+            repo_restore_arg(
+                source.as_deref(),
+                expected_head.as_deref(),
+                require_clean,
+                staged,
+                all,
+                kind,
+                path.as_deref(),
+            )
+            .unwrap(),
+            format!(
+                "--source HEAD~1 --expected-head {expected} --require-clean -- \"external.db\""
+            )
+        );
+    }
+
+    #[test]
+    fn rejects_ambiguous_repo_paths_before_pragma_serialization() {
+        let cli = Cli::try_parse_from(["graft", "add", " note.md "]).unwrap();
+        let err = validate_command_repo_paths(&cli.command).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("path components must not start or end with whitespace"),
+            "{err}"
+        );
+
+        let cli =
+            Cli::try_parse_from(["graft", "restore", "--source", "HEAD", " note.md "]).unwrap();
+        let err = validate_command_repo_paths(&cli.command).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("path components must not start or end with whitespace"),
+            "{err}"
+        );
+
+        let cli = Cli::try_parse_from(["graft", "restore", "my  note.md"]).unwrap();
+        validate_command_repo_paths(&cli.command).unwrap();
+        let Command::Restore { source, staged, all, kind, path, .. } = cli.command else {
+            panic!("expected restore command");
+        };
+        assert_eq!(
+            repo_restore_arg(
+                source.as_deref(),
+                None,
+                false,
+                staged,
+                all,
+                kind,
+                path.as_deref(),
+            )
+            .unwrap(),
+            "-- \"my  note.md\""
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn rejects_posix_backslash_repo_path_before_pragma_serialization() {
+        let cli =
+            Cli::try_parse_from(["graft", "restore", "--source", "HEAD", "foo\\bar.md"]).unwrap();
+        let err = validate_command_repo_paths(&cli.command).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("backslashes are not supported in POSIX repository paths"),
+            "{err}"
         );
     }
 
@@ -3433,7 +4088,10 @@ mod tests {
     fn parses_restore_staged_all_kind_filter() {
         let cli =
             Cli::try_parse_from(["graft", "restore", "--staged", "--all", "--kind", "db"]).unwrap();
-        let Command::Restore { json, source, staged, all, kind, path } = cli.command else {
+        let Command::Restore {
+            json, source, staged, all, kind, path, ..
+        } = cli.command
+        else {
             panic!("expected restore command");
         };
         assert!(!json);
@@ -3443,7 +4101,16 @@ mod tests {
         assert_eq!(kind, Some(PathKind::SqliteDatabase));
         assert_eq!(path, None);
         assert_eq!(
-            repo_restore_arg(source.as_deref(), staged, all, kind, path.as_deref()),
+            repo_restore_arg(
+                source.as_deref(),
+                None,
+                false,
+                staged,
+                all,
+                kind,
+                path.as_deref(),
+            )
+            .unwrap(),
             "--staged --all --kind sqlite_database"
         );
 
@@ -3473,7 +4140,10 @@ mod tests {
 
         let cli =
             Cli::try_parse_from(["graft", "restore", "--json", "--staged", "external.db"]).unwrap();
-        let Command::Restore { json, source, staged, all, kind, path } = cli.command else {
+        let Command::Restore {
+            json, source, staged, all, kind, path, ..
+        } = cli.command
+        else {
             panic!("expected restore command");
         };
         assert!(json);
@@ -3483,8 +4153,17 @@ mod tests {
         assert_eq!(kind, None);
         assert_eq!(path, Some(PathBuf::from("external.db")));
         assert_eq!(
-            repo_restore_arg(source.as_deref(), staged, all, kind, path.as_deref()),
-            "--staged -- external.db"
+            repo_restore_arg(
+                source.as_deref(),
+                None,
+                false,
+                staged,
+                all,
+                kind,
+                path.as_deref(),
+            )
+            .unwrap(),
+            "--staged -- \"external.db\""
         );
         assert_eq!(restore_pragma(json), "json_restore");
 

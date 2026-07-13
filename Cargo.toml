@@ -17,6 +17,7 @@ codegen-units = 1
 [workspace.dependencies]
 anyhow = "1.0.100"
 assert_matches = "1.5.0"
+base64 = "0.22.1"
 bilrost = "0.1014.1"
 blake3 = "1.8.2"
 bs58 = "0.5.1"

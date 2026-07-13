@@ -841,6 +841,8 @@ pub(super) struct JsonRepoDiffOutcome<T> {
     pub(super) kind: Option<&'static str>,
     #[serde(flatten)]
     pub(super) diff: T,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) content: Option<RepoTextContentDiff>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -860,4 +862,7 @@ pub(super) struct JsonRepoLogOutcome {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) current_branch: Option<String>,
     pub(super) commits: Vec<CommitObject>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) next_cursor: Option<String>,
+    pub(super) has_more: bool,
 }

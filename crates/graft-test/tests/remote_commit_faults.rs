@@ -1,4 +1,7 @@
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::{
+    panic::{AssertUnwindSafe, catch_unwind},
+    sync::{Mutex, MutexGuard},
+};
 
 use graft::{
     core::{LogId, PageIdx, page::Page},
@@ -10,8 +13,19 @@ use graft_test::{
     workload::{Env, bank_setup, bank_tx, bank_validate},
 };
 
+// Precept faults are process-global. Serialise tests in this binary so one
+// workload cannot consume or clear another workload's pending fault.
+static FAULT_STATE_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_fault_state() -> MutexGuard<'static, ()> {
+    FAULT_STATE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[test]
 fn test_skip_segment_cache() {
+    let _fault_state = lock_fault_state();
     graft_test::ensure_test_env();
 
     let runtime = GraftTestRuntime::with_memory_remote();
@@ -56,6 +70,7 @@ fn test_skip_segment_cache() {
 
 #[test]
 fn test_bank_balance_skip_seg_cache() {
+    let _fault_state = lock_fault_state();
     graft_test::ensure_test_env();
     let mut runtime = GraftTestRuntime::with_memory_remote();
 
@@ -91,6 +106,7 @@ fn test_bank_balance_skip_seg_cache() {
 
 #[test]
 fn test_crash_after_commit_recovery() {
+    let _fault_state = lock_fault_state();
     graft_test::ensure_test_env();
 
     let mut runtime = GraftTestRuntime::with_memory_remote();

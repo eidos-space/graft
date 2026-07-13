@@ -89,7 +89,13 @@ fn json_log_status_mode_is_opt_in() {
     let legacy = Pragma { name: "graft_json_log", arg: None };
     assert!(matches!(
         GraftPragma::try_from(&legacy).unwrap(),
-        GraftPragma::JsonLog { mode: JsonLogMode::LegacyArray }
+        GraftPragma::JsonLog {
+            spec: JsonLogSpec {
+                mode: JsonLogMode::LegacyArray,
+                limit: None,
+                after: None,
+            }
+        }
     ));
 
     let with_status = Pragma {
@@ -98,7 +104,28 @@ fn json_log_status_mode_is_opt_in() {
     };
     assert!(matches!(
         GraftPragma::try_from(&with_status).unwrap(),
-        GraftPragma::JsonLog { mode: JsonLogMode::WithStatus }
+        GraftPragma::JsonLog {
+            spec: JsonLogSpec {
+                mode: JsonLogMode::WithStatus,
+                limit: None,
+                after: None,
+            }
+        }
+    ));
+
+    let page = Pragma {
+        name: "graft_json_log",
+        arg: Some("--with-status --limit 25 --after abc123"),
+    };
+    assert!(matches!(
+        GraftPragma::try_from(&page).unwrap(),
+        GraftPragma::JsonLog {
+            spec: JsonLogSpec {
+                mode: JsonLogMode::WithStatus,
+                limit: Some(25),
+                after: Some(ref after),
+            }
+        } if after == "abc123"
     ));
 
     let invalid = Pragma {
@@ -106,6 +133,12 @@ fn json_log_status_mode_is_opt_in() {
         arg: Some("--status"),
     };
     assert!(GraftPragma::try_from(&invalid).is_err());
+
+    let cursor_without_limit = Pragma {
+        name: "graft_json_log",
+        arg: Some("--after abc123"),
+    };
+    assert!(GraftPragma::try_from(&cursor_without_limit).is_err());
 }
 
 #[test]
@@ -530,6 +563,7 @@ fn parse_repo_diff_arg_supports_row_mode() {
             mode: DiffMode::Rows,
             kind: None,
             target: RepoDiffTarget::Worktree { path: None },
+            content: None,
         }
     );
     assert_eq!(
@@ -538,6 +572,7 @@ fn parse_repo_diff_arg_supports_row_mode() {
             mode: DiffMode::Rows,
             kind: None,
             target: RepoDiffTarget::Staged { path: Some("app.db".to_string()) },
+            content: None,
         }
     );
     assert_eq!(
@@ -546,6 +581,7 @@ fn parse_repo_diff_arg_supports_row_mode() {
             mode: DiffMode::Default,
             kind: Some(RepoTrackedPathKind::SqliteDatabase),
             target: RepoDiffTarget::Staged { path: None },
+            content: None,
         }
     );
     assert_eq!(
@@ -558,6 +594,7 @@ fn parse_repo_diff_arg_supports_row_mode() {
                 to: "HEAD".to_string(),
                 path: Some("app.db".to_string()),
             },
+            content: None,
         }
     );
     assert_eq!(
@@ -569,11 +606,108 @@ fn parse_repo_diff_arg_supports_row_mode() {
                 rev: "HEAD".to_string(),
                 path: Some("--rows".to_string()),
             },
+            content: None,
         }
     );
     assert!(parse_repo_diff_arg(Some("--rows --rows")).is_err());
     assert!(parse_repo_diff_arg(Some("--kind nope")).is_err());
     assert!(parse_repo_diff_arg(Some("--kind db --kind text_file")).is_err());
+}
+
+#[test]
+fn parse_repo_diff_arg_requires_bounded_single_path_content_mode() {
+    assert_eq!(
+        parse_repo_diff_arg(Some("--content HEAD~1 HEAD -- notes/readme.md")).unwrap(),
+        RepoDiffSpec {
+            mode: DiffMode::Default,
+            kind: None,
+            target: RepoDiffTarget::Revisions {
+                from: "HEAD~1".to_string(),
+                to: "HEAD".to_string(),
+                path: Some("notes/readme.md".to_string()),
+            },
+            content: Some(RepoTextContentSpec {
+                max_bytes: graft::repo::DEFAULT_TEXT_DIFF_CONTENT_LIMIT,
+            }),
+        }
+    );
+    assert_eq!(
+        parse_repo_diff_arg(Some("--content HEAD -- notes/readme.md")).unwrap(),
+        RepoDiffSpec {
+            mode: DiffMode::Default,
+            kind: None,
+            target: RepoDiffTarget::RevisionToWorktree {
+                rev: "HEAD".to_string(),
+                path: Some("notes/readme.md".to_string()),
+            },
+            content: Some(RepoTextContentSpec {
+                max_bytes: graft::repo::DEFAULT_TEXT_DIFF_CONTENT_LIMIT,
+            }),
+        }
+    );
+    assert_eq!(
+        parse_repo_diff_arg(Some(
+            "--content --max-content-bytes 4096 HEAD~1 HEAD -- notes/readme.md",
+        ))
+        .unwrap()
+        .content,
+        Some(RepoTextContentSpec { max_bytes: ByteUnit::new(4096) })
+    );
+
+    for invalid in [
+        "--content",
+        "--content HEAD~1",
+        "--content HEAD~1 HEAD",
+        "--rows --content HEAD~1 HEAD -- note.md",
+        "--content --kind db HEAD~1 HEAD -- note.md",
+        "--max-content-bytes 4 HEAD~1 HEAD -- note.md",
+        "--content --max-content-bytes 0 HEAD~1 HEAD -- note.md",
+    ] {
+        assert!(
+            parse_repo_diff_arg(Some(invalid)).is_err(),
+            "accepted {invalid}"
+        );
+    }
+}
+
+#[test]
+fn parse_repo_diff_arg_supports_explicit_root_comparisons() {
+    assert_eq!(
+        parse_repo_diff_arg(Some("--root HEAD")).unwrap(),
+        RepoDiffSpec {
+            mode: DiffMode::Default,
+            kind: None,
+            target: RepoDiffTarget::Root { to: "HEAD".to_string(), path: None },
+            content: None,
+        }
+    );
+    assert_eq!(
+        parse_repo_diff_arg(Some(
+            "--content --max-content-bytes 4096 --root HEAD -- \"notes/first  draft.md\"",
+        ))
+        .unwrap(),
+        RepoDiffSpec {
+            mode: DiffMode::Default,
+            kind: None,
+            target: RepoDiffTarget::Root {
+                to: "HEAD".to_string(),
+                path: Some("notes/first  draft.md".to_string()),
+            },
+            content: Some(RepoTextContentSpec { max_bytes: ByteUnit::new(4096) }),
+        }
+    );
+    for invalid in [
+        "--root",
+        "--root HEAD extra",
+        "--root HEAD --staged",
+        "--content --root HEAD",
+        "--root HEAD --root HEAD",
+    ] {
+        assert!(
+            parse_repo_diff_arg(Some(invalid)).is_err(),
+            "accepted {invalid}"
+        );
+    }
 }
 
 #[test]
@@ -627,6 +761,15 @@ fn parse_repo_add_arg_supports_force() {
         parse_repo_add_arg(Some("assets/readme.md")).unwrap(),
         RepoAddSpec {
             path: Some(PathBuf::from("assets/readme.md")),
+            force: false,
+            all: false,
+            kind: None,
+        }
+    );
+    assert_eq!(
+        parse_repo_add_arg(Some("-- \"notes/it's  \\\"quoted\\\".md\"")).unwrap(),
+        RepoAddSpec {
+            path: Some(PathBuf::from("notes/it's  \"quoted\".md")),
             force: false,
             all: false,
             kind: None,
@@ -1152,6 +1295,8 @@ fn parse_checkout_and_switch_force_args() {
         parse_repo_restore_arg("external.db").unwrap(),
         RepoRestoreSpec {
             source: None,
+            expected_head: None,
+            require_clean: false,
             staged: false,
             all: false,
             kind: None,
@@ -1162,6 +1307,8 @@ fn parse_checkout_and_switch_force_args() {
         parse_repo_restore_arg("--source HEAD~1 -- external.db").unwrap(),
         RepoRestoreSpec {
             source: Some("HEAD~1".to_string()),
+            expected_head: None,
+            require_clean: false,
             staged: false,
             all: false,
             kind: None,
@@ -1169,9 +1316,33 @@ fn parse_checkout_and_switch_force_args() {
         }
     );
     assert_eq!(
+        parse_repo_restore_arg("--source HEAD~1 -- \"notes/my draft.md\"").unwrap(),
+        RepoRestoreSpec {
+            source: Some("HEAD~1".to_string()),
+            expected_head: None,
+            require_clean: false,
+            staged: false,
+            all: false,
+            kind: None,
+            path: Some(PathBuf::from("notes/my draft.md")),
+        }
+    );
+    #[cfg(not(windows))]
+    assert!(parse_repo_restore_arg("--source HEAD~1 -- foo\\bar.md").is_err());
+    #[cfg(not(windows))]
+    assert_eq!(
+        parse_repo_checkout_arg("HEAD~1 -- foo\\bar.md").unwrap(),
+        RepoCheckoutSpec::Path {
+            rev: "HEAD~1".to_string(),
+            path: "foo\\bar.md".to_string(),
+        }
+    );
+    assert_eq!(
         parse_repo_restore_arg("--staged -- external.db").unwrap(),
         RepoRestoreSpec {
             source: None,
+            expected_head: None,
+            require_clean: false,
             staged: true,
             all: false,
             kind: None,
@@ -1182,6 +1353,8 @@ fn parse_checkout_and_switch_force_args() {
         parse_repo_restore_arg("--staged --source HEAD -- external.db").unwrap(),
         RepoRestoreSpec {
             source: Some("HEAD".to_string()),
+            expected_head: None,
+            require_clean: false,
             staged: true,
             all: false,
             kind: None,
@@ -1192,16 +1365,35 @@ fn parse_checkout_and_switch_force_args() {
         parse_repo_restore_arg("--staged --all --kind db").unwrap(),
         RepoRestoreSpec {
             source: None,
+            expected_head: None,
+            require_clean: false,
             staged: true,
             all: true,
             kind: Some(RepoTrackedPathKind::SqliteDatabase),
             path: None,
         }
     );
+    assert_eq!(
+        parse_repo_restore_arg(
+            "--source HEAD~1 --expected-head abc123 --require-clean -- external.db",
+        )
+        .unwrap(),
+        RepoRestoreSpec {
+            source: Some("HEAD~1".to_string()),
+            expected_head: Some("abc123".to_string()),
+            require_clean: true,
+            staged: false,
+            all: false,
+            kind: None,
+            path: Some(PathBuf::from("external.db")),
+        }
+    );
     assert!(parse_repo_restore_arg("--all").is_err());
     assert!(parse_repo_restore_arg("--kind db -- external.db").is_err());
     assert!(parse_repo_restore_arg("--staged --all external.db").is_err());
     assert!(parse_repo_restore_arg("--staged --all --kind nope").is_err());
+    assert!(parse_repo_restore_arg("--expected-head -- external.db").is_err());
+    assert!(parse_repo_restore_arg("--require-clean --require-clean -- external.db").is_err());
     assert_eq!(
         parse_repo_export_arg("--output snapshot.db").unwrap(),
         RepoExportSpec {
@@ -1210,6 +1402,8 @@ fn parse_checkout_and_switch_force_args() {
             output: PathBuf::from("snapshot.db"),
         }
     );
+    #[cfg(not(windows))]
+    assert!(parse_repo_export_arg("--output snapshot.db -- foo\\bar.md").is_err());
     assert_eq!(
         parse_repo_export_arg("--source HEAD~1 --output snapshot.db -- app.db").unwrap(),
         RepoExportSpec {
@@ -1364,4 +1558,14 @@ fn parse_checkout_and_switch_force_args() {
         GraftPragma::JsonBranchUnsetUpstream { branch: Some(branch) }
             if branch == "feature/query"
     ));
+}
+
+#[test]
+fn batch_restore_plan_rejects_file_descendant_conflicts() {
+    let restored = BTreeSet::from(["notes".to_string()]);
+    assert!(validate_restore_plan_path_conflicts(&restored).is_ok());
+
+    let restored = BTreeSet::from(["notes".to_string(), "notes/today.md".to_string()]);
+    let error = validate_restore_plan_path_conflicts(&restored).unwrap_err();
+    assert!(error.to_string().contains("together with descendant"));
 }

@@ -1,6 +1,6 @@
 [package]
 name = "graft"
-version = "0.5.0"
+version = "0.5.4"
 edition = "2024"
 authors.workspace = true
 license.workspace = true
@@ -15,6 +15,7 @@ workspace = true
 
 [dependencies]
 assert_matches = { workspace = true }
+base64 = { workspace = true }
 bilrost = { workspace = true, features = ["bytestring", "thin-vec"] }
 blake3 = { workspace = true }
 bs58 = { workspace = true }

@@ -217,7 +217,7 @@ impl Repository {
                 return Err(RepoErr::CommitNotFound(id.clone()));
             };
             let object = object::Object::decode(&bytes)?;
-            let actual = object.id();
+            let actual = object::ObjectId::for_bytes(&bytes);
             if actual != object_id {
                 return Err(RepoErr::Object(object::ObjectErr::ObjectIdMismatch {
                     expected: object_id,
@@ -287,7 +287,7 @@ impl Repository {
             }));
         };
         let object = object::Object::decode(&bytes)?;
-        let actual = object.id();
+        let actual = object::ObjectId::for_bytes(&bytes);
         if actual != *id {
             return Err(RepoErr::Object(object::ObjectErr::ObjectIdMismatch {
                 expected: id.clone(),
@@ -403,7 +403,7 @@ impl Repository {
         let object = match self.object_store().read_raw(id)? {
             Some(bytes) => {
                 let object = object::Object::decode(&bytes)?;
-                let actual = object.id();
+                let actual = object::ObjectId::for_bytes(&bytes);
                 if actual != *id {
                     return Err(RepoErr::Object(object::ObjectErr::ObjectIdMismatch {
                         expected: id.clone(),

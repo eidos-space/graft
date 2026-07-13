@@ -47,8 +47,10 @@ use refspec::{ParsedRefspec, parse_fetch_refspec, parse_push_refspec};
 use worktree::{
     IgnoreRules, artifact_storage_for_path, classify_artifact_bytes, classify_artifact_path,
     config_path_patterns_match, is_sqlite_database_file, is_sqlite_sidecar_file,
-    normalize_repo_path,
+    normalize_repo_path, normalize_repo_path_key,
 };
+
+pub use worktree::validate_repo_path_identity;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -66,6 +68,7 @@ pub const GRAFT_DIR: &str = ".graft";
 pub const GRAFT_IGNORE_FILE: &str = ".graftignore";
 pub const REPOSITORY_FORMAT_VERSION: u32 = 2;
 pub const OBJECT_FORMAT: &str = "blake3";
+pub const DEFAULT_TEXT_DIFF_CONTENT_LIMIT: ByteUnit = ByteUnit::MB;
 const NULL_OBJECT_ID: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 const REFLOG_ACTOR: &str = "Graft <graft@example.invalid>";
 const DEFAULT_LARGE_FILE_THRESHOLD: ByteUnit = ByteUnit::MB;
@@ -187,11 +190,20 @@ pub enum RepoErr {
     #[error("path `{0}` is not valid UTF-8")]
     NonUtf8Path(PathBuf),
 
+    #[error("path `{path}` has an unsupported repository identity: {reason}")]
+    UnsupportedPathIdentity { path: String, reason: &'static str },
+
     #[error("path `{path}` does not exist in revision `{rev}`")]
     PathNotFoundInRevision { path: String, rev: String },
 
     #[error("path `{0}` is not tracked")]
     PathNotTracked(String),
+
+    #[error("path `{0}` is not a text artifact")]
+    PathNotTextArtifact(String),
+
+    #[error("text diff content limit must be greater than zero")]
+    InvalidTextDiffContentLimit,
 
     #[error("path `{0}` is not conflicted")]
     PathNotConflicted(String),
@@ -530,6 +542,12 @@ pub enum CommitArtifactState {
 }
 
 impl CommitArtifactState {
+    pub fn kind(&self) -> RepoTrackedPathKind {
+        match self {
+            Self::File { kind, .. } | Self::LargeFile { kind, .. } => *kind,
+        }
+    }
+
     pub fn oid(&self) -> &object::ObjectId {
         match self {
             Self::File { oid, .. } | Self::LargeFile { oid, .. } => oid,
@@ -554,11 +572,7 @@ impl CommitArtifactState {
 }
 
 fn artifact_tracked_path_kind(state: &CommitArtifactState) -> RepoTrackedPathKind {
-    match state {
-        CommitArtifactState::File { kind, .. } | CommitArtifactState::LargeFile { kind, .. } => {
-            *kind
-        }
-    }
+    state.kind()
 }
 
 fn artifact_diff_kind(
@@ -713,6 +727,39 @@ pub struct RepoArtifactDiff {
     pub storage: RepoPathStorage,
     pub from: Option<CommitArtifactState>,
     pub to: Option<CommitArtifactState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoTextContentDiff {
+    pub path: String,
+    pub change: RepoFileChange,
+    pub kind: RepoTrackedPathKind,
+    pub storage: RepoPathStorage,
+    pub before: RepoTextContentState,
+    pub after: RepoTextContentState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum RepoTextContentState {
+    Absent,
+    Utf8 {
+        content: String,
+        size: u64,
+        content_hash: object::ObjectId,
+    },
+    TooLarge {
+        size: u64,
+        content_hash: object::ObjectId,
+    },
+    MissingPayload {
+        size: u64,
+        content_hash: object::ObjectId,
+    },
+    InvalidUtf8 {
+        size: u64,
+        content_hash: object::ObjectId,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

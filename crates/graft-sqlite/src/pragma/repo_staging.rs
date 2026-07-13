@@ -171,13 +171,35 @@ pub(super) fn staged_entry_kind_storage_and_change(
 
 pub(super) fn stage_repo_add_path(
     runtime: &Runtime,
-    file: &VolFile,
+    file: &mut VolFile,
     repo: &Repository,
     path: &Path,
     force: bool,
 ) -> Result<Vec<graft::repo::index::IndexEntry>, ErrCtx> {
+    if !path.is_absolute()
+        && let Some(path) = path.to_str()
+    {
+        graft::repo::validate_repo_path_identity(path)?;
+    }
     let physical_path = repo_input_path(repo, path);
-    let metadata = std::fs::metadata(&physical_path)?;
+    let metadata = match std::fs::metadata(&physical_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let (key, _) = repo_restore_path_arg(repo, path)?;
+            let tracked = tracked_repo_keys_under_directory(repo, &key)?;
+            if tracked.is_empty() {
+                return Err(ErrCtx::Repo(graft::repo::RepoErr::PathNotTracked(key)));
+            }
+            let mut entries = Vec::with_capacity(tracked.len());
+            for tracked_key in tracked {
+                if let Some(entry) = stage_repo_add_deletion(repo, &tracked_key)? {
+                    entries.push(entry);
+                }
+            }
+            return Ok(entries);
+        }
+        Err(err) => return Err(err.into()),
+    };
     let current_key = repo.file_key(&file.tag)?;
 
     if metadata.is_dir() {
@@ -192,11 +214,31 @@ pub(super) fn stage_repo_add_path(
             return ignored_add_path_error(repo, &directory);
         }
 
+        let directory_key = repo_directory_key(repo, &directory)?;
+        if !force {
+            let status = repo_status_for_file(runtime, file, repo)?;
+            let changes = status
+                .unstaged_changes
+                .into_iter()
+                .filter(|change| repo_key_is_under_directory(&change.path, &directory_key))
+                .collect();
+            return stage_repo_add_changes(runtime, file, repo, changes);
+        }
+
         let mut paths = BTreeSet::new();
         collect_repo_add_directory_files(repo, &directory, force, &mut paths)?;
-        let mut entries = Vec::with_capacity(paths.len());
+        let tracked = tracked_repo_keys_under_directory(repo, &directory_key)?;
+        let mut entries = Vec::with_capacity(paths.len() + tracked.len());
+        for key in tracked {
+            if !repo.worktree().join(&key).is_file()
+                && let Some(entry) = stage_repo_add_deletion(repo, &key)?
+            {
+                entries.push(entry);
+            }
+        }
         for key in paths {
             let physical_path = repo.worktree().join(&key);
+            entries.extend(stage_repo_add_topology_removals(repo, &key)?);
             entries.push(stage_repo_add_file(
                 runtime,
                 file,
@@ -223,14 +265,44 @@ pub(super) fn stage_repo_add_path(
     if !force && repo.is_ignored_worktree_path(&physical_path)? {
         return ignored_add_path_error(repo, &physical_path);
     }
-    Ok(vec![stage_repo_add_file(
+    let mut entries = stage_repo_add_topology_removals(repo, &key)?;
+    entries.push(stage_repo_add_file(
         runtime,
         file,
         repo,
         &current_key,
         &key,
         &physical_path,
-    )?])
+    )?);
+    Ok(entries)
+}
+
+pub(super) fn stage_repo_add_topology_removals(
+    repo: &Repository,
+    key: &str,
+) -> Result<Vec<graft::repo::index::IndexEntry>, ErrCtx> {
+    let mut effective_keys = BTreeSet::new();
+    effective_keys.extend(repo.index_files()?.into_keys());
+    effective_keys.extend(repo.index_artifacts()?.into_keys());
+    let head = repo_head_commit(repo)?;
+    let mut removals = Vec::new();
+
+    for conflict in effective_keys.into_iter().filter(|candidate| {
+        candidate != key
+            && (repo_key_is_under_directory(candidate, key)
+                || repo_key_is_under_directory(key, candidate))
+    }) {
+        let tracked_at_head = head.as_ref().is_some_and(|commit| {
+            commit.files.contains_key(&conflict) || commit.artifacts.contains_key(&conflict)
+        });
+        if tracked_at_head {
+            removals.push(repo.stage_file_removal_key(conflict)?);
+        } else if repo.index_has_key(&conflict)? {
+            repo.restore_index_key_from_head(conflict)?;
+        }
+    }
+
+    Ok(removals)
 }
 
 pub(super) fn stage_repo_add_all(
@@ -240,13 +312,24 @@ pub(super) fn stage_repo_add_all(
     kind: Option<RepoTrackedPathKind>,
 ) -> Result<Vec<graft::repo::index::IndexEntry>, ErrCtx> {
     let status = repo_status_for_file(runtime, file, repo)?;
-    let current_key = repo.file_key(&file.tag)?;
-    let mut entries = Vec::with_capacity(status.unstaged_changes.len());
+    let changes = status
+        .unstaged_changes
+        .into_iter()
+        .filter(|change| kind.is_none_or(|kind| change.kind == kind))
+        .collect();
+    stage_repo_add_changes(runtime, file, repo, changes)
+}
 
-    for change in status.unstaged_changes {
-        if kind.is_some_and(|kind| change.kind != kind) {
-            continue;
-        }
+pub(super) fn stage_repo_add_changes(
+    runtime: &Runtime,
+    file: &mut VolFile,
+    repo: &Repository,
+    changes: Vec<graft::repo::RepoWorktreeChange>,
+) -> Result<Vec<graft::repo::index::IndexEntry>, ErrCtx> {
+    let current_key = repo.file_key(&file.tag)?;
+    let mut entries = Vec::with_capacity(changes.len());
+
+    for change in changes {
         match change.change {
             RepoWorktreeChangeKind::Modified | RepoWorktreeChangeKind::Untracked => {
                 let physical_path = repo.worktree().join(&change.path);
@@ -260,17 +343,40 @@ pub(super) fn stage_repo_add_all(
                 )?);
             }
             RepoWorktreeChangeKind::Deleted => {
-                let entry = repo.stage_file_removal_key(&change.path)?;
+                let entry = stage_repo_add_deletion(repo, &change.path)?;
                 if change.path == current_key {
                     let volume = runtime.volume_open(None, None, None)?;
                     file.switch_volume(&volume.vid)?;
                 }
-                entries.push(entry);
+                if let Some(entry) = entry {
+                    entries.push(entry);
+                }
             }
         }
     }
 
     Ok(entries)
+}
+
+pub(super) fn stage_repo_add_deletion(
+    repo: &Repository,
+    key: &str,
+) -> Result<Option<graft::repo::index::IndexEntry>, ErrCtx> {
+    let head = repo_head_commit(repo)?;
+    if head
+        .as_ref()
+        .is_some_and(|commit| commit.files.contains_key(key) || commit.artifacts.contains_key(key))
+    {
+        return Ok(Some(repo.stage_file_removal_key(key)?));
+    }
+    if repo.index_has_key(key)? {
+        repo.restore_index_key_from_head(key)?;
+        repo.clear_dirty_key(key)?;
+        return Ok(None);
+    }
+    Err(ErrCtx::Repo(graft::repo::RepoErr::PathNotTracked(
+        key.to_string(),
+    )))
 }
 
 pub(super) fn stage_repo_add_file(
