@@ -1,13 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-RELEASE_FLAGS=""
-EXECUTE=""
+EXECUTE="false"
 
 while [[ $# -gt 0 ]]; do
-    case $1 in
+    case "$1" in
         --execute)
-            RELEASE_FLAGS="--execute --no-confirm"
             EXECUTE="true"
             shift
             ;;
@@ -17,75 +15,73 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ $# -eq 0 ]]; then
+if [[ $# -ne 1 ]]; then
     echo "Usage: $0 [--execute] VERSION"
     exit 1
 fi
 
-# Accepts:
-#   X.Y.Z
-#   X.Y.Z-rc.N
-regex='^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$'
+VERSION="$1"
+VERSION_REGEX='^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$'
+if [[ ! "$VERSION" =~ $VERSION_REGEX ]]; then
+    echo "Version must match X.Y.Z or X.Y.Z-rc.N"
+    exit 1
+fi
 
-VERSION=$1
-if [[ ! $VERSION =~ $regex ]]; then
-    echo "Version must match the format X.Y.Z or X.Y.Z-rc.N"
+git fetch --prune --tags origin main:refs/remotes/origin/main
+
+HEAD_COMMIT="$(git rev-parse HEAD)"
+ORIGIN_MAIN_COMMIT="$(git rev-parse origin/main)"
+if [[ "$HEAD_COMMIT" != "$ORIGIN_MAIN_COMMIT" ]]; then
+    echo "Error: HEAD ($HEAD_COMMIT) is not the current origin/main ($ORIGIN_MAIN_COMMIT)."
+    exit 1
+fi
+
+if [[ -n "$(git status --porcelain=v1 --untracked-files=all)" ]]; then
+    echo "Error: git working directory is not clean. Commit or stash every change first."
     exit 1
 fi
 
 RELEASE_CRATES=(
     graft
     graft-sqlite
+    graft-ext
+    graft-tool
+    graft-test
+    graft-tracing
 )
 
-# verify that HEAD == origin/main
-git fetch origin
-HEAD_COMMIT=$(git rev-parse HEAD)
-ORIGIN_MAIN_COMMIT=$(git rev-parse origin/main)
+for crate in "${RELEASE_CRATES[@]}"; do
+    CRATE_VERSION="$(cargo pkgid -p "$crate" | sed 's/.*#//')"
+    if [[ "$CRATE_VERSION" != "$VERSION" ]]; then
+        echo "Error: crate $crate is $CRATE_VERSION, expected $VERSION."
+        exit 1
+    fi
+done
 
-if [ "$HEAD_COMMIT" != "$ORIGIN_MAIN_COMMIT" ]; then
-    echo "Warning: HEAD ($HEAD_COMMIT) is not equal to origin/main ($ORIGIN_MAIN_COMMIT)."
-    read -r -p "Continue anyway? [y/N] " reply
-    case "$reply" in
-        [Yy]*) ;; # proceed
-        *)
-            echo "Aborting."
-            exit 1
-            ;;
-    esac
-fi
-
-# verify that git is clean
-if ! git diff-index --quiet HEAD --; then
-    echo "Error: git working directory is not clean. Please commit or stash your changes."
+SQLPKG_VERSION="$(python3 -c 'import json; print(json.load(open("sqlpkg.json"))["version"])')"
+if [[ "$SQLPKG_VERSION" != "$VERSION" ]]; then
+    echo "Error: sqlpkg.json is $SQLPKG_VERSION, expected $VERSION."
     exit 1
 fi
 
-BRANCH="release/v${VERSION}"
+cargo metadata --locked --format-version 1 --no-deps >/dev/null
+cargo check --workspace --all-targets --locked
 
-if [ -n "$EXECUTE" ]; then
-    # create a new branch for the release, if not already on it
-    if [ "$(git branch --show-current)" != "$BRANCH" ]; then
-        git checkout -b ${BRANCH}
-    fi
+TAG_NAME="v${VERSION}"
+if git rev-parse --verify "refs/tags/$TAG_NAME" >/dev/null 2>&1; then
+    echo "Error: local tag $TAG_NAME already exists."
+    exit 1
+fi
+if git ls-remote --exit-code --tags origin "refs/tags/$TAG_NAME" >/dev/null 2>&1; then
+    echo "Error: remote tag $TAG_NAME already exists."
+    exit 1
 fi
 
-for crate in "${RELEASE_CRATES[@]}"; do
-    cargo release version ${VERSION} --package ${crate} ${RELEASE_FLAGS}
-    cargo release replace --package ${crate} ${RELEASE_FLAGS}
-    cargo release hook --package ${crate} ${RELEASE_FLAGS}
-done
-
-# commit and push to the release branch
-if [ -n "$EXECUTE" ]; then
-    git add .
-    git commit -m "chore: Release v${VERSION}"
-
-    # push the branch to origin
-    git push origin ${BRANCH}
-
-    echo "To continue the release process, create a GitHub PR on the release branch: ${BRANCH}"
+if [[ "$EXECUTE" == "true" ]]; then
+    git tag -a "$TAG_NAME" -m "Release $TAG_NAME"
+    git push origin "refs/tags/$TAG_NAME"
+    echo "Pushed $TAG_NAME. The SQLite extension and CLI release workflow is now running."
 else
-    echo "To start the release process, run:"
-    echo "  $0 --execute ${VERSION}"
+    echo "Release checks passed. To create and push $TAG_NAME, run:"
+    echo "  $0 --execute $VERSION"
 fi

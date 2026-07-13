@@ -5,8 +5,8 @@ members = ["crates/*"]
 [workspace.package]
 authors = ["orbitinghail <hello@orbitinghail.dev>"]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/orbitinghail/graft"
-homepage = "https://github.com/orbitinghail/graft"
+repository = "https://github.com/eidos-space/graft"
+homepage = "https://github.com/eidos-space/graft"
 rust-version = "1.91"
 
 [profile.release]
@@ -60,10 +60,10 @@ zerocopy = { version = "0.8.27", features = ["derive"] }
 zstd = "0.13.3"
 
 [workspace.dependencies.opendal]
-# version = "0.55.0"
+version = "0.55.0"
 features = ["services-s3", "services-fs"]
 git = "https://github.com/apache/opendal"
-branch = "main"
+rev = "06f088d93e38e1150a3f1558f327ec0252446302"
 
 [workspace.lints.clippy]
 disallowed_methods = "deny"

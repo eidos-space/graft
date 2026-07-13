@@ -1889,7 +1889,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 [[package]]
 name = "opendal"
 version = "0.55.0"
-source = "git+https://github.com/apache/opendal?branch=main#06f088d93e38e1150a3f1558f327ec0252446302"
+source = "git+https://github.com/apache/opendal?rev=06f088d93e38e1150a3f1558f327ec0252446302#06f088d93e38e1150a3f1558f327ec0252446302"
 dependencies = [
  "ctor",
  "opendal-core",
@@ -1904,7 +1904,7 @@ dependencies = [
 [[package]]
 name = "opendal-core"
 version = "0.55.0"
-source = "git+https://github.com/apache/opendal?branch=main#06f088d93e38e1150a3f1558f327ec0252446302"
+source = "git+https://github.com/apache/opendal?rev=06f088d93e38e1150a3f1558f327ec0252446302#06f088d93e38e1150a3f1558f327ec0252446302"
 dependencies = [
  "anyhow",
  "base64",
@@ -1930,7 +1930,7 @@ dependencies = [
 [[package]]
 name = "opendal-layer-concurrent-limit"
 version = "0.55.0"
-source = "git+https://github.com/apache/opendal?branch=main#06f088d93e38e1150a3f1558f327ec0252446302"
+source = "git+https://github.com/apache/opendal?rev=06f088d93e38e1150a3f1558f327ec0252446302#06f088d93e38e1150a3f1558f327ec0252446302"
 dependencies = [
  "futures",
  "http",
@@ -1941,7 +1941,7 @@ dependencies = [
 [[package]]
 name = "opendal-layer-logging"
 version = "0.55.0"
-source = "git+https://github.com/apache/opendal?branch=main#06f088d93e38e1150a3f1558f327ec0252446302"
+source = "git+https://github.com/apache/opendal?rev=06f088d93e38e1150a3f1558f327ec0252446302#06f088d93e38e1150a3f1558f327ec0252446302"
 dependencies = [
  "log",
  "opendal-core",
@@ -1950,7 +1950,7 @@ dependencies = [
 [[package]]
 name = "opendal-layer-retry"
 version = "0.55.0"
-source = "git+https://github.com/apache/opendal?branch=main#06f088d93e38e1150a3f1558f327ec0252446302"
+source = "git+https://github.com/apache/opendal?rev=06f088d93e38e1150a3f1558f327ec0252446302#06f088d93e38e1150a3f1558f327ec0252446302"
 dependencies = [
  "backon",
  "log",
@@ -1960,7 +1960,7 @@ dependencies = [
 [[package]]
 name = "opendal-layer-timeout"
 version = "0.55.0"
-source = "git+https://github.com/apache/opendal?branch=main#06f088d93e38e1150a3f1558f327ec0252446302"
+source = "git+https://github.com/apache/opendal?rev=06f088d93e38e1150a3f1558f327ec0252446302#06f088d93e38e1150a3f1558f327ec0252446302"
 dependencies = [
  "opendal-core",
  "tokio",
@@ -1969,7 +1969,7 @@ dependencies = [
 [[package]]
 name = "opendal-service-fs"
 version = "0.55.0"
-source = "git+https://github.com/apache/opendal?branch=main#06f088d93e38e1150a3f1558f327ec0252446302"
+source = "git+https://github.com/apache/opendal?rev=06f088d93e38e1150a3f1558f327ec0252446302#06f088d93e38e1150a3f1558f327ec0252446302"
 dependencies = [
  "bytes",
  "log",
@@ -1982,7 +1982,7 @@ dependencies = [
 [[package]]
 name = "opendal-service-s3"
 version = "0.55.0"
-source = "git+https://github.com/apache/opendal?branch=main#06f088d93e38e1150a3f1558f327ec0252446302"
+source = "git+https://github.com/apache/opendal?rev=06f088d93e38e1150a3f1558f327ec0252446302#06f088d93e38e1150a3f1558f327ec0252446302"
 dependencies = [
  "base64",
  "bytes",

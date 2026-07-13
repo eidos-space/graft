@@ -1,19 +1,20 @@
 {
-  "owner": "orbitinghail",
+  "owner": "eidos-space",
   "name": "graft",
-  "repository": "https://github.com/orbitinghail/graft",
+  "version": "0.5.4",
+  "repository": "https://github.com/eidos-space/graft",
   "authors": ["Carl Sverre"],
   "license": "MIT OR Apache-2.0",
-  "description": "A SQLite extension which replicates data to and from object storage.",
+  "description": "Version control for SQLite-backed application state and files.",
   "symbols": [],
   "assets": {
-    "path": "https://github.com/orbitinghail/graft/releases/latest/download",
     "files": {
-      "darwin-arm64": "libgraft-ext-macos-aarch64.tar.gz",
-      "linux-amd64": "libgraft-ext-linux-x86_64.tar.gz",
-      "linux-arm64": "libgraft-ext-linux-aarch64.tar.gz",
-      "windows-amd64": "libgraft-ext-windows-x86_64.zip",
-      "windows-arm64": "libgraft-ext-windows-aarch64.zip"
+      "darwin-amd64": "sqlite-graft-{version}-x86_64-apple-darwin.tar.gz",
+      "darwin-arm64": "sqlite-graft-{version}-aarch64-apple-darwin.tar.gz",
+      "linux-amd64": "sqlite-graft-{version}-x86_64-unknown-linux-gnu.tar.gz",
+      "linux-arm64": "sqlite-graft-{version}-aarch64-unknown-linux-gnu.tar.gz",
+      "windows-amd64": "sqlite-graft-{version}-x86_64-pc-windows-msvc.zip",
+      "windows-arm64": "sqlite-graft-{version}-aarch64-pc-windows-msvc.zip"
     }
   }
 }

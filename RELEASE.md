@@ -1,28 +1,32 @@
-# How to release Graft
+# Releasing Graft
 
-Starting from a clean local repo state on the main branch.
+Graft has one release pipeline: [`.github/workflows/sqlite-extension-release.yml`](.github/workflows/sqlite-extension-release.yml). It builds and publishes the SQLite extension and the `graft` CLI for every supported target.
 
-First figure out the version you want to release. The latest version can be found using: `git describe --tags --abbrev=0` and you might also find `cargo release changes` helpful.
+## Prepare the release commit
 
-In order to cut a pre-release, use the version format `X.Y.Z-rc.N`.
+Update every workspace crate and the `version` field in `sqlpkg.json` to the same version, then merge that change into `main`. Release tags must point at the current `origin/main` commit; do not release from a side branch.
 
-When you are ready to release, run:
+The latest tag merged into `origin/main` can be found with:
 
+```sh
+git fetch --tags origin
+git tag --merged origin/main --sort=-v:refname | head -n 1
 ```
-just run release --execute <VERSION NUMBER>
+
+## Validate and publish
+
+From a completely clean checkout of the current `origin/main`, validate the release without changing Git state:
+
+```sh
+just run release <VERSION>
 ```
 
-This script will prepare the release and push it to a release branch named `release/<VERSION NUMBER>`.
+When those checks pass, create and push the annotated release tag:
 
-Next, create a PR for the release branch and wait until the `release-prep.yml` workflow has finished. Address any issues it hits in the release PR.
+```sh
+just run release --execute <VERSION>
+```
 
-`release-prep` will create a GitHub Release in draft mode with draft notes. Once the workflow has succeeded with no errors and you are ready to release, update the draft GitHub Release notes to ensure they clearly outline what has actually changed.
+`VERSION` must use `X.Y.Z` or `X.Y.Z-rc.N`. The script rejects dirty worktrees, untracked files, version mismatches, non-main commits, and existing tags.
 
-> ![IMPORTANT]
-> DO NOT PUBLISH THE RELEASE AT THIS STEP. The `release.yml` job will do that.
-
-`release-prep` will also trigger the `release.yml` workflow on the main branch. This workflow will wait for manual approval and will replace itself as needed. Do not approve this workflow until after the PR has landed.
-
-Finally, it's time to release! Merge the PR and approve the most recent `release.yml` workflow. This will cause all of the actual releases to go out to the various package managers as well as pushing a git tag and publishing the GitHub release.
-
-Success! Hopefully. Go and check everything. But assuming it all looks good, great job!
+Pushing the tag starts the release workflow. It builds all CLI and extension targets, packages them, generates `SHA256SUMS`, and only then creates or updates the GitHub release. A version containing a suffix such as `-rc.1` is published as a prerelease.

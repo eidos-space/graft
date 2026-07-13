@@ -17,7 +17,6 @@ env:
 
 permissions:
   contents: read
-  checks: write
 
 jobs:
   skip-check:
@@ -35,7 +34,7 @@ jobs:
     if: needs.skip-check.outputs.should_skip != 'true'
     steps:
       - name: system dependencies
-        uses: awalsh128/cache-apt-pkgs-action@latest
+        uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # latest
         with:
           packages: clang libclang-dev llvm libncurses-dev build-essential libreadline-dev
           version: 1.0
@@ -55,7 +54,9 @@ jobs:
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
 
       - name: Install Nextest
-        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C /usr/local/bin
+        uses: taiki-e/install-action@df7d4e2b3680b909f3a4aec8f15e498616ae9641 # nextest
+        with:
+          tool: nextest
 
       - name: Cargo fmt
         run: cargo fmt --check
@@ -70,7 +71,7 @@ jobs:
         run: cargo test --doc
 
       - name: Cache SQLite
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: target/sqlite-*/sqlite3
           key: ${{ runner.os }}-sqlite3-${{ hashFiles('tasks/sqlite/*') }}
@@ -79,6 +80,32 @@ jobs:
         run: just run sqlite test
 
       - name: Clippy
-        uses: auguwu/clippy-action@94a9ff2f6920180b89e5c03d121d0af04a9d3e03 # 1.4.0
+        run: cargo clippy --workspace --all-targets
+
+  msrv:
+    name: Check MSRV 1.91
+    runs-on: ubuntu-24.04
+    needs: skip-check
+    if: needs.skip-check.outputs.should_skip != 'true'
+    steps:
+      - name: system dependencies
+        uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # latest
         with:
-          token: ${{secrets.GITHUB_TOKEN}}
+          packages: clang libclang-dev llvm libncurses-dev build-essential libreadline-dev
+          version: 1.0
+
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: "1.91"
+
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          key: msrv-1.91
+
+      - name: Cargo check
+        run: cargo check --workspace --all-targets --locked

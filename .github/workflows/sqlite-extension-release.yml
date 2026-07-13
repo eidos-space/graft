@@ -4,22 +4,6 @@ on:
   push:
     tags:
       - "v*"
-  workflow_dispatch:
-    inputs:
-      version:
-        description: "Version to release, for example 0.2.1 or v0.2.1-rc.1"
-        required: true
-        type: string
-      draft:
-        description: "Create the GitHub release as a draft"
-        required: true
-        default: true
-        type: boolean
-      prerelease:
-        description: "Mark the GitHub release as a prerelease"
-        required: true
-        default: false
-        type: boolean
 
 concurrency:
   group: sqlite-extension-release-${{ github.ref }}
@@ -42,29 +26,25 @@ jobs:
       draft: ${{ steps.meta.outputs.draft }}
       prerelease: ${{ steps.meta.outputs.prerelease }}
     steps:
+      - name: Checkout release commit
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
       - name: Resolve release metadata
         id: meta
         shell: bash
-        env:
-          INPUT_VERSION: ${{ inputs.version }}
-          INPUT_DRAFT: ${{ inputs.draft }}
-          INPUT_PRERELEASE: ${{ inputs.prerelease }}
         run: |
           set -euo pipefail
 
-          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
-            raw_version="${INPUT_VERSION}"
-            draft="${INPUT_DRAFT}"
-            prerelease="${INPUT_PRERELEASE}"
-          else
-            raw_version="${GITHUB_REF_NAME}"
-            draft="false"
-            prerelease="false"
-          fi
-
+          raw_version="${GITHUB_REF_NAME}"
+          draft="false"
+          prerelease="false"
           version="${raw_version#v}"
-          if [[ -z "$version" ]]; then
-            echo "::error::release version is empty"
+          version_regex='^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$'
+          if [[ ! "$version" =~ $version_regex ]]; then
+            echo "::error::release version must match X.Y.Z or X.Y.Z-rc.N"
             exit 1
           fi
 
@@ -84,6 +64,38 @@ jobs:
             echo "Draft: ${draft}"
             echo "Prerelease: ${prerelease}"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Validate release commit and crate versions
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          HEAD_COMMIT="$(git rev-parse HEAD)"
+          if ! git merge-base --is-ancestor "$HEAD_COMMIT" origin/main; then
+            echo "::error::release commit $HEAD_COMMIT is not reachable from origin/main"
+            exit 1
+          fi
+          if [[ "$(git cat-file -t "refs/tags/${GITHUB_REF_NAME}")" != "tag" ]]; then
+            echo "::error::release tag ${GITHUB_REF_NAME} must be annotated"
+            exit 1
+          fi
+
+          crates=(graft graft-sqlite graft-ext graft-tool graft-test graft-tracing)
+          for crate in "${crates[@]}"; do
+            crate_version="$(cargo pkgid -p "$crate" | sed 's/.*#//')"
+            if [[ "$crate_version" != "$RELEASE_VERSION" ]]; then
+              echo "::error::$crate is $crate_version, expected $RELEASE_VERSION"
+              exit 1
+            fi
+          done
+          sqlpkg_version="$(python3 -c 'import json; print(json.load(open("sqlpkg.json"))["version"])')"
+          if [[ "$sqlpkg_version" != "$RELEASE_VERSION" ]]; then
+            echo "::error::sqlpkg.json is $sqlpkg_version, expected $RELEASE_VERSION"
+            exit 1
+          fi
+          cargo metadata --locked --format-version 1 --no-deps >/dev/null
 
   build:
     name: Build ${{ matrix.target }}
@@ -180,6 +192,16 @@ jobs:
             --release \
             --package graft-tool \
             --target "${{ matrix.target }}"
+
+      - name: Smoke test CLI
+        if: matrix.target != 'aarch64-unknown-linux-gnu' && matrix.target != 'aarch64-pc-windows-msvc'
+        run: |
+          set -euo pipefail
+          binary="target/${{ matrix.target }}/release/graft"
+          if [[ "${{ matrix.target }}" == *"windows"* ]]; then
+            binary="${binary}.exe"
+          fi
+          "$binary" --help >/dev/null
 
       - name: Stage extension artifact
         run: |
