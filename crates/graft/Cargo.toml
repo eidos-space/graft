@@ -27,6 +27,7 @@ foldhash = { workspace = true }
 futures = { workspace = true }
 hashbrown = { workspace = true }
 itertools = { workspace = true }
+lz4_flex = { workspace = true }
 opendal = { workspace = true }
 parking_lot = { workspace = true }
 precept = { workspace = true, optional = true }
