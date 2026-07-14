@@ -890,7 +890,7 @@ fn test_repo_init_preserves_existing_vfs_database_contents() {
 }
 
 #[test]
-fn test_repo_json_status_ignores_untracked_auxiliary_sqlite_files() {
+fn test_repo_json_status_filters_auxiliary_sqlite_files_with_track_roots() {
     graft_test::ensure_test_env();
 
     let temp_dir = tempfile::tempdir().unwrap();
@@ -916,6 +916,14 @@ fn test_repo_json_status_ignores_untracked_auxiliary_sqlite_files() {
     let sqlite = runtime.open_sqlite(db_name, None);
 
     assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+    assert_eq!(
+        pragma_arg_string(
+            &sqlite,
+            "graft_config_set",
+            "track.default_roots -- db.sqlite3",
+        ),
+        "track.default_roots = db.sqlite3\n",
+    );
     sqlite
         .execute_batch(
             r#"
