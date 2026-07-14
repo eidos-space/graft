@@ -61,9 +61,22 @@ fn setup_log_file(path: &Path) {
         .open(path)
         .expect("failed to open log file");
 
-    setup_tracing_with_writer(TracingConsumer::Tool, Mutex::new(file), None).init();
+    install_tracing(setup_tracing_with_writer(
+        TracingConsumer::Tool,
+        Mutex::new(file),
+        None,
+    ));
 
     tracing::info!("Log file opened");
+}
+
+fn install_tracing<S>(subscriber: S)
+where
+    S: tracing::Subscriber + Send + Sync + 'static,
+{
+    // A host process may load the extension for more than one SQLite connection.
+    // Keep the first global subscriber instead of panicking on subsequent loads.
+    let _ = subscriber.try_init();
 }
 
 #[allow(dead_code, reason = "msg is unused in static build")]
@@ -138,7 +151,11 @@ fn setup_logger(logger: SqliteLogger) {
     let writer = Writer(Arc::new(Mutex::new(logger)));
     let make_writer = move || writer.clone();
 
-    setup_tracing_with_writer(TracingConsumer::Tool, make_writer, None).init();
+    install_tracing(setup_tracing_with_writer(
+        TracingConsumer::Tool,
+        make_writer,
+        None,
+    ));
 }
 
 #[cfg(feature = "dynamic")]
@@ -250,5 +267,19 @@ mod tests {
         assert_eq!(config.data_dir, Some(data_dir));
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn tracing_initialization_is_idempotent() {
+        install_tracing(setup_tracing_with_writer(
+            TracingConsumer::Tool,
+            std::io::sink,
+            None,
+        ));
+        install_tracing(setup_tracing_with_writer(
+            TracingConsumer::Tool,
+            std::io::sink,
+            None,
+        ));
     }
 }
