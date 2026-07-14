@@ -77,7 +77,7 @@ jobs:
             echo "::error::release commit $HEAD_COMMIT is not reachable from origin/main"
             exit 1
           fi
-          if [[ "$(git cat-file -t "refs/tags/${GITHUB_REF_NAME}")" != "tag" ]]; then
+          if ! git ls-remote --exit-code origin "refs/tags/${GITHUB_REF_NAME}^{}" >/dev/null; then
             echo "::error::release tag ${GITHUB_REF_NAME} must be annotated"
             exit 1
           fi
