@@ -296,6 +296,51 @@ impl Repository {
         })
     }
 
+    /// Returns every `SQLite` storage state reachable from the index or a
+    /// repository ref. These states are the repository-owned roots for the
+    /// Fjall storage garbage collector.
+    pub fn referenced_storage_states(&self) -> Result<Vec<CommitFileState>> {
+        let mut states = self
+            .read_index()?
+            .entries
+            .into_iter()
+            .filter_map(|entry| entry.file)
+            .collect::<Vec<_>>();
+
+        let mut starts = BTreeSet::new();
+        if let Some(head) = self.head_target()? {
+            starts.insert(head);
+        }
+        if let Some(merge_head) = self.merge_head()? {
+            starts.insert(merge_head);
+        }
+        if let Some(orig_head) = self.orig_head()? {
+            starts.insert(orig_head);
+        }
+        for branch in self.branches()? {
+            starts.extend(branch.target);
+        }
+        for branch in self.remote_tracking_branches()? {
+            starts.insert(branch.head);
+        }
+        for tag in self.tags()? {
+            starts.insert(tag.target);
+        }
+
+        let mut seen = BTreeSet::new();
+        let mut pending = starts.into_iter().collect::<Vec<_>>();
+        while let Some(id) = pending.pop() {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            let commit = self.read_commit(&id)?;
+            pending.extend(commit_parent_ids(&commit));
+            states.extend(commit.files.into_values());
+        }
+
+        Ok(states)
+    }
+
     pub fn tracked_paths(&self) -> Result<Vec<RepoTrackedPath>> {
         let files = self.index_files()?;
         let artifacts = self.index_artifacts()?;

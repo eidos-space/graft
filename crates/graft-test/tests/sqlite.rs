@@ -2267,9 +2267,25 @@ fn test_repo_status_classifies_tracked_physical_sqlite_files() {
             .unwrap();
     }
 
+    let untracked_baseline = debug_volume_count(&sqlite);
+    let status: Value =
+        serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status")).unwrap();
+    assert_eq!(status["dirty"], true);
+    assert!(pragma_arg_string(&sqlite, "graft_diff", "-- external.db").contains("added"));
+    assert_eq!(
+        debug_volume_count(&sqlite),
+        untracked_baseline,
+        "inspecting an untracked physical database must not import it"
+    );
+
     assert_eq!(
         pragma_arg_string(&sqlite, "graft_add", "external.db"),
         "Added external.db"
+    );
+    assert_eq!(
+        debug_volume_count(&sqlite),
+        untracked_baseline + 1,
+        "staging is the operation that persists a physical database"
     );
     assert!(pragma_arg_string(&sqlite, "graft_commit", "external v1").contains("external v1"));
 
@@ -2316,6 +2332,243 @@ fn test_repo_status_classifies_tracked_physical_sqlite_files() {
     );
     let text_status = pragma_query_string(&sqlite, "graft_status");
     assert!(text_status.contains("deleted: external.db"));
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_status_and_diff_do_not_persist_physical_sqlite_comparison_volumes() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_path.to_str().unwrap(), None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+
+    let external_db = temp_dir.path().join("external.db");
+    {
+        let external = Connection::open(&external_db).unwrap();
+        external
+            .execute_batch(
+                r#"
+                PRAGMA page_size=4096;
+                CREATE TABLE external_data (
+                    id INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    payload BLOB NOT NULL
+                );
+                WITH RECURSIVE rows(id) AS (
+                    VALUES(1)
+                    UNION ALL
+                    SELECT id + 1 FROM rows WHERE id < 256
+                )
+                INSERT INTO external_data (id, name, payload)
+                SELECT id, printf('row-%d', id), zeroblob(4096) FROM rows;
+                "#,
+            )
+            .unwrap();
+    }
+
+    let before_stage_volumes = debug_volume_count(&sqlite);
+    for _ in 0..3 {
+        let status: Value =
+            serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status")).unwrap();
+        assert_eq!(status["dirty"], true);
+        let diff = pragma_arg_string(&sqlite, "graft_diff", "-- external.db");
+        assert!(diff.contains("external.db"), "{diff}");
+    }
+    assert_eq!(
+        debug_volume_count(&sqlite),
+        before_stage_volumes,
+        "read-only comparison of an untracked physical database must not persist a volume"
+    );
+
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_add", "external.db"),
+        "Added external.db"
+    );
+    assert_eq!(
+        debug_volume_count(&sqlite),
+        before_stage_volumes + 1,
+        "staging is the operation that should persist exactly one imported volume"
+    );
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "external v1").contains("external v1"));
+
+    let baseline_volumes = debug_volume_count(&sqlite);
+    for _ in 0..3 {
+        let status: Value =
+            serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status")).unwrap();
+        assert_eq!(status["dirty"], false);
+        assert!(pragma_arg_string(&sqlite, "graft_diff", "-- external.db").contains("No changes."));
+    }
+    assert_eq!(
+        debug_volume_count(&sqlite),
+        baseline_volumes,
+        "read-only status and diff calls must not create persistent comparison volumes"
+    );
+
+    {
+        let external = Connection::open(&external_db).unwrap();
+        external
+            .execute("UPDATE external_data SET name = 'changed' WHERE id = 1", [])
+            .unwrap();
+    }
+
+    for _ in 0..3 {
+        let status: Value =
+            serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status")).unwrap();
+        assert_eq!(status["dirty"], true);
+        let diff = pragma_arg_string(&sqlite, "graft_diff", "-- external.db");
+        assert!(diff.contains("external.db"), "{diff}");
+        let row_diff = pragma_arg_string(&sqlite, "graft_diff", "--rows -- external.db");
+        assert!(row_diff.contains("~1 updates"), "{row_diff}");
+    }
+    assert_eq!(
+        debug_volume_count(&sqlite),
+        baseline_volumes,
+        "comparing a modified physical database must not retain scratch volumes"
+    );
+    let gc: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_gc")).unwrap();
+    assert_eq!(gc["candidate_volumes"], 0);
+    assert_eq!(gc["candidate_commits"], 0);
+    assert_eq!(gc["candidate_segments"], 0);
+    assert_eq!(gc["candidate_pages"], 0);
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_gc_prunes_replaced_physical_stages_and_preserves_history() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_path.to_str().unwrap(), None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+
+    let external_db = temp_dir.path().join("external.db");
+    {
+        let external = Connection::open(&external_db).unwrap();
+        external
+            .execute_batch(
+                r#"
+                PRAGMA page_size=4096;
+                CREATE TABLE external_data (
+                    id INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    payload BLOB NOT NULL
+                );
+                WITH RECURSIVE rows(id) AS (
+                    VALUES(1)
+                    UNION ALL
+                    SELECT id + 1 FROM rows WHERE id < 64
+                )
+                INSERT INTO external_data (id, name, payload)
+                SELECT id, printf('row-%d', id), zeroblob(4096) FROM rows;
+                "#,
+            )
+            .unwrap();
+    }
+
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_add", "external.db"),
+        "Added external.db"
+    );
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "external v1").contains("external v1"));
+
+    {
+        let external = Connection::open(&external_db).unwrap();
+        external
+            .execute("UPDATE external_data SET name = 'v2' WHERE id = 1", [])
+            .unwrap();
+    }
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_add", "external.db"),
+        "Added external.db"
+    );
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "external v2").contains("external v2"));
+
+    {
+        let external = Connection::open(&external_db).unwrap();
+        external
+            .execute(
+                "UPDATE external_data SET name = 'orphaned-stage' WHERE id = 2",
+                [],
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_add", "external.db"),
+        "Added external.db"
+    );
+    let replaced_stage_pages = std::fs::metadata(&external_db).unwrap().len() / 4096;
+
+    {
+        let external = Connection::open(&external_db).unwrap();
+        external
+            .execute(
+                "UPDATE external_data SET name = 'retained-stage' WHERE id = 3",
+                [],
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_add", "external.db"),
+        "Added external.db"
+    );
+
+    let volumes_before = debug_volume_count(&sqlite);
+    let dry_run: Value =
+        serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_gc")).unwrap();
+    assert_eq!(dry_run["operation"], "gc");
+    assert_eq!(dry_run["dry_run"], true);
+    assert_eq!(dry_run["candidate_volumes"], 1);
+    assert_eq!(dry_run["candidate_commits"], 1);
+    assert_eq!(dry_run["candidate_segments"], 1);
+    assert_eq!(dry_run["candidate_pages"], replaced_stage_pages);
+    assert_eq!(
+        dry_run["candidate_page_bytes"].as_u64().unwrap(),
+        dry_run["candidate_pages"].as_u64().unwrap() * 4096
+    );
+    assert_eq!(dry_run["pruned_pages"], 0);
+    assert_eq!(debug_volume_count(&sqlite), volumes_before);
+
+    let pruned: Value =
+        serde_json::from_str(&pragma_arg_string(&sqlite, "graft_json_gc", "--force")).unwrap();
+    assert_eq!(pruned["dry_run"], false);
+    assert_eq!(pruned["pruned_volumes"], dry_run["candidate_volumes"]);
+    assert_eq!(pruned["pruned_commits"], dry_run["candidate_commits"]);
+    assert_eq!(pruned["pruned_segments"], dry_run["candidate_segments"]);
+    assert_eq!(pruned["pruned_pages"], dry_run["candidate_pages"]);
+    assert_eq!(
+        debug_volume_count(&sqlite),
+        volumes_before - pruned["pruned_volumes"].as_u64().unwrap() as usize
+    );
+    let volumes_after_gc = debug_volume_count(&sqlite);
+
+    let staged_row_diff =
+        pragma_arg_string(&sqlite, "graft_diff", "--rows --staged -- external.db");
+    assert!(staged_row_diff.contains("~2 updates"), "{staged_row_diff}");
+    assert_eq!(debug_volume_count(&sqlite), volumes_after_gc);
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "external v3").contains("external v3"));
+    assert_eq!(debug_volume_count(&sqlite), volumes_after_gc);
+
+    let old_history =
+        pragma_arg_string(&sqlite, "graft_diff", "--rows HEAD~2 HEAD~1 -- external.db");
+    assert!(old_history.contains("~1 updates"), "{old_history}");
+    let recent_history =
+        pragma_arg_string(&sqlite, "graft_diff", "--rows HEAD~1 HEAD -- external.db");
+    assert!(recent_history.contains("~2 updates"), "{recent_history}");
+    assert_eq!(debug_volume_count(&sqlite), volumes_after_gc);
+
+    let second_gc: Value =
+        serde_json::from_str(&pragma_arg_string(&sqlite, "graft_json_gc", "--force")).unwrap();
+    assert_eq!(second_gc["candidate_volumes"], 0);
+    assert_eq!(second_gc["candidate_commits"], 0);
+    assert_eq!(second_gc["candidate_segments"], 0);
+    assert_eq!(second_gc["candidate_pages"], 0);
 
     runtime.shutdown().unwrap();
 }
@@ -12349,6 +12602,12 @@ fn pragma_query_string(conn: &Connection, name: &str) -> String {
     })
     .unwrap();
     output.unwrap()
+}
+
+fn debug_volume_count(conn: &Connection) -> usize {
+    let volumes: Value =
+        serde_json::from_str(&pragma_query_string(conn, "graft_debug_volume_json_list")).unwrap();
+    volumes.as_array().unwrap().len()
 }
 
 fn pragma_query_error(conn: &Connection, name: &str) -> String {

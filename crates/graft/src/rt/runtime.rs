@@ -1,4 +1,4 @@
-use std::{ops::RangeInclusive, path::Path, sync::Arc, time::Duration};
+use std::{collections::BTreeSet, ops::RangeInclusive, path::Path, sync::Arc, time::Duration};
 
 use crate::core::{
     CommitHashBuilder, LogId, PageCount, PageIdx, SegmentId, VolumeId,
@@ -30,7 +30,7 @@ use crate::{
     volume_writer::VolumeWriter,
 };
 
-use crate::local::fjall_storage::{FjallStorage, FjallStorageErr};
+use crate::local::fjall_storage::{FjallStorage, FjallStorageErr, StorageGcOutcome};
 
 pub type Result<T> = std::result::Result<T, GraftErr>;
 
@@ -262,6 +262,20 @@ impl Runtime {
     pub fn volume_reader(&self, vid: VolumeId) -> Result<VolumeReader> {
         let snapshot = self.volume_snapshot(&vid)?;
         Ok(VolumeReader::new(self.clone(), vid, snapshot))
+    }
+
+    /// Opens a reader directly over an existing snapshot without creating a Volume.
+    pub fn snapshot_reader(&self, snapshot: Snapshot) -> VolumeReader {
+        VolumeReader::new(self.clone(), VolumeId::EMPTY, snapshot)
+    }
+
+    pub fn storage_gc(
+        &self,
+        root_volumes: &BTreeSet<VolumeId>,
+        root_snapshots: &[Snapshot],
+        dry_run: bool,
+    ) -> Result<StorageGcOutcome> {
+        Ok(self.storage().gc(root_volumes, root_snapshots, dry_run)?)
     }
 
     pub fn volume_writer(&self, vid: VolumeId) -> Result<VolumeWriter> {
@@ -550,7 +564,7 @@ impl Runtime {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
     use crate::core::{LogId, PageIdx, lsn::LSN, page::Page};
     use test_log::test;
@@ -682,6 +696,102 @@ mod tests {
             }
         });
         tokio_rt.block_on(task).unwrap();
+    }
+
+    #[test]
+    fn storage_gc_prunes_only_unreachable_storage() {
+        let tokio_rt = tokio::runtime::Builder::new_current_thread()
+            .start_paused(true)
+            .enable_all()
+            .build()
+            .unwrap();
+        let remote = Arc::new(RemoteConfig::Memory.build().unwrap());
+        let storage = Arc::new(FjallStorage::open_temporary().unwrap());
+        let runtime = Runtime::new(tokio_rt.handle().clone(), remote, storage, None);
+
+        let rooted = runtime.volume_open(None, None, None).unwrap();
+        let mut writer = runtime.volume_writer(rooted.vid.clone()).unwrap();
+        writer
+            .write_page(PageIdx::must_new(1), Page::test_filled(1))
+            .unwrap();
+        writer
+            .write_page(PageIdx::must_new(2), Page::test_filled(2))
+            .unwrap();
+        writer.commit().unwrap();
+
+        let tagged = runtime.volume_open(None, None, None).unwrap();
+        let mut writer = runtime.volume_writer(tagged.vid.clone()).unwrap();
+        writer
+            .write_page(PageIdx::must_new(1), Page::test_filled(3))
+            .unwrap();
+        writer.commit().unwrap();
+        runtime.tag_replace("active", tagged.vid.clone()).unwrap();
+
+        let snapshot_only = runtime.volume_open(None, None, None).unwrap();
+        let mut writer = runtime.volume_writer(snapshot_only.vid.clone()).unwrap();
+        writer
+            .write_page(PageIdx::must_new(1), Page::test_filled(4))
+            .unwrap();
+        let snapshot_only_state = writer.commit().unwrap().snapshot().clone();
+        runtime.volume_delete(&snapshot_only.vid).unwrap();
+
+        let orphan = runtime.volume_open(None, None, None).unwrap();
+        let mut writer = runtime.volume_writer(orphan.vid.clone()).unwrap();
+        for index in 1..=3 {
+            writer
+                .write_page(PageIdx::must_new(index), Page::test_filled(5))
+                .unwrap();
+        }
+        writer.commit().unwrap();
+
+        let roots = BTreeSet::from([rooted.vid.clone()]);
+        let dry_run = runtime
+            .storage_gc(&roots, std::slice::from_ref(&snapshot_only_state), true)
+            .unwrap();
+        assert!(dry_run.dry_run);
+        assert_eq!(dry_run.retained_volumes, 2);
+        assert_eq!(dry_run.candidate_volumes, 1);
+        assert_eq!(dry_run.candidate_commits, 1);
+        assert_eq!(dry_run.candidate_segments, 1);
+        assert_eq!(dry_run.candidate_pages, 3);
+        assert_eq!(dry_run.candidate_page_bytes, 3 * 4096);
+        assert_eq!(dry_run.pruned_pages, 0);
+        assert!(runtime.volume_exists(&orphan.vid).unwrap());
+
+        let pruned = runtime
+            .storage_gc(&roots, std::slice::from_ref(&snapshot_only_state), false)
+            .unwrap();
+        assert!(!pruned.dry_run);
+        assert_eq!(pruned.pruned_volumes, 1);
+        assert_eq!(pruned.pruned_commits, 1);
+        assert_eq!(pruned.pruned_segments, 1);
+        assert_eq!(pruned.pruned_pages, 3);
+        assert_eq!(pruned.pruned_page_bytes, 3 * 4096);
+        assert!(!runtime.volume_exists(&orphan.vid).unwrap());
+
+        assert_eq!(
+            runtime
+                .volume_reader(rooted.vid)
+                .unwrap()
+                .read_page(PageIdx::must_new(2))
+                .unwrap(),
+            Page::test_filled(2)
+        );
+        assert_eq!(
+            runtime
+                .volume_reader(tagged.vid)
+                .unwrap()
+                .read_page(PageIdx::must_new(1))
+                .unwrap(),
+            Page::test_filled(3)
+        );
+        assert_eq!(
+            runtime
+                .snapshot_reader(snapshot_only_state)
+                .read_page(PageIdx::must_new(1))
+                .unwrap(),
+            Page::test_filled(4)
+        );
     }
 
     #[test]

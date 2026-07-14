@@ -107,6 +107,11 @@ pub(crate) struct LargeFilePruneSpec {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageGcSpec {
+    pub(super) dry_run: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LargeFileFetchSpec {
     pub(super) remote: Option<String>,
     pub(super) rev: Option<String>,

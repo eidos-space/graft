@@ -96,6 +96,12 @@ pub(super) fn format_repo_diff(diff: &RepoDiff) -> Result<String, ErrCtx> {
                 to.snapshot.page_count,
                 to.snapshot.ranges.len()
             )?;
+        } else if let Some(worktree) = &file.worktree {
+            writeln!(
+                &mut f,
+                "  to:   {} page(s), physical worktree",
+                worktree.page_count
+            )?;
         }
     }
     for artifact in &diff.artifacts {
@@ -177,7 +183,7 @@ pub(super) fn repo_file_row_diff(
     repo: &Repository,
     file: &graft::repo::RepoFileDiff,
 ) -> Result<Option<crate::row_level_diff::RowLevelDiff>, ErrCtx> {
-    let (Some(from), Some(to)) = (&file.from, &file.to) else {
+    let Some(from) = &file.from else {
         return Ok(None);
     };
     let resolver = RepoSnapshotResolver::local_then_remote(
@@ -187,6 +193,26 @@ pub(super) fn repo_file_row_diff(
         SnapshotHashPolicy::AllowHydratedMismatch,
     );
     resolver.resolve_snapshot(&from.snapshot)?;
+    if file.worktree.is_some() {
+        let physical_path = repo.worktree().join(&file.path);
+        let physical = PhysicalSqliteReader::open(&physical_path)?;
+        let from_snapshot = from.snapshot.to_snapshot();
+        let from_lsn = from_snapshot.head().map_or(LSN::FIRST, |(_, lsn)| lsn);
+        let from_reader = runtime.snapshot_reader(from_snapshot);
+        return crate::row_level_diff::row_level_diff_readers(
+            &from_reader,
+            &physical,
+            from_lsn,
+            from_lsn.saturating_next(),
+        )
+        .map(Some)
+        .map_err(|err| {
+            ErrCtx::PragmaErr(format!("Row diff error for `{}`: {err:?}", file.path).into())
+        });
+    }
+    let Some(to) = &file.to else {
+        return Ok(None);
+    };
     resolver.resolve_snapshot(&to.snapshot)?;
     crate::row_level_diff::row_level_diff_snapshots(
         runtime,
@@ -521,6 +547,48 @@ pub(super) fn format_large_file_prune_outcome(
             file.content_hash, file.size, file.path
         )?;
     }
+    Ok(f)
+}
+
+pub(super) fn format_storage_gc_outcome(
+    outcome: &graft::local::fjall_storage::StorageGcOutcome,
+) -> Result<String, ErrCtx> {
+    let mut f = String::new();
+    if outcome.candidate_volumes == 0
+        && outcome.candidate_commits == 0
+        && outcome.candidate_segments == 0
+        && outcome.candidate_pages == 0
+    {
+        writeln!(&mut f, "No unreachable SQLite storage records.")?;
+    } else if outcome.dry_run {
+        writeln!(
+            &mut f,
+            "Would prune {} volume(s), {} commit(s), {} segment(s), and {} page(s) ({} byte(s)).",
+            outcome.candidate_volumes,
+            outcome.candidate_commits,
+            outcome.candidate_segments,
+            outcome.candidate_pages,
+            outcome.candidate_page_bytes
+        )?;
+    } else {
+        writeln!(
+            &mut f,
+            "Pruned {} volume(s), {} commit(s), {} segment(s), and {} page(s) ({} byte(s)).",
+            outcome.pruned_volumes,
+            outcome.pruned_commits,
+            outcome.pruned_segments,
+            outcome.pruned_pages,
+            outcome.pruned_page_bytes
+        )?;
+    }
+    writeln!(
+        &mut f,
+        "Retained {} volume(s), {} commit(s), {} segment(s), and {} page(s).",
+        outcome.retained_volumes,
+        outcome.retained_commits,
+        outcome.retained_segments,
+        outcome.retained_pages
+    )?;
     Ok(f)
 }
 

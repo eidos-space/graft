@@ -25,16 +25,15 @@ pub(super) fn repo_diff_for_spec(
                         format!("path `{}` is not a regular file", physical_path.display()).into(),
                     )),
                     Ok(_) if is_sqlite_database_path(&physical_path)? => {
-                        let state = import_physical_sqlite_file_state(runtime, &physical_path)?;
                         let expected = repo.index_files()?.get(&key).cloned();
-                        let state = if let Some(expected) = expected
-                            && repo_file_state_content_eq(runtime, &state, &expected)?
-                        {
-                            expected
-                        } else {
-                            state
-                        };
-                        Ok(repo.diff_worktree_file(&physical_path, state, Some(&key))?)
+                        repo_diff_physical_sqlite_file(
+                            runtime,
+                            repo,
+                            &physical_path,
+                            &key,
+                            expected,
+                            None,
+                        )
                     }
                     Ok(_) => Ok(repo.diff_worktree_artifact(&physical_path, Some(&key))?),
                     Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -74,22 +73,16 @@ pub(super) fn repo_diff_for_spec(
                         format!("path `{}` is not a regular file", physical_path.display()).into(),
                     )),
                     Ok(_) if is_sqlite_database_path(&physical_path)? => {
-                        let state = import_physical_sqlite_file_state(runtime, &physical_path)?;
                         let from_id = repo.resolve_revision(&rev)?;
                         let expected = repo.read_commit(&from_id)?.files.get(&key).cloned();
-                        let state = if let Some(expected) = expected
-                            && repo_file_state_content_eq(runtime, &state, &expected)?
-                        {
-                            expected
-                        } else {
-                            state
-                        };
-                        Ok(repo.diff_revision_to_worktree_file(
-                            &rev,
+                        repo_diff_physical_sqlite_file(
+                            runtime,
+                            repo,
                             &physical_path,
-                            state,
-                            Some(&key),
-                        )?)
+                            &key,
+                            expected,
+                            Some(&rev),
+                        )
                     }
                     Ok(_) => Ok(repo.diff_revision_to_worktree_artifact(
                         &rev,
@@ -236,25 +229,20 @@ pub(super) fn repo_worktree_diff_for_filter(
                     if !is_sqlite_database_path(&physical_path)? {
                         continue;
                     }
-                    let state = import_physical_sqlite_file_state(runtime, &physical_path)?;
                     let expected = if let Some(rev) = rev {
                         let from_id = repo.resolve_revision(rev)?;
                         repo.read_commit(&from_id)?.files.get(&key).cloned()
                     } else {
                         index_files.get(&key).cloned()
                     };
-                    let state = if let Some(expected) = expected
-                        && repo_file_state_content_eq(runtime, &state, &expected)?
-                    {
-                        expected
-                    } else {
-                        state
-                    };
-                    if let Some(rev) = rev {
-                        repo.diff_revision_to_worktree_file(rev, &physical_path, state, Some(&key))?
-                    } else {
-                        repo.diff_worktree_file(&physical_path, state, Some(&key))?
-                    }
+                    repo_diff_physical_sqlite_file(
+                        runtime,
+                        repo,
+                        &physical_path,
+                        &key,
+                        expected,
+                        rev,
+                    )?
                 }
                 Ok(_) => continue,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -391,8 +379,7 @@ pub(super) fn repo_status_for_file(
                 if !is_sqlite_database_path(&physical_path)? {
                     continue;
                 }
-                let state = import_physical_sqlite_file_state(runtime, &physical_path)?;
-                if repo_file_state_content_eq(runtime, &state, &expected_state)? {
+                if physical_sqlite_file_matches_state(runtime, &physical_path, &expected_state)? {
                     None
                 } else {
                     Some(RepoWorktreeChangeKind::Modified)
@@ -423,6 +410,48 @@ pub(super) fn repo_status_for_file(
         .collect();
     status.refresh_summary_flags();
     Ok(status)
+}
+
+pub(super) fn repo_diff_physical_sqlite_file(
+    runtime: &Runtime,
+    repo: &Repository,
+    physical_path: &Path,
+    key: &str,
+    expected: Option<CommitFileState>,
+    rev: Option<&str>,
+) -> Result<RepoDiff, ErrCtx> {
+    let physical = PhysicalSqliteReader::open(physical_path)?;
+    let matches = expected
+        .as_ref()
+        .map(|expected| physical.matches_state(runtime, expected))
+        .transpose()?
+        .unwrap_or(false);
+    let state = if matches {
+        expected.expect("matching physical file has an expected state")
+    } else {
+        CommitFileState {
+            volume: VolumeId::EMPTY,
+            snapshot: RepoSnapshot {
+                page_count: physical.page_count(),
+                ranges: Vec::new(),
+            },
+        }
+    };
+    let mut diff = if let Some(rev) = rev {
+        repo.diff_revision_to_worktree_file(rev, physical_path, state, Some(key))?
+    } else {
+        repo.diff_worktree_file(physical_path, state, Some(key))?
+    };
+    if !matches {
+        let file = diff
+            .files
+            .iter_mut()
+            .find(|file| file.path == key)
+            .expect("changed physical SQLite file should produce a diff entry");
+        file.to = None;
+        file.worktree = Some(physical.worktree_state());
+    }
+    Ok(diff)
 }
 
 pub(super) fn repo_has_work_in_progress_for_file(
@@ -592,20 +621,15 @@ pub(super) fn snapshot_table_summary(
         return Ok(Vec::new());
     }
 
-    let volume = runtime.volume_from_snapshot(snapshot)?;
-    let vid = volume.vid.clone();
-    let result = snapshot_table_summary_checked_out(runtime, &vid, mode);
-    let _ = runtime.volume_delete(&vid);
-    result
+    let reader = runtime.snapshot_reader(snapshot.clone());
+    snapshot_table_summary_from_reader(&reader, mode)
 }
 
-pub(super) fn snapshot_table_summary_checked_out(
-    runtime: &Runtime,
-    vid: &VolumeId,
+fn snapshot_table_summary_from_reader(
+    reader: &dyn VolumeRead,
     mode: SnapshotSummaryMode,
 ) -> Result<Vec<CommitTableSummary>, ErrCtx> {
-    let reader = runtime.volume_reader(vid.clone())?;
-    let scanner = crate::sqlite_parse::TableScanner::new(&reader)
+    let scanner = crate::sqlite_parse::TableScanner::new(reader)
         .map_err(|e| ErrCtx::PragmaErr(format!("Parse error: {e:?}").into()))?;
     let master = scanner
         .read_master_table()
@@ -617,7 +641,7 @@ pub(super) fn snapshot_table_summary_checked_out(
         if !crate::row_level_diff::is_diffable_table(&entry, &ignored_tables) {
             continue;
         }
-        let row_count = crate::sqlite_parse::read_all_rows(&reader, entry.root_page)
+        let row_count = crate::sqlite_parse::read_all_rows(reader, entry.root_page)
             .map_err(|e| ErrCtx::PragmaErr(format!("Table read error: {e:?}").into()))?
             .len();
         let summary = match mode {

@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 
 use graft::core::PageIdx;
-use graft::volume_reader::{VolumeRead, VolumeReader};
+use graft::volume_reader::VolumeRead;
 
 /// `SQLite` database header
 #[derive(Debug, Clone)]
@@ -163,12 +163,12 @@ pub enum KeyConstraintKind {
 
 /// Table scanner for reading B-tree pages
 pub struct TableScanner<'a> {
-    reader: &'a VolumeReader,
+    reader: &'a dyn VolumeRead,
     header: DatabaseHeader,
 }
 
 impl<'a> TableScanner<'a> {
-    pub fn new(reader: &'a VolumeReader) -> Result<Self, ParseError> {
+    pub fn new(reader: &'a dyn VolumeRead) -> Result<Self, ParseError> {
         let header_page = reader
             .read_page(PageIdx::FIRST)
             .map_err(|_| ParseError::ReadError)?;
@@ -761,7 +761,7 @@ fn parse_value(data: &[u8], pos: usize, type_code: i64) -> Result<(Value, usize)
 
 /// Parse all rows of a table, returns rowid -> Record mapping
 pub fn read_all_rows(
-    reader: &VolumeReader,
+    reader: &dyn VolumeRead,
     root_page: u32,
 ) -> Result<HashMap<i64, Record>, ParseError> {
     let scanner = TableScanner::new(reader)?;

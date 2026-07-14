@@ -11,7 +11,7 @@ use crate::sqlite_parse::{
 use graft::core::{PageIdx, VolumeId, lsn::LSN};
 use graft::rt::runtime::Runtime;
 use graft::snapshot::Snapshot;
-use graft::volume_reader::{VolumeRead, VolumeReader};
+use graft::volume_reader::VolumeRead;
 
 /// Coarse logical status for a SQLite snapshot diff.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -507,25 +507,20 @@ pub fn row_level_diff_snapshots(
     from_snapshot: &Snapshot,
     to_snapshot: &Snapshot,
 ) -> Result<RowLevelDiff, graft::err::GraftErr> {
-    let from_vol = runtime.volume_from_snapshot(from_snapshot)?;
-    let to_vol = match runtime.volume_from_snapshot(to_snapshot) {
-        Ok(to_vol) => to_vol,
-        Err(err) => {
-            let _ = runtime.volume_delete(&from_vol.vid);
-            return Err(err);
-        }
-    };
-
-    let from_vid = from_vol.vid.clone();
-    let to_vid = to_vol.vid.clone();
+    let from_reader = runtime.snapshot_reader(from_snapshot.clone());
+    let to_reader = runtime.snapshot_reader(to_snapshot.clone());
     let from_lsn = from_snapshot.head().map_or(LSN::FIRST, |(_, lsn)| lsn);
     let to_lsn = to_snapshot.head().map_or(LSN::FIRST, |(_, lsn)| lsn);
+    row_level_diff_readers(&from_reader, &to_reader, from_lsn, to_lsn)
+}
 
-    let result = row_level_diff_checked_out(runtime, &from_vid, &to_vid, from_lsn, to_lsn);
-    let _ = runtime.volume_delete(&from_vol.vid);
-    let _ = runtime.volume_delete(&to_vol.vid);
-
-    result
+pub fn row_level_diff_readers(
+    from_reader: &dyn VolumeRead,
+    to_reader: &dyn VolumeRead,
+    from_lsn: LSN,
+    to_lsn: LSN,
+) -> Result<RowLevelDiff, graft::err::GraftErr> {
+    row_level_diff_from_readers(from_reader, to_reader, from_lsn, to_lsn)
 }
 
 fn row_level_diff_checked_out(
@@ -545,23 +540,29 @@ fn row_level_diff_checked_out(
         graft::err::LogicalErr::Other(format!("Failed to create reader for {to_vid}: {e:?}"))
     })?;
 
+    row_level_diff_from_readers(&from_reader, &to_reader, from_lsn, to_lsn)
+}
+
+fn row_level_diff_from_readers(
+    from_reader: &dyn VolumeRead,
+    to_reader: &dyn VolumeRead,
+    from_lsn: LSN,
+    to_lsn: LSN,
+) -> Result<RowLevelDiff, graft::err::GraftErr> {
     // Read master table for both versions
-    let from_scanner = TableScanner::new(&from_reader).map_err(|e| {
-        tracing::error!("Failed to create from_scanner for {}: {:?}", from_vid, e);
-        graft::err::LogicalErr::Other(format!("Failed to parse B-tree for {from_vid}: {e:?}"))
+    let from_scanner = TableScanner::new(from_reader).map_err(|e| {
+        tracing::error!("Failed to create source scanner: {:?}", e);
+        graft::err::LogicalErr::Other(format!("Failed to parse source B-tree: {e:?}"))
     })?;
-    let to_scanner = TableScanner::new(&to_reader).map_err(|e| {
-        tracing::error!("Failed to create to_scanner for {}: {:?}", to_vid, e);
-        graft::err::LogicalErr::Other(format!("Failed to parse B-tree for {to_vid}: {e:?}"))
+    let to_scanner = TableScanner::new(to_reader).map_err(|e| {
+        graft::err::LogicalErr::Other(format!("Failed to parse target B-tree: {e:?}"))
     })?;
 
     let from_master = from_scanner.read_master_table().map_err(|e| {
-        tracing::error!("Failed to read from_master_table for {}: {:?}", from_vid, e);
-        graft::err::LogicalErr::Other(format!("Failed to read schema for {from_vid}: {e:?}"))
+        graft::err::LogicalErr::Other(format!("Failed to read source schema: {e:?}"))
     })?;
     let to_master = to_scanner.read_master_table().map_err(|e| {
-        tracing::error!("Failed to read to_master_table for {}: {:?}", to_vid, e);
-        graft::err::LogicalErr::Other(format!("Failed to read schema for {to_vid}: {e:?}"))
+        graft::err::LogicalErr::Other(format!("Failed to read target schema: {e:?}"))
     })?;
 
     // Compare schema and tables
@@ -578,13 +579,13 @@ fn row_level_diff_checked_out(
     dedupe_limitations(&mut limitations);
     let ignored_tables: HashSet<String> = ignored_table_infos.keys().cloned().collect();
     let opaque_changes = diff_opaque_tables(
-        &from_reader,
-        &to_reader,
+        from_reader,
+        to_reader,
         &from_master,
         &to_master,
         &ignored_table_infos,
     );
-    let index_btree_changes = diff_index_btrees(&from_reader, &to_reader, &from_master, &to_master);
+    let index_btree_changes = diff_index_btrees(from_reader, to_reader, &from_master, &to_master);
     limitations.extend(index_btree_changes.iter().map(|change| {
         RowLevelDiffLimitation::new(change.reason.limitation_kind(), Some(change.name.clone()))
     }));
@@ -627,11 +628,11 @@ fn row_level_diff_checked_out(
         let changes = match (from_entry, to_entry) {
             (Some(from), Some(to)) => {
                 // Table exists in both, diff rows
-                diff_table_rows(&from_reader, &to_reader, from, to)?
+                diff_table_rows(from_reader, to_reader, from, to)?
             }
             (Some(from), None) => {
                 // Table deleted, all rows are DELETE
-                let rows = read_all_rows(&from_reader, from.root_page)
+                let rows = read_all_rows(from_reader, from.root_page)
                     .map_err(|e| table_read_err("from", from, e))?;
                 rows.into_iter()
                     .map(|(rowid, row)| RowChange::Delete { rowid, row })
@@ -639,7 +640,7 @@ fn row_level_diff_checked_out(
             }
             (None, Some(to)) => {
                 // New table, all rows are INSERT
-                let rows = read_all_rows(&to_reader, to.root_page)
+                let rows = read_all_rows(to_reader, to.root_page)
                     .map_err(|e| table_read_err("to", to, e))?;
                 rows.into_iter()
                     .map(|(rowid, row)| RowChange::Insert { rowid, row })
@@ -765,8 +766,8 @@ fn change_kind_label(kind: SchemaChangeKind) -> &'static str {
 
 /// Diff rows for a single table
 fn diff_table_rows(
-    from_reader: &VolumeReader,
-    to_reader: &VolumeReader,
+    from_reader: &dyn VolumeRead,
+    to_reader: &dyn VolumeRead,
     from_entry: &MasterEntry,
     to_entry: &MasterEntry,
 ) -> Result<Vec<RowChange>, graft::err::LogicalErr> {
@@ -945,8 +946,8 @@ pub(crate) fn ignored_row_diff_table_infos(
 }
 
 fn diff_opaque_tables(
-    from_reader: &VolumeReader,
-    to_reader: &VolumeReader,
+    from_reader: &dyn VolumeRead,
+    to_reader: &dyn VolumeRead,
     from_master: &[MasterEntry],
     to_master: &[MasterEntry],
     ignored_tables: &BTreeMap<String, IgnoredTable>,
@@ -979,8 +980,8 @@ fn diff_opaque_tables(
 }
 
 fn diff_index_btrees(
-    from_reader: &VolumeReader,
-    to_reader: &VolumeReader,
+    from_reader: &dyn VolumeRead,
+    to_reader: &dyn VolumeRead,
     from_master: &[MasterEntry],
     to_master: &[MasterEntry],
 ) -> Vec<OpaqueChange> {
@@ -1013,8 +1014,8 @@ fn diff_index_btrees(
 }
 
 fn opaque_table_change_kind(
-    from_reader: &VolumeReader,
-    to_reader: &VolumeReader,
+    from_reader: &dyn VolumeRead,
+    to_reader: &dyn VolumeRead,
     from: &MasterEntry,
     to: &MasterEntry,
     reason: OpaqueChangeReason,
@@ -1048,8 +1049,8 @@ fn opaque_table_change_kind(
 }
 
 fn opaque_root_page_change_kind(
-    from_reader: &VolumeReader,
-    to_reader: &VolumeReader,
+    from_reader: &dyn VolumeRead,
+    to_reader: &dyn VolumeRead,
     from: &MasterEntry,
     to: &MasterEntry,
 ) -> Option<OpaqueChangeKind> {

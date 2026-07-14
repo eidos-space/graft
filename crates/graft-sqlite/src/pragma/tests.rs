@@ -925,6 +925,37 @@ fn parse_lfs_prune_arg_defaults_to_dry_run() {
 }
 
 #[test]
+fn parse_storage_gc_arg_defaults_to_dry_run() {
+    assert_eq!(
+        parse_storage_gc_arg(None).unwrap(),
+        StorageGcSpec { dry_run: true }
+    );
+    assert_eq!(
+        parse_storage_gc_arg(Some("")).unwrap(),
+        StorageGcSpec { dry_run: true }
+    );
+    assert_eq!(
+        parse_storage_gc_arg(Some("--dry-run")).unwrap(),
+        StorageGcSpec { dry_run: true }
+    );
+    assert_eq!(
+        parse_storage_gc_arg(Some("--force")).unwrap(),
+        StorageGcSpec { dry_run: false }
+    );
+    assert!(parse_storage_gc_arg(Some("--force --dry-run")).is_err());
+    assert!(parse_storage_gc_arg(Some("--unknown")).is_err());
+
+    assert!(matches!(
+        GraftPragma::try_from(&Pragma {
+            name: "graft_json_gc",
+            arg: Some("--force")
+        })
+        .unwrap(),
+        GraftPragma::JsonStorageGc { spec: StorageGcSpec { dry_run: false } }
+    ));
+}
+
+#[test]
 fn payload_pragmas_alias_lfs_payload_pragmas() {
     assert!(matches!(
         GraftPragma::try_from(&Pragma {

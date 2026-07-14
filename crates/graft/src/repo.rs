@@ -717,6 +717,13 @@ pub struct RepoFileDiff {
     pub storage: RepoPathStorage,
     pub from: Option<CommitFileState>,
     pub to: Option<CommitFileState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<RepoWorktreeFileState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoWorktreeFileState {
+    pub page_count: PageCount,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2189,6 +2196,7 @@ fn diff_repo_maps(
                 storage: RepoPathStorage::SqliteSnapshot,
                 from: before,
                 to: after,
+                worktree: None,
             });
         }
     }

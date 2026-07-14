@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::{Display, Write},
     fs::File,
-    io::{Read, Write as IoWrite},
+    io::{Read, Seek, SeekFrom, Write as IoWrite},
     path::{Path, PathBuf},
     str::FromStr,
     sync::{
@@ -12,7 +12,7 @@ use std::{
 };
 
 use graft::core::{
-    LogId, PageIdx, VolumeId,
+    LogId, PageCount, PageIdx, VolumeId,
     byte_unit::ByteUnit,
     logref::LogRef,
     lsn::{LSN, LSNRangeExt},
@@ -28,7 +28,7 @@ use graft::repo::{
     RepoLargeFilePruneOutcome, RepoLargeFileStatusOutcome, RepoLargeFileStatusState, RepoLogRange,
     RepoPathStorage, RepoSnapshot, RepoStatus, RepoStorageCommit, RepoTextContentDiff,
     RepoTrackedPath, RepoTrackedPathDetail, RepoTrackedPathEntry, RepoTrackedPathKind,
-    RepoWorktreeChangeKind, Repository, ResetMode, ResetOutcome, TagInfo,
+    RepoWorktreeChangeKind, RepoWorktreeFileState, Repository, ResetMode, ResetOutcome, TagInfo,
 };
 use graft::{
     rt::runtime::Runtime, volume::AheadStatus, volume_reader::VolumeRead,
@@ -526,6 +526,12 @@ pub(crate) enum GraftPragma {
         operation: &'static str,
     },
 
+    /// `pragma graft_gc [= "[--dry-run|--force]"];`
+    StorageGc { spec: StorageGcSpec },
+
+    /// `pragma graft_json_gc [= "[--dry-run|--force]"];`
+    JsonStorageGc { spec: StorageGcSpec },
+
     /// `pragma graft_ls_files [= "[--stage|--details|--others] [--kind kind]"];`
     LsFiles { spec: LsFilesSpec },
 
@@ -988,6 +994,8 @@ impl TryFrom<&Pragma<'_>> for GraftPragma {
                     spec: parse_lfs_prune_arg(p.arg)?,
                     operation: "payload_prune",
                 }),
+                "gc" => Ok(GraftPragma::StorageGc { spec: parse_storage_gc_arg(p.arg)? }),
+                "json_gc" => Ok(GraftPragma::JsonStorageGc { spec: parse_storage_gc_arg(p.arg)? }),
                 "ls_files" => Ok(GraftPragma::LsFiles { spec: parse_ls_files_arg(p.arg)? }),
                 "json_ls_files" => {
                     Ok(GraftPragma::JsonLsFiles { spec: parse_ls_files_arg(p.arg)? })
@@ -1916,6 +1924,21 @@ impl GraftPragma {
                     outcome,
                 })?))
             }
+            GraftPragma::StorageGc { spec } => {
+                let outcome = run_repo_storage_gc(&runtime, file, spec.dry_run)?;
+                Ok(Some(format_storage_gc_outcome(&outcome)?))
+            }
+            GraftPragma::JsonStorageGc { spec } => {
+                let repo = repo_for_file(file)?;
+                let (current_head, current_branch) = repo_head_and_branch(&repo)?;
+                let outcome = run_repo_storage_gc(&runtime, file, spec.dry_run)?;
+                Ok(Some(to_json(&JsonStorageGcOutcome {
+                    operation: "gc",
+                    current_head,
+                    current_branch,
+                    outcome,
+                })?))
+            }
             GraftPragma::LsFiles { spec } => {
                 let repo = repo_for_file(file)?;
                 if spec.others {
@@ -2469,6 +2492,31 @@ impl GraftPragma {
             }
         }
     }
+}
+
+fn run_repo_storage_gc(
+    runtime: &Runtime,
+    file: &mut VolFile,
+    dry_run: bool,
+) -> Result<graft::local::fjall_storage::StorageGcOutcome, ErrCtx> {
+    if !file.is_idle() {
+        return pragma_err!("cannot run gc while there is an open transaction");
+    }
+
+    let repo = repo_for_file(file)?;
+    let states = repo.referenced_storage_states()?;
+    let mut root_volumes = states
+        .iter()
+        .map(|state| state.volume.clone())
+        .collect::<BTreeSet<_>>();
+    root_volumes.insert(file.vid.clone());
+    let root_snapshots = states
+        .iter()
+        .map(|state| state.snapshot.to_snapshot())
+        .collect::<Vec<_>>();
+    runtime
+        .storage_gc(&root_volumes, &root_snapshots, dry_run)
+        .map_err(ErrCtx::from)
 }
 
 #[cfg(test)]

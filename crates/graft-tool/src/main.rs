@@ -88,6 +88,9 @@ enum Command {
     /// Audit repository artifact payloads
     Audit(AuditArgs),
 
+    /// Prune unreachable `SQLite` storage from the repository
+    Gc(StorageGcArgs),
+
     /// List repository path inventory
     LsFiles {
         /// Emit JSON path inventory
@@ -520,6 +523,21 @@ struct AuditArgs {
 }
 
 #[derive(Args)]
+struct StorageGcArgs {
+    /// Emit JSON garbage-collection output
+    #[arg(long)]
+    json: bool,
+
+    /// Preview unreachable storage without deleting it
+    #[arg(long, conflicts_with = "force")]
+    dry_run: bool,
+
+    /// Delete unreachable storage and compact Fjall
+    #[arg(long, conflicts_with = "dry_run")]
+    force: bool,
+}
+
+#[derive(Args)]
 struct RmArgs {
     /// Emit JSON remove output with current repository state
     #[arg(long)]
@@ -852,6 +870,11 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
         Command::Audit(args) => {
             let pragma = if args.json { "json_audit" } else { "audit" };
             let arg = repo_audit_arg(args.repair, args.remote.as_deref());
+            print_output(run_repo_pragma(db_override, None, pragma, arg.as_deref())?);
+        }
+        Command::Gc(args) => {
+            let pragma = if args.json { "json_gc" } else { "gc" };
+            let arg = repo_gc_arg(args.dry_run, args.force);
             print_output(run_repo_pragma(db_override, None, pragma, arg.as_deref())?);
         }
         Command::LsFiles { json, stage, details, others, kind } => {
@@ -2004,6 +2027,15 @@ fn repo_payload_prune_arg(dry_run: bool, force: bool) -> Option<String> {
     }
 }
 
+fn repo_gc_arg(dry_run: bool, force: bool) -> Option<String> {
+    match (dry_run, force) {
+        (false, false) => None,
+        (true, false) => Some("--dry-run".to_string()),
+        (false, true) => Some("--force".to_string()),
+        (true, true) => unreachable!("clap prevents --dry-run with --force"),
+    }
+}
+
 fn repo_payload_fetch_arg(remote: Option<&str>, rev: Option<&str>) -> Option<String> {
     let mut parts = Vec::new();
     if let Some(remote) = remote {
@@ -2881,6 +2913,32 @@ mod tests {
         assert!(
             Cli::try_parse_from(["graft", "payload", "prune", "--dry-run", "--force"]).is_err()
         );
+    }
+
+    #[test]
+    fn parses_gc_flags() {
+        let cli = Cli::try_parse_from(["graft", "gc", "--json"]).unwrap();
+        let Command::Gc(args) = cli.command else {
+            panic!("expected gc command");
+        };
+        assert!(args.json);
+        assert!(!args.dry_run);
+        assert!(!args.force);
+        assert_eq!(repo_gc_arg(args.dry_run, args.force), None);
+
+        let cli = Cli::try_parse_from(["graft", "gc", "--force"]).unwrap();
+        let Command::Gc(args) = cli.command else {
+            panic!("expected gc command");
+        };
+        assert!(!args.json);
+        assert!(!args.dry_run);
+        assert!(args.force);
+        assert_eq!(
+            repo_gc_arg(args.dry_run, args.force).as_deref(),
+            Some("--force")
+        );
+
+        assert!(Cli::try_parse_from(["graft", "gc", "--dry-run", "--force"]).is_err());
     }
 
     #[test]

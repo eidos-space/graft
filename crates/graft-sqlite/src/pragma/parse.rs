@@ -12,7 +12,8 @@ use super::{
     JsonTagsMode, LargeFileFetchSpec, LargeFilePruneSpec, LargeFileStatusSpec, LsFilesSpec,
     RepoAddSpec, RepoAuditSpec, RepoCheckoutSpec, RepoCloneSpec, RepoDiffSpec, RepoDiffTarget,
     RepoExportSpec, RepoInitSpec, RepoRemoveSpec, RepoResolveRowSpec, RepoResolveSpec,
-    RepoRestoreSpec, RepoTextContentSpec, ResolveSide, StatusSpec, parse_or_fail, pragma_fail,
+    RepoRestoreSpec, RepoTextContentSpec, ResolveSide, StatusSpec, StorageGcSpec, parse_or_fail,
+    pragma_fail,
 };
 
 pub(super) fn parse_remote_add(arg: &str) -> Result<(String, RemoteConfig), PragmaErr> {
@@ -800,6 +801,39 @@ pub(super) fn parse_lfs_prune_arg(arg: Option<&str>) -> Result<LargeFilePruneSpe
     }
 
     Ok(LargeFilePruneSpec { dry_run: dry_run.unwrap_or(true) })
+}
+
+pub(super) fn parse_storage_gc_arg(arg: Option<&str>) -> Result<StorageGcSpec, PragmaErr> {
+    let Some(arg) = arg else {
+        return Ok(StorageGcSpec { dry_run: true });
+    };
+    let parts = split_pragma_words(arg.trim())?;
+    if parts.is_empty() {
+        return Ok(StorageGcSpec { dry_run: true });
+    }
+
+    let mut dry_run = None;
+    for part in parts {
+        match part.as_str() {
+            "--dry-run" => {
+                if dry_run.replace(true).is_some() {
+                    return Err(pragma_fail("gc accepts only one mode flag"));
+                }
+            }
+            "--force" => {
+                if dry_run.replace(false).is_some() {
+                    return Err(pragma_fail("gc accepts only one mode flag"));
+                }
+            }
+            value => {
+                return Err(pragma_fail(format!(
+                    "unknown gc argument `{value}`; expected `--dry-run` or `--force`"
+                )));
+            }
+        }
+    }
+
+    Ok(StorageGcSpec { dry_run: dry_run.unwrap_or(true) })
 }
 
 pub(super) fn parse_status_arg(arg: Option<&str>) -> Result<StatusSpec, PragmaErr> {

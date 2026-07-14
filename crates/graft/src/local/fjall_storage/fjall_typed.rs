@@ -49,6 +49,10 @@ where
     pub fn remove(&self, key: K) -> Result<()> {
         Ok(self.keyspace.remove(key.into_slice())?)
     }
+
+    pub fn major_compact(&self) -> Result<()> {
+        Ok(self.keyspace.major_compact()?)
+    }
 }
 
 pub trait WriteBatchExt<K, V>

@@ -786,84 +786,164 @@ pub(super) fn stage_physical_sqlite_file(
     Ok(entry)
 }
 
+pub(super) struct PhysicalSqliteReader {
+    input: Mutex<File>,
+    path: PathBuf,
+    snapshot: graft::snapshot::Snapshot,
+}
+
+impl PhysicalSqliteReader {
+    pub(super) fn open(path: &Path) -> Result<Self, ErrCtx> {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !metadata.file_type().is_file() {
+            return Err(ErrCtx::PragmaErr(
+                format!(
+                    "path `{}` is not a regular SQLite database file",
+                    path.display()
+                )
+                .into(),
+            ));
+        }
+
+        if metadata.len() < 100 {
+            return Err(ErrCtx::PragmaErr(
+                format!("path `{}` is not a SQLite database", path.display()).into(),
+            ));
+        }
+
+        let mut input = File::open(path)?;
+        let mut header = [0_u8; 100];
+        input.read_exact(&mut header)?;
+        if &header[..SQLITE_DATABASE_MAGIC.len()] != SQLITE_DATABASE_MAGIC {
+            return Err(ErrCtx::PragmaErr(
+                format!("path `{}` is not a SQLite database", path.display()).into(),
+            ));
+        }
+
+        let sqlite_page_size = sqlite_page_size_from_header(&header);
+        let graft_page_size = PAGESIZE.as_usize() as u32;
+        if sqlite_page_size != graft_page_size {
+            return Err(ErrCtx::PragmaErr(format!(
+                "can only read SQLite databases with {graft_page_size}-byte pages directly; \
+                 `{}` uses {sqlite_page_size}-byte pages. Use VACUUM INTO with the Graft VFS to import it.",
+                path.display()
+            ).into()));
+        }
+
+        let page_size = PAGESIZE.as_usize();
+        if metadata.len() % page_size as u64 != 0 {
+            return Err(ErrCtx::PragmaErr(
+                format!(
+                    "SQLite database `{}` is not an even multiple of {page_size} bytes",
+                    path.display()
+                )
+                .into(),
+            ));
+        }
+
+        let page_count = metadata.len() / page_size as u64;
+        let page_count = u32::try_from(page_count).map_err(|_| {
+            ErrCtx::PragmaErr(
+                format!("SQLite database `{}` has too many pages", path.display()).into(),
+            )
+        })?;
+        let mut snapshot = graft::snapshot::Snapshot::empty();
+        snapshot.page_count = PageCount::new(page_count);
+        Ok(Self {
+            input: Mutex::new(input),
+            path: path.to_path_buf(),
+            snapshot,
+        })
+    }
+
+    pub(super) fn worktree_state(&self) -> RepoWorktreeFileState {
+        RepoWorktreeFileState { page_count: self.page_count() }
+    }
+
+    pub(super) fn matches_state(
+        &self,
+        runtime: &Runtime,
+        expected: &CommitFileState,
+    ) -> Result<bool, ErrCtx> {
+        if self.page_count() != expected.snapshot.page_count {
+            return Ok(false);
+        }
+
+        let stored = runtime.snapshot_reader(expected.snapshot.to_snapshot());
+        for page_number in 1..=self.page_count().to_u32() {
+            let pageidx = PageIdx::try_from(page_number).map_err(|err| {
+                ErrCtx::PragmaErr(format!("invalid SQLite page index {page_number}: {err}").into())
+            })?;
+            if self.read_page(pageidx)? != stored.read_page(pageidx)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+}
+
+impl VolumeRead for PhysicalSqliteReader {
+    fn snapshot(&self) -> &graft::snapshot::Snapshot {
+        &self.snapshot
+    }
+
+    fn page_count(&self) -> PageCount {
+        self.snapshot.page_count
+    }
+
+    fn read_page(&self, pageidx: PageIdx) -> Result<Page, graft::err::GraftErr> {
+        if pageidx.to_u32() > self.page_count().to_u32() {
+            return Ok(Page::EMPTY);
+        }
+        let offset = u64::from(pageidx.to_u32() - 1) * PAGESIZE.as_u64();
+        let mut page_bytes = vec![0_u8; PAGESIZE.as_usize()];
+        let mut input = self.input.lock();
+        input.seek(SeekFrom::Start(offset)).map_err(|err| {
+            graft::err::LogicalErr::Other(format!(
+                "failed to seek SQLite database `{}`: {err}",
+                self.path.display()
+            ))
+        })?;
+        input.read_exact(&mut page_bytes).map_err(|err| {
+            graft::err::LogicalErr::Other(format!(
+                "failed to read SQLite database `{}`: {err}",
+                self.path.display()
+            ))
+        })?;
+        Page::try_from(page_bytes.as_slice()).map_err(|err| {
+            graft::err::LogicalErr::Other(format!(
+                "invalid SQLite page in `{}`: {err}",
+                self.path.display()
+            ))
+            .into()
+        })
+    }
+}
+
+pub(super) fn physical_sqlite_file_matches_state(
+    runtime: &Runtime,
+    path: &Path,
+    expected: &CommitFileState,
+) -> Result<bool, ErrCtx> {
+    let physical = PhysicalSqliteReader::open(path)?;
+    physical.matches_state(runtime, expected)
+}
+
 pub(super) fn import_physical_sqlite_file_state(
     runtime: &Runtime,
     path: &Path,
 ) -> Result<CommitFileState, ErrCtx> {
-    let metadata = std::fs::symlink_metadata(path)?;
-    if !metadata.file_type().is_file() {
-        return Err(ErrCtx::PragmaErr(
-            format!(
-                "path `{}` is not a regular SQLite database file",
-                path.display()
-            )
-            .into(),
-        ));
-    }
-
-    if metadata.len() < 100 {
-        return Err(ErrCtx::PragmaErr(
-            format!("path `{}` is not a SQLite database", path.display()).into(),
-        ));
-    }
-
-    let mut input = File::open(path)?;
-    let mut header = [0_u8; 100];
-    input.read_exact(&mut header)?;
-    if &header[..SQLITE_DATABASE_MAGIC.len()] != SQLITE_DATABASE_MAGIC {
-        return Err(ErrCtx::PragmaErr(
-            format!("path `{}` is not a SQLite database", path.display()).into(),
-        ));
-    }
-
-    let sqlite_page_size = sqlite_page_size_from_header(&header);
-    let graft_page_size = PAGESIZE.as_usize() as u32;
-    if sqlite_page_size != graft_page_size {
-        return Err(ErrCtx::PragmaErr(format!(
-            "can only add SQLite databases with {graft_page_size}-byte pages directly; \
-             `{}` uses {sqlite_page_size}-byte pages. Use VACUUM INTO with the Graft VFS to import it.",
-            path.display()
-        ).into()));
-    }
-
-    let page_size = PAGESIZE.as_usize();
-    if metadata.len() % page_size as u64 != 0 {
-        return Err(ErrCtx::PragmaErr(
-            format!(
-                "SQLite database `{}` is not an even multiple of {page_size} bytes",
-                path.display()
-            )
-            .into(),
-        ));
-    }
-
-    let page_count = metadata.len() / page_size as u64;
-    let page_count_u32 = u32::try_from(page_count).map_err(|_| {
-        ErrCtx::PragmaErr(
-            format!(
-                "SQLite database `{}` has too many pages to import",
-                path.display()
-            )
-            .into(),
-        )
-    })?;
-
+    let physical = PhysicalSqliteReader::open(path)?;
     let volume = runtime.volume_open(None, None, None)?;
     let vid = volume.vid;
     let mut writer = runtime.volume_writer(vid.clone())?;
-    let mut page_bytes = vec![0_u8; page_size];
-    let mut input = File::open(path)?;
-    for page_number in 1..=page_count_u32 {
-        input.read_exact(&mut page_bytes)?;
-        let page = Page::try_from(page_bytes.as_slice()).map_err(|err| {
-            ErrCtx::PragmaErr(format!("invalid SQLite page in `{}`: {err}", path.display()).into())
-        })?;
+    for page_number in 1..=physical.page_count().to_u32() {
         let pageidx = PageIdx::try_from(page_number).map_err(|err| {
             ErrCtx::PragmaErr(
                 format!("invalid SQLite page index in `{}`: {err}", path.display()).into(),
             )
         })?;
-        writer.write_page(pageidx, page)?;
+        writer.write_page(pageidx, physical.read_page(pageidx)?)?;
     }
     let reader = writer.commit()?;
     Ok(CommitFileState {

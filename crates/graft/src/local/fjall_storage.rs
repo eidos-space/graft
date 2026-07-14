@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, fmt::Debug, ops::RangeInclusive, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt::Debug,
+    ops::RangeInclusive,
+    path::Path,
+};
 
 use crate::{
     core::{
@@ -8,7 +13,7 @@ use crate::{
         commit_hash::CommitHash,
         logref::LogRef,
         lsn::{LSN, LSNRangeExt, LSNSet},
-        page::Page,
+        page::{PAGESIZE, Page},
         pageset::PageSet,
     },
     local::fjall_storage::{
@@ -51,6 +56,25 @@ pub enum FjallStorageErr {
 
     #[error(transparent)]
     LogicalErr(#[from] LogicalErr),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct StorageGcOutcome {
+    pub dry_run: bool,
+    pub retained_volumes: usize,
+    pub retained_commits: usize,
+    pub retained_segments: usize,
+    pub retained_pages: usize,
+    pub candidate_volumes: usize,
+    pub candidate_commits: usize,
+    pub candidate_segments: usize,
+    pub candidate_pages: usize,
+    pub candidate_page_bytes: u64,
+    pub pruned_volumes: usize,
+    pub pruned_commits: usize,
+    pub pruned_segments: usize,
+    pub pruned_pages: usize,
+    pub pruned_page_bytes: u64,
 }
 
 struct Keyspaces {
@@ -203,6 +227,184 @@ impl FjallStorage {
         batch.write_volume(volume.clone());
         batch.commit()?;
         Ok(volume)
+    }
+
+    /// Removes storage records that are not reachable from repository snapshots,
+    /// repository volumes, tagged volumes, or in-flight remote commits.
+    pub fn gc(
+        &self,
+        root_volumes: &BTreeSet<VolumeId>,
+        root_snapshots: &[Snapshot],
+        dry_run: bool,
+    ) -> Result<StorageGcOutcome, FjallStorageErr> {
+        let _permit = self.lock.lock();
+        let read = self.read();
+
+        let all_volumes = read
+            .snapshot
+            .iter(&self.ks.volumes)
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        let all_commits = read
+            .snapshot
+            .iter(&self.ks.log)
+            .map(|entry| {
+                let (logref, commit) = entry?;
+                Ok(((logref.log, logref.lsn), commit))
+            })
+            .collect::<Result<BTreeMap<_, _>, FjallStorageErr>>()?;
+
+        let mut retained_volumes = root_volumes.clone();
+        for tagged in read.snapshot.iter(&self.ks.tags).values() {
+            retained_volumes.insert(tagged?);
+        }
+        for volume in all_volumes.values() {
+            if volume.pending_commit().is_some() {
+                retained_volumes.insert(volume.vid.clone());
+            }
+        }
+
+        let mut retained_logs = BTreeSet::new();
+        for vid in &retained_volumes {
+            if let Some(volume) = all_volumes.get(vid) {
+                retained_logs.insert(volume.local.clone());
+                retained_logs.insert(volume.remote.clone());
+            }
+        }
+
+        let mut retained_commit_keys = all_commits
+            .keys()
+            .filter(|(log, _)| retained_logs.contains(log))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for snapshot in root_snapshots {
+            for commit in read.commits(snapshot) {
+                let commit = commit?;
+                retained_commit_keys.insert((commit.log, commit.lsn));
+            }
+        }
+
+        let mut pending = retained_commit_keys.iter().cloned().collect::<Vec<_>>();
+        while let Some(key) = pending.pop() {
+            let Some(commit) = all_commits.get(&key) else {
+                continue;
+            };
+            for checkpoint in commit.checkpoints() {
+                let checkpoint_key = (commit.log.clone(), *checkpoint);
+                if retained_commit_keys.insert(checkpoint_key.clone()) {
+                    pending.push(checkpoint_key);
+                }
+            }
+        }
+
+        let all_segments = all_commits
+            .values()
+            .filter_map(|commit| commit.segment_id().cloned())
+            .collect::<BTreeSet<_>>();
+        let retained_segments = retained_commit_keys
+            .iter()
+            .filter_map(|key| all_commits.get(key))
+            .filter_map(|commit| commit.segment_id().cloned())
+            .collect::<BTreeSet<_>>();
+
+        let candidate_volumes = all_volumes
+            .keys()
+            .filter(|vid| !retained_volumes.contains(*vid))
+            .cloned()
+            .collect::<Vec<_>>();
+        let candidate_commits = all_commits
+            .keys()
+            .filter(|key| !retained_commit_keys.contains(*key))
+            .cloned()
+            .collect::<Vec<_>>();
+        let candidate_checkpoints = read
+            .snapshot
+            .iter(&self.ks.checkpoints)
+            .keys()
+            .filter_map(|entry| match entry {
+                Ok(logref) if !retained_commit_keys.contains(&(logref.log.clone(), logref.lsn)) => {
+                    Some(Ok(logref))
+                }
+                Ok(_) => None,
+                Err(err) => Some(Err(err)),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let candidate_page_versions = read
+            .snapshot
+            .iter(&self.ks.page_versions)
+            .keys()
+            .filter_map(|entry| match entry {
+                Ok(version)
+                    if !retained_commit_keys.contains(&(version.log.clone(), version.lsn)) =>
+                {
+                    Some(Ok(version))
+                }
+                Ok(_) => None,
+                Err(err) => Some(Err(err)),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let all_pages = read
+            .snapshot
+            .iter(&self.ks.pages)
+            .keys()
+            .collect::<Result<Vec<_>, _>>()?;
+        let candidate_pages = all_pages
+            .iter()
+            .filter(|key| !retained_segments.contains(key.segment_id()))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let candidate_segments = all_segments.len() - retained_segments.len();
+        let candidate_page_bytes = candidate_pages.len() as u64 * PAGESIZE.as_u64();
+        let outcome = StorageGcOutcome {
+            dry_run,
+            retained_volumes: all_volumes.len() - candidate_volumes.len(),
+            retained_commits: all_commits.len() - candidate_commits.len(),
+            retained_segments: retained_segments.len(),
+            retained_pages: all_pages.len() - candidate_pages.len(),
+            candidate_volumes: candidate_volumes.len(),
+            candidate_commits: candidate_commits.len(),
+            candidate_segments,
+            candidate_pages: candidate_pages.len(),
+            candidate_page_bytes,
+            pruned_volumes: if dry_run { 0 } else { candidate_volumes.len() },
+            pruned_commits: if dry_run { 0 } else { candidate_commits.len() },
+            pruned_segments: if dry_run { 0 } else { candidate_segments },
+            pruned_pages: if dry_run { 0 } else { candidate_pages.len() },
+            pruned_page_bytes: if dry_run { 0 } else { candidate_page_bytes },
+        };
+
+        if dry_run {
+            return Ok(outcome);
+        }
+
+        let mut batch = self.db.batch();
+        for vid in candidate_volumes {
+            batch.remove_typed(&self.ks.volumes, vid);
+        }
+        for (log, lsn) in candidate_commits {
+            batch.remove_typed(&self.ks.log, LogRef::new(log, lsn));
+        }
+        for checkpoint in candidate_checkpoints {
+            batch.remove_typed(&self.ks.checkpoints, checkpoint);
+        }
+        for version in candidate_page_versions {
+            batch.remove_typed(&self.ks.page_versions, version);
+        }
+        for page in candidate_pages {
+            batch.remove_typed(&self.ks.pages, page);
+        }
+        batch.commit()?;
+
+        // Fjall cannot reclaim tombstoned blob values while this GC's read
+        // snapshot is alive. Drop it before forcing compaction.
+        drop(read);
+        self.ks.volumes.major_compact()?;
+        self.ks.log.major_compact()?;
+        self.ks.checkpoints.major_compact()?;
+        self.ks.page_versions.major_compact()?;
+        self.ks.pages.major_compact()?;
+
+        Ok(outcome)
     }
 }
 

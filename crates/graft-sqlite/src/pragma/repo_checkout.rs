@@ -1681,8 +1681,7 @@ pub(super) fn write_repo_file_state_to_path(
     if snapshot.is_empty() {
         return write_empty_sqlite_file_to_path(path);
     }
-    let volume = runtime.volume_from_snapshot(&snapshot)?;
-    let reader = runtime.volume_reader(volume.vid)?;
+    let reader = runtime.snapshot_reader(snapshot);
     write_volume_reader_to_path(&reader, path)
 }
 

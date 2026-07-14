@@ -810,6 +810,17 @@ pub(super) struct JsonLargeFilePruneOutcome {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub(super) struct JsonStorageGcOutcome {
+    pub(super) operation: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) current_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) current_branch: Option<String>,
+    #[serde(flatten)]
+    pub(super) outcome: graft::local::fjall_storage::StorageGcOutcome,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub(super) struct JsonLargeFileFetchOutcome {
     pub(super) operation: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
