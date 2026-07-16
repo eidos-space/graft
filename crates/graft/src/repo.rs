@@ -8,6 +8,13 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(unix)]
+use std::{
+    collections::HashMap,
+    os::unix::fs::MetadataExt,
+    sync::{Mutex, OnceLock},
+};
+
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream};
 
@@ -72,6 +79,8 @@ pub const DEFAULT_TEXT_DIFF_CONTENT_LIMIT: ByteUnit = ByteUnit::MB;
 const NULL_OBJECT_ID: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 const REFLOG_ACTOR: &str = "Graft <graft@example.invalid>";
 const DEFAULT_LARGE_FILE_THRESHOLD: ByteUnit = ByteUnit::MB;
+#[cfg(unix)]
+const ARTIFACT_STAT_CACHE_MAX_ENTRIES: usize = 100_000;
 
 const CONFIG_FILE: &str = "config.toml";
 const HEAD_FILE: &str = "HEAD";
@@ -1803,6 +1812,83 @@ fn validate_large_file_content(id: &object::ObjectId, size: u64, bytes: &[u8]) -
     Ok(())
 }
 
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ArtifactStatFingerprint {
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArtifactStatCacheEntry {
+    expected: object::ObjectId,
+    fingerprint: ArtifactStatFingerprint,
+    matches: bool,
+}
+
+#[cfg(unix)]
+static ARTIFACT_STAT_CACHE: OnceLock<Mutex<HashMap<PathBuf, ArtifactStatCacheEntry>>> =
+    OnceLock::new();
+
+#[cfg(unix)]
+fn artifact_stat_fingerprint(metadata: &fs::Metadata) -> ArtifactStatFingerprint {
+    ArtifactStatFingerprint {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        size: metadata.len(),
+        modified_seconds: metadata.mtime(),
+        modified_nanoseconds: metadata.mtime_nsec(),
+        changed_seconds: metadata.ctime(),
+        changed_nanoseconds: metadata.ctime_nsec(),
+    }
+}
+
+#[cfg(unix)]
+fn cached_artifact_match(
+    path: &Path,
+    expected: &object::ObjectId,
+    fingerprint: ArtifactStatFingerprint,
+) -> Option<bool> {
+    let cache = ARTIFACT_STAT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache
+        .get(path)
+        .filter(|entry| entry.expected == *expected && entry.fingerprint == fingerprint)
+        .map(|entry| entry.matches)
+}
+
+#[cfg(unix)]
+fn cache_artifact_match(
+    path: &Path,
+    expected: &object::ObjectId,
+    fingerprint: ArtifactStatFingerprint,
+    matches: bool,
+) {
+    let cache = ARTIFACT_STAT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if cache.len() >= ARTIFACT_STAT_CACHE_MAX_ENTRIES && !cache.contains_key(path) {
+        cache.clear();
+    }
+    cache.insert(
+        path.to_path_buf(),
+        ArtifactStatCacheEntry {
+            expected: expected.clone(),
+            fingerprint,
+            matches,
+        },
+    );
+}
+
 fn artifact_file_matches(path: &Path, expected: &CommitArtifactState) -> Result<Option<bool>> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
@@ -1812,10 +1898,24 @@ fn artifact_file_matches(path: &Path, expected: &CommitArtifactState) -> Result<
             if metadata.len() != expected.size() {
                 return Ok(Some(false));
             }
+            #[cfg(unix)]
+            let fingerprint = artifact_stat_fingerprint(&metadata);
+            #[cfg(unix)]
+            if let Some(matches) = cached_artifact_match(path, expected.content_hash(), fingerprint)
+            {
+                return Ok(Some(matches));
+            }
             let bytes = fs::read(path)?;
-            Ok(Some(
-                object::ObjectId::for_bytes(&bytes) == *expected.content_hash(),
-            ))
+            let matches = object::ObjectId::for_bytes(&bytes) == *expected.content_hash();
+            #[cfg(unix)]
+            if fs::symlink_metadata(path)
+                .ok()
+                .filter(|metadata| metadata.file_type().is_file())
+                .is_some_and(|metadata| artifact_stat_fingerprint(&metadata) == fingerprint)
+            {
+                cache_artifact_match(path, expected.content_hash(), fingerprint, matches);
+            }
+            Ok(Some(matches))
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(err.into()),

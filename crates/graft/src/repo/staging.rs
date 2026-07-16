@@ -19,20 +19,19 @@ impl Repository {
             volume,
             snapshot: repo_snapshot_with_test_hashes(snapshot),
         };
-        self.stage_file_state(key, file)
+        let entry = self.index_entry_for_state(key, index::IndexStage::Normal, file)?;
+        self.stage_index_entries(std::slice::from_ref(&entry))?;
+        Ok(entry)
     }
 
-    pub(super) fn stage_file_state(
+    pub fn prepare_file_state_path(
         &self,
-        key: String,
+        path: impl AsRef<Path>,
         file: CommitFileState,
     ) -> Result<index::IndexEntry> {
-        let entry = self.index_entry_for_state(key.clone(), index::IndexStage::Normal, file)?;
-        let mut index = self.read_index()?;
-        index.stage(entry.clone());
-        self.write_index(&index)?;
-        self.clear_dirty_key(&key)?;
-        Ok(entry)
+        validate_commit_file_state(&file)?;
+        let key = self.file_key(path)?;
+        self.index_entry_for_state(key, index::IndexStage::Normal, file)
     }
 
     pub fn stage_file_state_path(
@@ -40,16 +39,22 @@ impl Repository {
         path: impl AsRef<Path>,
         file: CommitFileState,
     ) -> Result<index::IndexEntry> {
-        validate_commit_file_state(&file)?;
-        let key = self.file_key(path)?;
-        self.stage_file_state(key, file)
+        let entry = self.prepare_file_state_path(path, file)?;
+        self.stage_index_entries(std::slice::from_ref(&entry))?;
+        Ok(entry)
     }
 
-    pub fn stage_artifact_path(&self, path: impl AsRef<Path>) -> Result<index::IndexEntry> {
+    pub fn prepare_artifact_path(&self, path: impl AsRef<Path>) -> Result<index::IndexEntry> {
         let key = self.file_key(path)?;
         let physical_path = self.worktree.join(&key);
         let artifact = self.write_artifact_state_from_path(&key, &physical_path)?;
-        self.stage_artifact_state(key, artifact)
+        Ok(self.index_entry_for_artifact_state(key, index::IndexStage::Normal, artifact))
+    }
+
+    pub fn stage_artifact_path(&self, path: impl AsRef<Path>) -> Result<index::IndexEntry> {
+        let entry = self.prepare_artifact_path(path)?;
+        self.stage_index_entries(std::slice::from_ref(&entry))?;
+        Ok(entry)
     }
 
     #[cfg(test)]
@@ -66,20 +71,8 @@ impl Repository {
         };
         let artifact =
             self.write_artifact_state_from_path_with_file_config(&key, &physical_path, &config)?;
-        self.stage_artifact_state(key, artifact)
-    }
-
-    pub(super) fn stage_artifact_state(
-        &self,
-        key: String,
-        artifact: CommitArtifactState,
-    ) -> Result<index::IndexEntry> {
-        let entry =
-            self.index_entry_for_artifact_state(key.clone(), index::IndexStage::Normal, artifact);
-        let mut index = self.read_index()?;
-        index.stage(entry.clone());
-        self.write_index(&index)?;
-        self.clear_dirty_key(&key)?;
+        let entry = self.index_entry_for_artifact_state(key, index::IndexStage::Normal, artifact);
+        self.stage_index_entries(std::slice::from_ref(&entry))?;
         Ok(entry)
     }
 
@@ -101,11 +94,18 @@ impl Repository {
             file: None,
             artifact: None,
         };
-        let mut index = self.read_index()?;
-        index.stage(entry.clone());
-        self.write_index(&index)?;
-        self.clear_dirty_key(&entry.path)?;
+        self.stage_index_entries(std::slice::from_ref(&entry))?;
         Ok(entry)
+    }
+
+    pub fn stage_index_entries(&self, entries: &[index::IndexEntry]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut index = self.read_index()?;
+        index.stage_all(entries.iter().cloned());
+        self.write_index(&index)?;
+        self.clear_dirty_keys(entries.iter().map(|entry| entry.path.as_str()))
     }
 
     pub fn resolve_file_conflict(

@@ -223,6 +223,112 @@ fn test_repo_json_init_reports_repository_and_preserves_database_contents() {
 }
 
 #[test]
+fn test_repo_json_add_can_guard_one_path_and_return_final_status() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let project_dir = temp_dir.path().join("project");
+    let db_path = project_dir.join("app.db");
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_path.to_str().unwrap(), None);
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE guarded_add (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+            INSERT INTO guarded_add (name) VALUES ('Alice');
+            "#,
+        )
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_json_init");
+    std::fs::write(project_dir.join("first.md"), "first\n").unwrap();
+
+    let unborn: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_add",
+        "--with-status --expected-head unborn -- first.md",
+    ))
+    .expect("guarded add should return JSON for an unborn HEAD");
+    assert_eq!(unborn["operation"], "add");
+    assert!(unborn["status"].get("current_head").is_none());
+    let first = unborn["status"]["paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["path"] == "first.md")
+        .unwrap();
+    assert_eq!(first["index_status"], "added");
+
+    let committed: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_commit",
+        "guarded add base",
+    ))
+    .unwrap();
+    let head = committed["commit"]["id"].as_str().unwrap();
+
+    let clean_error = pragma_arg_error(
+        &sqlite,
+        "graft_json_add",
+        format!("--with-status --expected-head {head} -- first.md"),
+    );
+    assert!(clean_error.contains("[graft:add:path-no-changes]"));
+
+    let note_path = project_dir.join("note.md");
+    std::fs::write(&note_path, "first\n").unwrap();
+    let staged: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_add",
+        format!("--with-status --expected-head {head} -- note.md"),
+    ))
+    .unwrap();
+    assert_eq!(staged["status"]["current_head"], head);
+    let note = staged["status"]["paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["path"] == "note.md")
+        .unwrap();
+    assert_eq!(note["index_status"], "added");
+
+    let already_staged: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_add",
+        format!("--with-status --expected-head {head} -- note.md"),
+    ))
+    .unwrap();
+    let note = already_staged["status"]["paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["path"] == "note.md")
+        .unwrap();
+    assert_eq!(note["index_status"], "added");
+
+    let mismatch = pragma_arg_error(
+        &sqlite,
+        "graft_json_add",
+        "--with-status --expected-head wrong-head -- note.md",
+    );
+    assert!(mismatch.contains("[graft:add:expected-head-mismatch]"));
+
+    let repo = Repository::discover_for_file(&db_path).unwrap();
+    let mut config = repo.config().unwrap();
+    config.track.user_roots = vec!["documents/**".to_string()];
+    repo.write_config(&config).unwrap();
+    std::fs::write(project_dir.join("outside.md"), "outside\n").unwrap();
+    let outside_roots = pragma_arg_error(
+        &sqlite,
+        "graft_json_add",
+        format!("--with-status --expected-head {head} -- outside.md"),
+    );
+    assert!(outside_roots.contains("[graft:add:path-no-changes]"));
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
 fn test_repo_json_export_reports_output_path_and_source() {
     graft_test::ensure_test_env();
 

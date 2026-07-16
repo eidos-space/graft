@@ -719,6 +719,8 @@ fn parse_repo_add_arg_supports_force() {
             force: false,
             all: false,
             kind: None,
+            with_status: false,
+            expected_head: None,
         }
     );
     assert_eq!(
@@ -728,6 +730,8 @@ fn parse_repo_add_arg_supports_force() {
             force: false,
             all: true,
             kind: None,
+            with_status: false,
+            expected_head: None,
         }
     );
     assert_eq!(
@@ -737,6 +741,8 @@ fn parse_repo_add_arg_supports_force() {
             force: false,
             all: true,
             kind: None,
+            with_status: false,
+            expected_head: None,
         }
     );
     assert_eq!(
@@ -746,6 +752,8 @@ fn parse_repo_add_arg_supports_force() {
             force: false,
             all: true,
             kind: Some(RepoTrackedPathKind::SqliteDatabase),
+            with_status: false,
+            expected_head: None,
         }
     );
     assert_eq!(
@@ -755,6 +763,8 @@ fn parse_repo_add_arg_supports_force() {
             force: false,
             all: true,
             kind: Some(RepoTrackedPathKind::BinaryFile),
+            with_status: false,
+            expected_head: None,
         }
     );
     assert_eq!(
@@ -764,6 +774,8 @@ fn parse_repo_add_arg_supports_force() {
             force: false,
             all: false,
             kind: None,
+            with_status: false,
+            expected_head: None,
         }
     );
     assert_eq!(
@@ -773,6 +785,8 @@ fn parse_repo_add_arg_supports_force() {
             force: false,
             all: false,
             kind: None,
+            with_status: false,
+            expected_head: None,
         }
     );
     assert_eq!(
@@ -782,6 +796,8 @@ fn parse_repo_add_arg_supports_force() {
             force: true,
             all: false,
             kind: None,
+            with_status: false,
+            expected_head: None,
         }
     );
     assert_eq!(
@@ -791,6 +807,47 @@ fn parse_repo_add_arg_supports_force() {
             force: true,
             all: false,
             kind: None,
+            with_status: false,
+            expected_head: None,
+        }
+    );
+    assert_eq!(
+        parse_repo_add_arg(Some("--with-status -- \"notes/today.md\"")).unwrap(),
+        RepoAddSpec {
+            path: Some(PathBuf::from("notes/today.md")),
+            force: false,
+            all: false,
+            kind: None,
+            with_status: true,
+            expected_head: None,
+        }
+    );
+    assert_eq!(
+        parse_repo_add_arg(Some(
+            "--with-status --expected-head head-2 -- \"notes/today.md\"",
+        ))
+        .unwrap(),
+        RepoAddSpec {
+            path: Some(PathBuf::from("notes/today.md")),
+            force: false,
+            all: false,
+            kind: None,
+            with_status: true,
+            expected_head: Some(Some("head-2".to_string())),
+        }
+    );
+    assert_eq!(
+        parse_repo_add_arg(Some(
+            "--with-status --expected-head unborn -- \"notes/today.md\"",
+        ))
+        .unwrap(),
+        RepoAddSpec {
+            path: Some(PathBuf::from("notes/today.md")),
+            force: false,
+            all: false,
+            kind: None,
+            with_status: true,
+            expected_head: Some(None),
         }
     );
     assert!(parse_repo_add_arg(Some("--force --all")).is_err());

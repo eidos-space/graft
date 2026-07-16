@@ -1,5 +1,14 @@
 use super::*;
 
+const ADD_EXPECTED_HEAD_MISMATCH: &str = "[graft:add:expected-head-mismatch]";
+const ADD_PATH_NO_CHANGES: &str = "[graft:add:path-no-changes]";
+const ADD_PATH_CONFLICTED: &str = "[graft:add:path-conflicted]";
+
+struct RepoAddGuard {
+    status: Option<RepoStatus>,
+    already_staged: bool,
+}
+
 pub(super) fn run_repo_add(
     runtime: &Runtime,
     file: &mut VolFile,
@@ -9,13 +18,142 @@ pub(super) fn run_repo_add(
         return pragma_err!("cannot add while there is an open transaction");
     }
     let repo = repo_for_file(file)?;
+    let guard = validate_repo_add_guard(runtime, file, &repo, spec)?;
+    if guard.as_ref().is_some_and(|guard| guard.already_staged) {
+        return Ok(Vec::new());
+    }
     if spec.all {
         stage_repo_add_all(runtime, file, &repo, spec.kind)
     } else if let Some(path) = spec.path.as_deref() {
-        stage_repo_add_path(runtime, file, &repo, path, spec.force)
+        stage_repo_add_path(
+            runtime,
+            file,
+            &repo,
+            path,
+            spec.force,
+            guard.as_ref().and_then(|guard| guard.status.as_ref()),
+        )
     } else {
         let state = current_repo_file_state(runtime, file)?;
         Ok(vec![repo.stage_file_state_path(&file.tag, state)?])
+    }
+}
+
+fn validate_repo_add_guard(
+    runtime: &Runtime,
+    file: &VolFile,
+    repo: &Repository,
+    spec: &RepoAddSpec,
+) -> Result<Option<RepoAddGuard>, ErrCtx> {
+    let Some(expected_head) = spec.expected_head.as_ref() else {
+        return Ok(None);
+    };
+    let current_head = repo.head_target()?;
+    if current_head.as_ref() != expected_head.as_ref() {
+        return Err(ErrCtx::PragmaErr(ADD_EXPECTED_HEAD_MISMATCH.into()));
+    }
+
+    let path = spec
+        .path
+        .as_deref()
+        .ok_or_else(|| ErrCtx::PragmaErr("add --expected-head requires one path".into()))?;
+    let path_str = path
+        .to_str()
+        .ok_or_else(|| graft::repo::RepoErr::NonUtf8Path(path.to_path_buf()))?;
+    let filter = repo_path_arg(repo, path_str)?;
+    if let Some(already_staged) =
+        validate_single_repo_add_path(runtime, file, repo, path, spec.force, &filter)?
+    {
+        return Ok(Some(RepoAddGuard { status: None, already_staged }));
+    }
+    let status = repo_status_for_file(runtime, file, repo)?;
+    let changes = status
+        .paths
+        .iter()
+        .filter(|change| repo_key_matches_filter(&change.path, &filter))
+        .collect::<Vec<_>>();
+    if changes.is_empty() {
+        return Err(ErrCtx::PragmaErr(ADD_PATH_NO_CHANGES.into()));
+    }
+    if changes.iter().any(|change| change.conflicted) {
+        return Err(ErrCtx::PragmaErr(ADD_PATH_CONFLICTED.into()));
+    }
+    let already_staged = changes.iter().all(|change| {
+        change.worktree_status == graft::repo::RepoStatusPathState::None
+            && change.index_status != graft::repo::RepoStatusPathState::None
+    });
+    Ok(Some(RepoAddGuard { status: Some(status), already_staged }))
+}
+
+fn validate_single_repo_add_path(
+    runtime: &Runtime,
+    file: &VolFile,
+    repo: &Repository,
+    path: &Path,
+    force: bool,
+    key: &str,
+) -> Result<Option<bool>, ErrCtx> {
+    let physical_path = repo_input_path(repo, path);
+    let metadata = match std::fs::metadata(&physical_path) {
+        Ok(metadata) if metadata.is_dir() => return Ok(None),
+        Ok(metadata) if metadata.is_file() => Some(metadata),
+        Ok(_) => return Ok(None),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            if !physical_path.parent().is_some_and(Path::exists) {
+                return Ok(None);
+            }
+            None
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let index = repo.read_index()?;
+    if index
+        .entries
+        .iter()
+        .any(|entry| entry.path == key && entry.stage != graft::repo::index::IndexStage::Normal)
+    {
+        return Err(ErrCtx::PragmaErr(ADD_PATH_CONFLICTED.into()));
+    }
+    let staged = index
+        .stage0_entries()
+        .find(|entry| entry.path == key)
+        .cloned();
+    let had_staged_entry = staged.is_some();
+    let (expected_file, expected_artifact) = match staged {
+        Some(entry) => (entry.file, entry.artifact),
+        None => (
+            repo.head_file(&physical_path)?,
+            repo.head_artifact(&physical_path)?,
+        ),
+    };
+
+    let has_worktree_change = if let Some(expected) = expected_file.as_ref() {
+        let current_key = repo.file_key(&file.tag)?;
+        let actual = if key == current_key {
+            Some(current_repo_file_state(runtime, file)?)
+        } else {
+            repo_file_state_for_key(runtime, repo, key)?
+        };
+        match actual {
+            Some(actual) => !repo_file_state_content_eq(runtime, &actual, expected)?,
+            None => true,
+        }
+    } else if let Some(expected) = expected_artifact.as_ref() {
+        repo.artifact_path_matches_state(&physical_path, expected)? != Some(true)
+    } else if metadata.is_some() {
+        force
+            || (repo.path_matches_track_roots(key)?
+                && !repo.is_ignored_worktree_path(&physical_path)?)
+    } else {
+        false
+    };
+
+    if has_worktree_change {
+        Ok(Some(false))
+    } else if had_staged_entry {
+        Ok(Some(true))
+    } else {
+        Err(ErrCtx::PragmaErr(ADD_PATH_NO_CHANGES.into()))
     }
 }
 
@@ -175,6 +313,7 @@ pub(super) fn stage_repo_add_path(
     repo: &Repository,
     path: &Path,
     force: bool,
+    status: Option<&RepoStatus>,
 ) -> Result<Vec<graft::repo::index::IndexEntry>, ErrCtx> {
     if !path.is_absolute()
         && let Some(path) = path.to_str()
@@ -216,11 +355,19 @@ pub(super) fn stage_repo_add_path(
 
         let directory_key = repo_directory_key(repo, &directory)?;
         if !force {
-            let status = repo_status_for_file(runtime, file, repo)?;
+            let owned_status;
+            let status = match status {
+                Some(status) => status,
+                None => {
+                    owned_status = repo_status_for_file(runtime, file, repo)?;
+                    &owned_status
+                }
+            };
             let changes = status
                 .unstaged_changes
-                .into_iter()
+                .iter()
                 .filter(|change| repo_key_is_under_directory(&change.path, &directory_key))
+                .cloned()
                 .collect();
             return stage_repo_add_changes(runtime, file, repo, changes);
         }
@@ -328,19 +475,22 @@ pub(super) fn stage_repo_add_changes(
 ) -> Result<Vec<graft::repo::index::IndexEntry>, ErrCtx> {
     let current_key = repo.file_key(&file.tag)?;
     let mut entries = Vec::with_capacity(changes.len());
+    let mut prepared_entries = Vec::with_capacity(changes.len());
 
     for change in changes {
         match change.change {
             RepoWorktreeChangeKind::Modified | RepoWorktreeChangeKind::Untracked => {
                 let physical_path = repo.worktree().join(&change.path);
-                entries.push(stage_repo_add_file(
+                let entry = prepare_repo_add_file(
                     runtime,
                     file,
                     repo,
                     &current_key,
                     &change.path,
                     &physical_path,
-                )?);
+                )?;
+                prepared_entries.push(entry.clone());
+                entries.push(entry);
             }
             RepoWorktreeChangeKind::Deleted => {
                 let entry = stage_repo_add_deletion(repo, &change.path)?;
@@ -355,6 +505,7 @@ pub(super) fn stage_repo_add_changes(
         }
     }
 
+    repo.stage_index_entries(&prepared_entries)?;
     Ok(entries)
 }
 
@@ -387,17 +538,33 @@ pub(super) fn stage_repo_add_file(
     key: &str,
     physical_path: &Path,
 ) -> Result<graft::repo::index::IndexEntry, ErrCtx> {
+    let entry = prepare_repo_add_file(runtime, file, repo, current_key, key, physical_path)?;
+    repo.stage_index_entries(std::slice::from_ref(&entry))?;
+    Ok(entry)
+}
+
+pub(super) fn prepare_repo_add_file(
+    runtime: &Runtime,
+    file: &VolFile,
+    repo: &Repository,
+    current_key: &str,
+    key: &str,
+    physical_path: &Path,
+) -> Result<graft::repo::index::IndexEntry, ErrCtx> {
     if key == current_key {
         let state = current_repo_file_state(runtime, file)?;
-        repo.stage_file_state_path(&file.tag, state)
+        repo.prepare_file_state_path(&file.tag, state)
             .map_err(Into::into)
     } else if let Some(state) = repo_file_state_for_key(runtime, repo, key)? {
-        repo.stage_file_state_path(repo.worktree().join(key), state)
+        repo.prepare_file_state_path(repo.worktree().join(key), state)
             .map_err(Into::into)
     } else if is_sqlite_database_path(physical_path)? {
-        stage_physical_sqlite_file(runtime, repo, key, physical_path)
+        let state = import_physical_sqlite_file_state(runtime, physical_path)?;
+        repo.prepare_file_state_path(repo.worktree().join(key), state)
+            .map_err(Into::into)
     } else {
-        repo.stage_artifact_path(physical_path).map_err(Into::into)
+        repo.prepare_artifact_path(physical_path)
+            .map_err(Into::into)
     }
 }
 
@@ -773,17 +940,6 @@ pub(super) fn remove_physical_artifact_file(path: &Path) -> Result<(), ErrCtx> {
     }
 
     Ok(())
-}
-
-pub(super) fn stage_physical_sqlite_file(
-    runtime: &Runtime,
-    repo: &Repository,
-    key: &str,
-    path: &Path,
-) -> Result<graft::repo::index::IndexEntry, ErrCtx> {
-    let state = import_physical_sqlite_file_state(runtime, path)?;
-    let entry = repo.stage_file_state_path(repo.worktree().join(key), state)?;
-    Ok(entry)
 }
 
 pub(super) struct PhysicalSqliteReader {

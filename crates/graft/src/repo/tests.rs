@@ -1260,6 +1260,32 @@ fn stage_artifact_path_commits_regular_file_and_status_tracks_changes() {
 }
 
 #[test]
+fn artifact_status_cache_detects_same_size_rewrites() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = Repository::init(tmp.path()).unwrap();
+    let notes = tmp.path().join("notes.txt");
+    fs::write(&notes, b"first").unwrap();
+
+    repo.stage_artifact_path(&notes).unwrap();
+    repo.commit_staged("track notes").unwrap();
+    assert!(repo.status().unwrap().unstaged_changes.is_empty());
+
+    fs::write(&notes, b"other").unwrap();
+    assert_eq!(
+        repo.status().unwrap().unstaged_changes,
+        vec![RepoWorktreeChange {
+            path: "notes.txt".to_string(),
+            change: RepoWorktreeChangeKind::Modified,
+            kind: RepoTrackedPathKind::TextFile,
+            storage: RepoPathStorage::Inline,
+        }]
+    );
+
+    fs::write(&notes, b"first").unwrap();
+    assert!(repo.status().unwrap().unstaged_changes.is_empty());
+}
+
+#[test]
 fn stage_artifact_path_handles_large_inline_text_with_compact_encoding() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = Repository::init(tmp.path()).unwrap();

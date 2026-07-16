@@ -82,6 +82,8 @@ pub(crate) struct RepoAddSpec {
     pub(super) force: bool,
     pub(super) all: bool,
     pub(super) kind: Option<RepoTrackedPathKind>,
+    pub(super) with_status: bool,
+    pub(super) expected_head: Option<Option<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

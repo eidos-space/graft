@@ -1,5 +1,11 @@
 use super::*;
 
+#[derive(Debug, Clone, Copy)]
+struct ScannedWorktreePath {
+    is_sqlite: bool,
+    size: u64,
+}
+
 impl Repository {
     pub fn mark_dirty_path(&self, path: impl AsRef<Path>) -> Result<()> {
         let key = self.file_key(path)?;
@@ -37,10 +43,20 @@ impl Repository {
     }
 
     pub fn clear_dirty_key(&self, key: &str) -> Result<()> {
-        let key = normalize_repo_path_key(key)?;
+        self.clear_dirty_keys(std::iter::once(key))
+    }
+
+    pub(super) fn clear_dirty_keys<'a>(
+        &self,
+        keys: impl IntoIterator<Item = &'a str>,
+    ) -> Result<()> {
+        let keys = keys
+            .into_iter()
+            .map(normalize_repo_path_key)
+            .collect::<Result<BTreeSet<_>>>()?;
         let mut state = self.read_worktree_state()?;
-        state.dirty.retain(|path| path != &key);
-        state.deleted.retain(|path| path != &key);
+        state.dirty.retain(|path| !keys.contains(path));
+        state.deleted.retain(|path| !keys.contains(path));
         self.write_worktree_state(&state)
     }
 
@@ -408,7 +424,7 @@ impl Repository {
         self.graft_dir.join(DIR_INDEX).join("state.toml")
     }
 
-    pub(super) fn head_target(&self) -> Result<Option<String>> {
+    pub fn head_target(&self) -> Result<Option<String>> {
         match self.head()? {
             Head::Branch { name } => self.read_branch_ref(&name),
             Head::Detached { commit } => Ok(Some(commit)),
@@ -929,47 +945,33 @@ impl Repository {
     ) -> Result<Vec<RepoTrackedPath>> {
         let tracked = self.files_for_worktree_status(index)?;
         let tracked_artifacts = self.artifacts_for_worktree_status(index)?;
-        let mut paths = BTreeMap::<String, RepoTrackedPath>::new();
+        let file_config = self.file_config()?;
+        let mut paths = Vec::new();
 
-        for path in self.scan_untracked_sqlite_files()? {
-            if !tracked.contains_key(&path) && !tracked_artifacts.contains_key(&path) {
-                let size = self.worktree_path_size(&path)?;
-                paths.insert(
-                    path.clone(),
-                    RepoTrackedPath {
-                        path,
-                        kind: RepoTrackedPathKind::SqliteDatabase,
-                        storage: RepoPathStorage::SqliteSnapshot,
-                        size,
-                        page_count: None,
-                    },
-                );
+        for (path, scanned) in self.scan_worktree_files()? {
+            if tracked.contains_key(&path) || tracked_artifacts.contains_key(&path) {
+                continue;
             }
+            let (kind, storage) = if scanned.is_sqlite {
+                (
+                    RepoTrackedPathKind::SqliteDatabase,
+                    RepoPathStorage::SqliteSnapshot,
+                )
+            } else {
+                let kind = classify_artifact_path(&self.worktree.join(&path))?;
+                let storage = artifact_storage_for_path(&path, kind, scanned.size, &file_config);
+                (kind, storage)
+            };
+            paths.push(RepoTrackedPath {
+                path,
+                kind,
+                storage,
+                size: Some(scanned.size),
+                page_count: None,
+            });
         }
 
-        for path in self.scan_untracked_artifact_files()? {
-            if !tracked.contains_key(&path) && !tracked_artifacts.contains_key(&path) {
-                let (kind, storage) = self.worktree_path_descriptor(&path)?;
-                let size = self.worktree_path_size(&path)?;
-                paths.entry(path.clone()).or_insert(RepoTrackedPath {
-                    path,
-                    kind,
-                    storage,
-                    size,
-                    page_count: None,
-                });
-            }
-        }
-
-        Ok(paths.into_values().collect())
-    }
-
-    pub(super) fn worktree_path_size(&self, key: &str) -> Result<Option<u64>> {
-        match fs::metadata(self.worktree.join(key)) {
-            Ok(metadata) => Ok(Some(metadata.len())),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(err) => Err(err.into()),
-        }
+        Ok(paths)
     }
 
     pub(super) fn worktree_path_descriptor(
@@ -995,25 +997,18 @@ impl Repository {
         Ok((kind, storage))
     }
 
-    pub(super) fn scan_untracked_sqlite_files(&self) -> Result<Vec<String>> {
-        let mut paths = BTreeSet::new();
+    fn scan_worktree_files(&self) -> Result<BTreeMap<String, ScannedWorktreePath>> {
+        let mut paths = BTreeMap::new();
         let ignore = self.ignore_rules()?;
-        self.collect_sqlite_worktree_files(&self.worktree, &ignore, &mut paths)?;
-        Ok(paths.into_iter().collect())
+        self.collect_worktree_files(&self.worktree, &ignore, &mut paths)?;
+        Ok(paths)
     }
 
-    pub(super) fn scan_untracked_artifact_files(&self) -> Result<Vec<String>> {
-        let mut paths = BTreeSet::new();
-        let ignore = self.ignore_rules()?;
-        self.collect_artifact_worktree_files(&self.worktree, &ignore, &mut paths)?;
-        Ok(paths.into_iter().collect())
-    }
-
-    pub(super) fn collect_sqlite_worktree_files(
+    fn collect_worktree_files(
         &self,
         dir: &Path,
         ignore: &IgnoreRules,
-        out: &mut BTreeSet<String>,
+        out: &mut BTreeMap<String, ScannedWorktreePath>,
     ) -> Result<()> {
         if !dir.is_dir() {
             return Ok(());
@@ -1031,52 +1026,20 @@ impl Repository {
                 if ignore.is_ignored(&key, true) {
                     continue;
                 }
-                self.collect_sqlite_worktree_files(&path, ignore, out)?;
+                self.collect_worktree_files(&path, ignore, out)?;
             } else if file_type.is_file() {
                 let key = self.worktree_key_for_path(&path)?;
                 if ignore.is_ignored(&key, false) {
                     continue;
                 }
-                if is_sqlite_database_file(&path)? {
-                    out.insert(key);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    pub(super) fn collect_artifact_worktree_files(
-        &self,
-        dir: &Path,
-        ignore: &IgnoreRules,
-        out: &mut BTreeSet<String>,
-    ) -> Result<()> {
-        if !dir.is_dir() {
-            return Ok(());
-        }
-
-        for entry in fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            let file_type = entry.file_type()?;
-            if file_type.is_dir() {
-                if entry.file_name() == GRAFT_DIR {
+                let is_sqlite = is_sqlite_database_file(&path)?;
+                if !is_sqlite && is_sqlite_sidecar_file(&path) {
                     continue;
                 }
-                let key = self.worktree_key_for_path(&path)?;
-                if ignore.is_ignored(&key, true) {
-                    continue;
-                }
-                self.collect_artifact_worktree_files(&path, ignore, out)?;
-            } else if file_type.is_file()
-                && !is_sqlite_sidecar_file(&path)
-                && !is_sqlite_database_file(&path)?
-            {
-                let key = self.worktree_key_for_path(&path)?;
-                if ignore.is_ignored(&key, false) {
-                    continue;
-                }
-                out.insert(key);
+                out.insert(
+                    key,
+                    ScannedWorktreePath { is_sqlite, size: entry.metadata()?.len() },
+                );
             }
         }
         Ok(())

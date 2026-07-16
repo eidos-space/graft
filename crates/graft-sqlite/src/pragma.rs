@@ -200,10 +200,10 @@ pub(crate) enum GraftPragma {
     /// `pragma graft_json_status [= "[--kind kind]"];`
     JsonStatus { spec: StatusSpec },
 
-    /// `pragma graft_add = "[--all|-A] [--kind kind]|[--force] [path]";`
+    /// `pragma graft_add = "[--with-status] [--all|-A] [--kind kind]|[--force] [path]";`
     Add { spec: RepoAddSpec },
 
-    /// `pragma graft_json_add = "[--all|-A] [--kind kind]|[--force] [path]";`
+    /// `pragma graft_json_add = "[--with-status] [--all|-A] [--kind kind]|[--force] [path]";`
     JsonAdd { spec: RepoAddSpec },
 
     /// `pragma graft_rm = "[--cached] [path]";`
@@ -1304,14 +1304,35 @@ impl GraftPragma {
             GraftPragma::JsonAdd { spec } => {
                 let entries = run_repo_add(&runtime, file, &spec)?;
                 let repo = repo_for_file(file)?;
-                let (current_head, current_branch) = repo_head_and_branch(&repo)?;
                 let kind = spec.kind.map(repo_tracked_path_kind_json_label);
+                let status = if spec.with_status {
+                    let status = repo_status_for_file(&runtime, file, &repo)?;
+                    let status = filter_repo_status_by_kind(status, spec.kind);
+                    let current_head = status.head_target.clone();
+                    let current_branch = repo.current_branch()?;
+                    let conflict_analysis =
+                        current_file_status_row_merge_analysis_lossy(&runtime, file, &repo, None);
+                    Some(JsonRepoStatus {
+                        current_head,
+                        current_branch,
+                        kind,
+                        status,
+                        conflict_analysis,
+                    })
+                } else {
+                    None
+                };
+                let (current_head, current_branch) = match status.as_ref() {
+                    Some(status) => (status.current_head.clone(), status.current_branch.clone()),
+                    None => repo_head_and_branch(&repo)?,
+                };
                 Ok(Some(to_json(&JsonAddOutcome {
                     operation: "add",
                     current_head,
                     current_branch,
                     kind,
                     paths: json_staged_entry_paths(&repo, &entries)?,
+                    status,
                 })?))
             }
 

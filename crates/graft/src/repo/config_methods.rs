@@ -144,6 +144,11 @@ impl Repository {
         Ok(self.config()?.track.has_roots())
     }
 
+    pub fn path_matches_track_roots(&self, path: &str) -> Result<bool> {
+        let roots = self.track_roots()?;
+        Ok(roots.is_empty() || config_path_patterns_match(&roots, path))
+    }
+
     pub(super) fn track_roots(&self) -> Result<Vec<String>> {
         Ok(self.config()?.track.roots())
     }

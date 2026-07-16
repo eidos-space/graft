@@ -487,6 +487,8 @@ pub(super) fn parse_repo_add_arg(arg: Option<&str>) -> Result<RepoAddSpec, Pragm
             force: false,
             all: false,
             kind: None,
+            with_status: false,
+            expected_head: None,
         });
     };
     let arg = arg.trim();
@@ -496,6 +498,68 @@ pub(super) fn parse_repo_add_arg(arg: Option<&str>) -> Result<RepoAddSpec, Pragm
             force: false,
             all: false,
             kind: None,
+            with_status: false,
+            expected_head: None,
+        });
+    }
+
+    if arg.split_whitespace().any(|part| part == "--with-status") {
+        let mut parts = split_pragma_words(arg)?;
+        let flag_count = parts.iter().filter(|part| *part == "--with-status").count();
+        if flag_count != 1 {
+            return Err(pragma_fail("add accepts --with-status only once"));
+        }
+        parts.retain(|part| part != "--with-status");
+        let expected_head =
+            if let Some(index) = parts.iter().position(|part| part == "--expected-head") {
+                let Some(value) = parts.get(index + 1).cloned() else {
+                    return Err(pragma_fail("add --expected-head requires a value"));
+                };
+                parts.drain(index..=index + 1);
+                Some(if value == "unborn" { None } else { Some(value) })
+            } else {
+                None
+            };
+        let (path, force, all, kind) = match parts.as_slice() {
+            [flag] if flag == "--all" || flag == "-A" => (None, false, true, None),
+            [flag, kind_flag, kind]
+                if (flag == "--all" || flag == "-A") && kind_flag == "--kind" =>
+            {
+                (
+                    None,
+                    false,
+                    true,
+                    Some(parse_repo_tracked_path_kind_arg(kind)?),
+                )
+            }
+            [force, separator, path]
+                if (force == "--force" || force == "-f") && separator == "--" =>
+            {
+                (Some(PathBuf::from(path)), true, false, None)
+            }
+            [force, path] if force == "--force" || force == "-f" => {
+                (Some(PathBuf::from(path)), true, false, None)
+            }
+            [separator, path] if separator == "--" => {
+                (Some(PathBuf::from(path)), false, false, None)
+            }
+            [path] if !path.starts_with('-') => (Some(PathBuf::from(path)), false, false, None),
+            _ => {
+                return Err(pragma_fail(
+                    "argument must be in the form: `[--with-status] [--all|-A]` or `[--with-status] [--force] [path]`",
+                ));
+            }
+        };
+        if expected_head.is_some() && path.is_none() {
+            return Err(pragma_fail("add --expected-head requires one path"));
+        }
+        return Ok(RepoAddSpec {
+            path,
+            force,
+            all,
+            kind,
+            with_status: true,
+            expected_head,
         });
     }
 
@@ -538,6 +602,8 @@ pub(super) fn parse_repo_add_arg(arg: Option<&str>) -> Result<RepoAddSpec, Pragm
             force: false,
             all: true,
             kind,
+            with_status: false,
+            expected_head: None,
         });
     }
 
@@ -547,6 +613,8 @@ pub(super) fn parse_repo_add_arg(arg: Option<&str>) -> Result<RepoAddSpec, Pragm
             force: false,
             all: true,
             kind: None,
+            with_status: false,
+            expected_head: None,
         });
     }
 
@@ -557,6 +625,8 @@ pub(super) fn parse_repo_add_arg(arg: Option<&str>) -> Result<RepoAddSpec, Pragm
                 force: true,
                 all: false,
                 kind: None,
+                with_status: false,
+                expected_head: None,
             });
         }
         if let Some(path) = arg.strip_prefix(&format!("{flag} -- ")) {
@@ -566,6 +636,8 @@ pub(super) fn parse_repo_add_arg(arg: Option<&str>) -> Result<RepoAddSpec, Pragm
                 force: true,
                 all: false,
                 kind: None,
+                with_status: false,
+                expected_head: None,
             });
         }
         if let Some(path) = arg.strip_prefix(&format!("{flag} ")) {
@@ -579,6 +651,8 @@ pub(super) fn parse_repo_add_arg(arg: Option<&str>) -> Result<RepoAddSpec, Pragm
                 force: true,
                 all: false,
                 kind: None,
+                with_status: false,
+                expected_head: None,
             });
         }
     }
@@ -589,6 +663,8 @@ pub(super) fn parse_repo_add_arg(arg: Option<&str>) -> Result<RepoAddSpec, Pragm
             force: false,
             all: false,
             kind: None,
+            with_status: false,
+            expected_head: None,
         });
     }
 
@@ -603,6 +679,8 @@ pub(super) fn parse_repo_add_arg(arg: Option<&str>) -> Result<RepoAddSpec, Pragm
         force: false,
         all: false,
         kind: None,
+        with_status: false,
+        expected_head: None,
     })
 }
 

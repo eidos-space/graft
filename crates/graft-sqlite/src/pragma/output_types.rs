@@ -284,6 +284,8 @@ pub(super) struct JsonAddOutcome {
     pub(super) kind: Option<&'static str>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(super) paths: Vec<crate::json::JsonRepoPathDiff>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) status: Option<JsonRepoStatus>,
 }
 
 #[derive(Debug, Clone, Serialize)]

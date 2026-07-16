@@ -15,13 +15,20 @@ pub struct Index {
 
 impl Index {
     pub fn stage(&mut self, entry: IndexEntry) {
-        if entry.stage == IndexStage::Normal {
-            self.entries.retain(|existing| existing.path != entry.path);
-        } else {
-            self.entries
-                .retain(|existing| !(existing.path == entry.path && existing.stage == entry.stage));
+        self.stage_all(std::iter::once(entry));
+    }
+
+    pub fn stage_all(&mut self, entries: impl IntoIterator<Item = IndexEntry>) {
+        for entry in entries {
+            if entry.stage == IndexStage::Normal {
+                self.entries.retain(|existing| existing.path != entry.path);
+            } else {
+                self.entries.retain(|existing| {
+                    !(existing.path == entry.path && existing.stage == entry.stage)
+                });
+            }
+            self.entries.push(entry);
         }
-        self.entries.push(entry);
         self.entries.sort_by(|a, b| {
             a.path
                 .cmp(&b.path)
