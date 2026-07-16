@@ -27,7 +27,7 @@ if [[ ! "$VERSION" =~ $VERSION_REGEX ]]; then
     exit 1
 fi
 
-git fetch --prune --tags origin main:refs/remotes/origin/main
+git fetch --prune --tags origin +refs/heads/main:refs/remotes/origin/main
 
 HEAD_COMMIT="$(git rev-parse HEAD)"
 ORIGIN_MAIN_COMMIT="$(git rev-parse origin/main)"
