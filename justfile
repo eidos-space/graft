@@ -52,6 +52,28 @@ test:
     cargo test --doc
     just run sqlite test
 
+# Run the reproducible end-to-end speed and storage benchmark.
+benchmark profile='ci' samples='5' warmups='1' output='target/benchmark/current.json':
+    cargo build --release --locked -p graft-tool -p graft-bench
+    ./target/release/graft-bench run \
+      --graft-bin ./target/release/graft \
+      --output {{ quote(output) }} \
+      --label "{{ GIT_SHA }}" \
+      --profile {{ quote(profile) }} \
+      --samples {{ quote(samples) }} \
+      --warmups {{ quote(warmups) }}
+
+# Run a single small sample to validate the benchmark harness.
+benchmark-smoke:
+    just benchmark smoke 1 0 target/benchmark/smoke.json
+
+# Compare two benchmark JSON reports and produce Markdown.
+benchmark-compare baseline candidate output='target/benchmark/comparison.md':
+    cargo run --locked -p graft-bench --release -- compare \
+      --baseline {{ quote(baseline) }} \
+      --candidate {{ quote(candidate) }} \
+      --output {{ quote(output) }}
+
 build-all:
     cargo build
     cargo build --no-default-features --features register-static --package graft-sqlite
