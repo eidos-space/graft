@@ -9,12 +9,14 @@ pub(super) fn run_repo_switch_branch(
     if !file.is_idle() {
         return pragma_err!("cannot switch branches while there is an open transaction");
     }
+    let _workspace_checkout = begin_workspace_checkout(file)?;
     let repo = repo_for_file(file)?;
     let plan = repo.plan_switch_branch(&name)?;
     prepare_repo_switch_checkout(runtime, file, &repo, &plan, force)?;
     let previous_files = current_repo_files_for_checkout(&repo)?;
     let previous_artifacts = current_repo_artifacts_for_checkout(&repo)?;
     let paths = checkout_plan_path_actions(&plan, &previous_files, &previous_artifacts);
+    preflight_workspace_checkout(&repo, &plan, &previous_files)?;
     repo.apply_switch_branch_plan(&name, &plan)?;
     checkout_repo_plan(
         runtime,
@@ -38,12 +40,14 @@ pub(super) fn run_repo_switch_create(
     if !file.is_idle() {
         return pragma_err!("cannot switch branches while there is an open transaction");
     }
+    let _workspace_checkout = begin_workspace_checkout(file)?;
     let repo = repo_for_file(file)?;
     let plan = repo.plan_switch_new_branch(&name, start_point.as_deref())?;
     prepare_repo_switch_checkout(runtime, file, &repo, &plan.checkout, force)?;
     let previous_files = current_repo_files_for_checkout(&repo)?;
     let previous_artifacts = current_repo_artifacts_for_checkout(&repo)?;
     let paths = checkout_plan_path_actions(&plan.checkout, &previous_files, &previous_artifacts);
+    preflight_workspace_checkout(&repo, &plan.checkout, &previous_files)?;
     let branch = repo.apply_switch_new_branch_plan(&plan)?;
     checkout_repo_plan(
         runtime,

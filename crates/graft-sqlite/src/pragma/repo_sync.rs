@@ -89,6 +89,7 @@ pub(super) fn run_repo_pull(
     if !file.is_idle() {
         return pragma_err!("cannot pull while there is an open transaction");
     }
+    let _workspace_checkout = begin_workspace_checkout(file)?;
     if repo_has_work_in_progress_for_file(runtime, file, &repo)? {
         return pragma_err!("cannot pull with staged or unstaged changes");
     }
@@ -109,6 +110,7 @@ pub(super) fn run_repo_pull(
     ensure_checkout_plan_preserves_untracked_paths(runtime, file, &repo, &plan.merge.checkout)?;
     let previous_files = current_repo_files_for_checkout(&repo)?;
     let previous_artifacts = current_repo_artifacts_for_checkout(&repo)?;
+    preflight_workspace_checkout(&repo, &plan.merge.checkout, &previous_files)?;
     clear_row_conflict_resolution_state(&repo)?;
     let mut outcome = repo.apply_pull_plan(&plan)?;
     checkout_merge_outcome(

@@ -5,6 +5,10 @@ pub mod lsn;
 pub mod page;
 pub mod page_count;
 pub mod pageidx;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod pageset;
+#[cfg(target_arch = "wasm32")]
+#[path = "core/pageset_wasm.rs"]
 pub mod pageset;
 
 pub mod commit;

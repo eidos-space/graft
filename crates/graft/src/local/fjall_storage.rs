@@ -24,7 +24,6 @@ use crate::{
 use bytestring::ByteString;
 use fjall::{Database, KeyspaceCreateOptions, KvSeparationOptions, OwnedWriteBatch};
 use parking_lot::{Mutex, MutexGuard};
-use splinter_rs::Splinter;
 use thin_vec::thin_vec;
 use tryiter::TryIteratorExt;
 
@@ -135,12 +134,18 @@ impl Debug for FjallStorage {
 
 impl FjallStorage {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, FjallStorageErr> {
-        Self::open_from_builder(Database::builder(path))
+        let builder = Database::builder(path);
+        #[cfg(target_arch = "wasm32")]
+        let builder = builder.worker_threads_unchecked(0);
+        Self::open_from_builder(builder)
     }
 
     pub fn open_temporary() -> Result<Self, FjallStorageErr> {
         let path = tempfile::tempdir()?.keep();
-        Self::open_from_builder(Database::builder(path).temporary(true))
+        let builder = Database::builder(path).temporary(true);
+        #[cfg(target_arch = "wasm32")]
+        let builder = builder.worker_threads_unchecked(0);
+        Self::open_from_builder(builder)
     }
 
     fn open_from_builder(
@@ -601,7 +606,12 @@ impl<'a> ReadGuard<'a> {
     ) -> impl Iterator<Item = Result<(SegmentIdx, PageSet), FjallStorageErr>> {
         // the set of pages we are searching for.
         // we remove pages from this set as we iterate through commits.
-        let mut pages = PageSet::from_range(PageIdx::FIRST..=PageIdx::LAST);
+        let mut pages = snapshot
+            .page_count
+            .last_pageidx()
+            .map_or(PageSet::EMPTY, |last| {
+                PageSet::from_range(PageIdx::FIRST..=last)
+            });
 
         self.commits(snapshot).try_filter_map(move |commit| {
             // if we have found all pages, we are done
@@ -907,7 +917,7 @@ impl<'a> ReadWriteGuard<'a> {
         tracing::debug!(vid=?volume.vid, log=?volume.local, %commit_lsn, "local commit");
 
         // build the segment index
-        let pageset = PageSet::from(Splinter::from_iter(pages.keys().map(|&k| k.to_u32())));
+        let pageset = PageSet::from_pageidx_iter(pages.keys().copied());
         let sid = SegmentId::random();
         let segment = SegmentIdx::new(sid.clone(), pageset);
 

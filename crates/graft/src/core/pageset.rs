@@ -1,4 +1,4 @@
-use std::ops::{BitOrAssign, RangeBounds, RangeInclusive};
+use std::ops::{BitOr, BitOrAssign, RangeBounds, RangeInclusive};
 
 use bytes::Bytes;
 use splinter_rs::{CowSplinter, Cut, PartitionRead, PartitionWrite, Splinter};
@@ -30,6 +30,10 @@ impl PageSet {
         Self {
             splinter: Splinter::from(range.start().to_u32()..=range.end().to_u32()).into(),
         }
+    }
+
+    pub fn from_pageidx_iter(iter: impl IntoIterator<Item = PageIdx>) -> Self {
+        Self::from(Splinter::from_iter(iter.into_iter().map(PageIdx::to_u32)))
     }
 
     #[inline]
@@ -114,6 +118,18 @@ impl PageSet {
         self.splinter.to_mut().cut(&rhs.splinter).into()
     }
 
+    pub fn difference(&self, rhs: &PageSet) -> PageSet {
+        let rhs = rhs.clone().splinter.into_owned();
+        let mut result = self.clone().splinter.into_owned();
+        result -= rhs;
+        result.into()
+    }
+
+    pub fn intersection_range(&self, range: RangeInclusive<PageIdx>) -> PageSet {
+        let range = Splinter::from(range.start().to_u32()..=range.end().to_u32());
+        (range & &self.splinter).into()
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = PageIdx> {
         self.splinter.iter().map(|v| {
             // SAFETY: The PageSet type verifies that `0` is not contained by the
@@ -168,5 +184,14 @@ derive_newtype_proxy!(
 impl BitOrAssign<Self> for PageSet {
     fn bitor_assign(&mut self, rhs: Self) {
         self.splinter.to_mut().bitor_assign(rhs.splinter);
+    }
+}
+
+impl BitOr<Self> for PageSet {
+    type Output = Self;
+
+    fn bitor(mut self, rhs: Self) -> Self::Output {
+        self |= rhs;
+        self
     }
 }

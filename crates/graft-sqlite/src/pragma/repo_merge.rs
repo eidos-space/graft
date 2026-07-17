@@ -7,11 +7,13 @@ pub(super) fn run_repo_merge_abort(
     if !file.is_idle() {
         return pragma_err!("cannot abort merge while there is an open transaction");
     }
+    let _workspace_checkout = begin_workspace_checkout(file)?;
     let repo = repo_for_file(file)?;
     let plan = repo.plan_merge_abort()?;
     let previous_files = current_repo_files_for_checkout(&repo)?;
     let previous_artifacts = current_repo_artifacts_for_checkout(&repo)?;
     let paths = checkout_plan_path_actions(&plan.checkout, &previous_files, &previous_artifacts);
+    preflight_workspace_checkout(&repo, &plan.checkout, &previous_files)?;
     let target = repo.apply_merge_abort_plan(&plan)?;
     checkout_repo_plan(
         runtime,
@@ -56,6 +58,7 @@ pub(super) fn run_repo_merge(
     if !file.is_idle() {
         return pragma_err!("cannot merge while there is an open transaction");
     }
+    let _workspace_checkout = begin_workspace_checkout(file)?;
     let repo = repo_for_file(file)?;
     if repo_has_work_in_progress_for_file(runtime, file, &repo)? {
         return pragma_err!("cannot merge with staged or unstaged changes");
@@ -66,6 +69,7 @@ pub(super) fn run_repo_merge(
     ensure_checkout_plan_preserves_untracked_paths(runtime, file, &repo, &plan.checkout)?;
     let previous_files = current_repo_files_for_checkout(&repo)?;
     let previous_artifacts = current_repo_artifacts_for_checkout(&repo)?;
+    preflight_workspace_checkout(&repo, &plan.checkout, &previous_files)?;
     let mut outcome = repo.apply_merge_plan(&plan)?;
     checkout_merge_outcome(
         runtime,

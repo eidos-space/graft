@@ -29,7 +29,7 @@ clap = "4.5.49"
 config = { version = "0.15.18", features = ["toml"] }
 enum_dispatch = "0.3.13"
 file-lock = "2.1.11"
-fjall = { version = "3.1.6", features = ["bytes_1", "lz4"] }
+fjall = { path = "crates/fjall", version = "3.1.6", features = ["bytes_1", "lz4"] }
 foldhash = "0.2.0"
 futures = "0.3.31"
 hashbrown = "0.16.0"
@@ -44,7 +44,7 @@ reqwest = { version = "0.12.26", default-features = false, features = ["hickory-
 rusqlite = "0.38.0"
 serde = "1.0.228"
 splinter-rs = "0.12.1"
-sqlite-plugin = { version = "0.9.0", default-features = false }
+sqlite-plugin = { path = "crates/sqlite-plugin", version = "0.9.0", default-features = false }
 static_assertions = "1.1.0"
 tempfile = "3.23.0"
 test-log = "0.2.19"
@@ -63,7 +63,7 @@ zstd = "0.13.3"
 
 [workspace.dependencies.opendal]
 version = "0.55.0"
-features = ["services-s3", "services-fs"]
+default-features = false
 git = "https://github.com/apache/opendal"
 rev = "06f088d93e38e1150a3f1558f327ec0252446302"
 

@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="800" viewBox="0 0 1200 800" role="img" aria-labelledby="title description">
+  <title id="title">One coherent application state</title>
+  <desc id="description">A document, database, and image artifact converge into one versioned snapshot.</desc>
+  <rect width="1200" height="800" fill="#f2f2ef"/>
+
+  <g fill="none" stroke="#c6c7c3" stroke-width="2">
+    <path d="M80 80H1120M80 240H1120M80 400H1120M80 560H1120M80 720H1120"/>
+    <path d="M80 80V720M280 80V720M480 80V720M680 80V720M880 80V720M1120 80V720"/>
+  </g>
+
+  <g stroke="#111214" stroke-width="8" stroke-linejoin="miter">
+    <rect x="110" y="218" width="220" height="280" fill="#fbfbf9"/>
+    <path d="M110 218H330V266H110Z" fill="#d51f26" stroke="none"/>
+    <path d="M150 318H286M150 358H286M150 398H250M150 438H272"/>
+
+    <path d="M420 290C420 252 478 222 550 222C622 222 680 252 680 290V454C680 492 622 522 550 522C478 522 420 492 420 454Z" fill="#fbfbf9"/>
+    <ellipse cx="550" cy="290" rx="130" ry="68" fill="#d51f26"/>
+    <path d="M420 372C420 410 478 440 550 440C622 440 680 410 680 372M420 454C420 492 478 522 550 522C622 522 680 492 680 454"/>
+
+    <rect x="770" y="218" width="260" height="280" fill="#fbfbf9"/>
+    <rect x="810" y="258" width="180" height="184" fill="#e7e7e3"/>
+    <circle cx="948" cy="302" r="22" fill="#d51f26" stroke="none"/>
+    <path d="M810 442L862 374L906 410L944 350L990 410V442Z" fill="#111214"/>
+  </g>
+
+  <g fill="none" stroke="#111214" stroke-width="8">
+    <path d="M220 548V614H500"/>
+    <path d="M550 554V614"/>
+    <path d="M900 548V614H600"/>
+  </g>
+  <path d="M550 650L514 594H586Z" fill="#111214"/>
+
+  <g stroke="#111214" stroke-width="8">
+    <rect x="430" y="642" width="240" height="88" fill="#d51f26"/>
+    <rect x="454" y="666" width="192" height="40" fill="#fbfbf9" stroke="none"/>
+    <rect x="486" y="674" width="128" height="24" fill="#111214" stroke="none"/>
+  </g>
+
+  <g fill="#d51f26">
+    <rect x="72" y="72" width="16" height="16"/>
+    <rect x="1112" y="712" width="16" height="16"/>
+  </g>
+</svg>

@@ -30,11 +30,16 @@ use sqlite_plugin::{
 use thiserror::Error;
 
 use crate::{
-    file::{FileHandle, VfsFile, mem_file::MemFile, vol_file::VolFile},
+    file::{
+        FileHandle, VfsFile,
+        mem_file::MemFile,
+        vol_file::{VolFile, WorkspaceCoordinator},
+    },
     pragma::GraftPragma,
 };
 
 const SQLITE_DATABASE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
+const LEGACY_WORKSPACE_DATABASE: &str = "control.sqlite";
 
 #[derive(Debug, Error)]
 pub enum ErrCtx {
@@ -113,6 +118,7 @@ pub struct GraftVfs {
     repo_runtimes: Arc<RepoRuntimeRegistry>,
     // VolFile locks keyed by tag
     locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    workspace: Arc<WorkspaceCoordinator>,
 }
 
 #[derive(Debug)]
@@ -147,6 +153,7 @@ impl GraftVfs {
             repo_runtimes: Arc::new(RepoRuntimeRegistry::new(runtime.clone())),
             runtime,
             locks: Default::default(),
+            workspace: Arc::new(WorkspaceCoordinator::default()),
         }
     }
 
@@ -214,6 +221,30 @@ impl Vfs for GraftVfs {
                     }
                 );
 
+                if let Some(repo) = workspace_session_repository(&tag) {
+                    let runtime = match &repo {
+                        Some(repo) => {
+                            let runtime = self.repo_runtimes.runtime_for(repo)?;
+                            remove_legacy_workspace_database(&runtime, repo)?;
+                            runtime
+                        }
+                        None => self.runtime.clone(),
+                    };
+                    let volume = runtime.volume_open(None, None, None)?;
+                    let reserved_lock = self.locks.lock().entry(tag.clone()).or_default().clone();
+                    return Ok(VolFile::new_workspace_session(
+                        runtime,
+                        tag,
+                        volume.vid,
+                        opts,
+                        reserved_lock,
+                        repo,
+                        self.repo_runtimes.clone(),
+                        self.workspace.clone(),
+                    )
+                    .into());
+                }
+
                 let (runtime, repo) = self.runtime_for_tag(&tag)?;
 
                 let vid = if let Some(vid) = runtime.tag_get(&tag)? {
@@ -239,6 +270,7 @@ impl Vfs for GraftVfs {
                     reserved_lock,
                     repo,
                     self.repo_runtimes.clone(),
+                    self.workspace.clone(),
                 )
                 .into());
             }
@@ -440,6 +472,38 @@ fn sqlite_page_size_from_header(header: &[u8; 100]) -> u32 {
 pub(crate) fn should_discover_repo(tag: &str) -> bool {
     let path = std::path::Path::new(tag);
     path.is_absolute() || tag.contains('/') || tag.contains('\\') || path.extension().is_some()
+}
+
+fn workspace_session_repository(tag: &str) -> Option<Option<graft::repo::Repository>> {
+    let path = Path::new(tag);
+    if path.file_name()? != std::ffi::OsStr::new(graft::repo::GRAFT_DIR) {
+        return None;
+    }
+    let parent = path.parent()?;
+    if !parent.is_dir() || path.exists() && !path.is_dir() {
+        return None;
+    }
+    Some(graft::repo::Repository::discover(parent).ok())
+}
+
+fn remove_legacy_workspace_database(
+    runtime: &Runtime,
+    repo: &graft::repo::Repository,
+) -> Result<(), ErrCtx> {
+    let path = repo.graft_dir().join(LEGACY_WORKSPACE_DATABASE);
+    runtime.tag_delete(&path.to_string_lossy())?;
+    for suffix in ["", "-journal", "-wal", "-shm"] {
+        let candidate = repo
+            .graft_dir()
+            .join(format!("{LEGACY_WORKSPACE_DATABASE}{suffix}"));
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(metadata) if metadata.file_type().is_file() => std::fs::remove_file(candidate)?,
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(())
 }
 
 fn normalize_tag(tag: &str) -> Result<String, ErrCtx> {

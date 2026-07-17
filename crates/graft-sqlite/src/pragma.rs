@@ -47,7 +47,7 @@ use zerocopy::FromBytes;
 
 use crate::{
     dbg::SqliteHeader,
-    file::vol_file::VolFile,
+    file::vol_file::{VolFile, WorkspaceCheckoutGuard},
     vfs::{ErrCtx, should_discover_repo},
 };
 

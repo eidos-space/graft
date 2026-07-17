@@ -151,7 +151,11 @@ impl WorktreeConfig {
 
 impl Default for WorktreeConfig {
     fn default() -> Self {
-        Self { materialize_sqlite: true }
+        Self {
+            // Browser OPFS access is already mediated by Graft's persistent VFS bindings;
+            // maintaining a second full SQLite projection only adds copy amplification.
+            materialize_sqlite: !cfg!(target_arch = "wasm32"),
+        }
     }
 }
 

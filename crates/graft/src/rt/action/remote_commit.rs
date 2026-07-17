@@ -1,14 +1,14 @@
 use std::{collections::BTreeMap, ops::RangeInclusive, sync::Arc};
 
 use crate::core::{
-    CommitHashBuilder, LogId, PageCount, PageIdx, SegmentId, VolumeId,
+    CommitHashBuilder, LogId, PageCount, SegmentId, VolumeId,
     commit::{Commit, SegmentIdx},
     commit_hash::CommitHash,
     logref::LogRef,
     lsn::LSN,
+    pageset::PageSet,
 };
 use bytes::Bytes;
-use splinter_rs::{Optimizable, PartitionRead, Splinter};
 use thin_vec::thin_vec;
 use tokio::task::spawn_blocking;
 use tryiter::TryIteratorExt;
@@ -233,7 +233,7 @@ fn build_segment(
     // for each unique pageidx
     let page_count = plan.page_count;
     let mut pages = BTreeMap::new();
-    let mut pageset = Splinter::default();
+    let mut pageset = PageSet::EMPTY;
     let mut commits = reader.commits(&snapshot);
     while let Some(commit) = commits.try_next()? {
         if let Some(idx) = commit.segment_idx {
@@ -245,11 +245,9 @@ fn build_segment(
             }
 
             // figure out which pages we haven't seen
-            let outstanding = commit_pages.inner() - &pageset;
+            let outstanding = commit_pages.difference(&pageset);
             // load all of the outstanding pages
             for pageidx in outstanding.iter() {
-                // SAFETY: outstanding is built from a set of valid PageIdxs
-                let pageidx = unsafe { PageIdx::new_unchecked(pageidx) };
                 assert!(
                     plan.page_count.contains(pageidx),
                     "BUG: page is out of range for volume"
@@ -263,16 +261,13 @@ fn build_segment(
 
         // we can early-terminate if we happen to see the entire volume.
         // this can happen if this push includes a checkpoint.
-        if pageset.cardinality() == page_count.to_usize() {
+        if pageset.cardinality().to_usize() == page_count.to_usize() {
             break;
         }
     }
 
-    // optimize the pageset
-    pageset.optimize();
-
     assert_eq!(
-        pageset.cardinality(),
+        pageset.cardinality().to_usize(),
         pages.len(),
         "BUG: pageset cardinality doesn't match number of pages in segment"
     );
@@ -307,7 +302,7 @@ fn build_segment(
 
     let commit_hash = commithash_builder.build();
     let (frames, chunks) = segment_builder.finish();
-    let idx = SegmentIdx::new(sid, pageset.into()).with_frames(frames);
+    let idx = SegmentIdx::new(sid, pageset).with_frames(frames);
 
     batch.commit()?;
 

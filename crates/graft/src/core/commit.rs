@@ -2,7 +2,6 @@ use std::ops::{Deref, DerefMut, Range, RangeInclusive};
 
 use bilrost::Message;
 use itertools::Itertools;
-use splinter_rs::Splinter;
 use thin_vec::ThinVec;
 
 use crate::core::{
@@ -215,8 +214,7 @@ impl SegmentIdx {
             })
             .filter(move |(_, pages)| filter(pages))
             .map(|(bytes, pages)| {
-                let pages = pages.start().to_u32()..=pages.end().to_u32();
-                let pageset = (Splinter::from(pages) & self.pageset.splinter()).into();
+                let pageset = self.pageset.intersection_range(pages);
                 SegmentRangeRef { sid: self.sid.clone(), bytes, pageset }
             })
     }
@@ -310,12 +308,10 @@ impl SegmentRangeRef {
             return Err((self, other));
         };
 
-        let left_splinter: Splinter = left.pageset.into();
-        let right_splinter: Splinter = right.pageset.into();
         Ok(Self {
             sid: left.sid,
             bytes: left.bytes.start..right.bytes.end,
-            pageset: (left_splinter | right_splinter).into(),
+            pageset: left.pageset | right.pageset,
         })
     }
 }

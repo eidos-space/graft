@@ -129,14 +129,21 @@ fn validate_single_repo_add_path(
 
     let has_worktree_change = if let Some(expected) = expected_file.as_ref() {
         let current_key = repo.file_key(&file.tag)?;
-        let actual = if key == current_key {
-            Some(current_repo_file_state(runtime, file)?)
+        if key == current_key {
+            !repo_file_state_content_eq(
+                runtime,
+                &current_repo_file_state(runtime, file)?,
+                expected,
+            )?
+        } else if repo_key_uses_volume_binding(repo, key)? {
+            match repo_file_state_for_key(runtime, repo, key)? {
+                Some(actual) => !repo_file_state_content_eq(runtime, &actual, expected)?,
+                None => true,
+            }
+        } else if metadata.is_some() && is_sqlite_database_path(&physical_path)? {
+            !physical_sqlite_file_matches_state(runtime, &physical_path, expected)?
         } else {
-            repo_file_state_for_key(runtime, repo, key)?
-        };
-        match actual {
-            Some(actual) => !repo_file_state_content_eq(runtime, &actual, expected)?,
-            None => true,
+            true
         }
     } else if let Some(expected) = expected_artifact.as_ref() {
         repo.artifact_path_matches_state(&physical_path, expected)? != Some(true)
@@ -325,6 +332,21 @@ pub(super) fn stage_repo_add_path(
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             let (key, _) = repo_restore_path_arg(repo, path)?;
+            if repo_key_uses_volume_binding(repo, &key)?
+                && repo_file_state_for_key(runtime, repo, &key)?.is_some()
+            {
+                let current_key = repo.file_key(&file.tag)?;
+                let mut entries = stage_repo_add_topology_removals(repo, &key)?;
+                entries.push(stage_repo_add_file(
+                    runtime,
+                    file,
+                    repo,
+                    &current_key,
+                    &key,
+                    &physical_path,
+                )?);
+                return Ok(entries);
+            }
             let tracked = tracked_repo_keys_under_directory(repo, &key)?;
             if tracked.is_empty() {
                 return Err(ErrCtx::Repo(graft::repo::RepoErr::PathNotTracked(key)));
@@ -555,11 +577,16 @@ pub(super) fn prepare_repo_add_file(
         let state = current_repo_file_state(runtime, file)?;
         repo.prepare_file_state_path(&file.tag, state)
             .map_err(Into::into)
-    } else if let Some(state) = repo_file_state_for_key(runtime, repo, key)? {
+    } else if repo_key_uses_volume_binding(repo, key)?
+        && let Some(state) = repo_file_state_for_key(runtime, repo, key)?
+    {
         repo.prepare_file_state_path(repo.worktree().join(key), state)
             .map_err(Into::into)
     } else if is_sqlite_database_path(physical_path)? {
         let state = import_physical_sqlite_file_state(runtime, physical_path)?;
+        repo.prepare_file_state_path(repo.worktree().join(key), state)
+            .map_err(Into::into)
+    } else if let Some(state) = repo_file_state_for_key(runtime, repo, key)? {
         repo.prepare_file_state_path(repo.worktree().join(key), state)
             .map_err(Into::into)
     } else {

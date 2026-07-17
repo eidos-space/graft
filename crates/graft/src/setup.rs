@@ -1,4 +1,7 @@
-use std::{future::pending, num::NonZero, path::PathBuf, sync::Arc, time::Duration};
+use std::{num::NonZero, path::PathBuf, sync::Arc, time::Duration};
+
+#[cfg(not(target_arch = "wasm32"))]
+use std::future::pending;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -67,12 +70,19 @@ fn setup_runtime(
         .enable_all()
         .build()?;
     let tokio_handle = rt.handle().clone();
+    #[cfg(not(target_arch = "wasm32"))]
     std::thread::Builder::new()
         .name("graft-runtime".to_string())
         .spawn(move || {
             // run the tokio event loop in this thread
             rt.block_on(pending::<()>())
         })?;
+
+    // Browser commands run on one Web Worker. Local repository operations are
+    // synchronous; retaining the current-thread runtime keeps Handle::block_on
+    // available without requiring SharedArrayBuffer or browser pthreads.
+    #[cfg(target_arch = "wasm32")]
+    std::mem::forget(rt);
 
     let remote = Arc::new(remote.build()?);
     let autosync = autosync.map(|s| Duration::from_secs(s.get()));
