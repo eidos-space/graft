@@ -1,6 +1,7 @@
 [files]
 extend-exclude = [
- "context7.json"
+  "context7.json",
+  "vendor/sqlite-plugin/**",
 ]
 
 [default]

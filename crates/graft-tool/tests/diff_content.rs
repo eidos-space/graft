@@ -55,6 +55,51 @@ fn diff_content_cli_returns_bounded_read_only_json() {
 }
 
 #[test]
+fn diff_content_cli_preserves_utf8_with_ascii_percent() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let repo = Repository::init(temp_dir.path()).unwrap();
+    let note = temp_dir.path().join("note.md");
+    let before = "# 债券追踪\nSpaceX 债券价格跌破发行价 10% 后仍需观察\n";
+    let after = "# 债券追踪\nSpaceX 债券价格跌破发行价 15% 后已企稳\n";
+
+    fs::write(&note, before).unwrap();
+    repo.stage_artifact_path(&note).unwrap();
+    repo.commit_staged("before").unwrap();
+    fs::write(&note, after).unwrap();
+    repo.stage_artifact_path(&note).unwrap();
+    repo.commit_staged("after").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_graft"))
+        .current_dir(temp_dir.path())
+        .args([
+            "diff",
+            "--json",
+            "--content",
+            "--max-content-bytes",
+            "1048576",
+            "HEAD~1",
+            "HEAD",
+            "--",
+            "note.md",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|err| {
+        panic!(
+            "graft diff should return complete JSON for content containing `%`: {err}; stdout={}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    });
+    assert_eq!(json["content"]["before"]["content"], before);
+    assert_eq!(json["content"]["after"]["content"], after);
+}
+
+#[test]
 fn diff_content_cli_compares_a_revision_to_the_worktree() {
     let temp_dir = tempfile::tempdir().unwrap();
     let repo = Repository::init(temp_dir.path()).unwrap();

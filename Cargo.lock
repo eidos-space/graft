@@ -980,7 +980,7 @@ dependencies = [
 
 [[package]]
 name = "graft"
-version = "0.5.7"
+version = "0.5.8"
 dependencies = [
  "assert_matches",
  "base64",
@@ -1035,7 +1035,7 @@ dependencies = [
 
 [[package]]
 name = "graft-ext"
-version = "0.5.7"
+version = "0.5.8"
 dependencies = [
  "config",
  "graft",
@@ -1049,7 +1049,7 @@ dependencies = [
 
 [[package]]
 name = "graft-sqlite"
-version = "0.5.7"
+version = "0.5.8"
 dependencies = [
  "bytes",
  "enum_dispatch",
@@ -1069,7 +1069,7 @@ dependencies = [
 
 [[package]]
 name = "graft-test"
-version = "0.5.7"
+version = "0.5.8"
 dependencies = [
  "anyhow",
  "clap",
@@ -1092,7 +1092,7 @@ dependencies = [
 
 [[package]]
 name = "graft-tool"
-version = "0.5.7"
+version = "0.5.8"
 dependencies = [
  "anyhow",
  "clap",
@@ -1105,7 +1105,7 @@ dependencies = [
 
 [[package]]
 name = "graft-tracing"
-version = "0.5.7"
+version = "0.5.8"
 dependencies = [
  "tracing",
  "tracing-subscriber",
@@ -2855,8 +2855,6 @@ dependencies = [
 [[package]]
 name = "sqlite-plugin"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82bfb157f1d40ffdbe7842077fc65ce9985a4e0a3f34ba1a18d928111aebb646"
 dependencies = [
  "bindgen",
 ]
