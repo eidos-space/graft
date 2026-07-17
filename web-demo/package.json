@@ -1,0 +1,30 @@
+{
+  "name": "graft-web-demo",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build:wasm": "../scripts/build-web-demo-wasm.sh",
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "build:site": "tsc -b && vite build --base=/playground/",
+    "test:e2e": "playwright test",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@pierre/diffs": "^1.2.12",
+    "@pierre/trees": "^1.0.0-beta.5",
+    "@wterm/dom": "^0.3.0",
+    "@wterm/react": "^0.3.0",
+    "react": "^19.2.3",
+    "react-dom": "^19.2.3"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.55.0",
+    "@types/react": "^19.2.8",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.1.2",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.1"
+  }
+}

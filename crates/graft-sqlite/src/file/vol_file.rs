@@ -3,7 +3,10 @@ use std::{
     fmt::Debug,
     hash::{DefaultHasher, Hash, Hasher},
     mem,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
 };
 
 use bytes::BytesMut;
@@ -35,6 +38,54 @@ enum VolFileState {
     Shared { reader: VolumeReader },
     Reserved { writer: VolumeWriter },
     Committing,
+}
+
+#[derive(Debug, Default)]
+pub struct WorkspaceCoordinator {
+    checkout_active: AtomicBool,
+    writers: AtomicUsize,
+}
+
+pub struct WorkspaceCheckoutGuard {
+    coordinator: Arc<WorkspaceCoordinator>,
+}
+
+impl WorkspaceCoordinator {
+    pub fn try_checkout(self: &Arc<Self>) -> Option<WorkspaceCheckoutGuard> {
+        self.checkout_active
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()?;
+        if self.writers.load(Ordering::SeqCst) != 0 {
+            self.checkout_active.store(false, Ordering::SeqCst);
+            return None;
+        }
+        Some(WorkspaceCheckoutGuard { coordinator: self.clone() })
+    }
+
+    fn try_begin_write(&self) -> bool {
+        if self.checkout_active.load(Ordering::SeqCst) {
+            return false;
+        }
+        self.writers.fetch_add(1, Ordering::SeqCst);
+        if self.checkout_active.load(Ordering::SeqCst) {
+            self.writers.fetch_sub(1, Ordering::SeqCst);
+            return false;
+        }
+        true
+    }
+
+    fn end_write(&self) {
+        let previous = self.writers.fetch_sub(1, Ordering::SeqCst);
+        assert!(previous > 0, "workspace writer count must be positive");
+    }
+}
+
+impl Drop for WorkspaceCheckoutGuard {
+    fn drop(&mut self) {
+        self.coordinator
+            .checkout_active
+            .store(false, Ordering::SeqCst);
+    }
 }
 
 impl VolFileState {
@@ -70,6 +121,10 @@ pub struct VolFile {
     opts: OpenOpts,
     pub repo: Option<Repository>,
     repo_runtimes: Arc<RepoRuntimeRegistry>,
+    workspace: Arc<WorkspaceCoordinator>,
+    binding_enabled: bool,
+    tag_bound: bool,
+    workspace_writer_active: bool,
 
     reserved: Arc<Mutex<()>>,
     state: VolFileState,
@@ -96,6 +151,55 @@ impl VolFile {
         reserved: Arc<Mutex<()>>,
         repo: Option<Repository>,
         repo_runtimes: Arc<RepoRuntimeRegistry>,
+        workspace: Arc<WorkspaceCoordinator>,
+    ) -> Self {
+        Self::new_with_binding(
+            runtime,
+            tag,
+            vid,
+            opts,
+            reserved,
+            repo,
+            repo_runtimes,
+            workspace,
+            true,
+        )
+    }
+
+    pub fn new_workspace_session(
+        runtime: Runtime,
+        tag: String,
+        vid: VolumeId,
+        opts: OpenOpts,
+        reserved: Arc<Mutex<()>>,
+        repo: Option<Repository>,
+        repo_runtimes: Arc<RepoRuntimeRegistry>,
+        workspace: Arc<WorkspaceCoordinator>,
+    ) -> Self {
+        Self::new_with_binding(
+            runtime,
+            tag,
+            vid,
+            opts,
+            reserved,
+            repo,
+            repo_runtimes,
+            workspace,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_binding(
+        runtime: Runtime,
+        tag: String,
+        vid: VolumeId,
+        opts: OpenOpts,
+        reserved: Arc<Mutex<()>>,
+        repo: Option<Repository>,
+        repo_runtimes: Arc<RepoRuntimeRegistry>,
+        workspace: Arc<WorkspaceCoordinator>,
+        binding_enabled: bool,
     ) -> Self {
         Self {
             runtime,
@@ -104,6 +208,10 @@ impl VolFile {
             opts,
             repo,
             repo_runtimes,
+            workspace,
+            binding_enabled,
+            tag_bound: binding_enabled,
+            workspace_writer_active: false,
             reserved,
             state: VolFileState::Idle,
             pending_message: None,
@@ -131,6 +239,11 @@ impl VolFile {
         }
 
         let runtime = self.repo_runtimes.runtime_for(&repo)?;
+        if !self.binding_enabled {
+            self.switch_runtime(runtime)?;
+            self.repo = Some(repo);
+            return Ok(false);
+        }
         if runtime.tag_get(&self.tag)?.is_some() {
             self.switch_runtime(runtime)?;
             self.repo = Some(repo);
@@ -160,7 +273,9 @@ impl VolFile {
     }
 
     fn switch_runtime(&mut self, runtime: Runtime) -> Result<(), ErrCtx> {
-        let vid = if let Some(vid) = runtime.tag_get(&self.tag)? {
+        let vid = if !self.binding_enabled {
+            runtime.volume_open(None, None, None)?.vid
+        } else if let Some(vid) = runtime.tag_get(&self.tag)? {
             vid
         } else {
             let volume = runtime.volume_open(None, None, None)?;
@@ -203,9 +318,52 @@ impl VolFile {
     }
 
     pub fn switch_volume(&mut self, vid: &VolumeId) -> Result<(), ErrCtx> {
-        self.runtime.tag_replace(&self.tag, vid.clone())?;
+        if self.binding_enabled {
+            self.runtime.tag_replace(&self.tag, vid.clone())?;
+        }
         self.vid = vid.clone();
+        self.tag_bound = self.binding_enabled;
         Ok(())
+    }
+
+    pub fn clear_volume_binding(&mut self) -> Result<(), ErrCtx> {
+        if self.binding_enabled {
+            self.runtime.tag_delete(&self.tag)?;
+        }
+        let volume = self.runtime.volume_open(None, None, None)?;
+        self.vid = volume.vid;
+        self.tag_bound = false;
+        Ok(())
+    }
+
+    pub fn try_workspace_checkout(&self) -> Option<WorkspaceCheckoutGuard> {
+        self.workspace.try_checkout()
+    }
+
+    fn refresh_volume_binding(&mut self) -> Result<(), ErrCtx> {
+        if !self.binding_enabled {
+            return Ok(());
+        }
+        match self.runtime.tag_get(&self.tag)? {
+            Some(vid) => {
+                self.vid = vid;
+                self.tag_bound = true;
+            }
+            None if self.tag_bound => {
+                let volume = self.runtime.volume_open(None, None, None)?;
+                self.vid = volume.vid;
+                self.tag_bound = false;
+            }
+            None => {}
+        }
+        Ok(())
+    }
+
+    fn end_workspace_write(&mut self) {
+        if self.workspace_writer_active {
+            self.workspace.end_write();
+            self.workspace_writer_active = false;
+        }
     }
 
     pub fn reader(&self) -> Result<VolumeReadRef<'_>, ErrCtx> {
@@ -238,6 +396,7 @@ impl VfsFile for VolFile {
             LockLevel::Shared => {
                 if let VolFileState::Idle = self.state {
                     // Transition Idle -> Shared
+                    self.refresh_volume_binding()?;
                     let reader = self.runtime.volume_reader(self.vid.clone())?;
                     self.state = VolFileState::Shared { reader };
                 } else {
@@ -271,6 +430,10 @@ impl VfsFile for VolFile {
                         tracing::trace!("unable to lock: Shared -> Reserved: snapshot changed");
                         return Err(ErrCtx::BusySnapshot);
                     }
+                    if !self.workspace.try_begin_write() {
+                        return Err(ErrCtx::Busy);
+                    }
+                    self.workspace_writer_active = true;
 
                     // convert the reader into a writer
                     self.state = VolFileState::Reserved {
@@ -306,6 +469,14 @@ impl VfsFile for VolFile {
         match level {
             LockLevel::Unlocked => match self.state {
                 VolFileState::Idle | VolFileState::Shared { .. } | VolFileState::Committing => {
+                    if matches!(self.state, VolFileState::Committing) {
+                        self.end_workspace_write();
+                        if self.reserved.is_locked() {
+                            // SAFETY: Committing is entered only while this handle owns the
+                            // reserved lock, and SQLite is abandoning that failed commit here.
+                            unsafe { self.reserved.force_unlock() };
+                        }
+                    }
                     self.state = VolFileState::Idle;
                 }
                 VolFileState::Reserved { .. } => {
@@ -327,6 +498,14 @@ impl VfsFile for VolFile {
                     // Commit the writer, downgrading to a reader
                     let reader = writer.commit()?;
                     self.state = VolFileState::Shared { reader };
+
+                    // Release both write guards before repository bookkeeping, which can fail
+                    // independently after the SQLite commit has already succeeded.
+                    assert!(self.reserved.is_locked(), "reserved lock must be locked");
+                    // SAFETY: the preceding Reserved state means this handle owns the lock.
+                    unsafe { self.reserved.force_unlock() };
+                    self.end_workspace_write();
+
                     if let Some(repo) = &self.repo {
                         let key = repo.file_key(&self.tag)?;
                         if key != graft::repo::GRAFT_DIR
@@ -337,14 +516,6 @@ impl VfsFile for VolFile {
                             repo.mark_dirty_key(key)?;
                         }
                     }
-
-                    // release the reserved lock
-                    // between threads while holding the lock
-                    // TODO: find a way to assert that this thread actually owns the lock
-                    assert!(self.reserved.is_locked(), "reserved lock must be locked");
-                    // SAFETY: we are in the Reserved state, thus we are holding the lock
-                    // SAFETY: we depend on the connection not being passed
-                    unsafe { self.reserved.force_unlock() };
                 } else {
                     tracing::error!(
                         "invalid unlock request Shared in state {}",

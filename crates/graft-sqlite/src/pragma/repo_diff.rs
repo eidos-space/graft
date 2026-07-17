@@ -356,7 +356,9 @@ pub(super) fn repo_status_for_file(
             continue;
         }
 
-        if let Some(state) = repo_file_state_for_key(runtime, repo, &key)? {
+        if repo_key_uses_volume_binding(repo, &key)?
+            && let Some(state) = repo_file_state_for_key(runtime, repo, &key)?
+        {
             if !repo_file_state_content_eq(runtime, &state, &expected_state)? {
                 status
                     .unstaged_changes
@@ -729,6 +731,13 @@ pub(super) fn repo_file_state_for_key(
         volume,
         snapshot: repo_snapshot_with_commit_hashes(runtime, &snapshot)?,
     }))
+}
+
+pub(super) fn repo_key_uses_volume_binding(repo: &Repository, key: &str) -> Result<bool, ErrCtx> {
+    if !repo.config()?.worktree.materialize_sqlite {
+        return Ok(true);
+    }
+    Ok(repo.dirty_paths()?.iter().any(|dirty| dirty == key))
 }
 
 pub(super) fn repo_key_volume_id(

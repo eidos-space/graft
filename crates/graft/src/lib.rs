@@ -12,6 +12,10 @@ pub mod rt {
 pub mod core;
 pub mod err;
 pub mod oracle;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod remote;
+#[cfg(target_arch = "wasm32")]
+#[path = "remote_wasm.rs"]
 pub mod remote;
 pub mod repo;
 pub mod setup;

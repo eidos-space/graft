@@ -1934,6 +1934,53 @@ fn test_repo_clone_pragma_cleans_new_repo_after_fetch_failure() {
 }
 
 #[test]
+fn test_repo_clone_from_workspace_session_materializes_database_paths() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let remote_dir = temp_dir.path().join("remote");
+    let source_path = temp_dir.path().join("source/app.db");
+    let clone_dir = temp_dir.path().join("clone");
+    std::fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(&clone_dir).unwrap();
+
+    let mut source_runtime = GraftTestRuntime::with_memory_remote();
+    let source = source_runtime.open_sqlite(source_path.to_str().unwrap(), None);
+    assert!(pragma_query_string(&source, "graft_init").contains(".graft"));
+    pragma_arg_string(
+        &source,
+        "graft_remote_add",
+        format!("origin fs://{}", remote_dir.display()),
+    );
+    source
+        .execute_batch("CREATE TABLE notes(body TEXT); INSERT INTO notes VALUES ('cloned');")
+        .unwrap();
+    pragma_query_string(&source, "graft_add");
+    pragma_arg_string(&source, "graft_commit", "clone workspace source");
+    pragma_arg_string(&source, "graft_push", "origin main");
+
+    let mut clone_runtime = GraftTestRuntime::with_memory_remote();
+    let workspace_path = clone_dir.join(".graft");
+    let workspace = clone_runtime.open_sqlite(workspace_path.to_str().unwrap(), None);
+    let cloned = pragma_arg_string(
+        &workspace,
+        "graft_clone",
+        format!("fs://{} main", remote_dir.display()),
+    );
+    assert!(cloned.contains("Cloned origin/main"), "{cloned}");
+    assert!(workspace_path.is_dir());
+    assert!(!clone_dir.join(".graft-clone.sqlite").exists());
+    assert_workspace_clean_on_branch(&workspace, "main");
+
+    let app_path = clone_dir.join("app.db");
+    let app = clone_runtime.open_sqlite(app_path.to_str().unwrap(), None);
+    assert_eq!(query_single_text(&app, "SELECT body FROM notes"), "cloned");
+
+    source_runtime.shutdown().unwrap();
+    clone_runtime.shutdown().unwrap();
+}
+
+#[test]
 fn test_repo_clone_pragma_without_branch_uses_remote_head() {
     graft_test::ensure_test_env();
 
@@ -4379,6 +4426,227 @@ fn test_repo_json_switch_branch_reports_materialized_path_actions() {
         .query_row("SELECT COUNT(*) FROM app_notes", [], |row| row.get(0))
         .unwrap();
     assert_eq!(count, 2);
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_workspace_switch_rebinds_multiple_sqlite_paths_from_workspace_session() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let primary_path = temp_dir.path().join("primary.sqlite");
+    let secondary_path = temp_dir.path().join("secondary.sqlite");
+    let main_only_path = temp_dir.path().join("main-only.sqlite");
+    let feature_only_path = temp_dir.path().join("feature-only.sqlite");
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let primary = runtime.open_sqlite(primary_path.to_str().unwrap(), None);
+    assert!(pragma_query_string(&primary, "graft_init").contains(".graft"));
+    let secondary = runtime.open_sqlite(secondary_path.to_str().unwrap(), None);
+    let main_only = runtime.open_sqlite(main_only_path.to_str().unwrap(), None);
+    let workspace_path = temp_dir.path().join(".graft");
+    let workspace = runtime.open_sqlite(workspace_path.to_str().unwrap(), None);
+
+    primary
+        .execute_batch("CREATE TABLE notes(body TEXT); INSERT INTO notes VALUES ('main');")
+        .unwrap();
+    secondary
+        .execute_batch("CREATE TABLE settings(value TEXT); INSERT INTO settings VALUES ('main');")
+        .unwrap();
+    main_only
+        .execute_batch(
+            "CREATE TABLE branch_marker(value TEXT); INSERT INTO branch_marker VALUES ('main');",
+        )
+        .unwrap();
+    std::fs::write(temp_dir.path().join("note.txt"), "main text").unwrap();
+    std::fs::write(temp_dir.path().join("blob.bin"), b"\0main\xff").unwrap();
+    assert!(pragma_arg_string(&workspace, "graft_add", "--all").contains("Added 5 paths"));
+    pragma_arg_string(&workspace, "graft_commit", "main workspace");
+
+    pragma_arg_string(&workspace, "graft_switch_create", "feature");
+    primary
+        .execute("UPDATE notes SET body = 'feature'", [])
+        .unwrap();
+    secondary
+        .execute("UPDATE settings SET value = 'feature'", [])
+        .unwrap();
+    pragma_arg_string(&workspace, "graft_rm", "main-only.sqlite");
+    let feature_only = runtime.open_sqlite(feature_only_path.to_str().unwrap(), None);
+    feature_only
+        .execute_batch(
+            "CREATE TABLE branch_marker(value TEXT); INSERT INTO branch_marker VALUES ('feature');",
+        )
+        .unwrap();
+    std::fs::write(temp_dir.path().join("note.txt"), "feature text").unwrap();
+    std::fs::write(temp_dir.path().join("blob.bin"), b"\0feature\xff").unwrap();
+    assert!(pragma_arg_string(&workspace, "graft_add", "--all").contains("Added 5 paths"));
+    pragma_arg_string(&workspace, "graft_commit", "feature workspace");
+
+    pragma_arg_string(&workspace, "graft_switch_branch", "main");
+    assert_eq!(
+        query_single_text(&primary, "SELECT body FROM notes"),
+        "main"
+    );
+    assert_eq!(
+        query_single_text(&secondary, "SELECT value FROM settings"),
+        "main"
+    );
+    assert_eq!(
+        query_single_text(&main_only, "SELECT value FROM branch_marker"),
+        "main"
+    );
+    assert_eq!(
+        feature_only
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'branch_marker'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        std::fs::read_to_string(temp_dir.path().join("note.txt")).unwrap(),
+        "main text"
+    );
+    assert_eq!(
+        std::fs::read(temp_dir.path().join("blob.bin")).unwrap(),
+        b"\0main\xff"
+    );
+    assert_workspace_clean_on_branch(&workspace, "main");
+
+    secondary.execute_batch("BEGIN").unwrap();
+    assert_eq!(
+        query_single_text(&secondary, "SELECT value FROM settings"),
+        "main"
+    );
+    pragma_arg_string(&workspace, "graft_switch_branch", "feature");
+    assert_eq!(
+        query_single_text(&secondary, "SELECT value FROM settings"),
+        "main",
+        "an existing read transaction keeps its snapshot"
+    );
+    secondary.execute_batch("COMMIT").unwrap();
+    assert_eq!(
+        query_single_text(&secondary, "SELECT value FROM settings"),
+        "feature",
+        "the idle connection refreshes its path binding"
+    );
+    assert_eq!(
+        query_single_text(&primary, "SELECT body FROM notes"),
+        "feature"
+    );
+    assert_eq!(
+        query_single_text(&feature_only, "SELECT value FROM branch_marker"),
+        "feature"
+    );
+    assert_workspace_clean_on_branch(&workspace, "feature");
+
+    secondary.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let err = pragma_arg_error(&workspace, "graft_switch_branch", "main");
+    assert!(err.contains("another SQLite write transaction"), "{err}");
+    assert_workspace_clean_on_branch(&workspace, "feature");
+    secondary.execute_batch("ROLLBACK").unwrap();
+
+    std::fs::create_dir(&main_only_path).unwrap();
+    let err = pragma_arg_error(&workspace, "graft_switch_branch", "--force main");
+    assert!(err.contains("not a regular SQLite database file"), "{err}");
+    assert_workspace_clean_on_branch(&workspace, "feature");
+    std::fs::remove_dir(&main_only_path).unwrap();
+
+    pragma_arg_string(&workspace, "graft_switch_branch", "main");
+    assert_eq!(
+        query_single_text(&primary, "SELECT body FROM notes"),
+        "main"
+    );
+    assert_eq!(
+        query_single_text(&secondary, "SELECT value FROM settings"),
+        "main"
+    );
+    assert_workspace_clean_on_branch(&workspace, "main");
+
+    primary
+        .execute("UPDATE notes SET body = 'dirty primary'", [])
+        .unwrap();
+    secondary
+        .execute("UPDATE settings SET value = 'dirty secondary'", [])
+        .unwrap();
+    let status: Value =
+        serde_json::from_str(&pragma_query_string(&workspace, "graft_json_status")).unwrap();
+    assert_eq!(status["dirty"], true);
+    pragma_arg_string(&workspace, "graft_reset", "--hard HEAD");
+    assert_eq!(
+        query_single_text(&primary, "SELECT body FROM notes"),
+        "main"
+    );
+    assert_eq!(
+        query_single_text(&secondary, "SELECT value FROM settings"),
+        "main"
+    );
+    assert_workspace_clean_on_branch(&workspace, "main");
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_workspace_merge_rebinds_multiple_sqlite_paths_from_workspace_session() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let primary_path = temp_dir.path().join("primary.sqlite");
+    let secondary_path = temp_dir.path().join("secondary.sqlite");
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let primary = runtime.open_sqlite(primary_path.to_str().unwrap(), None);
+    assert!(pragma_query_string(&primary, "graft_init").contains(".graft"));
+    let secondary = runtime.open_sqlite(secondary_path.to_str().unwrap(), None);
+    let workspace_path = temp_dir.path().join(".graft");
+    let workspace = runtime.open_sqlite(workspace_path.to_str().unwrap(), None);
+
+    primary
+        .execute_batch("CREATE TABLE notes(body TEXT); INSERT INTO notes VALUES ('base');")
+        .unwrap();
+    secondary
+        .execute_batch("CREATE TABLE settings(value TEXT); INSERT INTO settings VALUES ('base');")
+        .unwrap();
+    assert!(pragma_arg_string(&workspace, "graft_add", "--all").contains("Added 2 paths"));
+    pragma_arg_string(&workspace, "graft_commit", "base workspace");
+
+    pragma_arg_string(&workspace, "graft_switch_create", "feature");
+    secondary
+        .execute("UPDATE settings SET value = 'feature'", [])
+        .unwrap();
+    pragma_arg_string(&workspace, "graft_add", "secondary.sqlite");
+    pragma_arg_string(&workspace, "graft_commit", "feature secondary");
+
+    pragma_arg_string(&workspace, "graft_switch_branch", "main");
+    primary
+        .execute("UPDATE notes SET body = 'main'", [])
+        .unwrap();
+    pragma_arg_string(&workspace, "graft_add", "primary.sqlite");
+    pragma_arg_string(&workspace, "graft_commit", "main primary");
+
+    let merge = pragma_arg_string(&workspace, "graft_merge", "feature");
+    assert!(merge.contains("Merged"), "{merge}");
+    assert_eq!(
+        query_single_text(&primary, "SELECT body FROM notes"),
+        "main",
+        "the merge retains the current branch database snapshot"
+    );
+    assert_eq!(
+        query_single_text(&secondary, "SELECT value FROM settings"),
+        "feature",
+        "the merge activates the incoming database snapshot"
+    );
+
+    let status: Value =
+        serde_json::from_str(&pragma_query_string(&workspace, "graft_json_status")).unwrap();
+    assert_eq!(status["current_branch"], "main");
+    assert_eq!(status["has_conflicts"], false);
+    assert_eq!(status["staged_changes"][0]["path"], "secondary.sqlite");
+    pragma_arg_string(&workspace, "graft_merge_continue", "merge feature");
+    assert_workspace_clean_on_branch(&workspace, "main");
 
     runtime.shutdown().unwrap();
 }
@@ -12698,6 +12966,20 @@ fn json_values_contain(values: &Value, needle: &str) -> bool {
     values
         .as_array()
         .is_some_and(|values| values.iter().any(|value| value.as_str() == Some(needle)))
+}
+
+fn query_single_text(conn: &Connection, sql: &str) -> String {
+    conn.query_row(sql, [], |row| row.get(0)).unwrap()
+}
+
+fn assert_workspace_clean_on_branch(conn: &Connection, branch: &str) {
+    let status: Value =
+        serde_json::from_str(&pragma_query_string(conn, "graft_json_status")).unwrap();
+    assert_eq!(status["current_branch"], branch, "{status}");
+    assert_eq!(status["dirty"], false, "{status}");
+    assert_eq!(status["counts"]["unstaged"], 0, "{status}");
+    assert_eq!(status["counts"]["staged"], 0, "{status}");
+    assert_eq!(status["counts"]["conflicted"], 0, "{status}");
 }
 
 fn pragma_query_string(conn: &Connection, name: &str) -> String {

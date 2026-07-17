@@ -18,6 +18,9 @@ use rusqlite::{
     Batch, Connection, OpenFlags, fallible_iterator::FallibleIterator, types::ValueRef,
 };
 
+#[cfg(target_arch = "wasm32")]
+use std::sync::OnceLock;
+
 #[derive(Subcommand)]
 enum Command {
     /// Generate an internal test identifier
@@ -813,6 +816,17 @@ struct RemoteBranchArgs {
 #[command(version, about, long_about = None)]
 #[command(propagate_version = true)]
 struct Cli {
+    /// Browser shell working directory.
+    #[cfg(target_arch = "wasm32")]
+    #[arg(
+        long,
+        global = true,
+        hide = true,
+        value_name = "PATH",
+        default_value = "/"
+    )]
+    browser_cwd: PathBuf,
+
     /// Database path used for SQLite-specific commands.
     #[arg(long, global = true, value_name = "PATH")]
     db: Option<PathBuf>,
@@ -823,7 +837,31 @@ struct Cli {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    #[cfg(target_arch = "wasm32")]
+    enter_browser_worktree(&cli.browser_cwd)?;
     run_cli(cli)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn enter_browser_worktree(worktree: &Path) -> Result<()> {
+    if !worktree.is_absolute() {
+        bail!("browser working directory must be absolute");
+    }
+    std::env::set_current_dir(worktree).context("failed to enter browser worktree")?;
+    Ok(())
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "emscripten"))]
+#[unsafe(no_mangle)]
+extern "C" fn wasmfs_create_root_dir() -> *mut std::ffi::c_void {
+    unsafe extern "C" {
+        fn wasmfs_create_opfs_backend() -> *mut std::ffi::c_void;
+    }
+
+    // Graft canonicalizes repository paths. Making OPFS the WasmFS root keeps
+    // those absolute paths on the persistent backend instead of escaping a
+    // child mount when its root is canonicalized to `/`.
+    unsafe { wasmfs_create_opfs_backend() }
 }
 
 fn run_cli(cli: Cli) -> Result<()> {
@@ -859,7 +897,7 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
         Command::Clone { json, branch_option, remote, branch } => {
             let branch = branch_option.as_deref().or(branch.as_deref());
             let arg = repo_clone_arg(&remote, branch);
-            let db = resolve_clone_db(db_override)?;
+            let db = resolve_clone_workspace_session(db_override)?;
             print_output(run_pragma(&db, clone_pragma(json), Some(&arg))?);
         }
         Command::Status { json, kind } => {
@@ -1392,7 +1430,7 @@ fn run_repo_pragma(
 ) -> Result<Option<String>> {
     let db = match command_db.or(db_override) {
         Some(path) => resolve_cli_db(Some(path))?,
-        None => resolve_repo_control_db()?,
+        None => resolve_repo_workspace_session()?,
     };
     run_pragma(&db, suffix, arg)
 }
@@ -1485,18 +1523,18 @@ fn ensure_db_parent_exists_in_repo(db: &Path) -> Result<()> {
     Ok(())
 }
 
-fn resolve_repo_control_db() -> Result<PathBuf> {
+fn resolve_repo_workspace_session() -> Result<PathBuf> {
     let cwd = std::env::current_dir().context("failed to read current directory")?;
     let repo = Repository::discover(&cwd)?;
-    Ok(repo.graft_dir().join("control.sqlite"))
+    Ok(repo.graft_dir().to_path_buf())
 }
 
-fn resolve_clone_db(path: Option<&Path>) -> Result<PathBuf> {
+fn resolve_clone_workspace_session(path: Option<&Path>) -> Result<PathBuf> {
     if let Some(path) = path {
         return resolve_cli_db(Some(path));
     }
     let cwd = std::env::current_dir().context("failed to read current directory")?;
-    Ok(cwd.join(".graft-clone.sqlite"))
+    Ok(cwd.join(graft::repo::GRAFT_DIR))
 }
 
 fn json_escape(value: &str) -> String {
@@ -2390,43 +2428,88 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 struct GraftConnection {
     conn: Connection,
+    #[cfg(not(target_arch = "wasm32"))]
     _vfs: RegisteredVfs,
 }
 
 fn open_graft_connection(db: &Path) -> Result<GraftConnection> {
     let vfs = register_graft_vfs()?;
     let db = absolute_db_path(db)?;
-    let uri = format!("file:{}?vfs={}", db.display(), vfs.name);
-    let conn = Connection::open_with_flags(
-        &uri,
-        OpenFlags::SQLITE_OPEN_READ_WRITE
-            | OpenFlags::SQLITE_OPEN_CREATE
-            | OpenFlags::SQLITE_OPEN_URI,
+    let conn = Connection::open_with_flags_and_vfs(
+        &db,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+        vfs.name.as_str(),
     )
-    .with_context(|| format!("failed to open {uri}"))?;
-    Ok(GraftConnection { conn, _vfs: vfs })
+    .with_context(|| format!("failed to open {} with VFS {}", db.display(), vfs.name))?;
+    Ok(GraftConnection {
+        conn,
+        #[cfg(not(target_arch = "wasm32"))]
+        _vfs: vfs,
+    })
 }
 
 struct RegisteredVfs {
     name: String,
+    #[cfg(not(target_arch = "wasm32"))]
     _data_dir: tempfile::TempDir,
+    #[cfg(target_arch = "wasm32")]
+    _data_dir: PathBuf,
 }
 
+#[cfg(target_arch = "wasm32")]
+static BROWSER_VFS: OnceLock<RegisteredVfs> = OnceLock::new();
+
+#[cfg(target_arch = "wasm32")]
+fn register_graft_vfs() -> Result<&'static RegisteredVfs> {
+    if let Some(vfs) = BROWSER_VFS.get() {
+        return Ok(vfs);
+    }
+    let vfs = create_registered_vfs()?;
+    let _ = BROWSER_VFS.set(vfs);
+    Ok(BROWSER_VFS
+        .get()
+        .expect("browser VFS initialized on this worker"))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn register_graft_vfs() -> Result<RegisteredVfs> {
+    create_registered_vfs()
+}
+
+fn create_registered_vfs() -> Result<RegisteredVfs> {
     let name = format!("graft_cli_{}_{}", std::process::id(), unique_suffix());
+
+    #[cfg(target_arch = "wasm32")]
+    let data_dir = {
+        let path = PathBuf::from("/.graft/tmp/browser-vfs-base");
+        std::fs::create_dir_all(&path)
+            .context("failed to create browser Graft VFS data directory")?;
+        path
+    };
+
+    #[cfg(not(target_arch = "wasm32"))]
     let data_dir = tempfile::Builder::new()
         .prefix(&name)
         .tempdir()
         .context("failed to create temporary Graft data directory")?;
+
     graft_sqlite::register_static(
         &name,
         false,
         GraftConfig {
             remote: RemoteConfig::Memory,
+            #[cfg(target_arch = "wasm32")]
+            data_dir: data_dir.clone(),
+            #[cfg(not(target_arch = "wasm32"))]
             data_dir: data_dir.path().to_path_buf(),
             autosync: None,
         },
     )?;
+
+    #[cfg(target_arch = "wasm32")]
+    return Ok(RegisteredVfs { name, _data_dir: data_dir });
+
+    #[cfg(not(target_arch = "wasm32"))]
     Ok(RegisteredVfs { name, _data_dir: data_dir })
 }
 
@@ -3582,6 +3665,54 @@ mod tests {
         assert!(output.contains("untracked: app.db"), "{output}");
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn repo_commands_preserve_question_marks_in_paths() {
+        let _guard = CWD_LOCK.lock().unwrap();
+        let original_dir = std::env::current_dir().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let worktree = temp_dir.path().join("space ? #");
+        let repo = graft::repo::Repository::init(&worktree).unwrap();
+        let legacy_workspace_db = repo.graft_dir().join("control.sqlite");
+        std::fs::write(&legacy_workspace_db, b"legacy workspace database").unwrap();
+        std::env::set_current_dir(&worktree).unwrap();
+
+        let output = run_repo_pragma(None, None, "json_status", None)
+            .unwrap()
+            .expect("status pragma should return JSON");
+        std::env::set_current_dir(original_dir).unwrap();
+
+        assert!(
+            output.contains(&repo.worktree().display().to_string()),
+            "{output}"
+        );
+        assert!(!temp_dir.path().join("space ").exists());
+        assert!(!legacy_workspace_db.exists());
+        assert!(
+            std::fs::read_dir(repo.graft_dir())
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| entry.path().extension().is_none_or(|ext| ext != "sqlite"))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn repo_commands_accept_windows_verbatim_database_paths() {
+        let _guard = CWD_LOCK.lock().unwrap();
+        let original_dir = std::env::current_dir().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo = graft::repo::Repository::init(temp_dir.path()).unwrap();
+        std::env::set_current_dir(repo.worktree()).unwrap();
+
+        let output = run_repo_pragma(None, None, "json_status", None)
+            .unwrap()
+            .expect("status pragma should return JSON");
+        std::env::set_current_dir(original_dir).unwrap();
+
+        assert!(output.contains("\"current_branch\":\"main\""), "{output}");
+    }
+
     #[test]
     fn sql_status_reports_untracked_artifacts_in_eidos_worktree() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -3730,20 +3861,20 @@ mod tests {
     }
 
     #[test]
-    fn clone_defaults_its_database_tag_to_the_current_worktree() {
+    fn clone_defaults_to_an_anonymous_workspace_session() {
         let _guard = CWD_LOCK.lock().unwrap();
         let original_dir = std::env::current_dir().unwrap();
         let temp_dir = tempfile::tempdir().unwrap();
         std::env::set_current_dir(temp_dir.path()).unwrap();
 
-        let result = resolve_clone_db(None);
+        let result = resolve_clone_workspace_session(None);
 
         std::env::set_current_dir(original_dir).unwrap();
         assert_eq!(
             result.unwrap(),
             std::fs::canonicalize(temp_dir.path())
                 .unwrap()
-                .join(".graft-clone.sqlite")
+                .join(graft::repo::GRAFT_DIR)
         );
     }
 

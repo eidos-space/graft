@@ -1,5 +1,13 @@
 use super::*;
 
+pub(super) fn begin_workspace_checkout(file: &VolFile) -> Result<WorkspaceCheckoutGuard, ErrCtx> {
+    file.try_workspace_checkout().ok_or_else(|| {
+        ErrCtx::PragmaErr(
+            "cannot update the worktree while another SQLite write transaction is open".into(),
+        )
+    })
+}
+
 pub(super) fn run_repo_checkout(
     runtime: &Runtime,
     file: &mut VolFile,
@@ -8,6 +16,7 @@ pub(super) fn run_repo_checkout(
     if !file.is_idle() {
         return pragma_err!("cannot checkout while there is an open transaction");
     }
+    let _workspace_checkout = begin_workspace_checkout(file)?;
     let repo = repo_for_file(file)?;
     match spec {
         RepoCheckoutSpec::Detach { rev, force } => {
@@ -25,6 +34,7 @@ pub(super) fn run_repo_checkout(
             verify_repo_checkout_plan(runtime, &plan, None)?;
             let previous_files = current_repo_files_for_checkout(&repo)?;
             let previous_artifacts = current_repo_artifacts_for_checkout(&repo)?;
+            preflight_workspace_checkout(&repo, &plan, &previous_files)?;
             let id = repo.apply_detach_plan(&rev, &plan)?;
             checkout_repo_plan(
                 runtime,
@@ -363,6 +373,7 @@ pub(super) fn run_repo_reset(
     if !file.is_idle() {
         return pragma_err!("cannot reset while there is an open transaction");
     }
+    let _workspace_checkout = begin_workspace_checkout(file)?;
 
     let repo = repo_for_file(file)?;
     let current_state = current_repo_file_state(runtime, file)?;
@@ -399,6 +410,9 @@ pub(super) fn run_repo_reset(
     } else {
         Vec::new()
     };
+    if matches!(mode, ResetMode::Hard) {
+        preflight_workspace_checkout(&repo, &plan.checkout, &previous_files)?;
+    }
     let outcome = repo.apply_reset_plan(&plan)?;
 
     match mode {
@@ -636,33 +650,279 @@ pub(super) fn checkout_repo_plan(
     previous_artifacts: &BTreeMap<String, graft::repo::CommitArtifactState>,
     remote: Option<Arc<Remote>>,
 ) -> Result<(), ErrCtx> {
-    let key = repo.file_key(&file.tag)?;
-    if let Some(state) = plan.files.get(&key) {
-        checkout_repo_file_state(runtime, file, state, remote.clone())?;
-    } else {
-        let volume = runtime.volume_open(None, None, None)?;
-        file.switch_volume(&volume.vid)?;
+    WorkspaceCheckout::new(runtime, file, repo)?.apply(
+        plan,
+        previous_files,
+        previous_artifacts,
+        remote,
+    )
+}
+
+struct WorkspaceCheckout<'a> {
+    runtime: &'a Runtime,
+    file: &'a mut VolFile,
+    repo: &'a Repository,
+    current_key: String,
+}
+
+impl<'a> WorkspaceCheckout<'a> {
+    fn new(
+        runtime: &'a Runtime,
+        file: &'a mut VolFile,
+        repo: &'a Repository,
+    ) -> Result<Self, ErrCtx> {
+        let current_key = repo.file_key(&file.tag)?;
+        Ok(Self { runtime, file, repo, current_key })
     }
-    for (path, state) in &plan.files {
-        if path == &key {
-            continue;
+
+    fn apply(
+        &mut self,
+        plan: &CheckoutPlan,
+        previous_files: &BTreeMap<String, CommitFileState>,
+        previous_artifacts: &BTreeMap<String, CommitArtifactState>,
+        remote: Option<Arc<Remote>>,
+    ) -> Result<(), ErrCtx> {
+        preflight_workspace_checkout(self.repo, plan, previous_files)?;
+        let bindings = prepare_workspace_bindings(self.runtime, plan, remote)?;
+        let previous_bindings = self.previous_bindings(plan, previous_files)?;
+        let backups = WorkspacePhysicalBackups::stage(self.repo, plan, previous_files)?;
+
+        if let Err(err) = self.materialize_sqlite_projections(plan) {
+            backups.restore();
+            return Err(err);
         }
-        checkout_repo_file_state_to_path(
-            runtime,
-            repo,
-            state,
-            &repo.worktree().join(path),
-            remote.clone(),
-        )?;
+        if let Err(err) = self.repo.materialize_artifact_checkout(
+            &plan.artifacts,
+            previous_artifacts,
+            &plan.files,
+        ) {
+            backups.restore();
+            return Err(err.into());
+        }
+        if let Err(err) = self.apply_bindings(plan, previous_files, &bindings) {
+            self.rollback_artifacts(plan, previous_files, previous_artifacts);
+            self.restore_bindings(&previous_bindings);
+            backups.restore();
+            return Err(err);
+        }
+
+        backups.discard();
+        Ok(())
     }
-    repo.materialize_artifact_checkout(&plan.artifacts, previous_artifacts, &plan.files)?;
-    for path in previous_files.keys() {
-        if path == &key || plan.files.contains_key(path) || plan.artifacts.contains_key(path) {
-            continue;
+
+    fn materialize_sqlite_projections(&self, plan: &CheckoutPlan) -> Result<(), ErrCtx> {
+        if !self.repo.config()?.worktree.materialize_sqlite {
+            return Ok(());
         }
-        remove_materialized_repo_file(repo, path)?;
+        for (key, state) in &plan.files {
+            write_repo_file_state_to_path(self.runtime, state, &self.repo.worktree().join(key))?;
+        }
+        Ok(())
+    }
+
+    fn previous_bindings(
+        &self,
+        plan: &CheckoutPlan,
+        previous_files: &BTreeMap<String, CommitFileState>,
+    ) -> Result<BTreeMap<String, Option<VolumeId>>, ErrCtx> {
+        workspace_sqlite_keys(plan, previous_files)
+            .into_iter()
+            .map(|key| {
+                let tag = workspace_sqlite_tag(self.repo, &key);
+                Ok((key, self.runtime.tag_get(&tag)?))
+            })
+            .collect()
+    }
+
+    fn apply_bindings(
+        &mut self,
+        plan: &CheckoutPlan,
+        previous_files: &BTreeMap<String, CommitFileState>,
+        bindings: &BTreeMap<String, VolumeId>,
+    ) -> Result<(), ErrCtx> {
+        for key in workspace_sqlite_keys(plan, previous_files) {
+            if let Some(vid) = bindings.get(&key) {
+                self.replace_binding(&key, vid)?;
+            } else {
+                self.remove_binding(&key)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn replace_binding(&mut self, key: &str, vid: &VolumeId) -> Result<(), ErrCtx> {
+        if key == self.current_key {
+            self.file.switch_volume(vid)
+        } else {
+            self.runtime
+                .tag_replace(&workspace_sqlite_tag(self.repo, key), vid.clone())?;
+            Ok(())
+        }
+    }
+
+    fn remove_binding(&mut self, key: &str) -> Result<(), ErrCtx> {
+        if key == self.current_key {
+            self.file.clear_volume_binding()
+        } else {
+            self.runtime
+                .tag_delete(&workspace_sqlite_tag(self.repo, key))?;
+            Ok(())
+        }
+    }
+
+    fn restore_bindings(&mut self, bindings: &BTreeMap<String, Option<VolumeId>>) {
+        for (key, vid) in bindings {
+            let result = match vid {
+                Some(vid) => self.replace_binding(key, vid),
+                None => self.remove_binding(key),
+            };
+            if let Err(err) = result {
+                tracing::error!(
+                    path = key,
+                    "failed to restore workspace SQLite binding: {err}"
+                );
+            }
+        }
+    }
+
+    fn rollback_artifacts(
+        &self,
+        plan: &CheckoutPlan,
+        previous_files: &BTreeMap<String, CommitFileState>,
+        previous_artifacts: &BTreeMap<String, CommitArtifactState>,
+    ) {
+        if let Err(err) = self.repo.materialize_artifact_checkout(
+            previous_artifacts,
+            &plan.artifacts,
+            previous_files,
+        ) {
+            tracing::error!("failed to restore workspace artifacts: {err}");
+        }
+    }
+}
+
+fn prepare_workspace_bindings(
+    runtime: &Runtime,
+    plan: &CheckoutPlan,
+    remote: Option<Arc<Remote>>,
+) -> Result<BTreeMap<String, VolumeId>, ErrCtx> {
+    let mut bindings = BTreeMap::new();
+    for (key, state) in &plan.files {
+        hydrate_repo_file_state(runtime, state, remote.clone())?;
+        bindings.insert(key.clone(), repo_file_state_volume(runtime, state)?);
+    }
+    Ok(bindings)
+}
+
+fn workspace_sqlite_keys(
+    plan: &CheckoutPlan,
+    previous_files: &BTreeMap<String, CommitFileState>,
+) -> BTreeSet<String> {
+    plan.files
+        .keys()
+        .chain(previous_files.keys())
+        .cloned()
+        .collect()
+}
+
+fn workspace_sqlite_tag(repo: &Repository, key: &str) -> String {
+    repo.worktree().join(key).to_string_lossy().into_owned()
+}
+
+pub(super) fn preflight_workspace_checkout(
+    repo: &Repository,
+    plan: &CheckoutPlan,
+    previous_files: &BTreeMap<String, CommitFileState>,
+) -> Result<(), ErrCtx> {
+    for key in workspace_sqlite_keys(plan, previous_files) {
+        let path = repo.worktree().join(&key);
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => {
+                return pragma_err!(format!(
+                    "path `{}` is not a regular SQLite database file",
+                    path.display()
+                ));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+    for state in plan.artifacts.values() {
+        repo.verify_artifact_state(state)?;
     }
     Ok(())
+}
+
+struct WorkspacePhysicalBackups {
+    root: Option<PathBuf>,
+    entries: Vec<(PathBuf, Option<PathBuf>)>,
+}
+
+impl WorkspacePhysicalBackups {
+    fn stage(
+        repo: &Repository,
+        plan: &CheckoutPlan,
+        previous_files: &BTreeMap<String, CommitFileState>,
+    ) -> Result<Self, ErrCtx> {
+        let mut backups = Self { root: None, entries: Vec::new() };
+        for key in workspace_sqlite_keys(plan, previous_files) {
+            let path = repo.worktree().join(key);
+            if !path.is_file() {
+                backups.entries.push((path, None));
+                continue;
+            }
+            let root = backups.root(repo)?;
+            let backup = root.join(backups.entries.len().to_string());
+            if let Err(err) = std::fs::rename(&path, &backup) {
+                backups.restore();
+                return Err(err.into());
+            }
+            backups.entries.push((path, Some(backup)));
+        }
+        Ok(backups)
+    }
+
+    fn root(&mut self, repo: &Repository) -> Result<PathBuf, ErrCtx> {
+        if let Some(root) = &self.root {
+            return Ok(root.clone());
+        }
+        let parent = repo.graft_dir().join("tmp");
+        std::fs::create_dir_all(&parent)?;
+        let id = NEXT_JOB_ID.fetch_add(1, Ordering::Relaxed);
+        let root = parent.join(format!("workspace-checkout-{}-{id}", std::process::id()));
+        std::fs::create_dir(&root)?;
+        self.root = Some(root.clone());
+        Ok(root)
+    }
+
+    fn restore(self) {
+        let Self { root, entries } = self;
+        for (path, backup) in entries.into_iter().rev() {
+            if let Some(backup) = backup {
+                if let Err(err) = std::fs::rename(&backup, &path) {
+                    tracing::error!(path = %path.display(), "failed to restore SQLite projection: {err}");
+                }
+            } else if let Err(err) = std::fs::remove_file(&path)
+                && err.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::error!(path = %path.display(), "failed to remove new SQLite projection: {err}");
+            }
+        }
+        Self::remove_root(root.as_deref());
+    }
+
+    fn discard(self) {
+        Self::remove_root(self.root.as_deref());
+    }
+
+    fn remove_root(root: Option<&Path>) {
+        if let Some(root) = root
+            && let Err(err) = std::fs::remove_dir_all(root)
+        {
+            tracing::warn!(path = %root.display(), "failed to remove checkout backup: {err}");
+        }
+    }
 }
 
 pub(super) fn current_repo_files_for_checkout(
@@ -1529,14 +1789,10 @@ pub(super) fn checkout_repo_file_state(
     state: &CommitFileState,
     remote: Option<Arc<Remote>>,
 ) -> Result<(), ErrCtx> {
-    let snapshot = state.snapshot.to_snapshot();
-    let volume = if snapshot.is_empty() {
-        runtime.volume_open(None, None, None)?
-    } else {
+    if !state.snapshot.to_snapshot().is_empty() {
         hydrate_repo_file_state(runtime, state, remote)?;
-        runtime.volume_from_snapshot(&snapshot)?
-    };
-    file.switch_volume(&volume.vid)?;
+    }
+    file.switch_volume(&repo_file_state_volume(runtime, state)?)?;
     Ok(())
 }
 
@@ -1562,7 +1818,8 @@ pub(super) fn checkout_repo_file_state_to_path(
     }
 
     hydrate_repo_file_state(runtime, state, remote)?;
-    write_repo_file_state_to_path(runtime, state, &path)
+    write_repo_file_state_to_path(runtime, state, &path)?;
+    bind_repo_file_state_to_path(runtime, state, &path)
 }
 
 pub(super) fn checkout_repo_file_state_to_key(
@@ -1586,7 +1843,36 @@ pub(super) fn checkout_repo_file_state_to_key(
     }
 
     hydrate_repo_file_state(runtime, state, remote)?;
-    write_repo_file_state_to_path(runtime, state, &path)
+    write_repo_file_state_to_path(runtime, state, &path)?;
+    bind_repo_file_state_to_path(runtime, state, &path)
+}
+
+fn bind_repo_file_state_to_path(
+    runtime: &Runtime,
+    state: &CommitFileState,
+    path: &Path,
+) -> Result<(), ErrCtx> {
+    runtime.tag_replace(
+        &path.to_string_lossy(),
+        repo_file_state_volume(runtime, state)?,
+    )?;
+    Ok(())
+}
+
+fn repo_file_state_volume(runtime: &Runtime, state: &CommitFileState) -> Result<VolumeId, ErrCtx> {
+    let snapshot = state.snapshot.to_snapshot();
+    if let Ok(reader) = runtime.volume_reader(state.volume.clone())
+        && reader.snapshot().page_count == snapshot.page_count
+        && reader.snapshot().iter().eq(snapshot.iter())
+    {
+        return Ok(state.volume.clone());
+    }
+    let volume = if snapshot.is_empty() {
+        runtime.volume_open(None, None, None)?
+    } else {
+        runtime.volume_from_snapshot(&snapshot)?
+    };
+    Ok(volume.vid)
 }
 
 pub(super) fn write_empty_sqlite_file_to_path(path: &Path) -> Result<(), ErrCtx> {
@@ -1712,38 +1998,59 @@ pub(super) fn checkout_merge_outcome(
             }
         }
         MergeOutcome::Merged { staged, conflicted, .. } if conflicted.is_empty() => {
-            let key = repo.file_key(&file.tag)?;
-            let index = repo.read_index()?;
-            for entry in index.stage0_entries() {
-                if !staged.iter().any(|path| path == &entry.path) {
-                    continue;
-                }
-
-                if entry.path == key {
-                    if let Some(state) = &entry.file {
-                        checkout_repo_file_state(runtime, file, state, remote.clone())?;
-                    } else if let Some(state) = &entry.artifact {
-                        repo.materialize_artifact_key(&entry.path, state)?;
-                    } else {
-                        let volume = runtime.volume_open(None, None, None)?;
-                        file.switch_volume(&volume.vid)?;
-                    }
-                } else if let Some(state) = &entry.file {
-                    checkout_repo_file_state_to_path(
-                        runtime,
-                        repo,
-                        state,
-                        &repo.worktree().join(&entry.path),
-                        remote.clone(),
-                    )?;
-                } else if let Some(state) = &entry.artifact {
-                    repo.materialize_artifact_key(&entry.path, state)?;
-                } else {
-                    remove_materialized_repo_file(repo, &entry.path)?;
-                }
-            }
+            checkout_merged_repo_paths(
+                runtime,
+                file,
+                repo,
+                staged,
+                previous_files,
+                previous_artifacts,
+                remote,
+            )?;
         }
         _ => {}
     }
     Ok(())
+}
+
+fn checkout_merged_repo_paths(
+    runtime: &Runtime,
+    file: &mut VolFile,
+    repo: &Repository,
+    staged: &[String],
+    previous_files: &BTreeMap<String, CommitFileState>,
+    previous_artifacts: &BTreeMap<String, CommitArtifactState>,
+    remote: Option<Arc<Remote>>,
+) -> Result<(), ErrCtx> {
+    let staged = staged.iter().cloned().collect::<BTreeSet<_>>();
+    let index = repo.read_index()?;
+    let mut files = BTreeMap::new();
+    let mut artifacts = BTreeMap::new();
+    for entry in index
+        .stage0_entries()
+        .filter(|entry| staged.contains(&entry.path))
+    {
+        if let Some(state) = &entry.file {
+            files.insert(entry.path.clone(), state.clone());
+        } else if let Some(state) = &entry.artifact {
+            artifacts.insert(entry.path.clone(), state.clone());
+        }
+    }
+    let previous_files = previous_files
+        .iter()
+        .filter(|(key, _)| staged.contains(*key))
+        .map(|(key, state)| (key.clone(), state.clone()))
+        .collect();
+    let previous_artifacts = previous_artifacts
+        .iter()
+        .filter(|(key, _)| staged.contains(*key))
+        .map(|(key, state)| (key.clone(), state.clone()))
+        .collect();
+    let plan = CheckoutPlan { target: None, files, artifacts };
+    WorkspaceCheckout::new(runtime, file, repo)?.apply(
+        &plan,
+        &previous_files,
+        &previous_artifacts,
+        remote,
+    )
 }
