@@ -256,7 +256,7 @@ impl SqliteApi {
     /// 2. it is the callers responsibility to eventually free the allocated buffer
     pub unsafe fn mprintf(&self, s: &str, out: *mut *const c_char) -> VfsResult<()> {
         let s = CString::new(s).map_err(|_| vars::SQLITE_INTERNAL)?;
-        let p = unsafe { (self.mprintf)(s.as_ptr()) };
+        let p = unsafe { (self.mprintf)(c"%s".as_ptr(), s.as_ptr()) };
         if p.is_null() {
             Err(vars::SQLITE_NOMEM)
         } else {
@@ -857,6 +857,26 @@ mod tests {
 
     fn log_handler(_: i32, arg2: &str) {
         println!("{arg2}");
+    }
+
+    #[test]
+    fn mprintf_copies_percent_as_literal_text() {
+        let expected = "进度 10% — 完整";
+        let mut output = core::ptr::null();
+
+        unsafe {
+            SqliteApi::new_static()
+                .mprintf(expected, &raw mut output)
+                .unwrap();
+        }
+        let actual = unsafe { CStr::from_ptr(output) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe {
+            ffi::sqlite3_free(output.cast_mut().cast());
+        }
+
+        assert_eq!(actual, expected);
     }
 
     #[test]

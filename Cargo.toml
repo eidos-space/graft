@@ -67,11 +67,6 @@ default-features = false
 git = "https://github.com/apache/opendal"
 rev = "06f088d93e38e1150a3f1558f327ec0252446302"
 
-# sqlite-plugin 0.9.0 passes PRAGMA payloads to sqlite3_mprintf as format strings.
-# Remove this override once an upstream release copies payloads as literal text.
-[patch.crates-io]
-sqlite-plugin = { path = "vendor/sqlite-plugin" }
-
 [workspace.lints.clippy]
 disallowed_methods = "deny"
 uninlined_format_args = "warn"
