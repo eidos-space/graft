@@ -1,0 +1,51 @@
+---
+title: SQLite 快照
+description: tracked SQLite 文件、Graft snapshot 和 materialized database file 的关系。
+---
+
+Graft 把 SQLite 数据库路径跟踪为 snapshot。snapshot 是一个不可变的数据库
+状态，可以被 repository commit 引用。
+
+这让 SQLite 数据库路径在 Graft 中成为一等版本对象。repository 不必把
+`data.sqlite` 只当作 opaque binary blob：它可以记录 snapshot、比较支持的
+row/schema changes、合并兼容编辑，并把结果 materialize 回普通 SQLite 文件。
+
+```text
+project/
+  data.sqlite
+  .graft/
+```
+
+`data.sqlite` 是 worktree path；commit 里保存的是 `.graft/` 支撑的 snapshot
+descriptor。
+
+## 通过 Graft 写入
+
+```bash
+graft sql --db data.sqlite "INSERT INTO notes(body) VALUES ('hello');"
+graft add data.sqlite
+graft commit -m "add note"
+```
+
+通过 `graft sql` 或 `vfs=graft` 写入时，SQLite transaction 会推进当前
+Graft database state。stage 和 commit 后，它才成为 repository history。
+
+## Materialized Files
+
+默认情况下，commit、checkout、switch、pull、merge-continue 后，Graft 会把
+tracked SQLite snapshot 写回 worktree 中的普通 SQLite 文件。
+
+```bash
+sqlite3 data.sqlite "SELECT count(*) FROM notes;"
+```
+
+repository commit 仍然保存可验证的 snapshot descriptor，而不是只保存整个
+文件副本。
+
+## Export
+
+```bash
+graft export --source HEAD --output data.head.sqlite data.sqlite
+```
+
+`graft export` 不移动 `HEAD`，不修改 index，也不把导出文件连接到当前 Graft volume。

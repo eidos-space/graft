@@ -9,8 +9,8 @@ interface Props {
 
 import { Aside } from "@astrojs/starlight/components";
 
-const issueUrl = `https://github.com/orbitinghail/graft/issues/${Astro.props.issue}`;
-const prUrl = `https://github.com/orbitinghail/graft/pull/${Astro.props.pr}`;
+const issueUrl = `https://github.com/eidos-space/graft/issues/${Astro.props.issue}`;
+const prUrl = `https://github.com/eidos-space/graft/pull/${Astro.props.pr}`;
 const date = new Date(Astro.props.startDate).toISOString().split("T")[0];
 ---
 
@@ -22,7 +22,7 @@ const date = new Date(Astro.props.startDate).toISOString().split("T")[0];
         <li>
           <b>Issue:</b>{" "}
           <a href={issueUrl} target="_blank" rel="noopener noreferrer">
-            <code>orbitinghail/graft#{Astro.props.issue}</code>
+            <code>eidos-space/graft#{Astro.props.issue}</code>
           </a>
         </li>
       )
@@ -32,7 +32,7 @@ const date = new Date(Astro.props.startDate).toISOString().split("T")[0];
         <li>
           <b>PR:</b>{" "}
           <a href={prUrl} target="_blank" rel="noopener noreferrer">
-            <code>orbitinghail/graft#{Astro.props.pr}</code>
+            <code>eidos-space/graft#{Astro.props.pr}</code>
           </a>
         </li>
       )

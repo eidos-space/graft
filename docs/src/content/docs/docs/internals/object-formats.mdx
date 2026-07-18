@@ -1,0 +1,103 @@
+---
+title: Object Formats
+description: Internal repository object shapes for commits, trees, SQLite snapshots, file blobs, and payload pointers.
+---
+
+Graft repository history is built from typed immutable objects. The exact
+serialization is an implementation detail, but the object model is useful when
+debugging repository state.
+
+## Commit Objects
+
+A commit points to a tree and parent commits:
+
+```text
+commit
+tree <tree-oid>
+parent <parent-oid>
+message seed app state
+```
+
+Branch and tag refs point at commit ids or tag objects.
+
+## Tree Objects
+
+A tree maps repository paths to typed content objects:
+
+```text
+data.sqlite                 sqlite_snapshot_v1
+settings.json               file_blob_v1
+attachments/report.pdf      large_file_pointer_v1
+```
+
+This is the app-state boundary: each tree path describes one piece of the state
+the app can open.
+
+## SQLite Snapshot Objects
+
+A SQLite snapshot object identifies a database snapshot in Graft storage. It
+records enough information to reconstruct and verify the database state, such
+as volume identity, page count, log ranges, and expected storage commit hashes.
+
+Conceptually:
+
+```text
+sqlite-snapshot-v1
+volume <VolumeId>
+page-count <n>
+range <LogId> <start-lsn> <end-lsn>
+commit <LogId> <lsn> <storage-hash>
+```
+
+Repository users normally address snapshots through commits and paths, not
+through these storage coordinates.
+
+## File Blob Objects
+
+Small text files can be stored directly as repository objects:
+
+```text
+file-blob-v2
+kind text_file
+size <bytes>
+encoding base64
+data <base64-bytes>
+```
+
+`file-blob-v2` replaces the quadratic Base58 payload encoding used by
+`file-blob-v1`. Readers continue to accept v1 objects so existing repositories
+remain readable, while new inline files use linear-time Base64 encoding.
+
+The user-facing storage value is `inline`.
+
+## External Payload Pointer Objects
+
+Binary files and configured external paths use pointer objects:
+
+```json
+{
+  "type": "large_file_pointer_v1",
+  "oid": "blake3:...",
+  "size": 12345678,
+  "media_type": "application/pdf"
+}
+```
+
+The bytes live in local `.graft/store/files` and remote payload storage. The
+user-facing storage value is `external`.
+
+## Object Database
+
+Repository objects live under `.graft/objects/`. SQLite page/log storage and
+external file payloads live under `.graft/store/`.
+
+```text
+.graft/
+  objects/
+  store/
+    sqlite/
+    files/
+```
+
+This split lets repository history stay small while large payloads and SQLite
+storage are hydrated independently.

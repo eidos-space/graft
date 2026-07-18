@@ -1,0 +1,101 @@
+---
+title: What Is Graft
+description: Understand Graft's role as version control for SQLite-backed app state.
+---
+
+Graft is version control for SQLite-backed application state. It tracks SQLite
+databases and app-owned files as one repository, then gives them Git-like
+operations: status, add, commit, branch, switch, diff, restore, merge, fetch,
+pull, and push.
+
+The short version:
+
+```text
+SQLite owns transactions.
+Graft owns history.
+```
+
+Git makes plain text a first-class versioned format: line diffs, line merges,
+and code review all work because Git can see the structure it cares about.
+SQLite files can be committed to Git, but they are usually opaque database
+files. Graft gives SQLite databases that first-class version-management
+surface: repository paths, snapshots, row diffs, row-aware merge, structured
+conflicts, and restore.
+
+## The Problem
+
+Many apps store durable state in more than one file:
+
+```text
+app-data/
+  data.sqlite
+  search.sqlite
+  settings.json
+  attachments/
+    invoice.pdf
+    avatar.png
+```
+
+Rows inside `data.sqlite` may refer to files under `attachments/`. If a branch,
+rollback, AI edit, or sync operation changes the database without changing the
+matching files, the app can open an inconsistent state.
+
+Graft's core invariant is:
+
+```text
+A commit records one coherent application state.
+```
+
+## What Graft Provides
+
+- A repository directory, `.graft/`, next to the app data worktree.
+- An index for staging SQLite snapshots and file artifacts.
+- SQLite databases as first-class versioned paths, not opaque binary blobs.
+- Commits, refs, branches, tags, and remote-tracking refs.
+- Row-level diffs for supported SQLite tables.
+- Conservative conflicts for file artifacts and unsupported SQLite surfaces.
+- JSON command output for application UIs.
+- Remotes backed by local files, S3-compatible object storage, or the Graft HTTP protocol.
+
+## When To Use Graft
+
+Use Graft when an app needs to inspect, accept, reject, branch, merge, revert,
+or sync changes to SQLite-backed state.
+
+Good fits include:
+
+- local-first apps with SQLite data and attachment directories
+- apps that let AI agents edit structured data or files
+- products that need user-visible history, checkpoints, or change review
+- tools that need row-aware diffs instead of opaque database-file diffs
+- apps that want to keep large files outside SQLite while versioning them with database rows
+
+## When Not To Use Graft
+
+Graft is not a replacement for SQLite transactions, application authorization,
+or a general-purpose source-code Git repository.
+
+It is also not a SQL query replication layer. If you need every client to apply
+the same operation log in real time, use a sync protocol designed for that
+shape. Graft records repository snapshots and merges app states.
+
+## Integration Surfaces
+
+Most developers start with the CLI:
+
+```bash
+graft init
+graft sql --db data.sqlite "CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT);"
+graft add --all
+graft commit -m "seed notes"
+```
+
+Applications usually integrate through the SQLite extension:
+
+```sql
+PRAGMA graft_json_status;
+PRAGMA graft_add = '--all';
+PRAGMA graft_commit = 'save checkpoint';
+```
+
+The CLI and extension share the same repository semantics.

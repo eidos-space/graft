@@ -1,0 +1,78 @@
+---
+title: Export SQLite Files
+description: Export Graft SQLite snapshots as normal database files and round-trip external SQLite edits.
+---
+
+Graft stores SQLite database history as snapshots, but it can materialize and
+export normal SQLite database files for standard tools.
+
+## Materialized Worktree Files
+
+By default, Graft materializes committed SQLite snapshots at their tracked
+worktree paths after operations such as commit, checkout, switch, pull, and
+merge-continue.
+
+```text
+project/
+  data.sqlite
+  .graft/
+```
+
+`data.sqlite` is a normal SQLite file that tools can inspect. The repository
+history still stores a SQLite snapshot object under `.graft/`.
+
+## Export A Snapshot
+
+Export the current worktree database state:
+
+```bash
+graft export --output data.inspect.sqlite data.sqlite
+```
+
+Export a committed revision:
+
+```bash
+graft export --source HEAD --output data.head.sqlite data.sqlite
+graft export --source HEAD~1 --output data.previous.sqlite data.sqlite
+```
+
+JSON output:
+
+```bash
+graft export --json --source HEAD --output data.head.sqlite data.sqlite
+```
+
+The exported file is a regular SQLite database. It is not connected to the
+Graft volume after export.
+
+## Use External SQLite Tools
+
+You can inspect exported or materialized files with tools such as `sqlite3`, DB
+Browser for SQLite, Datasette, or app-specific debuggers.
+
+If you edit a tracked materialized file directly, close the writer, checkpoint
+WAL data if needed, and stage the path:
+
+```bash
+sqlite3 data.sqlite "INSERT INTO notes(body) VALUES ('external edit');"
+sqlite3 data.sqlite "PRAGMA wal_checkpoint(TRUNCATE);"
+graft add data.sqlite
+graft commit -m "import external edit"
+```
+
+For application code, prefer writing through `graft sql --db` or a SQLite
+connection opened with `vfs=graft`. That keeps Graft's current snapshot state
+in sync with SQLite writes.
+
+## Disable Materialization
+
+Materialization is controlled by repository config:
+
+```toml
+[worktree]
+materialize_sqlite = true
+```
+
+It is `true` by default. Set it to `false` only for integrations that
+intentionally want volume-only database paths and do not want ordinary SQLite
+files in the worktree.

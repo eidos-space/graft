@@ -1,6 +1,6 @@
 # Contributing to Graft
 
-Welcome to the orbitinghail Graft repo! We are so excited you are here. Thank you for your interest in contributing your time and expertise to the project. The following document details contribution guidelines.
+Welcome to the Eidos Graft repo! We are so excited you are here. Thank you for your interest in contributing your time and expertise to the project. The following document details contribution guidelines.
 
 Whether you're addressing an open issue (or filing a new one), fixing a typo in our documentation, adding to core capabilities of the project, or introducing a new use case, all kinds of contributions are welcome.
 
@@ -12,8 +12,8 @@ Before working on Graft, it's important to gain consensus on what you want to ch
 - [Start a discussion]: best for ideas and more abstract topics
 - [Join the Discord]: best for real-time collaboration
 
-[File an issue]: https://github.com/orbitinghail/graft/issues/new
-[Start a discussion]: https://github.com/orbitinghail/graft/discussions/new/choose
+[File an issue]: https://github.com/eidos-space/graft/issues/new
+[Start a discussion]: https://github.com/eidos-space/graft/discussions/new/choose
 [Join the Discord]: https://discord.gg/dhyjne5XK9
 
 Once you're ready to start building, it's time to get Graft running on your computer!
@@ -112,8 +112,8 @@ Graft is licensed under either of
 - Apache License, Version 2.0 ([LICENSE-APACHE] or https://www.apache.org/licenses/LICENSE-2.0)
 - MIT license ([LICENSE-MIT] or https://opensource.org/licenses/MIT)
 
-[LICENSE-APACHE]: https://github.com/orbitinghail/graft/blob/main/LICENSE-APACHE
-[LICENSE-MIT]: https://github.com/orbitinghail/graft/blob/main/LICENSE-MIT
+[LICENSE-APACHE]: https://github.com/eidos-space/graft/blob/main/LICENSE-APACHE
+[LICENSE-MIT]: https://github.com/eidos-space/graft/blob/main/LICENSE-MIT
 
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you shall be dual licensed as above, without any additional terms or conditions.
 

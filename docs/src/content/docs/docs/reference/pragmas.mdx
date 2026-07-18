@@ -1,0 +1,438 @@
+---
+title: Repository Pragmas
+description: Reference for public Graft repository-mode SQLite PRAGMA commands.
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+Repository pragmas are the primary API for embedding Graft in applications.
+
+## Lifecycle
+
+```sql
+PRAGMA graft_init;
+PRAGMA graft_json_init;
+PRAGMA graft_clone = 'fs:///srv/graft/app';
+PRAGMA graft_clone = 'fs:///srv/graft/app feature/search';
+PRAGMA graft_clone = '--branch feature/search fs:///srv/graft/app';
+PRAGMA graft_json_clone = 'fs:///srv/graft/app feature/search';
+```
+
+`graft_init` creates `.graft/`. `graft_clone` creates `.graft/`, configures `origin`, fetches a branch, sets upstream tracking, and materializes the database.
+`graft_json_init` returns structured initialization metadata with `graft_dir`,
+`worktree`, post-init `current_head` and `current_branch` when available,
+current database repo `path`, `kind`, and `preserved_contents`.
+`graft_json_clone` returns the same operation as structured JSON with
+post-operation `current_head` and `current_branch`, `remote`, `branch`, fetched
+`head`, `commits`, `graft_dir`, and materialized `paths`.
+
+## Status, Stage, Commit
+
+```sql
+PRAGMA graft_status;
+PRAGMA graft_json_status;
+PRAGMA graft_ls_files;
+PRAGMA graft_json_ls_files;
+PRAGMA graft_json_ls_files = '--details --kind binary_file';
+PRAGMA graft_json_ls_files = '--stage';
+PRAGMA graft_json_ls_files = '--others --kind text_file';
+PRAGMA graft_audit;
+PRAGMA graft_json_audit;
+PRAGMA graft_json_audit = '--repair origin';
+PRAGMA graft_gc;
+PRAGMA graft_json_gc = '--dry-run';
+PRAGMA graft_json_gc = '--force';
+PRAGMA graft_payload_fetch;
+PRAGMA graft_json_payload_fetch = '--remote origin HEAD';
+PRAGMA graft_payload_status;
+PRAGMA graft_json_payload_status = 'HEAD';
+PRAGMA graft_payload_prune;
+PRAGMA graft_json_payload_prune;
+PRAGMA graft_json_payload_prune = '--force';
+PRAGMA graft_add;
+PRAGMA graft_add = '--all';
+PRAGMA graft_add = '--all --kind text_file';
+PRAGMA graft_add = 'analytics.sqlite';
+PRAGMA graft_json_add = '--all';
+PRAGMA graft_rm = 'analytics.sqlite';
+PRAGMA graft_rm = '--cached -- analytics.sqlite';
+PRAGMA graft_json_rm = 'analytics.sqlite';
+PRAGMA graft_json_rm = '--cached -- analytics.sqlite';
+PRAGMA graft_commit = 'message';
+PRAGMA graft_json_commit = 'message';
+```
+
+Without an argument, `graft_add` stages the currently open database. With
+`--all`, it stages every unstaged database and file change in the worktree,
+including deletions. Add `--kind sqlite_database|text_file|binary_file` to
+stage only one path content class. With a path argument, it stages one
+repo-relative database or file path.
+
+`graft_json_add` runs the same staging operation and returns `operation:
+"add"`, the optional requested `kind` filter, post-operation `current_head` and
+`current_branch` when available, plus `paths`, where each entry includes `path`,
+`change` (`added`, `modified`, or `deleted`), `kind` (`sqlite_database`,
+`text_file`, or `binary_file`), and `storage` (`sqlite_snapshot`, `inline`, or
+`external`).
+
+`graft_rm` stages deletion of a tracked database or file.
+Pass `--cached` to remove the path from the index while keeping the worktree
+contents.
+
+`graft_json_rm` runs the same remove operation as `graft_rm` and returns
+`operation: "rm"`, the requested `cached` boolean, post-operation
+`current_head` and `current_branch` when available, plus `paths`, where each
+entry includes `path`, `kind`, and `action`. `action: "staged"` means a
+deletion is staged for the next commit; `action: "removed"` means an
+uncommitted staged addition was removed from the index and, unless `cached` is
+true, the worktree.
+
+`graft_json_commit` runs the same commit operation as `graft_commit` and
+returns `operation: "commit"`, post-operation `current_head` and
+`current_branch`, updated `head`, current `branch`, a compact `commit` summary
+(`id`, `message`, `parents`), and committed `paths` with `path`, `change`, and
+`kind`. When SQLite snapshots are materialized into the worktree, the response
+also includes `materialized` entries with `path`, `kind`, `storage`, and
+`action`.
+
+`graft_json_status` returns the current repository position as `current_head`
+and `current_branch` when available, keeps the legacy `staged` and `unstaged`
+path lists, and adds app-facing summary booleans: `has_unstaged_changes`,
+`has_staged_changes`, `has_conflicts`, and `work_in_progress`. The legacy
+`dirty` flag remains unstaged-focused; use `work_in_progress` when an
+application needs to know whether any unstaged, staged, conflicted, or merge
+state is present. The nested `counts` object gives `unstaged`, `staged`, and
+`conflicted` path counts for app badges and sidebars. The `paths` array is a
+one-entry-per-changed-path rollup with `kind`, `storage`, `index_status`,
+`worktree_status`, a Git-like two-character `code`, `unstaged_change`,
+`staged_change`, and `conflicted`, so applications can render status tables
+without joining the lower-level arrays. Structured `staged_changes` and
+`unstaged_changes` entries include `change`, `kind`, and `storage`, so
+applications can distinguish SQLite databases, text files, binary files, and
+external payload-backed files throughout staging.
+
+`graft_json_ls_files` returns `current_head`, `current_branch`, `stage`, and
+`paths`. Without `--stage`, `paths` lists the current tracked repository paths.
+Pass `--details` to include artifact `oid`, `content_hash`, `object_present`,
+and `external_payload_present` fields for payload cache views. With
+`--stage`, `paths` contains raw index entries with `stage`, `mode`, `oid`, path
+`kind`, `storage`, byte `size`, and SQLite `page_count`, including unmerged
+`base`/`ours`/`theirs` entries during conflicts. Pass `--others` to list
+untracked worktree SQLite databases, text files, and binary files that can be
+staged with `graft_add`; JSON output includes `others: true` in this mode.
+`--details`, `--stage`, and `--others` are mutually exclusive.
+
+`graft_json_audit` verifies that tracked file artifact objects and external
+payloads for the current repository state are present and valid locally. It
+returns `current_head`, `current_branch`, artifact counts, external payload counts,
+and structured `issues` when payloads are missing or invalid. Pass `--repair
+[remote]` to hydrate missing artifact objects and external payloads from a
+remote without changing HEAD, the index, or worktree contents. Repair JSON uses
+`operation: "audit_repair"` and returns the `remote`, fetched object counts,
+and `before`/`after` audit state.
+
+`graft_gc` and `graft_json_gc` scan internal SQLite storage for unreachable
+data. They default to dry-run mode; pass `--force` to delete and compact it.
+This is separate from `graft_payload_prune`, which manages the external file
+payload cache.
+
+`graft_payload_fetch` and `graft_json_payload_fetch` hydrate missing external payloads
+for `HEAD` or a selected revision without moving refs, changing the index, or
+touching worktree files. Argument shape is `[--remote remote] [rev]`; the
+remote defaults to the current upstream remote, then origin, and `rev` defaults
+to `HEAD`. JSON output uses `operation: "payload_fetch"` and returns `remote`,
+`target`, external payload counts, fetched byte totals, and `files` entries with
+content hashes, store paths, status, and repository paths.
+
+`graft_payload_status` and `graft_json_payload_status` inspect local cache presence for
+external payloads referenced by `HEAD` or a selected revision. They are
+read-only and never fetch or delete payloads. JSON output uses
+`operation: "payload_status"` and returns `target`, present, missing, and invalid counts, byte
+totals, and `files` entries with content hashes, store paths, status, optional
+messages, and repository paths.
+
+`graft_payload_prune` and `graft_json_payload_prune` scan the local external payload
+cache in `.graft/store/files` for payloads that are not referenced by the
+index, branches, remote-tracking branches, tags, or reachable commits. They
+default to dry-run mode; pass `--force` to delete candidates. JSON output uses
+`operation: "payload_prune"` and returns `dry_run`, `current_head`,
+`current_branch`, referenced, candidate, and pruned counts, byte totals, and
+candidate `files` with content hashes and store paths.
+
+`graft_lfs_fetch`, `graft_json_lfs_fetch`, `graft_lfs_status`,
+`graft_json_lfs_status`, `graft_lfs_prune`, and `graft_json_lfs_prune` remain
+accepted aliases for older callers.
+
+## History And Diff
+
+```sql
+PRAGMA graft_log;
+PRAGMA graft_json_log;
+PRAGMA graft_json_log = '--with-status';
+PRAGMA graft_json_log = '--with-status --limit 50';
+PRAGMA graft_json_log = '--with-status --limit 50 --after <commit-id>';
+PRAGMA graft_show = 'HEAD';
+PRAGMA graft_json_show = 'HEAD';
+PRAGMA graft_diff;
+PRAGMA graft_diff = '--staged';
+PRAGMA graft_diff = '--kind text_file --staged';
+PRAGMA graft_diff = 'HEAD~1 HEAD -- data.sqlite';
+PRAGMA graft_json_diff = 'HEAD~1 HEAD -- data.sqlite';
+PRAGMA graft_json_diff = '--content --max-content-bytes 65536 HEAD~1 HEAD -- notes.md';
+```
+
+Repository diff arguments follow the CLI shape:
+
+```text
+[--rows] [--kind kind] [--staged] [from] [to] [-- path]
+```
+
+In v0.6.0, the JSON-only `--content` mode returns bounded content for one
+changed UTF-8 text artifact. It cannot be combined with `--rows` or `--staged`;
+the default limit is 1 MiB.
+
+`graft_json_diff` returns `current_head` and `current_branch`, plus a top-level
+`paths` summary with `path`, `change`, `kind`, and `storage` for each changed
+repository path. Add `--kind sqlite_database|text_file|binary_file` to return
+only one path content class; JSON output includes the requested `kind` filter
+when present. Detailed database entries in `files` and artifact entries in
+`artifacts` keep the same `kind` and `storage` values. With `--rows`, `paths`
+still lists filtered changed repository paths while `files` carries row
+payloads only for SQLite database entries.
+
+`graft_json_show` returns `current_head` and `current_branch` alongside the
+selected commit object, including its path-level `changes`.
+
+`graft_json_log` preserves the legacy JSON array by default. With
+`--with-status`, it returns `current_head`, `current_branch`, and a `commits`
+array. Each commit includes path-level `changes` relative to its first parent
+commit. Add `--limit n` to page through history and pass the last full commit id
+back as `--after oid` for the next page.
+
+## Checkout, Restore, Reset
+
+```sql
+PRAGMA graft_checkout = 'HEAD~1';
+PRAGMA graft_checkout = 'HEAD~1 -- data.sqlite';
+PRAGMA graft_checkout = '--force main';
+
+PRAGMA graft_restore = '-- data.sqlite';
+PRAGMA graft_restore = '--source HEAD~1 -- data.sqlite';
+PRAGMA graft_restore = '--staged -- data.sqlite';
+PRAGMA graft_restore = '--staged --all --kind sqlite_database';
+
+PRAGMA graft_reset = 'HEAD~1';
+PRAGMA graft_reset = '--soft HEAD~1';
+PRAGMA graft_reset = '--mixed HEAD~1';
+PRAGMA graft_reset = '--hard HEAD~1';
+```
+
+`graft_json_checkout` returns post-operation `current_head` and
+`current_branch`, preserves its command `head`/`branch`, `target`, and
+`path`/`paths` strings, and exposes app-facing `path_details` entries with
+`path`, `kind` (`sqlite_database`, `text_file`, or `binary_file`), and
+`storage` (`sqlite_snapshot`, `inline`, or `external`). For path checkout,
+`target` is the source revision and `current_head` remains the current
+repository HEAD. `graft_json_restore` uses the same `path`/`paths` shape and
+also reports `current_head`, `current_branch`, `source`, `staged`, `all`, and an
+optional requested `kind` filter. `--staged --all` unstages every staged path
+without touching the worktree; add
+`--kind sqlite_database|text_file|binary_file` to limit that index restore to one
+path content class.
+`graft_json_reset` returns post-operation `current_head` and `current_branch`,
+updated `head`, `target`, and `mode`. For `--hard`, structured `paths` entries
+include `path`, `kind`, and `action` (`checked_out` or `removed`).
+
+## Export
+
+```sql
+PRAGMA graft_export = '--output data.inspect.sqlite';
+PRAGMA graft_export = '--source HEAD --output data.head.sqlite';
+PRAGMA graft_export = '--source HEAD~1 --output data.previous.sqlite -- data.sqlite';
+PRAGMA graft_json_export = '--source HEAD --output data.head.sqlite -- data.sqlite';
+```
+
+`graft_export` writes a normal SQLite database file without moving `HEAD`, changing the index, or changing the current worktree Volume.
+`graft_json_export` returns `operation`, current `current_head` and
+`current_branch`, optional `source`, exported repo `path`, `kind`, and `output`.
+
+Argument shape:
+
+```text
+[--source rev] --output output.db [-- path]
+```
+
+Without `--source`, it exports the currently opened database path. With `--source`, it exports the snapshot for `path` from that revision. If `path` is omitted, it defaults to the current database path.
+
+## Branches And Tags
+
+```sql
+PRAGMA graft_branch;
+PRAGMA graft_branch = '--remote';
+PRAGMA graft_branch = '--all';
+PRAGMA graft_json_branch = '--all';
+PRAGMA graft_branch_create = 'feature/search';
+PRAGMA graft_branch_create = 'feature/search main';
+PRAGMA graft_branch_delete = 'feature/search';
+PRAGMA graft_branch_delete = '--force feature/search';
+PRAGMA graft_branch_rename = 'old new';
+PRAGMA graft_branch_upstream = 'feature/search origin/main';
+PRAGMA graft_branch_unset_upstream = 'feature/search';
+PRAGMA graft_json_branch_create = 'feature/search';
+PRAGMA graft_json_branch_delete = 'feature/search';
+PRAGMA graft_json_branch_rename = 'old new';
+PRAGMA graft_json_branch_upstream = 'feature/search origin/main';
+PRAGMA graft_json_branch_unset_upstream = 'feature/search';
+
+PRAGMA graft_switch_branch = 'main';
+PRAGMA graft_json_switch_branch = 'main';
+PRAGMA graft_switch_create = 'feature/search main';
+PRAGMA graft_json_switch_create = 'feature/search main';
+
+PRAGMA graft_tags;
+PRAGMA graft_json_tags = '--with-status';
+PRAGMA graft_tag_create = 'v0.1 HEAD';
+PRAGMA graft_tag_create = '--annotated v0.1 -- release notes';
+PRAGMA graft_tag_delete = 'v0.1';
+PRAGMA graft_json_tag_create = 'v0.1 HEAD';
+PRAGMA graft_json_tag_create = '--annotated v0.1 -- release notes';
+PRAGMA graft_json_tag_delete = 'v0.1';
+```
+
+`graft_json_switch_branch` and `graft_json_switch_create` return `operation`,
+post-operation `current_head` and `current_branch`, command `head`/`branch`
+fields, optional `target`, and structured `paths` entries with `path`, `kind`,
+and `action` (`checked_out` or `removed`) for app-facing branch switch result
+views.
+
+`graft_json_branch` returns `current_head`, `current_branch`, `branches`, and
+`remote_branches` so branch pickers can render the selected repository state
+without an extra status query.
+`graft_json_tags` preserves its legacy tag array by default. With
+`--with-status`, it returns `current_head`, `current_branch`, and a `tags`
+array for tag pickers that need the selected repository state.
+
+The `graft_json_branch_*` mutation pragmas perform the same branch create,
+delete, rename, upstream, and unset-upstream operations as their text
+counterparts. They return `operation`, post-operation `current_head` and
+`current_branch` when available, and a structured `branch` object with `name`,
+`target`, `current`, and `upstream`; rename additionally returns `old_branch`.
+`graft_json_tag_create` and `graft_json_tag_delete` perform the same tag
+mutations as their text counterparts and return `operation`, post-operation
+`current_head` and `current_branch` when available, plus a structured `tag`
+object with `name`, `object`, `target`, `annotated`, and optional `message`.
+
+## Remotes And Sync
+
+```sql
+PRAGMA graft_remote_add = 'origin fs:///srv/graft/app';
+PRAGMA graft_remote_add = 'backup s3_compatible://my-bucket/prod?endpoint=https://account.r2.cloudflarestorage.com';
+PRAGMA graft_json_remote_add = 'origin fs:///srv/graft/app';
+PRAGMA graft_remotes;
+PRAGMA graft_json_remotes;
+PRAGMA graft_remote_get_url = 'origin';
+PRAGMA graft_json_remote_get_url = 'origin';
+PRAGMA graft_remote_set_url = 'origin fs:///srv/graft/app-v2';
+PRAGMA graft_json_remote_set_url = 'origin fs:///srv/graft/app-v2';
+PRAGMA graft_remote_rename = 'origin upstream';
+PRAGMA graft_json_remote_rename = 'origin upstream';
+PRAGMA graft_remote_remove = 'upstream';
+PRAGMA graft_json_remote_remove = 'upstream';
+PRAGMA graft_remote_prune = 'origin';
+PRAGMA graft_json_remote_prune = 'origin';
+
+PRAGMA graft_ls_remote = 'origin';
+PRAGMA graft_json_ls_remote = 'origin';
+PRAGMA graft_fetch = 'origin main';
+PRAGMA graft_json_fetch = 'origin main';
+PRAGMA graft_json_fetch_async = '--with-status origin main';
+PRAGMA graft_json_job_status = 'graft-job-1';
+PRAGMA graft_json_job_result = 'graft-job-1';
+PRAGMA graft_fetch = '--all origin';
+PRAGMA graft_pull = 'origin main';
+PRAGMA graft_push = 'origin main';
+PRAGMA graft_json_push = 'origin main';
+PRAGMA graft_push = '--force origin main';
+PRAGMA graft_push = '--all origin';
+```
+
+`graft_json_fetch` and `graft_json_push` include post-operation `current_head`
+and `current_branch` when available, alongside structured branch outcomes.
+`graft_json_fetch_async` keeps the legacy job-id string by default. With
+`--with-status`, it returns a job object with `id`, `kind`, `state`,
+`result_format`, `result`, and `error`; use `graft_json_job_status` to poll that
+same shape and `graft_json_job_result` to read the completed fetch JSON.
+`graft_json_pull` includes the fetched remote `head`, post-operation
+`current_head`, `current_branch`, and structured `paths` entries with `path`,
+`kind`, and `action` (`checked_out`, `removed`, `staged`, or `conflicted`) for
+app-facing sync result views.
+`graft_json_remote_*` mutation pragmas return `operation`, post-operation
+`current_head` and `current_branch` when available, plus a structured `remote`
+object with `name`, serialized `config`, and display-ready `url`; rename also
+returns `old_name`. `graft_json_remote_prune`, `graft_json_remotes`, and
+`graft_json_ls_remote` also include `current_head` and `current_branch`;
+`graft_json_remotes` returns a `remotes` array, and `graft_json_ls_remote`
+returns remote branch refs with `remote`, `branch`, and `head`.
+
+## Merge And Conflict Resolution
+
+```sql
+PRAGMA graft_merge = 'feature/search';
+PRAGMA graft_json_merge = 'feature/search';
+PRAGMA graft_merge_abort;
+PRAGMA graft_json_merge_abort;
+PRAGMA graft_merge_continue = 'merge feature/search';
+PRAGMA graft_json_merge_continue = 'merge feature/search';
+PRAGMA graft_conflicts;
+PRAGMA graft_json_conflicts;
+PRAGMA graft_resolve = '--ours data.sqlite';
+PRAGMA graft_resolve = '--theirs data.sqlite';
+PRAGMA graft_resolve = '--theirs assets/model.bin';
+```
+
+For the currently opened SQLite database, `graft_merge` can auto-merge
+non-conflicting row changes and stage the merged snapshot. Same-row, schema,
+add/delete, and opaque-table conflicts remain as conflict stages for
+`graft_resolve` or manual resolution.
+`graft_json_merge` includes post-operation `current_head`, `current_branch`,
+command `head`/`branch` fields, and structured `paths` entries with `path`,
+`kind`, and `action` (`checked_out`, `removed`, `staged`, or `conflicted`) for
+app-facing merge result views.
+`graft_json_merge_abort` returns post-operation `current_head` and
+`current_branch`, restored `head`, target commit, and structured `paths` entries
+with `path`, `kind`, and `action` for app-facing abort result views.
+`graft_json_merge_continue` returns post-operation `current_head` and
+`current_branch`, updated `head`, a compact merge commit summary, and `paths`
+entries with `path`, `change`, and `kind` for app-facing post-merge history
+updates. It also includes `materialized` entries for SQLite database files
+written back to the worktree.
+`graft_json_conflicts` includes current `current_head` and `current_branch`,
+plus top-level `paths` entries with path `kind`, `storage`, aggregate `status`,
+and resolved/unresolved artifact counts for conflict sidebars. Detailed
+artifacts include `path_kind` and `storage` so applications can distinguish
+SQLite databases, text files, binary files, and external payload-backed file
+conflicts.
+`graft_resolve` can choose sides for SQLite database conflicts as well as
+regular-file and external payload-backed file conflicts.
+`graft_json_resolve_conflict` returns post-operation `current_head` and
+`current_branch`, `path_kind`, and `storage` alongside the resolved `path`,
+selected `resolution`, and `remaining_conflicts`.
+
+The row-level merge planner is controlled by repository merge policy. See
+[Merge Policy](/docs/reference/merge-policy/) for semantic keys, schema
+resolvers, internal SQLite resolvers, and validation behavior.
+
+## Debug Pragmas
+
+<Aside type="caution">
+`graft_debug_*` pragmas are intentionally not the normal application API. They expose storage-layer details such as LSNs and page-level diagnostics.
+</Aside>
+
+Useful diagnostics:
+
+```sql
+PRAGMA graft_debug_log_lsn;
+PRAGMA graft_debug_volume_diff = '2,4';
+PRAGMA graft_debug_volume_diff = '2,4,rows';
+PRAGMA graft_debug_volume_json_diff = '2,4,rows';
+```

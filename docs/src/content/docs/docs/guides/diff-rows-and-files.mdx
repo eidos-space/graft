@@ -1,0 +1,137 @@
+---
+title: Diff Rows And Files
+description: Compare Graft worktree, staged changes, commits, SQLite rows, and file artifacts.
+---
+
+Graft has two diff layers:
+
+- repository diffs compare paths in the app-state tree
+- row diffs expand modified SQLite database snapshots into table and row changes
+
+Use repository diffs to answer "which app-state paths changed?" Use row diffs
+to answer "which SQLite rows changed?"
+
+## Compare Worktree Changes
+
+```bash
+graft diff
+graft diff --json
+```
+
+Compare staged changes:
+
+```bash
+graft diff --staged
+graft diff --json --staged
+```
+
+Filter by content kind:
+
+```bash
+graft diff --kind sqlite_database
+graft diff --kind text_file
+graft diff --kind binary_file
+```
+
+## Compare Commits
+
+```bash
+graft diff HEAD~1 HEAD
+graft diff HEAD~1 HEAD data.sqlite
+graft diff --json HEAD~1 HEAD
+```
+
+Path-level output reports each changed path, its change type, `kind`, and
+`storage`.
+
+## Show SQLite Row Diffs
+
+Add `--rows` for SQLite database paths:
+
+```bash
+graft diff --rows HEAD~1 HEAD data.sqlite
+graft diff --json --rows HEAD~1 HEAD data.sqlite
+```
+
+With JSON output, database entries can include row changes, schema changes,
+capabilities, limitations, and a `logical_status`.
+
+Common logical statuses:
+
+| Status | Meaning |
+| --- | --- |
+| `logical_changes` | Supported row or schema changes were found. |
+| `unsupported_logical_surface` | SQLite changed in a way Graft cannot fully interpret. |
+| `file_changed_no_supported_logical_changes` | The file changed, but supported logical rows and schema have no net change. |
+| `row_diff_unavailable` | Row diff was not available for that file. |
+
+## Captured CLI Output
+
+This transcript was captured from a real `graft` run. Hashes and timestamps
+will differ on your machine.
+
+```bash
+$ graft diff --rows HEAD~1 HEAD app.sqlite
+Row Diff 55c99f73d879..d5cb39df069b
+modified: app.sqlite
+  Diff LSN 2 -> 4
+  ============================
+
+  Table 'tasks': +1 inserts ~1 updates
+    ~ rowid 2:
+      old: [Null, Text("record cli output"), Text("open")]
+      new: [Null, Text("record cli output"), Text("blocked")]
+    + rowid 4: [Null, Text("publish docs"), Text("open")]
+```
+
+Comparing two branches shows the row changes needed to transform `main` into
+`feature/progress`:
+
+```bash
+$ graft diff --rows main feature/progress app.sqlite
+Row Diff d5cb39df069b..89abefbeb063
+modified: app.sqlite
+  Diff LSN 4 -> 4
+  ============================
+
+  Table 'tasks': +1 inserts -1 deletes ~2 updates
+    - rowid 4: [Null, Text("publish docs"), Text("open")]
+    ~ rowid 2:
+      old: [Null, Text("record cli output"), Text("blocked")]
+      new: [Null, Text("record cli output"), Text("open")]
+    + rowid 3: [Null, Text("add screenshots"), Text("open")]
+    ~ rowid 1:
+      old: [Null, Text("write quickstart"), Text("open")]
+      new: [Null, Text("write quickstart"), Text("done")]
+```
+
+## Diff From SQLite
+
+The SQLite extension exposes the same diff:
+
+```sql
+PRAGMA graft_diff = '--rows HEAD~1 HEAD -- data.sqlite';
+PRAGMA graft_json_diff = '--rows HEAD~1 HEAD -- data.sqlite';
+```
+
+## How To Present Diffs In An App
+
+Use path summaries for navigation and row payloads for detail panes:
+
+```bash
+graft diff --json --rows HEAD~1 HEAD data.sqlite
+```
+
+Suggested UI treatment:
+
+| State | UI |
+| --- | --- |
+| file changed and `logical_changes` | Show table, row, and schema changes. |
+| file changed and `file_changed_no_supported_logical_changes` | Show as file-level change or logical no-op. |
+| `unsupported_logical_surface` | Show a caveat and keep a conservative review path. |
+| binary file changed | Show file-level metadata and allow open/replace/download. |
+
+Low-level LSN diffs are documented under
+[Snapshot Storage And LSNs](/docs/internals/snapshot-storage-lsns/) for storage
+debugging. Normal user-facing history should use repository commits and
+revspecs.

@@ -1,0 +1,54 @@
+---
+title: 文件制品
+description: Graft 如何把文本文件、二进制文件和 external payload 与 SQLite snapshot 一起版本化。
+---
+
+Graft 可以在同一个 commit tree 中跟踪 SQLite snapshot 和普通文件。
+
+```text
+data.sqlite
+settings.json
+attachments/report.pdf
+assets/icon.png
+```
+
+## Text Files
+
+小型 UTF-8 文本文件可以 inline 存储：
+
+```text
+settings.json      kind: text_file      storage: inline
+```
+
+## Binary Files 和 External Payload
+
+二进制文件使用 external payload：
+
+```text
+attachments/report.pdf      kind: binary_file      storage: external
+```
+
+commit 里保存 pointer object，真实字节保存在 `.graft/store/files` 和远端
+payload store。
+
+## Storage Policy
+
+```toml
+[files]
+inline_text_threshold = "1 MB"
+external_paths = ["assets/**", "attachments/**"]
+```
+
+附件、导入、导出、生成媒体、模型等目录适合作为 external paths。
+
+## Conflicts
+
+文件 artifact 当前采用保守的 file-level merge：
+
+```bash
+graft resolve --ours settings.json
+graft resolve --theirs attachments/report.pdf
+graft resolve --manual assets/icon.png
+```
+
+SQLite 数据库可以使用 row-aware merge；文件格式未来可以增加语义 resolver。

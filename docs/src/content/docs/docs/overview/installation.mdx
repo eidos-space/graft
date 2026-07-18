@@ -1,0 +1,90 @@
+---
+title: Installation
+description: Install the Graft CLI, build from source, and get the SQLite extension.
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+The fastest way to try Graft is the CLI. Applications can later load the
+SQLite extension or link the extension statically.
+
+## Install The CLI
+
+Install the version documented by this site:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/eidos-space/graft/main/install.sh \
+  | GRAFT_VERSION=0.6.0 sh
+```
+
+Then check the binary:
+
+```bash
+graft --version
+# graft 0.6.0
+```
+
+<Aside type="note" title="Latest release">
+  Omit `GRAFT_VERSION=0.6.0` to install the latest published release. Its
+  behavior may be newer than this v0.6.0 documentation.
+</Aside>
+
+Prebuilt archives are also available from the
+[GitHub releases page](https://github.com/eidos-space/graft/releases).
+
+## Build The CLI From Source
+
+From the repository root:
+
+```bash
+cargo build -p graft-tool --bin graft --release
+```
+
+The binary is written to:
+
+```text
+target/release/graft
+```
+
+Add it to your shell path:
+
+```bash
+mkdir -p ~/.local/bin
+ln -sf "$(pwd)/target/release/graft" ~/.local/bin/graft
+hash -r
+graft --help
+```
+
+## Build The SQLite Extension
+
+Build the dynamic SQLite extension:
+
+```bash
+cargo build -p graft-ext --release
+```
+
+The exact library filename depends on the platform. It is written under
+`target/release/` and can be loaded by SQLite:
+
+```sql
+.load ./libgraft_ext
+```
+
+Use the extension when your app process already owns SQLite connections and
+wants to call `PRAGMA graft_*` directly.
+
+## Build The Docs
+
+The documentation site lives in `docs/`:
+
+```bash
+cd docs
+pnpm install
+pnpm build
+```
+
+## Next
+
+Run the [CLI quickstart](/docs/quickstart/cli/) first. Then use the
+[SQLite extension quickstart](/docs/quickstart/sqlite-extension/) when you are
+ready to embed Graft in an application.

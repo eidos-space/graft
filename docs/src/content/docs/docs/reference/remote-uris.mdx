@@ -1,0 +1,102 @@
+---
+title: Remote URIs
+description: URI syntax for Graft filesystem, S3-compatible, and HTTP remotes.
+---
+
+Graft stores named remotes in `.graft/config.toml`. Add or update them with CLI
+commands:
+
+```bash
+graft remote add origin <uri>
+graft remote set-url origin <uri>
+```
+
+SQLite applications can use the matching remote pragmas.
+
+## URI Shapes
+
+| URI | Use |
+| --- | --- |
+| `memory` | Tests and in-process temporary remotes. |
+| `fs:///absolute/path` | Local or mounted filesystem remotes. |
+| `s3://bucket/prefix` | AWS S3-style object storage. |
+| `s3_compatible://bucket/prefix` | S3-compatible storage such as R2 or MinIO. |
+| `s3_compatible://bucket/prefix?endpoint=https://...` | S3-compatible storage with a custom endpoint. |
+| `graft+https://host/api/graft/v1/repos/org/space` | Graft HTTP remote protocol. |
+| `graft+http://127.0.0.1:8787/api/graft/v1/repos/org/space` | Local HTTP remote development. |
+
+## Filesystem
+
+```bash
+graft remote add origin fs:///srv/graft/app
+```
+
+Use `fs://` for local smoke tests, mounted disks, or simple shared storage.
+
+## S3-Compatible
+
+```bash
+export AWS_ACCESS_KEY_ID="..."
+export AWS_SECRET_ACCESS_KEY="..."
+export AWS_REGION="auto"
+
+graft remote add origin 's3_compatible://my-bucket/prod/app?endpoint=https://account.r2.cloudflarestorage.com'
+```
+
+The URI stores bucket, prefix, type, and optional endpoint. Credentials are not
+stored in `.graft/config.toml` or in the URI. Configure them through the
+environment or standard AWS config files.
+
+Graft currently accepts `endpoint` as the S3-compatible query parameter. Do not
+put access keys, secret keys, or region in the URI query string.
+
+## HTTP Protocol
+
+```bash
+export GRAFT_REMOTE_TOKEN='grt_...'
+graft remote add origin 'graft+https://example.com/api/graft/v1/repos/acme/archive'
+```
+
+The default token environment variable is `GRAFT_REMOTE_TOKEN`. Use `token_env`
+to choose a different variable:
+
+```bash
+export GRAFT_ARCHIVE_TOKEN='grt_...'
+graft remote add origin 'graft+https://example.com/api/graft/v1/repos/acme/archive?token_env=GRAFT_ARCHIVE_TOKEN'
+```
+
+HTTP remotes send the token as a bearer token. The server must implement the
+Graft HTTP remote protocol.
+
+## Stored Config Examples
+
+After parsing, `.graft/config.toml` stores structured remote config.
+
+Filesystem:
+
+```toml
+[remotes.origin]
+type = "fs"
+root = "/srv/graft/app"
+```
+
+S3-compatible:
+
+```toml
+[remotes.origin]
+type = "s3_compatible"
+bucket = "my-graft-bucket"
+prefix = "prod/app"
+endpoint = "https://account.r2.cloudflarestorage.com"
+```
+
+HTTP:
+
+```toml
+[remotes.origin]
+type = "http"
+url = "https://example.com/api/graft/v1/repos/acme/archive"
+token_env = "GRAFT_REMOTE_TOKEN"
+```
+
+See [Sync With Remotes](/docs/guides/sync-remotes/) for workflows.

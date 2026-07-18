@@ -1,0 +1,72 @@
+---
+title: 安装
+description: 安装 Graft CLI、从源码构建，并获取 SQLite 扩展。
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+最快的试用方式是 CLI。应用集成时再加载 SQLite extension 或静态链接扩展。
+
+## 安装 CLI
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/eidos-space/graft/main/install.sh \
+  | GRAFT_VERSION=0.6.0 sh
+graft --version
+# graft 0.6.0
+```
+
+<Aside type="note" title="最新 release">
+  去掉 `GRAFT_VERSION=0.6.0` 会安装最新已发布版本；它的行为可能比本站描述的
+  v0.6.0 更新。
+</Aside>
+
+也可以从
+[GitHub releases](https://github.com/eidos-space/graft/releases)
+下载预构建 archive。
+
+## 从源码构建 CLI
+
+在仓库根目录：
+
+```bash
+cargo build -p graft-tool --bin graft --release
+```
+
+生成位置：
+
+```text
+target/release/graft
+```
+
+加入 PATH：
+
+```bash
+mkdir -p ~/.local/bin
+ln -sf "$(pwd)/target/release/graft" ~/.local/bin/graft
+hash -r
+graft --help
+```
+
+## 构建 SQLite 扩展
+
+```bash
+cargo build -p graft-ext --release
+```
+
+平台相关的动态库会写入 `target/release/`。在 SQLite shell 中加载：
+
+```sql
+.load ./libgraft_ext
+```
+
+## 构建文档
+
+```bash
+cd docs
+pnpm install
+pnpm build
+```
+
+下一步先跑 [CLI 快速开始](/zh/docs/quickstart/cli/)，然后看
+[SQLite 扩展快速开始](/zh/docs/quickstart/sqlite-extension/)。

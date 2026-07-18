@@ -1,0 +1,98 @@
+---
+title: External Payloads
+description: Store large or binary app files outside the commit object graph and hydrate them when needed.
+---
+
+Graft stores binary files and configured app resource paths as external
+payloads. A commit records a pointer object with the payload hash and metadata;
+the bytes live in `.graft/store/files` locally and in the remote payload store
+when pushed.
+
+This keeps commits small while still versioning files with the database rows
+that reference them.
+
+## What Becomes External
+
+These paths use `storage: "external"`:
+
+- binary files
+- text files larger than `files.inline_text_threshold`
+- text files matching `files.external_paths`
+
+Configure resource directories:
+
+```bash
+graft config set files.external_paths "assets/**, attachments/**"
+graft config set files.inline_text_threshold 1 MB
+```
+
+Inspect status:
+
+```bash
+graft status --json
+graft ls-files --json --details
+```
+
+## Check Payload Presence
+
+```bash
+graft payload status HEAD
+graft payload status --json HEAD
+```
+
+The status command reports present, missing, and invalid external payloads for
+the selected revision. It never fetches or deletes data.
+
+## Fetch Missing Payloads
+
+```bash
+graft payload fetch --remote origin HEAD
+graft payload fetch --json --remote origin HEAD
+```
+
+`payload fetch` hydrates missing external payloads for the selected revision
+without moving refs, changing the index, or touching worktree files.
+
+If no remote is supplied, Graft uses the current branch upstream, then `origin`.
+
+## Audit And Repair
+
+```bash
+graft audit
+graft audit --json
+graft audit --repair origin
+```
+
+`audit` checks tracked file artifact objects and external payloads. With
+`--repair`, it fetches missing artifact objects and payloads from the selected
+remote.
+
+## Prune Local Payloads
+
+Preview unreferenced local payloads:
+
+```bash
+graft payload prune
+graft payload prune --json
+```
+
+Delete candidates:
+
+```bash
+graft payload prune --force
+```
+
+Payloads are candidates only when they are no longer referenced by the index,
+branches, remote-tracking branches, tags, or reachable commits.
+
+## App UI Pattern
+
+For a file browser or sync panel:
+
+```bash
+graft ls-files --json --details
+graft payload status --json HEAD
+```
+
+Use `external_payload_present` and payload status entries to show which files
+are available locally, missing, invalid, or ready to fetch.

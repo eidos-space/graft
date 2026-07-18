@@ -2,30 +2,97 @@
 title: Graft
 head:
   - tag: title
-    content: Graft - data sync to the edge
-description: Graft is an open-source transactional storage engine designed for efficient data synchronization at the edge.
+    content: Graft - Version control for SQLite-backed app state
+description: Graft versions SQLite databases and app-owned files together.
 template: splash
 hero:
-  tagline: Graft is an open-source transactional storage engine designed for efficient data synchronization at the edge.
+  tagline: Version control for SQLite-backed app state.
   actions:
-    - text: Learn more
-      link: /docs/about/
-      icon: open-book
-    - text: Open source
-      link: https://github.com/orbitinghail/graft
-      icon: github
-      external: true
+    - text: Try the Playground
+      link: /playground/
+    - text: Start with the CLI
+      link: /docs/quickstart/cli/
       variant: secondary
 ---
 
-import { LinkCard, CardGrid } from "@astrojs/starlight/components";
+import { Aside, CardGrid, LinkCard } from "@astrojs/starlight/components";
 
-## Use Graft with...
+<Aside type="note" title="Version baseline">
+  This site documents the [Graft v0.6.0 release](https://github.com/eidos-space/graft/releases/tag/v0.6.0).
+  Experimental or unreleased surfaces are called out explicitly.
+</Aside>
+
+Graft adds Git-like history to the state behind SQLite-backed applications.
+It versions SQLite databases and app-owned files together, so a commit records
+one coherent state your app can open.
+
+Git can store a `.sqlite` file, but it mostly treats that file as opaque bytes.
+Graft makes SQLite databases first-class versioned objects: you can stage,
+commit, diff rows, merge compatible changes, resolve structured conflicts, and
+restore them as database state.
+
+Use it when your app data directory looks like this:
+
+```text
+app-data/
+  data.sqlite
+  search.sqlite
+  settings.json
+  attachments/
+    note-42.png
+    contract.pdf
+```
+
+Graft keeps SQLite in charge of reads, writes, indexes, and transactions. It
+adds the repository layer around those files: stage, commit, branch, switch,
+diff rows, restore state, merge changes, and sync through remotes.
+
+## Start Here
 
 <CardGrid>
-  <LinkCard title="Python" href="/docs/sqlite/usage/python/" />
-  <LinkCard title="JavaScript" href="/docs/sqlite/usage/javascript/" />
-  <LinkCard title="Ruby" href="/docs/sqlite/usage/ruby/" />
-  <LinkCard title="Swift" href="/docs/sqlite/usage/swift/" />
-  <LinkCard title="Manual" href="/docs/sqlite/usage/direct/" />
+  <LinkCard
+    title="What Is Graft"
+    href="/docs/overview/what-is-graft/"
+    description="The problem Graft solves and where it fits."
+  />
+  <LinkCard
+    title="CLI Quickstart"
+    href="/docs/quickstart/cli/"
+    description="Create a repository, commit data, diff rows, and restore state."
+  />
+  <LinkCard
+    title="SQLite Extension"
+    href="/docs/quickstart/sqlite-extension/"
+    description="Call repository operations from SQLite and app runtimes."
+  />
+  <LinkCard
+    title="App-State Walkthrough"
+    href="/docs/quickstart/app-state-walkthrough/"
+    description="Track a database, files, branches, diffs, and a remote together."
+  />
+</CardGrid>
+
+## Common Tasks
+
+<CardGrid>
+  <LinkCard
+    title="Track databases and files"
+    href="/docs/guides/track-databases-and-files/"
+    description="Understand path kinds, storage strategies, and staging."
+  />
+  <LinkCard
+    title="Build an app UI"
+    href="/docs/guides/json-ui/"
+    description="Use JSON status, diff, conflict, and payload output."
+  />
+  <LinkCard
+    title="Sync with remotes"
+    href="/docs/guides/sync-remotes/"
+    description="Push, fetch, pull, clone, and choose a remote backend."
+  />
+  <LinkCard
+    title="Resolve merge conflicts"
+    href="/docs/guides/merge-conflicts/"
+    description="Use row-aware auto-merge and structured conflict output."
+  />
 </CardGrid>

@@ -1,0 +1,77 @@
+---
+title: HTTP Remote Protocol
+description: Internal protocol used by graft+http and graft+https remotes.
+---
+
+The `graft+http` and `graft+https` remote backend uses a simple object protocol.
+The Cloudflare Worker service implements this protocol under:
+
+```text
+/api/graft/v1/repos/<owner>/<repo>
+```
+
+Clients configure it as:
+
+```text
+graft+https://host/api/graft/v1/repos/acme/archive
+```
+
+## Authentication
+
+The client reads a bearer token from the environment. By default:
+
+```bash
+export GRAFT_REMOTE_TOKEN='grt_...'
+```
+
+The URI can specify another environment variable:
+
+```text
+graft+https://host/api/graft/v1/repos/acme/archive?token_env=GRAFT_ARCHIVE_TOKEN
+```
+
+## Operations
+
+The protocol works with raw object paths, compare-and-swap for refs, and object
+listing.
+
+Conceptual endpoint shape:
+
+```text
+GET    /raw/<path>
+HEAD   /raw/<path>
+PUT    /raw/<path>
+DELETE /raw/<path>
+PUT    /raw-if-not-exists/<path>
+POST   /cas/<path>
+POST   /cad/<path>
+GET    /list?prefix=<prefix>
+```
+
+Ref paths are stored transactionally by the service. Object paths are stored in
+the backing object store.
+
+## Status Codes
+
+| Status | Meaning |
+| --- | --- |
+| `204` | Object exists for `HEAD`. |
+| `404` | Object or ref is missing. |
+| `412` | Compare-and-swap or put-if-absent precondition failed. |
+
+The Rust client maps these responses into remote errors such as not found,
+precondition failed, compare-and-swap failure, or lock busy.
+
+## Range Reads
+
+HTTP remotes can serve byte ranges for raw objects using the standard `Range`
+header. This allows clients to fetch portions of larger objects when needed.
+
+## Server Implementation Requirements
+
+Graft v0.6.0 ships the client, not a bundled HTTP server. A compatible service
+must provide durable immutable object storage, transactional compare-and-swap
+for refs, bearer-token authorization when the repository is private, and the
+status-code behavior above.
+
+See [Connect An HTTP Remote](/docs/guides/http-remote/) for the client workflow.

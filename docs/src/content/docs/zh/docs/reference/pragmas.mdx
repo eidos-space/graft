@@ -1,0 +1,418 @@
+---
+title: 仓库 PRAGMA
+description: Graft 仓库模式 SQLite PRAGMA 命令参考。
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+仓库 PRAGMA 是应用嵌入 Graft 的主要 API。
+
+## Lifecycle
+
+```sql
+PRAGMA graft_init;
+PRAGMA graft_json_init;
+PRAGMA graft_clone = 'fs:///srv/graft/app';
+PRAGMA graft_clone = 'fs:///srv/graft/app feature/search';
+PRAGMA graft_clone = '--branch feature/search fs:///srv/graft/app';
+PRAGMA graft_json_clone = 'fs:///srv/graft/app feature/search';
+```
+
+`graft_init` 创建 `.graft/`。`graft_clone` 创建 `.graft/`、配置 `origin`、fetch 分支、设置 upstream tracking，并 materialize 数据库。
+`graft_json_init` 返回结构化初始化元数据，包括 `graft_dir`、`worktree`、
+可用时的初始化后 `current_head` 和 `current_branch`、当前数据库的 repo
+`path`、`kind` 和 `preserved_contents`。
+`graft_json_clone` 返回同一 clone 操作的结构化 JSON，包含操作后的
+`current_head` 和 `current_branch`、`remote`、`branch`、fetch 到的 `head`、
+`commits`、`graft_dir` 和 materialized `paths`。
+
+## Status, Stage, Commit
+
+```sql
+PRAGMA graft_status;
+PRAGMA graft_json_status;
+PRAGMA graft_ls_files;
+PRAGMA graft_json_ls_files;
+PRAGMA graft_json_ls_files = '--details --kind binary_file';
+PRAGMA graft_json_ls_files = '--stage';
+PRAGMA graft_json_ls_files = '--others --kind text_file';
+PRAGMA graft_audit;
+PRAGMA graft_json_audit;
+PRAGMA graft_json_audit = '--repair origin';
+PRAGMA graft_gc;
+PRAGMA graft_json_gc = '--dry-run';
+PRAGMA graft_json_gc = '--force';
+PRAGMA graft_payload_fetch;
+PRAGMA graft_json_payload_fetch = '--remote origin HEAD';
+PRAGMA graft_payload_status;
+PRAGMA graft_json_payload_status = 'HEAD';
+PRAGMA graft_payload_prune;
+PRAGMA graft_json_payload_prune;
+PRAGMA graft_json_payload_prune = '--force';
+PRAGMA graft_add;
+PRAGMA graft_add = '--all';
+PRAGMA graft_add = '--all --kind text_file';
+PRAGMA graft_add = 'analytics.sqlite';
+PRAGMA graft_json_add = '--all';
+PRAGMA graft_rm = 'analytics.sqlite';
+PRAGMA graft_rm = '--cached -- analytics.sqlite';
+PRAGMA graft_json_rm = 'analytics.sqlite';
+PRAGMA graft_json_rm = '--cached -- analytics.sqlite';
+PRAGMA graft_commit = 'message';
+PRAGMA graft_json_commit = 'message';
+```
+
+不传参数时，`graft_add` 暂存当前打开的数据库。传 `--all` 时，它暂存 worktree
+中的全部 unstaged 数据库和文件变化，包括删除。加
+`--kind sqlite_database|text_file|binary_file` 可以只暂存其中一类 path 内容类型。传
+path 参数时，它暂存一个 repo-relative 数据库或文件路径。
+
+`graft_json_add` 执行同样的 staging 操作，并返回 `operation: "add"`、可选的
+请求 `kind` filter、可用时的操作后 `current_head` 和 `current_branch`，以及
+`paths`。每个 entry 包含 `path`、`change`（`added`、`modified` 或
+`deleted`）、`kind`（`sqlite_database`、`text_file` 或 `binary_file`）以及
+`storage`（`sqlite_snapshot`、`inline` 或 `external`），方便应用在暂存后直接刷新
+path-level UI。
+
+`graft_rm` 会暂存一个已跟踪数据库或文件的删除。传
+`--cached` 时只从 index 移除该 path，同时保留 worktree 内容。
+
+`graft_json_rm` 执行和 `graft_rm` 相同的 remove 操作，并返回 `operation:
+"rm"`、本次请求的 `cached` boolean、可用时的操作后 `current_head` 和
+`current_branch`，以及 `paths`。每个 entry 包含 `path`、`kind` 和
+`action`。`action: "staged"` 表示删除已经暂存、会进入下一次 commit；
+`action: "removed"` 表示一个尚未 commit 的 staged addition 已经从 index
+移除；除非 `cached` 为 true，否则也会从 worktree 移除。
+
+`graft_json_commit` 执行和 `graft_commit` 相同的提交操作，并返回
+`operation: "commit"`、操作后的 `current_head` 和 `current_branch`、更新后的
+`head`、当前 `branch`、紧凑的 `commit` 摘要（`id`、`message`、`parents`），
+以及本次提交的 `paths`，每项包含 `path`、`change` 和 `kind`。如果 SQLite
+snapshot 被 materialize 回 worktree，响应还会包含 `materialized` entries，每项有
+`path`、`kind`、`storage` 和 `action`。
+
+`graft_json_status` 会在可用时返回当前仓库位置 `current_head` 和
+`current_branch`，保留 legacy 的 `staged` 和 `unstaged` path list，并新增面向
+应用的 summary boolean：`has_unstaged_changes`、`has_staged_changes`、
+`has_conflicts` 和 `work_in_progress`。Legacy 的 `dirty` 仍然只关注
+unstaged；如果应用需要判断仓库是否存在任何 unstaged、staged、conflict 或
+merge-in-progress 状态，应该读取 `work_in_progress`。嵌套的 `counts` 对象提供
+`unstaged`、`staged` 和 `conflicted` path count，适合应用显示 badge 或侧边栏。
+`paths` 数组是 one-entry-per-changed-path 的汇总视图，包含 `kind`、`storage`、
+`index_status`、`worktree_status`、Git-like 两字符 `code`、
+`unstaged_change`、`staged_change` 和 `conflicted`，应用可以直接渲染状态表，
+不必自己 join 底层数组。结构化的 `staged_changes` 和 `unstaged_changes` entry
+包含 `change`、`kind` 和 `storage`，所以应用在整个 staging 流程里都能区分 SQLite
+数据库、文本文件、二进制文件，以及外部 payload-backed 文件。
+
+`graft_json_ls_files` 返回 `current_head`、`current_branch`、`stage` 和
+`paths`。不传 `--stage` 时，`paths` 会列出当前 tracked repository path；传
+`--details` 时，file cache 视图会额外获得 artifact `oid`、
+`content_hash`、`object_present` 和 `external_payload_present` 字段。传
+`--stage` 时，`paths` 包含 raw index entry，其中有 `stage`、`mode`、`oid`、
+path `kind`、`storage`、byte `size` 和 SQLite `page_count`，并能在 conflict 中展示
+unmerged 的 `base`/`ours`/`theirs` entry。传 `--others` 时，`paths` 会列出
+worktree 中尚未跟踪、可用 `graft_add` 暂存的 SQLite 数据库、文本文件和二进制文件；
+JSON 会包含 `others: true`。`--details`、`--stage` 和
+`--others` 互斥。
+
+`graft_json_audit` 会校验当前仓库状态需要的 tracked file artifact object 和
+external payload 是否都在本地且有效。它返回 `current_head`、
+`current_branch`、artifact 计数、external payload 计数，以及 payload 缺失或无效时的
+结构化 `issues`。传 `--repair [remote]` 时，它会从 remote hydrate 缺失的
+artifact object 和 external payload，且不会改变 HEAD、index 或 worktree 内容。
+Repair JSON 使用 `operation: "audit_repair"`，并返回 `remote`、fetched object
+计数，以及 `before`/`after` audit 状态。
+
+`graft_gc` 和 `graft_json_gc` 会扫描内部 SQLite storage 中的不可达数据。
+默认是 dry-run；传 `--force` 才会删除并 compact。它不同于只管理 external
+file payload cache 的 `graft_payload_prune`。
+
+`graft_payload_fetch` 和 `graft_json_payload_fetch` 会为 `HEAD` 或指定 revision hydrate
+缺失的 external payload，不移动 refs、不改变 index，也不触碰 worktree 文件。参数形状是
+`[--remote remote] [rev]`；remote 默认使用当前 upstream remote，其次 origin，`rev`
+默认是 `HEAD`。JSON 输出使用 `operation: "payload_fetch"`，并返回 `remote`、
+`target`、external payload 计数、fetched byte totals，以及带 content hash、store path、
+status 和 repository paths 的 `files` entries。
+
+`graft_payload_status` 和 `graft_json_payload_status` 会检查 `HEAD` 或指定 revision 引用的
+external payload 在本地 cache 中是否存在。它们是只读操作，不会 fetch，也不会删除
+payload。JSON 输出使用 `operation: "payload_status"`，并返回 `target`、present、
+missing、invalid 计数、byte totals，以及带 content hash、store path、status、
+可选 message 和 repository paths 的 `files` entries。
+
+`graft_payload_prune` 和 `graft_json_payload_prune` 会扫描 `.graft/store/files` 中的
+本地 external payload cache，找出不被 index、branches、remote-tracking
+branches、tags 或 reachable commits 引用的 payload。默认是 dry-run；传
+`--force` 才会删除候选项。JSON 输出使用 `operation: "payload_prune"`，并返回
+`dry_run`、`current_head`、`current_branch`、referenced、candidate、pruned
+计数、byte totals，以及带 content hash 和 store path 的候选 `files`。
+
+`graft_lfs_fetch`、`graft_json_lfs_fetch`、`graft_lfs_status`、
+`graft_json_lfs_status`、`graft_lfs_prune` 和 `graft_json_lfs_prune` 仍然作为旧调用方的 alias 保留。
+
+## History And Diff
+
+```sql
+PRAGMA graft_log;
+PRAGMA graft_json_log;
+PRAGMA graft_json_log = '--with-status';
+PRAGMA graft_json_log = '--with-status --limit 50';
+PRAGMA graft_json_log = '--with-status --limit 50 --after <commit-id>';
+PRAGMA graft_show = 'HEAD';
+PRAGMA graft_json_show = 'HEAD';
+PRAGMA graft_diff;
+PRAGMA graft_diff = '--staged';
+PRAGMA graft_diff = '--rows';
+PRAGMA graft_diff = '--kind text_file --staged';
+PRAGMA graft_diff = 'HEAD~1 HEAD -- data.sqlite';
+PRAGMA graft_json_diff = 'HEAD~1 HEAD -- data.sqlite';
+PRAGMA graft_json_diff = '--rows HEAD~1 HEAD -- data.sqlite';
+PRAGMA graft_json_diff = '--content --max-content-bytes 65536 HEAD~1 HEAD -- notes.md';
+```
+
+Repository diff 参数遵循 CLI 形状：
+
+```text
+[--rows] [--kind kind] [--staged] [from] [to] [-- path]
+```
+
+在 v0.6.0 中，只用于 JSON 的 `--content` 模式会返回一个 changed UTF-8
+text artifact 的 bounded content。它不能和 `--rows` 或 `--staged` 一起使用；
+默认上限为 1 MiB。
+
+`--rows` 会把 modified SQLite database snapshot 展开成 table-level row inserts、deletes 和 updates。新增或删除的数据库文件仍然显示为 file-level change。
+
+`graft_json_diff` 会返回 `current_head` 和 `current_branch`，以及顶层
+`paths` 汇总数组；每个 changed repository path 都有 `path`、`change` 和
+`kind`、`storage`。加 `--kind sqlite_database|text_file|binary_file` 可以只返回某一类
+path 内容类型；JSON 输出会在存在 filter 时包含请求的 `kind`。详细的数据库 entry
+仍在 `files` 中，artifact entry 仍在 `artifacts` 中，并保留同样的 `kind` 和
+`storage` 取值。使用 `--rows` 时，`paths` 仍会列出过滤后的 changed repository
+path，而 `files` 只承载 SQLite database entry 的 row payload。
+
+`graft_json_show` 会和选中的 commit object 一起返回 `current_head` 和
+`current_branch`；commit object 中也包含 path-level `changes`。
+
+`graft_json_log` 默认保留 legacy JSON array。传 `--with-status` 时，它会返回
+`current_head`、`current_branch` 和 `commits` 数组。每个 commit 都包含相对第一父
+提交的 path-level `changes`。加 `--limit n` 可以分页；下一页通过
+`--after oid` 传入上一页最后一个 commit 的完整 id。
+
+## Checkout, Restore, Reset
+
+```sql
+PRAGMA graft_checkout = 'HEAD~1';
+PRAGMA graft_checkout = 'HEAD~1 -- data.sqlite';
+PRAGMA graft_checkout = '--force main';
+
+PRAGMA graft_restore = '-- data.sqlite';
+PRAGMA graft_restore = '--source HEAD~1 -- data.sqlite';
+PRAGMA graft_restore = '--staged -- data.sqlite';
+PRAGMA graft_restore = '--staged --all --kind sqlite_database';
+
+PRAGMA graft_reset = 'HEAD~1';
+PRAGMA graft_reset = '--soft HEAD~1';
+PRAGMA graft_reset = '--mixed HEAD~1';
+PRAGMA graft_reset = '--hard HEAD~1';
+```
+
+`graft_json_checkout` 会返回操作后的 `current_head` 和 `current_branch`，
+并保留命令结果里的 `head`/`branch`、`target` 和 `path`/`paths` 字符串字段；
+也会返回面向应用的 `path_details`，每项包含 `path` 和 `kind`
+（`sqlite_database`、`text_file` 或 `binary_file`）以及 `storage`
+（`sqlite_snapshot`、`inline` 或 `external`）。对 path checkout，`target` 是恢复
+path 的来源 revision，`current_head` 仍是当前仓库 HEAD。
+`graft_json_restore` 使用同样的 `path`/`paths` 形状，并额外返回
+`current_head`、`current_branch`、`source`、`staged`、`all`，以及可选的请求
+`kind` filter。`--staged --all` 会 unstage 全部 staged path，不触碰 worktree；
+加 `--kind sqlite_database|text_file|binary_file` 可以只恢复某一类 path 内容类型的
+index 状态。
+`graft_json_reset` 会返回操作后的 `current_head` 和 `current_branch`、
+更新后的 `head`、`target` 和 `mode`。`--hard` 还会返回结构化 `paths`，每项
+包含 `path`、`kind` 和 `action`（`checked_out` 或 `removed`）。
+
+## Export
+
+```sql
+PRAGMA graft_export = '--output data.inspect.sqlite';
+PRAGMA graft_export = '--source HEAD --output data.head.sqlite';
+PRAGMA graft_export = '--source HEAD~1 --output data.previous.sqlite -- data.sqlite';
+PRAGMA graft_json_export = '--source HEAD --output data.head.sqlite -- data.sqlite';
+```
+
+`graft_export` 会写出一个普通 SQLite 数据库文件，不移动 `HEAD`，不改变 index，也不改变当前 worktree Volume。
+`graft_json_export` 返回 `operation`、当前 `current_head` 和
+`current_branch`、可选 `source`、导出的 repo `path`、`kind` 和 `output`。
+
+参数形状：
+
+```text
+[--source rev] --output output.db [-- path]
+```
+
+不传 `--source` 时，它导出当前打开的数据库路径。传 `--source` 时，它导出指定 revision 中 `path` 对应的 snapshot。如果省略 `path`，默认使用当前数据库路径。
+
+## Branches And Tags
+
+```sql
+PRAGMA graft_branch;
+PRAGMA graft_branch = '--remote';
+PRAGMA graft_branch = '--all';
+PRAGMA graft_json_branch = '--all';
+PRAGMA graft_branch_create = 'feature/search';
+PRAGMA graft_branch_create = 'feature/search main';
+PRAGMA graft_branch_delete = 'feature/search';
+PRAGMA graft_branch_delete = '--force feature/search';
+PRAGMA graft_branch_rename = 'old new';
+PRAGMA graft_branch_upstream = 'feature/search origin/main';
+PRAGMA graft_branch_unset_upstream = 'feature/search';
+PRAGMA graft_json_branch_create = 'feature/search';
+PRAGMA graft_json_branch_delete = 'feature/search';
+PRAGMA graft_json_branch_rename = 'old new';
+PRAGMA graft_json_branch_upstream = 'feature/search origin/main';
+PRAGMA graft_json_branch_unset_upstream = 'feature/search';
+
+PRAGMA graft_switch_branch = 'main';
+PRAGMA graft_json_switch_branch = 'main';
+PRAGMA graft_switch_create = 'feature/search main';
+PRAGMA graft_json_switch_create = 'feature/search main';
+
+PRAGMA graft_tags;
+PRAGMA graft_json_tags = '--with-status';
+PRAGMA graft_tag_create = 'v0.1 HEAD';
+PRAGMA graft_tag_create = '--annotated v0.1 -- release notes';
+PRAGMA graft_tag_delete = 'v0.1';
+PRAGMA graft_json_tag_create = 'v0.1 HEAD';
+PRAGMA graft_json_tag_create = '--annotated v0.1 -- release notes';
+PRAGMA graft_json_tag_delete = 'v0.1';
+```
+
+`graft_json_switch_branch` 和 `graft_json_switch_create` 会返回 `operation`、
+操作后的 `current_head` 和 `current_branch`、命令结果里的 `head`/`branch`、
+可选的 `target`，以及结构化 `paths`。每个 path 包含 `path`、`kind` 和
+`action`（`checked_out` 或 `removed`），方便应用渲染 branch switch 结果。
+
+`graft_json_branch` 返回 `current_head`、`current_branch`、`branches` 和
+`remote_branches`，branch picker 可以不用再额外查询 status 就渲染当前 repo
+状态。
+`graft_json_tags` 默认保留 legacy tag array。传 `--with-status` 时，它会返回
+`current_head`、`current_branch` 和 `tags` 数组，方便需要当前仓库状态的 tag
+picker 使用。
+
+`graft_json_branch_*` mutation pragmas 执行和文本版相同的 branch create、
+delete、rename、upstream、unset-upstream 操作，并返回 `operation`、可用时的
+操作后 `current_head` 和 `current_branch`，以及结构化 `branch` 对象。
+`branch` 包含 `name`、`target`、`current`、`upstream`；rename 额外返回
+`old_branch`。
+`graft_json_tag_create` 和 `graft_json_tag_delete` 执行和文本版相同的 tag
+mutation，并返回 `operation`、可用时的操作后 `current_head` 和
+`current_branch`，以及结构化 `tag` 对象。`tag` 包含 `name`、`object`、
+`target`、`annotated` 和可选 `message`。
+
+## Remotes And Sync
+
+```sql
+PRAGMA graft_remote_add = 'origin fs:///srv/graft/app';
+PRAGMA graft_remote_add = 'backup s3_compatible://my-bucket/prod?endpoint=https://account.r2.cloudflarestorage.com';
+PRAGMA graft_json_remote_add = 'origin fs:///srv/graft/app';
+PRAGMA graft_remotes;
+PRAGMA graft_json_remotes;
+PRAGMA graft_remote_get_url = 'origin';
+PRAGMA graft_json_remote_get_url = 'origin';
+PRAGMA graft_remote_set_url = 'origin fs:///srv/graft/app-v2';
+PRAGMA graft_json_remote_set_url = 'origin fs:///srv/graft/app-v2';
+PRAGMA graft_remote_rename = 'origin upstream';
+PRAGMA graft_json_remote_rename = 'origin upstream';
+PRAGMA graft_remote_remove = 'upstream';
+PRAGMA graft_json_remote_remove = 'upstream';
+PRAGMA graft_remote_prune = 'origin';
+PRAGMA graft_json_remote_prune = 'origin';
+
+PRAGMA graft_ls_remote = 'origin';
+PRAGMA graft_json_ls_remote = 'origin';
+PRAGMA graft_fetch = 'origin main';
+PRAGMA graft_json_fetch = 'origin main';
+PRAGMA graft_json_fetch_async = '--with-status origin main';
+PRAGMA graft_json_job_status = 'graft-job-1';
+PRAGMA graft_json_job_result = 'graft-job-1';
+PRAGMA graft_fetch = '--all origin';
+PRAGMA graft_pull = 'origin main';
+PRAGMA graft_push = 'origin main';
+PRAGMA graft_json_push = 'origin main';
+PRAGMA graft_push = '--force origin main';
+PRAGMA graft_push = '--all origin';
+```
+
+`graft_json_fetch` 和 `graft_json_push` 会在可用时返回操作后的
+`current_head` 和 `current_branch`，并包含结构化分支结果。
+`graft_json_fetch_async` 默认保留 legacy job id 字符串；传入
+`--with-status` 时会返回包含 `id`、`kind`、`state`、`result_format`、
+`result` 和 `error` 的 job 对象。应用可以用 `graft_json_job_status` 轮询同
+一种形状，并用 `graft_json_job_result` 读取完成后的 fetch JSON。
+`graft_json_pull` 会返回 fetch 到的远端 `head`、操作后的 `current_head`、`current_branch`，
+以及结构化 `paths`。每项包含 `path`、`kind` 和 `action`（`checked_out`、
+`removed`、`staged` 或 `conflicted`），方便应用渲染 sync 结果。
+`graft_json_remote_*` mutation pragmas 会返回 `operation`、可用时的操作后
+`current_head` 和 `current_branch`，以及结构化 `remote` 对象。`remote`
+包含 `name`、序列化后的 `config` 和可直接展示的 `url`；rename 额外返回
+`old_name`。`graft_json_remote_prune`、`graft_json_remotes` 和
+`graft_json_ls_remote` 也会包含 `current_head` 和 `current_branch`；
+`graft_json_remotes` 返回 `remotes` 数组，`graft_json_ls_remote` 返回包含
+`remote`、`branch`、`head` 的远端分支 refs。
+
+## Merge And Conflict Resolution
+
+```sql
+PRAGMA graft_merge = 'feature/search';
+PRAGMA graft_json_merge = 'feature/search';
+PRAGMA graft_merge_abort;
+PRAGMA graft_json_merge_abort;
+PRAGMA graft_merge_continue = 'merge feature/search';
+PRAGMA graft_json_merge_continue = 'merge feature/search';
+PRAGMA graft_conflicts;
+PRAGMA graft_json_conflicts;
+PRAGMA graft_resolve = '--ours data.sqlite';
+PRAGMA graft_resolve = '--theirs data.sqlite';
+PRAGMA graft_resolve = '--theirs assets/model.bin';
+```
+
+对当前打开的 SQLite database，`graft_merge` 会尝试自动合并不冲突的 row changes 并把 merged snapshot stage 到 index。same-row、schema、add/delete 和 opaque-table conflicts 仍会保留为 conflict stages，需要用 `graft_resolve` 或写入 resolved database 后再继续 merge。
+
+`graft_json_merge` 会返回操作后的 `current_head` 和 `current_branch`、
+命令结果里的 `head`/`branch`，以及结构化 `paths`；每项包含 `path`、`kind`
+和 `action`（`checked_out`、`removed`、`staged` 或 `conflicted`），方便应用渲染
+merge 结果。
+`graft_json_merge_abort` 会返回操作后的 `current_head` 和 `current_branch`、
+恢复后的 `head`、目标 commit，以及结构化 `paths`（包含 `path`、`kind`、
+`action`），方便应用渲染 abort 结果。
+`graft_json_merge_continue` 会返回操作后的 `current_head` 和 `current_branch`、
+更新后的 `head`、紧凑的 merge commit 摘要，以及包含 `path`、`change`、`kind`
+的 `paths`，方便应用在 merge 完成后刷新历史和 changed-path 视图。它也会包含
+写回 worktree 的 SQLite database files 对应的 `materialized` entries。
+`graft_json_conflicts` 会返回当前 `current_head` 和 `current_branch`，以及
+顶层 `paths` 汇总；每项包含 path `kind`、`storage`、聚合 `status`、
+resolved/unresolved artifact 计数，方便应用渲染 conflict sidebar。详细 artifact
+仍会返回 `path_kind` 和 `storage`，方便应用区分 SQLite database、文本文件、
+二进制文件和外部 payload-backed file conflict。
+`graft_resolve` 可以为 SQLite database conflict、普通文件 conflict 和外部
+payload-backed file conflict 选择 ours/theirs。`graft_json_resolve_conflict`
+会返回操作后的 `current_head` 和 `current_branch`，并在 resolved `path`、
+所选 `resolution` 和 `remaining_conflicts` 之外返回 `path_kind` 和 `storage`。
+
+row-level merge planner 由 repository merge policy 控制。semantic keys、schema resolvers、SQLite internal resolvers 和验证行为见 [合并策略](/zh/docs/reference/merge-policy/)。
+
+## Debug Pragmas
+
+<Aside type="caution">
+`graft_debug_*` PRAGMA 不是普通应用 API。它们暴露 storage-layer details，例如 LSN 和 page-level diagnostics。
+</Aside>
+
+常用诊断：
+
+```sql
+PRAGMA graft_debug_log_lsn;
+PRAGMA graft_debug_volume_diff = '2,4';
+PRAGMA graft_debug_volume_diff = '2,4,rows';
+PRAGMA graft_debug_volume_json_diff = '2,4,rows';
+```

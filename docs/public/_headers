@@ -1,0 +1,7 @@
+/playground/*
+  Cross-Origin-Embedder-Policy: require-corp
+  Cross-Origin-Opener-Policy: same-origin
+  X-Content-Type-Options: nosniff
+
+/playground/wasm/*
+  Cache-Control: public, max-age=0, must-revalidate

@@ -11,18 +11,18 @@ import {
 
 const GRAFT_DESCRIPTION = `# Graft Documentation
 
-Graft is an open-source transactional storage engine designed for efficient data
-synchronization at the edge. It supports lazy, partial replication with strong
-consistency, ensuring applications replicate only the data they need.
+Graft is version control for SQLite-backed app state. It records SQLite
+databases and app-owned files together, so a commit describes one coherent
+application state that can be inspected, restored, branched, merged, and synced.
 
 ## Core Benefits
 
-- **Lazy Replication**: Clients sync data on demand, saving network and compute.
-- **Partial Replication**: Minimize bandwidth by syncing only required data.
-- **Edge Optimization**: Lightweight client designed for edge, mobile, and embedded environments.
-- **Strong Consistency**: Serializable Snapshot Isolation ensures correct, consistent data views.
-- **Transactional Object Storage**: Graft turns object storage into a transactional system.
-- **Instant Read Replicas**: Decoupled metadata and data allow replicas to spin up immediately.
+- **App-state commits**: SQLite databases, text files, binary files, and external payloads can live in one repository tree.
+- **Git-like workflows**: status, add, commit, branch, switch, diff, restore, merge, fetch, pull, push, and clone.
+- **SQLite integration**: use the CLI for local work or PRAGMA graft_* commands inside application runtimes.
+- **Row-aware review**: supported SQLite changes can be shown as row and schema diffs instead of opaque file changes.
+- **Application UI support**: JSON output describes status, diffs, conflicts, payloads, config, and sync state.
+- **Remote sync**: use filesystem, S3-compatible, or Graft HTTP remotes.
 
 ## Documentation Sitemap
 
@@ -69,6 +69,13 @@ async function findMarkdownFile(
   return files[0] || null;
 }
 
+function slugFromSidebarLink(link: string): string | null {
+  if (/^[a-z][a-z\d+.-]*:/i.test(link)) {
+    return null;
+  }
+  return link.replace(/^\/+/, "").replace(/\/+$/, "") || null;
+}
+
 /** Get all markdown files in a directory (non-recursive) */
 async function getMarkdownFiles(dirPath: string): Promise<string[]> {
   const files = await fg("*.{md,mdx}", { cwd: dirPath, absolute: true });
@@ -107,12 +114,13 @@ async function collectPages(sourceDir: string): Promise<PageInfo[]> {
   }
 
   async function processItem(item: SidebarItem): Promise<void> {
-    if (item.slug) {
-      const filePath = await findMarkdownFile(sourceDir, item.slug);
+    const slug = item.slug ?? (item.link ? slugFromSidebarLink(item.link) : null);
+    if (slug) {
+      const filePath = await findMarkdownFile(sourceDir, slug);
       if (filePath) {
         const fm = await readFrontmatter(filePath);
         pages.push({
-          slug: item.slug,
+          slug,
           label: item.label,
           description: fm.description,
         });
@@ -168,7 +176,7 @@ async function copyMarkdownFiles(
 
   for (const file of files) {
     const srcPath = path.join(sourceDir, file);
-    // Convert .mdx to .md and flatten index files (e.g., docs/about/index.md -> docs/about.md)
+    // Convert .mdx to .md and flatten index files (e.g., docs/guide/index.md -> docs/guide.md)
     let destFile = file.replace(/\.mdx$/, ".md");
     destFile = destFile.replace(/\/index\.md$/, ".md");
     const destPath = path.join(destDir, destFile);

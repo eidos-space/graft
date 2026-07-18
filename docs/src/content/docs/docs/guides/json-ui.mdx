@@ -1,0 +1,113 @@
+---
+title: App UI From JSON
+description: Use Graft JSON output to build status panels, review screens, merge UIs, and payload views.
+---
+
+Graft's CLI and SQLite extension expose JSON output so applications do not have
+to scrape terminal text. Use JSON for status badges, change review screens,
+merge conflict flows, sync progress, and payload cache views.
+
+## Status Panel
+
+```bash
+graft status --json
+```
+
+```sql
+PRAGMA graft_json_status;
+```
+
+Useful fields:
+
+| Field | Meaning |
+| --- | --- |
+| `current_head` | Current commit id when available. |
+| `current_branch` | Current branch name when available. |
+| `work_in_progress` | True when there are staged, unstaged, conflicted, or merge-state changes. |
+| `counts` | Staged, unstaged, and conflicted path counts. |
+| `paths` | One entry per changed path with `kind`, `storage`, status, and Git-like code. |
+| `staged_changes` | Lower-level staged change entries. |
+| `unstaged_changes` | Lower-level unstaged change entries. |
+
+Use `paths` for most app tables. Use the lower-level arrays only when you need
+separate staged and unstaged detail.
+
+## File Inventory
+
+```bash
+graft ls-files --json
+graft ls-files --json --details
+graft ls-files --json --stage
+graft ls-files --json --others
+```
+
+Use `--details` for artifact hashes and payload presence, `--stage` for raw
+index stages during conflicts, and `--others` for addable untracked paths.
+
+## Review Diffs
+
+```bash
+graft diff --json
+graft diff --json --rows HEAD~1 HEAD data.sqlite
+```
+
+```sql
+PRAGMA graft_json_diff = '--rows HEAD~1 HEAD -- data.sqlite';
+```
+
+Use the top-level `paths` array as the navigation model. Use SQLite row payloads
+inside database entries for detail panes.
+
+## Merge UI
+
+```bash
+graft conflicts --json
+graft resolve --json --theirs --row docs 42 data.sqlite
+```
+
+```sql
+PRAGMA graft_json_conflicts;
+PRAGMA graft_json_resolve_conflict = '--theirs --row docs 42 data.sqlite';
+```
+
+Render different controls by path type:
+
+| Path type | Suggested UI |
+| --- | --- |
+| SQLite database | Row/schema conflict review with row-level accept controls. |
+| Text file | Side picker or manual editor. |
+| Binary or external file | Ours/theirs/manual replacement controls. |
+
+## Payload UI
+
+```bash
+graft payload status --json HEAD
+graft payload fetch --json --remote origin HEAD
+graft payload prune --json
+```
+
+Show present, missing, invalid, fetched, and pruned byte counts. For file
+browsers, combine this with:
+
+```bash
+graft ls-files --json --details
+```
+
+## Sync UI
+
+```bash
+graft remote list --json
+graft fetch --json origin main
+graft pull --json origin main
+graft push --json origin main
+```
+
+Sync JSON includes current repository position and operation-specific outcomes.
+After a non-fast-forward pull, the repository may enter merge state; follow with
+`status --json` and `conflicts --json`.
+
+## Rule Of Thumb
+
+Use human output for terminals. Use JSON output for applications. The JSON
+surface carries stable concepts such as path kind, storage strategy, current
+branch, current head, conflict state, and payload presence.

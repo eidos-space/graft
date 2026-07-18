@@ -1,0 +1,56 @@
+---
+title: Playground 导览
+description: 在零安装、纯浏览器 worktree 中试用真实的 Graft v0.6.0 CLI。
+---
+
+import { Aside, Steps } from "@astrojs/starlight/components";
+
+[Graft Playground](/playground/) 运行编译为 WebAssembly 的真实 Graft
+v0.6.0 CLI。worktree、SQLite 数据库和 `.graft/` repository 都保存在浏览器
+Origin Private File System（OPFS）中，因此不安装 Graft、也不改动本地文件就能
+学习完整模型。
+
+<Aside type="note" title="浏览器本地状态">
+  Playground 数据只保存在当前浏览器和 origin 中。刷新页面不会丢失；使用
+  **重置数据**或清理站点存储后才会删除。
+</Aside>
+
+## 跟随引导操作
+
+<Steps>
+
+1. [打开 Playground](/playground/)，等待 **GRAFT v0.6.0 · WASM** runtime
+   indicator 出现。
+2. 打开 **引导**，先完成 **基础**：初始化 repository、创建
+   `data.sqlite`、添加文件、stage 并 commit。
+3. 继续完成 **分支**和 **合并**，观察同一个 worktree 如何 materialize
+   不同的应用状态。
+4. 最后完成 **冲突**，查看结构化 SQLite conflict 并选择 resolution。
+
+</Steps>
+
+每一步都会在 terminal 中运行真实命令。OPFS 文件树、SQLite editor、版本
+面板、history 和 diff 会根据结果同步更新。
+
+## 可以探索什么
+
+| 区域 | 展示内容 |
+| --- | --- |
+| 文件 | 同一个应用状态 worktree 中的文本、图片和 SQLite 路径。 |
+| Terminal | v0.6.0 CLI 和一个小型 OPFS shell。 |
+| 版本 | Status、staging、commit、branch、reset 和 history。 |
+| Diff | 文本变化、图片版本和 SQLite row diff。 |
+| 冲突 | Three-way merge 状态和 row-aware resolution。 |
+
+## 浏览器边界
+
+- 浏览器版本暂不支持 remote sync。
+- OPFS 是 origin-private 的，普通文件系统工具不能直接打开其中路径。
+- **重置数据**会永久删除 Playground 的 OPFS worktree 和历史。
+- Playground 适合学习和评估，不应作为生产持久化方案。
+
+## 继续在本机使用
+
+完成引导后，通过 [CLI 快速开始](/zh/docs/quickstart/cli/)在本地目录重复同一套
+repository 流程。应用集成可继续阅读
+[SQLite 扩展快速开始](/zh/docs/quickstart/sqlite-extension/)。

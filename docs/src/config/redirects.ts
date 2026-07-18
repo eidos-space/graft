@@ -1,6 +1,35 @@
 export const SHORT_CODES = [
   {
     code: "graft_import",
-    dest: "/docs/sqlite/databases/#import-from-existing-database",
+    dest: "/docs/guides/export-sqlite/#use-external-sqlite-tools",
   },
 ];
+
+export const DOC_REDIRECTS = {
+  "/docs/get-started/cli/": "/docs/quickstart/cli/",
+  "/docs/get-started/sqlite-extension/": "/docs/quickstart/sqlite-extension/",
+  "/docs/get-started/usage-guide/": "/docs/quickstart/app-state-walkthrough/",
+  "/docs/guides/cloudflare-remote/": "/docs/guides/http-remote/",
+  "/docs/concepts/physical-files-volumes/": "/docs/concepts/sqlite-snapshots/",
+  "/docs/concepts/snapshots-lsn/": "/docs/internals/snapshot-storage-lsns/",
+  "/docs/concepts/diffs/": "/docs/guides/diff-rows-and-files/",
+  "/docs/concepts/remotes-branches/": "/docs/concepts/branches-and-remotes/",
+  "/docs/internals/architecture-v2/": "/docs/internals/architecture/",
+  "/docs/internals/repository-mode-v2/": "/docs/internals/architecture/",
+  "/docs/internals/graft-objects/": "/docs/internals/object-formats/",
+  "/docs/internals/snapshot-objects-v2/": "/docs/internals/object-formats/",
+  "/docs/internals/row-diff-v2/": "/docs/internals/row-diff-engine/",
+  "/zh/docs/get-started/cli/": "/zh/docs/quickstart/cli/",
+  "/zh/docs/get-started/sqlite-extension/": "/zh/docs/quickstart/sqlite-extension/",
+  "/zh/docs/get-started/usage-guide/": "/zh/docs/quickstart/app-state-walkthrough/",
+  "/zh/docs/guides/cloudflare-remote/": "/zh/docs/guides/http-remote/",
+  "/zh/docs/concepts/physical-files-volumes/": "/zh/docs/concepts/sqlite-snapshots/",
+  "/zh/docs/concepts/snapshots-lsn/": "/zh/docs/internals/snapshot-storage-lsns/",
+  "/zh/docs/concepts/diffs/": "/zh/docs/guides/diff-rows-and-files/",
+  "/zh/docs/concepts/remotes-branches/": "/zh/docs/concepts/branches-and-remotes/",
+  "/zh/docs/internals/architecture-v2/": "/zh/docs/internals/architecture/",
+  "/zh/docs/internals/repository-mode-v2/": "/zh/docs/internals/architecture/",
+  "/zh/docs/internals/graft-objects/": "/zh/docs/internals/object-formats/",
+  "/zh/docs/internals/snapshot-objects-v2/": "/zh/docs/internals/object-formats/",
+  "/zh/docs/internals/row-diff-v2/": "/zh/docs/internals/row-diff-engine/",
+} as const;

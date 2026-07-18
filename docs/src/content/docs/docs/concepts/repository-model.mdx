@@ -1,0 +1,96 @@
+---
+title: Repository Model
+description: How Graft maps Git-like repository concepts onto SQLite databases and app files.
+---
+
+Graft repository mode gives a SQLite-backed app data directory a Git-like
+shape:
+
+```text
+project/
+  data.sqlite
+  analytics.sqlite
+  attachments/
+  settings.json
+  .graft/
+```
+
+The worktree contains normal app files. `.graft/` contains repository metadata,
+objects, refs, an index, local SQLite storage, and external payload caches.
+
+## Worktree
+
+The worktree is the physical project directory. Repository paths are relative to
+that directory:
+
+```text
+data.sqlite
+analytics.sqlite
+attachments/report.pdf
+settings.json
+```
+
+When a database is opened through `graft sql --db data.sqlite` or
+`vfs=graft`, Graft maps the absolute file path back to the repo-relative path
+`data.sqlite`.
+
+## Index
+
+The index is the staging area. Staging a SQLite database records a snapshot
+descriptor for the current database state. Staging a file records an artifact
+object or external payload pointer.
+
+```bash
+graft add data.sqlite
+graft add attachments/report.pdf
+graft commit -m "save state"
+```
+
+The index is also where unresolved merge stages are stored.
+
+## Commits And Trees
+
+A commit points to a tree. The tree maps repository paths to typed objects:
+
+```text
+data.sqlite                 sqlite_snapshot_v1
+settings.json               file_blob_v1
+attachments/report.pdf      large_file_pointer_v1
+```
+
+The commit id is what users pass to `graft show`, `graft diff`, `graft
+checkout`, `graft restore`, and `graft reset`.
+
+## Branches, Tags, And HEAD
+
+Branches and tags are refs under `.graft/refs/`:
+
+```text
+.graft/
+  HEAD
+  refs/
+    heads/main
+    heads/feature/search
+    remotes/origin/main
+    tags/v0.1
+```
+
+`HEAD` points to the current branch or directly to a commit in detached mode.
+
+## Remotes
+
+Named remotes live in `.graft/config.toml`. `origin` is a convention, not a
+special singleton.
+
+```bash
+graft remote add origin fs:///srv/graft/app
+graft remote add backup s3_compatible://bucket/prefix
+```
+
+Remote-tracking refs live under `refs/remotes/<remote>/`.
+
+## Project Isolation
+
+Repository mode is project-local. Two directories can both contain
+`data.sqlite`; they still have separate `.graft/` directories, refs, objects,
+remotes, indexes, local storage, and payload caches.

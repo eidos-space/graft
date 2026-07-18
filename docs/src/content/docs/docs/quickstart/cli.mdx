@@ -1,0 +1,128 @@
+---
+title: CLI Quickstart
+description: Create a Graft repository, commit SQLite data and files, inspect row diffs, merge branches, and restore state.
+---
+
+import { Aside, Steps } from "@astrojs/starlight/components";
+
+The CLI is the easiest way to try Graft. It opens SQLite databases through the
+embedded Graft VFS, so you can create database state, stage it, commit it, and
+diff it without loading the SQLite extension manually.
+
+<Aside type="tip" title="Prefer zero install?">
+  Start with the [Playground](/docs/quickstart/playground/). It runs the same
+  v0.6.0 CLI in a browser-only OPFS worktree, then points back to this local
+  workflow.
+</Aside>
+
+## Create A Repository
+
+<Steps>
+
+1. Create a scratch app data directory.
+
+   ```bash
+   mkdir app-state-demo
+   cd app-state-demo
+   ```
+
+2. Initialize Graft.
+
+   ```bash
+   graft init
+   ```
+
+   This creates `.graft/`. It does not create a default SQLite database.
+
+3. Write SQLite data through Graft.
+
+   ```bash
+   graft sql --db data.sqlite "CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT);"
+   graft sql --db data.sqlite "INSERT INTO notes(body) VALUES ('first note');"
+   ```
+
+4. Inspect status.
+
+   ```bash
+   graft status
+   ```
+
+   `data.sqlite` appears as an unstaged SQLite database snapshot.
+
+5. Commit the first app-state version.
+
+   ```bash
+   graft add --all
+   graft commit -m "seed notes"
+   ```
+
+6. Change the database and add an app file.
+
+   ```bash
+   graft sql --db data.sqlite "INSERT INTO notes(body) VALUES ('second note');"
+   mkdir -p attachments
+   printf 'draft\n' > attachments/readme.txt
+   ```
+
+7. See how Graft classifies paths.
+
+   ```bash
+   graft status --json
+   ```
+
+   Path entries include `kind` and `storage`, so apps can render database
+   snapshots and files differently.
+
+8. Commit and inspect a row diff.
+
+   ```bash
+   graft add --all
+   graft commit -m "add second note and attachment"
+   graft diff --rows HEAD~1 HEAD data.sqlite
+   ```
+
+9. Restore the database from the latest commit.
+
+   ```bash
+   graft sql --db data.sqlite "DELETE FROM notes;"
+   graft restore --source HEAD -- data.sqlite
+   graft status
+   ```
+
+   The final status should be clean.
+
+</Steps>
+
+## Run SQL From Stdin
+
+If no SQL argument is passed, `graft sql --db <path>` reads stdin:
+
+```bash
+cat <<'SQL' | graft sql --db data.sqlite
+CREATE TABLE IF NOT EXISTS notes(id INTEGER PRIMARY KEY, body TEXT);
+INSERT INTO notes(body) VALUES ('hello from stdin');
+SELECT * FROM notes;
+SQL
+```
+
+## Branch App State
+
+Branch and merge commands operate on the repository discovered from the
+current directory:
+
+```bash
+graft switch main
+graft --db data.sqlite merge feature/search
+graft merge --continue -m "merge feature/search"
+```
+
+`switch` materializes the tracked worktree paths without a database selector.
+Pass `--db` to `merge` when it should open that SQLite database for row-aware
+analysis; finishing the repository merge does not need it.
+
+## What To Read Next
+
+- [Track databases and files](/docs/guides/track-databases-and-files/)
+- [Diff rows and files](/docs/guides/diff-rows-and-files/)
+- [Merge conflicts](/docs/guides/merge-conflicts/)
+- [Sync with remotes](/docs/guides/sync-remotes/)

@@ -1,0 +1,64 @@
+---
+title: HTTP 远端协议
+description: graft+http 和 graft+https remotes 使用的内部协议。
+---
+
+`graft+http` 和 `graft+https` remote backend 使用简单对象协议。Cloudflare
+Worker service 在下面路径实现它：
+
+```text
+/api/graft/v1/repos/<owner>/<repo>
+```
+
+客户端配置：
+
+```text
+graft+https://host/api/graft/v1/repos/acme/archive
+```
+
+## Authentication
+
+默认 token 环境变量：
+
+```bash
+export GRAFT_REMOTE_TOKEN='grt_...'
+```
+
+URI 可以指定：
+
+```text
+graft+https://host/api/graft/v1/repos/acme/archive?token_env=GRAFT_ARCHIVE_TOKEN
+```
+
+## Operations
+
+概念 endpoint：
+
+```text
+GET    /raw/<path>
+HEAD   /raw/<path>
+PUT    /raw/<path>
+DELETE /raw/<path>
+PUT    /raw-if-not-exists/<path>
+POST   /cas/<path>
+POST   /cad/<path>
+GET    /list?prefix=<prefix>
+```
+
+ref paths 由服务事务化存储；object paths 存入 backing object store。
+
+## Status Codes
+
+| Status | 含义 |
+| --- | --- |
+| `204` | `HEAD` 检查时 object 存在。 |
+| `404` | object 或 ref 缺失。 |
+| `412` | compare-and-swap 或 put-if-absent 失败。 |
+
+## 服务端实现要求
+
+Graft v0.6.0 只包含 client，不包含 HTTP server。兼容服务需要提供 durable
+immutable object storage、对 refs 的 transactional compare-and-swap、私有
+repository 的 bearer-token authorization，以及上表中的 status-code 行为。
+
+客户端流程见 [连接 HTTP 远端](/zh/docs/guides/http-remote/)。

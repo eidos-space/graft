@@ -1,0 +1,69 @@
+---
+title: 连接 HTTP 远端
+description: 将 Graft v0.6.0 连接到实现 Graft HTTP remote protocol 的服务。
+---
+
+Graft v0.6.0 包含 HTTP remote client，可以通过实现 Graft HTTP remote
+protocol 的服务 fetch 和 push repository objects。
+
+Graft **不包含也不部署**该服务端。你需要使用已有的兼容服务，或根据
+[HTTP 远端协议](/zh/docs/internals/http-remote-protocol/)自行实现服务端。
+
+## 配置 Remote
+
+把 bearer token 放进进程环境，然后添加 remote：
+
+```bash
+export GRAFT_REMOTE_TOKEN='grt_...'
+graft remote add origin \
+  'graft+https://example.com/api/graft/v1/repos/acme/archive'
+```
+
+`graft+https://` 前缀用于选择 Graft HTTP transport，实际请求仍使用标准
+HTTPS。
+
+如果 token 位于其他环境变量，使用 `token_env`：
+
+```bash
+export GRAFT_ARCHIVE_TOKEN='grt_...'
+graft remote add origin \
+  'graft+https://example.com/api/graft/v1/repos/acme/archive?token_env=GRAFT_ARCHIVE_TOKEN'
+```
+
+不要把 token 本身写进 URI 或 `.graft/config.toml`。
+
+## 验证和同步
+
+push 前先检查 URL 和远端 refs：
+
+```bash
+graft remote get-url origin
+graft ls-remote origin
+graft push origin main
+```
+
+在另一个 worktree 中：
+
+```bash
+graft clone \
+  'graft+https://example.com/api/graft/v1/repos/acme/archive' \
+  main
+```
+
+clone 进程需要使用同一个 token 环境变量。
+
+## 本地协议开发
+
+只在自己控制的本地服务中使用 `graft+http://`：
+
+```bash
+export GRAFT_REMOTE_TOKEN='dev-token'
+graft remote add origin \
+  'graft+http://127.0.0.1:8787/api/graft/v1/repos/acme/archive'
+```
+
+生产环境应使用 HTTPS，并由服务端负责 repository authorization、object
+integrity、request limits 和 durable storage。
+
+URI 语法见 [Remote URI](/zh/docs/reference/remote-uris/)，分支同步流程见
+[远端同步](/zh/docs/guides/sync-remotes/)。

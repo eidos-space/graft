@@ -1,0 +1,82 @@
+---
+title: Row Diffs And Merge Policy
+description: How Graft interprets SQLite database changes at the row, schema, and policy layers.
+---
+
+Graft stores SQLite databases as snapshots, but applications usually care about
+rows, schema entries, and business objects. The row diff and merge policy layer
+connects those views.
+
+## Repository Diff Versus Row Diff
+
+A repository diff can say:
+
+```text
+modified data.sqlite
+modified attachments/report.pdf
+```
+
+A row diff can expand `data.sqlite` into supported logical changes:
+
+```text
+table docs
+  row 42 updated
+  row 43 inserted
+```
+
+Use `--rows` when you need row-level detail:
+
+```bash
+graft diff --json --rows HEAD~1 HEAD data.sqlite
+```
+
+## Supported Surfaces
+
+The row engine can report capabilities and limitations. Current public concepts
+include:
+
+- row changes in ordinary rowid tables
+- schema entries from `sqlite_schema`
+- opaque-table detection
+- semantic insert conflicts from configured keys
+- limitations for virtual tables, FTS shadow tables, `WITHOUT ROWID` tables,
+  SQLite internal tables, index B-trees, UTF-16 text encoding, and generated columns
+
+Unsupported does not mean ignored. It means the output carries a caveat or the
+merge remains conservative.
+
+## Merge Policy
+
+Merge policy lives in `.graft/config.toml` and lets applications describe what
+is safe for their schema:
+
+```toml
+[merge]
+default_semantic_keys = ["_id"]
+
+[merge.semantic_keys]
+docs = ["id"]
+
+[merge.internal_resolvers]
+sqlite_sequence = "sequence_max"
+index_btree = "reindex"
+
+[merge.schema_resolvers]
+add_column = "alter_table_add_column"
+```
+
+Policy answers:
+
+- which application columns identify the same logical object
+- which generated columns should be omitted from row-apply SQL
+- which SQLite internal changes are rebuildable
+- which schema additions can be applied safely
+
+## Conflict Principle
+
+If Graft cannot prove a merge is safe, it leaves a conflict. That is deliberate:
+the app can show structured conflict details instead of receiving a guessed
+state.
+
+See [Merge Policy](/docs/reference/merge-policy/) for the exact configuration
+and [Merge Conflicts](/docs/guides/merge-conflicts/) for user-facing workflows.

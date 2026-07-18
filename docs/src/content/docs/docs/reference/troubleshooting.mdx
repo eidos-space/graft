@@ -1,0 +1,128 @@
+---
+title: Troubleshooting
+description: Common Graft setup, SQLite, file tracking, merge, and remote sync issues.
+---
+
+## `graft sql` says no repository exists
+
+Run `graft init` in the app data directory first:
+
+```bash
+graft init
+graft sql --db data.sqlite "SELECT 1;"
+```
+
+`graft sql` requires an explicit `--db` path and an existing `.graft/`
+repository.
+
+## A database does not appear in status
+
+Make sure the database was written through Graft or stage the physical file
+explicitly.
+
+```bash
+graft sql --db data.sqlite "INSERT INTO notes(body) VALUES ('hello');"
+graft status
+```
+
+If another SQLite tool edited the file:
+
+```bash
+sqlite3 data.sqlite "PRAGMA wal_checkpoint(TRUNCATE);"
+graft add data.sqlite
+```
+
+## A file is stored externally when you expected inline
+
+Binary files always use external payload storage. Text files use external
+storage when they exceed `files.inline_text_threshold` or match
+`files.external_paths`.
+
+```bash
+graft config get files.inline_text_threshold
+graft config get files.external_paths
+```
+
+## A payload is missing after clone or pull
+
+Check and hydrate external payloads:
+
+```bash
+graft payload status HEAD
+graft payload fetch --remote origin HEAD
+```
+
+For a broader repair:
+
+```bash
+graft audit --repair origin
+```
+
+## Pull enters merge state
+
+Inspect conflicts:
+
+```bash
+graft status
+graft conflicts --json
+```
+
+Resolve each conflict:
+
+```bash
+graft resolve --ours data.sqlite
+graft resolve --theirs attachments/report.pdf
+graft merge --continue -m "resolve merge"
+```
+
+Abort if you want to return to the pre-merge state:
+
+```bash
+graft merge --abort
+```
+
+## S3-compatible remote cannot authenticate
+
+Credentials do not belong in the remote URI. Configure them in the environment
+or standard AWS config files:
+
+```bash
+export AWS_ACCESS_KEY_ID="..."
+export AWS_SECRET_ACCESS_KEY="..."
+export AWS_REGION="auto"
+```
+
+For Cloudflare R2 and MinIO, include the endpoint in the URI:
+
+```bash
+graft remote add origin 's3_compatible://bucket/prefix?endpoint=https://account.r2.cloudflarestorage.com'
+```
+
+## HTTP remote returns unauthorized
+
+Set the token environment variable expected by the remote URL:
+
+```bash
+export GRAFT_REMOTE_TOKEN='grt_...'
+```
+
+If the URL uses `token_env`, set that variable instead:
+
+```bash
+export GRAFT_ARCHIVE_TOKEN='grt_...'
+```
+
+Then retry:
+
+```bash
+graft ls-remote origin
+```
+
+## Row diff is unavailable
+
+Row diff is only available for supported SQLite snapshots and surfaces. Added
+or deleted database files, missing snapshots, unsupported tables, or internal
+SQLite surfaces can limit row-level output.
+
+Use the repository path diff as the source of truth and show row-level details
+when `row_diff_available` is true.

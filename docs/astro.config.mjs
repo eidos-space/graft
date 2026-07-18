@@ -1,11 +1,16 @@
 // @ts-check
 import { execSync } from "node:child_process";
+import { readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { defineConfig } from "astro/config";
 import starlight from "@astrojs/starlight";
 import starlightDocSearch from "@astrojs/starlight-docsearch";
+import starlightThemeFlexoki from "starlight-theme-flexoki";
 import sitemap from "@astrojs/sitemap";
 import llmifyPlugin from "./src/plugins/llmify";
 import { sidebar } from "./src/config/sidebar";
+import { DOC_REDIRECTS } from "./src/config/redirects";
 
 // find the current branch name
 export function currentBranch() {
@@ -24,22 +29,59 @@ export function currentBranch() {
   }).trim();
 }
 
+/** @returns {import("astro").AstroIntegration} */
+function removeFavicon() {
+  return {
+    name: "remove-favicon",
+    hooks: {
+      "astro:build:done": ({ dir }) => {
+        const root = fileURLToPath(dir);
+        for (const file of walkHtmlFiles(root)) {
+          const html = readFileSync(file, "utf8");
+          const next = html.replace(
+            /<link(?=[^>]*\brel="shortcut icon")(?=[^>]*\bhref="\/favicon\.svg")[^>]*>/g,
+            "",
+          );
+          if (next !== html) {
+            writeFileSync(file, next);
+          }
+        }
+      },
+    },
+  };
+}
+
+/**
+ * @param {string} dir
+ * @returns {Generator<string, void, unknown>}
+ */
+function* walkHtmlFiles(dir) {
+  for (const entry of readdirSync(dir)) {
+    const path = join(dir, entry);
+    if (statSync(path).isDirectory()) {
+      yield* walkHtmlFiles(path);
+    } else if (path.endsWith(".html")) {
+      yield path;
+    }
+  }
+}
+
 // https://astro.build/config
 export default defineConfig({
-  site: "https://graft.rs/",
+  site: "https://graft.eidos.space/",
+  redirects: DOC_REDIRECTS,
   integrations: [
     starlight({
       plugins: [
+        starlightThemeFlexoki({
+          accentColor: "green",
+        }),
         starlightDocSearch({
           clientOptionsModule: "./src/config/docsearch.ts",
         }),
       ],
       title: "Graft",
       pagination: false,
-      logo: {
-        light: "./src/assets/logo-light.svg",
-        dark: "./src/assets/logo-dark.svg",
-      },
       head: [
         {
           tag: "script",
@@ -65,29 +107,32 @@ export default defineConfig({
           },
         },
       ],
-      expressiveCode: {
-        themes: ["dracula", "solarized-light"],
-      },
       lastUpdated: true,
+      locales: {
+        root: {
+          label: "English",
+          lang: "en",
+        },
+        zh: {
+          label: "简体中文",
+          lang: "zh-CN",
+        },
+      },
       social: [
         {
           icon: "github",
           label: "GitHub",
-          href: "https://github.com/orbitinghail/graft",
-        },
-        {
-          icon: "discord",
-          label: "Discord",
-          href: "https://discord.gg/dhyjne5XK9",
+          href: "https://github.com/eidos-space/graft",
         },
       ],
       customCss: ["./src/styles/global.css"],
       editLink: {
-        baseUrl: `https://github.com/orbitinghail/graft/blob/${currentBranch()}/docs/`,
+        baseUrl: `https://github.com/eidos-space/graft/blob/${currentBranch()}/docs/`,
       },
       sidebar,
     }),
     sitemap(),
     llmifyPlugin(),
+    removeFavicon(),
   ],
 });

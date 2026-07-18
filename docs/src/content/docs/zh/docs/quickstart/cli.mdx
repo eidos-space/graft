@@ -1,0 +1,118 @@
+---
+title: CLI 快速开始
+description: 创建 Graft 仓库、提交 SQLite 数据和文件、查看行级 diff、合并分支并恢复状态。
+---
+
+import { Aside, Steps } from "@astrojs/starlight/components";
+
+CLI 是试用 Graft 的最短路径。`graft sql` 会通过内置 Graft VFS 打开
+SQLite 数据库，所以不需要手动加载 SQLite 扩展。
+
+<Aside type="tip" title="想要零安装体验？">
+  先打开 [Playground 导览](/zh/docs/quickstart/playground/)。它会在浏览器 OPFS
+  worktree 中运行同一个 v0.6.0 CLI，再引导你回到本地流程。
+</Aside>
+
+## 创建仓库
+
+<Steps>
+
+1. 创建示例应用目录。
+
+   ```bash
+   mkdir app-state-demo
+   cd app-state-demo
+   ```
+
+2. 初始化 Graft。
+
+   ```bash
+   graft init
+   ```
+
+   这会创建 `.graft/`，但不会创建默认数据库。
+
+3. 通过 Graft 写入 SQLite。
+
+   ```bash
+   graft sql --db data.sqlite "CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT);"
+   graft sql --db data.sqlite "INSERT INTO notes(body) VALUES ('first note');"
+   ```
+
+4. 查看状态。
+
+   ```bash
+   graft status
+   ```
+
+5. 提交第一个应用状态版本。
+
+   ```bash
+   graft add --all
+   graft commit -m "seed notes"
+   ```
+
+6. 修改数据库并添加文件。
+
+   ```bash
+   graft sql --db data.sqlite "INSERT INTO notes(body) VALUES ('second note');"
+   mkdir -p attachments
+   printf 'draft\n' > attachments/readme.txt
+   ```
+
+7. 查看路径分类。
+
+   ```bash
+   graft status --json
+   ```
+
+   JSON 里的 path entry 会包含 `kind` 和 `storage`。
+
+8. 提交并查看行级 diff。
+
+   ```bash
+   graft add --all
+   graft commit -m "add second note and attachment"
+   graft diff --rows HEAD~1 HEAD data.sqlite
+   ```
+
+9. 从最新 commit 恢复数据库。
+
+   ```bash
+   graft sql --db data.sqlite "DELETE FROM notes;"
+   graft restore --source HEAD -- data.sqlite
+   graft status
+   ```
+
+</Steps>
+
+## 从 stdin 执行 SQL
+
+```bash
+cat <<'SQL' | graft sql --db data.sqlite
+CREATE TABLE IF NOT EXISTS notes(id INTEGER PRIMARY KEY, body TEXT);
+INSERT INTO notes(body) VALUES ('hello from stdin');
+SELECT * FROM notes;
+SQL
+```
+
+## 分支里的应用状态
+
+branch 和 merge 命令会从当前目录发现仓库并操作整个 repository：
+
+```bash
+graft switch main
+graft --db data.sqlite merge feature/search
+graft merge --continue -m "merge feature/search"
+```
+
+`switch` 会直接 materialize 被跟踪的 worktree paths，不需要数据库选择器。需要
+row-aware analysis 时，用 `--db` 让 `merge` 打开对应 SQLite 数据库；完成 repository
+merge 时不再需要它。
+
+下一步：
+
+- [跟踪数据库和文件](/zh/docs/guides/track-databases-and-files/)
+- [比较行与文件](/zh/docs/guides/diff-rows-and-files/)
+- [合并冲突](/zh/docs/guides/merge-conflicts/)
+- [远端同步](/zh/docs/guides/sync-remotes/)

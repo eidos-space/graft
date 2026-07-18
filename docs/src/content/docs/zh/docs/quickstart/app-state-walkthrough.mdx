@@ -1,0 +1,85 @@
+---
+title: 应用状态演练
+description: 用一个 SQLite 数据库、文件、分支、diff 和远端串起 Graft workflow。
+---
+
+这个演练跟踪一个小型应用数据目录：一个 SQLite 数据库、一个 JSON 配置文件
+和一个附件。运行下面的本地命令前，可以先在
+[浏览器 Playground](/zh/docs/quickstart/playground/) 中练习同一套概念。
+
+## 创建应用状态
+
+```bash
+mkdir graft-walkthrough
+cd graft-walkthrough
+graft init
+
+graft sql --db data.sqlite "CREATE TABLE docs(id TEXT PRIMARY KEY, title TEXT, attachment TEXT);"
+graft sql --db data.sqlite "INSERT INTO docs VALUES ('doc-1', 'Proposal', 'attachments/proposal.txt');"
+
+mkdir -p attachments
+printf 'proposal draft\n' > attachments/proposal.txt
+printf '{ "theme": "light" }\n' > settings.json
+```
+
+提交：
+
+```bash
+graft status --json
+graft add --all
+graft commit -m "seed app state"
+```
+
+这个 commit 同时记录 `data.sqlite`、`settings.json` 和
+`attachments/proposal.txt`。
+
+## 创建分支
+
+```bash
+graft switch -c rewrite-title
+graft sql --db data.sqlite "UPDATE docs SET title = 'Updated Proposal' WHERE id = 'doc-1';"
+printf 'proposal draft v2\n' > attachments/proposal.txt
+graft diff --rows HEAD data.sqlite
+graft add --all
+graft commit -m "rewrite proposal"
+```
+
+切回 main：
+
+```bash
+graft switch main
+graft sql --db data.sqlite "SELECT id, title, attachment FROM docs;"
+cat attachments/proposal.txt
+```
+
+## 合并并同步
+
+```bash
+graft merge rewrite-title
+graft status
+```
+
+有冲突时：
+
+```bash
+graft conflicts --json
+graft resolve --theirs data.sqlite
+graft merge --continue -m "merge rewrite"
+```
+
+本地远端 smoke test：
+
+```bash
+mkdir -p /tmp/graft-remote
+graft remote add origin fs:///tmp/graft-remote
+graft push origin main
+```
+
+克隆：
+
+```bash
+mkdir ../graft-clone
+cd ../graft-clone
+graft clone fs:///tmp/graft-remote main
+graft sql --db data.sqlite "SELECT id, title FROM docs;"
+```

@@ -1,0 +1,53 @@
+---
+title: Remote URI
+description: Graft filesystem、S3-compatible 和 HTTP remotes 的 URI 语法。
+---
+
+添加或修改 remote：
+
+```bash
+graft remote add origin <uri>
+graft remote set-url origin <uri>
+```
+
+## URI Shapes
+
+| URI | 用途 |
+| --- | --- |
+| `memory` | 测试和临时 remote。 |
+| `fs:///absolute/path` | 本地或挂载文件系统。 |
+| `s3://bucket/prefix` | AWS S3-style object storage。 |
+| `s3_compatible://bucket/prefix` | R2、MinIO 等 S3-compatible storage。 |
+| `s3_compatible://bucket/prefix?endpoint=https://...` | 带自定义 endpoint 的 S3-compatible storage。 |
+| `graft+https://host/api/graft/v1/repos/org/space` | Graft HTTP remote protocol。 |
+
+## S3-Compatible
+
+```bash
+export AWS_ACCESS_KEY_ID="..."
+export AWS_SECRET_ACCESS_KEY="..."
+export AWS_REGION="auto"
+
+graft remote add origin 's3_compatible://my-bucket/prod/app?endpoint=https://account.r2.cloudflarestorage.com'
+```
+
+credential 不写入 `.graft/config.toml`，也不放在 URI 中。使用环境变量或标准
+AWS config files。
+
+当前 URI query 只接受 `endpoint`。
+
+## HTTP Protocol
+
+```bash
+export GRAFT_REMOTE_TOKEN='grt_...'
+graft remote add origin 'graft+https://example.com/api/graft/v1/repos/acme/archive'
+```
+
+自定义 token 环境变量：
+
+```bash
+export GRAFT_ARCHIVE_TOKEN='grt_...'
+graft remote add origin 'graft+https://example.com/api/graft/v1/repos/acme/archive?token_env=GRAFT_ARCHIVE_TOKEN'
+```
+
+HTTP remote 以 bearer token 发送访问密钥。

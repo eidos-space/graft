@@ -1,0 +1,96 @@
+---
+title: Graft
+head:
+  - tag: title
+    content: Graft - SQLite 应用状态的版本管理
+description: Graft 将 SQLite 数据库和应用文件一起版本化。
+template: splash
+hero:
+  tagline: SQLite 应用状态的版本管理。
+  actions:
+    - text: 体验 Playground
+      link: /playground/
+    - text: 从 CLI 开始
+      link: /zh/docs/quickstart/cli/
+      variant: secondary
+---
+
+import { Aside, CardGrid, LinkCard } from "@astrojs/starlight/components";
+
+<Aside type="note" title="版本基线">
+  本站描述 [Graft v0.6.0 release](https://github.com/eidos-space/graft/releases/tag/v0.6.0)。
+  实验性或尚未发布的能力会单独标注。
+</Aside>
+
+Graft 为 SQLite 应用背后的状态增加 Git-like 历史。它把 SQLite 数据库和
+应用拥有的文件放进同一个仓库提交里，让一次 commit 表示应用可以打开的
+一个完整状态。
+
+Git 可以保存 `.sqlite` 文件，但通常只能把它当作 opaque bytes。Graft 让
+SQLite 数据库成为一等版本对象：可以 stage、commit、查看 row diff、合并兼容
+变化、解决结构化冲突，并恢复为数据库状态。
+
+典型应用数据目录：
+
+```text
+app-data/
+  data.sqlite
+  search.sqlite
+  settings.json
+  attachments/
+    note-42.png
+    contract.pdf
+```
+
+SQLite 继续负责读写、索引和事务。Graft 负责围绕这些状态建立历史：stage、
+commit、branch、switch、row diff、restore、merge 和 remote sync。
+
+## 从这里开始
+
+<CardGrid>
+  <LinkCard
+    title="Graft 是什么"
+    href="/zh/docs/overview/what-is-graft/"
+    description="先理解它解决的问题和边界。"
+  />
+  <LinkCard
+    title="CLI 快速开始"
+    href="/zh/docs/quickstart/cli/"
+    description="初始化仓库、提交数据、查看行级 diff、恢复状态。"
+  />
+  <LinkCard
+    title="SQLite 扩展"
+    href="/zh/docs/quickstart/sqlite-extension/"
+    description="从 SQLite 或应用运行时调用 Graft。"
+  />
+  <LinkCard
+    title="应用状态演练"
+    href="/zh/docs/quickstart/app-state-walkthrough/"
+    description="把数据库、文件、分支、diff 和远端串起来。"
+  />
+</CardGrid>
+
+## 常见任务
+
+<CardGrid>
+  <LinkCard
+    title="跟踪数据库和文件"
+    href="/zh/docs/guides/track-databases-and-files/"
+    description="理解 path kind、storage 和 staging。"
+  />
+  <LinkCard
+    title="用 JSON 构建应用 UI"
+    href="/zh/docs/guides/json-ui/"
+    description="用结构化输出做状态、diff、冲突和 payload 面板。"
+  />
+  <LinkCard
+    title="远端同步"
+    href="/zh/docs/guides/sync-remotes/"
+    description="push、fetch、pull、clone 和远端选择。"
+  />
+  <LinkCard
+    title="合并冲突"
+    href="/zh/docs/guides/merge-conflicts/"
+    description="使用行级自动合并和结构化冲突信息。"
+  />
+</CardGrid>

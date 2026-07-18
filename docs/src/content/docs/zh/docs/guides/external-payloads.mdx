@@ -1,0 +1,61 @@
+---
+title: 外部载荷
+description: 将大型或二进制应用文件存为 external payload，并按需 hydrate。
+---
+
+Graft 把二进制文件和配置的资源路径存为 external payload。commit 中记录
+pointer object，真实字节存放在本地 `.graft/store/files` 和远端 payload
+store 中。
+
+## 哪些路径是 External
+
+- binary files
+- 超过 `files.inline_text_threshold` 的 text files
+- 匹配 `files.external_paths` 的 text files
+
+配置：
+
+```bash
+graft config set files.external_paths "assets/**, attachments/**"
+graft config set files.inline_text_threshold 1 MB
+```
+
+查看：
+
+```bash
+graft status --json
+graft ls-files --json --details
+```
+
+## 查看和获取 Payload
+
+```bash
+graft payload status HEAD
+graft payload status --json HEAD
+graft payload fetch --remote origin HEAD
+graft payload fetch --json --remote origin HEAD
+```
+
+`payload fetch` 不移动 refs，不修改 index，也不触碰 worktree files。
+
+## Audit 和 Prune
+
+```bash
+graft audit
+graft audit --repair origin
+graft payload prune
+graft payload prune --force
+```
+
+`payload prune` 默认 dry-run。只有不再被 index、branch、remote-tracking
+branch、tag 或 reachable commit 引用的 payload 才是候选。
+
+## UI 模式
+
+```bash
+graft ls-files --json --details
+graft payload status --json HEAD
+```
+
+用 `external_payload_present` 和 payload status 显示本地可用、缺失、损坏或可
+fetch 的文件。

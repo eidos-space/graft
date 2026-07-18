@@ -1,0 +1,46 @@
+<svg
+  xmlns="http://www.w3.org/2000/svg"
+  width="512"
+  height="512"
+  viewBox="0 0 512 512"
+  fill="none"
+  role="img"
+  aria-labelledby="logos-title logos-description"
+>
+  <title id="logos-title">Logos</title>
+  <desc id="logos-description">
+    An isometric container holding a commit graph whose side branch diverges
+    from and merges back into the main history.
+  </desc>
+
+  <!--
+    The Eidos family silhouette becomes the application-state boundary:
+    SQLite databases, text, binary files, and references form one whole.
+  -->
+  <g stroke="#828282" fill="none">
+    <path
+      d="M256 28 454 142v228L256 484 58 370V142L256 28Z"
+      stroke-width="30"
+      stroke-linejoin="miter"
+    />
+
+    <!-- A Git-like history expressed on the same isometric grid. -->
+    <path
+      d="M300 412V100M300 334 190 270v-46l110-54"
+      stroke-width="26"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+    />
+
+    <!-- Commit nodes make divergence, parallel history, and merge explicit. -->
+    <g fill="white" stroke="#828282" stroke-width="13">
+      <circle cx="300" cy="404" r="18" />
+      <circle cx="300" cy="334" r="18" />
+      <circle cx="300" cy="252" r="18" />
+      <circle cx="300" cy="170" r="18" />
+      <circle cx="300" cy="100" r="18" />
+      <circle cx="190" cy="270" r="18" />
+      <circle cx="190" cy="224" r="18" />
+    </g>
+  </g>
+</svg>

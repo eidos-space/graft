@@ -1,0 +1,116 @@
+---
+title: SQLite Extension Quickstart
+description: Use Graft from SQLite with the Graft VFS and repository PRAGMA commands.
+---
+
+import { Aside, Steps } from "@astrojs/starlight/components";
+
+The SQLite extension is the main integration surface for applications. It
+registers a Graft VFS and exposes repository operations through
+`PRAGMA graft_*` commands.
+
+Use it when your app already opens SQLite connections from Electron, Node.js,
+Python, Ruby, Swift, Rust, or another runtime with SQLite support.
+
+<Aside type="tip" title="Evaluate the workflow first">
+  Use the [Playground](/docs/quickstart/playground/) or
+  [CLI Quickstart](/docs/quickstart/cli/) before embedding the extension. The
+  repository model and commands are the same.
+</Aside>
+
+## Open A Database Through Graft
+
+In the SQLite shell:
+
+```sql
+.load ./libgraft_ext
+.open "file:/path/to/project/data.sqlite?vfs=graft"
+```
+
+Then initialize the repository:
+
+```sql
+PRAGMA graft_init;
+```
+
+Repository state is stored under:
+
+```text
+/path/to/project/.graft/
+```
+
+## Basic Workflow
+
+<Steps>
+
+1. Write normal SQLite data.
+
+   ```sql
+   CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+   INSERT INTO users(name) VALUES ('Alice');
+   ```
+
+2. Inspect repository status.
+
+   ```sql
+   PRAGMA graft_status;
+   PRAGMA graft_json_status;
+   ```
+
+3. Stage the current database snapshot.
+
+   ```sql
+   PRAGMA graft_add;
+   ```
+
+4. Commit the staged snapshot.
+
+   ```sql
+   PRAGMA graft_commit = 'seed users';
+   ```
+
+5. Compare revisions.
+
+   ```sql
+   PRAGMA graft_diff = '--rows HEAD~1 HEAD -- data.sqlite';
+   PRAGMA graft_json_diff = '--rows HEAD~1 HEAD -- data.sqlite';
+   ```
+
+</Steps>
+
+## Path-Based Repository Mode
+
+The database path is part of repository identity. Opening
+`/project/data.sqlite` through the Graft VFS maps that database to the
+repo-relative path `data.sqlite` inside `/project`.
+
+Repository commands operate on the worktree, not on an implicit global
+database. A repository can track multiple database paths:
+
+```text
+project/
+  data.sqlite
+  analytics.sqlite
+  .graft/
+```
+
+Stage a specific path:
+
+```sql
+PRAGMA graft_add = 'analytics.sqlite';
+PRAGMA graft_commit = 'track analytics database';
+```
+
+## JSON For Applications
+
+Prefer JSON pragmas for application UI:
+
+```sql
+PRAGMA graft_json_status;
+PRAGMA graft_json_diff = '--rows HEAD~1 HEAD -- data.sqlite';
+PRAGMA graft_json_conflicts;
+PRAGMA graft_json_ls_files = '--details';
+```
+
+See [App UI from JSON](/docs/guides/json-ui/) for common UI patterns and
+[SQLite PRAGMAs](/docs/reference/pragmas/) for the full command reference.

@@ -1,0 +1,129 @@
+---
+title: Sync With Remotes
+description: Configure Graft remotes, push and pull branches, clone repositories, and choose a remote backend.
+---
+
+Graft remotes store repository objects, refs, SQLite storage, and external file
+payloads outside the local `.graft/` directory.
+
+Supported URI families:
+
+```text
+memory
+fs:///absolute/path
+s3://bucket/prefix
+s3_compatible://bucket/prefix?endpoint=https://...
+graft+https://host/api/graft/v1/repos/org/space
+graft+http://127.0.0.1:8787/api/graft/v1/repos/org/space
+```
+
+## Add A Remote
+
+Use a filesystem remote for local testing:
+
+```bash
+graft remote add origin fs:///tmp/graft-remote
+graft remote list
+```
+
+Use S3-compatible storage:
+
+```bash
+export AWS_ACCESS_KEY_ID="..."
+export AWS_SECRET_ACCESS_KEY="..."
+export AWS_REGION="auto"
+
+graft remote add origin 's3_compatible://my-bucket/prod/app?endpoint=https://account.r2.cloudflarestorage.com'
+```
+
+Use a Graft HTTP remote:
+
+```bash
+export GRAFT_REMOTE_TOKEN='grt_...'
+graft remote add origin 'graft+https://example.com/api/graft/v1/repos/acme/archive'
+```
+
+For a non-default token variable:
+
+```bash
+export GRAFT_ARCHIVE_TOKEN='grt_...'
+graft remote add origin 'graft+https://example.com/api/graft/v1/repos/acme/archive?token_env=GRAFT_ARCHIVE_TOKEN'
+```
+
+## Push
+
+Push the current branch:
+
+```bash
+graft push origin main
+```
+
+Push the current branch to its configured upstream:
+
+```bash
+graft push
+```
+
+Push every local branch:
+
+```bash
+graft push --all origin
+```
+
+Force push is available for deliberate non-fast-forward updates:
+
+```bash
+graft push --force origin main
+```
+
+Use it with the same care you would use `git push --force`.
+
+## Fetch And Pull
+
+Fetch updates remote-tracking refs without changing your current branch:
+
+```bash
+graft fetch origin main
+graft fetch --all origin
+```
+
+Pull fast-forwards or enters merge state:
+
+```bash
+graft pull origin main
+```
+
+If the branch has an upstream, you can omit the remote and branch:
+
+```bash
+graft pull
+```
+
+## Clone
+
+Clone a remote repository into an empty worktree:
+
+```bash
+mkdir app-clone
+cd app-clone
+graft clone fs:///tmp/graft-remote main
+```
+
+Clone picks the requested branch, materializes tracked database snapshots and
+files, and configures `origin`.
+
+## Manage Remotes
+
+```bash
+graft remote list
+graft remote get-url origin
+graft remote set-url origin fs:///srv/graft/new-app
+graft remote rename origin archive
+graft remote remove archive
+graft remote prune origin
+graft ls-remote origin
+```
+
+See [Remote URIs](/docs/reference/remote-uris/) for exact URI parsing rules and
+[Connect An HTTP Remote](/docs/guides/http-remote/) for the v0.6.0 HTTP client
+workflow.

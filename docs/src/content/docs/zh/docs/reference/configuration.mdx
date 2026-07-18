@@ -1,0 +1,175 @@
+---
+title: 配置
+description: 仓库本地配置和进程级 loader defaults。
+---
+
+Graft 仓库模式通过项目本地的 `.graft/config.toml` 配置。
+
+```text
+project/
+  .graft/
+    config.toml
+```
+
+## Repository Config
+
+config 保存 repository format settings、object format、命名远端和 branch upstreams。
+
+示例：
+
+```toml
+[core]
+repository_format_version = 2
+default_branch = "main"
+
+[extensions]
+object_format = "blake3"
+
+[remotes.origin]
+type = "fs"
+root = "/srv/graft/app"
+
+[branches.main]
+remote = "origin"
+merge = "refs/heads/main"
+```
+
+应用通常应该通过 PRAGMA 或 CLI 命令更新配置，而不是手动编辑：
+
+```bash
+graft remote add origin fs:///srv/graft/app
+graft branch --set-upstream-to origin/main main
+```
+
+SQLite 应用可以用 `graft_json_config_get` 和 `graft_json_config_list` 读取结构化
+config entry。`graft_json_config_get` 会在可用时返回 `current_head` 和
+`current_branch`，并和请求的 `key`、`value` 放在同一个对象里；
+`graft_json_config_list` 默认仍保留 legacy entry array。传 `--with-status`
+时，`graft_json_config_list` 会返回 `current_head`、`current_branch` 和
+`entries` 数组。`graft_json_config_set` 和 `graft_json_config_unset` 会返回
+`operation`、可用时的操作后 `current_head` 和 `current_branch`，以及包含
+`key`、`value` 的 `entry` 对象。
+
+## Merge Policy
+
+可选的 `[merge]` section 用来配置 SQLite 文件的 row-level merge 行为。它可以声明应用层 semantic keys、generated columns、schema resolvers 和安全的 SQLite internal resolvers。
+
+```toml
+[merge]
+default_semantic_keys = ["_id"]
+
+[merge.semantic_keys]
+app_objects = ["id"]
+
+[merge.internal_resolvers]
+sqlite_sequence = "sequence_max"
+index_btree = "reindex"
+
+[merge.schema_resolvers]
+add_column = "alter_table_add_column"
+
+[merge.generated_columns]
+app_objects = ["body_len"]
+```
+
+完整 resolver 列表、logical status、conflict reasons 和 validation policy 见 [合并策略](/zh/docs/reference/merge-policy/)。
+
+## Track Scope
+
+可选的 `[track]` section 定义哪些 worktree 路径默认进入 repository status 和自动
+commit。它只描述“哪些路径属于版本化状态”，不描述文件内容如何存储。
+
+```toml
+[track]
+default_roots = ["data.sqlite", "settings.json", "attachments/**"]
+user_roots = ["notes.md"]
+```
+
+`default_roots` 适合应用初始化时写入，由开发者定义 app 私有状态边界，例如 SQLite
+数据库、配置文件、附件目录、导入目录或 agent session 目录。配置后，这些 roots 里的
+新文件会出现在 `graft status` 中；提交时，Graft 会自动 stage configured roots。
+
+`user_roots` 适合保存用户明确选择纳入版本管理的 space 内容。space 里其他普通文件
+默认不会污染 app state 视图，但仍可通过 `graft ls-files --others` 发现。
+
+## File Storage
+
+可选的 `[files]` section 控制非 SQLite 文件的存储策略。SQLite 数据库始终使用
+`storage: "sqlite_snapshot"`。二进制文件始终使用 `storage: "external"`。文本文件默认使用
+`storage: "inline"`，除非命中 external path rule，或者超过 `inline_text_threshold`。
+
+```toml
+[files]
+inline_text_threshold = "1 MB"
+external_paths = ["assets/**", "attachments/**"]
+```
+
+`external_paths` 适合 app resource 目录，让小文件也按 payload 处理，例如图片、导入文件、
+附件、导出物、模型或生成媒体。
+
+## Worktree Materialization
+
+可选的 `[worktree]` section 控制已提交的 SQLite snapshot 是否写回 worktree 中的物理 SQLite 数据库文件。
+
+```toml
+[worktree]
+materialize_sqlite = true
+```
+
+默认值是 `true`。commit、checkout、switch、pull 或 merge-continue 之后，Graft 会把已跟踪 SQLite snapshot materialize 到它们的 repo-relative database path，例如 `data.sqlite` 或 `sub-app/main.sqlite`。
+
+只有在集成方明确想要 volume-only database path、不希望 worktree 出现普通 SQLite 文件时，才把它设为 `false`。
+
+## Repository Storage
+
+仓库模式的 SQLite 数据存储在：
+
+```text
+.graft/store/
+```
+
+这提供项目隔离。两个目录都可以包含 `data.sqlite`，但它们不会共享 storage、refs、branches、remotes、index state 或 materialized worktree files。
+
+## Loader Defaults
+
+动态 SQLite 扩展仍然可以有进程级默认值，用于测试和诊断。这些默认值不是 repository state。
+
+普通仓库模式中：
+
+- 不依赖环境变量识别项目身份
+- 不使用用户级配置保存 refs 或 remotes
+- 项目状态保存在 `.graft/`
+
+## Remote URIs
+
+常见 URI 形状：
+
+```text
+memory
+fs:///absolute/path
+s3://bucket/prefix
+s3_compatible://bucket/prefix
+s3_compatible://bucket/prefix?endpoint=https://account.r2.cloudflarestorage.com
+```
+
+`memory` 适合测试，`fs://` 适合本地目录或挂载目录，`s3://` 和 `s3_compatible://` 适合对象存储。Cloudflare R2、MinIO 这类 S3-compatible 服务通常需要显式的 `endpoint` query 参数。
+
+解析后，具体 remote type 会保存在 `.graft/config.toml`。例如：
+
+```toml
+[remotes.origin]
+type = "s3_compatible"
+bucket = "my-graft-bucket"
+prefix = "prod/app"
+endpoint = "https://account.r2.cloudflarestorage.com"
+```
+
+S3 凭据不会保存在 `.graft/config.toml` 或 remote URI 里。请通过进程环境变量配置，或者使用底层 S3 client 支持的标准 AWS config 和 credentials 文件：
+
+```bash
+export AWS_ACCESS_KEY_ID="..."
+export AWS_SECRET_ACCESS_KEY="..."
+export AWS_REGION="auto"
+```
+
+Cloudflare R2 使用 `AWS_REGION=auto`。当前 Graft 的 remote URI parser 只接受 `endpoint` 这个 S3 query 参数，不要把 `region`、access key 或 secret key 写进 URI。

@@ -1,0 +1,79 @@
+---
+title: SQLite Snapshots
+description: How tracked SQLite files relate to Graft snapshots and materialized database files.
+---
+
+Graft tracks SQLite database paths as snapshots. A snapshot is an immutable
+view of a database state that can be recorded in a repository commit.
+
+That makes a SQLite database path a first-class versioned object in Graft. The
+repository does not have to treat `data.sqlite` as an opaque binary blob: it can
+record a snapshot, compare supported row and schema changes, merge compatible
+edits, and materialize the result back to a normal SQLite file.
+
+Normal applications still see SQLite files:
+
+```text
+project/
+  data.sqlite
+  .graft/
+```
+
+`data.sqlite` is the worktree path. The commit stores a snapshot descriptor
+backed by Graft storage under `.graft/`.
+
+## Writing Through Graft
+
+When you write through the CLI:
+
+```bash
+graft sql --db data.sqlite "INSERT INTO notes(body) VALUES ('hello');"
+```
+
+or through SQLite with `vfs=graft`, SQLite commits advance the current Graft
+database state. That state becomes repository history after staging and
+committing:
+
+```bash
+graft add data.sqlite
+graft commit -m "add note"
+```
+
+## Materialized Files
+
+By default, Graft materializes committed SQLite snapshots back to normal
+database files in the worktree after commit, checkout, switch, pull, and
+merge-continue.
+
+That lets standard SQLite tools inspect the current state:
+
+```bash
+sqlite3 data.sqlite "SELECT count(*) FROM notes;"
+```
+
+The repository commit still stores a verifiable snapshot descriptor, not a
+plain copy of the whole file.
+
+## Exporting
+
+Use `graft export` when you want a separate normal SQLite file:
+
+```bash
+graft export --source HEAD --output data.head.sqlite data.sqlite
+```
+
+Export does not move `HEAD`, change the index, or connect the exported file to
+the current Graft volume.
+
+## External Edits
+
+If a standard SQLite tool edits a tracked materialized database directly,
+checkpoint WAL data if needed and stage the path:
+
+```bash
+sqlite3 data.sqlite "PRAGMA wal_checkpoint(TRUNCATE);"
+graft add data.sqlite
+```
+
+For app integrations, prefer opening the database through the Graft VFS so
+Graft can track the current database state directly.

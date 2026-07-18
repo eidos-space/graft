@@ -1,0 +1,90 @@
+---
+title: 故障排查
+description: 常见 Graft setup、SQLite、file tracking、merge 和 remote sync 问题。
+---
+
+## `graft sql` 提示没有 repository
+
+先在应用数据目录运行：
+
+```bash
+graft init
+graft sql --db data.sqlite "SELECT 1;"
+```
+
+`graft sql` 需要显式 `--db` 和已有 `.graft/`。
+
+## 数据库没有出现在 status 中
+
+确保通过 Graft 写入，或显式 stage 物理文件：
+
+```bash
+graft sql --db data.sqlite "INSERT INTO notes(body) VALUES ('hello');"
+graft status
+```
+
+外部 SQLite 工具修改后：
+
+```bash
+sqlite3 data.sqlite "PRAGMA wal_checkpoint(TRUNCATE);"
+graft add data.sqlite
+```
+
+## 文件被 external 存储
+
+binary file 总是 external。text file 在超过 `files.inline_text_threshold` 或
+匹配 `files.external_paths` 时也会 external。
+
+```bash
+graft config get files.inline_text_threshold
+graft config get files.external_paths
+```
+
+## clone 或 pull 后 payload 缺失
+
+```bash
+graft payload status HEAD
+graft payload fetch --remote origin HEAD
+graft audit --repair origin
+```
+
+## pull 进入 merge state
+
+```bash
+graft status
+graft conflicts --json
+graft resolve --ours data.sqlite
+graft resolve --theirs attachments/report.pdf
+graft merge --continue -m "resolve merge"
+```
+
+中止：
+
+```bash
+graft merge --abort
+```
+
+## S3-compatible remote 认证失败
+
+credential 不放在 URI 中：
+
+```bash
+export AWS_ACCESS_KEY_ID="..."
+export AWS_SECRET_ACCESS_KEY="..."
+export AWS_REGION="auto"
+```
+
+R2 或 MinIO 需要 endpoint：
+
+```bash
+graft remote add origin 's3_compatible://bucket/prefix?endpoint=https://account.r2.cloudflarestorage.com'
+```
+
+## HTTP remote 未授权
+
+设置 remote URL 需要的 token environment variable：
+
+```bash
+export GRAFT_REMOTE_TOKEN='grt_...'
+graft ls-remote origin
+```

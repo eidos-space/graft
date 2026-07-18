@@ -1,0 +1,60 @@
+---
+title: 导出 SQLite 文件
+description: 将 Graft SQLite snapshot 导出为普通数据库文件，并导入外部 SQLite 修改。
+---
+
+Graft 把 SQLite 历史存为 snapshot，但可以 materialize 和 export 普通 SQLite
+数据库文件。
+
+## Worktree Materialization
+
+默认情况下，commit、checkout、switch、pull 和 merge-continue 后，Graft 会把
+tracked SQLite snapshot 写回 worktree 的数据库路径：
+
+```text
+project/
+  data.sqlite
+  .graft/
+```
+
+`data.sqlite` 是普通 SQLite 文件，可被标准工具读取。
+
+## Export Snapshot
+
+导出当前 worktree database state：
+
+```bash
+graft export --output data.inspect.sqlite data.sqlite
+```
+
+导出指定 revision：
+
+```bash
+graft export --source HEAD --output data.head.sqlite data.sqlite
+graft export --source HEAD~1 --output data.previous.sqlite data.sqlite
+```
+
+导出的文件是普通 SQLite 数据库，不再连接当前 Graft volume。
+
+## 使用外部 SQLite 工具
+
+如果直接编辑 tracked materialized file，关闭 writer 后 checkpoint WAL 并 stage：
+
+```bash
+sqlite3 data.sqlite "INSERT INTO notes(body) VALUES ('external edit');"
+sqlite3 data.sqlite "PRAGMA wal_checkpoint(TRUNCATE);"
+graft add data.sqlite
+graft commit -m "import external edit"
+```
+
+应用代码更推荐通过 `graft sql --db` 或 `vfs=graft` 连接写入。
+
+## 禁用 Materialization
+
+```toml
+[worktree]
+materialize_sqlite = true
+```
+
+默认是 `true`。只有明确想要 volume-only database path 的集成才应设为
+`false`。

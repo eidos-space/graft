@@ -1,0 +1,144 @@
+---
+title: History And Restore
+description: Commit, inspect, branch, switch, restore, checkout, and reset Graft app-state history.
+---
+
+Graft uses a Git-like repository model for app data:
+
+```text
+worktree -> index -> commit
+```
+
+SQLite transactions update the current database state. Graft commits record
+which database snapshots and file artifacts should be treated as a named app
+state.
+
+## Commit A Version
+
+```bash
+graft status
+graft add --all
+graft commit -m "save checkpoint"
+```
+
+Inspect history:
+
+```bash
+graft log
+graft log --json
+graft show HEAD
+graft show --json HEAD
+```
+
+## Branch And Switch
+
+Create a branch:
+
+```bash
+graft branch feature/search
+graft switch feature/search
+```
+
+Create and switch in one command:
+
+```bash
+graft switch -c feature/search main
+```
+
+List branches:
+
+```bash
+graft branch
+graft branch -r
+graft branch -a
+```
+
+Switching branches materializes the target commit's tracked SQLite snapshots
+and file artifacts into the worktree.
+
+## Restore One Path
+
+Restore a worktree path from `HEAD`:
+
+```bash
+graft restore --source HEAD -- data.sqlite
+```
+
+Restore a path from an older revision:
+
+```bash
+graft restore --source HEAD~1 -- attachments/report.pdf
+```
+
+Unstage a staged path:
+
+```bash
+graft restore --staged -- data.sqlite
+```
+
+Unstage every staged path of one kind:
+
+```bash
+graft restore --staged --all --kind sqlite_database
+```
+
+## Checkout A Revision Or Path
+
+Check out an entire revision:
+
+```bash
+graft checkout HEAD~1
+```
+
+Restore one path from a revision:
+
+```bash
+graft checkout HEAD~1 data.sqlite
+```
+
+Use `checkout` for revision movement or Git-style path restore. Use `restore`
+for explicit staged/worktree restore operations.
+
+## Reset HEAD
+
+Move the current branch while keeping staged and worktree state:
+
+```bash
+graft reset --soft HEAD~1
+```
+
+Move the branch and reset the index:
+
+```bash
+graft reset --mixed HEAD~1
+```
+
+Move the branch, reset the index, and materialize the target revision:
+
+```bash
+graft reset --hard HEAD~1
+```
+
+`--hard` discards staged and unstaged worktree changes. Use it only when that is
+the intended operation.
+
+## Tags
+
+Create a lightweight tag:
+
+```bash
+graft tag v0.1
+```
+
+Create an annotated tag:
+
+```bash
+graft tag -a v0.1 -m "first checkpoint"
+```
+
+List or delete tags:
+
+```bash
+graft tag
+graft tag -d v0.1
+```

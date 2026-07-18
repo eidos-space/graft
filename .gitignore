@@ -7,8 +7,12 @@
 .env
 /.kosho**
 /.graft
+web-demo/dist/
+web-demo/node_modules/
+web-demo/public/wasm/
 /.claude/plans
 .tests/
 
 # Local SQL test files (non-deterministic Volume IDs)
 .tests/
+.gstack/

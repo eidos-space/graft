@@ -1,1 +1,1 @@
-Moved to https://graft.rs/docs/backend/
+Moved to https://graft.eidos.space/docs/reference/remote-uris/

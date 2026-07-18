@@ -1,0 +1,66 @@
+---
+title: 架构
+description: Graft core、SQLite integration、CLI、repository layer 和 remotes 的关系。
+---
+
+本页面向贡献者和高级调试。产品集成通常应使用 CLI、SQLite PRAGMA、JSON 输出
+和配置参考。
+
+## Layers
+
+```text
+Application
+  SQLite connection using vfs=graft
+  or graft CLI
+
+graft-sqlite
+  VFS
+  PRAGMA parser
+  repository command adapters
+
+graft
+  repository model
+  objects, refs, index, merge, sync
+  storage volumes, logs, snapshots
+  remote backends
+```
+
+## Crates
+
+| Crate | 作用 |
+| --- | --- |
+| `graft` | core storage、repository objects、refs、index、merge、sync、remotes。 |
+| `graft-sqlite` | SQLite VFS 和 repository PRAGMA。 |
+| `graft-ext` | SQLite extension wrapper。 |
+| `graft-tool` | CLI。 |
+| `graft-test` | integration tests 和 workloads。 |
+| `graft-tracing` | tracing helpers。 |
+
+## CLI Flow
+
+多数 repository CLI command 是 repository PRAGMA 的薄封装：
+
+```text
+graft status             -> PRAGMA graft_status
+graft add --all          -> PRAGMA graft_add = '--all'
+graft commit -m "msg"    -> PRAGMA graft_commit = 'msg'
+graft diff --rows ...    -> PRAGMA graft_diff = '--rows ...'
+```
+
+`graft sql --db <path>` 通过内置 Graft VFS 打开数据库并执行 SQL。
+
+## Commit / Checkout / Merge
+
+commit flow：
+
+```text
+SQLite writes through Graft VFS
+  -> current database state advances
+  -> graft add records snapshot/artifact entries
+  -> graft commit writes tree and commit objects
+  -> branch ref moves
+  -> SQLite snapshots may be materialized
+```
+
+merge flow 从 base/ours/theirs tree 开始，对 SQLite 路径做 row/schema
+analysis，对文件 artifact 使用保守 file-level conflicts。

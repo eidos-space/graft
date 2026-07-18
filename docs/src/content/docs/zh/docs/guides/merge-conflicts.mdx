@@ -1,0 +1,153 @@
+---
+title: 合并冲突
+description: 合并 Graft 分支、理解 row-aware auto-merge，并解决冲突。
+---
+
+Graft 先做 path-level merge。对 SQLite 数据库路径，它会比较 base、ours、
+theirs snapshots，并尝试 row-aware merge。文件 artifact 默认使用保守的
+file-level 处理。
+
+## 合并分支
+
+```bash
+graft switch main
+graft --db data.sqlite merge feature/search
+```
+
+`switch` 会从当前目录发现并操作整个 repository；`merge` 用 `--db` 打开
+`data.sqlite` 做 row-aware analysis。干净合并后：
+
+```bash
+graft merge --continue -m "merge feature/search"
+```
+
+有冲突时：
+
+```bash
+graft status
+graft conflicts
+graft --db data.sqlite conflicts --json
+```
+
+## 示例：合并不同 row 的变化
+
+这个例子从 `app.sqlite` 中的两个任务开始：
+
+| id | title | status |
+| --- | --- | --- |
+| 1 | Write quickstart | open |
+| 2 | Review commands | open |
+
+创建仓库并提交初始状态：
+
+```bash
+mkdir app-state-demo
+cd app-state-demo
+graft init
+graft sql --db app.sqlite \
+  "CREATE TABLE tasks(id INTEGER PRIMARY KEY, title TEXT, status TEXT); \
+   INSERT INTO tasks VALUES (1, 'Write quickstart', 'open'), \
+                            (2, 'Review commands', 'open');"
+graft add app.sqlite
+graft commit -m "seed tasks"
+```
+
+### 1. 在 Feature Branch 修改 Row 1
+
+feature branch 完成任务 1，并新增任务 3：
+
+```bash
+graft switch -c feature/progress
+graft sql --db app.sqlite \
+  "UPDATE tasks SET status = 'done' WHERE id = 1; \
+   INSERT INTO tasks VALUES (3, 'Add screenshots', 'open');"
+graft add app.sqlite
+graft commit -m "record feature progress"
+```
+
+### 2. 在 Main 修改 Row 2
+
+切回 `main` 会先 materialize 该分支的状态，然后再做另一组修改：
+
+```bash
+graft switch main
+graft sql --db app.sqlite \
+  "UPDATE tasks SET status = 'blocked' WHERE id = 2; \
+   INSERT INTO tasks VALUES (4, 'Publish docs', 'open');"
+graft add app.sqlite
+graft commit -m "update docs status"
+```
+
+两个分支修改了不同的 rows：`main` 修改 rows 2、4，`feature/progress` 修改
+rows 1、3。
+
+### 3. 合并并检查 Staged 结果
+
+```bash
+graft --db app.sqlite merge feature/progress
+graft conflicts
+graft diff --rows --staged app.sqlite
+```
+
+`graft conflicts` 不会报告 unresolved paths。staged row diff 包含 feature branch
+对 rows 1、3 的修改；`main` 已提交的 rows 2、4 保持不变。
+
+### 4. 完成合并
+
+```bash
+graft merge --continue -m "merge feature progress"
+graft sql --db app.sqlite \
+  "SELECT id, title, status FROM tasks ORDER BY id;"
+```
+
+合并后的数据库包含两个分支的结果：
+
+| id | title | status |
+| --- | --- | --- |
+| 1 | Write quickstart | done |
+| 2 | Review commands | blocked |
+| 3 | Add screenshots | open |
+| 4 | Publish docs | open |
+
+## 可以自动合并什么
+
+- 支持的 rowid table 中的 disjoint row changes
+- 兼容的 schema additions
+- 配置允许的 SQLite internal changes
+- 应用 merge plan 后通过 validation 的结果
+
+不能证明安全时，Graft 会留下冲突。
+
+## 解决冲突
+
+```bash
+graft --db data.sqlite resolve --ours data.sqlite
+graft resolve --theirs attachments/report.pdf
+graft resolve --manual settings.json
+```
+
+解决单个 SQLite row conflict：
+
+```bash
+graft --db data.sqlite resolve --theirs --row docs 42 data.sqlite
+```
+
+完成或中止：
+
+```bash
+graft merge --continue -m "resolve merge"
+graft merge --abort
+```
+
+## Merge UI
+
+应用 UI 使用：
+
+```bash
+graft status --json
+graft --db data.sqlite conflicts --json
+graft --db data.sqlite resolve --json --theirs --row docs 42 data.sqlite
+```
+
+根据 `kind` 和 `storage` 渲染不同控件：SQLite 数据库显示 row/schema review，
+文本文件显示 side picker 或编辑器，二进制/external 文件显示 ours/theirs/manual。

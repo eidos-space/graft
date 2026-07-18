@@ -1,0 +1,240 @@
+---
+title: 合并策略
+description: Graft 如何判断哪些 SQLite 行、schema 和内部状态变化可以自动合并。
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+Graft 把 SQLite 数据库保存为文件快照，但很多应用真正关心的是表行和业务对象。合并策略就是连接这两种视角的语义层。
+
+它在 repository merge 时回答三个问题：
+
+- 哪些 SQLite surface 可以解释成逻辑行变化或 schema 变化？
+- 哪些 SQLite 内部状态可以安全重建或忽略？
+- 哪些应用层字段应该被当作稳定的语义身份？
+
+如果 Graft 不能有把握地回答这些问题，它会保留 conflict artifact，而不是猜。
+
+## 策略什么时候生效
+
+Repository merge 首先看到的是 file-level snapshots。对 modified SQLite 文件，Graft 可以检查 base、ours 和 theirs 三个 snapshot，并构建 row-level merge plan。
+
+满足这些条件时，row-level plan 可以自动合并：
+
+- 两边修改的是支持的 rowid table，且没有触碰同一个逻辑行
+- 兼容的 schema addition 可以表达成 `ALTER TABLE ... ADD COLUMN`
+- 配置过的 SQLite 内部状态可以安全 resolver
+- 生成的临时数据库通过验证
+
+其他情况会保留为 conflict，交给 `graft_conflicts`、`graft_json_conflicts`、`graft_resolve` 或手动处理。
+
+## Logical Diff Status
+
+`graft diff --json --rows` 和 JSON PRAGMA 输出会包含粗粒度的 `logical_status`，这样应用不需要从 file-level `modified` 自己猜 row 语义。
+
+| Status | 含义 |
+| --- | --- |
+| `logical_changes` | Graft 发现了支持的 row、schema 或 opaque changes。 |
+| `unsupported_logical_surface` | 文件变化触及了 Graft 还不能完整解释的 SQLite surface。应该保守展示。 |
+| `file_changed_no_supported_logical_changes` | SQLite 文件变了，但支持的逻辑行和 schema 没有净变化。常见于 insert 后 delete、update 后改回去、freelist 或 page layout 变化。 |
+| `row_diff_unavailable` | 这个文件无法生成 row diff，通常是文件新增、删除，或缺少必要 snapshot。 |
+
+示例：
+
+```json
+{
+  "path": "data.sqlite",
+  "change": "modified",
+  "row_diff_available": true,
+  "logical_status": "file_changed_no_supported_logical_changes",
+  "capabilities": ["rowid_table_rows", "schema_entries", "opaque_table_detection"],
+  "limitations": [],
+  "tables": []
+}
+```
+
+<Aside type="note">
+即使没有逻辑行变化，file-level change 也是真实存在的。SQLite 可能会重写 pages、freelist state 或内部 metadata，而最终表数据不变。
+</Aside>
+
+## 支持范围和限制
+
+row-level 引擎会同时报告 capabilities 和 limitations。
+
+当前 capabilities：
+
+- `rowid_table_rows`：普通 rowid table 的行变化
+- `schema_entries`：来自 `sqlite_schema` 的 schema entries
+- `opaque_table_detection`：识别需要保持 file-level 的变化表
+- `semantic_insert_keys`：基于配置的 semantic keys 检测 insert 冲突
+
+当前 limitation kinds：
+
+- `virtual_table`
+- `fts_shadow_table`
+- `without_rowid_table`
+- `sqlite_internal_table`
+- `index_btree`
+- `utf16_text_encoding`
+- `generated_columns`
+
+limitation 不一定代表 merge 失败。它表示结果应该带上正确 caveat：某个 SQLite surface 被 resolver 处理了、被保留为 opaque，或者没有被解释成普通 rows。
+
+## Repository Config
+
+合并策略保存在 `.graft/config.toml` 的 `[merge]` 下。
+
+```toml
+[merge]
+default_semantic_keys = ["_id"]
+
+[merge.semantic_keys]
+eidos__tree = ["id"]
+eidos__kv = ["key"]
+eidos__messages = ["chat_id", "id"]
+
+[merge.internal_resolvers]
+sqlite_sequence = "sequence_max"
+sqlite_stat1 = "rebuild"
+sqlite_stat4 = "rebuild"
+index_btree = "reindex"
+
+[merge.schema_resolvers]
+add_column = "alter_table_add_column"
+
+[merge.generated_columns]
+eidos__references = ["display_text"]
+```
+
+应用应该从自己的 schema policy 生成这段配置。Graft 的内置默认值会保持保守；应用表通常需要应用自己提供 semantic keys。
+
+## Internal Resolvers
+
+Graft 对常见 SQLite 内部状态有安全默认值。
+
+| Subject | Resolver | 含义 |
+| --- | --- | --- |
+| `sqlite_sequence` | `sequence_max` | 保留一个对两边都足够高的 sequence 值。 |
+| `sqlite_stat1`, `sqlite_stat2`, `sqlite_stat3`, `sqlite_stat4` | `rebuild` | 把统计信息视为可重建的 query-planner state。 |
+| `index_btree` | `reindex` | 把 index B-tree 视为可由表行和 schema 派生。 |
+
+只有允许的 resolver/subject 组合会被接受。未知 subject 或非法 resolver 名称会被忽略，而不会放宽成不安全合并。
+
+## Schema Resolvers
+
+当前公开的 schema resolver 是：
+
+| Operation | Resolver | 含义 |
+| --- | --- | --- |
+| `add_column` | `alter_table_add_column` | 通过在另一边应用 `ALTER TABLE ... ADD COLUMN` 合并兼容的列新增。 |
+
+schema delete、不兼容 modify、同名不同定义，以及未知 schema operation 都会保留为 conflict。
+
+Schema conflict reasons 包括：
+
+- `schema_delete_conflict`
+- `schema_modify_conflict`
+- `schema_same_name_conflict`
+- `schema_conflict`
+
+列级 details 可能包含 `add_column`、`drop_column`、`rename_column` 和 `modify_column`。
+
+## Semantic Keys
+
+对普通 rowid table，SQLite rowid 是物理行身份。有些应用还有稳定的业务身份，比如 `_id`、`id` 或 `key`。
+
+Semantic keys 会增加一层应用级 conflict 检测。例如两个分支插入了不同 rowid，但 `_id` 相同，这通常应该冲突，即使 rowid 没有冲突。
+
+```toml
+[merge]
+default_semantic_keys = ["_id"]
+
+[merge.semantic_keys]
+eidos__kv = ["key"]
+eidos__messages = ["chat_id", "id"]
+```
+
+table-specific keys 会覆盖该表的 default。default 只会应用到包含所有配置列的表。
+
+Row conflict reasons 包括：
+
+- `row_conflict`：两边以不兼容方式触碰了同一个 rowid
+- `semantic_key_conflict`：两边插入或触碰了具有同一配置语义身份的 rows
+
+## Generated Columns
+
+Generated columns 很难仅从原始 SQLite pages 重建。应用知道某些列是 generated 且应该从 row-apply SQL 中省略时，可以配置 `[merge.generated_columns]`。
+
+```toml
+[merge.generated_columns]
+my_table = ["search_text", "computed_total"]
+```
+
+这是应用 schema policy，应该和应用实际创建的 schema 保持一致。
+
+## Apply Policy 和验证
+
+auto-merge 不会直接修改 live database。Graft 会把计划好的 SQL 应用到临时数据库，导入生成的 snapshot，并把这个 snapshot stage 成 merge result。
+
+apply 时：
+
+- SQL 应用期间 foreign keys 会被禁用
+- SQL 应用期间 triggers 会被禁用
+- 之后 `PRAGMA integrity_check` 必须通过
+- 之后 `PRAGMA foreign_key_check` 必须通过
+
+apply policy 会出现在 conflict analysis JSON 中：
+
+```json
+{
+  "apply_policy": {
+    "foreign_keys": "disabled_during_apply_checked_after",
+    "triggers": "disabled_during_apply",
+    "validation": ["integrity_check", "foreign_key_check"]
+  }
+}
+```
+
+<Aside type="caution">
+禁用 triggers 意味着 row-level auto-merge 保证的是 SQLite 完整性，不会执行应用 trigger side effects。依赖 triggers 或应用服务维护不变量的应用，应该把这些规则编码进 merge policy，或让文件保留冲突并手动解决。
+</Aside>
+
+## Conflict Analysis
+
+`graft_json_status` 和 `graft_json_conflicts` 可以为冲突中的数据库文件包含 row merge analysis。
+
+重要字段：
+
+| Field | 含义 |
+| --- | --- |
+| `available` | 这个文件是否可以做 row-level analysis。 |
+| `can_auto_merge` | Graft 是否可以自动应用这个 plan。 |
+| `blocked_reasons` | auto-merge 被阻止的原因。 |
+| `row_conflicts` | rowid 或 semantic-key conflicts。 |
+| `schema_conflicts` | 带列级 details 的 schema conflicts。 |
+| `opaque_changes` | 仍未解决的 unsupported 或 opaque SQLite surfaces。 |
+| `resolved_opaque_change_details` | 已由 policy 解决的 opaque/internal changes。 |
+| `limitations` | UI 应该展示为 caveat 的 SQLite surfaces。 |
+| `apply_policy` | planner 使用的 SQL apply 和 validation policy。 |
+
+常见 `blocked_reasons`：
+
+- `row_conflicts`
+- `schema_conflicts`
+- `opaque_changes`
+- `no_applicable_changes`
+- `add_delete_conflict`
+- `analysis_error`
+
+## 实践建议
+
+构建普通 diff UI 时使用 `graft diff --json --rows`。构建 merge UI 时使用 `graft_json_status` 和 `graft_json_conflicts`。
+
+这些状态应该区别展示：
+
+- file changed + `logical_changes`：展示 table/schema changes
+- file changed + `file_changed_no_supported_logical_changes`：展示为 file-only 或 logical no-op
+- file changed + `unsupported_logical_surface`：展示 limitation，并保持保守路径
+- conflicts + `blocked_reasons`：告诉用户为什么不能自动合并
+
+这就是 policy layer 的意义：Graft 保持通用，应用补充只有自己知道的 schema 和身份规则。

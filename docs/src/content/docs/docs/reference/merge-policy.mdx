@@ -1,0 +1,273 @@
+---
+title: Merge Policy
+description: How Graft decides which SQLite row, schema, and internal changes can be auto-merged.
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+Graft stores SQLite databases as file snapshots, but many applications care
+about table rows and business objects. The merge policy is the layer that
+connects those two views.
+
+It answers three questions during a repository merge:
+
+- Which SQLite surfaces can be interpreted as logical row or schema changes?
+- Which internal SQLite changes are safe to rebuild or ignore?
+- Which application-specific keys should be treated as semantic identity?
+
+If Graft cannot answer those questions confidently, it leaves a conflict
+artifact instead of guessing.
+
+## When Policy Runs
+
+Repository merge starts with file-level snapshots. For a modified SQLite file,
+Graft can inspect the base, ours, and theirs snapshots and build a row-level
+merge plan.
+
+The row-level plan can auto-merge non-conflicting changes when:
+
+- both sides modify supported rowid tables without touching the same logical row
+- compatible schema additions can be expressed as `ALTER TABLE ... ADD COLUMN`
+- configured internal SQLite changes can be resolved safely
+- the resulting temporary database passes validation
+
+Other cases remain as conflicts for `graft_conflicts`, `graft_json_conflicts`,
+`graft_resolve`, or manual resolution.
+
+## Logical Diff Status
+
+`graft diff --json --rows` and JSON PRAGMA outputs include a coarse
+`logical_status` so applications do not have to infer row semantics from a
+file-level `modified` status.
+
+| Status | Meaning |
+| --- | --- |
+| `logical_changes` | Graft found supported row, schema, or opaque changes. |
+| `unsupported_logical_surface` | The file changed and the diff touched SQLite surfaces that Graft cannot fully interpret. Treat this as conservative. |
+| `file_changed_no_supported_logical_changes` | The SQLite file changed, but supported logical rows and schema have no net change. This can happen after insert-then-delete, update-back, freelist, or page-layout changes. |
+| `row_diff_unavailable` | Row diff could not be produced for this file, usually because the file was added, deleted, or a required snapshot is missing. |
+
+Example:
+
+```json
+{
+  "path": "data.sqlite",
+  "change": "modified",
+  "row_diff_available": true,
+  "logical_status": "file_changed_no_supported_logical_changes",
+  "capabilities": ["rowid_table_rows", "schema_entries", "opaque_table_detection"],
+  "limitations": [],
+  "tables": []
+}
+```
+
+<Aside type="note">
+A file-level change is still real even when there are no logical row changes.
+SQLite may rewrite pages, freelist state, or internal metadata without changing
+the final table contents.
+</Aside>
+
+## Supported And Unsupported Surfaces
+
+The row-level engine reports both capabilities and limitations.
+
+Current capabilities:
+
+- `rowid_table_rows`: row changes in ordinary rowid tables
+- `schema_entries`: schema entries from `sqlite_schema`
+- `opaque_table_detection`: changed tables that should stay file-level
+- `semantic_insert_keys`: insert conflicts based on configured semantic keys
+
+Current limitation kinds:
+
+- `virtual_table`
+- `fts_shadow_table`
+- `without_rowid_table`
+- `sqlite_internal_table`
+- `index_btree`
+- `utf16_text_encoding`
+- `generated_columns`
+
+Limitations do not always mean the merge failed. They mean the result should be
+presented with the correct caveat: some changed SQLite surface was handled by a
+resolver, left opaque, or not interpreted as ordinary rows.
+
+## Repository Config
+
+Merge policy lives in `.graft/config.toml` under `[merge]`.
+
+```toml
+[merge]
+default_semantic_keys = ["_id"]
+
+[merge.semantic_keys]
+eidos__tree = ["id"]
+eidos__kv = ["key"]
+eidos__messages = ["chat_id", "id"]
+
+[merge.internal_resolvers]
+sqlite_sequence = "sequence_max"
+sqlite_stat1 = "rebuild"
+sqlite_stat4 = "rebuild"
+index_btree = "reindex"
+
+[merge.schema_resolvers]
+add_column = "alter_table_add_column"
+
+[merge.generated_columns]
+eidos__references = ["display_text"]
+```
+
+Applications should generate this config from their own schema policy. Graft's
+built-in defaults are intentionally conservative; application tables often need
+application-owned semantic keys.
+
+## Internal Resolvers
+
+Graft has safe defaults for common SQLite internal state.
+
+| Subject | Resolver | Meaning |
+| --- | --- | --- |
+| `sqlite_sequence` | `sequence_max` | Keep a sequence value that is high enough for both sides. |
+| `sqlite_stat1`, `sqlite_stat2`, `sqlite_stat3`, `sqlite_stat4` | `rebuild` | Treat statistics as rebuildable query-planner state. |
+| `index_btree` | `reindex` | Treat index B-trees as derivable from table rows and schema. |
+
+Only allowed resolver/subject pairs are accepted. Unknown subjects or invalid
+resolver names are ignored rather than granting unsafe merge behavior.
+
+## Schema Resolvers
+
+The current public schema resolver is:
+
+| Operation | Resolver | Meaning |
+| --- | --- | --- |
+| `add_column` | `alter_table_add_column` | Merge compatible column additions by applying `ALTER TABLE ... ADD COLUMN` to the other side. |
+
+Schema deletes, incompatible modifies, same-name different definitions, and
+unknown schema operations remain conflicts.
+
+Schema conflict reasons include:
+
+- `schema_delete_conflict`
+- `schema_modify_conflict`
+- `schema_same_name_conflict`
+- `schema_conflict`
+
+Column-level details can include `add_column`, `drop_column`,
+`rename_column`, and `modify_column`.
+
+## Semantic Keys
+
+SQLite rowid is the physical row identity for ordinary rowid tables. Some
+applications also have stable business identifiers, such as `_id`, `id`, or
+`key`.
+
+Semantic keys add an application-level conflict check. For example, two branches
+that insert different rowids with the same `_id` should often conflict even
+though the rowids do not collide.
+
+```toml
+[merge]
+default_semantic_keys = ["_id"]
+
+[merge.semantic_keys]
+eidos__kv = ["key"]
+eidos__messages = ["chat_id", "id"]
+```
+
+Table-specific keys override the default for that table. The default applies
+only to tables that contain all configured columns.
+
+Row conflict reasons include:
+
+- `row_conflict`: both sides touched the same rowid incompatibly
+- `semantic_key_conflict`: both sides inserted or touched rows with the same configured semantic identity
+
+## Generated Columns
+
+Generated columns can be difficult to reconstruct from raw SQLite pages. Use
+`[merge.generated_columns]` when an application knows that specific columns
+should be treated as generated and omitted from row-apply SQL.
+
+```toml
+[merge.generated_columns]
+my_table = ["search_text", "computed_total"]
+```
+
+This is an application schema policy. It should match the schema that the
+application actually creates.
+
+## Apply Policy And Validation
+
+Auto-merge does not edit the live database in place. Graft applies the planned
+SQL to a temporary database, imports the resulting snapshot, and stages that
+snapshot as the merge result.
+
+During apply:
+
+- foreign keys are disabled while SQL is applied
+- triggers are disabled while SQL is applied
+- `PRAGMA integrity_check` must pass afterward
+- `PRAGMA foreign_key_check` must pass afterward
+
+The apply policy appears in conflict analysis JSON:
+
+```json
+{
+  "apply_policy": {
+    "foreign_keys": "disabled_during_apply_checked_after",
+    "triggers": "disabled_during_apply",
+    "validation": ["integrity_check", "foreign_key_check"]
+  }
+}
+```
+
+<Aside type="caution">
+Disabling triggers means row-level auto-merge enforces SQLite integrity, not
+application-trigger side effects. Applications that rely on triggers or
+application services for invariants should encode those rules in merge policy
+or leave the file in conflict for manual resolution.
+</Aside>
+
+## Conflict Analysis
+
+`graft_json_status` and `graft_json_conflicts` can include row merge analysis
+for conflicted database files.
+
+Important fields:
+
+| Field | Meaning |
+| --- | --- |
+| `available` | Whether row-level analysis was available for this file. |
+| `can_auto_merge` | Whether Graft can apply the plan automatically. |
+| `blocked_reasons` | Why auto-merge is blocked. |
+| `row_conflicts` | Rowid or semantic-key conflicts. |
+| `schema_conflicts` | Schema conflicts with column-level details. |
+| `opaque_changes` | Unsupported or opaque SQLite surfaces that remain unresolved. |
+| `resolved_opaque_change_details` | Opaque/internal changes resolved by policy. |
+| `limitations` | SQLite surfaces that should be shown as caveats. |
+| `apply_policy` | The SQL apply and validation policy used by the planner. |
+
+Common `blocked_reasons`:
+
+- `row_conflicts`
+- `schema_conflicts`
+- `opaque_changes`
+- `no_applicable_changes`
+- `add_delete_conflict`
+- `analysis_error`
+
+## Practical Guidance
+
+Use `graft diff --json --rows` when building UI around normal diffs. Use
+`graft_json_status` and `graft_json_conflicts` when building merge UI.
+
+Treat these states differently:
+
+- file changed plus `logical_changes`: show table/schema changes
+- file changed plus `file_changed_no_supported_logical_changes`: show this as file-only or logical no-op
+- file changed plus `unsupported_logical_surface`: show the limitation and keep a conservative path
+- conflicts with `blocked_reasons`: tell the user why auto-merge was blocked
+
+That separation is the point of the policy layer: Graft stays general-purpose,
+while applications can supply the schema and identity rules that only they know.

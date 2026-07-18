@@ -1,0 +1,92 @@
+---
+title: Architecture
+description: How the Graft core, SQLite integration, CLI, repository layer, and remotes fit together.
+---
+
+This page is for contributors and advanced debugging. Product integrations
+should normally use the CLI, SQLite PRAGMAs, JSON output, and config reference.
+
+## Layers
+
+```text
+Application
+  SQLite connection using vfs=graft
+  or graft CLI
+
+graft-sqlite
+  VFS
+  PRAGMA parser
+  repository command adapters
+
+graft
+  repository model
+  objects, refs, index, merge, sync
+  storage volumes, logs, snapshots
+  remote backends
+
+Remote storage
+  fs, S3-compatible, Graft HTTP protocol
+```
+
+## Core Crates
+
+| Crate | Role |
+| --- | --- |
+| `graft` | Core storage, repository objects, refs, index, merge, sync, remotes. |
+| `graft-sqlite` | SQLite VFS and repository PRAGMA implementation. |
+| `graft-ext` | Dynamic/static SQLite extension wrapper. |
+| `graft-tool` | CLI that maps arguments to repository operations. |
+| `graft-test` | Integration test harnesses and workloads. |
+| `graft-tracing` | Tracing setup helpers. |
+
+## CLI Flow
+
+Most CLI repository commands are thin wrappers around repository pragmas:
+
+```text
+graft status             -> PRAGMA graft_status
+graft add --all          -> PRAGMA graft_add = '--all'
+graft commit -m "msg"    -> PRAGMA graft_commit = 'msg'
+graft diff --rows ...    -> PRAGMA graft_diff = '--rows ...'
+```
+
+`graft sql --db <path>` opens the database through the embedded Graft VFS and
+executes SQL directly.
+
+## Commit Flow
+
+```text
+SQLite writes through Graft VFS
+  -> current database state advances
+  -> graft add records snapshot/artifact entries in the index
+  -> graft commit writes a tree and commit object
+  -> branch ref moves to the new commit
+  -> SQLite snapshots may be materialized back to worktree files
+```
+
+For file artifacts, staging records inline blobs or external payload pointers.
+
+## Checkout And Switch Flow
+
+```text
+resolve target commit
+  -> compare target tree to current worktree/index state
+  -> materialize tracked SQLite snapshots and files
+  -> update HEAD or branch
+```
+
+Conflicting local work blocks checkout unless the command is explicitly forced.
+
+## Merge Flow
+
+```text
+base tree + ours tree + theirs tree
+  -> path-level merge
+  -> SQLite row/schema analysis for database paths
+  -> auto-merge compatible database changes
+  -> store unresolved stages in the index
+  -> merge --continue writes the merge commit
+```
+
+File artifacts use conservative file-level conflict handling unless a resolver
+understands the format.

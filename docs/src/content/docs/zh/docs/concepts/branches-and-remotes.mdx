@@ -1,0 +1,58 @@
+---
+title: 分支与远端
+description: Graft 如何为 app-state repository 建模 branch、upstream、fetch、pull、push 和 clone。
+---
+
+Graft 的 branch 和 remote 模型接近 Git。
+
+## Branches
+
+```bash
+graft branch feature/search
+graft switch feature/search
+graft switch -c experiment main
+```
+
+切换分支会把目标 commit 中的数据库 snapshot 和文件 materialize 到 worktree。
+
+## Fetch / Pull / Push
+
+fetch 更新 remote-tracking refs：
+
+```bash
+graft fetch origin main
+graft fetch --all origin
+```
+
+pull 会 fast-forward 或进入 merge state：
+
+```bash
+graft pull origin main
+```
+
+push 上传 repository objects、SQLite storage、external payloads 和 refs：
+
+```bash
+graft push origin main
+graft push --all origin
+```
+
+## Clone
+
+```bash
+graft clone fs:///srv/graft/app main
+```
+
+clone 会配置 `origin`、fetch history、设置 upstream，并 materialize 选中的
+分支。
+
+## Remote Backends
+
+```text
+fs:///srv/graft/app
+s3_compatible://bucket/prefix?endpoint=https://...
+graft+https://host/api/graft/v1/repos/org/space
+```
+
+详见 [远端同步](/zh/docs/guides/sync-remotes/) 和
+[Remote URI](/zh/docs/reference/remote-uris/)。

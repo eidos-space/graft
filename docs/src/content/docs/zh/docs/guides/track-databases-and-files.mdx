@@ -1,0 +1,90 @@
+---
+title: 跟踪数据库和文件
+description: 在一个 app-state commit 中跟踪 SQLite 数据库、文本文件、二进制文件和 external payload。
+---
+
+Graft repository 以 worktree 为边界。一次 commit 可以同时包含多个 SQLite
+数据库路径和普通应用文件。
+
+```text
+project/
+  data.sqlite
+  analytics.sqlite
+  settings.json
+  attachments/report.pdf
+  .graft/
+```
+
+## Path Kind
+
+| Kind | 含义 |
+| --- | --- |
+| `sqlite_database` | 通过 Graft 跟踪的 SQLite snapshot。 |
+| `text_file` | UTF-8 文本文件。 |
+| `binary_file` | 二进制文件。 |
+
+支持 `--kind` 的命令也接受 `sqlite`、`db`、`text`、`binary` 等别名。
+
+## Storage
+
+| Storage | 用途 |
+| --- | --- |
+| `sqlite_snapshot` | SQLite 数据库路径。 |
+| `inline` | 小文本文件，直接存入 object database。 |
+| `external` | 二进制文件、配置的 external path、大文本文件。 |
+
+`kind` 表示内容类型，`storage` 表示存储策略。
+
+## Stage 和 Commit
+
+```bash
+graft status
+graft add --all
+graft commit -m "save app state"
+```
+
+按类型 stage：
+
+```bash
+graft add --all --kind sqlite_database
+graft add --all --kind text_file
+graft add --all --kind binary_file
+```
+
+单路径 stage：
+
+```bash
+graft add data.sqlite
+graft add attachments/report.pdf
+```
+
+## 查看文件清单
+
+```bash
+graft ls-files --json
+graft ls-files --json --details
+graft ls-files --json --others
+```
+
+`--details` 包含 object id、content hash 和 external payload 本地状态。
+`--others` 列出可添加的 untracked paths。
+
+## 配置文件存储
+
+```bash
+graft config set files.inline_text_threshold 8 MB
+graft config set files.external_paths "assets/**, attachments/**"
+```
+
+附件、导入、导出、生成媒体、模型等资源目录通常适合放入
+`external_paths`。
+
+## 外部 SQLite 修改
+
+如果普通 SQLite 工具直接修改 materialized 数据库文件，关闭 writer 后先
+checkpoint WAL，再 stage：
+
+```bash
+sqlite3 data.sqlite "PRAGMA wal_checkpoint(TRUNCATE);"
+graft add data.sqlite
+```

@@ -1,0 +1,63 @@
+---
+title: 仓库模型
+description: Graft 如何把 Git-like repository concepts 映射到 SQLite 数据库和应用文件。
+---
+
+Graft repository mode 给 SQLite 应用数据目录一个 Git-like 形状：
+
+```text
+project/
+  data.sqlite
+  analytics.sqlite
+  attachments/
+  settings.json
+  .graft/
+```
+
+worktree 是普通应用文件；`.graft/` 保存 repository metadata、objects、refs、
+index、本地 SQLite storage 和 external payload cache。
+
+## Worktree
+
+Repository path 相对于 worktree：
+
+```text
+data.sqlite
+analytics.sqlite
+attachments/report.pdf
+settings.json
+```
+
+通过 `graft sql --db data.sqlite` 或 `vfs=graft` 打开数据库时，Graft 会把
+绝对路径映射回 `data.sqlite`。
+
+## Index
+
+index 是 staging area。stage SQLite 数据库会记录当前数据库状态的 snapshot
+descriptor；stage 文件会记录 artifact object 或 external payload pointer。
+
+```bash
+graft add data.sqlite
+graft add attachments/report.pdf
+graft commit -m "save state"
+```
+
+merge conflict 的 base/ours/theirs stages 也存放在 index 中。
+
+## Commits、Trees、Refs
+
+commit 指向 tree，tree 把 repository paths 映射到 typed objects：
+
+```text
+data.sqlite                 sqlite_snapshot_v1
+settings.json               file_blob_v1
+attachments/report.pdf      large_file_pointer_v1
+```
+
+branches 和 tags 是 `.graft/refs/` 下的 refs，`HEAD` 指向当前 branch 或一个
+detached commit。
+
+## Project Isolation
+
+repository mode 是项目本地的。两个目录都可以有 `data.sqlite`，但它们拥有不同
+的 `.graft/`、refs、objects、remotes、index、storage 和 payload cache。

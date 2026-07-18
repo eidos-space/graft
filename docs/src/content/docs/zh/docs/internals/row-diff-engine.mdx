@@ -1,0 +1,50 @@
+---
+title: 行级差异引擎
+description: Graft 如何生成 SQLite row diff 和 merge diagnostics 的内部说明。
+---
+
+row diff engine 比较 SQLite snapshots，并尝试用 table/row/schema 术语描述变化。
+
+## Public Entry Points
+
+产品集成使用 repository-level row diff：
+
+```bash
+graft diff --rows HEAD~1 HEAD data.sqlite
+graft diff --json --rows HEAD~1 HEAD data.sqlite
+```
+
+SQLite：
+
+```sql
+PRAGMA graft_json_diff = '--rows HEAD~1 HEAD -- data.sqlite';
+```
+
+## Debug Entry Points
+
+低层 storage diagnostics 可以比较 raw LSN：
+
+```sql
+PRAGMA graft_debug_log_lsn;
+PRAGMA graft_debug_volume_diff = '2,4,rows';
+PRAGMA graft_debug_volume_json_diff = '2,4,rows';
+```
+
+这些不是正常应用 API。
+
+## Output Shape
+
+```json
+{
+  "path": "data.sqlite",
+  "change": "modified",
+  "row_diff_available": true,
+  "logical_status": "logical_changes",
+  "capabilities": ["rowid_table_rows", "schema_entries"],
+  "limitations": [],
+  "tables": []
+}
+```
+
+merge 时，同一分析会产生 row conflicts、schema conflicts、opaque changes、
+blocked reasons 和 apply policy。

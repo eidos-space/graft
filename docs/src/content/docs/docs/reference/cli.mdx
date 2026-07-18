@@ -1,0 +1,234 @@
+---
+title: CLI
+description: Reference for the graft command-line interface.
+---
+
+The `graft` CLI is intended for local development, scripting, demos, and manual repository operations. Repository commands share semantics with the SQLite extension, so CLI examples translate directly to `PRAGMA graft_*` calls inside an app.
+
+## Global Options
+
+```bash
+graft sql --db path/to/data.sqlite "SELECT 1;"
+```
+
+`--db` names the SQLite database path for SQLite-specific commands such as
+`graft sql`. Repository commands discover `.graft/` from the current directory
+and operate on the repository as a whole. `switch` and `merge --continue` do
+not need a database selector. Pass `--db` when `merge`, `conflicts`, or `resolve`
+should open a specific SQLite database for row-aware analysis or resolution.
+
+## SQL Runner
+
+```bash
+graft sql --db data.sqlite "SELECT 1;"
+graft sql --db data.sqlite "CREATE TABLE t(id INTEGER PRIMARY KEY); INSERT INTO t DEFAULT VALUES;"
+cat script.sql | graft sql --db data.sqlite
+```
+
+`graft sql` opens the database through the embedded Graft VFS. This is the easiest way to try Graft locally without loading the SQLite extension manually.
+
+It requires an explicit `--db` path and an existing `.graft/` repository. Use `graft init` once in the worktree before creating or modifying a database through the CLI.
+
+## Repository Commands
+
+| Command | Purpose |
+| --- | --- |
+| `graft init [--json]` | Create `.graft/` in the current worktree. |
+| `graft clone [--json] <remote> [branch]` | Clone a remote repository into the current worktree. |
+| `graft status [--json] [--kind kind]` | Show branch, HEAD, staged, unstaged, and conflict state. |
+| `graft audit [--json] [--repair [remote]]` | Verify repository objects and external payloads; `--repair` hydrates missing artifact payloads from a remote. |
+| `graft gc [--json] [--dry-run\|--force]` | Preview or delete unreachable SQLite storage; defaults to dry-run. |
+| `graft payload fetch [--json] [--remote remote] [rev]` | Hydrate missing external payloads for a revision; defaults to `HEAD` and the current upstream remote, then origin. |
+| `graft payload status [--json] [rev]` | Show present, missing, and invalid local external payloads for a revision; defaults to `HEAD`. |
+| `graft payload prune [--json] [--dry-run\|--force]` | Preview or delete unreferenced local external payloads; defaults to dry-run. |
+| `graft ls-files [--json] [--details\|--stage\|--others] [--kind kind]` | List tracked SQLite databases, text files, or binary files; `--details` includes artifact hashes and payload presence, while `--others` lists untracked worktree candidates that can be added. |
+| `graft add [--json] [--all [--kind kind]] [path]` | Stage all worktree changes, optionally filtered by kind, or one repo-relative path. |
+| `graft rm [--json] [--cached] [path]` | Stage removal of a tracked database or file; `--cached` keeps worktree contents. |
+| `graft commit [--json] -m <message>` | Create a repository commit from the index. |
+| `graft log [--json] [--limit n] [--after oid]` | Show repository history; pagination requires JSON output. |
+| `graft show [--json] <rev>` | Show one repository commit. |
+| `graft diff [--json] [--rows] [--content [--max-content-bytes n]] [--kind kind] [--staged] [from] [to] [path]` | Compare worktree, index, or revisions, optionally filtered by kind. |
+| `graft checkout [--json] [-f] <rev> [path]` | Check out a revision or restore one path from a revision. |
+| `graft restore [--json] [--staged] [--source rev] <path>`<br />`graft restore [--json] --staged --all [--kind kind]` | Restore a worktree path, one staged path, or all staged paths optionally filtered by kind. |
+| `graft export [--json] [--source rev] --output <file> [path]` | Write a Graft database snapshot as a physical SQLite file. |
+| `graft reset [--json] [--soft\|--mixed\|--hard] <rev>` | Move the current branch or HEAD. |
+
+`graft diff --rows` expands modified SQLite database snapshots into table and
+row changes:
+
+```bash
+graft diff --rows HEAD~1 HEAD data.sqlite
+graft diff --rows --staged data.sqlite
+graft log --json
+graft log --json --limit 50
+graft diff --json --rows HEAD~1 HEAD data.sqlite
+graft diff --json --content --max-content-bytes 65536 HEAD~1 HEAD notes.md
+```
+
+In v0.6.0, `diff --content` returns bounded content for one changed UTF-8 text
+artifact. It requires `--json`, cannot be combined with `--rows` or `--staged`,
+and uses 1 MiB when `--max-content-bytes` is omitted.
+
+For paginated history, pass the exact last commit id from one page back as
+`--after` on the next request:
+
+```bash
+graft log --json --limit 50 --after <commit-id>
+```
+
+`add --json`, `rm --json`, `commit --json`, `checkout --json`,
+`restore --json`, and `reset --json` return structured path changes and the
+current repository position when available. `commit --json` also reports
+`materialized` SQLite database paths when snapshots are written back to the
+worktree.
+
+`init --json`, `clone --json`, and `export --json` return lifecycle metadata
+such as repository paths, current branch/head, remote info, materialized paths,
+and exported output files.
+
+`add --all --kind`, `restore --staged --all --kind`, `diff --kind`,
+`status --kind`, and `ls-files --kind` accept `sqlite_database`, `text_file`,
+or `binary_file`; aliases such as `sqlite`, `db`, `text`, and `binary` are
+accepted by the CLI. JSON path entries also include `storage`
+(`sqlite_snapshot`, `inline`, or `external`) so apps can distinguish content
+type from storage strategy.
+
+`graft payload fetch` makes external payloads present for `HEAD` or the selected
+revision without moving refs, changing the index, or touching worktree files.
+It reads payloads from the selected remote and reports which content hashes were
+already present or fetched.
+
+`graft payload status` is the read-only companion for cache-aware app panels. It
+checks the external payloads referenced by `HEAD` or the selected revision and
+reports present, missing, and invalid payloads without fetching or deleting
+anything.
+
+`graft payload prune` scans `.graft/store/files` for local external payloads that
+are no longer referenced by the index, branches, remote-tracking branches, tags,
+or reachable commits. It is a dry-run unless `--force` is passed. JSON output
+uses `operation: "payload_prune"` and reports referenced, candidate, pruned, and
+byte counts plus candidate file hashes and store paths.
+
+`graft gc` scans repository reachability for internal SQLite storage. It is a
+dry-run unless `--force` is passed. This is separate from `payload prune`, which
+only manages the external file-payload cache.
+
+## Exporting Physical SQLite Files
+
+```bash
+graft export --output data.inspect.sqlite data.sqlite
+graft export --source HEAD --output data.head.sqlite data.sqlite
+graft export --source HEAD~1 --output data.previous.sqlite data.sqlite
+```
+
+Without `--source`, `graft export` writes the current worktree database state for the requested path. With `--source`, it writes the database snapshot stored in that revision. The output is a normal SQLite database that can be opened by standard tools.
+
+If you edit a materialized or exported SQLite file with ordinary SQLite tooling, stage the physical file explicitly after the writer has closed and any WAL data has been checkpointed:
+
+```bash
+sqlite3 data.sqlite "PRAGMA wal_checkpoint(TRUNCATE);"
+graft add data.sqlite
+```
+
+## Branches And Tags
+
+| Command | Purpose |
+| --- | --- |
+| `graft branch [--json]` | List local branches. |
+| `graft branch [--json] -r` | List remote-tracking branches. |
+| `graft branch [--json] -a` | List local and remote-tracking branches. |
+| `graft branch [--json] <name> [start-point]` | Create a branch. |
+| `graft branch [--json] -d <name>` | Delete a fully merged branch. |
+| `graft branch [--json] -D <name>` | Force-delete a branch. |
+| `graft branch [--json] -m [old] <new>` | Rename a branch. |
+| `graft branch [--json] -u <remote>/<branch> [branch]` | Set upstream. |
+| `graft branch [--json] --unset-upstream [branch]` | Remove upstream config. |
+| `graft switch [--json] <branch>` | Switch branches. |
+| `graft switch [--json] -c <branch> [start-point]` | Create and switch. |
+| `graft tag [--json]` | List tags. |
+| `graft tag [--json] <name> [rev]` | Create a lightweight tag. |
+| `graft tag [--json] -a <name> [-m message] [rev]` | Create an annotated tag. |
+| `graft tag [--json] -d <name>` | Delete a tag. |
+
+`graft branch --json` returns `current_head`, `current_branch`, `branches`,
+and `remote_branches`. Branch mutation JSON returns `operation` and the affected
+`branch`.
+
+`graft switch --json` returns the switch `operation`, current repository
+position, target branch/head, and materialized path changes.
+
+Switching branches materializes all affected tracked worktree paths. No
+database option is required:
+
+```bash
+graft switch main
+graft switch -c feature/search
+```
+
+`graft tag --json` returns `current_head`, `current_branch`, and `tags`.
+Tag create/delete JSON returns the affected `tag` and `operation`.
+
+## Remotes
+
+| Command | Purpose |
+| --- | --- |
+| `graft remote add [--json] <name> <uri>` | Add a remote. |
+| `graft remote list [--json]` | List remotes. |
+| `graft remote get-url [--json] <name>` | Print a remote URL. |
+| `graft remote set-url [--json] <name> <uri>` | Update a remote URL. |
+| `graft remote rename [--json] <old> <new>` | Rename a remote. |
+| `graft remote remove [--json] <name>` | Remove a remote. |
+| `graft remote prune [--json] <name>` | Delete stale remote-tracking refs. |
+| `graft ls-remote [--json] <remote>` | List refs advertised by a remote. |
+| `graft fetch [--json] [--all] [remote] [branch]` | Fetch remote branches. |
+| `graft pull [--json] [remote] [branch]` | Fast-forward or enter merge state. |
+| `graft push [--json] [--all] [--force] [remote] [branch]` | Push local refs. |
+
+Remote JSON commands include `current_head` and `current_branch` when
+available. `remote list --json` returns `remotes`; `ls-remote --json` returns
+advertised refs.
+`fetch --json`, `pull --json`, and `push --json` return structured sync
+outcomes with the current repository position when available.
+
+## Configuration
+
+```bash
+graft config list --json
+graft config get --json files.inline_text_threshold
+graft config set --json files.inline_text_threshold 8 MB
+graft config set --json files.external_paths "assets/**, attachments/**"
+graft config get --json files.external_paths
+graft config unset --json files.inline_text_threshold
+graft config unset --json files.external_paths
+```
+
+`graft config list --json` returns the app-facing wrapper with `current_head`,
+`current_branch`, and `entries`. The JSON forms of `get`, `set`, and `unset`
+return `current_head`, `current_branch`, and the affected config entry; mutation
+responses also include `operation`.
+
+## Merge And Conflict Commands
+
+```bash
+graft --db data.sqlite merge <rev>
+graft merge --abort
+graft merge --continue -m "merge message"
+graft conflicts
+graft --db data.sqlite conflicts --json
+graft --db data.sqlite resolve --ours data.sqlite
+graft --db data.sqlite resolve --theirs data.sqlite
+graft --db data.sqlite resolve --manual data.sqlite
+graft --db data.sqlite merge --json <rev>
+graft --db data.sqlite resolve --json --theirs data.sqlite
+graft --db data.sqlite resolve --json --theirs --row docs 42 data.sqlite
+```
+
+Conflicts are stored in the index as staged conflict entries. Graft can
+auto-merge non-conflicting row changes in tracked SQLite databases and stage
+the results directly when `merge` opens the database with `--db`. Same-row,
+schema, add/delete, and opaque-table conflicts still require resolution. After
+resolving all paths, commit with `graft merge --continue`.
+The JSON forms return current repository position, path rollups, conflict
+analysis, and remaining conflict counts for app-side merge UIs.
+`graft resolve` accepts exactly one of `--ours`, `--theirs`, or `--manual`;
+`--row <table> <rowid>` narrows the resolution to a single SQLite row conflict.

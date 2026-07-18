@@ -1,1 +1,1 @@
-Moved to https://graft.rs/docs/internals/
+Moved to https://graft.eidos.space/docs/internals/architecture/

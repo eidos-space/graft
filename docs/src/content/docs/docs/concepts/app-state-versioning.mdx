@@ -1,0 +1,115 @@
+---
+title: App-State Versioning
+description: "The product model behind Graft: version a complete SQLite-backed application state."
+---
+
+Graft versions application state, not just database bytes.
+
+For a SQLite-backed app, durable state often includes database files, settings,
+attachments, generated assets, imports, and other files the database points at.
+Graft records those paths together so a commit describes one state the app can
+open.
+
+The key difference from Git is not that Git cannot store SQLite files. It can.
+The difference is that Git's first-class versioning experience is built around
+plain text, while Graft makes SQLite databases first-class versioned app-state
+objects. A database path can have snapshot identity, row-level diffs,
+row-aware merge, and structured conflict output.
+
+```text
+app-state commit
+  data.sqlite
+  search.sqlite
+  settings.json
+  attachments/report.pdf
+```
+
+## Why Files Belong With Databases
+
+SQLite rows frequently reference files outside the database:
+
+```text
+data.sqlite
+attachments/3f/report.pdf
+attachments/8a/avatar.png
+assets/icon.png
+```
+
+If a rollback restores `data.sqlite` without restoring the matching
+attachments, the app can open broken references. If a branch updates an
+attachment without the row that points at it, the app can show the wrong state.
+
+Graft's invariant is:
+
+```text
+A commit records one coherent application state.
+```
+
+## Repository-Level History
+
+Graft uses Git-like repository concepts for app state:
+
+- worktree: app data files on disk
+- index: staged database snapshots and file artifacts
+- commit: an immutable app-state version
+- refs: branches, tags, and remote-tracking refs
+- remotes: shared storage for repository history and payloads
+
+SQLite still owns transaction atomicity. A committed SQLite transaction is not a
+Graft commit until the path is staged and committed at the repository layer.
+
+## State Ownership Boundaries
+
+In a source-code repository, users usually decide which files enter version
+control. In a SQLite-backed app, the state boundary is often more like a product
+contract: the developer knows which databases, resource directories, and
+internal files form a recoverable app state.
+
+Embedded apps can encode that contract in repository config:
+
+- `track.default_roots`: developer-defined default app-state roots.
+- `track.user_roots`: user-owned space content explicitly opted into versioning.
+- `files.external_paths`: file-content storage policy, not tracking scope.
+
+This lets app-private state enter status and commits by default while ordinary
+user files in the same space do not pollute the app-state view. See
+[Configuration](/docs/reference/configuration/) for the detailed keys.
+
+## Content Types
+
+Graft distinguishes content kind from storage strategy.
+
+| Kind | Meaning |
+| --- | --- |
+| `sqlite_database` | A database path tracked as a SQLite snapshot. |
+| `text_file` | A UTF-8 app file. |
+| `binary_file` | A binary app file. |
+
+| Storage | Meaning |
+| --- | --- |
+| `sqlite_snapshot` | Snapshot descriptor backed by Graft page/log storage. |
+| `inline` | Small text bytes stored directly in the object database. |
+| `external` | Payload bytes stored by content hash outside normal commit objects. |
+
+This split lets apps render "what is this?" and "where are the bytes?" as
+separate concerns.
+
+## Integration Shape
+
+The CLI is useful for local development and scripts:
+
+```bash
+graft status --json
+graft add --all
+graft commit -m "save checkpoint"
+```
+
+The SQLite extension is useful inside application processes:
+
+```sql
+PRAGMA graft_json_status;
+PRAGMA graft_add = '--all';
+PRAGMA graft_commit = 'save checkpoint';
+```
+
+Both surfaces operate on the same repository model.

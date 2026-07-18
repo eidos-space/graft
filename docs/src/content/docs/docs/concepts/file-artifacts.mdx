@@ -1,0 +1,69 @@
+---
+title: File Artifacts
+description: How Graft versions text files, binary files, and external payloads with SQLite snapshots.
+---
+
+Graft can track files in the same commit tree as SQLite database snapshots.
+This is how a repository records a full app state instead of only database
+history.
+
+```text
+data.sqlite
+settings.json
+attachments/report.pdf
+assets/icon.png
+```
+
+## Text Files
+
+Small UTF-8 text files can be stored inline as content-addressed repository
+objects:
+
+```text
+settings.json      kind: text_file      storage: inline
+```
+
+This is useful for config, metadata, and small app documents.
+
+## Binary Files And External Payloads
+
+Binary files use external payload storage:
+
+```text
+attachments/report.pdf      kind: binary_file      storage: external
+```
+
+The commit stores a pointer object with hash, size, and metadata. The bytes
+live in `.graft/store/files` locally and in the remote payload store after
+push.
+
+Text files can also be external if they exceed the inline threshold or match an
+external path rule.
+
+## Storage Policy
+
+Configure file storage under `[files]`:
+
+```toml
+[files]
+inline_text_threshold = "1 MB"
+external_paths = ["assets/**", "attachments/**"]
+```
+
+Use external paths for app resource directories where files should behave like
+payloads even when they are small.
+
+## Conflicts
+
+File artifacts currently use conservative file-level merge behavior. During a
+merge, choose one side or mark the file resolved after manual replacement:
+
+```bash
+graft resolve --ours settings.json
+graft resolve --theirs attachments/report.pdf
+graft resolve --manual assets/icon.png
+```
+
+SQLite databases can use row-aware merge logic. File formats can gain semantic
+resolvers later, but the default is to avoid silently producing an inconsistent
+app state.

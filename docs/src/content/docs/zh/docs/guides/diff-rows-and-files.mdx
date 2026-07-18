@@ -1,0 +1,99 @@
+---
+title: 比较行与文件
+description: 比较 Graft worktree、staged changes、commits、SQLite rows 和 file artifacts。
+---
+
+Graft 有两层 diff：
+
+- repository diff：比较 app-state tree 里的路径
+- row diff：把 modified SQLite snapshot 展开成 table/row/schema changes
+
+## 比较 Worktree 和 Staged
+
+```bash
+graft diff
+graft diff --json
+graft diff --staged
+graft diff --json --staged
+```
+
+按 kind 过滤：
+
+```bash
+graft diff --kind sqlite_database
+graft diff --kind text_file
+graft diff --kind binary_file
+```
+
+## 比较 Commit
+
+```bash
+graft diff HEAD~1 HEAD
+graft diff HEAD~1 HEAD data.sqlite
+graft diff --json HEAD~1 HEAD
+```
+
+path-level 输出会说明每个路径的 change、`kind` 和 `storage`。
+
+## SQLite Row Diff
+
+```bash
+graft diff --rows HEAD~1 HEAD data.sqlite
+graft diff --json --rows HEAD~1 HEAD data.sqlite
+```
+
+JSON 中常见 `logical_status`：
+
+| Status | 含义 |
+| --- | --- |
+| `logical_changes` | 找到支持的 row/schema changes。 |
+| `unsupported_logical_surface` | SQLite 变化触及无法完整解释的表面。 |
+| `file_changed_no_supported_logical_changes` | 文件变了，但支持的逻辑行和 schema 没有净变化。 |
+| `row_diff_unavailable` | 此文件无法产生 row diff。 |
+
+## 真实 CLI 输出
+
+下面是一次真实 `graft` 运行捕获到的输出。你本机的 hash 和时间会不同。
+
+```bash
+$ graft diff --rows HEAD~1 HEAD app.sqlite
+Row Diff 55c99f73d879..d5cb39df069b
+modified: app.sqlite
+  Diff LSN 2 -> 4
+  ============================
+
+  Table 'tasks': +1 inserts ~1 updates
+    ~ rowid 2:
+      old: [Null, Text("record cli output"), Text("open")]
+      new: [Null, Text("record cli output"), Text("blocked")]
+    + rowid 4: [Null, Text("publish docs"), Text("open")]
+```
+
+比较两个分支时，输出展示的是从 `main` 变成 `feature/progress` 需要的 row changes：
+
+```bash
+$ graft diff --rows main feature/progress app.sqlite
+Row Diff d5cb39df069b..89abefbeb063
+modified: app.sqlite
+  Diff LSN 4 -> 4
+  ============================
+
+  Table 'tasks': +1 inserts -1 deletes ~2 updates
+    - rowid 4: [Null, Text("publish docs"), Text("open")]
+    ~ rowid 2:
+      old: [Null, Text("record cli output"), Text("blocked")]
+      new: [Null, Text("record cli output"), Text("open")]
+    + rowid 3: [Null, Text("add screenshots"), Text("open")]
+    ~ rowid 1:
+      old: [Null, Text("write quickstart"), Text("open")]
+      new: [Null, Text("write quickstart"), Text("done")]
+```
+
+SQLite 扩展：
+
+```sql
+PRAGMA graft_json_diff = '--rows HEAD~1 HEAD -- data.sqlite';
+```
+
+普通应用 UI 应使用 repository commits 和 revspecs。LSN 级 debug diff 放在
+[快照存储与 LSN](/zh/docs/internals/snapshot-storage-lsns/)。

@@ -1,0 +1,58 @@
+---
+title: 对象格式
+description: commits、trees、SQLite snapshots、file blobs 和 payload pointers 的内部 repository object 形状。
+---
+
+Graft repository history 由 typed immutable objects 组成。具体序列化是实现
+细节，但对象模型有助于调试。
+
+## Commit 和 Tree
+
+commit 指向 tree 和 parent commits：
+
+```text
+commit
+tree <tree-oid>
+parent <parent-oid>
+message seed app state
+```
+
+tree 把 repository paths 映射到 typed content objects：
+
+```text
+data.sqlite                 sqlite_snapshot_v1
+settings.json               file_blob_v1
+attachments/report.pdf      large_file_pointer_v1
+```
+
+## SQLite Snapshot Objects
+
+SQLite snapshot object 标识 Graft storage 中的数据库 snapshot。概念上包括
+volume identity、page count、log ranges 和 expected storage commit hashes。
+
+```text
+sqlite-snapshot-v1
+volume <VolumeId>
+page-count <n>
+range <LogId> <start-lsn> <end-lsn>
+commit <LogId> <lsn> <storage-hash>
+```
+
+普通用户通过 commit 和 path 地址化 snapshot，而不是这些 storage coordinates。
+
+## File Blob 和 External Pointer
+
+小文本文件可以存为 `file_blob_v1`，用户层 storage 是 `inline`。
+
+二进制和 external paths 使用 pointer object：
+
+```json
+{
+  "type": "large_file_pointer_v1",
+  "oid": "blake3:...",
+  "size": 12345678,
+  "media_type": "application/pdf"
+}
+```
+
+字节存放在 `.graft/store/files` 和远端 payload store。

@@ -1,0 +1,75 @@
+---
+title: JSON 输出
+description: Graft commands 和 pragmas 返回的常见 app-facing JSON 字段。
+---
+
+大多数 repository command 都有 JSON 形式。CLI 使用 `--json`：
+
+```bash
+graft status --json
+graft diff --json --rows HEAD~1 HEAD data.sqlite
+```
+
+SQLite 使用 `graft_json_*` pragmas：
+
+```sql
+PRAGMA graft_json_status;
+PRAGMA graft_json_diff = '--rows HEAD~1 HEAD -- data.sqlite';
+```
+
+## Repository Position
+
+| Field | 含义 |
+| --- | --- |
+| `current_head` | 当前 commit id。 |
+| `current_branch` | 当前 branch。 |
+| `operation` | mutation response 的操作名。 |
+
+## Path Entries
+
+| Field | 含义 |
+| --- | --- |
+| `path` | repository-relative path。 |
+| `kind` | `sqlite_database`、`text_file` 或 `binary_file`。 |
+| `storage` | `sqlite_snapshot`、`inline` 或 `external`。 |
+| `change` | `added`、`modified` 或 `deleted`。 |
+| `index_status` | staged 状态。 |
+| `worktree_status` | unstaged 状态。 |
+| `code` | Git-like 两字符状态码。 |
+| `conflicted` | 是否有 unresolved conflict stages。 |
+
+## Status
+
+```bash
+graft status --json
+```
+
+常用字段：`paths`、`counts`、`has_unstaged_changes`、`has_staged_changes`、
+`has_conflicts`、`work_in_progress`、`staged_changes`、`unstaged_changes`。
+
+应用决定是否允许 switch、pull 或关闭 review flow 时，应优先使用
+`work_in_progress`。
+
+## Diff 和 Conflicts
+
+```bash
+graft diff --json --rows HEAD~1 HEAD data.sqlite
+graft conflicts --json
+```
+
+diff 的顶层 `paths` 适合做导航；SQLite database entries 在 `--rows` 时可以
+包含 row-level payload。
+
+conflict JSON 可包含 `row_conflicts`、`schema_conflicts`、`opaque_changes`、
+`blocked_reasons` 和 `apply_policy`。
+
+## Files 和 Payloads
+
+```bash
+graft ls-files --json --details
+graft payload status --json HEAD
+graft payload fetch --json --remote origin HEAD
+graft payload prune --json
+```
+
+使用这些输出构建文件浏览器、离线可用性面板和 payload cache 管理 UI。

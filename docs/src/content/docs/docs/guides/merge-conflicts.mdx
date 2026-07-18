@@ -1,0 +1,189 @@
+---
+title: Merge Conflicts
+description: Merge Graft branches, understand row-aware auto-merge, and resolve conflicts.
+---
+
+Graft starts merge from repository paths. When a modified path is a SQLite
+database, it can inspect base, ours, and theirs snapshots and attempt a
+row-aware merge. Files use conservative file-level handling.
+
+## Merge A Branch
+
+```bash
+graft switch main
+graft --db data.sqlite merge feature/search
+```
+
+`switch` operates on the repository discovered from the current directory.
+`merge` uses `--db` to open `data.sqlite` for row-aware analysis. If the merge
+is clean, Graft stages the result. Finish it:
+
+```bash
+graft merge --continue -m "merge feature/search"
+```
+
+If there are conflicts:
+
+```bash
+graft status
+graft conflicts
+graft --db data.sqlite conflicts --json
+```
+
+## Example: Merge Changes To Different Rows
+
+This example starts with two tasks in `app.sqlite`:
+
+| id | title | status |
+| --- | --- | --- |
+| 1 | Write quickstart | open |
+| 2 | Review commands | open |
+
+Create the repository and commit that starting state:
+
+```bash
+mkdir app-state-demo
+cd app-state-demo
+graft init
+graft sql --db app.sqlite \
+  "CREATE TABLE tasks(id INTEGER PRIMARY KEY, title TEXT, status TEXT); \
+   INSERT INTO tasks VALUES (1, 'Write quickstart', 'open'), \
+                            (2, 'Review commands', 'open');"
+graft add app.sqlite
+graft commit -m "seed tasks"
+```
+
+### 1. Change Row 1 On A Feature Branch
+
+The feature branch completes task 1 and adds task 3:
+
+```bash
+graft switch -c feature/progress
+graft sql --db app.sqlite \
+  "UPDATE tasks SET status = 'done' WHERE id = 1; \
+   INSERT INTO tasks VALUES (3, 'Add screenshots', 'open');"
+graft add app.sqlite
+graft commit -m "record feature progress"
+```
+
+### 2. Change Row 2 On Main
+
+Switching back materializes `main` before making a different set of changes:
+
+```bash
+graft switch main
+graft sql --db app.sqlite \
+  "UPDATE tasks SET status = 'blocked' WHERE id = 2; \
+   INSERT INTO tasks VALUES (4, 'Publish docs', 'open');"
+graft add app.sqlite
+graft commit -m "update docs status"
+```
+
+The branches changed different rows: `main` changed rows 2 and 4, while
+`feature/progress` changed rows 1 and 3.
+
+### 3. Merge And Review The Staged Result
+
+```bash
+graft --db app.sqlite merge feature/progress
+graft conflicts
+graft diff --rows --staged app.sqlite
+```
+
+`graft conflicts` reports no unresolved paths. The staged row diff contains the
+feature branch changes to rows 1 and 3; the committed `main` changes to rows 2
+and 4 remain in place.
+
+### 4. Finish The Merge
+
+```bash
+graft merge --continue -m "merge feature progress"
+graft sql --db app.sqlite \
+  "SELECT id, title, status FROM tasks ORDER BY id;"
+```
+
+The merged database contains both branches:
+
+| id | title | status |
+| --- | --- | --- |
+| 1 | Write quickstart | done |
+| 2 | Review commands | blocked |
+| 3 | Add screenshots | open |
+| 4 | Publish docs | open |
+
+## What Can Auto-Merge
+
+Graft can auto-merge compatible SQLite changes when the merge policy can
+interpret them safely:
+
+- disjoint row changes in supported rowid tables
+- compatible schema additions
+- configured SQLite internal changes such as sequence or index rebuilds
+- changes that pass validation after applying the merge plan
+
+Graft leaves conflicts when it cannot merge confidently:
+
+- both sides edit the same logical row incompatibly
+- schema changes conflict
+- one side deletes a path while the other modifies it
+- a changed SQLite surface is unsupported or opaque
+- file artifacts require an explicit side or manual replacement
+
+## Resolve A Path
+
+Use one of `--ours`, `--theirs`, or `--manual`:
+
+```bash
+graft --db data.sqlite resolve --ours data.sqlite
+graft resolve --theirs attachments/report.pdf
+graft resolve --manual settings.json
+```
+
+For SQLite row conflicts, resolve one row:
+
+```bash
+graft --db data.sqlite resolve --theirs --row docs 42 data.sqlite
+```
+
+Continue after resolving all conflicts:
+
+```bash
+graft merge --continue -m "resolve merge"
+```
+
+Abort a merge:
+
+```bash
+graft merge --abort
+```
+
+## JSON For Merge UIs
+
+Use JSON output when building an application review flow:
+
+```bash
+graft status --json
+graft --db data.sqlite conflicts --json
+graft --db data.sqlite resolve --json --theirs --row docs 42 data.sqlite
+```
+
+Important conflict fields include:
+
+| Field | Meaning |
+| --- | --- |
+| `path` | Repository path in conflict. |
+| `path_kind` or `kind` | SQLite database, text file, or binary file. |
+| `storage` | SQLite snapshot, inline file, or external payload. |
+| `row_conflicts` | Rowid or semantic-key conflicts. |
+| `schema_conflicts` | Schema conflicts with column-level detail. |
+| `opaque_changes` | Changed SQLite surfaces Graft did not interpret. |
+| `blocked_reasons` | Why auto-merge did not finish. |
+
+## Configure Merge Policy
+
+Applications can configure semantic keys, generated columns, schema resolvers,
+and internal SQLite resolvers in `.graft/config.toml`.
+
+See [Merge Policy](/docs/reference/merge-policy/) for supported settings and
+[Row Diffs And Merge Policy](/docs/concepts/row-diffs-and-merge-policy/) for
+the mental model.

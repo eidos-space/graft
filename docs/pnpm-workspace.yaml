@@ -7,3 +7,7 @@ minimumReleaseAge: 4320
 minimumReleaseAgeExclude:
   # Renovate security update: wrangler@4.59.1
   - wrangler@4.59.1
+allowBuilds:
+  esbuild: true
+  sharp: true
+  workerd: true

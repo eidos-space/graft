@@ -1,0 +1,60 @@
+---
+title: 快照存储与 LSN
+description: repository commits、SQLite snapshots、storage logs、LSN 和 storage commit hashes 的内部关系。
+---
+
+大多数用户应该使用 repository commits：
+
+```text
+HEAD
+HEAD~1
+main
+feature/search
+```
+
+内部诊断有时会暴露 storage coordinates：
+
+```text
+VolumeId
+LogId
+LSN
+storage commit hash
+```
+
+## Repository Commit Id
+
+repository commit id 标识一个 app-state commit，可以包含多个路径：SQLite
+snapshot、text file、binary file 和 external payload pointer。
+
+```bash
+graft diff --rows HEAD~1 HEAD data.sqlite
+```
+
+## Storage LSN
+
+LSN 是 storage log 内的 logical sequence number：
+
+```text
+(LogId, LSN) -> storage commit
+```
+
+LSN 本身不是全局唯一，也不是 hash。它必须和 `LogId` 一起解释。
+
+debug pragma：
+
+```sql
+PRAGMA graft_debug_log_lsn;
+```
+
+## Storage Commit Hash
+
+每个 storage commit 都有 content hash。snapshot object 记录 expected hash，
+用于验证 LSN coordinate 指向预期 page history。
+
+```text
+log X from LSN 1 to LSN 4
+  LSN 1 -> hash A
+  LSN 2 -> hash B
+```
+
+实际规则：应用历史使用 repository commits；只有调试 storage 层时才使用 LSN。

@@ -1,0 +1,183 @@
+---
+title: Configuration
+description: Repository-local configuration and process-level loader defaults.
+---
+
+Graft repository mode is configured through the project-local `.graft/config.toml`.
+
+```text
+project/
+  .graft/
+    config.toml
+```
+
+## Repository Config
+
+The config stores repository format settings, object format, named remotes, and branch upstreams.
+
+Example:
+
+```toml
+[core]
+repository_format_version = 2
+default_branch = "main"
+
+[extensions]
+object_format = "blake3"
+
+[remotes.origin]
+type = "fs"
+root = "/srv/graft/app"
+
+[branches.main]
+remote = "origin"
+merge = "refs/heads/main"
+```
+
+Applications should normally update config through pragmas or CLI commands instead of editing it by hand:
+
+```bash
+graft remote add origin fs:///srv/graft/app
+graft branch --set-upstream-to origin/main main
+```
+
+SQLite applications can use `graft_json_config_get` and `graft_json_config_list`
+to read structured config entries. `graft_json_config_get` returns
+`current_head` and `current_branch` when available alongside the requested
+`key` and `value`; `graft_json_config_list` preserves its legacy entry array by
+default. With `--with-status`, `graft_json_config_list` returns `current_head`,
+`current_branch`, and an `entries` array. `graft_json_config_set` and
+`graft_json_config_unset` return `operation`, post-operation `current_head` and
+`current_branch` when available, and an `entry` object with `key` and `value`.
+
+## Merge Policy
+
+The optional `[merge]` section configures row-level merge behavior for SQLite
+files. It can declare application semantic keys, generated columns, schema
+resolvers, and safe SQLite internal resolvers.
+
+```toml
+[merge]
+default_semantic_keys = ["_id"]
+
+[merge.semantic_keys]
+app_objects = ["id"]
+
+[merge.internal_resolvers]
+sqlite_sequence = "sequence_max"
+index_btree = "reindex"
+
+[merge.schema_resolvers]
+add_column = "alter_table_add_column"
+
+[merge.generated_columns]
+app_objects = ["body_len"]
+```
+
+See [Merge Policy](/docs/reference/merge-policy/) for the full resolver list,
+logical status values, conflict reasons, and validation policy.
+
+## Track Scope
+
+The optional `[track]` section defines which worktree paths enter repository
+status and auto-staged commits by default. It describes which paths are part of
+versioned state; it does not describe how file contents are stored.
+
+```toml
+[track]
+default_roots = ["data.sqlite", "settings.json", "attachments/**"]
+user_roots = ["notes.md"]
+```
+
+Use `default_roots` during app initialization for developer-defined app-private
+state, such as SQLite databases, config files, attachment directories, import
+directories, or agent session directories. New files under those roots appear
+in `graft status`; commits auto-stage configured roots.
+
+Use `user_roots` for user-owned space content that the user explicitly opts
+into versioning. Other ordinary files in the space do not pollute the app-state
+view by default, but `graft ls-files --others` can still discover them.
+
+## File Storage
+
+The optional `[files]` section controls storage strategy for non-SQLite files.
+SQLite databases always use `storage: "sqlite_snapshot"`. Binary files always
+use `storage: "external"`. Text files use `storage: "inline"` unless they match
+an external path rule or exceed `inline_text_threshold`.
+
+```toml
+[files]
+inline_text_threshold = "1 MB"
+external_paths = ["assets/**", "attachments/**"]
+```
+
+Use `external_paths` for app resource directories where even small files should
+behave like payloads, for example images, imports, attachments, exports, models,
+or generated media.
+
+## Worktree Materialization
+
+The optional `[worktree]` section controls whether committed SQLite snapshots are written back to physical SQLite database files in the worktree.
+
+```toml
+[worktree]
+materialize_sqlite = true
+```
+
+This is `true` by default. After commit, checkout, switch, pull, or merge-continue, Graft materializes tracked SQLite snapshots at their repo-relative database paths, such as `data.sqlite` or `sub-app/main.sqlite`.
+
+Set it to `false` only for integrations that intentionally want volume-only database paths and do not want ordinary SQLite files in the worktree.
+
+## Repository Storage
+
+Repository-mode SQLite data is stored under:
+
+```text
+.graft/store/
+```
+
+This makes project data isolated. Two directories can both contain `data.sqlite` without sharing storage, refs, branches, remotes, index state, or materialized worktree files.
+
+## Loader Defaults
+
+The dynamic SQLite extension can still have process-level defaults for tests and diagnostics. Those defaults are not repository state.
+
+In normal repository mode:
+
+- do not rely on environment variables for project identity
+- do not use user-wide config for refs or remotes
+- do keep project state under `.graft/`
+
+## Remote URIs
+
+Common URI shapes:
+
+```text
+memory
+fs:///absolute/path
+s3://bucket/prefix
+s3_compatible://bucket/prefix
+s3_compatible://bucket/prefix?endpoint=https://account.r2.cloudflarestorage.com
+```
+
+Use `memory` for tests, `fs://` for a local or mounted directory, and `s3://` or `s3_compatible://` for object storage. S3-compatible services such as Cloudflare R2 and MinIO usually need an explicit `endpoint` query parameter.
+
+The exact remote type is stored in `.graft/config.toml` after parsing. For example:
+
+```toml
+[remotes.origin]
+type = "s3_compatible"
+bucket = "my-graft-bucket"
+prefix = "prod/app"
+endpoint = "https://account.r2.cloudflarestorage.com"
+```
+
+S3 credentials are not stored in `.graft/config.toml` or in the remote URI. Configure them in the process environment, or with the standard AWS config and credentials files understood by the S3 client:
+
+```bash
+export AWS_ACCESS_KEY_ID="..."
+export AWS_SECRET_ACCESS_KEY="..."
+export AWS_REGION="auto"
+```
+
+Use `AWS_REGION=auto` for Cloudflare R2. Graft's remote URI parser currently accepts `endpoint` as the only S3 query parameter, so do not put `region`, access keys, or secret keys in the URI.

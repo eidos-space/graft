@@ -1,0 +1,224 @@
+---
+title: CLI
+description: graft 命令行接口参考。
+---
+
+`graft` CLI 用于本地开发、脚本、演示和手动仓库操作。仓库命令和 SQLite 扩展共享同一套语义，因此 CLI 示例可以直接映射到应用内的 `PRAGMA graft_*` 调用。
+
+## 全局选项
+
+```bash
+graft sql --db path/to/data.sqlite "SELECT 1;"
+```
+
+`--db` 用来指定 SQLite-specific 命令操作的数据库路径，例如 `graft sql`。仓库命令
+会从当前目录发现 `.graft/` 并操作整个 repository。`switch` 和
+`merge --continue` 不需要数据库选择器；当 `merge`、`conflicts` 或 `resolve` 需要
+打开某个 SQLite 数据库做 row-aware analysis 或 resolution 时，传入 `--db`。
+
+## SQL Runner
+
+```bash
+graft sql --db data.sqlite "SELECT 1;"
+graft sql --db data.sqlite "CREATE TABLE t(id INTEGER PRIMARY KEY); INSERT INTO t DEFAULT VALUES;"
+cat script.sql | graft sql --db data.sqlite
+```
+
+`graft sql` 会通过内置 Graft VFS 打开数据库。这是在本地使用 Graft 最简单的方式，不需要手动加载 SQLite 扩展。
+
+它要求显式 `--db` 路径和已存在的 `.graft/` 仓库。先在 worktree 里运行一次 `graft init`，再通过 CLI 创建或修改数据库。
+
+## 仓库命令
+
+| Command | Purpose |
+| --- | --- |
+| `graft init [--json]` | 在当前 worktree 创建 `.graft/`。 |
+| `graft clone [--json] <remote> [branch]` | 把远端仓库 clone 到当前 worktree。 |
+| `graft status [--json] [--kind kind]` | 显示 branch、HEAD、staged、unstaged 和 conflict 状态。 |
+| `graft audit [--json] [--repair [remote]]` | 校验 repository objects 和 external payloads；`--repair` 会从 remote hydrate 缺失的 artifact payload。 |
+| `graft gc [--json] [--dry-run\|--force]` | 预览或删除不可达的 SQLite storage；默认 dry-run。 |
+| `graft payload fetch [--json] [--remote remote] [rev]` | hydrate 某个 revision 缺失的 external payload；默认 `HEAD` 和当前 upstream remote，其次 origin。 |
+| `graft payload status [--json] [rev]` | 显示某个 revision 的本地 external payload 是 present、missing 还是 invalid；默认 `HEAD`。 |
+| `graft payload prune [--json] [--dry-run\|--force]` | 预览或删除未被引用的本地 external payload；默认 dry-run。 |
+| `graft ls-files [--json] [--details\|--stage\|--others] [--kind kind]` | 列出已跟踪的 SQLite databases、text files 或 binary files；`--details` 包含 artifact hashes 和 payload presence，`--others` 列出可以 add 的未跟踪 worktree 候选。 |
+| `graft add [--json] [--all [--kind kind]] [path]` | 暂存全部 worktree 变化，也可以按 kind 过滤；不传 `--all` 时暂存一个 repo-relative path。 |
+| `graft rm [--json] [--cached] [path]` | 暂存已跟踪数据库或文件的删除；`--cached` 会保留 worktree 内容。 |
+| `graft commit [--json] -m <message>` | 从 index 创建 repository commit。 |
+| `graft log [--json] [--limit n] [--after oid]` | 显示仓库历史；分页需要 JSON 输出。 |
+| `graft show [--json] <rev>` | 显示一个 repository commit。 |
+| `graft diff [--json] [--rows] [--content [--max-content-bytes n]] [--kind kind] [--staged] [from] [to] [path]` | 比较 worktree、index 或 revisions，也可以按 kind 过滤。 |
+| `graft checkout [--json] [-f] <rev> [path]` | checkout 一个 revision，或从 revision restore 一个路径。 |
+| `graft restore [--json] [--staged] [--source rev] <path>`<br />`graft restore [--json] --staged --all [--kind kind]` | restore 一个 worktree path、一个 staged path，或按 kind 批量 unstage。 |
+| `graft export [--json] [--source rev] --output <file> [path]` | 把 Graft 数据库 snapshot 写成物理 SQLite 文件。 |
+| `graft reset [--json] [--soft\|--mixed\|--hard] <rev>` | 移动当前 branch 或 HEAD。 |
+
+`graft diff --rows` 会把 modified SQLite database snapshot 展开成 table 和 row changes：
+
+```bash
+graft diff --rows HEAD~1 HEAD data.sqlite
+graft diff --rows --staged data.sqlite
+graft log --json
+graft log --json --limit 50
+graft diff --json --rows HEAD~1 HEAD data.sqlite
+graft diff --json --content --max-content-bytes 65536 HEAD~1 HEAD notes.md
+```
+
+在 v0.6.0 中，`diff --content` 会返回一个 changed UTF-8 text artifact 的
+bounded content。它要求 `--json`，不能和 `--rows` 或 `--staged` 一起使用；
+未提供 `--max-content-bytes` 时默认上限为 1 MiB。
+
+分页读取 history 时，把上一页最后一个 commit 的完整 id 传给下一次请求：
+
+```bash
+graft log --json --limit 50 --after <commit-id>
+```
+
+`add --json`、`rm --json`、`commit --json`、`checkout --json`、
+`restore --json` 和 `reset --json` 会返回结构化 path changes，并在可用时包含当前
+repository position。`commit --json` 还会在 SQLite snapshot 写回 worktree 时返回
+`materialized` database paths。
+
+`init --json`、`clone --json` 和 `export --json` 会返回 lifecycle metadata，
+包括 repository paths、当前 branch/head、remote info、materialized paths 和导出的
+output files。
+
+`add --all --kind`、`restore --staged --all --kind`、`diff --kind`、
+`status --kind` 和 `ls-files --kind` 接受 `sqlite_database`、`text_file` 或
+`binary_file`；CLI 也接受 `sqlite`、`db`、`text`、`binary` 这些别名。JSON path
+entry 还会包含 `storage`（`sqlite_snapshot`、`inline` 或 `external`），方便应用把
+内容类型和存储策略分开。
+
+`graft payload fetch` 会为 `HEAD` 或指定 revision hydrate external payload，不移动
+refs、不改变 index，也不触碰 worktree 文件。它从指定 remote 读取 payload，并报告每个
+content hash 是已经存在还是本次 fetch 回来的。
+
+`graft payload status` 是面向 cache-aware app panels 的只读配套命令。它检查 `HEAD`
+或指定 revision 引用的 external payload，并报告哪些 present、missing、invalid；
+不会 fetch，也不会删除任何内容。
+
+`graft payload prune` 会扫描 `.graft/store/files` 中的本地 external payload，
+找出不再被 index、branches、remote-tracking branches、tags 或 reachable
+commits 引用的候选项。默认只是 dry-run，只有传 `--force` 才会删除。JSON 输出使用
+`operation: "payload_prune"`，并返回 referenced、candidate、pruned、byte count，
+以及候选文件的 hash 和 store path。
+
+`graft gc` 会按 repository reachability 扫描内部 SQLite storage。默认只做
+dry-run，只有传 `--force` 才会删除。它不同于只管理 external file-payload
+cache 的 `payload prune`。
+
+## 导出物理 SQLite 文件
+
+```bash
+graft export --output data.inspect.sqlite data.sqlite
+graft export --source HEAD --output data.head.sqlite data.sqlite
+graft export --source HEAD~1 --output data.previous.sqlite data.sqlite
+```
+
+不传 `--source` 时，`graft export` 导出指定路径的当前 worktree database state。传 `--source` 时，它导出指定 revision 中保存的数据库 snapshot。输出文件是普通 SQLite 数据库，可以用标准工具打开。
+
+如果你用普通 SQLite 工具修改了 materialized 或 exported SQLite 文件，等写入方关闭并 checkpoint WAL 后，显式暂存这个物理文件：
+
+```bash
+sqlite3 data.sqlite "PRAGMA wal_checkpoint(TRUNCATE);"
+graft add data.sqlite
+```
+
+## Branches And Tags
+
+| Command | Purpose |
+| --- | --- |
+| `graft branch [--json]` | 列出本地分支。 |
+| `graft branch [--json] -r` | 列出 remote-tracking branches。 |
+| `graft branch [--json] -a` | 列出本地和 remote-tracking branches。 |
+| `graft branch [--json] <name> [start-point]` | 创建分支。 |
+| `graft branch [--json] -d <name>` | 删除已合并分支。 |
+| `graft branch [--json] -D <name>` | 强制删除分支。 |
+| `graft branch [--json] -m [old] <new>` | 重命名分支。 |
+| `graft branch [--json] -u <remote>/<branch> [branch]` | 设置 upstream。 |
+| `graft branch [--json] --unset-upstream [branch]` | 移除 upstream 配置。 |
+| `graft switch [--json] <branch>` | 切换分支。 |
+| `graft switch [--json] -c <branch> [start-point]` | 创建并切换。 |
+| `graft tag [--json]` | 列出 tags。 |
+| `graft tag [--json] <name> [rev]` | 创建 lightweight tag。 |
+| `graft tag [--json] -a <name> [-m message] [rev]` | 创建 annotated tag。 |
+| `graft tag [--json] -d <name>` | 删除 tag。 |
+
+`graft branch --json` 会返回 `current_head`、`current_branch`、`branches` 和
+`remote_branches`。branch mutation JSON 会返回 `operation` 和受影响的
+`branch`。
+
+`graft switch --json` 会返回 switch `operation`、当前 repository position、
+目标 branch/head，以及被 materialize 的 path changes。
+
+切换分支会 materialize 所有受影响的已跟踪 worktree paths，不需要数据库选项：
+
+```bash
+graft switch main
+graft switch -c feature/search
+```
+
+`graft tag --json` 会返回 `current_head`、`current_branch` 和 `tags`。
+tag create/delete JSON 会返回受影响的 `tag` 和 `operation`。
+
+## Remotes
+
+| Command | Purpose |
+| --- | --- |
+| `graft remote add [--json] <name> <uri>` | 添加远端。 |
+| `graft remote list [--json]` | 列出远端。 |
+| `graft remote get-url [--json] <name>` | 打印远端 URL。 |
+| `graft remote set-url [--json] <name> <uri>` | 更新远端 URL。 |
+| `graft remote rename [--json] <old> <new>` | 重命名远端。 |
+| `graft remote remove [--json] <name>` | 删除远端。 |
+| `graft remote prune [--json] <name>` | 删除 stale remote-tracking refs。 |
+| `graft ls-remote [--json] <remote>` | 列出远端公布的 refs。 |
+| `graft fetch [--json] [--all] [remote] [branch]` | fetch 远端分支。 |
+| `graft pull [--json] [remote] [branch]` | fast-forward 或进入 merge state。 |
+| `graft push [--json] [--all] [--force] [remote] [branch]` | push 本地 refs。 |
+
+Remote JSON 命令会在可用时包含 `current_head` 和 `current_branch`。
+`remote list --json` 返回 `remotes`；`ls-remote --json` 返回远端公布的 refs。
+`fetch --json`、`pull --json` 和 `push --json` 会返回结构化 sync 结果，并在可用时
+包含当前 repository position。
+
+## Configuration
+
+```bash
+graft config list --json
+graft config get --json files.inline_text_threshold
+graft config set --json files.inline_text_threshold 8 MB
+graft config set --json files.external_paths "assets/**, attachments/**"
+graft config get --json files.external_paths
+graft config unset --json files.inline_text_threshold
+graft config unset --json files.external_paths
+```
+
+`graft config list --json` 会返回 app-facing wrapper，包含 `current_head`、
+`current_branch` 和 `entries`。`get`、`set` 和 `unset` 的 JSON 形式会返回
+`current_head`、`current_branch` 以及受影响的 config entry；mutation 响应还会
+包含 `operation`。
+
+## Merge And Conflict Commands
+
+```bash
+graft --db data.sqlite merge <rev>
+graft merge --abort
+graft merge --continue -m "merge message"
+graft conflicts
+graft --db data.sqlite conflicts --json
+graft --db data.sqlite resolve --ours data.sqlite
+graft --db data.sqlite resolve --theirs data.sqlite
+graft --db data.sqlite resolve --manual data.sqlite
+graft --db data.sqlite merge --json <rev>
+graft --db data.sqlite resolve --json --theirs data.sqlite
+graft --db data.sqlite resolve --json --theirs --row docs 42 data.sqlite
+```
+
+conflicts 会以 staged conflict entries 形式存储在 index 中。Graft 可以自动合并
+`merge` 通过 `--db` 打开的 SQLite database 中不冲突的 row changes 并直接 stage。
+same-row、schema、add/delete 和 opaque-table conflicts 仍然需要手动解决。解决所有
+paths 后用 `graft merge --continue` 提交。
+JSON 形式会返回当前 repository position、path rollups、conflict analysis，以及剩余
+conflict counts，方便 app 侧实现 merge UI。
+`graft resolve` 必须在 `--ours`、`--theirs`、`--manual` 里三选一；
+`--row <table> <rowid>` 可以把 resolution 缩小到单个 SQLite row conflict。

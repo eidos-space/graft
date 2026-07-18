@@ -1,0 +1,74 @@
+---
+title: 应用状态版本管理
+description: Graft 的产品模型：版本化一个完整的 SQLite 应用状态。
+---
+
+Graft 版本化的是应用状态，而不仅是数据库字节。
+
+SQLite 应用的持久状态通常包括数据库、设置、附件、生成资产、导入文件等。
+Graft 把这些路径一起记录，让一次 commit 表示应用可以打开的一个完整状态。
+
+和 Git 的区别不是 Git 不能存 SQLite 文件。Git 可以存。区别是 Git 的一等
+版本体验主要围绕纯文本，而 Graft 让 SQLite 数据库成为一等版本化的应用状态
+对象：数据库路径可以有 snapshot identity、row-level diff、row-aware merge
+和 structured conflict output。
+
+```text
+app-state commit
+  data.sqlite
+  search.sqlite
+  settings.json
+  attachments/report.pdf
+```
+
+## 为什么文件属于应用状态
+
+数据库行经常引用数据库外的文件。如果 rollback 恢复了 `data.sqlite`，但没有
+恢复对应附件，应用会出现断裂引用。Graft 的约束是：
+
+```text
+一次 commit 记录一个一致的应用状态。
+```
+
+## Repository-Level History
+
+Graft 使用 Git-like repository concepts：
+
+- worktree：磁盘上的应用数据文件
+- index：staged database snapshots 和 file artifacts
+- commit：不可变的 app-state version
+- refs：branches、tags、remote-tracking refs
+- remotes：共享 history 和 payload 的存储
+
+SQLite 仍负责 transaction atomicity。SQLite transaction 成功后，只有经过
+`graft add` 和 `graft commit` 才会成为 Graft history。
+
+## 状态归属边界
+
+代码仓库通常由用户决定哪些文件加入版本管理。SQLite-backed app 的状态边界通常更像
+产品契约：开发者知道哪些数据库、资源目录和内部文件共同构成可恢复的 app state。
+
+嵌入式应用可以把这层契约写进 repository config：
+
+- `track.default_roots`：开发者定义的默认 app state roots。
+- `track.user_roots`：用户明确选择纳入版本管理的 space 内容。
+- `files.external_paths`：文件内容的存储策略，不决定是否追踪。
+
+这样，应用私有状态可以默认进入 status 和 commit，而用户放在同一个 space 里的普通
+文件不会自动污染应用状态视图。配置细节见 [配置](/zh/docs/reference/configuration/)。
+
+## Kind 和 Storage
+
+| Kind | 含义 |
+| --- | --- |
+| `sqlite_database` | SQLite snapshot 路径。 |
+| `text_file` | UTF-8 应用文件。 |
+| `binary_file` | 二进制应用文件。 |
+
+| Storage | 含义 |
+| --- | --- |
+| `sqlite_snapshot` | 由 Graft page/log storage 支撑的 snapshot descriptor。 |
+| `inline` | 小文本字节直接存入 object database。 |
+| `external` | 大文件或二进制 payload 按 content hash 存放。 |
+
+CLI 和 SQLite PRAGMA 都操作同一套 repository model。

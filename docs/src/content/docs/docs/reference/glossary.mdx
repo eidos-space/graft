@@ -1,0 +1,70 @@
+---
+title: Glossary
+description: Common Graft terms for developers integrating with the repository model.
+---
+
+## App State
+
+The durable state an application needs to open coherently: SQLite databases,
+settings, attachments, generated assets, imports, and related app-owned files.
+
+## Artifact
+
+A tracked non-SQLite file entry in a Graft tree. Text files can be inline.
+Binary files and configured resource paths use external payload storage.
+
+## Commit
+
+An immutable repository object that points to a tree and records one app-state
+version.
+
+## External Payload
+
+File bytes stored by content hash outside normal commit/tree objects. Used for
+binary files and configured external paths.
+
+## Graft VFS
+
+The SQLite virtual file system registered by the Graft extension. Opening a
+database through this VFS lets Graft track SQLite snapshots.
+
+## Index
+
+The staging area between the worktree and the next commit. During conflicts,
+the index can also hold base, ours, and theirs stages.
+
+## Kind
+
+The content class of a tracked path: `sqlite_database`, `text_file`, or
+`binary_file`.
+
+## Materialization
+
+Writing a tracked SQLite snapshot back to a normal SQLite database file in the
+worktree.
+
+## Remote
+
+A named storage backend for repository objects, refs, SQLite storage, and
+external payloads. Examples include `fs://`, `s3_compatible://`, and
+`graft+https://`.
+
+## Repository
+
+A worktree plus `.graft/` metadata. The repository stores refs, objects, index
+state, local SQLite storage, config, and payload cache.
+
+## Snapshot
+
+An immutable SQLite database state that can be referenced by a repository
+object.
+
+## Storage
+
+The representation strategy for a path: `sqlite_snapshot`, `inline`, or
+`external`.
+
+## Worktree
+
+The app data directory containing materialized SQLite files and app-owned files
+that Graft tracks.

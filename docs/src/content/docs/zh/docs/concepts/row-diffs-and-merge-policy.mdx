@@ -1,0 +1,57 @@
+---
+title: 行级差异与合并策略
+description: Graft 如何按 row、schema 和 policy 理解 SQLite 数据库变化。
+---
+
+Graft 存储 SQLite snapshot，但应用通常关心 rows、schema entries 和业务对象。
+row diff 和 merge policy 把这两层连接起来。
+
+## Repository Diff 与 Row Diff
+
+repository diff 说明哪个路径变了：
+
+```text
+modified data.sqlite
+modified attachments/report.pdf
+```
+
+row diff 会把 `data.sqlite` 展开成支持的逻辑变化：
+
+```text
+table docs
+  row 42 updated
+  row 43 inserted
+```
+
+```bash
+graft diff --json --rows HEAD~1 HEAD data.sqlite
+```
+
+## Supported Surfaces
+
+当前公开概念包括：
+
+- ordinary rowid tables 的 row changes
+- `sqlite_schema` 中的 schema entries
+- opaque-table detection
+- semantic keys 产生的 insert conflicts
+- virtual table、FTS shadow table、`WITHOUT ROWID`、SQLite internal table、
+  index B-tree、UTF-16 text、generated columns 等 limitations
+
+Unsupported 不表示忽略，而是输出 caveat 或保持 conservative conflict。
+
+## Merge Policy
+
+```toml
+[merge]
+default_semantic_keys = ["_id"]
+
+[merge.semantic_keys]
+docs = ["id"]
+
+[merge.internal_resolvers]
+sqlite_sequence = "sequence_max"
+index_btree = "reindex"
+```
+
+如果 Graft 不能证明 merge 安全，它会留下结构化冲突，由应用 UI 展示和解决。

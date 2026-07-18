@@ -1,0 +1,85 @@
+---
+title: Snapshot Storage And LSNs
+description: Internal relationship between repository commits, SQLite snapshots, storage logs, LSNs, and storage commit hashes.
+---
+
+Most users should think in repository commits:
+
+```text
+HEAD
+HEAD~1
+main
+feature/search
+```
+
+Internal diagnostics sometimes expose storage coordinates:
+
+```text
+VolumeId
+LogId
+LSN
+storage commit hash
+```
+
+## Repository Commit Id
+
+A repository commit id identifies an app-state commit. It can include multiple
+paths: SQLite database snapshots, text files, binary files, and external
+payload pointers.
+
+Use commit ids and revspecs for user-facing history:
+
+```bash
+graft diff --rows HEAD~1 HEAD data.sqlite
+```
+
+## Storage LSN
+
+An LSN is a logical sequence number inside a storage log:
+
+```text
+(LogId, LSN) -> storage commit
+```
+
+An LSN is not globally unique by itself and is not a hash. It only makes sense
+with its `LogId`.
+
+Debug pragmas can expose LSNs:
+
+```sql
+PRAGMA graft_debug_log_lsn;
+```
+
+## Storage Commit Hash
+
+Each storage commit has a content hash. Snapshot objects record expected hashes
+so a repository object can verify that an LSN coordinate points at the expected
+page history.
+
+```text
+log X from LSN 1 to LSN 4
+  LSN 1 -> hash A
+  LSN 2 -> hash B
+  LSN 3 -> hash C
+  LSN 4 -> hash D
+```
+
+## Why A Repository Commit Can Contain Multiple LSNs
+
+One repository commit can record more than one database path. Each database
+snapshot may involve different storage logs and LSN ranges.
+
+```text
+commit abc123
+  data.sqlite      log A, LSN 10..12
+  analytics.sqlite log B, LSN 2..6
+```
+
+That is why repository history and storage history are separate coordinate
+systems.
+
+## Practical Rule
+
+- Use repository commits, branches, tags, and revspecs for app-facing history.
+- Use LSNs only when debugging the storage layer or low-level row diff behavior.
+- Prefer `graft diff --rows` over debug LSN diff commands for application UI.

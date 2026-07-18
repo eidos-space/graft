@@ -1,0 +1,109 @@
+---
+title: App-State Walkthrough
+description: Walk through a realistic Graft repository with a SQLite database, files, branches, diffs, and a remote.
+---
+
+This walkthrough tracks a small app data directory: one SQLite database, one
+JSON config file, and one attachment. It shows the everyday shape Graft is
+designed for. You can rehearse the same concepts in the
+[browser Playground](/docs/quickstart/playground/) before running the local
+commands below.
+
+## Create App State
+
+```bash
+mkdir graft-walkthrough
+cd graft-walkthrough
+graft init
+
+graft sql --db data.sqlite "CREATE TABLE docs(id TEXT PRIMARY KEY, title TEXT, attachment TEXT);"
+graft sql --db data.sqlite "INSERT INTO docs VALUES ('doc-1', 'Proposal', 'attachments/proposal.txt');"
+
+mkdir -p attachments
+printf 'proposal draft\n' > attachments/proposal.txt
+printf '{ "theme": "light" }\n' > settings.json
+```
+
+Stage and commit everything:
+
+```bash
+graft status --json
+graft add --all
+graft commit -m "seed app state"
+```
+
+That commit records one coherent state:
+
+```text
+data.sqlite
+settings.json
+attachments/proposal.txt
+```
+
+## Make A Branch
+
+```bash
+graft switch -c rewrite-title
+graft sql --db data.sqlite "UPDATE docs SET title = 'Updated Proposal' WHERE id = 'doc-1';"
+printf 'proposal draft v2\n' > attachments/proposal.txt
+graft diff --rows HEAD data.sqlite
+graft add --all
+graft commit -m "rewrite proposal"
+```
+
+Switch back:
+
+```bash
+graft switch main
+graft sql --db data.sqlite "SELECT id, title, attachment FROM docs;"
+cat attachments/proposal.txt
+```
+
+Graft materializes the branch's committed SQLite snapshots and files into the
+worktree as you switch.
+
+## Merge The Branch
+
+```bash
+graft merge rewrite-title
+graft status
+```
+
+If the changes are compatible, Graft can stage the merge result. If not, inspect
+conflicts:
+
+```bash
+graft conflicts --json
+graft resolve --theirs data.sqlite
+graft merge --continue -m "merge rewrite"
+```
+
+SQLite conflicts can include row-level analysis. File artifacts use conservative
+file-level resolution.
+
+## Sync Through A Local Remote
+
+Use a filesystem remote for a local smoke test:
+
+```bash
+mkdir -p /tmp/graft-remote
+graft remote add origin fs:///tmp/graft-remote
+graft push origin main
+```
+
+Clone elsewhere:
+
+```bash
+mkdir ../graft-clone
+cd ../graft-clone
+graft clone fs:///tmp/graft-remote main
+graft sql --db data.sqlite "SELECT id, title FROM docs;"
+```
+
+You now have the same app-state history in another worktree.
+
+## Next
+
+- [Track databases and files](/docs/guides/track-databases-and-files/)
+- [Merge conflicts](/docs/guides/merge-conflicts/)
+- [Sync with remotes](/docs/guides/sync-remotes/)

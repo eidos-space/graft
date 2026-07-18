@@ -1,0 +1,88 @@
+---
+title: 历史与恢复
+description: 提交、查看、分支、切换、恢复、checkout 和 reset Graft app-state history。
+---
+
+Graft 使用 Git-like 模型：
+
+```text
+worktree -> index -> commit
+```
+
+SQLite transaction 更新数据库状态；Graft commit 记录哪些 snapshot 和文件
+artifact 属于一个应用状态版本。
+
+## 提交历史
+
+```bash
+graft status
+graft add --all
+graft commit -m "save checkpoint"
+```
+
+查看：
+
+```bash
+graft log
+graft log --json
+graft show HEAD
+graft show --json HEAD
+```
+
+## 分支和切换
+
+```bash
+graft branch feature/search
+graft switch feature/search
+graft switch -c experiment main
+```
+
+切换分支会把目标 commit 中的 SQLite snapshot 和文件 artifact materialize
+到 worktree。
+
+## 恢复路径
+
+从 `HEAD` 恢复 worktree path：
+
+```bash
+graft restore --source HEAD -- data.sqlite
+```
+
+从旧 revision 恢复：
+
+```bash
+graft restore --source HEAD~1 -- attachments/report.pdf
+```
+
+取消 stage：
+
+```bash
+graft restore --staged -- data.sqlite
+graft restore --staged --all --kind sqlite_database
+```
+
+## Checkout 和 Reset
+
+```bash
+graft checkout HEAD~1
+graft checkout HEAD~1 data.sqlite
+```
+
+Reset：
+
+```bash
+graft reset --soft HEAD~1
+graft reset --mixed HEAD~1
+graft reset --hard HEAD~1
+```
+
+`--hard` 会丢弃 staged 和 unstaged worktree changes，只在明确需要时使用。
+
+## Tags
+
+```bash
+graft tag v0.1
+graft tag -a v0.1 -m "first checkpoint"
+graft tag
+graft tag -d v0.1
+```

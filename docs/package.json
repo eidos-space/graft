@@ -6,7 +6,10 @@
   "scripts": {
     "dev": "astro dev",
     "start": "astro dev",
-    "build": "astro build",
+    "build": "node -e \"const fs=require('node:fs'); for (const path of ['dist', '.astro']) fs.rmSync(path, { recursive: true, force: true })\" && astro build",
+    "build:playground": "pnpm --dir ../web-demo run build:site && node scripts/embed-playground.mjs",
+    "build:deploy": "pnpm build && pnpm build:playground",
+    "deploy": "pnpm build:deploy && wrangler pages deploy",
     "preview": "astro preview",
     "astro": "astro"
   },
@@ -20,6 +23,7 @@
     "js-yaml": "^4.1.1",
     "sharp": "^0.34.5",
     "starlight-package-managers": "^0.12.0",
+    "starlight-theme-flexoki": "^0.2.2",
     "typescript": "^5.9.3",
     "wrangler": "^4.61.1"
   },

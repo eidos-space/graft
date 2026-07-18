@@ -1,1 +1,1 @@
-Moved to https://graft.rs/docs/sqlite/
+Moved to https://graft.eidos.space/docs/quickstart/sqlite-extension/

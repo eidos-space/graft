@@ -1,0 +1,60 @@
+---
+title: 术语表
+description: 集成 Graft repository model 时常见的术语。
+---
+
+## App State
+
+应用需要一致打开的持久状态：SQLite 数据库、设置、附件、生成资产、导入文件等。
+
+## Artifact
+
+Graft tree 中跟踪的非 SQLite 文件 entry。文本可以 inline，二进制和配置资源
+路径使用 external payload。
+
+## Commit
+
+指向 tree 的不可变 repository object，记录一个 app-state version。
+
+## External Payload
+
+按 content hash 存储在普通 commit/tree object 外部的文件字节。
+
+## Graft VFS
+
+Graft SQLite extension 注册的 virtual file system。通过它打开数据库时，Graft
+可以跟踪 SQLite snapshot。
+
+## Index
+
+worktree 和下一个 commit 之间的 staging area。冲突时也保存 base/ours/theirs
+stages。
+
+## Kind
+
+tracked path 的内容类型：`sqlite_database`、`text_file`、`binary_file`。
+
+## Materialization
+
+把 tracked SQLite snapshot 写回 worktree 中的普通 SQLite database file。
+
+## Remote
+
+repository objects、refs、SQLite storage 和 external payloads 的命名存储后端。
+
+## Repository
+
+worktree 加 `.graft/` metadata。保存 refs、objects、index、local SQLite
+storage、config 和 payload cache。
+
+## Snapshot
+
+可被 repository object 引用的不可变 SQLite database state。
+
+## Storage
+
+path 的存储策略：`sqlite_snapshot`、`inline`、`external`。
+
+## Worktree
+
+应用数据目录，包含 materialized SQLite files 和 Graft 跟踪的应用文件。

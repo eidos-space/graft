@@ -1,0 +1,102 @@
+---
+title: SQLite 扩展快速开始
+description: 使用 Graft VFS 和 repository PRAGMA 从 SQLite 调用 Graft。
+---
+
+import { Aside, Steps } from "@astrojs/starlight/components";
+
+SQLite 扩展是应用集成 Graft 的主要入口。它注册 Graft VFS，并通过
+`PRAGMA graft_*` 暴露 repository 操作。
+
+<Aside type="tip" title="先评估工作流">
+  嵌入扩展前，先使用 [Playground](/zh/docs/quickstart/playground/) 或
+  [CLI 快速开始](/zh/docs/quickstart/cli/)。repository 模型和命令语义一致。
+</Aside>
+
+## 通过 Graft 打开数据库
+
+在 SQLite shell 中：
+
+```sql
+.load ./libgraft_ext
+.open "file:/path/to/project/data.sqlite?vfs=graft"
+```
+
+初始化仓库：
+
+```sql
+PRAGMA graft_init;
+```
+
+仓库状态会写到：
+
+```text
+/path/to/project/.graft/
+```
+
+## 基本流程
+
+<Steps>
+
+1. 写入正常 SQLite 数据。
+
+   ```sql
+   CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+   INSERT INTO users(name) VALUES ('Alice');
+   ```
+
+2. 查看 repository status。
+
+   ```sql
+   PRAGMA graft_status;
+   PRAGMA graft_json_status;
+   ```
+
+3. Stage 当前数据库 snapshot。
+
+   ```sql
+   PRAGMA graft_add;
+   ```
+
+4. Commit staged snapshot。
+
+   ```sql
+   PRAGMA graft_commit = 'seed users';
+   ```
+
+5. 比较 revisions。
+
+   ```sql
+   PRAGMA graft_diff = '--rows HEAD~1 HEAD -- data.sqlite';
+   PRAGMA graft_json_diff = '--rows HEAD~1 HEAD -- data.sqlite';
+   ```
+
+</Steps>
+
+## Path-Based Repository Mode
+
+打开 `/project/data.sqlite` 时，Graft 会把它映射为 worktree 中的
+`data.sqlite`。repository 命令操作的是 worktree 路径，而不是隐式全局
+数据库。
+
+一个仓库可以跟踪多个数据库：
+
+```text
+project/
+  data.sqlite
+  analytics.sqlite
+  .graft/
+```
+
+```sql
+PRAGMA graft_add = 'analytics.sqlite';
+PRAGMA graft_commit = 'track analytics database';
+```
+
+应用 UI 应优先使用 JSON pragmas：
+
+```sql
+PRAGMA graft_json_status;
+PRAGMA graft_json_diff = '--rows HEAD~1 HEAD -- data.sqlite';
+PRAGMA graft_json_conflicts;
+```

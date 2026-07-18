@@ -1,0 +1,137 @@
+---
+title: JSON Output
+description: Reference for common app-facing JSON fields returned by Graft commands and pragmas.
+---
+
+Most Graft repository commands have a JSON form. Use it for app UIs,
+automation, tests, and integrations that need structured state.
+
+CLI commands use `--json`:
+
+```bash
+graft status --json
+graft diff --json --rows HEAD~1 HEAD data.sqlite
+```
+
+SQLite uses `graft_json_*` pragmas:
+
+```sql
+PRAGMA graft_json_status;
+PRAGMA graft_json_diff = '--rows HEAD~1 HEAD -- data.sqlite';
+```
+
+## Repository Position
+
+Many JSON responses include:
+
+| Field | Meaning |
+| --- | --- |
+| `current_head` | Current commit id when available. |
+| `current_branch` | Current branch name when `HEAD` points to a branch. |
+| `operation` | Operation name for mutation responses. |
+
+Detached or uninitialized repositories may omit position fields.
+
+## Path Entries
+
+Path entries are the primary app-facing unit.
+
+| Field | Meaning |
+| --- | --- |
+| `path` | Repository-relative path. |
+| `kind` | `sqlite_database`, `text_file`, or `binary_file`. |
+| `storage` | `sqlite_snapshot`, `inline`, or `external`. |
+| `change` | `added`, `modified`, or `deleted` when available. |
+| `index_status` | Staged status in status output. |
+| `worktree_status` | Unstaged status in status output. |
+| `code` | Git-like two-character status code. |
+| `conflicted` | Whether the path has unresolved conflict stages. |
+
+Use `kind` to choose UI controls. Use `storage` to decide whether bytes are
+inline, snapshot-backed, or external-payload-backed.
+
+## Status
+
+```bash
+graft status --json
+```
+
+Important fields:
+
+| Field | Meaning |
+| --- | --- |
+| `paths` | One entry per changed path. |
+| `counts` | Counts for staged, unstaged, and conflicted paths. |
+| `has_unstaged_changes` | True when the worktree has unstaged changes. |
+| `has_staged_changes` | True when the index has staged changes. |
+| `has_conflicts` | True when there are unresolved conflicts. |
+| `work_in_progress` | True when any staged, unstaged, conflict, or merge state exists. |
+| `staged_changes` | Lower-level staged changes. |
+| `unstaged_changes` | Lower-level unstaged changes. |
+
+Prefer `work_in_progress` when deciding whether an app can safely switch,
+pull, or close a review flow.
+
+## Diff
+
+```bash
+graft diff --json
+graft diff --json --rows HEAD~1 HEAD data.sqlite
+```
+
+Top-level `paths` summarizes changed repository paths. SQLite database entries
+can also include row-level payloads when `--rows` is present.
+
+Useful database fields include:
+
+| Field | Meaning |
+| --- | --- |
+| `row_diff_available` | Whether row diff detail is present. |
+| `logical_status` | Coarse row-diff interpretation. |
+| `capabilities` | SQLite surfaces Graft interpreted. |
+| `limitations` | SQLite surfaces that need caveats. |
+| `tables` | Table-level row changes when available. |
+
+## Conflicts
+
+```bash
+graft conflicts --json
+```
+
+Conflict output is intended for merge review UIs. It can include path rollups,
+index stages, row merge analysis, schema conflicts, row conflicts, opaque
+changes, and blocked reasons.
+
+Common fields:
+
+| Field | Meaning |
+| --- | --- |
+| `available` | Whether row-level analysis is available for a database conflict. |
+| `can_auto_merge` | Whether the plan can be applied automatically. |
+| `blocked_reasons` | Why auto-merge is blocked. |
+| `row_conflicts` | Rowid or semantic-key conflicts. |
+| `schema_conflicts` | Schema conflict detail. |
+| `opaque_changes` | Unsupported or opaque SQLite surfaces. |
+| `apply_policy` | SQL apply and validation policy. |
+
+## File Inventory And Payloads
+
+```bash
+graft ls-files --json --details
+graft payload status --json HEAD
+graft payload fetch --json --remote origin HEAD
+graft payload prune --json
+```
+
+Use these for file browsers and offline availability panels.
+
+`ls-files --details` can include object ids, content hashes, and local external
+payload presence. Payload commands include present, missing, invalid, fetched,
+candidate, pruned, and byte-count summaries depending on the operation.
+
+## Compatibility Guidance
+
+Applications should prefer high-level fields such as `paths`, `kind`, `storage`,
+`current_head`, `current_branch`, `work_in_progress`, and documented conflict
+fields. Avoid depending on debug-only fields, storage LSNs, or internal object
+serialization details.

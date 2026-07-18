@@ -1,0 +1,72 @@
+---
+title: Project Status
+description: Current Graft capabilities, stability boundaries, and what to expect.
+---
+
+Graft is an experimental project. This documentation targets the
+[v0.6.0 release](https://github.com/eidos-space/graft/releases/tag/v0.6.0) and
+focuses on
+app-state versioning for SQLite-backed apps: SQLite database snapshots,
+app-owned files, row-aware diffs, merge support, and remote sync.
+
+Features that exist only on the development branch are not part of the v0.6.0
+documentation unless a page labels them as unreleased.
+
+## Available Today
+
+- CLI workflows for `init`, `clone`, `sql`, `status`, `audit`, `gc`,
+  `ls-files`, `payload`, `config`, `add`, `rm`, `commit`, `log`, `show`,
+  `diff`, `checkout`, `restore`, `export`, `reset`, `branch`, `switch`, `tag`,
+  `merge`, `conflicts`, `resolve`, `remote`, `ls-remote`, `fetch`, `pull`, and
+  `push`.
+- A SQLite extension that exposes repository operations through `PRAGMA graft_*`.
+- Repository-local state under `.graft/`.
+- Multiple tracked SQLite database paths in one worktree.
+- Text and binary file artifacts in the same commit tree as SQLite snapshots.
+- External payload storage for binary files and configured paths.
+- Row-level diff output for supported SQLite tables.
+- Row-aware merge planning for supported SQLite changes.
+- JSON output for app-facing status, diff, conflict, payload, config, and sync UIs.
+- Remotes using `fs://`, `s3://`, `s3_compatible://`, and `graft+http(s)://`.
+- An HTTP remote client for services that implement the Graft HTTP remote protocol.
+
+## Stability Boundaries
+
+Treat repository-mode CLI commands, SQLite repository pragmas, config keys, and
+JSON output as the intended external surfaces. They may still change while the
+project is experimental, but they are the surfaces this documentation is
+organized around.
+
+Treat these as implementation details:
+
+- storage LSNs
+- page and segment layout
+- debug pragmas
+- object serialization internals
+- internal Rust module boundaries
+
+The internals pages document those details for contributors and advanced
+debugging, not as product-level API guarantees.
+
+## Compatibility Notes
+
+Graft works alongside ordinary SQLite tooling by materializing committed
+snapshots back to SQLite database files. When an external tool edits a tracked
+database file directly, close the writer, checkpoint WAL data if needed, then
+stage the physical path with `graft add`.
+
+```bash
+sqlite3 data.sqlite "PRAGMA wal_checkpoint(TRUNCATE);"
+graft add data.sqlite
+```
+
+## Release Artifacts
+
+Prebuilt CLI and SQLite extension archives are published with the
+[v0.6.0 GitHub release](https://github.com/eidos-space/graft/releases/tag/v0.6.0).
+
+The repository is an experimental fork of
+[orbitinghail/graft](https://github.com/orbitinghail/graft). The upstream
+project is a transactional storage engine for lazy, partial data replication on
+object storage. This fork applies that foundation to SQLite-backed app-state
+versioning.

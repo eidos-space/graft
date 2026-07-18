@@ -1,0 +1,126 @@
+---
+title: Track Databases And Files
+description: Track SQLite databases, text files, binary files, and external payloads in one app-state commit.
+---
+
+Graft repositories are worktree based. A commit can contain multiple SQLite
+database paths and ordinary files that belong to the same application state.
+
+```text
+project/
+  data.sqlite
+  analytics.sqlite
+  settings.json
+  attachments/
+    report.pdf
+  .graft/
+```
+
+## Path Kinds
+
+Graft reports what each path contains with `kind`:
+
+| Kind | Meaning |
+| --- | --- |
+| `sqlite_database` | SQLite database snapshot tracked through Graft. |
+| `text_file` | UTF-8 text file tracked as an app artifact. |
+| `binary_file` | Binary file tracked as an app artifact. |
+
+Commands that accept `--kind` also accept common aliases such as `sqlite`,
+`db`, `text`, and `binary`.
+
+## Storage Strategies
+
+`storage` describes how Graft stores the path:
+
+| Storage | Used for |
+| --- | --- |
+| `sqlite_snapshot` | SQLite database paths. |
+| `inline` | Small text files stored in the object database. |
+| `external` | Binary files, configured external paths, and large text files. |
+
+Path kind and storage are separate. For example, a JSON file can be
+`kind: "text_file"` and `storage: "external"` if it matches an external path
+rule or exceeds the inline threshold.
+
+## Stage Everything
+
+```bash
+graft status
+graft add --all
+graft commit -m "save app state"
+```
+
+`graft add --all` stages database snapshots, file modifications, additions, and
+deletions.
+
+Filter by kind when an app wants to stage only one class of paths:
+
+```bash
+graft add --all --kind sqlite_database
+graft add --all --kind text_file
+graft add --all --kind binary_file
+```
+
+Stage one path:
+
+```bash
+graft add data.sqlite
+graft add attachments/report.pdf
+```
+
+## Inspect Tracked And Untracked Paths
+
+```bash
+graft ls-files
+graft ls-files --json
+graft ls-files --json --details
+graft ls-files --json --others
+```
+
+`--details` includes object ids, content hashes, and whether external payloads
+are present in the local cache. `--others` lists untracked worktree candidates
+that can be added.
+
+## Configure File Storage
+
+Text files are stored inline until they exceed `files.inline_text_threshold` or
+match `files.external_paths`.
+
+```bash
+graft config get files.inline_text_threshold
+graft config set files.inline_text_threshold 8 MB
+graft config set files.external_paths "assets/**, attachments/**"
+```
+
+Use `external_paths` for app resource directories such as attachments, imports,
+exports, generated media, models, or assets.
+
+## Remove Paths
+
+Stage a deletion:
+
+```bash
+graft rm attachments/report.pdf
+graft commit -m "remove report"
+```
+
+Remove a path from the repository while keeping the worktree file:
+
+```bash
+graft rm --cached attachments/report.pdf
+graft commit -m "stop tracking report"
+```
+
+## External SQLite Edits
+
+If a standard SQLite tool edits a materialized database file directly, close the
+writer, checkpoint WAL if needed, then stage the path:
+
+```bash
+sqlite3 data.sqlite "PRAGMA wal_checkpoint(TRUNCATE);"
+graft add data.sqlite
+```
+
+Writing through `graft sql --db data.sqlite` or `vfs=graft` keeps Graft aware
+of the database snapshot immediately.

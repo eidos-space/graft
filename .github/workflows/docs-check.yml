@@ -65,7 +65,7 @@ jobs:
             --accept '100..=103,200..=299,429'
             --max-concurrency 4
             --no-progress
-            --remap "https://graft.rs file://$PWD/dist"
+            --remap "https://graft.eidos.space file://$PWD/dist"
             --fallback-extensions html
             --exclude-path "llms-.*\.txt"
             --root-dir $PWD/dist

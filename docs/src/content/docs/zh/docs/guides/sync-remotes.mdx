@@ -1,0 +1,79 @@
+---
+title: 远端同步
+description: 配置 Graft remotes、push/pull 分支、clone 仓库并选择 remote backend。
+---
+
+Graft remote 存储 repository objects、refs、SQLite storage 和 external
+payloads。
+
+支持的 URI：
+
+```text
+memory
+fs:///absolute/path
+s3://bucket/prefix
+s3_compatible://bucket/prefix?endpoint=https://...
+graft+https://host/api/graft/v1/repos/org/space
+```
+
+## 添加 Remote
+
+本地测试：
+
+```bash
+graft remote add origin fs:///tmp/graft-remote
+```
+
+S3-compatible：
+
+```bash
+export AWS_ACCESS_KEY_ID="..."
+export AWS_SECRET_ACCESS_KEY="..."
+export AWS_REGION="auto"
+
+graft remote add origin 's3_compatible://my-bucket/prod/app?endpoint=https://account.r2.cloudflarestorage.com'
+```
+
+HTTP remote：
+
+```bash
+export GRAFT_REMOTE_TOKEN='grt_...'
+graft remote add origin 'graft+https://example.com/api/graft/v1/repos/acme/archive'
+```
+
+自定义 token 变量：
+
+```bash
+export GRAFT_ARCHIVE_TOKEN='grt_...'
+graft remote add origin 'graft+https://example.com/api/graft/v1/repos/acme/archive?token_env=GRAFT_ARCHIVE_TOKEN'
+```
+
+## Push / Fetch / Pull
+
+```bash
+graft push origin main
+graft push --all origin
+graft fetch origin main
+graft fetch --all origin
+graft pull origin main
+```
+
+当前分支配置 upstream 后，可以直接：
+
+```bash
+graft push
+graft pull
+```
+
+非 fast-forward pull 会进入 merge state。
+
+## Clone
+
+```bash
+mkdir app-clone
+cd app-clone
+graft clone fs:///tmp/graft-remote main
+```
+
+详见 [Remote URI](/zh/docs/reference/remote-uris/) 和
+[连接 HTTP 远端](/zh/docs/guides/http-remote/)。

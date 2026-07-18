@@ -1,0 +1,88 @@
+---
+title: Graft 是什么
+description: 理解 Graft 作为 SQLite 应用状态版本管理工具的定位。
+---
+
+Graft 是 SQLite 应用状态的版本管理工具。它把 SQLite 数据库和应用拥有的
+文件放在同一个仓库里，并提供 Git-like 操作：status、add、commit、
+branch、switch、diff、restore、merge、fetch、pull 和 push。
+
+一句话：
+
+```text
+SQLite 负责事务。
+Graft 负责历史。
+```
+
+Git 的一等版本管理体验主要围绕纯文本：line diff、line merge 和 code review。
+SQLite 文件当然也能提交到 Git，但通常只是 opaque database file。Graft 让
+SQLite 数据库获得一等版本管理表面：repository path、snapshot、row diff、
+row-aware merge、structured conflicts 和 restore。
+
+## 问题
+
+很多应用的持久状态不止一个数据库文件：
+
+```text
+app-data/
+  data.sqlite
+  search.sqlite
+  settings.json
+  attachments/
+    invoice.pdf
+    avatar.png
+```
+
+`data.sqlite` 里的行可能引用 `attachments/` 里的文件。如果 rollback、
+branch、AI edit 或 sync 只改变数据库而没有改变对应文件，应用会打开一个
+不一致的状态。
+
+Graft 的核心约束是：
+
+```text
+一次 commit 记录一个一致的应用状态。
+```
+
+## Graft 提供什么
+
+- 与 worktree 并列的 `.graft/` 仓库目录。
+- 用于 staging SQLite snapshot 和文件 artifact 的 index。
+- 作为一等版本路径的 SQLite 数据库，而不是 opaque binary blob。
+- commit、ref、branch、tag 和 remote-tracking ref。
+- 支持的 SQLite 表的行级 diff。
+- 对文件 artifact 和不支持的 SQLite surface 采用保守冲突。
+- 面向应用 UI 的 JSON 输出。
+- 基于本地文件、S3-compatible 对象存储或 Graft HTTP 协议的 remotes。
+
+## 适合使用的场景
+
+- SQLite local-first 应用，并且有附件目录。
+- 应用允许 AI agent 修改结构化数据或文件。
+- 产品需要用户可见的历史、checkpoint 或 change review。
+- 需要 row-aware diff，而不是只能看到数据库文件变了。
+- 大文件放在 SQLite 外部，但要和数据库行一起版本化。
+
+## 不适合替代什么
+
+Graft 不替代 SQLite transaction、应用权限系统，也不是源代码 Git 仓库。
+它也不是实时 SQL 操作复制协议。Graft 记录 repository snapshot，并合并
+应用状态。
+
+## 集成入口
+
+CLI 适合本地和脚本：
+
+```bash
+graft init
+graft sql --db data.sqlite "CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT);"
+graft add --all
+graft commit -m "seed notes"
+```
+
+应用进程通常通过 SQLite 扩展集成：
+
+```sql
+PRAGMA graft_json_status;
+PRAGMA graft_add = '--all';
+PRAGMA graft_commit = 'save checkpoint';
+```

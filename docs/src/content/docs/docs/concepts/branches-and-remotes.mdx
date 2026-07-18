@@ -1,0 +1,83 @@
+---
+title: Branches And Remotes
+description: How Graft models branches, upstreams, fetch, pull, push, and clone for app-state repositories.
+---
+
+Graft follows Git's branch and remote shape closely enough that common
+workflows should feel familiar.
+
+## Branches
+
+A branch is a named ref under `.graft/refs/heads/`:
+
+```bash
+graft branch feature/search
+graft switch feature/search
+graft switch -c experiment main
+```
+
+Switching branches materializes tracked database snapshots and file artifacts
+from the target commit into the worktree.
+
+## Remote-Tracking Refs
+
+Fetching from a remote updates refs under:
+
+```text
+refs/remotes/<remote>/<branch>
+```
+
+Fetch does not change the current branch:
+
+```bash
+graft fetch origin main
+graft fetch --all origin
+```
+
+## Pull
+
+Pull combines fetch with either fast-forward or merge:
+
+```bash
+graft pull origin main
+```
+
+If the current branch has an upstream, `graft pull` can infer the remote and
+branch. A non-fast-forward pull enters merge state and records conflict stages
+in the index.
+
+## Push
+
+Push uploads repository objects, SQLite storage, external payloads, and refs:
+
+```bash
+graft push origin main
+graft push --all origin
+```
+
+`--force` allows deliberate non-fast-forward ref updates.
+
+## Clone
+
+Clone initializes a new worktree from a remote branch:
+
+```bash
+graft clone fs:///srv/graft/app main
+```
+
+It configures `origin`, fetches history, sets upstream tracking, and
+materializes the selected branch.
+
+## Remote Backends
+
+Graft remotes can use a filesystem path, S3-compatible object storage, or the
+Graft HTTP protocol:
+
+```text
+fs:///srv/graft/app
+s3_compatible://bucket/prefix?endpoint=https://...
+graft+https://host/api/graft/v1/repos/org/space
+```
+
+See [Sync With Remotes](/docs/guides/sync-remotes/) for workflows and
+[Remote URIs](/docs/reference/remote-uris/) for URI syntax.

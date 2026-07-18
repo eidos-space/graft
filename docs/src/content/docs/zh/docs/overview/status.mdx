@@ -1,0 +1,53 @@
+---
+title: 项目状态
+description: 当前 Graft 的能力、稳定性边界和预期。
+---
+
+Graft 仍然是实验性项目。本文档以
+[v0.6.0 release](https://github.com/eidos-space/graft/releases/tag/v0.6.0)
+为基线，重点是 SQLite 应用状态版本管理：SQLite snapshot、应用文件、
+row-aware diff、merge 和 remote sync。
+
+只存在于开发分支的能力不属于 v0.6.0 文档，除非页面明确标注为未发布。
+
+## 当前可用
+
+- CLI：`init`、`clone`、`sql`、`status`、`audit`、`gc`、`ls-files`、
+  `payload`、`config`、`add`、`rm`、`commit`、`log`、`show`、`diff`、
+  `checkout`、`restore`、`export`、`reset`、`branch`、`switch`、`tag`、
+  `merge`、`conflicts`、`resolve`、`remote`、`ls-remote`、`fetch`、`pull`
+  和 `push`。
+- SQLite 扩展：通过 `PRAGMA graft_*` 暴露仓库操作。
+- `.graft/` 下的项目本地仓库状态。
+- 一个 worktree 中跟踪多个 SQLite 数据库路径。
+- 与 SQLite snapshot 在同一个 commit tree 中的 text/binary file artifact。
+- binary file 和配置路径的 external payload。
+- 支持表面的行级 diff 和 row-aware merge。
+- 面向应用的 JSON 输出。
+- `fs://`、`s3://`、`s3_compatible://` 和 `graft+http(s)://` remotes。
+- 可连接实现 Graft HTTP remote protocol 服务的 HTTP remote client。
+
+## 稳定性边界
+
+面向外部的主要表面是 repository-mode CLI、SQLite repository PRAGMA、配置项
+和 JSON 输出。项目实验阶段这些仍可能变化，但文档围绕这些表面组织。
+
+以下内容属于实现细节：
+
+- storage LSN
+- page 和 segment 布局
+- debug pragmas
+- object serialization
+- Rust 内部模块边界
+
+Internals 文档用于贡献者和高级调试，不是产品级 API 保证。
+
+## Release
+
+预构建 CLI 和 SQLite extension archive 随
+[v0.6.0 GitHub release](https://github.com/eidos-space/graft/releases/tag/v0.6.0)
+发布。
+
+这个仓库是 [orbitinghail/graft](https://github.com/orbitinghail/graft) 的
+实验性 fork，把上游的 storage foundation 应用到 SQLite app-state
+versioning。
