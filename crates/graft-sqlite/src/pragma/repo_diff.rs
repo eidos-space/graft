@@ -146,10 +146,10 @@ pub(super) fn repo_text_content_for_path(
         .cloned()
     else {
         return pragma_err!(format!(
-            "path `{path}` is not a changed text artifact in this comparison"
+            "path `{path}` is not a changed artifact in this comparison"
         ));
     };
-    let content = repo.diff_text_content(&artifact, max_bytes)?;
+    let content = repo.diff_artifact_content(&artifact, max_bytes)?;
     diff.files.clear();
     diff.artifacts.retain(|artifact| artifact.path == path);
     diff.refresh_paths();

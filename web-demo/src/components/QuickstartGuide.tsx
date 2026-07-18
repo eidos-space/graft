@@ -303,11 +303,8 @@ export function QuickstartGuide({
       </header>
 
       <div className="guide-progress">
-        <div>
-          <strong>{completed.length} / {QUICKSTART_STEPS.length}</strong>
-          <span>{t("guide.complete", { percent })}</span>
-        </div>
-        <progress max={QUICKSTART_STEPS.length} value={completed.length} />
+        <strong>{completed.length} / {QUICKSTART_STEPS.length}</strong>
+        <span>{t("guide.complete", { percent })}</span>
       </div>
 
       <div className="guide-intro">
@@ -322,14 +319,18 @@ export function QuickstartGuide({
           const done = candidateSteps.filter((step) => completedSet.has(step.id)).length;
           return (
             <button
+              aria-label={`${t(candidate.labelKey)} ${done}/${candidateSteps.length}`}
               aria-current={candidate.id === activeTrack ? "step" : undefined}
               key={candidate.id}
               onClick={() => setActiveTrack(candidate.id)}
               type="button"
             >
-              <span>{index + 1}</span>
+              <span className="guide-track-index">{index + 1}</span>
               <strong>{t(candidate.labelKey)}</strong>
               <small>{done}/{candidateSteps.length}</small>
+              <span className="guide-track-fill" aria-hidden="true">
+                <span style={{ width: `${(done / candidateSteps.length) * 100}%` }} />
+              </span>
             </button>
           );
         })}

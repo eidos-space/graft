@@ -2932,6 +2932,51 @@ fn test_repo_pragmas_track_regular_file_artifacts() {
 }
 
 #[test]
+fn test_repo_json_diff_content_returns_binary_snapshots_as_base64() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_path.to_str().unwrap(), None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+
+    let image = temp_dir.path().join("image.png");
+    std::fs::write(&image, [0, 159, 146, 150]).unwrap();
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_add", "image.png"),
+        "Added image.png"
+    );
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "image v1").contains("image v1"));
+
+    std::fs::write(&image, [0, 1, 2, 3]).unwrap();
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_add", "image.png"),
+        "Added image.png"
+    );
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "image v2").contains("image v2"));
+
+    let status_before: Value =
+        serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status")).unwrap();
+    let diff: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_diff",
+        "--content HEAD~1 HEAD -- image.png",
+    ))
+    .expect("binary content diff should return JSON");
+    assert_eq!(diff["content"]["kind"], "binary_file");
+    assert_eq!(diff["content"]["before"]["state"], "base64");
+    assert_eq!(diff["content"]["before"]["content"], "AJ+Slg==");
+    assert_eq!(diff["content"]["after"]["state"], "base64");
+    assert_eq!(diff["content"]["after"]["content"], "AAECAw==");
+    let status_after: Value =
+        serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status")).unwrap();
+    assert_eq!(status_after, status_before);
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
 fn test_repo_pragmas_add_all_stages_database_and_file_changes() {
     graft_test::ensure_test_env();
 

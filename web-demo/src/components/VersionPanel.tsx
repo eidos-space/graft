@@ -10,6 +10,7 @@ import type {
 } from "../types";
 
 export type VersionTab = "changes" | "history";
+export type ChangeSection = "staged" | "unstaged";
 
 interface VersionPanelProps {
   activeTab: VersionTab;
@@ -23,7 +24,7 @@ interface VersionPanelProps {
   onReset: (target: string, mode: ResetMode) => Promise<boolean>;
   onTabChange: (tab: VersionTab) => void;
   onSelectHistory: (commit: CommitInfo, path?: string) => void;
-  onSelectPath: (path: string) => void;
+  onSelectPath: (path: string, section: ChangeSection) => void;
   onStageAll: () => Promise<void>;
   onStagePath: (path: string) => Promise<void>;
   onSwitchBranch: (branch: string) => Promise<void>;
@@ -31,6 +32,7 @@ interface VersionPanelProps {
   onUnstagePath: (path: string) => Promise<void>;
   selectedHistoryId?: string;
   selectedPath?: string;
+  selectedSection?: ChangeSection;
   status: RepoStatus;
 }
 
@@ -61,11 +63,6 @@ function statusLabel(status: string | undefined, t: Translate) {
   return t("version.change.modified");
 }
 
-function changeLabel(path: RepoStatusPath) {
-  if (path.conflicted) return "conflict";
-  return path.staged_change ?? path.unstaged_change ?? "modified";
-}
-
 export function VersionPanel({
   activeTab,
   branches,
@@ -86,6 +83,7 @@ export function VersionPanel({
   onUnstagePath,
   selectedHistoryId,
   selectedPath,
+  selectedSection,
   status,
 }: VersionPanelProps) {
   const { t } = useI18n();
@@ -259,6 +257,7 @@ export function VersionPanel({
                 onUnstageAll={onUnstageAll}
                 onUnstagePath={onUnstagePath}
                 selectedPath={selectedPath}
+                selectedSection={selectedSection}
                 status={status}
               />
             ) : (
@@ -321,12 +320,13 @@ export function VersionPanel({
 interface ChangesListProps {
   busy: boolean;
   onRequestDiscard: (changes: RepoStatusPath[]) => void;
-  onSelectPath: (path: string) => void;
+  onSelectPath: (path: string, section: ChangeSection) => void;
   onStageAll: () => Promise<void>;
   onStagePath: (path: string) => Promise<void>;
   onUnstageAll: () => Promise<void>;
   onUnstagePath: (path: string) => Promise<void>;
   selectedPath?: string;
+  selectedSection?: ChangeSection;
   status: RepoStatus;
 }
 
@@ -339,116 +339,169 @@ function ChangesList({
   onUnstageAll,
   onUnstagePath,
   selectedPath,
+  selectedSection,
   status,
 }: ChangesListProps) {
   const { t } = useI18n();
-  const discardablePaths = status.paths.filter(
-    (path) => path.worktree_status !== "none" && !path.conflicted,
+  const stagedPaths = status.paths.filter(
+    (path) => path.index_status !== "none" || path.staged_change !== undefined,
   );
+  const unstagedPaths = status.paths.filter(
+    (path) => path.worktree_status !== "none" || path.conflicted,
+  );
+  const discardablePaths = unstagedPaths.filter((path) => !path.conflicted);
   if (status.paths.length === 0) {
     return <div className="empty-list">{t("version.clean")}</div>;
   }
-  return (
-    <>
-      <div className="list-actions">
-        <span>
-          {t("version.changeSummary", {
-            staged: status.counts.staged,
-            unstaged: status.counts.unstaged,
-          })}
-        </span>
-        <div>
-          {status.has_unstaged_changes && (
-            <button disabled={busy} onClick={() => void onStageAll()} type="button">
-              {t("version.stageAll")}
+
+  function renderPath(path: RepoStatusPath, section: "staged" | "unstaged") {
+    const staged = section === "staged";
+    const canStage = !staged && !path.conflicted;
+    const canDiscard = !staged && !path.conflicted;
+    const change = staged
+      ? (path.staged_change ?? "modified")
+      : path.conflicted
+        ? "conflicted"
+        : (path.unstaged_change ?? "modified");
+    return (
+      <div
+        className={`change-row ${selectedPath === path.path && selectedSection === section ? "is-selected" : ""}`}
+        key={`${section}:${path.path}`}
+      >
+        <button
+          className="change-main"
+          onClick={() => onSelectPath(path.path, section)}
+          type="button"
+        >
+          <span className={`change-code change-${change}`}>
+            {change === "conflicted" ? "!" : change.slice(0, 1).toUpperCase()}
+          </span>
+          <span>
+            <strong>{path.path}</strong>
+            <small>
+              <span>{kindLabel(path.kind, t)}</span>
+              <i aria-hidden="true">·</i>
+              <span>{statusLabel(change, t)}</span>
+            </small>
+          </span>
+        </button>
+        {!path.conflicted && <div className="change-row-actions">
+          <button
+            aria-label={t(canStage ? "version.stageAria" : "version.unstageAria", {
+              path: path.path,
+            })}
+            className="change-action"
+            disabled={busy}
+            onClick={() => void (canStage ? onStagePath(path.path) : onUnstagePath(path.path))}
+            title={t(canStage ? "version.stagePath" : "version.unstagePath")}
+            type="button"
+          >
+            {canStage ? "+" : "−"}
+          </button>
+          {canDiscard && (
+            <button
+              aria-label={t("version.discardAria", { path: path.path })}
+              className="change-action is-discard"
+              disabled={busy}
+              onClick={() => onRequestDiscard([path])}
+              title={t("version.discardPath")}
+              type="button"
+            >
+              ↶
             </button>
           )}
-          {status.has_staged_changes && (
-            <button disabled={busy} onClick={() => void onUnstageAll()} type="button">
+        </div>}
+      </div>
+    );
+  }
+
+  return (
+    <div className="changes-sections">
+      {stagedPaths.length > 0 && (
+        <section className="changes-section" aria-labelledby="staged-changes-title">
+          <header className="changes-section-header">
+            <strong id="staged-changes-title">
+              {t("version.stagedChanges")} <span>{stagedPaths.length}</span>
+            </strong>
+            <button
+              disabled={busy}
+              onClick={() => void onUnstageAll()}
+              title={t("version.unstageAll")}
+              type="button"
+            >
               {t("version.unstageAll")}
             </button>
-          )}
-          {discardablePaths.length > 0 && (
-            <button
-              className="is-danger"
-              disabled={busy}
-              onClick={() => onRequestDiscard(discardablePaths)}
-              type="button"
-            >
-              {t("version.discardAll")}
-            </button>
-          )}
-        </div>
-      </div>
-      {status.paths.map((path) => {
-        const canStage = path.worktree_status !== "none" && !path.conflicted;
-        const canUnstage = path.index_status !== "none" && !path.conflicted;
-        const canDiscard = path.worktree_status !== "none" && !path.conflicted;
-        return (
-          <div
-            className={`change-row ${selectedPath === path.path ? "is-selected" : ""}`}
-            key={path.path}
-          >
-            <button
-              className="change-main"
-              onClick={() => onSelectPath(path.path)}
-              type="button"
-            >
-              <span className={`change-code change-${changeLabel(path)}`}>
-                {path.code.trim() || "M"}
-              </span>
-              <span>
-                <strong>{path.path}</strong>
-                <small>
-                  <span>{kindLabel(path.kind, t)}</span>
-                  <i aria-hidden="true">·</i>
-                  <span>
-                    {statusLabel(
-                      path.conflicted
-                        ? "conflicted"
-                        : (path.staged_change ?? path.unstaged_change),
-                      t,
-                    )}
-                  </span>
-                </small>
-              </span>
-            </button>
-            {(canStage || canUnstage || canDiscard) && (
-              <div className="change-row-actions">
-                {(canStage || canUnstage) && (
-                  <button
-                    aria-label={t(canStage ? "version.stageAria" : "version.unstageAria", {
-                      path: path.path,
-                    })}
-                    className="change-action"
-                    disabled={busy}
-                    onClick={() =>
-                      void (canStage ? onStagePath(path.path) : onUnstagePath(path.path))
-                    }
-                    title={t(canStage ? "version.stagePath" : "version.unstagePath")}
-                    type="button"
-                  >
-                    {canStage ? "+" : "−"}
-                  </button>
-                )}
-                {canDiscard && (
-                  <button
-                    aria-label={t("version.discardAria", { path: path.path })}
-                    className="change-action is-discard"
-                    disabled={busy}
-                    onClick={() => onRequestDiscard([path])}
-                    title={t("version.discardPath")}
-                    type="button"
-                  >
-                    ↶
-                  </button>
-                )}
-              </div>
-            )}
+          </header>
+          <div className="changes-section-list">
+            {stagedPaths.map((path) => renderPath(path, "staged"))}
           </div>
-        );
-      })}
-    </>
+        </section>
+      )}
+
+      {unstagedPaths.length > 0 && (
+        <section className="changes-section" aria-labelledby="unstaged-changes-title">
+          <header className="changes-section-header">
+            <strong id="unstaged-changes-title">
+              {t("version.unstagedChanges")} <span>{unstagedPaths.length}</span>
+            </strong>
+            <div>
+              <button
+                disabled={busy}
+                onClick={() => void onStageAll()}
+                title={t("version.stageAll")}
+                type="button"
+              >
+                {t("version.stageAll")}
+              </button>
+              {discardablePaths.length > 0 && (
+                <button
+                  className="is-danger"
+                  disabled={busy}
+                  onClick={() => onRequestDiscard(discardablePaths)}
+                  title={t("version.discardAll")}
+                  type="button"
+                >
+                  {t("version.discardAll")}
+                </button>
+              )}
+            </div>
+          </header>
+          <div className="changes-section-list">
+            {unstagedPaths.map((path) => renderPath(path, "unstaged"))}
+          </div>
+        </section>
+      )}
+
+      {stagedPaths.length === 0 && unstagedPaths.length === 0 && (
+        <section className="changes-section" aria-labelledby="conflicted-changes-title">
+          <header className="changes-section-header">
+            <strong id="conflicted-changes-title">
+              {t("version.unstagedChanges")} <span>{status.paths.length}</span>
+            </strong>
+          </header>
+          <div className="changes-section-list">
+            {status.paths.map((path) => (
+              <div
+                className={`change-row ${selectedPath === path.path && selectedSection === "unstaged" ? "is-selected" : ""}`}
+                key={`conflict:${path.path}`}
+              >
+                <button
+                  className="change-main"
+                  onClick={() => onSelectPath(path.path, "unstaged")}
+                  type="button"
+                >
+                  <span className="change-code change-conflict">!</span>
+                  <span>
+                    <strong>{path.path}</strong>
+                    <small>{statusLabel("conflicted", t)}</small>
+                  </span>
+                </button>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+    </div>
   );
 }
 

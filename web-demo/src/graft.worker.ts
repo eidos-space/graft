@@ -30,7 +30,14 @@ function emit(stream: CommandOutput["stream"], line: string) {
 }
 
 const runtimeRoot = `${import.meta.env.BASE_URL}wasm/`;
-const moduleUrl = `${runtimeRoot}graft.js`;
+const runtimeManifest = await fetch(`${runtimeRoot}version.json`, { cache: "no-store" })
+  .then((response) => (response.ok ? response.json() : {}))
+  .catch(() => ({})) as { build?: string; version?: string };
+const runtimeCacheKey = runtimeManifest.build ?? runtimeManifest.version;
+const runtimeQuery = runtimeCacheKey
+  ? `?build=${encodeURIComponent(runtimeCacheKey)}`
+  : "";
+const moduleUrl = `${runtimeRoot}graft.js${runtimeQuery}`;
 // Keep Vite from treating the generated Emscripten module as source. It lives in
 // public/ so development and production serve the exact same generated file.
 const importRuntime = new Function("url", "return import(url)") as (
@@ -42,7 +49,9 @@ let graft: GraftModule;
 try {
   graft = (await createGraft({
     locateFile: (path: string) =>
-      path.endsWith(".wasm") ? `${runtimeRoot}graft.wasm` : `${runtimeRoot}${path}`,
+      path.endsWith(".wasm")
+        ? `${runtimeRoot}graft.wasm${runtimeQuery}`
+        : `${runtimeRoot}${path}`,
     noInitialRun: true,
     print: (line: string) => emit("stdout", line),
     printErr: (line: string) => emit("stderr", line),

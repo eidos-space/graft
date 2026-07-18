@@ -21,7 +21,11 @@ import {
   TerminalPanel,
   type TerminalPanelHandle,
 } from "./components/TerminalPanel";
-import { VersionPanel, type VersionTab } from "./components/VersionPanel";
+import {
+  VersionPanel,
+  type ChangeSection,
+  type VersionTab,
+} from "./components/VersionPanel";
 import { useI18n } from "./i18n";
 import { GraftClient, parseJsonOutput } from "./lib/graftClient";
 import { historyChange } from "./lib/history";
@@ -48,7 +52,7 @@ import type {
   SqliteTableDiff,
 } from "./types";
 
-type MobilePane = "commit" | "editor" | "sidebar" | "terminal";
+type MobilePane = "editor" | "sidebar" | "terminal";
 type SidebarTab = "files" | "version";
 type Surface =
   | { type: "empty" }
@@ -71,15 +75,17 @@ const emptyConflicts: RepoConflictList = {
   paths: [],
 };
 
-type JsonTextState = {
+type JsonContentState = {
   content?: string;
-  state: "absent" | "utf8" | "too_large" | "missing_payload" | "invalid_utf8";
+  content_hash?: string;
+  size?: number;
+  state: "absent" | "utf8" | "base64" | "too_large" | "missing_payload" | "invalid_utf8";
 };
 
 type JsonDiff = {
   content?: {
-    after: JsonTextState;
-    before: JsonTextState;
+    after: JsonContentState;
+    before: JsonContentState;
   };
   files?: Array<{
     change: string;
@@ -101,10 +107,14 @@ type JsonResolveOutcome = {
   remaining_conflicts: number;
 };
 
-function textContents(state: JsonTextState | undefined) {
+function textContents(state: JsonContentState | undefined) {
   if (!state || state.state === "absent") return "";
   if (state.state === "utf8") return state.content ?? "";
   return `[${state.state.replaceAll("_", " ")}]`;
+}
+
+function isPreviewableImagePath(path: string) {
+  return /\.(?:avif|bmp|gif|ico|jpe?g|png|webp)$/i.test(path);
 }
 
 function commandError(stderr: string[], fallback: string) {
@@ -154,6 +164,7 @@ export function App() {
   const { language, setLanguage, t } = useI18n();
   const [client, setClient] = useState(() => new GraftClient());
   const [runtimeReady, setRuntimeReady] = useState(false);
+  const [graftVersion, setGraftVersion] = useState("");
   const [repositoryReady, setRepositoryReady] = useState(false);
   const [status, setStatus] = useState<RepoStatus>(emptyStatus);
   const [conflicts, setConflicts] = useState<RepoConflictList>(emptyConflicts);
@@ -165,6 +176,7 @@ export function App() {
   const [sidebarTab, setSidebarTab] = useState<SidebarTab>("files");
   const [selectedFilePath, setSelectedFilePath] = useState<string>();
   const [selectedVersionPath, setSelectedVersionPath] = useState<string>();
+  const [selectedChangeSection, setSelectedChangeSection] = useState<ChangeSection>();
   const [selectedHistoryId, setSelectedHistoryId] = useState<string>();
   const [versionTab, setVersionTab] = useState<VersionTab>("changes");
   const [busy, setBusy] = useState(false);
@@ -178,7 +190,7 @@ export function App() {
     savedNumber("graft-explorer-width", 292),
   );
   const [commitFilesWidth, setCommitFilesWidth] = useState(() =>
-    savedNumber("graft-commit-files-width", 268),
+    savedNumber("graft-commit-files-width", 286),
   );
   const [guideWidth, setGuideWidth] = useState(() =>
     savedNumber("graft-guide-width", 344),
@@ -283,10 +295,11 @@ export function App() {
   }, []);
 
   const loadCurrentDiff = useCallback(
-    async (path: string, nextStatus = status) => {
+    async (path: string, nextStatus = status, section: ChangeSection = "unstaged") => {
       const change = nextStatus.paths.find((item) => item.path === path);
       if (!change) return;
       setSelectedVersionPath(path);
+      setSelectedChangeSection(section);
       setSelectedHistoryId(undefined);
       if (change.conflicted) {
         setSidebarTab("version");
@@ -461,6 +474,7 @@ export function App() {
     if (activeSurface.type === "conflict" && !nextStatus.merge_head) {
       setSurface({ type: "empty" });
       setSelectedVersionPath(undefined);
+      setSelectedChangeSection(undefined);
     }
     setMessage(
       nextStatus.merge_head
@@ -484,6 +498,17 @@ export function App() {
       .then(async () => {
         if (!active) return;
         setRuntimeReady(true);
+        void fetch(`${import.meta.env.BASE_URL}wasm/version.json`, { cache: "no-store" })
+          .then((response) => {
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            return response.json() as Promise<{ version?: string }>;
+          })
+          .then((manifest) => {
+            if (active && manifest.version) setGraftVersion(manifest.version);
+          })
+          .catch(() => {
+            // The runtime remains usable if an older deployment has no manifest.
+          });
         await refreshRef.current();
       })
       .catch((error: unknown) => {
@@ -534,6 +559,7 @@ export function App() {
         setSidebarTab("version");
         setVersionTab("changes");
         setSelectedVersionPath(conflictPath);
+        setSelectedChangeSection(conflictPath ? "unstaged" : undefined);
         setSurface({ path: conflictPath ?? "", type: "conflict" });
         setMobilePane("editor");
       } catch (error) {
@@ -577,6 +603,7 @@ export function App() {
         await refresh();
         setSurface({ path: request.path, type: "conflict" });
         setSelectedVersionPath(request.path);
+        setSelectedChangeSection("unstaged");
         return true;
       } catch (error) {
         setMessage(error instanceof Error ? error.message : String(error));
@@ -598,6 +625,7 @@ export function App() {
       }
       setSurface({ type: "empty" });
       setSelectedVersionPath(undefined);
+      setSelectedChangeSection(undefined);
       setMessage(t("status.mergeAborted"));
       await refresh();
       return true;
@@ -625,6 +653,7 @@ export function App() {
         }
         setSurface({ type: "empty" });
         setSelectedVersionPath(undefined);
+        setSelectedChangeSection(undefined);
         setMessage(t("status.mergeCompleted"));
         setGuideProgress((current) =>
           current.includes("continue-merge") ? current : [...current, "continue-merge"],
@@ -672,6 +701,7 @@ export function App() {
           setSurface({ type: "empty" });
         }
         setSelectedVersionPath(undefined);
+        setSelectedChangeSection(undefined);
         setSurfaceEpoch((current) => current + 1);
         setMessage(
           changes.length === 1
@@ -709,6 +739,7 @@ export function App() {
         if (mode === "hard") setSurfaceEpoch((current) => current + 1);
         setSelectedHistoryId(undefined);
         setSelectedVersionPath(undefined);
+        setSelectedChangeSection(undefined);
         setMessage(
           t("status.resetVersion", {
             branch: status.current_branch ?? "HEAD",
@@ -811,6 +842,7 @@ export function App() {
     setSidebarTab("version");
     setVersionTab("changes");
     setSelectedVersionPath(path || undefined);
+    setSelectedChangeSection(path ? "unstaged" : undefined);
     setSurface({ path, type: "conflict" });
     setMobilePane("editor");
     return true;
@@ -821,6 +853,7 @@ export function App() {
     setSurface({ type: "empty" });
     setSelectedFilePath(undefined);
     setSelectedVersionPath(undefined);
+    setSelectedChangeSection(undefined);
     setSelectedHistoryId(undefined);
     setVersionTab("changes");
     refreshToken.current += 1;
@@ -943,10 +976,11 @@ export function App() {
       if (!change) return;
       setSelectedHistoryId(commit.id);
       setSelectedVersionPath(change.path);
-      setMobilePane(path ? "editor" : "commit");
+      setSelectedChangeSection(undefined);
+      setMobilePane("editor");
       setBusy(true);
       try {
-        if (change.kind === "binary_file") {
+        if (change.kind === "binary_file" && !isPreviewableImagePath(change.path)) {
           setSurface({
             diff: {
               change: change.change,
@@ -954,6 +988,30 @@ export function App() {
               kind: change.kind,
               label: "HISTORY BINARY CHANGE",
               path: change.path,
+              storage: change.storage,
+            },
+            type: "diff",
+          });
+          return;
+        }
+        if (change.kind === "binary_file") {
+          const base = ["diff", "--json", "--content", "--max-content-bytes", "8388608"];
+          const args = commit.parent
+            ? [...base, commit.parent, commit.id, "--", change.path]
+            : [...base, "--root", commit.id, "--", change.path];
+          const payload = parseJsonOutput<JsonDiff>(await client.run(args));
+          const before = payload.content?.before;
+          const after = payload.content?.after;
+          setSurface({
+            diff: {
+              after,
+              before,
+              change: change.change,
+              description: `${commit.parent?.slice(0, 8) ?? "empty"} → ${commit.id.slice(0, 8)}`,
+              kind: change.kind,
+              label: "HISTORY IMAGE CHANGE",
+              path: change.path,
+              size: after?.size ?? before?.size,
               storage: change.storage,
             },
             type: "diff",
@@ -1034,58 +1092,61 @@ export function App() {
   const historyReviewOpen =
     repositoryReady && sidebarTab === "version" && versionTab === "history";
   const mobilePaneLabels: Record<MobilePane, string> = {
-    commit: t("app.commitFiles"),
     editor: t("app.editor"),
     sidebar: t("app.sidebar"),
     terminal: t("app.terminal"),
   };
-  const mobilePanes: MobilePane[] = historyReviewOpen
-    ? ["sidebar", "commit", "editor", "terminal"]
-    : ["sidebar", "editor", "terminal"];
+  const mobilePanes: MobilePane[] = ["sidebar", "editor", "terminal"];
 
   return (
     <main className="app-shell">
       <header className="app-header">
-        <div className="brand">
-          <span className="brand-mark" aria-hidden="true">
-            G
-          </span>
-          <div>
-            <strong>Graft Playground</strong>
-            <small>{t("brand.subtitle")}</small>
-          </div>
-        </div>
-        <div className="header-context">
-          <div className="runtime-strip" aria-live="polite">
-            <span className={runtimeReady ? "status-dot is-ready" : "status-dot"} />
-            <span>{message}</span>
-          </div>
-          <div className="header-worktree-summary" aria-label={t("tree.storageLegend")}>
-            <span className="header-worktree-meta">
-              <strong>{t("tree.worktreeRoot")}</strong>
-              <small>
-                {t("app.fileCount", {
-                  count: opfsFileCount,
-                  size: (totalBytes / 1024 / 1024).toFixed(1),
-                })}
-              </small>
+        <div className="header-leading">
+          <div className="brand">
+            <span className="brand-mark" aria-hidden="true">
+              G
             </span>
-            <span className="header-storage-state" title={t("tree.vfsTitle")}>
-              <b>VFS</b>
-              <em>{t("tree.vfsShort")}</em>
-            </span>
-            <span className="header-storage-state" title={t("tree.materializedTitle")}>
-              <b>OPFS</b>
-              <em>{t("tree.materializedShort")}</em>
+            <div>
+              <strong>Graft Playground</strong>
+              <small>{t("brand.subtitle")}</small>
+            </div>
+          </div>
+          <div className="header-context">
+            <div className="runtime-strip" aria-live="polite">
+              <span className={runtimeReady ? "status-dot is-ready" : "status-dot"} />
+              <span>{message}</span>
+            </div>
+            <div className="header-worktree-summary" aria-label={t("tree.storageLegend")}>
+              <span className="header-worktree-meta">
+                <strong>{t("tree.worktreeRoot")}</strong>
+                <small>
+                  {t("app.fileCount", {
+                    count: opfsFileCount,
+                    size: (totalBytes / 1024 / 1024).toFixed(1),
+                  })}
+                </small>
+              </span>
+              <span className="header-storage-state" title={t("tree.vfsTitle")}>
+                <b>VFS</b>
+                <em>{t("tree.vfsShort")}</em>
+              </span>
+              <span className="header-storage-state" title={t("tree.materializedTitle")}>
+                <b>OPFS</b>
+                <em>{t("tree.materializedShort")}</em>
+              </span>
+            </div>
+          </div>
+          <div className="capabilities" aria-label={t("app.runtimeCapabilities")}>
+            <span
+              className="graft-version"
+              data-graft-version={graftVersion || undefined}
+              title={graftVersion ? `Graft CLI ${graftVersion}` : "Graft CLI"}
+            >
+              GRAFT {graftVersion ? `v${graftVersion}` : "…"} · WASM
             </span>
           </div>
         </div>
         <div className="header-actions">
-          <div className="capabilities" aria-label={t("app.runtimeCapabilities")}>
-            <span>WASM</span>
-            <span>WORKER</span>
-            <span>OPFS</span>
-          </div>
           <div className="language-switcher" role="group" aria-label={t("language.label")}>
             <button
               aria-label={t("language.chinese")}
@@ -1142,7 +1203,7 @@ export function App() {
       </nav>
 
       <div
-        className={`ide-workspace mobile-${mobilePane} ${historyReviewOpen ? "has-commit-files" : ""} ${guideOpen ? "has-guide" : ""}`}
+        className={`ide-workspace mobile-${mobilePane} ${guideOpen ? "has-guide" : ""} ${terminalOpen ? "" : "terminal-closed"}`}
         style={
           {
             "--commit-files-width": `${commitFilesWidth}px`,
@@ -1222,7 +1283,7 @@ export function App() {
                     onMergeBranch={mergeBranch}
                     onReset={resetVersion}
                     onSelectHistory={(commit, path) => void loadHistoryDiff(commit, path)}
-                    onSelectPath={(path) => void loadCurrentDiff(path)}
+                    onSelectPath={(path, section) => void loadCurrentDiff(path, status, section)}
                     onStageAll={() =>
                       runGuiCommand(
                         ["add", "--json", "--all"],
@@ -1243,9 +1304,7 @@ export function App() {
                     }
                     onTabChange={(tab) => {
                       setVersionTab(tab);
-                      if (tab === "changes" && mobilePane === "commit") {
-                        setMobilePane("sidebar");
-                      } else if (tab === "history" && !selectedHistoryId && history[0]) {
+                      if (tab === "history" && !selectedHistoryId && history[0]) {
                         void loadHistoryDiff(history[0]);
                       }
                     }}
@@ -1263,6 +1322,7 @@ export function App() {
                     }
                     selectedHistoryId={selectedHistoryId}
                     selectedPath={selectedVersionPath}
+                    selectedSection={selectedChangeSection}
                     status={status}
                   />
                 ) : (
@@ -1278,31 +1338,36 @@ export function App() {
 
         <ResizeHandle
           axis="vertical"
+          className="explorer-resize-handle"
           label={t("app.resizeFiles")}
           onDelta={(delta) =>
             setExplorerWidth((current) => clamp(current + delta, 190, 480))
           }
         />
 
-        {historyReviewOpen && (
-          <>
-            <CommitFilesPane
-              commit={selectedHistoryCommit}
-              onSelectPath={(commit, path) => void loadHistoryDiff(commit, path)}
-              selectedPath={selectedVersionPath}
-            />
-            <ResizeHandle
-              axis="vertical"
-              label={t("app.resizeCommitFiles")}
-              onDelta={(delta) =>
-                setCommitFilesWidth((current) => clamp(current + delta, 210, 420))
-              }
-            />
-          </>
-        )}
-
         <div className={`ide-main ${terminalOpen ? "" : "is-terminal-closed"}`}>
-          <div className="primary-surface" data-area="editor">
+          <div
+            className={`primary-surface ${historyReviewOpen ? "is-history-review" : ""}`}
+            data-area="editor"
+          >
+            {historyReviewOpen && (
+              <CommitFilesPane
+                commit={selectedHistoryCommit}
+                onSelectPath={(commit, path) => void loadHistoryDiff(commit, path)}
+                selectedPath={selectedVersionPath}
+              />
+            )}
+            {historyReviewOpen && (
+              <ResizeHandle
+                axis="vertical"
+                className="commit-files-resize-handle"
+                label={t("app.resizeCommitFiles")}
+                onDelta={(delta) =>
+                  setCommitFilesWidth((current) => clamp(current + delta, 220, 420))
+                }
+              />
+            )}
+            <div className="primary-content">
             {surface.type === "conflict" ? (
               <ConflictResolver
                 busy={busy}
@@ -1312,6 +1377,7 @@ export function App() {
                 onResolve={resolveConflict}
                 onSelectPath={(path) => {
                   setSelectedVersionPath(path);
+                  setSelectedChangeSection("unstaged");
                   setSurface({ path, type: "conflict" });
                 }}
                 selectedPath={surface.path || selectedVersionPath}
@@ -1369,6 +1435,7 @@ export function App() {
                 </dl>
               </section>
             )}
+            </div>
           </div>
 
           <ResizeHandle
@@ -1432,6 +1499,7 @@ export function App() {
           <>
             <ResizeHandle
               axis="vertical"
+              className="guide-resize-handle"
               label={t("app.resizeGuide")}
               onDelta={(delta) =>
                 setGuideWidth((current) => clamp(current - delta, 280, 540))

@@ -1888,6 +1888,16 @@ fn diff_root_reports_first_commit_paths_as_added() {
         content.after,
         RepoTextContentState::Utf8 { content, .. } if content == "# First\n"
     ));
+
+    let binary_only = repo.diff_root("HEAD", Some("image.bin")).unwrap();
+    let binary_content = repo
+        .diff_artifact_content(&binary_only.artifacts[0], ByteUnit::new(128))
+        .unwrap();
+    assert_eq!(binary_content.before, RepoTextContentState::Absent);
+    assert!(matches!(
+        binary_content.after,
+        RepoTextContentState::Base64 { content, size: 4, .. } if content == "AJ+Slg=="
+    ));
 }
 
 #[test]

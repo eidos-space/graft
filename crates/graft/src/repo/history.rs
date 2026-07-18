@@ -1,4 +1,5 @@
 use super::*;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 
 impl Repository {
     pub fn resolve_revision(&self, rev: &str) -> Result<String> {
@@ -62,6 +63,14 @@ impl Repository {
         {
             return Err(RepoErr::PathNotTextArtifact(artifact.path.clone()));
         }
+        self.diff_artifact_content(artifact, max_bytes)
+    }
+
+    pub fn diff_artifact_content(
+        &self,
+        artifact: &RepoArtifactDiff,
+        max_bytes: ByteUnit,
+    ) -> Result<RepoTextContentDiff> {
         if max_bytes == ByteUnit::ZERO {
             return Err(RepoErr::InvalidTextDiffContentLimit);
         }
@@ -71,14 +80,19 @@ impl Repository {
             change: artifact.change,
             kind: artifact.kind,
             storage: artifact.storage,
-            before: self.text_content_state(artifact.from.as_ref(), max_bytes)?,
-            after: self.text_content_state(artifact.to.as_ref(), max_bytes)?,
+            before: self.artifact_content_state(
+                artifact.from.as_ref(),
+                artifact.kind,
+                max_bytes,
+            )?,
+            after: self.artifact_content_state(artifact.to.as_ref(), artifact.kind, max_bytes)?,
         })
     }
 
-    fn text_content_state(
+    fn artifact_content_state(
         &self,
         state: Option<&CommitArtifactState>,
+        kind: RepoTrackedPathKind,
         max_bytes: ByteUnit,
     ) -> Result<RepoTextContentState> {
         let Some(state) = state else {
@@ -99,6 +113,13 @@ impl Repository {
             }
             Err(err) => return Err(err),
         };
+        if kind == RepoTrackedPathKind::BinaryFile {
+            return Ok(RepoTextContentState::Base64 {
+                content: BASE64_STANDARD.encode(bytes),
+                size,
+                content_hash,
+            });
+        }
         match String::from_utf8(bytes) {
             Ok(content) => Ok(RepoTextContentState::Utf8 { content, size, content_hash }),
             Err(_) => Ok(RepoTextContentState::InvalidUtf8 { size, content_hash }),

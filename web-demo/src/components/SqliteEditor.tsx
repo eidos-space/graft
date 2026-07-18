@@ -237,7 +237,6 @@ export function SqliteEditor({
           >
             {t(materialized ? "sqlite.materialized" : "sqlite.vfsOnly")}
           </span>
-          <span>{t("sqlite.data")}</span>
           <button disabled={loading} onClick={() => void loadDatabase()} type="button">
             {t("sqlite.refresh")}
           </button>
@@ -246,7 +245,6 @@ export function SqliteEditor({
 
       {!materialized && (
         <div className="sqlite-storage-notice" role="status">
-          <strong>{t("sqlite.vfsOnly")}</strong>
           <span>{t("sqlite.vfsDescription")}</span>
         </div>
       )}
@@ -327,14 +325,16 @@ export function SqliteEditor({
                           </td>
                         ))}
                         <td className="row-actions-column">
-                          <button
-                            disabled={!dirtyRows.has(key) || workingRow === key || !hasRowid}
-                            onClick={() => void saveRow(row, rowIndex)}
-                            title={t("sqlite.saveRow")}
-                            type="button"
-                          >
-                            {t("sqlite.save")}
-                          </button>
+                          {dirtyRows.has(key) && (
+                            <button
+                              disabled={workingRow === key || !hasRowid}
+                              onClick={() => void saveRow(row, rowIndex)}
+                              title={t("sqlite.saveRow")}
+                              type="button"
+                            >
+                              {t("sqlite.save")}
+                            </button>
+                          )}
                           <button
                             disabled={workingRow === key || !hasRowid}
                             onClick={() => void deleteRow(row)}

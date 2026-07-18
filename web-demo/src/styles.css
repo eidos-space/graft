@@ -753,9 +753,10 @@ select:disabled {
 }
 
 .sqlite-grid .row-actions-column {
-  width: 94px;
-  min-width: 94px;
+  width: 80px;
+  min-width: 80px;
   padding: 4px 5px;
+  text-align: right;
   white-space: nowrap;
 }
 
@@ -764,6 +765,15 @@ select:disabled {
   margin-left: 4px;
   padding: 3px;
   color: #af3029;
+}
+
+.row-actions-column button:last-child {
+  opacity: 0.45;
+}
+
+.sqlite-grid tr:hover .row-actions-column button:last-child,
+.row-actions-column button:focus-visible {
+  opacity: 1;
 }
 
 .surface-message.compact {
@@ -3328,7 +3338,7 @@ body.is-resizing-rows * {
 
 .quickstart-sidebar {
   display: grid;
-  grid-template-rows: 58px 60px auto auto auto minmax(0, 1fr) auto;
+  grid-template-rows: 58px 40px auto auto auto minmax(0, 1fr) auto;
   min-width: 0;
   min-height: 0;
   overflow: hidden;
@@ -3401,18 +3411,12 @@ body.is-resizing-rows * {
 }
 
 .guide-progress {
-  display: grid;
-  align-content: center;
-  gap: 8px;
-  padding: 8px 12px;
-  border-bottom: 1px solid #b8b8b4;
-}
-
-.guide-progress > div {
   display: flex;
   align-items: baseline;
   justify-content: space-between;
   gap: 12px;
+  padding: 0 12px;
+  border-bottom: 1px solid #b8b8b4;
 }
 
 .guide-progress strong {
@@ -3425,21 +3429,6 @@ body.is-resizing-rows * {
   letter-spacing: 0.08em;
 }
 
-.guide-progress progress {
-  width: 100%;
-  height: 5px;
-  border: 0;
-  background: #d9d9d5;
-  accent-color: #cc0000;
-}
-
-.guide-progress progress::-webkit-progress-bar {
-  background: #d9d9d5;
-}
-
-.guide-progress progress::-webkit-progress-value {
-  background: #cc0000;
-}
 
 .guide-intro {
   padding: 10px 12px;
@@ -4150,23 +4139,16 @@ body.is-resizing-rows * {
 }
 
 .sqlite-storage-notice {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
-  align-items: baseline;
-  gap: 10px;
-  padding: 7px 12px;
-  border-bottom: 1px solid #111111;
+  display: flex;
+  align-items: center;
+  min-height: 32px;
+  padding: 5px 12px;
+  border-bottom: 1px solid var(--swiss-line);
+  border-left: 3px solid var(--swiss-red);
   color: #333333;
-  background: #efefeb;
-  font-size: 10px;
-  line-height: 1.45;
-}
-
-.sqlite-storage-notice strong {
-  color: #cc0000;
-  font-family: "SFMono-Regular", Consolas, monospace;
+  background: var(--swiss-surface);
   font-size: 9px;
-  letter-spacing: 0.08em;
+  line-height: 1.35;
 }
 
 @media (max-width: 560px) {
@@ -4176,8 +4158,7 @@ body.is-resizing-rows * {
   }
 
   .sqlite-storage-notice {
-    grid-template-columns: 1fr;
-    gap: 2px;
+    align-items: flex-start;
   }
 }
 
@@ -4575,6 +4556,74 @@ html[lang="zh-CN"] .change-code {
   overflow: auto;
 }
 
+.binary-diff-content.has-image-history {
+  align-content: start;
+  width: min(920px, calc(100% - 48px));
+}
+
+.binary-image-history {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  border-top: 1px solid #111111;
+  border-left: 1px solid #111111;
+}
+
+.binary-image-revision {
+  display: grid;
+  grid-template-rows: 34px minmax(180px, 36vh);
+  min-width: 0;
+  margin: 0;
+  border-right: 1px solid #111111;
+  border-bottom: 1px solid #111111;
+}
+
+.binary-image-revision figcaption {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 10px;
+  border-bottom: 1px solid #d2d2ce;
+  background: #eeeeeb;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 8px;
+}
+
+.binary-image-revision figcaption strong {
+  color: #111111;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.binary-image-revision figcaption span {
+  color: #666666;
+}
+
+.binary-image-revision > div {
+  display: grid;
+  place-items: center;
+  min-width: 0;
+  min-height: 0;
+  padding: 16px;
+  overflow: hidden;
+  background: #f5f5f2;
+}
+
+.binary-image-revision img {
+  display: block;
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
+
+.binary-image-revision > div > span {
+  max-width: 28ch;
+  color: #777777;
+  font-size: 10px;
+  line-height: 1.45;
+  text-align: center;
+}
+
 .binary-diff-heading {
   display: grid;
   gap: 8px;
@@ -4668,6 +4717,14 @@ html[lang="zh-CN"] .change-code {
 
   .binary-diff-content dl {
     grid-template-columns: 1fr;
+  }
+
+  .binary-image-history {
+    grid-template-columns: 1fr;
+  }
+
+  .binary-image-revision {
+    grid-template-rows: 34px minmax(160px, 30vh);
   }
 }
 
@@ -4804,6 +4861,12 @@ textarea:focus-visible {
 .capabilities span:first-child {
   color: #ffffff;
   background: var(--swiss-ink);
+}
+
+.capabilities .graft-version {
+  border: 1px solid var(--swiss-red);
+  color: var(--swiss-red);
+  background: var(--swiss-surface);
 }
 
 .language-switcher {
@@ -5217,8 +5280,9 @@ textarea:focus-visible {
 
 .sqlite-storage-notice {
   border-color: var(--swiss-line);
+  border-left-color: var(--swiss-red);
   color: var(--swiss-muted);
-  background: var(--swiss-soft);
+  background: var(--swiss-surface);
 }
 
 .version-panel input,
@@ -5288,6 +5352,93 @@ textarea:focus-visible {
   background: var(--swiss-red);
 }
 
+.changes-sections {
+  display: grid;
+  align-content: start;
+  min-height: 100%;
+  background: var(--swiss-surface);
+}
+
+.changes-section {
+  min-width: 0;
+  border-bottom: 1px solid var(--swiss-ink);
+}
+
+.changes-section-header {
+  position: sticky;
+  z-index: 1;
+  top: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  min-height: 32px;
+  padding: 4px 6px 4px 9px;
+  border-bottom: 1px solid var(--swiss-line);
+  background: var(--swiss-soft);
+}
+
+.changes-section-header > strong {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: 8px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.changes-section-header > strong span {
+  display: inline-grid;
+  place-items: center;
+  min-width: 16px;
+  height: 16px;
+  padding-inline: 4px;
+  color: #ffffff;
+  background: var(--swiss-red);
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 7px;
+}
+
+.changes-section-header > div {
+  display: flex;
+  gap: 4px;
+}
+
+.changes-section-header button {
+  min-height: 23px;
+  padding: 3px 6px;
+  border: 1px solid var(--swiss-line);
+  color: var(--swiss-muted);
+  background: var(--swiss-surface);
+  font-size: 7px;
+  font-weight: 750;
+  cursor: pointer;
+}
+
+.changes-section-header button:hover:not(:disabled),
+.changes-section-header button:focus-visible {
+  border-color: var(--swiss-ink);
+  color: #ffffff;
+  background: var(--swiss-ink);
+}
+
+.changes-section-header button.is-danger {
+  border-color: var(--swiss-red);
+  color: var(--swiss-red);
+}
+
+.changes-section-header button.is-danger:hover:not(:disabled),
+.changes-section-header button.is-danger:focus-visible {
+  color: #ffffff;
+  background: var(--swiss-red);
+}
+
+.changes-section-list .change-row:last-child {
+  border-bottom: 0;
+}
+
 .quickstart-sidebar {
   background: var(--swiss-surface);
 }
@@ -5323,15 +5474,6 @@ textarea:focus-visible {
 .guide-steps li,
 .guide-footer {
   border-color: var(--swiss-line);
-}
-
-.guide-progress progress,
-.guide-progress progress::-webkit-progress-bar {
-  background: var(--swiss-soft);
-}
-
-.guide-progress progress::-webkit-progress-value {
-  background: var(--swiss-red);
 }
 
 .guide-intro p,
@@ -5527,8 +5669,19 @@ textarea:focus-visible {
 }
 
 .binary-diff-content dl,
-.binary-diff-content dl > div {
+.binary-diff-content dl > div,
+.binary-image-history,
+.binary-image-revision {
   border-color: var(--swiss-line);
+}
+
+.binary-image-revision figcaption {
+  border-color: var(--swiss-line);
+  background: var(--swiss-soft);
+}
+
+.binary-image-revision > div {
+  background: var(--swiss-paper);
 }
 
 .dialog-backdrop,
@@ -5626,11 +5779,24 @@ textarea:focus-visible {
 
 /* Keep global repository context in the header; the explorer stays purely navigational. */
 .app-header {
-  grid-template-columns: minmax(205px, 0.75fr) minmax(360px, 1.4fr) auto;
-  column-gap: 16px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  column-gap: 12px;
+}
+
+.header-leading {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.header-leading .brand,
+.header-leading .capabilities {
+  flex: 0 0 auto;
 }
 
 .header-context {
+  flex: 0 1 400px;
   display: grid;
   align-content: center;
   gap: 3px;
@@ -5684,7 +5850,7 @@ textarea:focus-visible {
 }
 
 .header-worktree-meta + .header-storage-state {
-  margin-left: auto;
+  margin-left: 0;
 }
 
 .header-storage-state b {
@@ -5711,8 +5877,16 @@ textarea:focus-visible {
 
 @media (max-width: 1250px) {
   .app-header {
-    grid-template-columns: minmax(190px, 0.7fr) minmax(270px, 1fr) auto;
+    grid-template-columns: minmax(0, 1fr) auto;
     column-gap: 10px;
+  }
+
+  .header-leading {
+    gap: 9px;
+  }
+
+  .header-context {
+    flex-basis: 300px;
   }
 
   .header-storage-state em {
@@ -5722,8 +5896,16 @@ textarea:focus-visible {
 
 @media (max-width: 900px) {
   .app-header {
-    grid-template-columns: minmax(160px, 1fr) minmax(190px, 0.8fr) auto;
+    grid-template-columns: minmax(0, 1fr) auto;
     padding-inline: 10px;
+  }
+
+  .header-leading {
+    gap: 7px;
+  }
+
+  .header-context {
+    flex-basis: 220px;
   }
 
   .header-worktree-summary {
@@ -5745,73 +5927,67 @@ textarea:focus-visible {
   }
 }
 
-/* History review is a three-step workspace: commit, files in commit, file content. */
-.ide-workspace.has-commit-files {
-  grid-template-columns:
-    var(--explorer-width, 292px) 7px var(--commit-files-width, 268px) 7px
-    minmax(0, 1fr);
+/* History review follows the familiar Git GUI progression: commit, files, selected diff. */
+.primary-surface {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr);
 }
 
-.ide-workspace.has-commit-files.has-guide {
-  grid-template-columns:
-    var(--explorer-width, 292px) 7px var(--commit-files-width, 268px) 7px
-    minmax(0, 1fr) 7px var(--guide-width, 344px);
+.primary-surface.is-history-review {
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+.primary-content {
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .commit-files-pane {
   display: grid;
-  grid-template-rows: 42px auto 34px minmax(0, 1fr);
+  grid-template-rows: auto auto;
   min-width: 0;
-  min-height: 0;
+  max-height: min(220px, 34vh);
   overflow: hidden;
-  border-right: 1px solid var(--swiss-line);
+  border-bottom: 1px solid var(--swiss-ink);
   background: var(--swiss-surface);
 }
 
-.commit-files-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  min-width: 0;
-  padding: 0 11px;
-  border-bottom: 1px solid var(--swiss-ink);
-  background: var(--swiss-ink);
-}
-
-.commit-files-header span,
-.commit-files-header strong,
 .commit-files-heading,
+.commit-summary-meta,
 .commit-summary small {
   font-family: "SFMono-Regular", Consolas, monospace;
-}
-
-.commit-files-header span {
-  overflow: hidden;
-  color: #ffffff;
-  font-size: 8px;
-  font-weight: 750;
-  letter-spacing: 0.12em;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.commit-files-header strong {
-  flex: 0 0 auto;
-  color: #ff7075;
-  font-size: 8px;
-  letter-spacing: 0.06em;
 }
 
 .commit-summary {
   display: grid;
   align-content: center;
-  gap: 5px;
+  gap: 4px;
   min-width: 0;
-  min-height: 76px;
-  padding: 10px 12px;
+  padding: 9px 12px;
   border-bottom: 1px solid var(--swiss-line);
-  background: var(--swiss-soft);
+  background: var(--swiss-surface);
+}
+
+.commit-summary-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+  color: var(--swiss-muted);
+  font-size: 7px;
+  font-weight: 750;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.commit-summary-meta code {
+  flex: 0 0 auto;
+  color: var(--swiss-red);
+  font: inherit;
+  letter-spacing: 0.04em;
+  text-transform: none;
 }
 
 .commit-summary strong {
@@ -5831,44 +6007,52 @@ textarea:focus-visible {
   white-space: nowrap;
 }
 
+.commit-files-group {
+  display: grid;
+  grid-template-rows: 27px auto;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
 .commit-files-heading {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  padding: 0 11px;
+  padding: 0 10px;
   border-bottom: 1px solid var(--swiss-line);
   color: var(--swiss-muted);
-  background: var(--swiss-surface);
+  background: var(--swiss-soft);
   font-size: 8px;
   font-weight: 750;
   letter-spacing: 0.08em;
 }
 
 .commit-files-heading b {
-  display: grid;
-  place-items: center;
-  min-width: 20px;
-  height: 18px;
-  padding-inline: 4px;
-  color: #ffffff;
-  background: var(--swiss-red);
+  color: var(--swiss-red);
+  background: transparent;
   font-size: 8px;
 }
 
 .commit-file-list {
+  display: grid;
+  grid-auto-rows: 38px;
   min-height: 0;
-  overflow: auto;
+  max-height: 114px;
+  overflow-x: hidden;
+  overflow-y: auto;
 }
 
 .commit-file-list > button {
   display: grid;
-  grid-template-columns: 27px minmax(0, 1fr);
+  grid-template-columns: 27px minmax(0, 1fr) auto;
   align-items: center;
-  gap: 4px;
+  gap: 8px;
   width: 100%;
-  min-height: 54px;
-  padding: 7px 9px;
+  min-width: 0;
+  min-height: 38px;
+  padding: 6px 8px;
   border: 0;
   border-bottom: 1px solid var(--swiss-line);
   color: var(--swiss-ink);
@@ -5887,12 +6071,6 @@ textarea:focus-visible {
   box-shadow: inset 3px 0 var(--swiss-red);
 }
 
-.commit-file-list > button > span:last-child {
-  display: grid;
-  gap: 3px;
-  min-width: 0;
-}
-
 .commit-file-list strong,
 .commit-file-list small {
   overflow: hidden;
@@ -5901,13 +6079,16 @@ textarea:focus-visible {
 }
 
 .commit-file-list strong {
+  min-width: 0;
   font-size: 10px;
   font-weight: 650;
 }
 
 .commit-file-list small {
+  max-width: 170px;
   color: var(--swiss-muted);
   font-size: 8px;
+  text-align: right;
 }
 
 .commit-files-empty,
@@ -5918,13 +6099,24 @@ textarea:focus-visible {
 }
 
 .commit-files-empty {
-  padding: 18px 12px;
+  padding: 12px;
 }
 
 .commit-files-placeholder {
-  grid-row: 2 / -1;
-  align-self: start;
-  padding: 24px 18px;
+  grid-column: 1 / -1;
+  display: grid;
+  align-content: center;
+  gap: 3px;
+  padding: 12px 16px;
+}
+
+.commit-files-placeholder > span {
+  color: var(--swiss-red);
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 7px;
+  font-weight: 750;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
 }
 
 .commit-files-placeholder strong {
@@ -5933,21 +6125,113 @@ textarea:focus-visible {
 }
 
 .commit-files-placeholder p {
-  margin: 7px 0 0;
+  margin: 0;
 }
 
-@media (max-width: 900px) {
-  .mobile-nav {
-    grid-template-columns: repeat(auto-fit, minmax(0, 1fr));
+@media (max-width: 620px) {
+  .commit-files-pane {
+    max-height: min(196px, 34vh);
   }
 
-  .ide-workspace .commit-files-pane {
-    display: none;
+  .commit-summary {
+    padding-inline: 10px;
   }
 
-  .ide-workspace.mobile-commit .commit-files-pane {
+  .commit-file-list small {
+    max-width: 110px;
+  }
+}
+
+@media (min-width: 901px) {
+  .ide-workspace {
+    grid-template-rows: minmax(0, 1fr);
+  }
+
+  .ide-workspace.terminal-closed {
+    grid-template-rows: minmax(0, 1fr);
+  }
+
+  .ide-main {
     display: grid;
-    height: 100%;
+    grid-column: 3;
+    grid-row: 1;
+    grid-template-rows: minmax(230px, 1fr) 7px var(--terminal-height, 260px);
+  }
+
+  .ide-main.is-terminal-closed {
+    grid-template-rows: minmax(0, 1fr) 32px;
+  }
+
+  .ide-sidebar {
+    grid-column: 1;
+    grid-row: 1;
+  }
+
+  .ide-workspace > .explorer-resize-handle {
+    grid-column: 2;
+    grid-row: 1;
+  }
+
+  .primary-surface {
+    grid-column: 1;
+    grid-row: 1;
+  }
+
+  .terminal-resize-handle {
+    grid-column: 1;
+    grid-row: 2;
+  }
+
+  .terminal-dock {
+    grid-column: 1;
+    grid-row: 3;
+  }
+
+  .terminal-collapsed-bar {
+    grid-column: 1;
+    grid-row: 2;
+  }
+
+  .ide-workspace > .guide-resize-handle {
+    grid-column: 4;
+    grid-row: 1;
+  }
+
+  .quickstart-sidebar {
+    grid-column: 5;
+    grid-row: 1;
+  }
+
+  .primary-surface.is-history-review {
+    grid-template-columns: var(--commit-files-width, 286px) 7px minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr);
+  }
+
+  .commit-files-pane {
+    grid-column: 1;
+    grid-row: 1;
+    grid-template-rows: auto minmax(0, 1fr);
+    max-height: none;
+    border-right: 1px solid var(--swiss-ink);
+    border-bottom: 0;
+  }
+
+  .commit-files-resize-handle {
+    grid-column: 2;
+    grid-row: 1;
+  }
+
+  .primary-surface.is-history-review .primary-content {
+    grid-column: 3;
+    grid-row: 1;
+  }
+
+  .commit-files-group {
+    grid-template-rows: 27px minmax(0, 1fr);
+  }
+
+  .commit-file-list {
+    max-height: none;
   }
 }
 
@@ -6562,18 +6846,20 @@ textarea:focus-visible {
 /* The guide is a progressive curriculum, not one endless checklist. */
 .guide-tracks {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   border-block: 1px solid var(--swiss-ink);
 }
 
 .guide-tracks button {
+  position: relative;
   display: grid;
-  grid-template-columns: 17px minmax(0, 1fr);
-  grid-template-rows: auto auto;
-  gap: 1px 5px;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 4px;
   min-width: 0;
-  min-height: 47px;
-  padding: 7px 6px;
+  min-height: 38px;
+  padding: 0 7px 3px;
+  overflow: hidden;
   border: 0;
   border-right: 1px solid var(--swiss-line);
   color: var(--swiss-muted);
@@ -6582,12 +6868,8 @@ textarea:focus-visible {
   cursor: pointer;
 }
 
-.guide-tracks button:nth-child(2n) {
+.guide-tracks button:last-child {
   border-right: 0;
-}
-
-.guide-tracks button:nth-child(-n + 2) {
-  border-bottom: 1px solid var(--swiss-line);
 }
 
 .guide-tracks button[aria-current="step"] {
@@ -6595,12 +6877,10 @@ textarea:focus-visible {
   background: var(--swiss-ink);
 }
 
-.guide-tracks button > span {
-  grid-row: 1 / -1;
-  align-self: start;
+.guide-track-index {
   color: var(--swiss-red);
   font-family: "SFMono-Regular", Consolas, monospace;
-  font-size: 8px;
+  font-size: 7px;
   font-weight: 800;
 }
 
@@ -6618,7 +6898,28 @@ textarea:focus-visible {
 .guide-tracks small {
   color: inherit;
   font-family: "SFMono-Regular", Consolas, monospace;
-  font-size: 7px;
+  font-size: 6px;
+}
+
+.guide-track-fill {
+  position: absolute;
+  inset: auto 0 0;
+  height: 3px;
+  background: var(--swiss-soft);
+}
+
+.guide-track-fill > span {
+  display: block;
+  height: 100%;
+  background: var(--swiss-red);
+}
+
+.guide-tracks button[aria-current="step"] .guide-track-fill {
+  background: #34363b;
+}
+
+.guide-tracks button[aria-current="step"] .guide-track-fill > span {
+  background: #ff4b51;
 }
 
 .guide-track-intro {
@@ -6700,5 +7001,15 @@ textarea:focus-visible {
 
   .merge-continue-bar > div {
     grid-column: 1 / -1;
+  }
+}
+
+@media (max-width: 900px) {
+  .capabilities {
+    display: flex;
+  }
+
+  .capabilities > span:not(.graft-version) {
+    display: none;
   }
 }

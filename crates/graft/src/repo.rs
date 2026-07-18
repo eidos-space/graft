@@ -764,6 +764,11 @@ pub enum RepoTextContentState {
         size: u64,
         content_hash: object::ObjectId,
     },
+    Base64 {
+        content: String,
+        size: u64,
+        content_hash: object::ObjectId,
+    },
     TooLarge {
         size: u64,
         content_hash: object::ObjectId,

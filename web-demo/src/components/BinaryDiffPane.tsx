@@ -1,5 +1,5 @@
 import { useI18n } from "../i18n";
-import type { BinaryDiffView } from "../types";
+import type { BinaryContentState, BinaryDiffView } from "../types";
 
 function formatSize(bytes: number | undefined, locale: string, unavailable: string) {
   if (bytes === undefined) return unavailable;
@@ -14,9 +14,68 @@ function formatSize(bytes: number | undefined, locale: string, unavailable: stri
   return `${new Intl.NumberFormat(locale, { maximumFractionDigits: 1 }).format(value)} ${unit}`;
 }
 
+function imageMimeType(path: string) {
+  const extension = path.split(".").at(-1)?.toLowerCase();
+  if (extension === "avif") return "image/avif";
+  if (extension === "bmp") return "image/bmp";
+  if (extension === "gif") return "image/gif";
+  if (extension === "ico") return "image/x-icon";
+  if (extension === "jpg" || extension === "jpeg") return "image/jpeg";
+  if (extension === "png") return "image/png";
+  if (extension === "webp") return "image/webp";
+  return undefined;
+}
+
+function ImageRevision({
+  fileName,
+  label,
+  locale,
+  mimeType,
+  state,
+}: {
+  fileName: string;
+  label: string;
+  locale: string;
+  mimeType: string;
+  state: BinaryContentState | undefined;
+}) {
+  const { t } = useI18n();
+  const unavailable = !state
+    ? t("binaryDiff.state.unavailable")
+    : state.state === "absent"
+      ? t("binaryDiff.state.absent")
+      : state.state === "too_large"
+        ? t("binaryDiff.state.too_large")
+        : state.state === "missing_payload"
+          ? t("binaryDiff.state.missing_payload")
+          : state.state === "utf8"
+            ? t("binaryDiff.state.utf8")
+            : t("binaryDiff.state.invalid_utf8");
+  return (
+    <figure className={`binary-image-revision is-${state?.state ?? "unavailable"}`}>
+      <figcaption>
+        <strong>{label}</strong>
+        <span>{formatSize(state?.size, locale, t("binaryDiff.unavailable"))}</span>
+      </figcaption>
+      <div>
+        {state?.state === "base64" && state.content ? (
+          <img
+            alt={t("binaryDiff.imageAlt", { file: fileName, revision: label })}
+            src={`data:${mimeType};base64,${state.content}`}
+          />
+        ) : (
+          <span>{unavailable}</span>
+        )}
+      </div>
+    </figure>
+  );
+}
+
 export function BinaryDiffPane({ diff }: { diff: BinaryDiffView }) {
   const { locale, t } = useI18n();
   const fileName = diff.path.split("/").at(-1) ?? diff.path;
+  const mimeType = imageMimeType(diff.path);
+  const hasImageHistory = Boolean(mimeType && (diff.before || diff.after));
 
   return (
     <section className="binary-diff-surface" aria-label={t("binaryDiff.label", { path: diff.path })}>
@@ -32,12 +91,30 @@ export function BinaryDiffPane({ diff }: { diff: BinaryDiffView }) {
         </div>
       </header>
 
-      <div className="binary-diff-content">
+      <div className={`binary-diff-content ${hasImageHistory ? "has-image-history" : ""}`}>
         <div className="binary-diff-heading">
-          <span>{t("binaryDiff.eyebrow")}</span>
+          <span>{t(hasImageHistory ? "binaryDiff.imageEyebrow" : "binaryDiff.eyebrow")}</span>
           <h1>{fileName}</h1>
-          <p>{t("binaryDiff.description")}</p>
+          <p>{t(hasImageHistory ? "binaryDiff.imageDescription" : "binaryDiff.description")}</p>
         </div>
+        {hasImageHistory && mimeType && (
+          <div className="binary-image-history">
+            <ImageRevision
+              fileName={fileName}
+              label={t("binaryDiff.before")}
+              locale={locale}
+              mimeType={mimeType}
+              state={diff.before}
+            />
+            <ImageRevision
+              fileName={fileName}
+              label={t("binaryDiff.after")}
+              locale={locale}
+              mimeType={mimeType}
+              state={diff.after}
+            />
+          </div>
+        )}
         <dl>
           <div>
             <dt>{t("binaryDiff.path")}</dt>

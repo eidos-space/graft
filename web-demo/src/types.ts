@@ -153,10 +153,19 @@ export interface TextDiffView extends DiffViewBase {
 }
 
 export interface BinaryDiffView extends DiffViewBase {
+  after?: BinaryContentState;
+  before?: BinaryContentState;
   change: "added" | "deleted" | "modified" | "untracked";
   kind: "binary_file";
   size?: number;
   storage: RepoStatusPath["storage"];
+}
+
+export interface BinaryContentState {
+  content?: string;
+  content_hash?: string;
+  size?: number;
+  state: "absent" | "utf8" | "base64" | "too_large" | "missing_payload" | "invalid_utf8";
 }
 
 export interface SqliteRowChange {

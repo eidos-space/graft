@@ -161,7 +161,7 @@ enum Command {
         #[arg(long, value_enum)]
         kind: Option<PathKind>,
 
-        /// Include bounded UTF-8 content for one changed text path
+        /// Include bounded UTF-8 or Base64 content for one changed artifact path
         #[arg(long, requires = "json", conflicts_with_all = ["rows", "staged"])]
         content: bool,
 

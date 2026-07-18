@@ -39,4 +39,17 @@ mkdir -p web-demo/public/wasm
 cp target/wasm32-unknown-emscripten/release/graft.js web-demo/public/wasm/graft.js
 cp target/wasm32-unknown-emscripten/release/graft.wasm web-demo/public/wasm/graft.wasm
 
-echo "Wrote web-demo/public/wasm/graft.js and graft.wasm"
+graft_version="$(sed -nE 's/^version = "([^"]+)"/\1/p' crates/graft-tool/Cargo.toml | head -1)"
+if [[ -z "$graft_version" ]]; then
+  echo "Could not determine graft-tool version." >&2
+  exit 1
+fi
+if command -v sha256sum >/dev/null 2>&1; then
+  runtime_hash="$(sha256sum web-demo/public/wasm/graft.wasm | cut -d ' ' -f 1)"
+else
+  runtime_hash="$(shasum -a 256 web-demo/public/wasm/graft.wasm | cut -d ' ' -f 1)"
+fi
+printf '{\n  "version": "%s",\n  "build": "%s"\n}\n' \
+  "$graft_version" "${runtime_hash:0:16}" >web-demo/public/wasm/version.json
+
+echo "Wrote web-demo/public/wasm/graft.js, graft.wasm, and version.json ($graft_version, ${runtime_hash:0:16})"

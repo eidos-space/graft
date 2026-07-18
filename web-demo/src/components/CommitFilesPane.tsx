@@ -40,59 +40,60 @@ export function CommitFilesPane({
 
   return (
     <section className="commit-files-pane" data-area="commit-files">
-      <header className="commit-files-header">
-        <span>{t("version.commitDetails")}</span>
-        <strong>{commit ? commit.id.slice(0, 8) : "—"}</strong>
-      </header>
-
       {commit ? (
         <>
           <div className="commit-summary">
+            <div className="commit-summary-meta">
+              <span>{t("version.commitDetails")}</span>
+              <code>{commit.id.slice(0, 8)}</code>
+            </div>
             <strong>{commit.message}</strong>
             <small>
               {formatDate(commit.timestamp_ms, locale)}
               {commit.parent ? ` · ${commit.parent.slice(0, 8)} → ${commit.id.slice(0, 8)}` : ""}
             </small>
           </div>
-          <div className="commit-files-heading">
-            <span>{t("version.commitFiles")}</span>
-            <b>{changes.length}</b>
-          </div>
-          <div className="commit-file-list">
-            {changes.length > 0 ? (
-              changes.map((change) => {
-                const active = selectedPath === change.path;
-                return (
-                  <button
-                    aria-current={active ? "page" : undefined}
-                    aria-label={t("version.openCommitFile", {
-                      commit: commit.id.slice(0, 8),
-                      path: change.path,
-                    })}
-                    className={active ? "is-selected" : ""}
-                    key={change.path}
-                    onClick={() => onSelectPath(commit, change.path)}
-                    type="button"
-                  >
-                    <span className={`change-code change-${change.change}`}>
-                      {change.change.slice(0, 1).toUpperCase()}
-                    </span>
-                    <span>
+          <div className="commit-files-group">
+            <div className="commit-files-heading">
+              <span>{t("version.commitFiles")}</span>
+              <b>{changes.length}</b>
+            </div>
+            <div className="commit-file-list">
+              {changes.length > 0 ? (
+                changes.map((change) => {
+                  const active = selectedPath === change.path;
+                  return (
+                    <button
+                      aria-current={active ? "page" : undefined}
+                      aria-label={t("version.openCommitFile", {
+                        commit: commit.id.slice(0, 8),
+                        path: change.path,
+                      })}
+                      className={active ? "is-selected" : ""}
+                      key={change.path}
+                      onClick={() => onSelectPath(commit, change.path)}
+                      title={change.path}
+                      type="button"
+                    >
+                      <span className={`change-code change-${change.change}`}>
+                        {change.change.slice(0, 1).toUpperCase()}
+                      </span>
                       <strong>{change.path}</strong>
                       <small>
                         {kindLabel(change.kind, t)} · {changeLabel(change.change, t)}
                       </small>
-                    </span>
-                  </button>
-                );
-              })
-            ) : (
-              <div className="commit-files-empty">{t("version.noCommitFiles")}</div>
-            )}
+                    </button>
+                  );
+                })
+              ) : (
+                <div className="commit-files-empty">{t("version.noCommitFiles")}</div>
+              )}
+            </div>
           </div>
         </>
       ) : (
         <div className="commit-files-placeholder">
+          <span>{t("version.commitDetails")}</span>
           <strong>{t("version.selectCommit")}</strong>
           <p>{t("version.selectCommitBody")}</p>
         </div>
