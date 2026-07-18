@@ -1,7 +1,7 @@
 {
   "owner": "eidos-space",
   "name": "graft",
-  "version": "0.5.7",
+  "version": "0.6.0",
   "repository": "https://github.com/eidos-space/graft",
   "authors": ["Carl Sverre"],
   "license": "MIT OR Apache-2.0",

@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+exclude = ["vendor/sqlite-plugin"]
 
 [workspace.package]
 authors = ["orbitinghail <hello@orbitinghail.dev>"]
