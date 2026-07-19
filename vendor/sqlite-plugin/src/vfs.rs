@@ -256,6 +256,8 @@ impl SqliteApi {
     /// 2. it is the callers responsibility to eventually free the allocated buffer
     pub unsafe fn mprintf(&self, s: &str, out: *mut *const c_char) -> VfsResult<()> {
         let s = CString::new(s).map_err(|_| vars::SQLITE_INTERNAL)?;
+        // PRAGMA output is data, not a format string. Passing it as the format
+        // argument would interpret literal `%` sequences and corrupt the result.
         let p = unsafe { (self.mprintf)(c"%s".as_ptr(), s.as_ptr()) };
         if p.is_null() {
             Err(vars::SQLITE_NOMEM)
