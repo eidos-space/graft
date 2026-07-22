@@ -1,5 +1,7 @@
 use super::*;
 
+const COMMIT_NO_STAGED_CHANGES: &str = "[graft:commit:no-staged-changes]";
+
 pub(super) fn run_repo_commit(
     runtime: &Runtime,
     file: &mut VolFile,
@@ -13,7 +15,13 @@ pub(super) fn run_repo_commit(
         stage_repo_add_all(runtime, file, &repo, None)?;
     }
     let tables = staged_commit_table_summary(runtime, &repo)?;
-    let commit = repo.commit_staged_with_table_summary(message, tables)?;
+    let commit = match repo.commit_staged_with_table_summary(message, tables) {
+        Ok(commit) => commit,
+        Err(graft::repo::RepoErr::NoStagedChanges) => {
+            return pragma_err!(COMMIT_NO_STAGED_CHANGES);
+        }
+        Err(err) => return Err(err.into()),
+    };
     let materialized = materialize_commit_sqlite_files(runtime, &repo, &commit)?;
     let branch = repo.current_branch()?;
     Ok(RepoCommitOutcome { commit, branch, materialized })

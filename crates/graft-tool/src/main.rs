@@ -993,12 +993,9 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
             )?);
         }
         Command::Commit { json, message } => {
-            print_output(run_repo_pragma(
-                db_override,
-                None,
-                commit_pragma(json),
-                Some(&message),
-            )?);
+            let output = run_repo_pragma(db_override, None, commit_pragma(json), Some(&message))
+                .map_err(clean_commit_error)?;
+            print_output(output);
         }
         Command::Diff {
             rows,
@@ -1433,6 +1430,18 @@ fn run_repo_pragma(
         None => resolve_repo_workspace_session()?,
     };
     run_pragma(&db, suffix, arg)
+}
+
+fn clean_commit_error(err: anyhow::Error) -> anyhow::Error {
+    const NO_STAGED_CHANGES: &str = "[graft:commit:no-staged-changes]";
+    if err
+        .chain()
+        .any(|cause| cause.to_string().contains(NO_STAGED_CHANGES))
+    {
+        anyhow::anyhow!("no changes added to commit")
+    } else {
+        err
+    }
 }
 
 fn run_repo_init(json: bool) -> Result<Option<String>> {
