@@ -849,6 +849,9 @@ fn changed_table_leaf_pages(
         return Ok(None);
     }
 
+    let leaf_pages: HashSet<u32> = from_pages.iter().copied().collect();
+    let non_leaf_pages_changed =
+        table_non_leaf_pages_changed(from_reader, to_reader, &leaf_pages, from_entry, to_entry)?;
     let mut changed_pages = Vec::new();
     for page_num in from_pages {
         let page_idx = PageIdx::try_new(page_num)
@@ -860,14 +863,44 @@ fn changed_table_leaf_pages(
             .read_page(page_idx)
             .map_err(|_| table_read_err("to", to_entry, ParseError::ReadError))?;
         if from_page != to_page
-            || from_scanner
-                .leaf_page_has_overflow(page_num, from_page.as_ref())
-                .map_err(|e| table_read_err("from", from_entry, e))?
+            || (non_leaf_pages_changed
+                && from_scanner
+                    .leaf_page_has_overflow(page_num, from_page.as_ref())
+                    .map_err(|e| table_read_err("from", from_entry, e))?)
         {
             changed_pages.push(page_num);
         }
     }
     Ok(Some(changed_pages))
+}
+
+fn table_non_leaf_pages_changed(
+    from_reader: &dyn VolumeRead,
+    to_reader: &dyn VolumeRead,
+    leaf_pages: &HashSet<u32>,
+    from_entry: &MasterEntry,
+    to_entry: &MasterEntry,
+) -> Result<bool, graft::err::LogicalErr> {
+    if from_reader.page_count() != to_reader.page_count() {
+        return Ok(true);
+    }
+    for page_num in 2..=from_reader.page_count().to_u32() {
+        if leaf_pages.contains(&page_num) {
+            continue;
+        }
+        let page_idx = PageIdx::try_new(page_num)
+            .ok_or_else(|| table_read_err("from", from_entry, ParseError::InvalidPageNumber))?;
+        let from_page = from_reader
+            .read_page(page_idx)
+            .map_err(|_| table_read_err("from", from_entry, ParseError::ReadError))?;
+        let to_page = to_reader
+            .read_page(page_idx)
+            .map_err(|_| table_read_err("to", to_entry, ParseError::ReadError))?;
+        if from_page != to_page {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn table_read_err(side: &str, entry: &MasterEntry, err: ParseError) -> graft::err::LogicalErr {
