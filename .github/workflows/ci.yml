@@ -80,7 +80,10 @@ jobs:
         run: just run sqlite test
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets
+        # Lint first-party crates without re-linting the pinned vendored sources.
+        # The vendored crates retain their upstream lint policy and are still
+        # compiled as dependencies and exercised by the workspace test suite.
+        run: cargo clippy --workspace --all-targets --exclude fjall --exclude sqlite-plugin --no-deps
 
   msrv:
     name: Check MSRV 1.91

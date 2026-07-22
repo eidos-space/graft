@@ -27,7 +27,7 @@ function quoteIdentifier(value: string) {
 
 function sqlValue(value: string, type: string) {
   if (value.toUpperCase() === "NULL") return "NULL";
-  const numeric = /(INT|REAL|FLOA|DOUB|NUM|DEC|BOOL)/i.test(type);
+  const numeric = /(INT|REAL|FLOA|DOUBLE|NUM|DEC|BOOL)/i.test(type);
   if (numeric && /^[-+]?(?:\d+\.?\d*|\.\d+)$/.test(value.trim())) return value.trim();
   return `'${value.replaceAll("'", "''")}'`;
 }
