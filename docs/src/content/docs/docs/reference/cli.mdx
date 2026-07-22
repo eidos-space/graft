@@ -65,7 +65,7 @@ graft diff --json --rows HEAD~1 HEAD data.sqlite
 graft diff --json --content --max-content-bytes 65536 HEAD~1 HEAD notes.md
 ```
 
-In v0.6.0, `diff --content` returns bounded content for one changed UTF-8 text
+In v0.6.1, `diff --content` returns bounded content for one changed UTF-8 text
 artifact. It requires `--json`, cannot be combined with `--rows` or `--staged`,
 and uses 1 MiB when `--max-content-bytes` is omitted.
 
