@@ -63,7 +63,7 @@ graft diff --json --rows HEAD~1 HEAD data.sqlite
 graft diff --json --content --max-content-bytes 65536 HEAD~1 HEAD notes.md
 ```
 
-在 v0.6.0 中，`diff --content` 会返回一个 changed UTF-8 text artifact 的
+在 v0.6.1 中，`diff --content` 会返回一个 changed UTF-8 text artifact 的
 bounded content。它要求 `--json`，不能和 `--rows` 或 `--staged` 一起使用；
 未提供 `--max-content-bytes` 时默认上限为 1 MiB。
 

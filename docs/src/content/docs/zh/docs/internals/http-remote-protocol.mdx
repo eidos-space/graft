@@ -57,7 +57,7 @@ ref paths 由服务事务化存储；object paths 存入 backing object store。
 
 ## 服务端实现要求
 
-Graft v0.6.0 只包含 client，不包含 HTTP server。兼容服务需要提供 durable
+Graft v0.6.1 只包含 client，不包含 HTTP server。兼容服务需要提供 durable
 immutable object storage、对 refs 的 transactional compare-and-swap、私有
 repository 的 bearer-token authorization，以及上表中的 status-code 行为。
 
