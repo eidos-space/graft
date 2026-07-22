@@ -269,6 +269,127 @@ impl<'a> TableScanner<'a> {
         Ok(rows)
     }
 
+    /// Return the leaf page numbers reachable from a table B-tree root.
+    pub fn table_leaf_pages(&self, root_page: u32) -> Result<Vec<u32>, ParseError> {
+        let mut pages = Vec::new();
+        self.collect_table_leaf_pages(root_page, &mut pages)?;
+        Ok(pages)
+    }
+
+    /// Read rows from a known subset of table leaf pages.
+    pub fn read_rows_from_leaf_pages(
+        &self,
+        leaf_pages: &[u32],
+    ) -> Result<HashMap<i64, Record>, ParseError> {
+        let mut cells = Vec::new();
+        for &page_num in leaf_pages {
+            let (full_page, header_offset, header) = self.read_table_page(page_num)?;
+            if header.page_type != 13 {
+                return Err(ParseError::InvalidPage);
+            }
+            self.read_leaf_cells(full_page.as_ref(), header_offset, &header, &mut cells)?;
+        }
+
+        let mut rows = HashMap::new();
+        for cell in cells {
+            rows.insert(cell.rowid, Record::parse(&cell.payload)?);
+        }
+        Ok(rows)
+    }
+
+    /// Return true when a leaf may depend on overflow pages not represented by its own bytes.
+    pub fn leaf_page_has_overflow(
+        &self,
+        page_num: u32,
+        full_page: &[u8],
+    ) -> Result<bool, ParseError> {
+        let header_offset = if page_num == 1 { 100 } else { 0 };
+        if full_page.len() < header_offset + 8 {
+            return Err(ParseError::InvalidPage);
+        }
+        let header = Self::read_btree_header(&full_page[header_offset..])?;
+        if header.page_type != 13 {
+            return Err(ParseError::InvalidPage);
+        }
+        for cell_index in 0..header.num_cells {
+            let ptr_offset = header_offset + header.header_size() + usize::from(cell_index) * 2;
+            if ptr_offset + 2 > full_page.len() {
+                return Err(ParseError::InvalidCell);
+            }
+            let cell_offset = usize::from(u16::from_be_bytes([
+                full_page[ptr_offset],
+                full_page[ptr_offset + 1],
+            ]));
+            let usable_end = self.usable_size().min(full_page.len());
+            if cell_offset >= usable_end {
+                return Err(ParseError::InvalidCell);
+            }
+            let (payload_size, bytes_read) = read_varint(&full_page[cell_offset..usable_end]);
+            if payload_size < 0 || bytes_read == 0 {
+                return Err(ParseError::InvalidCell);
+            }
+            let payload_size =
+                usize::try_from(payload_size).map_err(|_| ParseError::InvalidCell)?;
+            if self.local_table_leaf_payload_size(payload_size) < payload_size {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn collect_table_leaf_pages(
+        &self,
+        page_num: u32,
+        pages: &mut Vec<u32>,
+    ) -> Result<(), ParseError> {
+        let (full_page, header_offset, header) = self.read_table_page(page_num)?;
+        let page_bytes = full_page.as_ref();
+        match header.page_type {
+            13 => pages.push(page_num),
+            5 => {
+                if let Some(right_child) = header.right_child_ptr {
+                    self.collect_table_leaf_pages(right_child, pages)?;
+                }
+                for cell_index in 0..header.num_cells {
+                    let ptr_offset =
+                        header_offset + header.header_size() + usize::from(cell_index) * 2;
+                    if ptr_offset + 2 > page_bytes.len() {
+                        return Err(ParseError::InvalidCell);
+                    }
+                    let cell_offset = usize::from(u16::from_be_bytes([
+                        page_bytes[ptr_offset],
+                        page_bytes[ptr_offset + 1],
+                    ]));
+                    let cell = Self::parse_table_interior_cell(&page_bytes[cell_offset..])?
+                        .ok_or(ParseError::InvalidCell)?;
+                    self.collect_table_leaf_pages(cell.left_child, pages)?;
+                }
+            }
+            _ => return Err(ParseError::InvalidPage),
+        }
+        Ok(())
+    }
+
+    fn read_table_page(
+        &self,
+        page_num: u32,
+    ) -> Result<(graft::core::page::Page, usize, BtreePageHeader), ParseError> {
+        if page_num == 0 || page_num > self.header.num_pages {
+            return Err(ParseError::InvalidPageNumber);
+        }
+        let page_idx = PageIdx::try_new(page_num).ok_or(ParseError::InvalidPageNumber)?;
+        let full_page = self
+            .reader
+            .read_page(page_idx)
+            .map_err(|_| ParseError::ReadError)?;
+        let header_offset = if page_num == 1 { 100 } else { 0 };
+        if full_page.len() < header_offset + 8 {
+            return Err(ParseError::InvalidPage);
+        }
+        let header = Self::read_btree_header(&full_page[header_offset..])?;
+        Ok((full_page, header_offset, header))
+    }
+
     /// Recursively scan B-tree pages
     fn scan_table_page(
         &self,

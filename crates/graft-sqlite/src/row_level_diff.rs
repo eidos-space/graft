@@ -628,7 +628,7 @@ fn row_level_diff_from_readers(
         let changes = match (from_entry, to_entry) {
             (Some(from), Some(to)) => {
                 // Table exists in both, diff rows
-                diff_table_rows(from_reader, to_reader, from, to)?
+                diff_table_rows(from_reader, to_reader, &from_scanner, &to_scanner, from, to)?
             }
             (Some(from), None) => {
                 // Table deleted, all rows are DELETE
@@ -768,14 +768,34 @@ fn change_kind_label(kind: SchemaChangeKind) -> &'static str {
 fn diff_table_rows(
     from_reader: &dyn VolumeRead,
     to_reader: &dyn VolumeRead,
+    from_scanner: &TableScanner<'_>,
+    to_scanner: &TableScanner<'_>,
     from_entry: &MasterEntry,
     to_entry: &MasterEntry,
 ) -> Result<Vec<RowChange>, graft::err::LogicalErr> {
-    // Read rows from both versions
-    let from_rows = read_all_rows(from_reader, from_entry.root_page)
-        .map_err(|e| table_read_err("from", from_entry, e))?;
-    let to_rows = read_all_rows(to_reader, to_entry.root_page)
-        .map_err(|e| table_read_err("to", to_entry, e))?;
+    let changed_leaf_pages = changed_table_leaf_pages(
+        from_reader,
+        to_reader,
+        from_scanner,
+        to_scanner,
+        from_entry,
+        to_entry,
+    )?;
+    let (from_rows, to_rows) = if let Some(leaf_pages) = changed_leaf_pages {
+        let from_rows = from_scanner
+            .read_rows_from_leaf_pages(&leaf_pages)
+            .map_err(|e| table_read_err("from", from_entry, e))?;
+        let to_rows = to_scanner
+            .read_rows_from_leaf_pages(&leaf_pages)
+            .map_err(|e| table_read_err("to", to_entry, e))?;
+        (from_rows, to_rows)
+    } else {
+        let from_rows = read_all_rows(from_reader, from_entry.root_page)
+            .map_err(|e| table_read_err("from", from_entry, e))?;
+        let to_rows = read_all_rows(to_reader, to_entry.root_page)
+            .map_err(|e| table_read_err("to", to_entry, e))?;
+        (from_rows, to_rows)
+    };
 
     let mut changes = Vec::new();
 
@@ -809,6 +829,45 @@ fn diff_table_rows(
     }
 
     Ok(changes)
+}
+
+fn changed_table_leaf_pages(
+    from_reader: &dyn VolumeRead,
+    to_reader: &dyn VolumeRead,
+    from_scanner: &TableScanner<'_>,
+    to_scanner: &TableScanner<'_>,
+    from_entry: &MasterEntry,
+    to_entry: &MasterEntry,
+) -> Result<Option<Vec<u32>>, graft::err::LogicalErr> {
+    let from_pages = from_scanner
+        .table_leaf_pages(from_entry.root_page)
+        .map_err(|e| table_read_err("from", from_entry, e))?;
+    let to_pages = to_scanner
+        .table_leaf_pages(to_entry.root_page)
+        .map_err(|e| table_read_err("to", to_entry, e))?;
+    if from_pages != to_pages {
+        return Ok(None);
+    }
+
+    let mut changed_pages = Vec::new();
+    for page_num in from_pages {
+        let page_idx = PageIdx::try_new(page_num)
+            .ok_or_else(|| table_read_err("from", from_entry, ParseError::InvalidPageNumber))?;
+        let from_page = from_reader
+            .read_page(page_idx)
+            .map_err(|_| table_read_err("from", from_entry, ParseError::ReadError))?;
+        let to_page = to_reader
+            .read_page(page_idx)
+            .map_err(|_| table_read_err("to", to_entry, ParseError::ReadError))?;
+        if from_page != to_page
+            || from_scanner
+                .leaf_page_has_overflow(page_num, from_page.as_ref())
+                .map_err(|e| table_read_err("from", from_entry, e))?
+        {
+            changed_pages.push(page_num);
+        }
+    }
+    Ok(Some(changed_pages))
 }
 
 fn table_read_err(side: &str, entry: &MasterEntry, err: ParseError) -> graft::err::LogicalErr {
@@ -1035,7 +1094,13 @@ fn opaque_table_change_kind(
         return opaque_root_page_change_kind(from_reader, to_reader, from, to);
     }
 
-    match diff_table_rows(from_reader, to_reader, from, to) {
+    let changes = (|| {
+        let from_scanner =
+            TableScanner::new(from_reader).map_err(|e| table_read_err("from", from, e))?;
+        let to_scanner = TableScanner::new(to_reader).map_err(|e| table_read_err("to", to, e))?;
+        diff_table_rows(from_reader, to_reader, &from_scanner, &to_scanner, from, to)
+    })();
+    match changes {
         Ok(changes) => (!changes.is_empty()).then_some(OpaqueChangeKind::Modified),
         Err(err) => {
             tracing::warn!(
