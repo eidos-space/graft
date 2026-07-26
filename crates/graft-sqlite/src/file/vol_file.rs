@@ -3,6 +3,7 @@ use std::{
     fmt::Debug,
     hash::{DefaultHasher, Hash, Hasher},
     mem,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -123,6 +124,7 @@ pub struct VolFile {
     repo_runtimes: Arc<RepoRuntimeRegistry>,
     workspace: Arc<WorkspaceCoordinator>,
     binding_enabled: bool,
+    repository_database: Option<PathBuf>,
     tag_bound: bool,
     workspace_writer_active: bool,
 
@@ -143,6 +145,32 @@ impl Debug for VolFile {
 }
 
 impl VolFile {
+    pub(crate) fn new_repository_session(
+        runtime: Runtime,
+        tag: String,
+        repository_database: Option<PathBuf>,
+        repo: Option<Repository>,
+        repo_runtimes: Arc<RepoRuntimeRegistry>,
+    ) -> Result<Self, ErrCtx> {
+        let volume = runtime.volume_open(None, None, None)?;
+        let mut file = Self::new_workspace_session(
+            runtime,
+            tag,
+            volume.vid,
+            OpenOpts::new(
+                sqlite_plugin::vars::SQLITE_OPEN_MAIN_DB
+                    | sqlite_plugin::vars::SQLITE_OPEN_READWRITE
+                    | sqlite_plugin::vars::SQLITE_OPEN_CREATE,
+            ),
+            Arc::new(Mutex::new(())),
+            repo,
+            repo_runtimes,
+            Arc::new(WorkspaceCoordinator::default()),
+        );
+        file.repository_database = repository_database;
+        Ok(file)
+    }
+
     pub fn new(
         runtime: Runtime,
         tag: String,
@@ -166,7 +194,7 @@ impl VolFile {
         )
     }
 
-    pub fn new_workspace_session(
+    pub(crate) fn new_workspace_session(
         runtime: Runtime,
         tag: String,
         vid: VolumeId,
@@ -210,6 +238,7 @@ impl VolFile {
             repo_runtimes,
             workspace,
             binding_enabled,
+            repository_database: None,
             tag_bound: binding_enabled,
             workspace_writer_active: false,
             reserved,
@@ -220,6 +249,18 @@ impl VolFile {
 
     pub fn runtime(&self) -> &Runtime {
         &self.runtime
+    }
+
+    /// Returns the `SQLite` database selected for row-aware repository operations.
+    ///
+    /// VFS-backed files use their open database path. A control-plane-only repository session has
+    /// no current volume binding, so the CLI passes its optional `--db` path separately.
+    pub(crate) fn repository_database_path(&self) -> Option<&Path> {
+        if self.binding_enabled {
+            Some(Path::new(&self.tag))
+        } else {
+            self.repository_database.as_deref()
+        }
     }
 
     pub fn attach_repo(&mut self, repo: Repository) -> Result<(), ErrCtx> {

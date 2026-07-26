@@ -5,12 +5,13 @@ description: 创建 Graft 仓库、提交 SQLite 数据和文件、查看行级 
 
 import { Aside, Steps } from "@astrojs/starlight/components";
 
-CLI 是试用 Graft 的最短路径。`graft sql` 会通过内置 Graft VFS 打开
-SQLite 数据库，所以不需要手动加载 SQLite 扩展。
+CLI 是试用 Graft 的最短路径。`graft sql` 打开普通物理 SQLite worktree 文件；
+repository command 直接调用 Graft control-plane service，不经过 SQLite extension
+或 repository PRAGMA。
 
 <Aside type="tip" title="想要零安装体验？">
   先打开 [Playground 导览](/zh/docs/quickstart/playground/)。它会在浏览器 OPFS
-  worktree 中运行同一个 v0.6.1 CLI，再引导你回到本地流程。
+  worktree 中运行同一个 v0.7.0 CLI，再引导你回到本地流程。
 </Aside>
 
 ## 创建仓库
@@ -32,7 +33,7 @@ SQLite 数据库，所以不需要手动加载 SQLite 扩展。
 
    这会创建 `.graft/`，但不会创建默认数据库。
 
-3. 通过 Graft 写入 SQLite。
+3. 写入 SQLite。
 
    ```bash
    graft sql --db data.sqlite "CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT);"
@@ -44,6 +45,9 @@ SQLite 数据库，所以不需要手动加载 SQLite 扩展。
    ```bash
    graft status
    ```
+
+   `data.sqlite` 仍是普通 SQLite 文件。repository command 需要检查或 stage 该
+   path 时，Graft 才读取它。
 
 5. 提交第一个应用状态版本。
 

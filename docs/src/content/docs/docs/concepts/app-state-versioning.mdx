@@ -104,12 +104,7 @@ graft add --all
 graft commit -m "save checkpoint"
 ```
 
-The SQLite extension is useful inside application processes:
-
-```sql
-PRAGMA graft_json_status;
-PRAGMA graft_add = '--all';
-PRAGMA graft_commit = 'save checkpoint';
-```
-
-Both surfaces operate on the same repository model.
+Applications can invoke the CLI with `--json` to consume the same repository
+model without scraping terminal text. They continue to open normal SQLite
+worktree files through their existing database library. The optional Graft VFS
+is a separate live page-storage mode, not a second repository command API.

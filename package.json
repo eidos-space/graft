@@ -1,0 +1,10 @@
+{
+  "name": "graft-js-workspace",
+  "private": true,
+  "packageManager": "pnpm@10.14.0",
+  "scripts": {
+    "build:remote": "pnpm --filter @eidos.space/graft-remote build && pnpm --filter @eidos.space/graft-remote-hono build && pnpm --filter @eidos.space/graft-remote-cloudflare build",
+    "check:remote": "pnpm --filter @eidos.space/graft-remote check && pnpm --filter @eidos.space/graft-remote build && pnpm --filter @eidos.space/graft-remote-hono check && pnpm --filter @eidos.space/graft-remote-hono build && pnpm --filter @eidos.space/graft-remote-cloudflare check && pnpm --filter @eidos.space/graft-remote-cloudflare build && pnpm --filter graft-remote-cloudflare-verification check",
+    "test:remote": "pnpm --filter @eidos.space/graft-remote test && pnpm --filter @eidos.space/graft-remote build && pnpm --filter @eidos.space/graft-remote-hono test && pnpm --filter @eidos.space/graft-remote-hono build && pnpm --filter @eidos.space/graft-remote-cloudflare check && pnpm --filter @eidos.space/graft-remote-cloudflare build && pnpm --filter graft-remote-cloudflare-verification test"
+  }
+}

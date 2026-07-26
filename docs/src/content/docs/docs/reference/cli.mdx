@@ -3,7 +3,10 @@ title: CLI
 description: Reference for the graft command-line interface.
 ---
 
-The `graft` CLI is intended for local development, scripting, demos, and manual repository operations. Repository commands share semantics with the SQLite extension, so CLI examples translate directly to `PRAGMA graft_*` calls inside an app.
+The `graft` CLI is the repository control plane for local development,
+scripting, application integration, demos, and manual operations. It calls the
+repository service directly; it does not route commands through SQLite
+PRAGMAs.
 
 ## Global Options
 
@@ -25,7 +28,8 @@ graft sql --db data.sqlite "CREATE TABLE t(id INTEGER PRIMARY KEY); INSERT INTO 
 cat script.sql | graft sql --db data.sqlite
 ```
 
-`graft sql` opens the database through the embedded Graft VFS. This is the easiest way to try Graft locally without loading the SQLite extension manually.
+`graft sql` opens a normal physical SQLite worktree file. It uses the same
+platform SQLite VFS as other database tools and application libraries.
 
 It requires an explicit `--db` path and an existing `.graft/` repository. Use `graft init` once in the worktree before creating or modifying a database through the CLI.
 
@@ -53,6 +57,11 @@ It requires an explicit `--db` path and an existing `.graft/` repository. Use `g
 | `graft export [--json] [--source rev] --output <file> [path]` | Write a Graft database snapshot as a physical SQLite file. |
 | `graft reset [--json] [--soft\|--mixed\|--hard] <rev>` | Move the current branch or HEAD. |
 
+When `graft add` stages a physical SQLite path, it takes a consistent online
+backup and compares 4 KiB pages with the current staged or committed snapshot.
+Committed WAL frames are included. Only changed pages extend Graft storage, and
+an unchanged file creates no new storage commit.
+
 `graft diff --rows` expands modified SQLite database snapshots into table and
 row changes:
 
@@ -65,7 +74,7 @@ graft diff --json --rows HEAD~1 HEAD data.sqlite
 graft diff --json --content --max-content-bytes 65536 HEAD~1 HEAD notes.md
 ```
 
-In v0.6.1, `diff --content` returns bounded content for one changed UTF-8 text
+In v0.7.0, `diff --content` returns bounded content for one changed UTF-8 text
 artifact. It requires `--json`, cannot be combined with `--rows` or `--staged`,
 and uses 1 MiB when `--max-content-bytes` is omitted.
 
@@ -123,12 +132,18 @@ graft export --source HEAD~1 --output data.previous.sqlite data.sqlite
 
 Without `--source`, `graft export` writes the current worktree database state for the requested path. With `--source`, it writes the database snapshot stored in that revision. The output is a normal SQLite database that can be opened by standard tools.
 
-If you edit a materialized or exported SQLite file with ordinary SQLite tooling, stage the physical file explicitly after the writer has closed and any WAL data has been checkpointed:
+If you edit a materialized or exported SQLite file with ordinary SQLite tooling,
+commit the transaction and stage the physical path. Manual WAL checkpointing is
+not required:
 
 ```bash
-sqlite3 data.sqlite "PRAGMA wal_checkpoint(TRUNCATE);"
+sqlite3 data.sqlite "INSERT INTO notes(body) VALUES ('external edit');"
 graft add data.sqlite
 ```
+
+Close database connections before commands that replace worktree files, such as
+checkout, switch, restore, or hard reset. Graft obtains SQLite locks, normalizes
+WAL state, and rejects replacement while another writer is active.
 
 ## Branches And Tags
 

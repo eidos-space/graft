@@ -1,21 +1,17 @@
 ---
 title: JSON 输出
-description: Graft commands 和 pragmas 返回的常见 app-facing JSON 字段。
+description: Graft CLI commands 返回的常见 app-facing JSON 字段。
 ---
 
-大多数 repository command 都有 JSON 形式。CLI 使用 `--json`：
+大多数 repository command 都有 JSON 形式，使用 `--json`：
 
 ```bash
 graft status --json
 graft diff --json --rows HEAD~1 HEAD data.sqlite
 ```
 
-SQLite 使用 `graft_json_*` pragmas：
-
-```sql
-PRAGMA graft_json_status;
-PRAGMA graft_json_diff = '--rows HEAD~1 HEAD -- data.sqlite';
-```
+SQLite 扩展不提供 repository JSON PRAGMA。嵌入式应用应启动 CLI 并消费这些
+稳定的 JSON 结果。
 
 ## Repository Position
 

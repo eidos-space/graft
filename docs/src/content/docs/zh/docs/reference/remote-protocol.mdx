@@ -1,0 +1,242 @@
+---
+title: Remote Service 协议
+description: 与具体实现无关的 Graft HTTP remote service 规范。
+---
+
+本文规定 Graft remote service protocol version 1。它是 Graft client 与
+remote service 之间的互操作契约，不限定编程语言、部署平台、数据库或对象存储。
+
+文中的 **必须（MUST）**、**不得（MUST NOT）**、**应该（SHOULD）**、
+**不应该（SHOULD NOT）**和**可以（MAY）**按
+[BCP 14](https://www.rfc-editor.org/rfc/rfc8174)解释。
+
+## Repository URL
+
+规范的 Git 风格 URL 是：
+
+```text
+https://host/<namespace>/<repository>
+```
+
+client 也必须接受显式 transport 形式：
+
+```text
+graft+https://host/<namespace>/<repository>
+```
+
+`graft+https` 选择本协议，wire 上仍使用 HTTPS。client 可以为本地开发或可信
+网络接受 `graft+http`；生产服务应该使用 HTTPS。
+
+repository path 是协议 base URL，对 client 不透明。服务若有不同的租户模型，
+可以使用多于两段的路径；面向用户的 URL 应保持熟悉的
+`<namespace>/<repository>` 形式，不得暴露内部 `/api/...` 路由或协议版本。
+
+可选的 `token_env` query 只属于 client 本地配置：
+
+```text
+https://host/acme/archive?token_env=GRAFT_ARCHIVE_TOKEN
+```
+
+client 发请求前必须移除 `token_env`，不得把 token 本身写进 URL。version 1
+repository URL 不得包含 userinfo、fragment 或其他 query parameter。
+
+## 协议版本
+
+每个请求必须包含：
+
+```http
+Graft-Protocol: 1
+```
+
+每个响应（包括错误响应）必须回显同一 header。无法提供请求版本的服务应该返回
+`426 Upgrade Required`，并通过 `Graft-Protocol` 声明所支持的版本。版本属于
+协商元数据，不属于 repository URL。
+
+## 认证
+
+服务可以要求授权。version 1 client 支持 bearer token：
+
+```http
+Authorization: Bearer <token>
+```
+
+默认环境变量是 `GRAFT_REMOTE_TOKEN`，`token_env` 可选择另一个变量。凭证缺失或
+无效时应该返回 `401` 和合适的 `WWW-Authenticate` header。token 签发、租户和
+ACL 存储不属于本协议。
+
+## Repository Descriptor
+
+`GET {base}` 返回用于诊断和 capability discovery 的描述：
+
+```json
+{
+  "protocol": "graft-remote",
+  "version": 1,
+  "capabilities": ["range", "list", "put-if-absent", "cas", "cad"]
+}
+```
+
+响应可以增加字段，client 必须忽略未知字段。
+
+## Object Key
+
+操作使用 repository-relative 的 opaque key。version 1 已知 key 包括：
+
+```text
+HEAD
+refs/heads/<branch>
+objects/<fanout>/<object-id>
+objects/pack/<pack-id>.pack
+objects/pack/<pack-id>.idx
+store/files/<fanout>/<object-id>
+logs/<log-id>/commits/<lsn>
+segments/<segment-id>
+```
+
+`HEAD` 和 `refs/**` 是事务元数据；`objects/**`、`store/**`、`logs/**` 和
+`segments/**` 下的内容创建后不可变。`locks/**` 是保留 namespace，不得作为
+repository 数据暴露。
+
+每个 key segment 独立进行 UTF-8 percent encoding。`/` 只作为分隔符，不得作为
+segment 数据编码。空 segment、`.`、`..`、反斜杠、NUL、控制字符和非法 percent
+encoding 必须被拒绝。服务可以公布 key/body 限制，并在超限时返回 `413`/`414`。
+
+## 操作
+
+下表 path 都相对于 `{base}`：
+
+| Request | 用途 | 成功状态 |
+| --- | --- | --- |
+| `HEAD /raw/<key>` | 检查存在性和大小。 | `200 OK` |
+| `GET /raw/<key>` | 读取原始字节。 | `200 OK` |
+| `PUT /raw/<key>` | 替换事务元数据。 | `204 No Content` |
+| `DELETE /raw/<key>` | 删除事务元数据。 | `204 No Content` |
+| `PUT /raw-if-not-exists/<key>` | 仅当对象不存在时创建。 | `204 No Content` |
+| `POST /cas/<key>` | 原子 compare-and-swap。 | `204 No Content` |
+| `POST /cad/<key>` | 原子 compare-and-delete。 | `204 No Content` |
+| `GET /list?prefix=<prefix>` | 递归列举 key。 | `200 OK` |
+
+`PUT` 和 `POST /cas` 的 body 是新的原始字节，应该使用
+`application/octet-stream`。mutation 成功响应没有 body。
+成功的 `HEAD` 响应必须通过 `Content-Length` 返回对应完整 `GET` 的字节数。
+
+服务必须为不可变对象支持 `raw-if-not-exists`，并应该拒绝不可变对象的无条件覆盖
+或删除。Graft 的发布顺序是：先发布不可变对象，pack 成功后发布 index，最后 CAS
+更新 ref。ref 更新失败可以留下不可达对象，但不会暴露不完整 commit。
+
+对已不存在 key 的 `DELETE /raw` 应该仍成功，以保持幂等。
+
+## Compare 操作
+
+`POST /cas` 和 `POST /cad` 用两个 header 携带 expected value：
+
+```http
+x-graft-expected-present: true
+x-graft-expected-hex: 6162630a
+```
+
+- `present: false` 表示预期 key 不存在，此时 hex header 必须存在且为空；
+- `present: true` 表示当前字节必须精确等于小写 hex；空 hex 表示“存在的零长度
+  对象”，不同于“不存在”；
+- `/cas` 用 request body 替换匹配值；
+- `/cad` 删除匹配值且没有 request body。
+
+比较和 mutation 对 repository 的所有 client 必须表现为一个原子操作。`HEAD` 和
+`refs/**` 必须支持 CAS/CAD；服务可以拒绝对不可变 key 使用它们。
+
+## Range Read
+
+`GET /raw/<key>` 必须支持一个标准 byte range：
+
+```http
+Range: bytes=1024-2047
+```
+
+合法的部分响应返回 `206`、`Content-Range`、`Content-Length` 和
+`Accept-Ranges: bytes`。非法、多段或不可满足的 range 返回 `416`；object 存在时，
+该响应必须包含 `Content-Range: bytes */<size>`。大 request 和 response 应该使用
+stream，不应整体缓冲。
+
+## List
+
+`prefix` 作为单个 query component 编码，因此 `refs/heads/` 会发送为
+`refs%2Fheads%2F`。每页响应为：
+
+```json
+{
+  "paths": [
+    "refs/heads/feature/search",
+    "refs/heads/main"
+  ],
+  "next_cursor": "opaque-service-value"
+}
+```
+
+version 1 list 是递归的。为限制单次请求的工作量和内存，服务可以分页。响应包含
+`next_cursor` 时，client 必须把它原样作为一个编码后的 query component 请求下一页：
+
+```text
+GET /list?prefix=refs%2Fheads%2F&cursor=opaque-service-value
+```
+
+cursor 对 client 不透明；client 不得解析或自行构造。只有返回最后一页时，服务才能
+省略 `next_cursor`。可选的正整数 `limit` 是 page size hint，服务可以使用更小的已
+公布上限，或对超出范围的值返回 `400`。一次返回完整结果的服务仍兼容本规范；不含
+`next_cursor` 的响应也兼容早期 client。
+
+完整遍历必须恰好一次返回所有匹配 key，使用解码后的 repository-relative path。
+每页及所有 page 拼接后的结果都必须按 bytewise lexical order 升序排列。cursor
+必须向前推进，若会过期，服务应该公布有效期。
+
+## 状态码
+
+| 状态 | 含义 |
+| --- | --- |
+| `200` | 完整 read、descriptor、`HEAD` 或 list。 |
+| `204` | mutation 成功。 |
+| `206` | byte-range read 成功。 |
+| `400` | path、query、header 或 request 非法。 |
+| `401` / `403` | 缺少凭证或无权限。 |
+| `404` | repository 或 object 不存在。 |
+| `405` | 该 key 不允许此操作。 |
+| `409` | CAS/CAD 的 expected bytes 不匹配。 |
+| `412` | `raw-if-not-exists` 遇到已有 object。 |
+| `413` / `414` | 超过服务 body/key 限制。 |
+| `416` | range 非法或不可满足。 |
+| `423` | 使用锁的实现可以表示临时 lock contention。 |
+| `426` | 不支持请求的 `Graft-Protocol` 版本。 |
+| `429` | 服务限流；client 可以退避重试。 |
+| `500` / `503` | 服务端故障或服务配置不可用。 |
+
+`409` 与 `412` 有意区分：client 把 `409` 解释为并发 ref 变化，把 `412` 解释为
+create-only collision。
+
+错误应该使用 `application/problem+json`。client 必须依赖状态码，不得依赖某个
+特定 error body schema。
+
+## 一致性与持久性
+
+兼容服务必须提供：
+
+- mutation 成功后的 durable read-after-write；
+- `raw-if-not-exists` 的 create-only atomicity；
+- 每个事务 key 上 linearizable 的 CAS/CAD；
+- repository isolation；
+- byte-preserving read/write；
+- 在没有并发 mutation 时，一次完整 list 遍历能看到第一页请求前已完成且匹配
+  prefix 的所有 write。
+
+服务可以把事务元数据和不可变字节放在不同系统中。这些要求描述可观察行为，不规定
+实现方式。
+
+## 兼容性
+
+早期文档使用：
+
+```text
+graft+https://host/api/graft/v1/repos/acme/archive
+```
+
+服务可以保留该 path 作为兼容 alias，但新配置应该使用
+`https://host/acme/archive`（或显式 `graft+https` 形式）。client 必须把配置的
+repository base 当作 opaque value，不得自行插入旧 `/api/graft/v1/repos` prefix。

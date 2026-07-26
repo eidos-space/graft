@@ -109,7 +109,10 @@ pub(super) fn parse_remote_config_uri(uri: &str) -> Result<RemoteConfig, PragmaE
                 .map(ToString::to_string),
             endpoint,
         }
-    } else if let Some(rest) = uri.strip_prefix("graft+https://") {
+    } else if let Some(rest) = uri
+        .strip_prefix("https://")
+        .or_else(|| uri.strip_prefix("graft+https://"))
+    {
         let (path, token_env) = parse_http_remote_uri_query(rest)?;
         RemoteConfig::Http {
             url: format!("https://{path}"),
@@ -120,7 +123,7 @@ pub(super) fn parse_remote_config_uri(uri: &str) -> Result<RemoteConfig, PragmaE
         RemoteConfig::Http { url: format!("http://{path}"), token_env }
     } else {
         return Err(pragma_fail(
-            "remote URI must start with memory, fs://, s3://, s3_compatible://, graft+https://, or graft+http://",
+            "remote URI must start with memory, fs://, s3://, s3_compatible://, https://, graft+https://, or graft+http://",
         ));
     })
 }
@@ -159,20 +162,140 @@ pub(super) fn parse_s3_remote_uri_query(uri: &str) -> Result<(&str, Option<Strin
 }
 
 pub(super) fn parse_http_remote_uri_query(uri: &str) -> Result<(&str, Option<String>), PragmaErr> {
-    let (path, query) = uri
-        .split_once('?')
-        .map_or((uri, ""), |(path, query)| (path, query));
-    if path.is_empty() {
+    if uri.contains('#') {
         return Err(pragma_fail(
-            "Graft HTTP remote URI must include a host and path",
+            "Graft HTTP remote URI must not include a fragment",
         ));
     }
+
+    let (location, query) = uri
+        .split_once('?')
+        .map_or((uri, None), |(location, query)| (location, Some(query)));
+    validate_http_remote_location(location)?;
+    let token_env = match query {
+        Some(query) => parse_http_remote_query(query)?,
+        None => None,
+    };
+    Ok((location, token_env))
+}
+
+fn validate_http_remote_location(location: &str) -> Result<(), PragmaErr> {
+    let Some((authority, repository_path)) = location.split_once('/') else {
+        return Err(pragma_fail(
+            "Graft HTTP remote URI must include an authority and repository path",
+        ));
+    };
+    if repository_path.is_empty() {
+        return Err(pragma_fail(
+            "Graft HTTP remote URI must include an authority and repository path",
+        ));
+    }
+    validate_http_remote_authority(authority)?;
+    if repository_path.contains('\\') {
+        return Err(pragma_fail(
+            "Graft HTTP remote repository path must not contain backslashes",
+        ));
+    }
+    validate_http_remote_path_segments(repository_path)
+}
+
+fn validate_http_remote_authority(authority: &str) -> Result<(), PragmaErr> {
+    if authority.is_empty() {
+        return Err(pragma_fail(
+            "Graft HTTP remote URI must include an authority and repository path",
+        ));
+    }
+    if authority.contains('@') {
+        return Err(pragma_fail(
+            "Graft HTTP remote URI must not include userinfo",
+        ));
+    }
+    if authority.contains('\\')
+        || authority
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+    {
+        return Err(pragma_fail(
+            "Graft HTTP remote URI has an invalid authority",
+        ));
+    }
+    let valid = if authority.starts_with('[') {
+        validate_bracketed_http_remote_authority(authority)
+    } else {
+        let (host, port) = authority
+            .rsplit_once(':')
+            .map_or((authority, None), |(host, port)| (host, Some(port)));
+        !host.is_empty()
+            && !host.contains([':', '[', ']'])
+            && port.is_none_or(valid_http_remote_port)
+    };
+    if !valid {
+        return Err(pragma_fail(
+            "Graft HTTP remote URI has an invalid authority",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_bracketed_http_remote_authority(authority: &str) -> bool {
+    let Some(closing_bracket) = authority.find(']') else {
+        return false;
+    };
+    if authority[1..closing_bracket]
+        .parse::<std::net::Ipv6Addr>()
+        .is_err()
+    {
+        return false;
+    }
+    let suffix = &authority[closing_bracket + 1..];
+    suffix.is_empty() || suffix.strip_prefix(':').is_some_and(valid_http_remote_port)
+}
+
+fn valid_http_remote_port(port: &str) -> bool {
+    !port.is_empty()
+        && port.bytes().all(|byte| byte.is_ascii_digit())
+        && port.parse::<u16>().is_ok()
+}
+
+fn validate_http_remote_path_segments(repository_path: &str) -> Result<(), PragmaErr> {
+    for segment in repository_path.split('/') {
+        if segment.is_empty() {
+            return Err(pragma_fail(
+                "Graft HTTP remote repository path must not contain empty segments",
+            ));
+        }
+        if is_dot_segment(segment) {
+            return Err(pragma_fail(
+                "Graft HTTP remote repository path must not contain dot segments",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn is_dot_segment(segment: &str) -> bool {
+    segment == "."
+        || segment == ".."
+        || segment.eq_ignore_ascii_case("%2e")
+        || segment.eq_ignore_ascii_case(".%2e")
+        || segment.eq_ignore_ascii_case("%2e.")
+        || segment.eq_ignore_ascii_case("%2e%2e")
+}
+
+fn parse_http_remote_query(query: &str) -> Result<Option<String>, PragmaErr> {
     if query.is_empty() {
-        return Ok((path, None));
+        return Err(pragma_fail(
+            "Graft HTTP remote URI query must contain token_env",
+        ));
     }
 
     let mut token_env = None;
-    for part in query.split('&').filter(|part| !part.is_empty()) {
+    for part in query.split('&') {
+        if part.is_empty() {
+            return Err(pragma_fail(
+                "Graft HTTP remote URI query must not contain empty parameters",
+            ));
+        }
         let (key, value) = part
             .split_once('=')
             .map_or((part, ""), |(key, value)| (key, value));
@@ -195,7 +318,7 @@ pub(super) fn parse_http_remote_uri_query(uri: &str) -> Result<(&str, Option<Str
         }
     }
 
-    Ok((path, token_env))
+    Ok(token_env)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

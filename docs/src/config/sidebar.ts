@@ -160,8 +160,8 @@ export const sidebar = [
     items: [
       { label: "CLI", slug: "docs/reference/cli" },
       {
-        label: "SQLite PRAGMAs",
-        translations: { "zh-CN": "SQLite PRAGMA" },
+        label: "VFS PRAGMAs",
+        translations: { "zh-CN": "VFS PRAGMA" },
         slug: "docs/reference/pragmas",
       },
       {
@@ -183,6 +183,11 @@ export const sidebar = [
         label: "Remote URIs",
         translations: { "zh-CN": "远端 URI" },
         slug: "docs/reference/remote-uris",
+      },
+      {
+        label: "Remote Service Protocol",
+        translations: { "zh-CN": "Remote Service 协议" },
+        slug: "docs/reference/remote-protocol",
       },
       {
         label: "Glossary",
@@ -220,11 +225,6 @@ export const sidebar = [
         label: "Row Diff Engine",
         translations: { "zh-CN": "行级差异引擎" },
         slug: "docs/internals/row-diff-engine",
-      },
-      {
-        label: "HTTP Remote Protocol",
-        translations: { "zh-CN": "HTTP 远端协议" },
-        slug: "docs/internals/http-remote-protocol",
       },
     ],
   },

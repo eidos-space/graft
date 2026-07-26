@@ -13,7 +13,8 @@ pub(super) fn run_repo_merge_abort(
     let previous_files = current_repo_files_for_checkout(&repo)?;
     let previous_artifacts = current_repo_artifacts_for_checkout(&repo)?;
     let paths = checkout_plan_path_actions(&plan.checkout, &previous_files, &previous_artifacts);
-    preflight_workspace_checkout(&repo, &plan.checkout, &previous_files)?;
+    let _sqlite_replacement_guards =
+        preflight_workspace_checkout(&repo, &plan.checkout, &previous_files)?;
     let target = repo.apply_merge_abort_plan(&plan)?;
     checkout_repo_plan(
         runtime,
@@ -69,7 +70,8 @@ pub(super) fn run_repo_merge(
     ensure_checkout_plan_preserves_untracked_paths(runtime, file, &repo, &plan.checkout)?;
     let previous_files = current_repo_files_for_checkout(&repo)?;
     let previous_artifacts = current_repo_artifacts_for_checkout(&repo)?;
-    preflight_workspace_checkout(&repo, &plan.checkout, &previous_files)?;
+    let _sqlite_replacement_guards =
+        preflight_workspace_checkout(&repo, &plan.checkout, &previous_files)?;
     let mut outcome = repo.apply_merge_plan(&plan)?;
     checkout_merge_outcome(
         runtime,
@@ -81,14 +83,15 @@ pub(super) fn run_repo_merge(
         &previous_artifacts,
         None,
     )?;
-    let row_auto_merge =
-        match try_row_auto_merge_current_file_conflict(runtime, file, &repo, &outcome, None) {
-            Ok(row_auto_merge) => row_auto_merge,
-            Err(err) => {
-                tracing::warn!("row-level auto-merge unavailable: {err}");
-                None
-            }
-        };
+    let row_auto_merge = match try_row_auto_merge_current_file_conflict(
+        runtime, file, &repo, &outcome, None, true,
+    ) {
+        Ok(row_auto_merge) => row_auto_merge,
+        Err(err) => {
+            tracing::warn!("row-level auto-merge unavailable: {err}");
+            None
+        }
+    };
     if let Some(row_auto_merge) = &row_auto_merge {
         outcome = merge_outcome_with_row_auto_merge(&outcome, &row_auto_merge.key);
     }

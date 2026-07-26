@@ -19,6 +19,7 @@ export const DOC_REDIRECTS = {
   "/docs/internals/graft-objects/": "/docs/internals/object-formats/",
   "/docs/internals/snapshot-objects-v2/": "/docs/internals/object-formats/",
   "/docs/internals/row-diff-v2/": "/docs/internals/row-diff-engine/",
+  "/docs/internals/http-remote-protocol/": "/docs/reference/remote-protocol/",
   "/zh/docs/get-started/cli/": "/zh/docs/quickstart/cli/",
   "/zh/docs/get-started/sqlite-extension/": "/zh/docs/quickstart/sqlite-extension/",
   "/zh/docs/get-started/usage-guide/": "/zh/docs/quickstart/app-state-walkthrough/",
@@ -32,4 +33,5 @@ export const DOC_REDIRECTS = {
   "/zh/docs/internals/graft-objects/": "/zh/docs/internals/object-formats/",
   "/zh/docs/internals/snapshot-objects-v2/": "/zh/docs/internals/object-formats/",
   "/zh/docs/internals/row-diff-v2/": "/zh/docs/internals/row-diff-engine/",
+  "/zh/docs/internals/http-remote-protocol/": "/zh/docs/reference/remote-protocol/",
 } as const;

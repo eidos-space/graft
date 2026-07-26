@@ -89,11 +89,5 @@ modified: app.sqlite
       new: [Null, Text("write quickstart"), Text("done")]
 ```
 
-SQLite 扩展：
-
-```sql
-PRAGMA graft_json_diff = '--rows HEAD~1 HEAD -- data.sqlite';
-```
-
 普通应用 UI 应使用 repository commits 和 revspecs。LSN 级 debug diff 放在
 [快照存储与 LSN](/zh/docs/internals/snapshot-storage-lsns/)。

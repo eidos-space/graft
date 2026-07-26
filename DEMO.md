@@ -9,16 +9,17 @@ just run sqlite shell --release --client f1
 ```
 
 ```sql
+-- Low-level volume demo. Repository workflows use the graft CLI.
 -- volume on s3
-pragma graft_clone = '74ggoCYV4P-2r2cmkXpB2nJ5';
+pragma graft_debug_volume_clone = '74ggoCYV4P-2r2cmkXpB2nJ5';
 -- volume on fs
-pragma graft_clone = '74ggoDeWBQ-2o7qkWGgrdYDn.';
+pragma graft_debug_volume_clone = '74ggoDeWBQ-2o7qkWGgrdYDn.';
 
-pragma graft_pull;
-pragma graft_push;
-pragma graft_info;
-pragma graft_status;
-pragma graft_audit;
+pragma graft_debug_volume_pull;
+pragma graft_debug_volume_push;
+pragma graft_debug_volume_info;
+pragma graft_debug_volume_status;
+pragma graft_debug_volume_audit;
 
 -- get the total balance of all accounts
 SELECT SUM(balance) FROM accounts;

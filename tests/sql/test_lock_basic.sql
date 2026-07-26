@@ -1,8 +1,7 @@
--- initialize two connections to the same repository database
+-- initialize two connections to the same VFS database
 .connection 0
 .open "file:app.db?vfs=graft"
 .output /dev/null
-pragma graft_init;
 .read datasets/simple.sql
 .output stdout
 
@@ -72,11 +71,3 @@ commit;
 
 -- verify that we now see the new row
 select * from t;
-
--- check repository metadata commands without asserting dynamic output
-.output /dev/null
-pragma graft_status;
-pragma graft_add;
-pragma graft_commit = 'lock smoke final state';
-pragma graft_log;
-.output stdout

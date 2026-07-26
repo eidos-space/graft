@@ -3,20 +3,21 @@ title: 架构
 description: Graft core、SQLite integration、CLI、repository layer 和 remotes 的关系。
 ---
 
-本页面向贡献者和高级调试。产品集成通常应使用 CLI、SQLite PRAGMA、JSON 输出
-和配置参考。
+本页面面向贡献者和高级调试。产品集成通常应使用 CLI、JSON 输出和配置参考；
+SQLite extension 是可选 data-plane integration。
 
 ## Layers
 
 ```text
 Application
-  SQLite connection using vfs=graft
-  or graft CLI
+  ordinary SQLite connection -> physical worktree database
+  optional SQLite connection using vfs=graft
+  graft CLI / JSON
 
 graft-sqlite
-  VFS
-  PRAGMA parser
-  repository command adapters
+  repository command service (control plane)
+  physical SQLite snapshot/import boundary
+  optional VFS + VFS diagnostic PRAGMAs (data plane)
 
 graft
   repository model
@@ -30,7 +31,7 @@ graft
 | Crate | 作用 |
 | --- | --- |
 | `graft` | core storage、repository objects、refs、index、merge、sync、remotes。 |
-| `graft-sqlite` | SQLite VFS 和 repository PRAGMA。 |
+| `graft-sqlite` | repository command service、物理 SQLite import boundary 和可选 SQLite VFS。 |
 | `graft-ext` | SQLite extension wrapper。 |
 | `graft-tool` | CLI。 |
 | `graft-test` | integration tests 和 workloads。 |
@@ -38,29 +39,37 @@ graft
 
 ## CLI Flow
 
-多数 repository CLI command 是 repository PRAGMA 的薄封装：
+repository CLI command 直接调用 typed repository service：
 
 ```text
-graft status             -> PRAGMA graft_status
-graft add --all          -> PRAGMA graft_add = '--all'
-graft commit -m "msg"    -> PRAGMA graft_commit = 'msg'
-graft diff --rows ...    -> PRAGMA graft_diff = '--rows ...'
+CLI arguments
+  -> RepositoryCommand parser
+  -> repository-scoped runtime/session
+  -> repository operation
 ```
 
-`graft sql --db <path>` 通过内置 Graft VFS 打开数据库并执行 SQL。
+这条 control flow 不打开 SQLite connection，也不执行 PRAGMA。`graft sql --db
+<path>` 是独立的数据路径，使用普通 SQLite 打开物理 database。
 
 ## Commit / Checkout / Merge
 
 commit flow：
 
 ```text
-SQLite writes through Graft VFS
-  -> current database state advances
-  -> graft add records snapshot/artifact entries
+SQLite commits to physical database (main file and possibly WAL)
+  -> graft add takes a consistent private SQLite backup
+  -> unchanged pages are reused; changed pages extend Graft storage
+  -> index records the snapshot descriptor
   -> graft commit writes tree and commit objects
   -> branch ref moves
-  -> SQLite snapshots may be materialized
+  -> SQLite snapshots are materialized to physical worktree files
 ```
+
+可选 Graft VFS 会直接写 Volume page，因此跳过 physical import；它不暴露 repository
+command。
+
+checkout materialize 物理 database 前会取得 SQLite replacement lock、处理 WAL 并清理
+sidecar。活跃 writer 会阻止替换。
 
 merge flow 从 base/ours/theirs tree 开始，对 SQLite 路径做 row/schema
 analysis，对文件 artifact 使用保守 file-level conflicts。

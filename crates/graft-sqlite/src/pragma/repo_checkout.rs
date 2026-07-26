@@ -34,7 +34,8 @@ pub(super) fn run_repo_checkout(
             verify_repo_checkout_plan(runtime, &plan, None)?;
             let previous_files = current_repo_files_for_checkout(&repo)?;
             let previous_artifacts = current_repo_artifacts_for_checkout(&repo)?;
-            preflight_workspace_checkout(&repo, &plan, &previous_files)?;
+            let _sqlite_replacement_guards =
+                preflight_workspace_checkout(&repo, &plan, &previous_files)?;
             let id = repo.apply_detach_plan(&rev, &plan)?;
             checkout_repo_plan(
                 runtime,
@@ -410,9 +411,9 @@ pub(super) fn run_repo_reset(
     } else {
         Vec::new()
     };
-    if matches!(mode, ResetMode::Hard) {
-        preflight_workspace_checkout(&repo, &plan.checkout, &previous_files)?;
-    }
+    let _sqlite_replacement_guards = matches!(mode, ResetMode::Hard)
+        .then(|| preflight_workspace_checkout(&repo, &plan.checkout, &previous_files))
+        .transpose()?;
     let outcome = repo.apply_reset_plan(&plan)?;
 
     match mode {
@@ -682,7 +683,6 @@ impl<'a> WorkspaceCheckout<'a> {
         previous_artifacts: &BTreeMap<String, CommitArtifactState>,
         remote: Option<Arc<Remote>>,
     ) -> Result<(), ErrCtx> {
-        preflight_workspace_checkout(self.repo, plan, previous_files)?;
         let bindings = prepare_workspace_bindings(self.runtime, plan, remote)?;
         let previous_bindings = self.previous_bindings(plan, previous_files)?;
         let backups = WorkspacePhysicalBackups::stage(self.repo, plan, previous_files)?;
@@ -833,11 +833,18 @@ pub(super) fn preflight_workspace_checkout(
     repo: &Repository,
     plan: &CheckoutPlan,
     previous_files: &BTreeMap<String, CommitFileState>,
-) -> Result<(), ErrCtx> {
+) -> Result<Vec<SqliteReplacementGuard>, ErrCtx> {
+    let mut guards = Vec::new();
     for key in workspace_sqlite_keys(plan, previous_files) {
         let path = repo.worktree().join(&key);
         match std::fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(metadata) if metadata.file_type().is_file() => {
+                // Repository state is updated only after this preflight succeeds. Check ordinary
+                // SQLite locks and detach any WAL before the checkout backup can rename the file.
+                // Retain the exclusive transaction until materialization completes so an external
+                // writer cannot enter between this preflight and the destructive operation.
+                guards.push(prepare_sqlite_path_for_replacement(&path)?);
+            }
             Ok(_) => {
                 return pragma_err!(format!(
                     "path `{}` is not a regular SQLite database file",
@@ -851,7 +858,7 @@ pub(super) fn preflight_workspace_checkout(
     for state in plan.artifacts.values() {
         repo.verify_artifact_state(state)?;
     }
-    Ok(())
+    Ok(guards)
 }
 
 struct WorkspacePhysicalBackups {
@@ -1715,18 +1722,28 @@ pub(super) fn export_repo_path(
     }
 
     let current_key = repo.file_key(&file.tag)?;
-    if key != current_key {
-        return Err(ErrCtx::PragmaErr(
-            format!(
-                "exporting worktree path `{key}` requires opening that database path or passing --source"
-            )
-            .into(),
-        ));
+    if key == current_key {
+        let reader = file.reader()?;
+        write_volume_reader_to_path(&reader, &spec.output)?;
+        return Ok(key);
     }
 
-    let reader = file.reader()?;
-    write_volume_reader_to_path(&reader, &spec.output)?;
-    Ok(key)
+    // The default worktree is now a physical SQLite file. Export it through the same online
+    // backup boundary used by `add` so a committed WAL is included and the output is a standalone
+    // rollback-journal database. This also avoids treating the CLI's control session as a VFS
+    // Volume binding.
+    if physical_path.exists() && is_sqlite_database_path(&physical_path)? {
+        let reader = PhysicalSqliteReader::open(&physical_path)?;
+        write_volume_reader_to_path(&reader, &spec.output)?;
+        return Ok(key);
+    }
+
+    Err(ErrCtx::PragmaErr(
+        format!(
+            "worktree database `{key}` does not exist; pass --source to export a repository revision"
+        )
+        .into(),
+    ))
 }
 
 pub(super) fn update_worktree_state_after_index_restore_key(
@@ -1847,6 +1864,31 @@ pub(super) fn checkout_repo_file_state_to_key(
     bind_repo_file_state_to_path(runtime, state, &path)
 }
 
+pub(super) fn checkout_repo_file_state_to_prepared_key(
+    runtime: &Runtime,
+    repo: &Repository,
+    key: &str,
+    state: &CommitFileState,
+    remote: Option<Arc<Remote>>,
+) -> Result<(), ErrCtx> {
+    let path = repo.worktree().join(key);
+    if let Ok(metadata) = std::fs::symlink_metadata(&path)
+        && !metadata.file_type().is_file()
+    {
+        return Err(ErrCtx::PragmaErr(
+            format!(
+                "path `{}` is not a regular SQLite database file",
+                path.display()
+            )
+            .into(),
+        ));
+    }
+
+    hydrate_repo_file_state(runtime, state, remote)?;
+    write_repo_file_state_to_prepared_path(runtime, state, &path)?;
+    bind_repo_file_state_to_path(runtime, state, &path)
+}
+
 fn bind_repo_file_state_to_path(
     runtime: &Runtime,
     state: &CommitFileState,
@@ -1894,7 +1936,22 @@ pub(super) fn write_volume_reader_to_path<R: VolumeRead>(
 
 pub(super) fn write_sqlite_file_to_path(
     path: &Path,
+    write_contents: impl FnMut(&mut File) -> Result<(), ErrCtx>,
+) -> Result<(), ErrCtx> {
+    write_sqlite_file_to_path_inner(path, write_contents, true)
+}
+
+fn write_sqlite_file_to_prepared_path(
+    path: &Path,
+    write_contents: impl FnMut(&mut File) -> Result<(), ErrCtx>,
+) -> Result<(), ErrCtx> {
+    write_sqlite_file_to_path_inner(path, write_contents, false)
+}
+
+fn write_sqlite_file_to_path_inner(
+    path: &Path,
     mut write_contents: impl FnMut(&mut File) -> Result<(), ErrCtx>,
+    prepare_replacement: bool,
 ) -> Result<(), ErrCtx> {
     if let Ok(metadata) = std::fs::symlink_metadata(path)
         && !metadata.file_type().is_file()
@@ -1938,6 +1995,9 @@ pub(super) fn write_sqlite_file_to_path(
         })();
 
         match write_result.and_then(|()| {
+            let _replacement_guard = prepare_replacement
+                .then(|| prepare_sqlite_path_for_replacement(path))
+                .transpose()?;
             std::fs::rename(&tmp, path)?;
             Ok(())
         }) {
@@ -1969,6 +2029,25 @@ pub(super) fn write_repo_file_state_to_path(
     }
     let reader = runtime.snapshot_reader(snapshot);
     write_volume_reader_to_path(&reader, path)
+}
+
+fn write_repo_file_state_to_prepared_path(
+    runtime: &Runtime,
+    state: &CommitFileState,
+    path: &Path,
+) -> Result<(), ErrCtx> {
+    let snapshot = state.snapshot.to_snapshot();
+    if snapshot.is_empty() {
+        return write_sqlite_file_to_prepared_path(path, |_| Ok(()));
+    }
+    let reader = runtime.snapshot_reader(snapshot);
+    write_sqlite_file_to_prepared_path(path, |output| {
+        for page_idx in reader.page_count().iter() {
+            let page = reader.read_page(page_idx)?;
+            output.write_all(page.as_ref())?;
+        }
+        Ok(())
+    })
 }
 
 pub(super) fn checkout_merge_outcome(

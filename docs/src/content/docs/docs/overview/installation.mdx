@@ -14,19 +14,19 @@ Install the version documented by this site:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/eidos-space/graft/main/install.sh \
-  | GRAFT_VERSION=0.6.1 sh
+  | GRAFT_VERSION=0.7.0 sh
 ```
 
 Then check the binary:
 
 ```bash
 graft --version
-# graft 0.6.1
+# graft 0.7.0
 ```
 
 <Aside type="note" title="Latest release">
-  Omit `GRAFT_VERSION=0.6.1` to install the latest published release. Its
-  behavior may be newer than this v0.6.1 documentation.
+  Omit `GRAFT_VERSION=0.7.0` to install the latest published release. Its
+  behavior may be newer than this v0.7.0 documentation.
 </Aside>
 
 Prebuilt archives are also available from the
@@ -70,8 +70,9 @@ The exact library filename depends on the platform. It is written under
 .load ./libgraft_ext
 ```
 
-Use the extension when your app process already owns SQLite connections and
-wants to call `PRAGMA graft_*` directly.
+Use the extension when your app deliberately wants the Graft VFS as a live
+page-storage data plane. Repository commands are not exposed as SQLite
+PRAGMAs; use the CLI and its JSON output for the control plane.
 
 ## Build The Docs
 
@@ -85,6 +86,6 @@ pnpm build
 
 ## Next
 
-Run the [CLI quickstart](/docs/quickstart/cli/) first. Then use the
-[SQLite extension quickstart](/docs/quickstart/sqlite-extension/) when you are
-ready to embed Graft in an application.
+Run the [CLI quickstart](/docs/quickstart/cli/) first. Use the
+[SQLite extension quickstart](/docs/quickstart/sqlite-extension/) only when the
+application deliberately opts into the Graft VFS.

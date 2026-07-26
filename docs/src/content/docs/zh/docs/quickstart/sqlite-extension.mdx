@@ -1,102 +1,88 @@
 ---
 title: SQLite 扩展快速开始
-description: 使用 Graft VFS 和 repository PRAGMA 从 SQLite 调用 Graft。
+description: 把可选 Graft VFS 用作 SQLite live page-storage data plane。
 ---
 
 import { Aside, Steps } from "@astrojs/starlight/components";
 
-SQLite 扩展是应用集成 Graft 的主要入口。它注册 Graft VFS，并通过
-`PRAGMA graft_*` 暴露 repository 操作。
+大多数应用应使用普通 SQLite worktree file 和 Graft CLI。只有明确希望 SQLite 打开
+期间由 Graft Volume 保存 live pages 时，才需要 SQLite extension。
 
-<Aside type="tip" title="先评估工作流">
-  嵌入扩展前，先使用 [Playground](/zh/docs/quickstart/playground/) 或
-  [CLI 快速开始](/zh/docs/quickstart/cli/)。repository 模型和命令语义一致。
+extension 注册 `vfs=graft`，并提供 version 和低层 `graft_debug_*` PRAGMA。
+status、add、commit、branch、merge 和 sync 等 repository command 不再是 SQLite
+PRAGMA，统一通过 CLI 执行。
+
+<Aside type="caution" title="选择一条写入路径">
+  不要通过 platform file VFS 和 Graft VFS 同时写同一个逻辑 database。branch
+  operation 需要替换或 rebind database state 前，应关闭 live SQLite connection。
 </Aside>
 
-## 通过 Graft 打开数据库
+## 初始化 Repository
+
+先从 shell 创建 repository：
+
+```bash
+mkdir app-state
+cd app-state
+graft init
+```
+
+## 通过 Graft VFS 打开数据库
 
 在 SQLite shell 中：
 
 ```sql
 .load ./libgraft_ext
-.open "file:/path/to/project/data.sqlite?vfs=graft"
+.open "file:/path/to/app-state/data.sqlite?vfs=graft"
 ```
 
-初始化仓库：
+绝对路径仍映射为 repository-relative path `data.sqlite`，但 live pages 由 repository
+的 Graft storage 支撑，而不是普通 worktree file。
 
-```sql
-PRAGMA graft_init;
-```
-
-仓库状态会写到：
-
-```text
-/path/to/project/.graft/
-```
-
-## 基本流程
+## 写入和提交
 
 <Steps>
 
-1. 写入正常 SQLite 数据。
+1. 通过 VFS connection 执行普通 SQL。
 
    ```sql
    CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT NOT NULL);
    INSERT INTO users(name) VALUES ('Alice');
    ```
 
-2. 查看 repository status。
+2. 关闭 connection，再通过 CLI 查看和 stage。
 
-   ```sql
-   PRAGMA graft_status;
-   PRAGMA graft_json_status;
+   ```bash
+   graft status
+   graft add data.sqlite
+   graft commit -m "seed users"
    ```
 
-3. Stage 当前数据库 snapshot。
+3. 通过 CLI 比较 repository revision。
 
-   ```sql
-   PRAGMA graft_add;
-   ```
-
-4. Commit staged snapshot。
-
-   ```sql
-   PRAGMA graft_commit = 'seed users';
-   ```
-
-5. 比较 revisions。
-
-   ```sql
-   PRAGMA graft_diff = '--rows HEAD~1 HEAD -- data.sqlite';
-   PRAGMA graft_json_diff = '--rows HEAD~1 HEAD -- data.sqlite';
+   ```bash
+   graft diff --rows HEAD~1 HEAD data.sqlite
+   graft diff --json --rows HEAD~1 HEAD data.sqlite
    ```
 
 </Steps>
 
-## Path-Based Repository Mode
+## Extension Diagnostics
 
-打开 `/project/data.sqlite` 时，Graft 会把它映射为 worktree 中的
-`data.sqlite`。repository 命令操作的是 worktree 路径，而不是隐式全局
-数据库。
-
-一个仓库可以跟踪多个数据库：
-
-```text
-project/
-  data.sqlite
-  analytics.sqlite
-  .graft/
-```
+生产 extension 的 PRAGMA 表面刻意保持很小：
 
 ```sql
-PRAGMA graft_add = 'analytics.sqlite';
-PRAGMA graft_commit = 'track analytics database';
+PRAGMA graft_version;
+PRAGMA graft_debug_volume_info;
+PRAGMA graft_debug_volume_json_info;
+PRAGMA graft_debug_log_lsn;
 ```
 
-应用 UI 应优先使用 JSON pragmas：
+这些命令检查当前 VFS Volume，不读取或修改 repository branch、index、commit、remote
+或 merge state。完整列表见 [VFS PRAGMA](/zh/docs/reference/pragmas/)。
 
-```sql
-PRAGMA graft_json_status;
-PRAGMA graft_json_diff = '--rows HEAD~1 HEAD -- data.sqlite';
-PRAGMA graft_json_conflicts;
-```
+## 默认物理模式
+
+如果不需要 live Volume storage，就跳过 extension 并正常打开 `data.sqlite`。
+`graft add` 会取得一致 SQLite backup、包含 committed WAL frames，并且只存储相对
+当前 staged 或 committed snapshot 发生变化的 page。这是大多数应用的推荐集成方式。

@@ -4,12 +4,12 @@ description: Current Graft capabilities, stability boundaries, and what to expec
 ---
 
 Graft is an experimental project. This documentation targets the
-[v0.6.1 release](https://github.com/eidos-space/graft/releases/latest) and
+[v0.7.0 release](https://github.com/eidos-space/graft/releases/latest) and
 focuses on
 app-state versioning for SQLite-backed apps: SQLite database snapshots,
 app-owned files, row-aware diffs, merge support, and remote sync.
 
-Features that exist only on the development branch are not part of the v0.6.1
+Features that exist only on the development branch are not part of the v0.7.0
 documentation unless a page labels them as unreleased.
 
 ## Available Today
@@ -19,7 +19,8 @@ documentation unless a page labels them as unreleased.
   `diff`, `checkout`, `restore`, `export`, `reset`, `branch`, `switch`, `tag`,
   `merge`, `conflicts`, `resolve`, `remote`, `ls-remote`, `fetch`, `pull`, and
   `push`.
-- A SQLite extension that exposes repository operations through `PRAGMA graft_*`.
+- A SQLite extension that provides the optional Graft VFS plus version and
+  low-level `graft_debug_*` diagnostics.
 - Repository-local state under `.graft/`.
 - Multiple tracked SQLite database paths in one worktree.
 - Text and binary file artifacts in the same commit tree as SQLite snapshots.
@@ -32,8 +33,8 @@ documentation unless a page labels them as unreleased.
 
 ## Stability Boundaries
 
-Treat repository-mode CLI commands, SQLite repository pragmas, config keys, and
-JSON output as the intended external surfaces. They may still change while the
+Treat repository-mode CLI commands, config keys, and JSON output as the intended
+external surfaces. They may still change while the
 project is experimental, but they are the surfaces this documentation is
 organized around.
 
@@ -50,20 +51,25 @@ debugging, not as product-level API guarantees.
 
 ## Compatibility Notes
 
-Graft works alongside ordinary SQLite tooling by materializing committed
-snapshots back to SQLite database files. When an external tool edits a tracked
-database file directly, close the writer, checkpoint WAL data if needed, then
-stage the physical path with `graft add`.
+Graft works alongside ordinary SQLite tooling by using physical worktree files
+and materializing committed snapshots back to those paths. After an external
+tool commits a transaction, stage the physical path with `graft add`. The
+staging snapshot includes committed WAL frames, so a manual checkpoint is not
+required.
 
 ```bash
-sqlite3 data.sqlite "PRAGMA wal_checkpoint(TRUNCATE);"
+sqlite3 data.sqlite "INSERT INTO notes(body) VALUES ('hello');"
 graft add data.sqlite
 ```
+
+Close database connections before branch, checkout, restore, or reset operations
+that replace the file. Graft refuses to replace a database under an active
+writer.
 
 ## Release Artifacts
 
 Prebuilt CLI and SQLite extension archives are published with the
-[v0.6.1 GitHub release](https://github.com/eidos-space/graft/releases/latest).
+[v0.7.0 GitHub release](https://github.com/eidos-space/graft/releases/latest).
 
 The repository is an experimental fork of
 [orbitinghail/graft](https://github.com/orbitinghail/graft). The upstream

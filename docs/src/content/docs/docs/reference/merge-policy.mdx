@@ -31,14 +31,13 @@ The row-level plan can auto-merge non-conflicting changes when:
 - configured internal SQLite changes can be resolved safely
 - the resulting temporary database passes validation
 
-Other cases remain as conflicts for `graft_conflicts`, `graft_json_conflicts`,
-`graft_resolve`, or manual resolution.
+Other cases remain as conflicts for `graft conflicts`, `graft resolve`, or
+manual resolution.
 
 ## Logical Diff Status
 
-`graft diff --json --rows` and JSON PRAGMA outputs include a coarse
-`logical_status` so applications do not have to infer row semantics from a
-file-level `modified` status.
+`graft diff --json --rows` includes a coarse `logical_status` so applications
+do not have to infer row semantics from a file-level `modified` status.
 
 | Status | Meaning |
 | --- | --- |
@@ -231,8 +230,8 @@ or leave the file in conflict for manual resolution.
 
 ## Conflict Analysis
 
-`graft_json_status` and `graft_json_conflicts` can include row merge analysis
-for conflicted database files.
+`graft --db <path> conflicts --json` can include row merge analysis for
+conflicted database files.
 
 Important fields:
 
@@ -260,7 +259,7 @@ Common `blocked_reasons`:
 ## Practical Guidance
 
 Use `graft diff --json --rows` when building UI around normal diffs. Use
-`graft_json_status` and `graft_json_conflicts` when building merge UI.
+`graft --db <path> conflicts --json` when building merge UI.
 
 Treat these states differently:
 

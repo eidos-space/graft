@@ -105,15 +105,6 @@ modified: app.sqlite
       new: [Null, Text("write quickstart"), Text("done")]
 ```
 
-## Diff From SQLite
-
-The SQLite extension exposes the same diff:
-
-```sql
-PRAGMA graft_diff = '--rows HEAD~1 HEAD -- data.sqlite';
-PRAGMA graft_json_diff = '--rows HEAD~1 HEAD -- data.sqlite';
-```
-
 ## How To Present Diffs In An App
 
 Use path summaries for navigation and row payloads for detail panes:

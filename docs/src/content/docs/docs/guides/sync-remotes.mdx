@@ -13,8 +13,8 @@ memory
 fs:///absolute/path
 s3://bucket/prefix
 s3_compatible://bucket/prefix?endpoint=https://...
-graft+https://host/api/graft/v1/repos/org/space
-graft+http://127.0.0.1:8787/api/graft/v1/repos/org/space
+https://host/org/space
+graft+http://127.0.0.1:8787/org/space
 ```
 
 ## Add A Remote
@@ -40,14 +40,14 @@ Use a Graft HTTP remote:
 
 ```bash
 export GRAFT_REMOTE_TOKEN='grt_...'
-graft remote add origin 'graft+https://example.com/api/graft/v1/repos/acme/archive'
+graft remote add origin 'https://example.com/acme/archive'
 ```
 
 For a non-default token variable:
 
 ```bash
 export GRAFT_ARCHIVE_TOKEN='grt_...'
-graft remote add origin 'graft+https://example.com/api/graft/v1/repos/acme/archive?token_env=GRAFT_ARCHIVE_TOKEN'
+graft remote add origin 'https://example.com/acme/archive?token_env=GRAFT_ARCHIVE_TOKEN'
 ```
 
 ## Push
@@ -125,5 +125,4 @@ graft ls-remote origin
 ```
 
 See [Remote URIs](/docs/reference/remote-uris/) for exact URI parsing rules and
-[Connect An HTTP Remote](/docs/guides/http-remote/) for the v0.6.1 HTTP client
-workflow.
+[Connect An HTTP Remote](/docs/guides/http-remote/) for the HTTP client workflow.

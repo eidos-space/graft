@@ -110,7 +110,8 @@ pub(super) fn run_repo_pull(
     ensure_checkout_plan_preserves_untracked_paths(runtime, file, &repo, &plan.merge.checkout)?;
     let previous_files = current_repo_files_for_checkout(&repo)?;
     let previous_artifacts = current_repo_artifacts_for_checkout(&repo)?;
-    preflight_workspace_checkout(&repo, &plan.merge.checkout, &previous_files)?;
+    let _sqlite_replacement_guards =
+        preflight_workspace_checkout(&repo, &plan.merge.checkout, &previous_files)?;
     clear_row_conflict_resolution_state(&repo)?;
     let mut outcome = repo.apply_pull_plan(&plan)?;
     checkout_merge_outcome(
@@ -129,6 +130,7 @@ pub(super) fn run_repo_pull(
         &repo,
         &outcome.merge,
         Some(checkout_remote),
+        true,
     ) {
         outcome.merge = merge_outcome_with_row_auto_merge(&outcome.merge, &row_auto_merge.key);
     }

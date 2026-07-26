@@ -13,7 +13,7 @@ memory
 fs:///absolute/path
 s3://bucket/prefix
 s3_compatible://bucket/prefix?endpoint=https://...
-graft+https://host/api/graft/v1/repos/org/space
+https://host/org/space
 ```
 
 ## 添加 Remote
@@ -38,14 +38,14 @@ HTTP remote：
 
 ```bash
 export GRAFT_REMOTE_TOKEN='grt_...'
-graft remote add origin 'graft+https://example.com/api/graft/v1/repos/acme/archive'
+graft remote add origin 'https://example.com/acme/archive'
 ```
 
 自定义 token 变量：
 
 ```bash
 export GRAFT_ARCHIVE_TOKEN='grt_...'
-graft remote add origin 'graft+https://example.com/api/graft/v1/repos/acme/archive?token_env=GRAFT_ARCHIVE_TOKEN'
+graft remote add origin 'https://example.com/acme/archive?token_env=GRAFT_ARCHIVE_TOKEN'
 ```
 
 ## Push / Fetch / Pull

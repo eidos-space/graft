@@ -35,11 +35,10 @@ use crate::{
         mem_file::MemFile,
         vol_file::{VolFile, WorkspaceCoordinator},
     },
-    pragma::GraftPragma,
+    pragma::VfsPragma,
 };
 
 const SQLITE_DATABASE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
-const LEGACY_WORKSPACE_DATABASE: &str = "control.sqlite";
 
 #[derive(Debug, Error)]
 pub enum ErrCtx {
@@ -69,6 +68,12 @@ pub enum ErrCtx {
 
     #[error("Graft repository error: {0}")]
     Repo(#[from] RepoErr),
+
+    #[error("Graft setup error: {0}")]
+    Setup(#[from] graft::setup::InitErr),
+
+    #[error("SQLite database error: {0}")]
+    SqliteDatabase(#[from] rusqlite::Error),
 
     #[error(transparent)]
     IoErr(#[from] std::io::Error),
@@ -119,6 +124,7 @@ pub struct GraftVfs {
     // VolFile locks keyed by tag
     locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     workspace: Arc<WorkspaceCoordinator>,
+    allow_repository_pragmas_for_tests: bool,
 }
 
 #[derive(Debug)]
@@ -128,7 +134,7 @@ pub struct RepoRuntimeRegistry {
 }
 
 impl RepoRuntimeRegistry {
-    fn new(base: Runtime) -> Self {
+    pub(crate) fn new(base: Runtime) -> Self {
         Self { base, runtimes: Default::default() }
     }
 
@@ -154,6 +160,18 @@ impl GraftVfs {
             runtime,
             locks: Default::default(),
             workspace: Arc::new(WorkspaceCoordinator::default()),
+            allow_repository_pragmas_for_tests: false,
+        }
+    }
+
+    /// Constructs a VFS that retains the old repository PRAGMA transport for the legacy
+    /// integration suite. Production extension registration must use [`Self::new`].
+    #[cfg(feature = "test-repository-pragmas")]
+    #[doc(hidden)]
+    pub fn new_with_repository_pragmas_for_tests(runtime: Runtime) -> Self {
+        Self {
+            allow_repository_pragmas_for_tests: true,
+            ..Self::new(runtime)
         }
     }
 
@@ -221,7 +239,10 @@ impl Vfs for GraftVfs {
                     }
                 );
 
-                if let Some(repo) = workspace_session_repository(&tag) {
+                #[cfg(feature = "test-repository-pragmas")]
+                if self.allow_repository_pragmas_for_tests
+                    && let Some(repo) = workspace_session_repository(&tag)
+                {
                     let runtime = match &repo {
                         Some(repo) => {
                             let runtime = self.repo_runtimes.runtime_for(repo)?;
@@ -325,7 +346,9 @@ impl Vfs for GraftVfs {
     ) -> Result<Option<String>, PragmaErr> {
         tracing::trace!("pragma: file={handle:?}, pragma={pragma:?}");
         if let FileHandle::VolFile(file) = handle {
-            match GraftPragma::try_from(&pragma)?.eval(&self.runtime, file) {
+            match VfsPragma::parse(&pragma, self.allow_repository_pragmas_for_tests)?
+                .eval(&self.runtime, file)
+            {
                 Ok(val) => Ok(val),
                 Err(err) => Err(PragmaErr::Fail(err.sqlite_err(), Some(format!("{err}")))),
             }
@@ -474,6 +497,7 @@ pub(crate) fn should_discover_repo(tag: &str) -> bool {
     path.is_absolute() || tag.contains('/') || tag.contains('\\') || path.extension().is_some()
 }
 
+#[cfg(feature = "test-repository-pragmas")]
 fn workspace_session_repository(tag: &str) -> Option<Option<graft::repo::Repository>> {
     let path = Path::new(tag);
     if path.file_name()? != std::ffi::OsStr::new(graft::repo::GRAFT_DIR) {
@@ -486,10 +510,13 @@ fn workspace_session_repository(tag: &str) -> Option<Option<graft::repo::Reposit
     Some(graft::repo::Repository::discover(parent).ok())
 }
 
+#[cfg(feature = "test-repository-pragmas")]
 fn remove_legacy_workspace_database(
     runtime: &Runtime,
     repo: &graft::repo::Repository,
 ) -> Result<(), ErrCtx> {
+    const LEGACY_WORKSPACE_DATABASE: &str = "control.sqlite";
+
     let path = repo.graft_dir().join(LEGACY_WORKSPACE_DATABASE);
     runtime.tag_delete(&path.to_string_lossy())?;
     for suffix in ["", "-journal", "-wal", "-shm"] {

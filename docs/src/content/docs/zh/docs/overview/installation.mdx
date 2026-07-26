@@ -11,14 +11,14 @@ import { Aside } from "@astrojs/starlight/components";
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/eidos-space/graft/main/install.sh \
-  | GRAFT_VERSION=0.6.1 sh
+  | GRAFT_VERSION=0.7.0 sh
 graft --version
-# graft 0.6.1
+# graft 0.7.0
 ```
 
 <Aside type="note" title="最新 release">
-  去掉 `GRAFT_VERSION=0.6.1` 会安装最新已发布版本；它的行为可能比本站描述的
-  v0.6.1 更新。
+  去掉 `GRAFT_VERSION=0.7.0` 会安装最新已发布版本；它的行为可能比本站描述的
+  v0.7.0 更新。
 </Aside>
 
 也可以从
@@ -60,6 +60,9 @@ cargo build -p graft-ext --release
 .load ./libgraft_ext
 ```
 
+只有应用明确需要 Graft VFS 作为 live page-storage 数据面时才需要扩展。
+repository 命令不通过 SQLite PRAGMA 暴露；control plane 使用 CLI 及其 JSON 输出。
+
 ## 构建文档
 
 ```bash
@@ -68,5 +71,5 @@ pnpm install
 pnpm build
 ```
 
-下一步先跑 [CLI 快速开始](/zh/docs/quickstart/cli/)，然后看
-[SQLite 扩展快速开始](/zh/docs/quickstart/sqlite-extension/)。
+下一步先跑 [CLI 快速开始](/zh/docs/quickstart/cli/)。需要显式接入可选 Graft VFS
+时，再看 [SQLite 扩展快速开始](/zh/docs/quickstart/sqlite-extension/)。

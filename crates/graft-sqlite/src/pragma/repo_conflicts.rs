@@ -129,9 +129,11 @@ pub(super) fn resolve_repo_conflict_for_file(
                 path_storage,
             });
         }
-        ResolveSide::Manual if physical_path.exists() => {
-            Some(import_physical_sqlite_file_state(runtime, &physical_path)?)
-        }
+        ResolveSide::Manual if physical_path.exists() => Some(import_physical_sqlite_file_state(
+            runtime,
+            &physical_path,
+            None,
+        )?),
         ResolveSide::Manual => None,
     };
     let entry = repo.resolve_file_conflict(&physical_path, state)?;

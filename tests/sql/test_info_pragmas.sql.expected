@@ -1,4 +1,4 @@
--- exercise repository metadata pragmas through the SQLite extension
+-- exercise the intentionally narrow VFS pragma surface
 .connection 0
 .open "file:app.db?vfs=graft"
 .output /dev/null

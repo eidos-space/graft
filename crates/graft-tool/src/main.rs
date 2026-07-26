@@ -2,24 +2,15 @@ use std::{
     io::Read,
     num::NonZeroU64,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use graft::{
     core::{LogId, SegmentId, VolumeId},
-    remote::RemoteConfig,
     repo::Repository,
-    setup::GraftConfig,
 };
-use rusqlite::{
-    Batch, Connection, OpenFlags, fallible_iterator::FallibleIterator, types::ValueRef,
-};
-
-#[cfg(target_arch = "wasm32")]
-use std::sync::OnceLock;
+use rusqlite::{Batch, Connection, fallible_iterator::FallibleIterator, types::ValueRef};
 
 #[derive(Subcommand)]
 enum Command {
@@ -48,7 +39,7 @@ enum Command {
     /// Initialize a .graft repository in the current worktree
     Init(InitArgs),
 
-    /// Execute SQL through the embedded Graft SQLite VFS
+    /// Execute SQL against a physical `SQLite` worktree database
     Sql {
         /// SQL to execute. Reads SQL from stdin when omitted.
         #[arg(
@@ -70,7 +61,9 @@ enum Command {
         #[arg(short = 'b', long = "branch", conflicts_with = "branch")]
         branch_option: Option<String>,
 
-        /// Remote URI: memory, fs://..., s3://..., s3_compatible://..., graft+https://..., or graft+http://...
+        #[arg(
+            help = "Remote URI: https://host/org/repo (or graft+https://host/org/repo), graft+http://host/org/repo for local use, memory, fs://, s3://, or s3_compatible://"
+        )]
         remote: String,
 
         /// Optional branch to clone. Defaults to remote HEAD, then main.
@@ -254,7 +247,7 @@ enum Command {
         path: Option<PathBuf>,
     },
 
-    /// Export a Graft database snapshot as a physical SQLite file
+    /// Export a Graft database snapshot as a physical `SQLite` file
     Export(ExportArgs),
 
     /// Reset the current branch to a repository revision
@@ -574,7 +567,7 @@ struct ExportArgs {
     #[arg(short = 's', long)]
     source: Option<String>,
 
-    /// Output path for the physical SQLite database file
+    /// Output path for the physical `SQLite` database file
     #[arg(short, long)]
     output: PathBuf,
 
@@ -593,7 +586,9 @@ enum RemoteCommand {
         /// Remote name, for example origin
         name: String,
 
-        /// Remote URI: memory, fs://..., s3://..., s3_compatible://..., graft+https://..., or graft+http://...
+        #[arg(
+            help = "Remote URI: https://host/org/repo (or graft+https://host/org/repo), graft+http://host/org/repo for local use, memory, fs://, s3://, or s3_compatible://"
+        )]
         uri: String,
     },
 
@@ -649,7 +644,9 @@ enum RemoteCommand {
         /// Remote name, for example origin
         name: String,
 
-        /// Remote URI: memory, fs://..., s3://..., s3_compatible://..., graft+https://..., or graft+http://...
+        #[arg(
+            help = "Remote URI: https://host/org/repo (or graft+https://host/org/repo), graft+http://host/org/repo for local use, memory, fs://, s3://, or s3_compatible://"
+        )]
         uri: String,
     },
 
@@ -882,12 +879,17 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
             }
             if json {
                 let arg = repo_log_arg(limit, after.as_deref())?;
-                print_output(run_repo_pragma(db_override, None, "json_log", Some(&arg))?);
+                print_output(run_repository_command(
+                    db_override,
+                    None,
+                    "json_log",
+                    Some(&arg),
+                )?);
             } else {
                 if limit.is_some() || after.is_some() {
                     bail!("log pagination requires --json");
                 }
-                print_output(run_repo_pragma(db_override, None, "log", None)?);
+                print_output(run_repository_command(db_override, None, "log", None)?);
             }
         }
         Command::Init(args) => {
@@ -898,27 +900,51 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
             let branch = branch_option.as_deref().or(branch.as_deref());
             let arg = repo_clone_arg(&remote, branch);
             let db = resolve_clone_workspace_session(db_override)?;
-            print_output(run_pragma(&db, clone_pragma(json), Some(&arg))?);
+            print_output(execute_repository_command(
+                &db,
+                clone_pragma(json),
+                Some(&arg),
+            )?);
         }
         Command::Status { json, kind } => {
             let pragma = if json { "json_status" } else { "status" };
             let arg = repo_status_arg(kind);
-            print_output(run_repo_pragma(db_override, None, pragma, arg.as_deref())?);
+            print_output(run_repository_command(
+                db_override,
+                None,
+                pragma,
+                arg.as_deref(),
+            )?);
         }
         Command::Audit(args) => {
             let pragma = if args.json { "json_audit" } else { "audit" };
             let arg = repo_audit_arg(args.repair, args.remote.as_deref());
-            print_output(run_repo_pragma(db_override, None, pragma, arg.as_deref())?);
+            print_output(run_repository_command(
+                db_override,
+                None,
+                pragma,
+                arg.as_deref(),
+            )?);
         }
         Command::Gc(args) => {
             let pragma = if args.json { "json_gc" } else { "gc" };
             let arg = repo_gc_arg(args.dry_run, args.force);
-            print_output(run_repo_pragma(db_override, None, pragma, arg.as_deref())?);
+            print_output(run_repository_command(
+                db_override,
+                None,
+                pragma,
+                arg.as_deref(),
+            )?);
         }
         Command::LsFiles { json, stage, details, others, kind } => {
             let pragma = if json { "json_ls_files" } else { "ls_files" };
             let arg = repo_ls_files_arg(stage, details, others, kind);
-            print_output(run_repo_pragma(db_override, None, pragma, arg.as_deref())?);
+            print_output(run_repository_command(
+                db_override,
+                None,
+                pragma,
+                arg.as_deref(),
+            )?);
         }
         Command::Payload { command } => match command {
             PayloadCommand::Fetch(args) => {
@@ -928,7 +954,12 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
                     "payload_fetch"
                 };
                 let arg = repo_payload_fetch_arg(args.remote.as_deref(), args.rev.as_deref());
-                print_output(run_repo_pragma(db_override, None, pragma, arg.as_deref())?);
+                print_output(run_repository_command(
+                    db_override,
+                    None,
+                    pragma,
+                    arg.as_deref(),
+                )?);
             }
             PayloadCommand::Status(args) => {
                 let pragma = if args.json {
@@ -937,7 +968,12 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
                     "payload_status"
                 };
                 let arg = repo_payload_status_arg(args.rev.as_deref());
-                print_output(run_repo_pragma(db_override, None, pragma, arg.as_deref())?);
+                print_output(run_repository_command(
+                    db_override,
+                    None,
+                    pragma,
+                    arg.as_deref(),
+                )?);
             }
             PayloadCommand::Prune(args) => {
                 let pragma = if args.json {
@@ -946,34 +982,55 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
                     "payload_prune"
                 };
                 let arg = repo_payload_prune_arg(args.dry_run, args.force);
-                print_output(run_repo_pragma(db_override, None, pragma, arg.as_deref())?);
+                print_output(run_repository_command(
+                    db_override,
+                    None,
+                    pragma,
+                    arg.as_deref(),
+                )?);
             }
         },
         Command::Config { command } => match command {
             ConfigCommand::Get { json, key } => {
                 let pragma = config_get_pragma(json);
-                print_output(run_repo_pragma(db_override, None, pragma, Some(&key))?);
+                print_output(run_repository_command(
+                    db_override,
+                    None,
+                    pragma,
+                    Some(&key),
+                )?);
             }
             ConfigCommand::List { json } => {
                 let (pragma, arg) = config_list_pragma(json);
-                print_output(run_repo_pragma(db_override, None, pragma, arg)?);
+                print_output(run_repository_command(db_override, None, pragma, arg)?);
             }
             ConfigCommand::Set { json, key, value } => {
                 let arg = repo_config_set_arg(&key, &value)?;
                 let pragma = config_set_pragma(json);
-                print_output(run_repo_pragma(db_override, None, pragma, Some(&arg))?);
+                print_output(run_repository_command(
+                    db_override,
+                    None,
+                    pragma,
+                    Some(&arg),
+                )?);
             }
             ConfigCommand::Unset { json, key } => {
                 let pragma = config_unset_pragma(json);
-                print_output(run_repo_pragma(db_override, None, pragma, Some(&key))?);
+                print_output(run_repository_command(
+                    db_override,
+                    None,
+                    pragma,
+                    Some(&key),
+                )?);
             }
         },
         Command::Add(args) => {
             if db_override.is_none() && !args.all && args.path.is_none() {
                 bail!("add requires a path, --all, or --db <path>");
             }
-            let arg = repo_add_arg(args.all, args.force, args.kind, args.path.as_deref())?;
-            print_output(run_repo_pragma(
+            let path = args.path.as_deref().or(db_override);
+            let arg = repo_add_arg(args.all, args.force, args.kind, path)?;
+            print_output(run_repository_command(
                 db_override,
                 None,
                 add_pragma(args.json),
@@ -984,8 +1041,9 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
             if db_override.is_none() && args.path.is_none() {
                 bail!("rm requires a path or --db <path>");
             }
-            let arg = repo_rm_arg(args.cached, args.path.as_deref());
-            print_output(run_repo_pragma(
+            let path = args.path.as_deref().or(db_override);
+            let arg = repo_rm_arg(args.cached, path);
+            print_output(run_repository_command(
                 db_override,
                 None,
                 rm_pragma(args.json),
@@ -993,8 +1051,9 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
             )?);
         }
         Command::Commit { json, message } => {
-            let output = run_repo_pragma(db_override, None, commit_pragma(json), Some(&message))
-                .map_err(clean_commit_error)?;
+            let output =
+                run_repository_command(db_override, None, commit_pragma(json), Some(&message))
+                    .map_err(clean_commit_error)?;
             print_output(output);
         }
         Command::Diff {
@@ -1021,15 +1080,25 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
                 to: to.as_deref(),
                 path: path.as_deref(),
             })?;
-            print_output(run_repo_pragma(db_override, None, suffix, arg.as_deref())?);
+            print_output(run_repository_command(
+                db_override,
+                None,
+                suffix,
+                arg.as_deref(),
+            )?);
         }
         Command::Show { rev, json } => {
             let suffix = if json { "json_show" } else { "show" };
-            print_output(run_repo_pragma(db_override, None, suffix, Some(&rev))?);
+            print_output(run_repository_command(
+                db_override,
+                None,
+                suffix,
+                Some(&rev),
+            )?);
         }
         Command::Checkout { json, force, rev, path } => {
             let arg = repo_checkout_arg(force, &rev, path.as_deref());
-            print_output(run_repo_pragma(
+            print_output(run_repository_command(
                 db_override,
                 None,
                 checkout_pragma(json),
@@ -1055,7 +1124,7 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
                 kind,
                 path.as_deref(),
             )?;
-            print_output(run_repo_pragma(
+            print_output(run_repository_command(
                 db_override,
                 None,
                 restore_pragma(json),
@@ -1066,22 +1135,18 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
             if db_override.is_none() && args.path.is_none() {
                 bail!("export requires a database path or --db <path>");
             }
-            let arg = repo_export_arg(args.source.as_deref(), &args.output, args.path.as_deref());
-            let command_db = if db_override.is_none() {
-                args.path.as_deref()
-            } else {
-                None
-            };
-            print_output(run_repo_pragma(
+            let path = args.path.as_deref().or(db_override);
+            let arg = repo_export_arg(args.source.as_deref(), &args.output, path);
+            print_output(run_repository_command(
                 db_override,
-                command_db,
+                args.path.as_deref(),
                 export_pragma(args.json),
                 Some(&arg),
             )?);
         }
         Command::Reset { json, soft, mixed, hard, rev } => {
             let arg = repo_reset_arg(&rev, soft, mixed, hard);
-            print_output(run_repo_pragma(
+            print_output(run_repository_command(
                 db_override,
                 None,
                 reset_pragma(json),
@@ -1113,7 +1178,7 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
                 } else {
                     name
                 };
-                print_output(run_repo_pragma(
+                print_output(run_repository_command(
                     db_override,
                     None,
                     branch_delete_pragma(json),
@@ -1139,7 +1204,7 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
                         }
                     }
                 };
-                print_output(run_repo_pragma(
+                print_output(run_repository_command(
                     db_override,
                     None,
                     branch_rename_pragma(json),
@@ -1153,7 +1218,7 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
                     Some(name) => format!("{name} {upstream}"),
                     None => upstream,
                 };
-                print_output(run_repo_pragma(
+                print_output(run_repository_command(
                     db_override,
                     None,
                     branch_upstream_pragma(json),
@@ -1163,7 +1228,7 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
                 if start_point.is_some() {
                     bail!("branch --unset-upstream accepts at most a branch name");
                 }
-                print_output(run_repo_pragma(
+                print_output(run_repository_command(
                     db_override,
                     None,
                     branch_unset_upstream_pragma(json),
@@ -1174,13 +1239,13 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
                     bail!("branch -r/-a accepts no branch name or start point");
                 }
                 let (pragma, arg) = branch_list_pragma(json, remote, all);
-                print_output(run_repo_pragma(db_override, None, pragma, arg)?);
+                print_output(run_repository_command(db_override, None, pragma, arg)?);
             } else if let Some(name) = name {
                 let arg = match start_point {
                     Some(start_point) => format!("{name} {start_point}"),
                     None => name,
                 };
-                print_output(run_repo_pragma(
+                print_output(run_repository_command(
                     db_override,
                     None,
                     branch_create_pragma(json),
@@ -1191,7 +1256,7 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
                     bail!("branch list accepts no start point");
                 }
                 let (pragma, arg) = branch_list_pragma(json, remote, all);
-                print_output(run_repo_pragma(db_override, None, pragma, arg)?);
+                print_output(run_repository_command(db_override, None, pragma, arg)?);
             }
         }
         Command::Tag {
@@ -1208,7 +1273,7 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
                     bail!("tag --list does not support patterns yet");
                 }
                 let (pragma, arg) = tag_list_pragma(json);
-                print_output(run_repo_pragma(db_override, None, pragma, arg)?);
+                print_output(run_repository_command(db_override, None, pragma, arg)?);
             } else if delete {
                 let Some(name) = name else {
                     bail!("tag delete requires a tag name");
@@ -1216,7 +1281,7 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
                 if rev.is_some() {
                     bail!("tag delete accepts only a tag name");
                 }
-                print_output(run_repo_pragma(
+                print_output(run_repository_command(
                     db_override,
                     None,
                     tag_delete_pragma(json),
@@ -1240,7 +1305,7 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
                         None => name,
                     }
                 };
-                print_output(run_repo_pragma(
+                print_output(run_repository_command(
                     db_override,
                     None,
                     tag_create_pragma(json),
@@ -1251,7 +1316,7 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
                     bail!("tag list accepts no annotation flags");
                 }
                 let (pragma, arg) = tag_list_pragma(json);
-                print_output(run_repo_pragma(db_override, None, pragma, arg)?);
+                print_output(run_repository_command(db_override, None, pragma, arg)?);
             }
         }
         Command::Switch { json, create, force, branch, start_point } => {
@@ -1264,7 +1329,12 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
                 switch_branch_pragma(json)
             };
             let arg = repo_switch_arg(force, &branch, start_point.as_deref());
-            print_output(run_repo_pragma(db_override, None, pragma, Some(&arg))?);
+            print_output(run_repository_command(
+                db_override,
+                None,
+                pragma,
+                Some(&arg),
+            )?);
         }
         Command::Merge {
             json,
@@ -1274,7 +1344,7 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
             rev,
         } => {
             if abort {
-                print_output(run_repo_pragma(
+                print_output(run_repository_command(
                     db_override,
                     None,
                     merge_abort_pragma(json),
@@ -1287,7 +1357,7 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
                 let Some(message) = message else {
                     bail!("merge --continue requires --message");
                 };
-                print_output(run_repo_pragma(
+                print_output(run_repository_command(
                     db_override,
                     None,
                     merge_continue_pragma(json),
@@ -1297,7 +1367,7 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
                 let Some(rev) = rev else {
                     bail!("merge requires a revision unless --abort is used");
                 };
-                print_output(run_repo_pragma(
+                print_output(run_repository_command(
                     db_override,
                     None,
                     merge_pragma(json),
@@ -1306,7 +1376,7 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
             }
         }
         Command::Conflicts(args) => {
-            print_output(run_repo_pragma(
+            print_output(run_repository_command(
                 db_override,
                 args.db.as_deref(),
                 conflicts_pragma(args.json),
@@ -1314,8 +1384,9 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
             )?);
         }
         Command::Resolve { json, ours, theirs, manual, row, path } => {
-            let arg = repo_resolve_arg(ours, theirs, manual, row.as_deref(), path.as_deref())?;
-            print_output(run_repo_pragma(
+            let path = path.as_deref().or(db_override);
+            let arg = repo_resolve_arg(ours, theirs, manual, row.as_deref(), path)?;
+            print_output(run_repository_command(
                 db_override,
                 None,
                 resolve_pragma(json),
@@ -1325,7 +1396,7 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
         Command::Remote { command } => match command {
             RemoteCommand::Add { json, name, uri } => {
                 let arg = format!("{name} {uri}");
-                print_output(run_repo_pragma(
+                print_output(run_repository_command(
                     db_override,
                     None,
                     remote_add_pragma(json),
@@ -1333,7 +1404,7 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
                 )?);
             }
             RemoteCommand::List { json } => {
-                print_output(run_repo_pragma(
+                print_output(run_repository_command(
                     db_override,
                     None,
                     remote_list_pragma(json),
@@ -1341,7 +1412,7 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
                 )?);
             }
             RemoteCommand::Remove { json, name } => {
-                print_output(run_repo_pragma(
+                print_output(run_repository_command(
                     db_override,
                     None,
                     remote_remove_pragma(json),
@@ -1350,7 +1421,7 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
             }
             RemoteCommand::Rename { json, old, new } => {
                 let arg = format!("{old} {new}");
-                print_output(run_repo_pragma(
+                print_output(run_repository_command(
                     db_override,
                     None,
                     remote_rename_pragma(json),
@@ -1358,7 +1429,7 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
                 )?);
             }
             RemoteCommand::GetUrl { json, name } => {
-                print_output(run_repo_pragma(
+                print_output(run_repository_command(
                     db_override,
                     None,
                     remote_get_url_pragma(json),
@@ -1367,7 +1438,7 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
             }
             RemoteCommand::SetUrl { json, name, uri } => {
                 let arg = format!("{name} {uri}");
-                print_output(run_repo_pragma(
+                print_output(run_repository_command(
                     db_override,
                     None,
                     remote_set_url_pragma(json),
@@ -1375,7 +1446,7 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
                 )?);
             }
             RemoteCommand::Prune { json, name } => {
-                print_output(run_repo_pragma(
+                print_output(run_repository_command(
                     db_override,
                     None,
                     remote_prune_pragma(json),
@@ -1384,7 +1455,7 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
             }
         },
         Command::LsRemote { json, remote } => {
-            print_output(run_repo_pragma(
+            print_output(run_repository_command(
                 db_override,
                 None,
                 ls_remote_pragma(json),
@@ -1392,7 +1463,7 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
             )?);
         }
         Command::Fetch(args) => {
-            print_output(run_repo_pragma(
+            print_output(run_repository_command(
                 db_override,
                 None,
                 fetch_pragma(args.json),
@@ -1400,7 +1471,7 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
             )?);
         }
         Command::Pull(args) => {
-            print_output(run_repo_pragma(
+            print_output(run_repository_command(
                 db_override,
                 None,
                 pull_pragma(args.json),
@@ -1408,7 +1479,7 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
             )?);
         }
         Command::Push(args) => {
-            print_output(run_repo_pragma(
+            print_output(run_repository_command(
                 db_override,
                 None,
                 push_pragma(args.json),
@@ -1419,7 +1490,7 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-fn run_repo_pragma(
+fn run_repository_command(
     db_override: Option<&Path>,
     command_db: Option<&Path>,
     suffix: &str,
@@ -1429,7 +1500,7 @@ fn run_repo_pragma(
         Some(path) => resolve_cli_db(Some(path))?,
         None => resolve_repo_workspace_session()?,
     };
-    run_pragma(&db, suffix, arg)
+    execute_repository_command(&db, suffix, arg)
 }
 
 fn clean_commit_error(err: anyhow::Error) -> anyhow::Error {
@@ -2330,28 +2401,19 @@ fn remote_branch_arg(args: &RemoteBranchArgs) -> Result<Option<String>> {
     })
 }
 
-fn run_pragma(db: &Path, suffix: &str, arg: Option<&str>) -> Result<Option<String>> {
-    let graft = open_graft_connection(db)?;
-    let pragma = format!("graft_{suffix}");
-
-    let mut output = None;
-    if let Some(arg) = arg {
-        graft.conn.pragma(None, &pragma, arg, |row| {
-            output = Some(row.get(0)?);
-            Ok(())
-        })?;
-    } else {
-        graft.conn.pragma_query(None, &pragma, |row| {
-            output = Some(row.get(0)?);
-            Ok(())
-        })?;
-    }
-    Ok(output)
+fn execute_repository_command(
+    db: &Path,
+    suffix: &str,
+    arg: Option<&str>,
+) -> Result<Option<String>> {
+    let command = graft_sqlite::repo_service::RepositoryCommand::parse(suffix, arg)?;
+    graft_sqlite::repo_service::execute_repository_command(db, command).map_err(anyhow::Error::from)
 }
 
 fn execute_sql(db: &Path, sql: &str) -> Result<Option<String>> {
-    let graft = open_graft_connection(db)?;
-    let mut batch = Batch::new(&graft.conn, sql);
+    let connection = Connection::open(db)
+        .with_context(|| format!("failed to open physical SQLite database {}", db.display()))?;
+    let mut batch = Batch::new(&connection, sql);
     let mut output = String::new();
     let mut statement_count = 0;
     let mut result_count = 0;
@@ -2388,11 +2450,8 @@ fn append_query_output(output: &mut String, stmt: &mut rusqlite::Statement<'_>) 
         .into_iter()
         .map(ToOwned::to_owned)
         .collect();
-    let show_header = !is_graft_pragma_statement(stmt);
-    if show_header {
-        output.push_str(&column_names.join("|"));
-        output.push('\n');
-    }
+    output.push_str(&column_names.join("|"));
+    output.push('\n');
 
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
@@ -2405,14 +2464,6 @@ fn append_query_output(output: &mut String, stmt: &mut rusqlite::Statement<'_>) 
         output.push('\n');
     }
     Ok(())
-}
-
-fn is_graft_pragma_statement(stmt: &rusqlite::Statement<'_>) -> bool {
-    stmt.expanded_sql().is_some_and(|sql| {
-        sql.trim_start()
-            .to_ascii_lowercase()
-            .starts_with("pragma graft_")
-    })
 }
 
 fn render_sql_value(value: ValueRef<'_>) -> String {
@@ -2435,93 +2486,6 @@ fn hex_encode(bytes: &[u8]) -> String {
     encoded
 }
 
-struct GraftConnection {
-    conn: Connection,
-    #[cfg(not(target_arch = "wasm32"))]
-    _vfs: RegisteredVfs,
-}
-
-fn open_graft_connection(db: &Path) -> Result<GraftConnection> {
-    let vfs = register_graft_vfs()?;
-    let db = absolute_db_path(db)?;
-    let conn = Connection::open_with_flags_and_vfs(
-        &db,
-        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
-        vfs.name.as_str(),
-    )
-    .with_context(|| format!("failed to open {} with VFS {}", db.display(), vfs.name))?;
-    Ok(GraftConnection {
-        conn,
-        #[cfg(not(target_arch = "wasm32"))]
-        _vfs: vfs,
-    })
-}
-
-struct RegisteredVfs {
-    name: String,
-    #[cfg(not(target_arch = "wasm32"))]
-    _data_dir: tempfile::TempDir,
-    #[cfg(target_arch = "wasm32")]
-    _data_dir: PathBuf,
-}
-
-#[cfg(target_arch = "wasm32")]
-static BROWSER_VFS: OnceLock<RegisteredVfs> = OnceLock::new();
-
-#[cfg(target_arch = "wasm32")]
-fn register_graft_vfs() -> Result<&'static RegisteredVfs> {
-    if let Some(vfs) = BROWSER_VFS.get() {
-        return Ok(vfs);
-    }
-    let vfs = create_registered_vfs()?;
-    let _ = BROWSER_VFS.set(vfs);
-    Ok(BROWSER_VFS
-        .get()
-        .expect("browser VFS initialized on this worker"))
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn register_graft_vfs() -> Result<RegisteredVfs> {
-    create_registered_vfs()
-}
-
-fn create_registered_vfs() -> Result<RegisteredVfs> {
-    let name = format!("graft_cli_{}_{}", std::process::id(), unique_suffix());
-
-    #[cfg(target_arch = "wasm32")]
-    let data_dir = {
-        let path = PathBuf::from("/.graft/tmp/browser-vfs-base");
-        std::fs::create_dir_all(&path)
-            .context("failed to create browser Graft VFS data directory")?;
-        path
-    };
-
-    #[cfg(not(target_arch = "wasm32"))]
-    let data_dir = tempfile::Builder::new()
-        .prefix(&name)
-        .tempdir()
-        .context("failed to create temporary Graft data directory")?;
-
-    graft_sqlite::register_static(
-        &name,
-        false,
-        GraftConfig {
-            remote: RemoteConfig::Memory,
-            #[cfg(target_arch = "wasm32")]
-            data_dir: data_dir.clone(),
-            #[cfg(not(target_arch = "wasm32"))]
-            data_dir: data_dir.path().to_path_buf(),
-            autosync: None,
-        },
-    )?;
-
-    #[cfg(target_arch = "wasm32")]
-    return Ok(RegisteredVfs { name, _data_dir: data_dir });
-
-    #[cfg(not(target_arch = "wasm32"))]
-    Ok(RegisteredVfs { name, _data_dir: data_dir })
-}
-
 fn absolute_db_path(path: &Path) -> Result<PathBuf> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
@@ -2540,14 +2504,6 @@ fn absolute_db_path(path: &Path) -> Result<PathBuf> {
     }
 
     Ok(absolute)
-}
-
-fn unique_suffix() -> u64 {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos() as u64);
-    now ^ COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
 #[cfg(test)]
@@ -3654,7 +3610,7 @@ mod tests {
     }
 
     #[test]
-    fn sql_command_runs_through_graft_vfs() {
+    fn sql_command_writes_a_physical_worktree_database() {
         let temp_dir = tempfile::tempdir().unwrap();
         let db = temp_dir.path().join("app.db");
         graft::repo::Repository::init(temp_dir.path()).unwrap();
@@ -3664,14 +3620,18 @@ mod tests {
             &[String::from(
                 "CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT); \
                  INSERT INTO users(name) VALUES ('Alice'), ('Bob'); \
-                 SELECT name FROM users ORDER BY id; \
-                 PRAGMA graft_status;",
+                 SELECT name FROM users ORDER BY id;",
             )],
         )
         .unwrap()
         .unwrap();
         assert!(output.contains("name\nAlice\nBob\n"), "{output}");
-        assert!(output.contains("untracked: app.db"), "{output}");
+        assert!(db.is_file());
+
+        let status = run_repository_command(Some(&db), None, "status", None)
+            .unwrap()
+            .unwrap();
+        assert!(status.contains("untracked: app.db"), "{status}");
     }
 
     #[cfg(not(windows))]
@@ -3682,11 +3642,9 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let worktree = temp_dir.path().join("space ? #");
         let repo = graft::repo::Repository::init(&worktree).unwrap();
-        let legacy_workspace_db = repo.graft_dir().join("control.sqlite");
-        std::fs::write(&legacy_workspace_db, b"legacy workspace database").unwrap();
         std::env::set_current_dir(&worktree).unwrap();
 
-        let output = run_repo_pragma(None, None, "json_status", None)
+        let output = run_repository_command(None, None, "json_status", None)
             .unwrap()
             .expect("status pragma should return JSON");
         std::env::set_current_dir(original_dir).unwrap();
@@ -3696,13 +3654,6 @@ mod tests {
             "{output}"
         );
         assert!(!temp_dir.path().join("space ").exists());
-        assert!(!legacy_workspace_db.exists());
-        assert!(
-            std::fs::read_dir(repo.graft_dir())
-                .unwrap()
-                .filter_map(Result::ok)
-                .all(|entry| entry.path().extension().is_none_or(|ext| ext != "sqlite"))
-        );
     }
 
     #[cfg(windows)]
@@ -3714,7 +3665,7 @@ mod tests {
         let repo = graft::repo::Repository::init(temp_dir.path()).unwrap();
         std::env::set_current_dir(repo.worktree()).unwrap();
 
-        let output = run_repo_pragma(None, None, "json_status", None)
+        let output = run_repository_command(None, None, "json_status", None)
             .unwrap()
             .expect("status pragma should return JSON");
         std::env::set_current_dir(original_dir).unwrap();
@@ -3723,7 +3674,7 @@ mod tests {
     }
 
     #[test]
-    fn sql_status_reports_untracked_artifacts_in_eidos_worktree() {
+    fn repository_status_reports_untracked_artifacts_after_physical_sql_writes() {
         let temp_dir = tempfile::tempdir().unwrap();
         let eidos_dir = temp_dir.path().join(".eidos");
         let files_dir = eidos_dir.join("files");
@@ -3732,15 +3683,16 @@ mod tests {
         graft::repo::Repository::init(&eidos_dir).unwrap();
         std::fs::write(files_dir.join("icon.png"), b"\x89PNG\r\n\x1a\n").unwrap();
 
-        let output = run_sql(
+        run_sql(
             Some(&db),
             &[String::from(
-                "CREATE TABLE app_state(id INTEGER PRIMARY KEY); \
-                 PRAGMA graft_json_status;",
+                "CREATE TABLE app_state(id INTEGER PRIMARY KEY);",
             )],
         )
-        .unwrap()
         .unwrap();
+        let output = run_repository_command(Some(&db), None, "json_status", None)
+            .unwrap()
+            .unwrap();
 
         assert!(output.contains(r#""path":"files/icon.png""#), "{output}");
         assert!(output.contains(r#""kind":"binary_file""#), "{output}");
@@ -3756,16 +3708,19 @@ mod tests {
 
         let result = (|| -> Result<()> {
             run_command(Command::Init(InitArgs { json: false }), None)?;
-            let output = run_sql(
+            run_sql(
                 Some(Path::new("sub-app/main.sqlite")),
                 &[String::from(
                     "CREATE TABLE docs(id TEXT PRIMARY KEY, title TEXT); \
-                     INSERT INTO docs VALUES ('1', 'Hello'); \
-                     PRAGMA graft_add; \
-                     PRAGMA graft_json_commit = 'initial docs';",
+                     INSERT INTO docs VALUES ('1', 'Hello');",
                 )],
-            )?
-            .unwrap();
+            )?;
+            let db = Path::new("sub-app/main.sqlite");
+            let add_arg = repo_add_arg(false, false, None, Some(db))?;
+            run_repository_command(Some(db), None, "add", add_arg.as_deref())?;
+            let output =
+                run_repository_command(Some(db), None, "json_commit", Some("initial docs"))?
+                    .unwrap();
             assert!(output.contains("\"materialized\""), "{output}");
 
             let materialized = temp_dir.path().join("sub-app/main.sqlite");
@@ -3777,6 +3732,187 @@ mod tests {
                 })
                 .unwrap();
             assert_eq!(title, "Hello");
+            Ok(())
+        })();
+
+        std::env::set_current_dir(original_dir).unwrap();
+        result.unwrap();
+    }
+
+    #[test]
+    fn switch_rejects_an_active_physical_sqlite_writer_before_moving_head() {
+        let _guard = CWD_LOCK.lock().unwrap();
+        let original_dir = std::env::current_dir().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::env::set_current_dir(temp_dir.path()).unwrap();
+
+        let result = (|| -> Result<()> {
+            run_command(Command::Init(InitArgs { json: false }), None)?;
+            let db = Path::new("app.sqlite");
+            run_sql(
+                Some(db),
+                &[String::from(
+                    "CREATE TABLE docs(id INTEGER PRIMARY KEY, title TEXT); \
+                     INSERT INTO docs VALUES (1, 'main');",
+                )],
+            )?;
+            let add_arg = repo_add_arg(false, false, None, Some(db))?;
+            run_repository_command(Some(db), None, "add", add_arg.as_deref())?;
+            run_repository_command(Some(db), None, "commit", Some("main state"))?;
+            run_repository_command(Some(db), None, "switch_create", Some("feature"))?;
+
+            run_sql(
+                Some(db),
+                &[String::from(
+                    "UPDATE docs SET title = 'feature' WHERE id = 1;",
+                )],
+            )?;
+            run_repository_command(Some(db), None, "add", add_arg.as_deref())?;
+            run_repository_command(Some(db), None, "commit", Some("feature state"))?;
+            run_repository_command(Some(db), None, "switch_branch", Some("main"))?;
+
+            let writer = Connection::open(db)?;
+            writer.execute_batch(
+                "BEGIN IMMEDIATE; UPDATE docs SET title = 'in flight' WHERE id = 1;",
+            )?;
+
+            let error = run_repository_command(Some(db), None, "switch_branch", Some("feature"))
+                .expect_err("an active physical writer must block branch replacement");
+            assert!(
+                error
+                    .to_string()
+                    .contains("while another transaction is active"),
+                "{error:#}"
+            );
+            let status = run_repository_command(Some(db), None, "json_status", None)?
+                .expect("status should return JSON");
+            assert!(status.contains(r#""current_branch":"main""#), "{status}");
+            let title: String =
+                writer.query_row("SELECT title FROM docs WHERE id = 1", [], |row| row.get(0))?;
+            assert_eq!(title, "in flight");
+
+            writer.execute_batch("ROLLBACK")?;
+            run_repository_command(Some(db), None, "switch_branch", Some("feature"))?;
+            let connection = Connection::open(db)?;
+            let title: String =
+                connection
+                    .query_row("SELECT title FROM docs WHERE id = 1", [], |row| row.get(0))?;
+            assert_eq!(title, "feature");
+            Ok(())
+        })();
+
+        std::env::set_current_dir(original_dir).unwrap();
+        result.unwrap();
+    }
+
+    #[test]
+    fn remove_rejects_an_active_physical_sqlite_writer_before_staging_deletion() {
+        let _guard = CWD_LOCK.lock().unwrap();
+        let original_dir = std::env::current_dir().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::env::set_current_dir(temp_dir.path()).unwrap();
+
+        let result = (|| -> Result<()> {
+            run_command(Command::Init(InitArgs { json: false }), None)?;
+            let db = Path::new("app.sqlite");
+            run_sql(
+                Some(db),
+                &[String::from(
+                    "CREATE TABLE docs(id INTEGER PRIMARY KEY, title TEXT); \
+                     INSERT INTO docs VALUES (1, 'main');",
+                )],
+            )?;
+            let add_arg = repo_add_arg(false, false, None, Some(db))?;
+            run_repository_command(Some(db), None, "add", add_arg.as_deref())?;
+            run_repository_command(Some(db), None, "commit", Some("main state"))?;
+
+            let writer = Connection::open(db)?;
+            writer.execute_batch(
+                "BEGIN IMMEDIATE; UPDATE docs SET title = 'in flight' WHERE id = 1;",
+            )?;
+
+            let remove_arg = repo_rm_arg(false, Some(db));
+            let error = run_repository_command(Some(db), None, "rm", remove_arg.as_deref())
+                .expect_err("an active physical writer must block database removal");
+            assert!(
+                error
+                    .to_string()
+                    .contains("while another transaction is active"),
+                "{error:#}"
+            );
+            assert!(db.exists());
+            let status = run_repository_command(Some(db), None, "json_status", None)?
+                .expect("status should return JSON");
+            assert!(status.contains(r#""has_staged_changes":false"#), "{status}");
+
+            writer.execute_batch("ROLLBACK")?;
+            let title: String =
+                writer.query_row("SELECT title FROM docs WHERE id = 1", [], |row| row.get(0))?;
+            assert_eq!(title, "main");
+            Ok(())
+        })();
+
+        std::env::set_current_dir(original_dir).unwrap();
+        result.unwrap();
+    }
+
+    #[test]
+    fn merge_with_db_auto_merges_non_overlapping_rows_into_the_physical_worktree() {
+        let _guard = CWD_LOCK.lock().unwrap();
+        let original_dir = std::env::current_dir().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::env::set_current_dir(temp_dir.path()).unwrap();
+
+        let result = (|| -> Result<()> {
+            run_command(Command::Init(InitArgs { json: false }), None)?;
+            let db = Path::new("data.sqlite");
+            run_sql(
+                Some(db),
+                &[String::from(
+                    "CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT); \
+                     INSERT INTO docs VALUES (1, 'one'), (2, 'two');",
+                )],
+            )?;
+            let add_arg = repo_add_arg(false, false, None, Some(db))?;
+            run_repository_command(Some(db), None, "add", add_arg.as_deref())?;
+            run_repository_command(Some(db), None, "commit", Some("base"))?;
+
+            run_repository_command(Some(db), None, "switch_create", Some("feature"))?;
+            run_sql(
+                Some(db),
+                &[String::from(
+                    "UPDATE docs SET body = 'theirs' WHERE id = 2;",
+                )],
+            )?;
+            run_repository_command(Some(db), None, "add", add_arg.as_deref())?;
+            run_repository_command(Some(db), None, "commit", Some("theirs"))?;
+
+            run_repository_command(Some(db), None, "switch_branch", Some("main"))?;
+            run_sql(
+                Some(db),
+                &[String::from("UPDATE docs SET body = 'ours' WHERE id = 1;")],
+            )?;
+            run_repository_command(Some(db), None, "add", add_arg.as_deref())?;
+            run_repository_command(Some(db), None, "commit", Some("ours"))?;
+
+            let output = run_repository_command(Some(db), None, "merge", Some("feature"))?
+                .expect("merge should return output");
+            assert!(
+                output.contains("Row-level auto-merged data.sqlite"),
+                "{output}"
+            );
+            let status = run_repository_command(Some(db), None, "json_status", None)?
+                .expect("status should return JSON");
+            assert!(status.contains(r#""has_conflicts":false"#), "{status}");
+
+            let connection = Connection::open(db)?;
+            let rows = connection
+                .prepare("SELECT id, body FROM docs ORDER BY id")?
+                .query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            assert_eq!(rows, [(1, "ours".to_string()), (2, "theirs".to_string())]);
             Ok(())
         })();
 
@@ -3802,6 +3938,26 @@ mod tests {
 
         let err = run_sql(None, &[String::from("SELECT 1")]).unwrap_err();
         assert!(err.to_string().contains("requires --db <path>"), "{err:#}");
+    }
+
+    #[test]
+    fn remote_uri_help_describes_canonical_and_compatibility_forms() {
+        for args in [
+            &["graft", "clone", "--help"][..],
+            &["graft", "remote", "add", "--help"][..],
+            &["graft", "remote", "set-url", "--help"][..],
+        ] {
+            let help = Cli::try_parse_from(args.iter().copied())
+                .err()
+                .expect("help should stop argument parsing")
+                .to_string();
+            assert!(help.contains("https://host/org/repo"), "{help}");
+            assert!(help.contains("graft+https://host/org/repo"), "{help}");
+            assert!(
+                help.contains("graft+http://host/org/repo for local use"),
+                "{help}"
+            );
+        }
     }
 
     #[test]
@@ -4404,7 +4560,7 @@ mod tests {
     }
 
     #[test]
-    fn export_pragma_writes_physical_sqlite_file() {
+    fn export_command_writes_physical_sqlite_file() {
         let temp_dir = tempfile::Builder::new()
             .prefix("graft-export-test")
             .tempdir_in("/tmp")
@@ -4415,19 +4571,66 @@ mod tests {
 
         run_sql(
             Some(&db),
-            &[format!(
+            &[String::from(
                 "CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT); \
-                 INSERT INTO users(name) VALUES ('Alice'), ('Bob'); \
-                 PRAGMA graft_add; \
-                 PRAGMA graft_commit = 'initial users'; \
-                 PRAGMA graft_export = '--source HEAD --output {}';",
-                output.display()
+                 INSERT INTO users(name) VALUES ('Alice'), ('Bob');",
             )],
         )
         .unwrap();
+        let add_arg = repo_add_arg(false, false, None, Some(&db)).unwrap();
+        run_repository_command(Some(&db), None, "add", add_arg.as_deref()).unwrap();
+        run_repository_command(Some(&db), None, "commit", Some("initial users")).unwrap();
+        let export_arg = repo_export_arg(Some("HEAD"), &output, Some(&db));
+        run_repository_command(Some(&db), None, "export", Some(&export_arg)).unwrap();
 
         let conn = Connection::open(&output).unwrap();
         let names: String = conn
+            .query_row(
+                "SELECT group_concat(name, ',') FROM users ORDER BY id",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(names, "Alice,Bob");
+    }
+
+    #[test]
+    fn export_command_snapshots_the_physical_wal_worktree() {
+        let temp_dir = tempfile::Builder::new()
+            .prefix("graft-export-wal-test")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let db = temp_dir.path().join("app.db");
+        let output = temp_dir.path().join("snapshot.db");
+        graft::repo::Repository::init(temp_dir.path()).unwrap();
+
+        let connection = Connection::open(&db).unwrap();
+        connection
+            .query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))
+            .unwrap();
+        connection
+            .pragma_update(None, "wal_autocheckpoint", 0)
+            .unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT); \
+                 INSERT INTO users(name) VALUES ('Alice'), ('Bob');",
+            )
+            .unwrap();
+        let wal_path = PathBuf::from(format!("{}-wal", db.display()));
+        assert!(wal_path.exists());
+
+        let export_arg = repo_export_arg(None, &output, Some(&db));
+        run_repository_command(Some(&db), None, "export", Some(&export_arg)).unwrap();
+
+        assert!(
+            wal_path.exists(),
+            "export must not checkpoint the source WAL"
+        );
+        let restored =
+            Connection::open_with_flags(&output, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        let names: String = restored
             .query_row(
                 "SELECT group_concat(name, ',') FROM users ORDER BY id",
                 [],

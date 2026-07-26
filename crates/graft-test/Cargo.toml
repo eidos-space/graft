@@ -1,6 +1,6 @@
 [package]
 name = "graft-test"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2024"
 authors = { workspace = true }
 license = { workspace = true }
@@ -13,7 +13,7 @@ workspace = true
 
 [dependencies]
 graft = { path = "../graft", features = ["testutil", "precept"] }
-graft-sqlite = { path = "../graft-sqlite" }
+graft-sqlite = { path = "../graft-sqlite", features = ["test-repository-pragmas"] }
 graft-tracing = { path = "../graft-tracing" }
 
 anyhow = { workspace = true }
