@@ -70,7 +70,9 @@ enum Command {
         #[arg(short = 'b', long = "branch", conflicts_with = "branch")]
         branch_option: Option<String>,
 
-        /// Remote URI: memory, fs://..., s3://..., s3_compatible://..., graft+https://..., or graft+http://...
+        #[arg(
+            help = "Remote URI: https://host/org/repo (or graft+https://host/org/repo), graft+http://host/org/repo for local use, memory, fs://, s3://, or s3_compatible://"
+        )]
         remote: String,
 
         /// Optional branch to clone. Defaults to remote HEAD, then main.
@@ -593,7 +595,9 @@ enum RemoteCommand {
         /// Remote name, for example origin
         name: String,
 
-        /// Remote URI: memory, fs://..., s3://..., s3_compatible://..., graft+https://..., or graft+http://...
+        #[arg(
+            help = "Remote URI: https://host/org/repo (or graft+https://host/org/repo), graft+http://host/org/repo for local use, memory, fs://, s3://, or s3_compatible://"
+        )]
         uri: String,
     },
 
@@ -649,7 +653,9 @@ enum RemoteCommand {
         /// Remote name, for example origin
         name: String,
 
-        /// Remote URI: memory, fs://..., s3://..., s3_compatible://..., graft+https://..., or graft+http://...
+        #[arg(
+            help = "Remote URI: https://host/org/repo (or graft+https://host/org/repo), graft+http://host/org/repo for local use, memory, fs://, s3://, or s3_compatible://"
+        )]
         uri: String,
     },
 
@@ -3802,6 +3808,26 @@ mod tests {
 
         let err = run_sql(None, &[String::from("SELECT 1")]).unwrap_err();
         assert!(err.to_string().contains("requires --db <path>"), "{err:#}");
+    }
+
+    #[test]
+    fn remote_uri_help_describes_canonical_and_compatibility_forms() {
+        for args in [
+            &["graft", "clone", "--help"][..],
+            &["graft", "remote", "add", "--help"][..],
+            &["graft", "remote", "set-url", "--help"][..],
+        ] {
+            let help = Cli::try_parse_from(args.iter().copied())
+                .err()
+                .expect("help should stop argument parsing")
+                .to_string();
+            assert!(help.contains("https://host/org/repo"), "{help}");
+            assert!(help.contains("graft+https://host/org/repo"), "{help}");
+            assert!(
+                help.contains("graft+http://host/org/repo for local use"),
+                "{help}"
+            );
+        }
     }
 
     #[test]

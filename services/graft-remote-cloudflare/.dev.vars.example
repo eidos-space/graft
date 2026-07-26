@@ -1,0 +1,2 @@
+# Copy this file to .dev.vars for local development.
+GRAFT_REMOTE_TOKEN=replace-with-a-local-development-token

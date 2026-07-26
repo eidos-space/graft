@@ -100,7 +100,7 @@ pub(super) fn remote_config_uri(config: &RemoteConfig) -> String {
         }
         RemoteConfig::Http { url, token_env } => {
             let mut uri = if let Some(rest) = url.strip_prefix("https://") {
-                format!("graft+https://{rest}")
+                format!("https://{rest}")
             } else if let Some(rest) = url.strip_prefix("http://") {
                 format!("graft+http://{rest}")
             } else {

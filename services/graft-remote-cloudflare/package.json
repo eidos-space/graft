@@ -1,0 +1,30 @@
+{
+  "name": "graft-remote-cloudflare-verification",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.14.0",
+  "scripts": {
+    "precheck": "tsc -p ../../packages/graft-remote/tsconfig.build.json && tsc -p ../../packages/graft-remote-hono/tsconfig.build.json && tsc -p ../../packages/graft-remote-cloudflare/tsconfig.build.json",
+    "check": "wrangler types worker-configuration.d.ts --include-runtime false --check && tsc --noEmit",
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "predeploy": "tsc -p ../../packages/graft-remote/tsconfig.build.json && tsc -p ../../packages/graft-remote-hono/tsconfig.build.json && tsc -p ../../packages/graft-remote-cloudflare/tsconfig.build.json",
+    "predev": "tsc -p ../../packages/graft-remote/tsconfig.build.json && tsc -p ../../packages/graft-remote-hono/tsconfig.build.json && tsc -p ../../packages/graft-remote-cloudflare/tsconfig.build.json",
+    "pretest": "tsc -p ../../packages/graft-remote/tsconfig.build.json && tsc -p ../../packages/graft-remote-hono/tsconfig.build.json && tsc -p ../../packages/graft-remote-cloudflare/tsconfig.build.json",
+    "test": "GRAFT_REMOTE_TOKEN=test-token vitest run",
+    "types": "wrangler types worker-configuration.d.ts --include-runtime false"
+  },
+  "dependencies": {
+    "@eidos.space/graft-remote-cloudflare": "workspace:*",
+    "@eidos.space/graft-remote-hono": "workspace:*",
+    "hono": "4.12.31"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "0.18.7",
+    "@cloudflare/workers-types": "5.20260722.1",
+    "typescript": "7.0.2",
+    "vitest": "4.1.10",
+    "wrangler": "4.113.0"
+  }
+}

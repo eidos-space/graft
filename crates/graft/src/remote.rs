@@ -1,4 +1,4 @@
-use std::{env, future, ops::Range, time::Duration};
+use std::{collections::HashSet, env, future, ops::Range, time::Duration};
 
 use crate::core::{LogId, SegmentId, cbe::CBE64, commit::Commit, lsn::LSN};
 use bilrost::{Message, OwnedMessage};
@@ -20,6 +20,8 @@ use thiserror::Error;
 pub mod segment;
 
 const REMOTE_CONCURRENCY: usize = 5;
+const GRAFT_PROTOCOL_HEADER: &str = "Graft-Protocol";
+const GRAFT_PROTOCOL_VERSION: &str = "1";
 
 enum RemotePath<'a> {
     /// Commits are stored at `/logs/{logid}/commits/{CBE64 hex LSN}`
@@ -58,6 +60,15 @@ pub enum RemoteErr {
         status: u16,
         path: String,
         message: String,
+    },
+
+    #[error(
+        "HTTP remote protocol mismatch for `{path}`: expected response header `Graft-Protocol: {expected}`, received {received:?}"
+    )]
+    HttpProtocolMismatch {
+        path: String,
+        expected: &'static str,
+        received: Option<String>,
     },
 
     #[error("Failed to decode file: {0}")]
@@ -150,6 +161,8 @@ struct HttpRemote {
 #[derive(Debug, Deserialize)]
 struct HttpListResponse {
     paths: Vec<String>,
+    #[serde(default)]
+    next_cursor: Option<String>,
 }
 
 impl Remote {
@@ -610,16 +623,24 @@ impl HttpRemote {
         format!("{}/{}/{}", self.url, kind, percent_encode_path(path))
     }
 
-    fn list_url(&self, prefix: &str) -> String {
-        format!(
+    fn list_url(&self, prefix: &str, cursor: Option<&str>) -> String {
+        let mut url = format!(
             "{}/list?prefix={}",
             self.url,
             percent_encode_component(prefix)
-        )
+        );
+        if let Some(cursor) = cursor {
+            url.push_str("&cursor=");
+            url.push_str(&percent_encode_component(cursor));
+        }
+        url
     }
 
     fn request(&self, method: reqwest::Method, url: String) -> reqwest::RequestBuilder {
-        let request = self.client.request(method, url);
+        let request = self
+            .client
+            .request(method, url)
+            .header(GRAFT_PROTOCOL_HEADER, GRAFT_PROTOCOL_VERSION);
         if let Some(token) = &self.token {
             request.bearer_auth(token)
         } else {
@@ -629,7 +650,28 @@ impl HttpRemote {
 
     async fn check_response(response: reqwest::Response, path: &str) -> Result<reqwest::Response> {
         if response.status().is_success() {
-            return Ok(response);
+            let protocol_headers = response.headers().get_all(GRAFT_PROTOCOL_HEADER);
+            let mut protocol_versions = protocol_headers.iter();
+            let first = protocol_versions.next();
+            if first.is_some_and(|value| value.as_bytes() == GRAFT_PROTOCOL_VERSION.as_bytes())
+                && protocol_versions.next().is_none()
+            {
+                return Ok(response);
+            }
+            let received = protocol_headers
+                .iter()
+                .fold(None, |received: Option<String>, value| {
+                    let value = String::from_utf8_lossy(value.as_bytes());
+                    Some(match received {
+                        Some(received) => format!("{received}, {value}"),
+                        None => value.into_owned(),
+                    })
+                });
+            return Err(RemoteErr::HttpProtocolMismatch {
+                path: path.to_string(),
+                expected: GRAFT_PROTOCOL_VERSION,
+                received,
+            });
         }
         let status = response.status().as_u16();
         let message = response
@@ -694,20 +736,42 @@ impl HttpRemote {
     }
 
     async fn list_raw(&self, prefix: &str) -> Result<Vec<String>> {
-        let response = self
-            .request(reqwest::Method::GET, self.list_url(prefix))
-            .send()
-            .await
-            .map_err(RemoteErr::HttpTransport)?;
-        let response = Self::check_response(response, prefix).await?;
-        let bytes = response.bytes().await.map_err(RemoteErr::HttpTransport)?;
-        let list: HttpListResponse =
-            serde_json::from_slice(&bytes).map_err(|err| RemoteErr::HttpStatus {
-                status: 502,
-                path: prefix.to_string(),
-                message: format!("invalid list response JSON: {err}"),
-            })?;
-        Ok(list.paths)
+        let mut paths = Vec::new();
+        let mut cursor = None;
+        let mut seen_cursors = HashSet::new();
+
+        loop {
+            let response = self
+                .request(
+                    reqwest::Method::GET,
+                    self.list_url(prefix, cursor.as_deref()),
+                )
+                .send()
+                .await
+                .map_err(RemoteErr::HttpTransport)?;
+            let response = Self::check_response(response, prefix).await?;
+            let bytes = response.bytes().await.map_err(RemoteErr::HttpTransport)?;
+            let page: HttpListResponse =
+                serde_json::from_slice(&bytes).map_err(|err| RemoteErr::HttpStatus {
+                    status: 502,
+                    path: prefix.to_string(),
+                    message: format!("invalid list response JSON: {err}"),
+                })?;
+            paths.extend(page.paths);
+
+            let Some(next_cursor) = page.next_cursor else {
+                return Ok(paths);
+            };
+            if next_cursor.is_empty() || !seen_cursors.insert(next_cursor.clone()) {
+                return Err(RemoteErr::HttpStatus {
+                    status: 502,
+                    path: prefix.to_string(),
+                    message: "list response repeated an empty or previously seen cursor"
+                        .to_string(),
+                });
+            }
+            cursor = Some(next_cursor);
+        }
     }
 
     async fn put_raw(&self, path: &str, bytes: Bytes) -> Result<()> {
@@ -840,6 +904,163 @@ fn remote_lock_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn serve_http_response(
+        status: &str,
+        protocol_versions: &[&str],
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        let protocol_versions = protocol_versions
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let status = status.to_string();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut buffer = [0_u8; 1024];
+                let read = stream.read(&mut buffer).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let protocol_headers = protocol_versions
+                .iter()
+                .map(|version| format!("Graft-Protocol: {version}\r\n"))
+                .collect::<String>();
+            let response = format!(
+                "HTTP/1.1 {status}\r\n{protocol_headers}Content-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        (format!("http://{address}/org/repo"), task)
+    }
+
+    #[tokio::test]
+    async fn http_remote_sends_and_requires_protocol_version() {
+        let (url, request) = serve_http_response("204 No Content", &["1"]).await;
+        let remote = HttpRemote::new(url, None).unwrap();
+        assert!(remote.has_raw("objects/one").await.unwrap());
+        let request = request.await.unwrap();
+        assert!(
+            request
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("Graft-Protocol: 1"))
+        );
+
+        let (url, request) = serve_http_response("204 No Content", &[]).await;
+        let remote = HttpRemote::new(url, None).unwrap();
+        assert!(matches!(
+            remote.has_raw("objects/one").await,
+            Err(RemoteErr::HttpProtocolMismatch { received: None, .. })
+        ));
+        request.await.unwrap();
+
+        let (url, request) = serve_http_response("204 No Content", &["2"]).await;
+        let remote = HttpRemote::new(url, None).unwrap();
+        assert!(matches!(
+            remote.has_raw("objects/one").await,
+            Err(RemoteErr::HttpProtocolMismatch {
+                received: Some(version),
+                ..
+            }) if version == "2"
+        ));
+        request.await.unwrap();
+
+        let (url, request) = serve_http_response("204 No Content", &["1", "2"]).await;
+        let remote = HttpRemote::new(url, None).unwrap();
+        assert!(matches!(
+            remote.has_raw("objects/one").await,
+            Err(RemoteErr::HttpProtocolMismatch {
+                received: Some(versions),
+                ..
+            }) if versions == "1, 2"
+        ));
+        request.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_remote_preserves_conditional_status_contracts() {
+        let (url, request) = serve_http_response("409 Conflict", &[]).await;
+        let remote = HttpRemote::new(url, None).unwrap();
+        assert!(matches!(
+            remote
+                .compare_and_swap_raw("refs/heads/main", None, Bytes::new())
+                .await,
+            Err(RemoteErr::CompareAndSwap { .. })
+        ));
+        request.await.unwrap();
+
+        let (url, request) = serve_http_response("409 Conflict", &[]).await;
+        let remote = HttpRemote::new(url, None).unwrap();
+        assert!(matches!(
+            remote.compare_and_delete_raw("refs/heads/main", None).await,
+            Err(RemoteErr::CompareAndSwap { .. })
+        ));
+        request.await.unwrap();
+
+        let (url, request) = serve_http_response("412 Precondition Failed", &[]).await;
+        let remote = HttpRemote::new(url, None).unwrap();
+        let error = remote
+            .put_raw_if_not_exists("objects/one", Bytes::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(&error, RemoteErr::HttpStatus { status: 412, .. }));
+        assert!(error.precondition_failed());
+        request.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_remote_follows_list_cursors() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let bodies = [
+                r#"{"paths":["objects/one"],"next_cursor":"opaque/+ cursor"}"#,
+                r#"{"paths":["objects/two"]}"#,
+            ];
+            let mut requests = Vec::new();
+            for body in bodies {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut buffer = [0_u8; 1024];
+                    let read = stream.read(&mut buffer).await.unwrap();
+                    request.extend_from_slice(&buffer[..read]);
+                    if read == 0 || request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                requests.push(String::from_utf8(request).unwrap());
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nGraft-Protocol: 1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+            requests
+        });
+
+        let remote = HttpRemote::new(format!("http://{address}/org/repo"), None).unwrap();
+        assert_eq!(
+            remote.list_raw("objects/").await.unwrap(),
+            ["objects/one", "objects/two"]
+        );
+        let requests = server.await.unwrap();
+        assert!(requests[0].starts_with("GET /org/repo/list?prefix=objects%2F "));
+        assert!(
+            requests[1]
+                .starts_with("GET /org/repo/list?prefix=objects%2F&cursor=opaque%2F%2B%20cursor ")
+        );
+    }
 
     #[test]
     fn compare_and_swap_raw_updates_only_when_expected_matches() {

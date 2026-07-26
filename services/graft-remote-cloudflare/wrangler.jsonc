@@ -1,0 +1,43 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "graft-remote",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-21",
+  "compatibility_flags": ["nodejs_compat"],
+  "secrets": {
+    "required": ["GRAFT_REMOTE_TOKEN"]
+  },
+  "r2_buckets": [
+    {
+      "binding": "OBJECTS",
+      "bucket_name": "graft-remote-objects",
+      "preview_bucket_name": "graft-remote-objects-preview"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "REPOSITORIES",
+        "class_name": "RepositoryDurableObject"
+      }
+    ]
+  },
+  "exports": {
+    "RepositoryDurableObject": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
+  },
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1,
+      "invocation_logs": true
+    },
+    "traces": {
+      "enabled": true,
+      "head_sampling_rate": 0.01
+    }
+  }
+}

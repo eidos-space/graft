@@ -287,29 +287,88 @@ fn parse_remote_add_rejects_unknown_s3_query_parameters() {
 }
 
 #[test]
-fn parse_remote_add_supports_graft_http_remote() {
-    let (name, config) = parse_remote_add(
-        "origin graft+https://graft.example.com/api/graft/v1/repos/acme/app?token_env=GRAFT_TOKEN",
-    )
-    .unwrap();
+fn parse_remote_add_supports_canonical_https_remote() {
+    let (name, config) =
+        parse_remote_add("origin https://graft.example.com/acme/app?token_env=GRAFT_TOKEN")
+            .unwrap();
 
     assert_eq!(name, "origin");
     assert_eq!(
         config,
         RemoteConfig::Http {
-            url: "https://graft.example.com/api/graft/v1/repos/acme/app".to_string(),
+            url: "https://graft.example.com/acme/app".to_string(),
             token_env: Some("GRAFT_TOKEN".to_string()),
         }
     );
     assert_eq!(
         remote_config_uri(&config),
-        "graft+https://graft.example.com/api/graft/v1/repos/acme/app?token_env=GRAFT_TOKEN"
+        "https://graft.example.com/acme/app?token_env=GRAFT_TOKEN"
     );
 }
 
 #[test]
-fn parse_remote_add_rejects_unknown_graft_http_query_parameters() {
-    assert!(parse_remote_add("origin graft+https://graft.example.com/api?token=secret").is_err());
+fn parse_remote_add_canonicalizes_https_alias_and_preserves_local_http_alias() {
+    let (_, https) = parse_remote_add("origin graft+https://graft.example.com/acme/app").unwrap();
+    assert_eq!(
+        remote_config_uri(&https),
+        "https://graft.example.com/acme/app"
+    );
+
+    let (_, legacy) =
+        parse_remote_add("origin graft+https://graft.example.com/api/graft/v1/repos/acme/app")
+            .unwrap();
+    assert_eq!(
+        remote_config_uri(&legacy),
+        "https://graft.example.com/api/graft/v1/repos/acme/app"
+    );
+
+    let (_, http) = parse_remote_add("origin graft+http://127.0.0.1:8787/acme/app").unwrap();
+    assert_eq!(
+        http,
+        RemoteConfig::Http {
+            url: "http://127.0.0.1:8787/acme/app".to_string(),
+            token_env: None,
+        }
+    );
+    assert_eq!(
+        remote_config_uri(&http),
+        "graft+http://127.0.0.1:8787/acme/app"
+    );
+
+    let (_, ipv6) = parse_remote_add("origin graft+http://[::1]:8787/acme/app").unwrap();
+    assert_eq!(remote_config_uri(&ipv6), "graft+http://[::1]:8787/acme/app");
+}
+
+#[test]
+fn parse_remote_add_rejects_invalid_http_remote_uris() {
+    for uri in [
+        "http://graft.example.com/acme/app",
+        "https://graft.example.com",
+        "https://graft.example.com/",
+        "https:///acme/app",
+        "https://:/acme/app",
+        "https://graft.example.com:+443/acme/app",
+        "https://graft.example.com:invalid/acme/app",
+        "https://[not-ipv6]/acme/app",
+        "https://user@graft.example.com/acme/app",
+        "https://graft.example.com/acme//app",
+        "https://graft.example.com/acme/app/",
+        "https://graft.example.com/acme\\..\\app",
+        "https://graft.example.com/acme/./app",
+        "https://graft.example.com/acme/../app",
+        "https://graft.example.com/acme/%2e%2e/app",
+        "https://graft.example.com/acme/app#readme",
+        "https://graft.example.com/acme/app?",
+        "https://graft.example.com/acme/app?token_env=",
+        "https://graft.example.com/acme/app?token_env=ONE&token_env=TWO",
+        "https://graft.example.com/acme/app?token=secret",
+        "https://graft.example.com/acme/app?token_env=TOKEN&",
+    ] {
+        assert!(
+            parse_remote_add(&format!("origin {uri}")).is_err(),
+            "URI should be rejected: {uri}"
+        );
+    }
 }
 
 #[test]
