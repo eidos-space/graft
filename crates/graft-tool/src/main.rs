@@ -3806,6 +3806,121 @@ mod tests {
     }
 
     #[test]
+    fn remove_rejects_an_active_physical_sqlite_writer_before_staging_deletion() {
+        let _guard = CWD_LOCK.lock().unwrap();
+        let original_dir = std::env::current_dir().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::env::set_current_dir(temp_dir.path()).unwrap();
+
+        let result = (|| -> Result<()> {
+            run_command(Command::Init(InitArgs { json: false }), None)?;
+            let db = Path::new("app.sqlite");
+            run_sql(
+                Some(db),
+                &[String::from(
+                    "CREATE TABLE docs(id INTEGER PRIMARY KEY, title TEXT); \
+                     INSERT INTO docs VALUES (1, 'main');",
+                )],
+            )?;
+            let add_arg = repo_add_arg(false, false, None, Some(db))?;
+            run_repository_command(Some(db), None, "add", add_arg.as_deref())?;
+            run_repository_command(Some(db), None, "commit", Some("main state"))?;
+
+            let writer = Connection::open(db)?;
+            writer.execute_batch(
+                "BEGIN IMMEDIATE; UPDATE docs SET title = 'in flight' WHERE id = 1;",
+            )?;
+
+            let remove_arg = repo_rm_arg(false, Some(db));
+            let error = run_repository_command(Some(db), None, "rm", remove_arg.as_deref())
+                .expect_err("an active physical writer must block database removal");
+            assert!(
+                error
+                    .to_string()
+                    .contains("while another transaction is active"),
+                "{error:#}"
+            );
+            assert!(db.exists());
+            let status = run_repository_command(Some(db), None, "json_status", None)?
+                .expect("status should return JSON");
+            assert!(status.contains(r#""has_staged_changes":false"#), "{status}");
+
+            writer.execute_batch("ROLLBACK")?;
+            let title: String =
+                writer.query_row("SELECT title FROM docs WHERE id = 1", [], |row| row.get(0))?;
+            assert_eq!(title, "main");
+            Ok(())
+        })();
+
+        std::env::set_current_dir(original_dir).unwrap();
+        result.unwrap();
+    }
+
+    #[test]
+    fn merge_with_db_auto_merges_non_overlapping_rows_into_the_physical_worktree() {
+        let _guard = CWD_LOCK.lock().unwrap();
+        let original_dir = std::env::current_dir().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::env::set_current_dir(temp_dir.path()).unwrap();
+
+        let result = (|| -> Result<()> {
+            run_command(Command::Init(InitArgs { json: false }), None)?;
+            let db = Path::new("data.sqlite");
+            run_sql(
+                Some(db),
+                &[String::from(
+                    "CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT); \
+                     INSERT INTO docs VALUES (1, 'one'), (2, 'two');",
+                )],
+            )?;
+            let add_arg = repo_add_arg(false, false, None, Some(db))?;
+            run_repository_command(Some(db), None, "add", add_arg.as_deref())?;
+            run_repository_command(Some(db), None, "commit", Some("base"))?;
+
+            run_repository_command(Some(db), None, "switch_create", Some("feature"))?;
+            run_sql(
+                Some(db),
+                &[String::from(
+                    "UPDATE docs SET body = 'theirs' WHERE id = 2;",
+                )],
+            )?;
+            run_repository_command(Some(db), None, "add", add_arg.as_deref())?;
+            run_repository_command(Some(db), None, "commit", Some("theirs"))?;
+
+            run_repository_command(Some(db), None, "switch_branch", Some("main"))?;
+            run_sql(
+                Some(db),
+                &[String::from("UPDATE docs SET body = 'ours' WHERE id = 1;")],
+            )?;
+            run_repository_command(Some(db), None, "add", add_arg.as_deref())?;
+            run_repository_command(Some(db), None, "commit", Some("ours"))?;
+
+            let output = run_repository_command(Some(db), None, "merge", Some("feature"))?
+                .expect("merge should return output");
+            assert!(
+                output.contains("Row-level auto-merged data.sqlite"),
+                "{output}"
+            );
+            let status = run_repository_command(Some(db), None, "json_status", None)?
+                .expect("status should return JSON");
+            assert!(status.contains(r#""has_conflicts":false"#), "{status}");
+
+            let connection = Connection::open(db)?;
+            let rows = connection
+                .prepare("SELECT id, body FROM docs ORDER BY id")?
+                .query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            assert_eq!(rows, [(1, "ours".to_string()), (2, "theirs".to_string())]);
+            Ok(())
+        })();
+
+        std::env::set_current_dir(original_dir).unwrap();
+        result.unwrap();
+    }
+
+    #[test]
     fn sql_command_requires_explicit_db_and_existing_graft_repo() {
         let temp_dir = tempfile::tempdir().unwrap();
         let db = temp_dir.path().join("app.db");

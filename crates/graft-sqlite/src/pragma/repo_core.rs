@@ -99,7 +99,8 @@ pub(super) fn run_repo_clone(
         let previous_files = BTreeMap::new();
         let previous_artifacts = BTreeMap::new();
         let paths = checkout_plan_path_actions(&plan, &previous_files, &previous_artifacts);
-        preflight_workspace_checkout(&repo, &plan, &previous_files)?;
+        let _sqlite_replacement_guards =
+            preflight_workspace_checkout(&repo, &plan, &previous_files)?;
         repo.apply_switch_branch_plan(&branch, &plan)?;
         checkout_repo_plan(
             &runtime,

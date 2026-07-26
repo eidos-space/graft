@@ -249,14 +249,29 @@ pub(super) fn physical_sqlite_file_matches_state(
 /// exclusive lock, fold a stale WAL into the main database, switch the old file back to rollback
 /// journal mode, and remove sidecars before rename. A live writer causes the checkout to fail
 /// instead of replacing the main file underneath it.
-pub(super) fn prepare_sqlite_path_for_replacement(path: &Path) -> Result<(), ErrCtx> {
+pub(super) struct SqliteReplacementGuard {
+    connection: Option<Connection>,
+}
+
+impl Drop for SqliteReplacementGuard {
+    fn drop(&mut self) {
+        if let Some(connection) = self.connection.take() {
+            let _ = connection.execute_batch("ROLLBACK");
+        }
+    }
+}
+
+pub(super) fn prepare_sqlite_path_for_replacement(
+    path: &Path,
+) -> Result<SqliteReplacementGuard, ErrCtx> {
     const LOCK_TIMEOUT: Duration = Duration::from_secs(1);
 
     if !path.exists() {
-        return remove_sqlite_sidecars(path);
+        remove_sqlite_sidecars(path)?;
+        return Ok(SqliteReplacementGuard { connection: None });
     }
     if !is_sqlite_database_path(path)? {
-        return Ok(());
+        return Ok(SqliteReplacementGuard { connection: None });
     }
 
     let connection = Connection::open_with_flags(
@@ -311,8 +326,26 @@ pub(super) fn prepare_sqlite_path_for_replacement(path: &Path) -> Result<(), Err
             ));
         }
     }
-    drop(connection);
-    remove_sqlite_sidecars(path)
+    match connection.execute_batch("BEGIN EXCLUSIVE") {
+        Ok(()) => {}
+        Err(rusqlite::Error::SqliteFailure(error, _))
+            if matches!(
+                error.code,
+                ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked
+            ) =>
+        {
+            return Err(ErrCtx::PragmaErr(
+                format!(
+                    "cannot replace SQLite database `{}` while another transaction is active",
+                    path.display()
+                )
+                .into(),
+            ));
+        }
+        Err(error) => return Err(error.into()),
+    }
+    remove_sqlite_sidecars(path)?;
+    Ok(SqliteReplacementGuard { connection: Some(connection) })
 }
 
 fn remove_sqlite_sidecars(path: &Path) -> Result<(), ErrCtx> {
@@ -607,5 +640,32 @@ mod tests {
             assert!(!PathBuf::from(format!("{}{}", path.display(), suffix)).exists());
         }
         Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    }
+
+    #[test]
+    fn replacement_guard_blocks_new_writers_until_it_is_dropped() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("app.sqlite");
+        drop(create_database(&path, "delete"));
+
+        let guard = prepare_sqlite_path_for_replacement(&path).unwrap();
+        let contender = Connection::open(&path).unwrap();
+        contender.busy_timeout(Duration::ZERO).unwrap();
+        let error = contender.execute_batch("BEGIN IMMEDIATE").unwrap_err();
+        assert!(matches!(
+            error,
+            rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code: ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked,
+                    ..
+                },
+                _
+            )
+        ));
+
+        drop(guard);
+        contender
+            .execute_batch("BEGIN IMMEDIATE; ROLLBACK")
+            .unwrap();
     }
 }

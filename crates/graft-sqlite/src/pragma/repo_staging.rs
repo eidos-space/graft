@@ -948,6 +948,7 @@ pub(super) fn remove_physical_sqlite_file(
                     .into(),
                 ));
             }
+            let _replacement_guard = prepare_sqlite_path_for_replacement(path)?;
             std::fs::remove_file(path)?;
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}

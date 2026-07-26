@@ -58,9 +58,14 @@ impl RepositoryCommandService {
             || target.to_path_buf(),
             |repo| repo.graft_dir().to_path_buf(),
         );
+        let repository_database = repo
+            .as_ref()
+            .filter(|repo| target != repo.graft_dir())
+            .map(|_| target.to_path_buf());
         let file = VolFile::new_repository_session(
             runtime,
             session_path.to_string_lossy().into_owned(),
+            repository_database,
             repo,
             runtimes,
         )?;

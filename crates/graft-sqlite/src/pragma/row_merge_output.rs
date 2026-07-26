@@ -11,7 +11,9 @@ pub(super) fn append_row_merge_analysis(
     let MergeOutcome::Merged { conflicted, .. } = outcome else {
         return Ok(());
     };
-    let key = repo.file_key(&file.tag)?;
+    let Some(key) = selected_repository_database_key(file, repo)? else {
+        return Ok(());
+    };
     if !conflicted.iter().any(|path| path == &key) {
         return Ok(());
     }
@@ -121,7 +123,9 @@ pub(super) fn current_file_status_row_merge_analysis(
     repo: &Repository,
     remote: Option<Arc<Remote>>,
 ) -> Result<Option<JsonRowMergeAnalysis>, ErrCtx> {
-    let key = repo.file_key(&file.tag)?;
+    let Some(key) = selected_repository_database_key(file, repo)? else {
+        return Ok(None);
+    };
     current_file_row_merge_analysis(runtime, repo, &key, remote)
 }
 
@@ -134,9 +138,10 @@ pub(super) fn current_file_status_row_merge_analysis_lossy(
     match current_file_status_row_merge_analysis(runtime, file, repo, remote) {
         Ok(analysis) => analysis,
         Err(err) => {
-            let path = repo
-                .file_key(&file.tag)
-                .unwrap_or_else(|_| "db.sqlite3".to_string());
+            let path = selected_repository_database_key(file, repo)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "db.sqlite3".to_string());
             Some(JsonRowMergeAnalysis {
                 path,
                 available: false,
@@ -721,16 +726,26 @@ pub(super) fn try_row_auto_merge_current_file_conflict(
     repo: &Repository,
     outcome: &MergeOutcome,
     remote: Option<Arc<Remote>>,
+    physical_replacement_prepared: bool,
 ) -> Result<Option<RowAutoMergeResult>, ErrCtx> {
     let MergeOutcome::Merged { conflicted, .. } = outcome else {
         return Ok(None);
     };
-    let key = repo.file_key(&file.tag)?;
+    let Some(key) = selected_repository_database_key(file, repo)? else {
+        return Ok(None);
+    };
     if !conflicted.iter().any(|path| path == &key) {
         return Ok(None);
     }
 
-    try_row_merge_current_file_status_conflict(runtime, file, repo, remote, true)
+    try_row_merge_current_file_status_conflict(
+        runtime,
+        file,
+        repo,
+        remote,
+        true,
+        physical_replacement_prepared,
+    )
 }
 
 pub(super) fn try_row_auto_merge_current_file_status_conflict(
@@ -739,7 +754,7 @@ pub(super) fn try_row_auto_merge_current_file_status_conflict(
     repo: &Repository,
     remote: Option<Arc<Remote>>,
 ) -> Result<Option<RowAutoMergeResult>, ErrCtx> {
-    try_row_merge_current_file_status_conflict(runtime, file, repo, remote, false)
+    try_row_merge_current_file_status_conflict(runtime, file, repo, remote, false, false)
 }
 
 pub(super) fn try_row_merge_current_file_status_conflict(
@@ -748,8 +763,11 @@ pub(super) fn try_row_merge_current_file_status_conflict(
     repo: &Repository,
     remote: Option<Arc<Remote>>,
     allow_partial: bool,
+    physical_replacement_prepared: bool,
 ) -> Result<Option<RowAutoMergeResult>, ErrCtx> {
-    let key = repo.file_key(&file.tag)?;
+    let Some(key) = selected_repository_database_key(file, repo)? else {
+        return Ok(None);
+    };
     let index = repo.read_index()?;
     if !index.conflicted_paths().iter().any(|path| path == &key) {
         return Ok(None);
@@ -777,11 +795,18 @@ pub(super) fn try_row_merge_current_file_status_conflict(
     let applied_changes = plan.apply_change_count();
     let sql = plan.theirs_apply_sql();
     let merged = materialize_row_auto_merge_state(runtime, repo, &key, &ours, &sql)?;
-    checkout_repo_file_state(runtime, file, &merged, None)?;
+    checkout_selected_repository_database(
+        runtime,
+        file,
+        repo,
+        &key,
+        &merged,
+        physical_replacement_prepared,
+    )?;
     if plan.analysis.has_conflicts() {
         return Ok(None);
     }
-    repo.resolve_file_conflict(&file.tag, Some(merged))?;
+    repo.resolve_file_conflict(repo.worktree().join(&key), Some(merged))?;
 
     Ok(Some(RowAutoMergeResult {
         key,
@@ -789,6 +814,32 @@ pub(super) fn try_row_merge_current_file_status_conflict(
         ours_changes: plan.analysis.ours_changes,
         theirs_changes: plan.analysis.theirs_changes,
     }))
+}
+
+fn selected_repository_database_key(
+    file: &VolFile,
+    repo: &Repository,
+) -> Result<Option<String>, ErrCtx> {
+    file.repository_database_path()
+        .map(|path| repo.file_key(path).map_err(ErrCtx::from))
+        .transpose()
+}
+
+fn checkout_selected_repository_database(
+    runtime: &Runtime,
+    file: &mut VolFile,
+    repo: &Repository,
+    key: &str,
+    state: &CommitFileState,
+    physical_replacement_prepared: bool,
+) -> Result<(), ErrCtx> {
+    if repo.file_key(&file.tag)? == key {
+        checkout_repo_file_state(runtime, file, state, None)
+    } else if physical_replacement_prepared {
+        checkout_repo_file_state_to_prepared_key(runtime, repo, key, state, None)
+    } else {
+        checkout_repo_file_state_to_key(runtime, repo, key, state, None)
+    }
 }
 
 pub(super) fn current_file_conflict_states(
