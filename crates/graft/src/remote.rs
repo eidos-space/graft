@@ -648,30 +648,35 @@ impl HttpRemote {
         }
     }
 
-    async fn check_response(response: reqwest::Response, path: &str) -> Result<reqwest::Response> {
-        if response.status().is_success() {
-            let protocol_headers = response.headers().get_all(GRAFT_PROTOCOL_HEADER);
-            let mut protocol_versions = protocol_headers.iter();
-            let first = protocol_versions.next();
-            if first.is_some_and(|value| value.as_bytes() == GRAFT_PROTOCOL_VERSION.as_bytes())
-                && protocol_versions.next().is_none()
-            {
-                return Ok(response);
-            }
-            let received = protocol_headers
-                .iter()
-                .fold(None, |received: Option<String>, value| {
-                    let value = String::from_utf8_lossy(value.as_bytes());
-                    Some(match received {
-                        Some(received) => format!("{received}, {value}"),
-                        None => value.into_owned(),
-                    })
-                });
-            return Err(RemoteErr::HttpProtocolMismatch {
-                path: path.to_string(),
-                expected: GRAFT_PROTOCOL_VERSION,
-                received,
+    fn check_protocol(response: &reqwest::Response, path: &str) -> Result<()> {
+        let protocol_headers = response.headers().get_all(GRAFT_PROTOCOL_HEADER);
+        let mut protocol_versions = protocol_headers.iter();
+        let first = protocol_versions.next();
+        if first.is_some_and(|value| value.as_bytes() == GRAFT_PROTOCOL_VERSION.as_bytes())
+            && protocol_versions.next().is_none()
+        {
+            return Ok(());
+        }
+        let received = protocol_headers
+            .iter()
+            .fold(None, |received: Option<String>, value| {
+                let value = String::from_utf8_lossy(value.as_bytes());
+                Some(match received {
+                    Some(received) => format!("{received}, {value}"),
+                    None => value.into_owned(),
+                })
             });
+        Err(RemoteErr::HttpProtocolMismatch {
+            path: path.to_string(),
+            expected: GRAFT_PROTOCOL_VERSION,
+            received,
+        })
+    }
+
+    async fn check_response(response: reqwest::Response, path: &str) -> Result<reqwest::Response> {
+        Self::check_protocol(&response, path)?;
+        if response.status().is_success() {
+            return Ok(response);
         }
         let status = response.status().as_u16();
         let message = response
@@ -692,6 +697,7 @@ impl HttpRemote {
             .await
             .map_err(RemoteErr::HttpTransport)?;
         if response.status().as_u16() == 404 {
+            Self::check_protocol(&response, path)?;
             return Ok(false);
         }
         Self::check_response(response, path).await?;
@@ -705,6 +711,7 @@ impl HttpRemote {
             .await
             .map_err(RemoteErr::HttpTransport)?;
         if response.status().as_u16() == 404 {
+            Self::check_protocol(&response, path)?;
             return Ok(None);
         }
         let response = Self::check_response(response, path).await?;
@@ -989,7 +996,7 @@ mod tests {
 
     #[tokio::test]
     async fn http_remote_preserves_conditional_status_contracts() {
-        let (url, request) = serve_http_response("409 Conflict", &[]).await;
+        let (url, request) = serve_http_response("409 Conflict", &["1"]).await;
         let remote = HttpRemote::new(url, None).unwrap();
         assert!(matches!(
             remote
@@ -999,7 +1006,7 @@ mod tests {
         ));
         request.await.unwrap();
 
-        let (url, request) = serve_http_response("409 Conflict", &[]).await;
+        let (url, request) = serve_http_response("409 Conflict", &["1"]).await;
         let remote = HttpRemote::new(url, None).unwrap();
         assert!(matches!(
             remote.compare_and_delete_raw("refs/heads/main", None).await,
@@ -1007,7 +1014,7 @@ mod tests {
         ));
         request.await.unwrap();
 
-        let (url, request) = serve_http_response("412 Precondition Failed", &[]).await;
+        let (url, request) = serve_http_response("412 Precondition Failed", &["1"]).await;
         let remote = HttpRemote::new(url, None).unwrap();
         let error = remote
             .put_raw_if_not_exists("objects/one", Bytes::new())
@@ -1015,6 +1022,19 @@ mod tests {
             .unwrap_err();
         assert!(matches!(&error, RemoteErr::HttpStatus { status: 412, .. }));
         assert!(error.precondition_failed());
+        request.await.unwrap();
+
+        let (url, request) = serve_http_response("404 Not Found", &[]).await;
+        let remote = HttpRemote::new(url, None).unwrap();
+        assert!(matches!(
+            remote.has_raw("objects/one").await,
+            Err(RemoteErr::HttpProtocolMismatch { received: None, .. })
+        ));
+        request.await.unwrap();
+
+        let (url, request) = serve_http_response("404 Not Found", &["1"]).await;
+        let remote = HttpRemote::new(url, None).unwrap();
+        assert!(!remote.has_raw("objects/one").await.unwrap());
         request.await.unwrap();
     }
 
