@@ -826,7 +826,7 @@ pub(super) fn materialize_row_auto_merge_state(
     let result = (|| {
         write_repo_file_state_to_path(runtime, ours, &temp_path)?;
         apply_row_merge_sql_to_path(&temp_path, sql)?;
-        import_physical_sqlite_file_state(runtime, &temp_path)
+        import_stable_sqlite_file_state(runtime, &temp_path)
     })();
     let cleanup = std::fs::remove_file(&temp_path);
     match (result, cleanup) {

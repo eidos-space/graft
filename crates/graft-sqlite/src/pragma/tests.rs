@@ -4,21 +4,27 @@ use graft::repo::{RepoConflictChange, RepoStagedChange, RepoStatusCounts, RepoWo
 #[test]
 fn legacy_volume_pragmas_are_debug_only() {
     let legacy = Pragma { name: "graft_volume_push", arg: None };
-    assert!(GraftPragma::try_from(&legacy).is_err());
+    assert!(VfsPragma::try_from(&legacy).is_err());
 
     let debug = Pragma {
         name: "graft_debug_volume_push",
         arg: None,
     };
     assert!(matches!(
-        GraftPragma::try_from(&debug).unwrap(),
-        GraftPragma::VolumePush
+        VfsPragma::try_from(&debug).unwrap().0,
+        GraftCommand::VolumePush
     ));
 }
 
 #[test]
-fn undocumented_repo_compat_pragmas_are_rejected() {
+fn repository_commands_are_not_exposed_as_sqlite_pragmas() {
     for name in [
+        "graft_status",
+        "graft_json_status",
+        "graft_add",
+        "graft_json_commit",
+        "graft_checkout",
+        "graft_fetch",
         "graft_repo_status",
         "graft_remove",
         "graft_branch_move",
@@ -30,57 +36,15 @@ fn undocumented_repo_compat_pragmas_are_rejected() {
     ] {
         let pragma = Pragma { name, arg: Some("app.db") };
         assert!(
-            GraftPragma::try_from(&pragma).is_err(),
+            VfsPragma::try_from(&pragma).is_err(),
             "{name} should be rejected"
         );
     }
 
     let status = Pragma { name: "graft_status", arg: None };
     assert!(matches!(
-        GraftPragma::try_from(&status).unwrap(),
-        GraftPragma::Status { spec: StatusSpec { kind: None } }
-    ));
-    let json_status = Pragma {
-        name: "graft_json_status",
-        arg: Some("--kind sqlite"),
-    };
-    assert!(matches!(
-        GraftPragma::try_from(&json_status).unwrap(),
-        GraftPragma::JsonStatus {
-            spec: StatusSpec {
-                kind: Some(RepoTrackedPathKind::SqliteDatabase),
-            },
-        }
-    ));
-
-    let json_init = Pragma { name: "graft_json_init", arg: None };
-    assert!(matches!(
-        GraftPragma::try_from(&json_init).unwrap(),
-        GraftPragma::JsonRepoInit { .. }
-    ));
-
-    let remove = Pragma { name: "graft_rm", arg: Some("app.db") };
-    assert!(matches!(
-        GraftPragma::try_from(&remove).unwrap(),
-        GraftPragma::Remove { .. }
-    ));
-
-    let json_remove = Pragma {
-        name: "graft_json_rm",
-        arg: Some("app.db"),
-    };
-    assert!(matches!(
-        GraftPragma::try_from(&json_remove).unwrap(),
-        GraftPragma::JsonRemove { .. }
-    ));
-
-    let json_commit = Pragma {
-        name: "graft_json_commit",
-        arg: Some("message"),
-    };
-    assert!(matches!(
-        GraftPragma::try_from(&json_commit).unwrap(),
-        GraftPragma::JsonCommit { .. }
+        GraftCommand::parse(&status).unwrap(),
+        GraftCommand::Status { spec: StatusSpec { kind: None } }
     ));
 }
 
@@ -88,8 +52,8 @@ fn undocumented_repo_compat_pragmas_are_rejected() {
 fn json_log_status_mode_is_opt_in() {
     let legacy = Pragma { name: "graft_json_log", arg: None };
     assert!(matches!(
-        GraftPragma::try_from(&legacy).unwrap(),
-        GraftPragma::JsonLog {
+        GraftCommand::parse(&legacy).unwrap(),
+        GraftCommand::JsonLog {
             spec: JsonLogSpec {
                 mode: JsonLogMode::LegacyArray,
                 limit: None,
@@ -103,8 +67,8 @@ fn json_log_status_mode_is_opt_in() {
         arg: Some("--with-status"),
     };
     assert!(matches!(
-        GraftPragma::try_from(&with_status).unwrap(),
-        GraftPragma::JsonLog {
+        GraftCommand::parse(&with_status).unwrap(),
+        GraftCommand::JsonLog {
             spec: JsonLogSpec {
                 mode: JsonLogMode::WithStatus,
                 limit: None,
@@ -118,8 +82,8 @@ fn json_log_status_mode_is_opt_in() {
         arg: Some("--with-status --limit 25 --after abc123"),
     };
     assert!(matches!(
-        GraftPragma::try_from(&page).unwrap(),
-        GraftPragma::JsonLog {
+        GraftCommand::parse(&page).unwrap(),
+        GraftCommand::JsonLog {
             spec: JsonLogSpec {
                 mode: JsonLogMode::WithStatus,
                 limit: Some(25),
@@ -132,13 +96,13 @@ fn json_log_status_mode_is_opt_in() {
         name: "graft_json_log",
         arg: Some("--status"),
     };
-    assert!(GraftPragma::try_from(&invalid).is_err());
+    assert!(GraftCommand::parse(&invalid).is_err());
 
     let cursor_without_limit = Pragma {
         name: "graft_json_log",
         arg: Some("--after abc123"),
     };
-    assert!(GraftPragma::try_from(&cursor_without_limit).is_err());
+    assert!(GraftCommand::parse(&cursor_without_limit).is_err());
 }
 
 #[test]
@@ -148,8 +112,8 @@ fn json_config_list_status_mode_is_opt_in() {
         arg: None,
     };
     assert!(matches!(
-        GraftPragma::try_from(&legacy).unwrap(),
-        GraftPragma::JsonConfigList { mode: JsonConfigListMode::LegacyArray }
+        GraftCommand::parse(&legacy).unwrap(),
+        GraftCommand::JsonConfigList { mode: JsonConfigListMode::LegacyArray }
     ));
 
     let with_status = Pragma {
@@ -157,23 +121,23 @@ fn json_config_list_status_mode_is_opt_in() {
         arg: Some("--with-status"),
     };
     assert!(matches!(
-        GraftPragma::try_from(&with_status).unwrap(),
-        GraftPragma::JsonConfigList { mode: JsonConfigListMode::WithStatus }
+        GraftCommand::parse(&with_status).unwrap(),
+        GraftCommand::JsonConfigList { mode: JsonConfigListMode::WithStatus }
     ));
 
     let invalid = Pragma {
         name: "graft_json_config_list",
         arg: Some("--status"),
     };
-    assert!(GraftPragma::try_from(&invalid).is_err());
+    assert!(GraftCommand::parse(&invalid).is_err());
 }
 
 #[test]
 fn json_tags_status_mode_is_opt_in() {
     let legacy = Pragma { name: "graft_json_tags", arg: None };
     assert!(matches!(
-        GraftPragma::try_from(&legacy).unwrap(),
-        GraftPragma::JsonTags { mode: JsonTagsMode::LegacyArray }
+        GraftCommand::parse(&legacy).unwrap(),
+        GraftCommand::JsonTags { mode: JsonTagsMode::LegacyArray }
     ));
 
     let with_status = Pragma {
@@ -181,15 +145,15 @@ fn json_tags_status_mode_is_opt_in() {
         arg: Some("--with-status"),
     };
     assert!(matches!(
-        GraftPragma::try_from(&with_status).unwrap(),
-        GraftPragma::JsonTags { mode: JsonTagsMode::WithStatus }
+        GraftCommand::parse(&with_status).unwrap(),
+        GraftCommand::JsonTags { mode: JsonTagsMode::WithStatus }
     ));
 
     let invalid = Pragma {
         name: "graft_json_tags",
         arg: Some("--status"),
     };
-    assert!(GraftPragma::try_from(&invalid).is_err());
+    assert!(GraftCommand::parse(&invalid).is_err());
 }
 
 #[test]
@@ -199,8 +163,8 @@ fn async_job_pragmas_are_parsed() {
         arg: Some("--all origin"),
     };
     assert!(matches!(
-        GraftPragma::try_from(&fetch).unwrap(),
-        GraftPragma::FetchAsync { remote: Some(_), all: true, .. }
+        GraftCommand::parse(&fetch).unwrap(),
+        GraftCommand::FetchAsync { remote: Some(_), all: true, .. }
     ));
 
     let json_fetch = Pragma {
@@ -208,8 +172,8 @@ fn async_job_pragmas_are_parsed() {
         arg: Some("origin main"),
     };
     assert!(matches!(
-        GraftPragma::try_from(&json_fetch).unwrap(),
-        GraftPragma::JsonFetchAsync {
+        GraftCommand::parse(&json_fetch).unwrap(),
+        GraftCommand::JsonFetchAsync {
             remote: Some(_),
             branch: Some(_),
             mode: JsonFetchAsyncMode::LegacyId,
@@ -222,8 +186,8 @@ fn async_job_pragmas_are_parsed() {
         arg: Some("--with-status --all origin"),
     };
     assert!(matches!(
-        GraftPragma::try_from(&json_fetch_with_status).unwrap(),
-        GraftPragma::JsonFetchAsync {
+        GraftCommand::parse(&json_fetch_with_status).unwrap(),
+        GraftCommand::JsonFetchAsync {
             remote: Some(_),
             all: true,
             mode: JsonFetchAsyncMode::WithStatus,
@@ -236,8 +200,8 @@ fn async_job_pragmas_are_parsed() {
         arg: Some("graft-job-1"),
     };
     assert!(matches!(
-        GraftPragma::try_from(&status).unwrap(),
-        GraftPragma::JobStatus { .. }
+        GraftCommand::parse(&status).unwrap(),
+        GraftCommand::JobStatus { .. }
     ));
 
     let json_status = Pragma {
@@ -245,8 +209,8 @@ fn async_job_pragmas_are_parsed() {
         arg: Some("graft-job-1"),
     };
     assert!(matches!(
-        GraftPragma::try_from(&json_status).unwrap(),
-        GraftPragma::JsonJobStatus { .. }
+        GraftCommand::parse(&json_status).unwrap(),
+        GraftCommand::JsonJobStatus { .. }
     ));
 
     let result = Pragma {
@@ -254,8 +218,8 @@ fn async_job_pragmas_are_parsed() {
         arg: Some("graft-job-1"),
     };
     assert!(matches!(
-        GraftPragma::try_from(&result).unwrap(),
-        GraftPragma::JobResult { .. }
+        GraftCommand::parse(&result).unwrap(),
+        GraftCommand::JobResult { .. }
     ));
 }
 
@@ -388,8 +352,8 @@ fn parse_json_remote_pragmas() {
         arg: Some("origin memory"),
     };
     assert!(matches!(
-        GraftPragma::try_from(&add).unwrap(),
-        GraftPragma::JsonRemoteAdd { name, config: RemoteConfig::Memory } if name == "origin"
+        GraftCommand::parse(&add).unwrap(),
+        GraftCommand::JsonRemoteAdd { name, config: RemoteConfig::Memory } if name == "origin"
     ));
 
     let remove = Pragma {
@@ -397,8 +361,8 @@ fn parse_json_remote_pragmas() {
         arg: Some("origin"),
     };
     assert!(matches!(
-        GraftPragma::try_from(&remove).unwrap(),
-        GraftPragma::JsonRemoteRemove { name } if name == "origin"
+        GraftCommand::parse(&remove).unwrap(),
+        GraftCommand::JsonRemoteRemove { name } if name == "origin"
     ));
 
     let rename = Pragma {
@@ -406,8 +370,8 @@ fn parse_json_remote_pragmas() {
         arg: Some("origin upstream"),
     };
     assert!(matches!(
-        GraftPragma::try_from(&rename).unwrap(),
-        GraftPragma::JsonRemoteRename { old, new } if old == "origin" && new == "upstream"
+        GraftCommand::parse(&rename).unwrap(),
+        GraftCommand::JsonRemoteRename { old, new } if old == "origin" && new == "upstream"
     ));
 
     let get_url = Pragma {
@@ -415,8 +379,8 @@ fn parse_json_remote_pragmas() {
         arg: Some("origin"),
     };
     assert!(matches!(
-        GraftPragma::try_from(&get_url).unwrap(),
-        GraftPragma::JsonRemoteGetUrl { name } if name == "origin"
+        GraftCommand::parse(&get_url).unwrap(),
+        GraftCommand::JsonRemoteGetUrl { name } if name == "origin"
     ));
 
     let set_url = Pragma {
@@ -424,8 +388,8 @@ fn parse_json_remote_pragmas() {
         arg: Some("origin memory"),
     };
     assert!(matches!(
-        GraftPragma::try_from(&set_url).unwrap(),
-        GraftPragma::JsonRemoteSetUrl { name, config: RemoteConfig::Memory } if name == "origin"
+        GraftCommand::parse(&set_url).unwrap(),
+        GraftCommand::JsonRemoteSetUrl { name, config: RemoteConfig::Memory } if name == "origin"
     ));
 
     let prune = Pragma {
@@ -433,8 +397,8 @@ fn parse_json_remote_pragmas() {
         arg: Some("origin"),
     };
     assert!(matches!(
-        GraftPragma::try_from(&prune).unwrap(),
-        GraftPragma::JsonRemotePrune { name } if name == "origin"
+        GraftCommand::parse(&prune).unwrap(),
+        GraftCommand::JsonRemotePrune { name } if name == "origin"
     ));
 
     let ls_remote = Pragma {
@@ -442,14 +406,14 @@ fn parse_json_remote_pragmas() {
         arg: Some("origin"),
     };
     assert!(matches!(
-        GraftPragma::try_from(&ls_remote).unwrap(),
-        GraftPragma::JsonLsRemote { name } if name == "origin"
+        GraftCommand::parse(&ls_remote).unwrap(),
+        GraftCommand::JsonLsRemote { name } if name == "origin"
     ));
 
     let remotes = Pragma { name: "graft_json_remotes", arg: None };
     assert!(matches!(
-        GraftPragma::try_from(&remotes).unwrap(),
-        GraftPragma::JsonRemotes
+        GraftCommand::parse(&remotes).unwrap(),
+        GraftCommand::JsonRemotes
     ));
 }
 
@@ -526,8 +490,8 @@ fn parse_repo_clone_arg_supports_default_branch_and_branch_flags() {
         arg: Some("--branch feature/search memory"),
     };
     assert!(matches!(
-        GraftPragma::try_from(&json_clone).unwrap(),
-        GraftPragma::JsonRepoClone {
+        GraftCommand::parse(&json_clone).unwrap(),
+        GraftCommand::JsonRepoClone {
             spec: RepoCloneSpec {
                 config: RemoteConfig::Memory,
                 branch: Some(branch),
@@ -1062,40 +1026,40 @@ fn parse_storage_gc_arg_defaults_to_dry_run() {
     assert!(parse_storage_gc_arg(Some("--unknown")).is_err());
 
     assert!(matches!(
-        GraftPragma::try_from(&Pragma {
+        GraftCommand::parse(&Pragma {
             name: "graft_json_gc",
             arg: Some("--force")
         })
         .unwrap(),
-        GraftPragma::JsonStorageGc { spec: StorageGcSpec { dry_run: false } }
+        GraftCommand::JsonStorageGc { spec: StorageGcSpec { dry_run: false } }
     ));
 }
 
 #[test]
 fn payload_pragmas_alias_lfs_payload_pragmas() {
     assert!(matches!(
-        GraftPragma::try_from(&Pragma {
+        GraftCommand::parse(&Pragma {
             name: "graft_payload_fetch",
             arg: Some("--remote origin HEAD")
         })
         .unwrap(),
-        GraftPragma::LargeFileFetch { .. }
+        GraftCommand::LargeFileFetch { .. }
     ));
     assert!(matches!(
-        GraftPragma::try_from(&Pragma {
+        GraftCommand::parse(&Pragma {
             name: "graft_json_payload_status",
             arg: Some("HEAD")
         })
         .unwrap(),
-        GraftPragma::JsonLargeFileStatus { .. }
+        GraftCommand::JsonLargeFileStatus { .. }
     ));
     assert!(matches!(
-        GraftPragma::try_from(&Pragma {
+        GraftCommand::parse(&Pragma {
             name: "graft_payload_prune",
             arg: Some("--dry-run")
         })
         .unwrap(),
-        GraftPragma::LargeFilePrune { .. }
+        GraftCommand::LargeFilePrune { .. }
     ));
 }
 
@@ -1393,8 +1357,8 @@ fn parse_json_tag_pragmas() {
         arg: Some("v1.0 HEAD"),
     };
     assert!(matches!(
-        GraftPragma::try_from(&create).unwrap(),
-        GraftPragma::JsonTagCreate {
+        GraftCommand::parse(&create).unwrap(),
+        GraftCommand::JsonTagCreate {
             name,
             target: Some(target),
             message: None,
@@ -1406,8 +1370,8 @@ fn parse_json_tag_pragmas() {
         arg: Some("--annotated v1.0 HEAD -- release 1.0"),
     };
     assert!(matches!(
-        GraftPragma::try_from(&annotated).unwrap(),
-        GraftPragma::JsonTagCreate {
+        GraftCommand::parse(&annotated).unwrap(),
+        GraftCommand::JsonTagCreate {
             name,
             target: Some(target),
             message: Some(message),
@@ -1419,8 +1383,8 @@ fn parse_json_tag_pragmas() {
         arg: Some("v1.0"),
     };
     assert!(matches!(
-        GraftPragma::try_from(&delete).unwrap(),
-        GraftPragma::JsonTagDelete { name } if name == "v1.0"
+        GraftCommand::parse(&delete).unwrap(),
+        GraftCommand::JsonTagDelete { name } if name == "v1.0"
     ));
 }
 
@@ -1593,8 +1557,8 @@ fn parse_checkout_and_switch_force_args() {
         arg: Some("--source HEAD --output snapshot.db -- app.db"),
     };
     assert!(matches!(
-        GraftPragma::try_from(&json_export).unwrap(),
-        GraftPragma::JsonExport {
+        GraftCommand::parse(&json_export).unwrap(),
+        GraftCommand::JsonExport {
             spec: RepoExportSpec {
                 source: Some(source),
                 path: Some(path),
@@ -1638,16 +1602,16 @@ fn parse_checkout_and_switch_force_args() {
         arg: Some("--force main"),
     };
     assert!(matches!(
-        GraftPragma::try_from(&json_switch_branch).unwrap(),
-        GraftPragma::JsonSwitchBranch { name, force: true } if name == "main"
+        GraftCommand::parse(&json_switch_branch).unwrap(),
+        GraftCommand::JsonSwitchBranch { name, force: true } if name == "main"
     ));
     let json_switch_create = Pragma {
         name: "graft_json_switch_create",
         arg: Some("-f feature/search HEAD"),
     };
     assert!(matches!(
-        GraftPragma::try_from(&json_switch_create).unwrap(),
-        GraftPragma::JsonSwitchCreate {
+        GraftCommand::parse(&json_switch_create).unwrap(),
+        GraftCommand::JsonSwitchCreate {
             name,
             start_point: Some(start_point),
             force: true,
@@ -1658,8 +1622,8 @@ fn parse_checkout_and_switch_force_args() {
         arg: Some("feature/search HEAD"),
     };
     assert!(matches!(
-        GraftPragma::try_from(&json_branch_create).unwrap(),
-        GraftPragma::JsonBranchCreate {
+        GraftCommand::parse(&json_branch_create).unwrap(),
+        GraftCommand::JsonBranchCreate {
             name,
             start_point: Some(start_point),
         } if name == "feature/search" && start_point == "HEAD"
@@ -1669,16 +1633,16 @@ fn parse_checkout_and_switch_force_args() {
         arg: Some("--force feature/search"),
     };
     assert!(matches!(
-        GraftPragma::try_from(&json_branch_delete).unwrap(),
-        GraftPragma::JsonBranchDelete { name, force: true } if name == "feature/search"
+        GraftCommand::parse(&json_branch_delete).unwrap(),
+        GraftCommand::JsonBranchDelete { name, force: true } if name == "feature/search"
     ));
     let json_branch_rename = Pragma {
         name: "graft_json_branch_rename",
         arg: Some("feature/search feature/query"),
     };
     assert!(matches!(
-        GraftPragma::try_from(&json_branch_rename).unwrap(),
-        GraftPragma::JsonBranchRename {
+        GraftCommand::parse(&json_branch_rename).unwrap(),
+        GraftCommand::JsonBranchRename {
             old: Some(old),
             new,
             force: false,
@@ -1689,8 +1653,8 @@ fn parse_checkout_and_switch_force_args() {
         arg: Some("feature/query origin/main"),
     };
     assert!(matches!(
-        GraftPragma::try_from(&json_branch_upstream).unwrap(),
-        GraftPragma::JsonBranchUpstream {
+        GraftCommand::parse(&json_branch_upstream).unwrap(),
+        GraftCommand::JsonBranchUpstream {
             branch: Some(branch),
             remote,
             remote_branch,
@@ -1701,8 +1665,8 @@ fn parse_checkout_and_switch_force_args() {
         arg: Some("feature/query"),
     };
     assert!(matches!(
-        GraftPragma::try_from(&json_branch_unset_upstream).unwrap(),
-        GraftPragma::JsonBranchUnsetUpstream { branch: Some(branch) }
+        GraftCommand::parse(&json_branch_unset_upstream).unwrap(),
+        GraftCommand::JsonBranchUnsetUpstream { branch: Some(branch) }
             if branch == "feature/query"
     ));
 }

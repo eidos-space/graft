@@ -15,7 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 graft = { path = "../graft" }
-graft-sqlite = { path = "../graft-sqlite", features = ["register-static"] }
+graft-sqlite = { path = "../graft-sqlite" }
 
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["derive"] }

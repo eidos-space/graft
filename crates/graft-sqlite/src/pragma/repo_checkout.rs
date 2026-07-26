@@ -837,7 +837,11 @@ pub(super) fn preflight_workspace_checkout(
     for key in workspace_sqlite_keys(plan, previous_files) {
         let path = repo.worktree().join(&key);
         match std::fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(metadata) if metadata.file_type().is_file() => {
+                // Repository state is updated only after this preflight succeeds. Check ordinary
+                // SQLite locks and detach any WAL before the checkout backup can rename the file.
+                prepare_sqlite_path_for_replacement(&path)?;
+            }
             Ok(_) => {
                 return pragma_err!(format!(
                     "path `{}` is not a regular SQLite database file",
@@ -1715,18 +1719,28 @@ pub(super) fn export_repo_path(
     }
 
     let current_key = repo.file_key(&file.tag)?;
-    if key != current_key {
-        return Err(ErrCtx::PragmaErr(
-            format!(
-                "exporting worktree path `{key}` requires opening that database path or passing --source"
-            )
-            .into(),
-        ));
+    if key == current_key {
+        let reader = file.reader()?;
+        write_volume_reader_to_path(&reader, &spec.output)?;
+        return Ok(key);
     }
 
-    let reader = file.reader()?;
-    write_volume_reader_to_path(&reader, &spec.output)?;
-    Ok(key)
+    // The default worktree is now a physical SQLite file. Export it through the same online
+    // backup boundary used by `add` so a committed WAL is included and the output is a standalone
+    // rollback-journal database. This also avoids treating the CLI's control session as a VFS
+    // Volume binding.
+    if physical_path.exists() && is_sqlite_database_path(&physical_path)? {
+        let reader = PhysicalSqliteReader::open(&physical_path)?;
+        write_volume_reader_to_path(&reader, &spec.output)?;
+        return Ok(key);
+    }
+
+    Err(ErrCtx::PragmaErr(
+        format!(
+            "worktree database `{key}` does not exist; pass --source to export a repository revision"
+        )
+        .into(),
+    ))
 }
 
 pub(super) fn update_worktree_state_after_index_restore_key(
@@ -1938,6 +1952,7 @@ pub(super) fn write_sqlite_file_to_path(
         })();
 
         match write_result.and_then(|()| {
+            prepare_sqlite_path_for_replacement(path)?;
             std::fs::rename(&tmp, path)?;
             Ok(())
         }) {

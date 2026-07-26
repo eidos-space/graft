@@ -1,4 +1,4 @@
--- initialize two connections to the same repository database
+-- initialize two connections to the same VFS database
 .connection 0
 .open "file:app.db?vfs=graft"
 .output /dev/null
@@ -11,7 +11,7 @@
 begin immediate;
 .connection 1
 -- EXPECT ERROR: database is locked
-Runtime error near line 17: database is locked (5)
+Runtime error near line 16: database is locked (5)
 begin immediate;
 
 -- reset
@@ -20,7 +20,7 @@ rollback;
 .connection 1
 -- EXPECT ERROR: no transaction
 (1) statement aborts at 1: [rollback;] cannot rollback - no transaction is active
-Runtime error near line 24: cannot rollback - no transaction is active
+Runtime error near line 23: cannot rollback - no transaction is active
 rollback;
 
 -- scenario: verify that upgrading is refused if a read snapshot is outdated
@@ -41,7 +41,7 @@ insert into t values(1);
 .connection 0
 -- try to upgrade the lock via performing a write; this should fail
 -- EXPECT ERROR: database is locked
-Runtime error near line 39: database is locked (5)
+Runtime error near line 38: database is locked (5)
 insert into t values(2);
 
 -- reset
@@ -50,7 +50,7 @@ rollback;
 .connection 1
 -- EXPECT ERROR: no transaction
 (1) statement aborts at 1: [rollback;] cannot rollback - no transaction is active
-Runtime error near line 46: cannot rollback - no transaction is active
+Runtime error near line 45: cannot rollback - no transaction is active
 rollback;
 
 -- scenario: verify that we can commit a write tx while another tx holds a read lock
@@ -102,8 +102,5 @@ select * from t;
 | 1                                 |
 | committed while read lock is held |
 +-----------------------------------+
-
--- check repository metadata commands without asserting dynamic output
-.output /dev/null
 
 SQLite Exit Code = 1

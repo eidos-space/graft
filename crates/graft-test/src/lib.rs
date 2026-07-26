@@ -125,7 +125,7 @@ impl GraftTestRuntime {
             };
             register_static(
                 vfs_id.clone(),
-                GraftVfs::new(self.runtime.clone()),
+                GraftVfs::new_with_repository_pragmas_for_tests(self.runtime.clone()),
                 RegisterOpts { make_default: false },
             )
             .expect("failed to register vfs");

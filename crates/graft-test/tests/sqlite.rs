@@ -2592,7 +2592,7 @@ fn test_repo_status_and_diff_do_not_persist_physical_sqlite_comparison_volumes()
 }
 
 #[test]
-fn test_repo_gc_prunes_replaced_physical_stages_and_preserves_history() {
+fn test_repo_gc_preserves_incremental_physical_stage_history() {
     graft_test::ensure_test_env();
 
     let temp_dir = tempfile::tempdir().unwrap();
@@ -2656,8 +2656,6 @@ fn test_repo_gc_prunes_replaced_physical_stages_and_preserves_history() {
         pragma_arg_string(&sqlite, "graft_add", "external.db"),
         "Added external.db"
     );
-    let replaced_stage_pages = std::fs::metadata(&external_db).unwrap().len() / 4096;
-
     {
         let external = Connection::open(&external_db).unwrap();
         external
@@ -2677,10 +2675,12 @@ fn test_repo_gc_prunes_replaced_physical_stages_and_preserves_history() {
         serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_gc")).unwrap();
     assert_eq!(dry_run["operation"], "gc");
     assert_eq!(dry_run["dry_run"], true);
-    assert_eq!(dry_run["candidate_volumes"], 1);
-    assert_eq!(dry_run["candidate_commits"], 1);
-    assert_eq!(dry_run["candidate_segments"], 1);
-    assert_eq!(dry_run["candidate_pages"], replaced_stage_pages);
+    // The replacement stage extends the same Volume incrementally. Its first changed page remains
+    // part of the later two-page stage, so there is no abandoned full-snapshot Volume to collect.
+    assert_eq!(dry_run["candidate_volumes"], 0);
+    assert_eq!(dry_run["candidate_commits"], 0);
+    assert_eq!(dry_run["candidate_segments"], 0);
+    assert_eq!(dry_run["candidate_pages"], 0);
     assert_eq!(
         dry_run["candidate_page_bytes"].as_u64().unwrap(),
         dry_run["candidate_pages"].as_u64().unwrap() * 4096
@@ -6520,9 +6520,8 @@ fn test_repo_add_physical_sqlite_file_rejects_non_graft_page_size() {
     }
 
     let err = pragma_arg_error(&sqlite, "graft_add", "external.db");
-    assert!(err.contains("4096-byte pages"));
-    assert!(err.contains("8192-byte pages"));
-    assert!(err.contains("VACUUM INTO"));
+    assert!(err.contains("page size is 8192 bytes"), "{err}");
+    assert!(err.contains("Graft requires 4096 bytes"), "{err}");
 
     runtime.shutdown().unwrap();
 }

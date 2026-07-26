@@ -84,13 +84,14 @@ mod repo_sync;
 mod row_diff;
 mod row_merge_output;
 mod spec;
+mod sqlite_worktree;
 mod volume_output;
 
 use self::{
     jobs::*, json::*, output_types::*, parse::*, repo_checkout::*, repo_conflicts::*, repo_core::*,
     repo_diff::*, repo_history::*, repo_merge::*, repo_output::*, repo_paths::*, repo_refs::*,
     repo_remote_output::*, repo_snapshot::*, repo_staging::*, repo_switch::*, repo_sync::*,
-    row_diff::*, row_merge_output::*, spec::*, volume_output::*,
+    row_diff::*, row_merge_output::*, spec::*, sqlite_worktree::*, volume_output::*,
 };
 
 const SQLITE_DATABASE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
@@ -129,7 +130,7 @@ impl<'a> PragmaExt<'a> for Pragma<'a> {
     }
 }
 
-pub(crate) enum GraftPragma {
+pub(crate) enum GraftCommand {
     /// `pragma graft_debug_volume_list;`
     VolumeList,
 
@@ -659,55 +660,53 @@ pub(crate) enum GraftPragma {
     VolumeSetMessage { message: String },
 }
 
-impl TryFrom<&Pragma<'_>> for GraftPragma {
-    type Error = PragmaErr;
-
-    fn try_from(p: &Pragma<'_>) -> Result<Self, Self::Error> {
+impl GraftCommand {
+    pub(crate) fn parse(p: &Pragma<'_>) -> Result<Self, PragmaErr> {
         if let Some((prefix, suffix)) = p.name.split_once("_")
             && prefix == "graft"
         {
             return match suffix {
-                "debug_volume_list" => Ok(GraftPragma::VolumeList),
-                "debug_volume_json_list" => Ok(GraftPragma::VolumeJsonList),
-                "tags" => Ok(GraftPragma::Tags),
-                "json_tags" => Ok(GraftPragma::JsonTags { mode: parse_json_tags_arg(p.arg)? }),
-                "debug_volume_tags" => Ok(GraftPragma::VolumeTags),
+                "debug_volume_list" => Ok(GraftCommand::VolumeList),
+                "debug_volume_json_list" => Ok(GraftCommand::VolumeJsonList),
+                "tags" => Ok(GraftCommand::Tags),
+                "json_tags" => Ok(GraftCommand::JsonTags { mode: parse_json_tags_arg(p.arg)? }),
+                "debug_volume_tags" => Ok(GraftCommand::VolumeTags),
                 "debug_volume_clone" => {
                     let remote = p.arg.map(parse_or_fail).transpose()?;
-                    Ok(GraftPragma::VolumeClone { remote })
+                    Ok(GraftCommand::VolumeClone { remote })
                 }
-                "debug_volume_fork" => Ok(GraftPragma::VolumeFork),
+                "debug_volume_fork" => Ok(GraftCommand::VolumeFork),
                 "checkout" => {
                     let arg = p.require_arg()?;
                     let spec = parse_repo_checkout_arg(arg)?;
-                    Ok(GraftPragma::RepoCheckout { spec })
+                    Ok(GraftCommand::RepoCheckout { spec })
                 }
                 "json_checkout" => {
                     let arg = p.require_arg()?;
                     let spec = parse_repo_checkout_arg(arg)?;
-                    Ok(GraftPragma::JsonRepoCheckout { spec })
+                    Ok(GraftCommand::JsonRepoCheckout { spec })
                 }
                 "restore" => {
                     let arg = p.require_arg()?;
                     let spec = parse_repo_restore_arg(arg)?;
-                    Ok(GraftPragma::Restore { spec })
+                    Ok(GraftCommand::Restore { spec })
                 }
                 "json_restore" => {
                     let arg = p.require_arg()?;
                     let spec = parse_repo_restore_arg(arg)?;
-                    Ok(GraftPragma::JsonRestore { spec })
+                    Ok(GraftCommand::JsonRestore { spec })
                 }
                 "export" => {
                     let arg = p.require_arg()?;
                     let spec = parse_repo_export_arg(arg)?;
-                    Ok(GraftPragma::Export { spec })
+                    Ok(GraftCommand::Export { spec })
                 }
                 "json_export" => {
                     let arg = p.require_arg()?;
                     let spec = parse_repo_export_arg(arg)?;
-                    Ok(GraftPragma::JsonExport { spec })
+                    Ok(GraftCommand::JsonExport { spec })
                 }
-                "debug_volume_new" => Ok(GraftPragma::VolumeSwitch {
+                "debug_volume_new" => Ok(GraftCommand::VolumeSwitch {
                     vid: VolumeId::random(),
                     local: None,
                     remote: None,
@@ -719,180 +718,180 @@ impl TryFrom<&Pragma<'_>> for GraftPragma {
                             "argument must be in the form: `local_vid[:local[:remote]]`",
                         ));
                     }
-                    Ok(GraftPragma::VolumeSwitch {
+                    Ok(GraftCommand::VolumeSwitch {
                         vid: parse_or_fail(parts[0])?,
                         local: parse_optional(parts.get(1))?,
                         remote: parse_optional(parts.get(2))?,
                     })
                 }
-                "debug_volume_info" => Ok(GraftPragma::VolumeInfo),
-                "status" => Ok(GraftPragma::Status { spec: parse_status_arg(p.arg)? }),
-                "debug_volume_status" => Ok(GraftPragma::VolumeStatus),
-                "init" => Ok(GraftPragma::RepoInit { spec: parse_repo_init_arg(p.arg)? }),
-                "json_init" => Ok(GraftPragma::JsonRepoInit { spec: parse_repo_init_arg(p.arg)? }),
+                "debug_volume_info" => Ok(GraftCommand::VolumeInfo),
+                "status" => Ok(GraftCommand::Status { spec: parse_status_arg(p.arg)? }),
+                "debug_volume_status" => Ok(GraftCommand::VolumeStatus),
+                "init" => Ok(GraftCommand::RepoInit { spec: parse_repo_init_arg(p.arg)? }),
+                "json_init" => Ok(GraftCommand::JsonRepoInit { spec: parse_repo_init_arg(p.arg)? }),
                 "clone" => {
                     let spec = parse_repo_clone_arg(p.require_arg()?)?;
-                    Ok(GraftPragma::RepoClone { spec })
+                    Ok(GraftCommand::RepoClone { spec })
                 }
                 "json_clone" => {
                     let spec = parse_repo_clone_arg(p.require_arg()?)?;
-                    Ok(GraftPragma::JsonRepoClone { spec })
+                    Ok(GraftCommand::JsonRepoClone { spec })
                 }
-                "json_status" => Ok(GraftPragma::JsonStatus { spec: parse_status_arg(p.arg)? }),
-                "add" => Ok(GraftPragma::Add { spec: parse_repo_add_arg(p.arg)? }),
-                "json_add" => Ok(GraftPragma::JsonAdd { spec: parse_repo_add_arg(p.arg)? }),
-                "rm" => Ok(GraftPragma::Remove { spec: parse_repo_remove_arg(p.arg)? }),
-                "json_rm" => Ok(GraftPragma::JsonRemove { spec: parse_repo_remove_arg(p.arg)? }),
-                "commit" => Ok(GraftPragma::Commit { message: p.require_arg()?.to_string() }),
+                "json_status" => Ok(GraftCommand::JsonStatus { spec: parse_status_arg(p.arg)? }),
+                "add" => Ok(GraftCommand::Add { spec: parse_repo_add_arg(p.arg)? }),
+                "json_add" => Ok(GraftCommand::JsonAdd { spec: parse_repo_add_arg(p.arg)? }),
+                "rm" => Ok(GraftCommand::Remove { spec: parse_repo_remove_arg(p.arg)? }),
+                "json_rm" => Ok(GraftCommand::JsonRemove { spec: parse_repo_remove_arg(p.arg)? }),
+                "commit" => Ok(GraftCommand::Commit { message: p.require_arg()?.to_string() }),
                 "json_commit" => {
-                    Ok(GraftPragma::JsonCommit { message: p.require_arg()?.to_string() })
+                    Ok(GraftCommand::JsonCommit { message: p.require_arg()?.to_string() })
                 }
-                "branch" => Ok(GraftPragma::Branch { mode: parse_branch_list_mode(p.arg)? }),
+                "branch" => Ok(GraftCommand::Branch { mode: parse_branch_list_mode(p.arg)? }),
                 "json_branch" => {
-                    Ok(GraftPragma::JsonBranch { mode: parse_branch_list_mode(p.arg)? })
+                    Ok(GraftCommand::JsonBranch { mode: parse_branch_list_mode(p.arg)? })
                 }
                 "branch_create" => {
                     let (name, start_point) = parse_branch_create_arg(p.require_arg()?)?;
-                    Ok(GraftPragma::BranchCreate { name, start_point })
+                    Ok(GraftCommand::BranchCreate { name, start_point })
                 }
                 "json_branch_create" => {
                     let (name, start_point) = parse_branch_create_arg(p.require_arg()?)?;
-                    Ok(GraftPragma::JsonBranchCreate { name, start_point })
+                    Ok(GraftCommand::JsonBranchCreate { name, start_point })
                 }
                 "branch_delete" => {
                     let (name, force) = parse_branch_delete_arg(p.require_arg()?)?;
-                    Ok(GraftPragma::BranchDelete { name, force })
+                    Ok(GraftCommand::BranchDelete { name, force })
                 }
                 "json_branch_delete" => {
                     let (name, force) = parse_branch_delete_arg(p.require_arg()?)?;
-                    Ok(GraftPragma::JsonBranchDelete { name, force })
+                    Ok(GraftCommand::JsonBranchDelete { name, force })
                 }
                 "branch_rename" => {
                     let (old, new, force) = parse_branch_rename_arg(p.require_arg()?)?;
-                    Ok(GraftPragma::BranchRename { old, new, force })
+                    Ok(GraftCommand::BranchRename { old, new, force })
                 }
                 "json_branch_rename" => {
                     let (old, new, force) = parse_branch_rename_arg(p.require_arg()?)?;
-                    Ok(GraftPragma::JsonBranchRename { old, new, force })
+                    Ok(GraftCommand::JsonBranchRename { old, new, force })
                 }
                 "branch_upstream" => {
                     let (branch, remote, remote_branch) =
                         parse_branch_upstream_arg(p.require_arg()?)?;
-                    Ok(GraftPragma::BranchUpstream { branch, remote, remote_branch })
+                    Ok(GraftCommand::BranchUpstream { branch, remote, remote_branch })
                 }
                 "json_branch_upstream" => {
                     let (branch, remote, remote_branch) =
                         parse_branch_upstream_arg(p.require_arg()?)?;
-                    Ok(GraftPragma::JsonBranchUpstream { branch, remote, remote_branch })
+                    Ok(GraftCommand::JsonBranchUpstream { branch, remote, remote_branch })
                 }
                 "branch_unset_upstream" => {
-                    Ok(GraftPragma::BranchUnsetUpstream { branch: p.arg.map(str::to_string) })
+                    Ok(GraftCommand::BranchUnsetUpstream { branch: p.arg.map(str::to_string) })
                 }
                 "json_branch_unset_upstream" => {
-                    Ok(GraftPragma::JsonBranchUnsetUpstream { branch: p.arg.map(str::to_string) })
+                    Ok(GraftCommand::JsonBranchUnsetUpstream { branch: p.arg.map(str::to_string) })
                 }
                 "tag_create" => {
                     let (name, target, message) = parse_tag_create_arg(p.require_arg()?)?;
-                    Ok(GraftPragma::TagCreate { name, target, message })
+                    Ok(GraftCommand::TagCreate { name, target, message })
                 }
                 "json_tag_create" => {
                     let (name, target, message) = parse_tag_create_arg(p.require_arg()?)?;
-                    Ok(GraftPragma::JsonTagCreate { name, target, message })
+                    Ok(GraftCommand::JsonTagCreate { name, target, message })
                 }
-                "tag_delete" => Ok(GraftPragma::TagDelete { name: p.require_arg()?.to_string() }),
+                "tag_delete" => Ok(GraftCommand::TagDelete { name: p.require_arg()?.to_string() }),
                 "json_tag_delete" => {
-                    Ok(GraftPragma::JsonTagDelete { name: p.require_arg()?.to_string() })
+                    Ok(GraftCommand::JsonTagDelete { name: p.require_arg()?.to_string() })
                 }
                 "switch_branch" => {
                     let (name, force) = parse_switch_branch_arg(p.require_arg()?)?;
-                    Ok(GraftPragma::SwitchBranch { name, force })
+                    Ok(GraftCommand::SwitchBranch { name, force })
                 }
                 "json_switch_branch" => {
                     let (name, force) = parse_switch_branch_arg(p.require_arg()?)?;
-                    Ok(GraftPragma::JsonSwitchBranch { name, force })
+                    Ok(GraftCommand::JsonSwitchBranch { name, force })
                 }
                 "switch_create" => {
                     let (name, start_point, force) = parse_switch_create_arg(p.require_arg()?)?;
-                    Ok(GraftPragma::SwitchCreate { name, start_point, force })
+                    Ok(GraftCommand::SwitchCreate { name, start_point, force })
                 }
                 "json_switch_create" => {
                     let (name, start_point, force) = parse_switch_create_arg(p.require_arg()?)?;
-                    Ok(GraftPragma::JsonSwitchCreate { name, start_point, force })
+                    Ok(GraftCommand::JsonSwitchCreate { name, start_point, force })
                 }
-                "merge" => Ok(GraftPragma::Merge { rev: p.require_arg()?.to_string() }),
-                "json_merge" => Ok(GraftPragma::JsonMerge { rev: p.require_arg()?.to_string() }),
-                "merge_abort" => Ok(GraftPragma::MergeAbort),
-                "json_merge_abort" => Ok(GraftPragma::JsonMergeAbort),
+                "merge" => Ok(GraftCommand::Merge { rev: p.require_arg()?.to_string() }),
+                "json_merge" => Ok(GraftCommand::JsonMerge { rev: p.require_arg()?.to_string() }),
+                "merge_abort" => Ok(GraftCommand::MergeAbort),
+                "json_merge_abort" => Ok(GraftCommand::JsonMergeAbort),
                 "merge_continue" => {
-                    Ok(GraftPragma::MergeContinue { message: p.require_arg()?.to_string() })
+                    Ok(GraftCommand::MergeContinue { message: p.require_arg()?.to_string() })
                 }
                 "json_merge_continue" => {
-                    Ok(GraftPragma::JsonMergeContinue { message: p.require_arg()?.to_string() })
+                    Ok(GraftCommand::JsonMergeContinue { message: p.require_arg()?.to_string() })
                 }
-                "conflicts" => Ok(GraftPragma::Conflicts),
-                "json_conflicts" => Ok(GraftPragma::JsonConflicts),
-                "resolve" => Ok(GraftPragma::Resolve {
+                "conflicts" => Ok(GraftCommand::Conflicts),
+                "json_conflicts" => Ok(GraftCommand::JsonConflicts),
+                "resolve" => Ok(GraftCommand::Resolve {
                     spec: parse_repo_resolve_arg(p.require_arg()?)?,
                 }),
-                "json_resolve_conflict" => Ok(GraftPragma::JsonResolveConflict {
+                "json_resolve_conflict" => Ok(GraftCommand::JsonResolveConflict {
                     spec: parse_repo_resolve_arg(p.require_arg()?)?,
                 }),
                 "remote_add" => {
                     let (name, config) = parse_remote_add(p.require_arg()?)?;
-                    Ok(GraftPragma::RemoteAdd { name, config })
+                    Ok(GraftCommand::RemoteAdd { name, config })
                 }
                 "json_remote_add" => {
                     let (name, config) = parse_remote_add(p.require_arg()?)?;
-                    Ok(GraftPragma::JsonRemoteAdd { name, config })
+                    Ok(GraftCommand::JsonRemoteAdd { name, config })
                 }
                 "remote_remove" => {
-                    Ok(GraftPragma::RemoteRemove { name: p.require_arg()?.to_string() })
+                    Ok(GraftCommand::RemoteRemove { name: p.require_arg()?.to_string() })
                 }
                 "json_remote_remove" => {
-                    Ok(GraftPragma::JsonRemoteRemove { name: p.require_arg()?.to_string() })
+                    Ok(GraftCommand::JsonRemoteRemove { name: p.require_arg()?.to_string() })
                 }
                 "remote_rename" => {
                     let (old, new) = parse_remote_rename(p.require_arg()?)?;
-                    Ok(GraftPragma::RemoteRename { old, new })
+                    Ok(GraftCommand::RemoteRename { old, new })
                 }
                 "json_remote_rename" => {
                     let (old, new) = parse_remote_rename(p.require_arg()?)?;
-                    Ok(GraftPragma::JsonRemoteRename { old, new })
+                    Ok(GraftCommand::JsonRemoteRename { old, new })
                 }
                 "remote_get_url" => {
-                    Ok(GraftPragma::RemoteGetUrl { name: p.require_arg()?.to_string() })
+                    Ok(GraftCommand::RemoteGetUrl { name: p.require_arg()?.to_string() })
                 }
                 "json_remote_get_url" => {
-                    Ok(GraftPragma::JsonRemoteGetUrl { name: p.require_arg()?.to_string() })
+                    Ok(GraftCommand::JsonRemoteGetUrl { name: p.require_arg()?.to_string() })
                 }
                 "remote_set_url" => {
                     let (name, config) = parse_remote_add(p.require_arg()?)?;
-                    Ok(GraftPragma::RemoteSetUrl { name, config })
+                    Ok(GraftCommand::RemoteSetUrl { name, config })
                 }
                 "json_remote_set_url" => {
                     let (name, config) = parse_remote_add(p.require_arg()?)?;
-                    Ok(GraftPragma::JsonRemoteSetUrl { name, config })
+                    Ok(GraftCommand::JsonRemoteSetUrl { name, config })
                 }
                 "remote_prune" => {
-                    Ok(GraftPragma::RemotePrune { name: p.require_arg()?.to_string() })
+                    Ok(GraftCommand::RemotePrune { name: p.require_arg()?.to_string() })
                 }
                 "json_remote_prune" => {
-                    Ok(GraftPragma::JsonRemotePrune { name: p.require_arg()?.to_string() })
+                    Ok(GraftCommand::JsonRemotePrune { name: p.require_arg()?.to_string() })
                 }
-                "ls_remote" => Ok(GraftPragma::LsRemote { name: p.require_arg()?.to_string() }),
+                "ls_remote" => Ok(GraftCommand::LsRemote { name: p.require_arg()?.to_string() }),
                 "json_ls_remote" => {
-                    Ok(GraftPragma::JsonLsRemote { name: p.require_arg()?.to_string() })
+                    Ok(GraftCommand::JsonLsRemote { name: p.require_arg()?.to_string() })
                 }
-                "remotes" => Ok(GraftPragma::Remotes),
-                "json_remotes" => Ok(GraftPragma::JsonRemotes),
-                "debug_volume_snapshot" => Ok(GraftPragma::VolumeSnapshot),
+                "remotes" => Ok(GraftCommand::Remotes),
+                "json_remotes" => Ok(GraftCommand::JsonRemotes),
+                "debug_volume_snapshot" => Ok(GraftCommand::VolumeSnapshot),
                 "fetch" => {
                     let arg = parse_remote_branch_arg(p.arg)?;
                     if arg.force {
                         return Err(pragma_fail("fetch does not support --force"));
                     }
                     let RemoteBranchArg { remote, branch, refspec, all, .. } = arg;
-                    Ok(GraftPragma::Fetch { remote, branch, refspec, all })
+                    Ok(GraftCommand::Fetch { remote, branch, refspec, all })
                 }
                 "json_fetch" => {
                     let arg = parse_remote_branch_arg(p.arg)?;
@@ -900,7 +899,7 @@ impl TryFrom<&Pragma<'_>> for GraftPragma {
                         return Err(pragma_fail("json_fetch does not support --force"));
                     }
                     let RemoteBranchArg { remote, branch, refspec, all, .. } = arg;
-                    Ok(GraftPragma::JsonFetch { remote, branch, refspec, all })
+                    Ok(GraftCommand::JsonFetch { remote, branch, refspec, all })
                 }
                 "fetch_async" => {
                     let arg = parse_remote_branch_arg(p.arg)?;
@@ -908,7 +907,7 @@ impl TryFrom<&Pragma<'_>> for GraftPragma {
                         return Err(pragma_fail("fetch_async does not support --force"));
                     }
                     let RemoteBranchArg { remote, branch, refspec, all, .. } = arg;
-                    Ok(GraftPragma::FetchAsync { remote, branch, refspec, all })
+                    Ok(GraftCommand::FetchAsync { remote, branch, refspec, all })
                 }
                 "json_fetch_async" => {
                     let (arg, mode) = parse_json_fetch_async_arg(p.arg)?;
@@ -916,15 +915,15 @@ impl TryFrom<&Pragma<'_>> for GraftPragma {
                         return Err(pragma_fail("json_fetch_async does not support --force"));
                     }
                     let RemoteBranchArg { remote, branch, refspec, all, .. } = arg;
-                    Ok(GraftPragma::JsonFetchAsync { remote, branch, refspec, all, mode })
+                    Ok(GraftCommand::JsonFetchAsync { remote, branch, refspec, all, mode })
                 }
-                "job_status" => Ok(GraftPragma::JobStatus { id: p.require_arg()?.to_string() }),
+                "job_status" => Ok(GraftCommand::JobStatus { id: p.require_arg()?.to_string() }),
                 "json_job_status" => {
-                    Ok(GraftPragma::JsonJobStatus { id: p.require_arg()?.to_string() })
+                    Ok(GraftCommand::JsonJobStatus { id: p.require_arg()?.to_string() })
                 }
-                "job_result" => Ok(GraftPragma::JobResult { id: p.require_arg()?.to_string() }),
+                "job_result" => Ok(GraftCommand::JobResult { id: p.require_arg()?.to_string() }),
                 "json_job_result" => {
-                    Ok(GraftPragma::JsonJobResult { id: p.require_arg()?.to_string() })
+                    Ok(GraftCommand::JsonJobResult { id: p.require_arg()?.to_string() })
                 }
                 "pull" => {
                     let arg = parse_remote_branch_arg(p.arg)?;
@@ -932,7 +931,7 @@ impl TryFrom<&Pragma<'_>> for GraftPragma {
                         return Err(pragma_fail("pull does not support --force"));
                     }
                     let RemoteBranchArg { remote, branch, refspec, all, .. } = arg;
-                    Ok(GraftPragma::Pull { remote, branch, refspec, all })
+                    Ok(GraftCommand::Pull { remote, branch, refspec, all })
                 }
                 "json_pull" => {
                     let arg = parse_remote_branch_arg(p.arg)?;
@@ -940,171 +939,262 @@ impl TryFrom<&Pragma<'_>> for GraftPragma {
                         return Err(pragma_fail("json_pull does not support --force"));
                     }
                     let RemoteBranchArg { remote, branch, refspec, all, .. } = arg;
-                    Ok(GraftPragma::JsonPull { remote, branch, refspec, all })
+                    Ok(GraftCommand::JsonPull { remote, branch, refspec, all })
                 }
                 "push" => {
                     let RemoteBranchArg { remote, branch, refspec, all, force } =
                         parse_remote_branch_arg(p.arg)?;
-                    Ok(GraftPragma::Push { remote, branch, refspec, all, force })
+                    Ok(GraftCommand::Push { remote, branch, refspec, all, force })
                 }
                 "json_push" => {
                     let RemoteBranchArg { remote, branch, refspec, all, force } =
                         parse_remote_branch_arg(p.arg)?;
-                    Ok(GraftPragma::JsonPush { remote, branch, refspec, all, force })
+                    Ok(GraftCommand::JsonPush { remote, branch, refspec, all, force })
                 }
-                "debug_volume_fetch" => Ok(GraftPragma::VolumeFetch),
-                "debug_volume_pull" => Ok(GraftPragma::VolumePull),
-                "debug_volume_push" => Ok(GraftPragma::VolumePush),
-                "debug_volume_audit" => Ok(GraftPragma::VolumeAudit),
-                "debug_volume_json_audit" => Ok(GraftPragma::VolumeJsonAudit),
-                "audit" => Ok(GraftPragma::RepoAudit { spec: parse_repo_audit_arg(p.arg)? }),
+                "debug_volume_fetch" => Ok(GraftCommand::VolumeFetch),
+                "debug_volume_pull" => Ok(GraftCommand::VolumePull),
+                "debug_volume_push" => Ok(GraftCommand::VolumePush),
+                "debug_volume_audit" => Ok(GraftCommand::VolumeAudit),
+                "debug_volume_json_audit" => Ok(GraftCommand::VolumeJsonAudit),
+                "audit" => Ok(GraftCommand::RepoAudit { spec: parse_repo_audit_arg(p.arg)? }),
                 "json_audit" => {
-                    Ok(GraftPragma::JsonRepoAudit { spec: parse_repo_audit_arg(p.arg)? })
+                    Ok(GraftCommand::JsonRepoAudit { spec: parse_repo_audit_arg(p.arg)? })
                 }
                 "lfs_fetch" | "payload_fetch" => {
-                    Ok(GraftPragma::LargeFileFetch { spec: parse_lfs_fetch_arg(p.arg)? })
+                    Ok(GraftCommand::LargeFileFetch { spec: parse_lfs_fetch_arg(p.arg)? })
                 }
-                "json_lfs_fetch" => Ok(GraftPragma::JsonLargeFileFetch {
+                "json_lfs_fetch" => Ok(GraftCommand::JsonLargeFileFetch {
                     spec: parse_lfs_fetch_arg(p.arg)?,
                     operation: "lfs_fetch",
                 }),
-                "json_payload_fetch" => Ok(GraftPragma::JsonLargeFileFetch {
+                "json_payload_fetch" => Ok(GraftCommand::JsonLargeFileFetch {
                     spec: parse_lfs_fetch_arg(p.arg)?,
                     operation: "payload_fetch",
                 }),
                 "lfs_status" | "payload_status" => {
-                    Ok(GraftPragma::LargeFileStatus { spec: parse_lfs_status_arg(p.arg)? })
+                    Ok(GraftCommand::LargeFileStatus { spec: parse_lfs_status_arg(p.arg)? })
                 }
-                "json_lfs_status" => Ok(GraftPragma::JsonLargeFileStatus {
+                "json_lfs_status" => Ok(GraftCommand::JsonLargeFileStatus {
                     spec: parse_lfs_status_arg(p.arg)?,
                     operation: "lfs_status",
                 }),
-                "json_payload_status" => Ok(GraftPragma::JsonLargeFileStatus {
+                "json_payload_status" => Ok(GraftCommand::JsonLargeFileStatus {
                     spec: parse_lfs_status_arg(p.arg)?,
                     operation: "payload_status",
                 }),
                 "lfs_prune" | "payload_prune" => {
-                    Ok(GraftPragma::LargeFilePrune { spec: parse_lfs_prune_arg(p.arg)? })
+                    Ok(GraftCommand::LargeFilePrune { spec: parse_lfs_prune_arg(p.arg)? })
                 }
-                "json_lfs_prune" => Ok(GraftPragma::JsonLargeFilePrune {
+                "json_lfs_prune" => Ok(GraftCommand::JsonLargeFilePrune {
                     spec: parse_lfs_prune_arg(p.arg)?,
                     operation: "lfs_prune",
                 }),
-                "json_payload_prune" => Ok(GraftPragma::JsonLargeFilePrune {
+                "json_payload_prune" => Ok(GraftCommand::JsonLargeFilePrune {
                     spec: parse_lfs_prune_arg(p.arg)?,
                     operation: "payload_prune",
                 }),
-                "gc" => Ok(GraftPragma::StorageGc { spec: parse_storage_gc_arg(p.arg)? }),
-                "json_gc" => Ok(GraftPragma::JsonStorageGc { spec: parse_storage_gc_arg(p.arg)? }),
-                "ls_files" => Ok(GraftPragma::LsFiles { spec: parse_ls_files_arg(p.arg)? }),
+                "gc" => Ok(GraftCommand::StorageGc { spec: parse_storage_gc_arg(p.arg)? }),
+                "json_gc" => Ok(GraftCommand::JsonStorageGc { spec: parse_storage_gc_arg(p.arg)? }),
+                "ls_files" => Ok(GraftCommand::LsFiles { spec: parse_ls_files_arg(p.arg)? }),
                 "json_ls_files" => {
-                    Ok(GraftPragma::JsonLsFiles { spec: parse_ls_files_arg(p.arg)? })
+                    Ok(GraftCommand::JsonLsFiles { spec: parse_ls_files_arg(p.arg)? })
                 }
-                "config_get" => Ok(GraftPragma::ConfigGet { key: p.require_arg()?.to_string() }),
+                "config_get" => Ok(GraftCommand::ConfigGet { key: p.require_arg()?.to_string() }),
                 "json_config_get" => {
-                    Ok(GraftPragma::JsonConfigGet { key: p.require_arg()?.to_string() })
+                    Ok(GraftCommand::JsonConfigGet { key: p.require_arg()?.to_string() })
                 }
-                "config_list" => Ok(GraftPragma::ConfigList),
+                "config_list" => Ok(GraftCommand::ConfigList),
                 "json_config_list" => {
-                    Ok(GraftPragma::JsonConfigList { mode: parse_json_config_list_arg(p.arg)? })
+                    Ok(GraftCommand::JsonConfigList { mode: parse_json_config_list_arg(p.arg)? })
                 }
                 "config_set" => {
                     let (key, value) = parse_repo_config_set_arg(p.require_arg()?)?;
-                    Ok(GraftPragma::ConfigSet { key, value })
+                    Ok(GraftCommand::ConfigSet { key, value })
                 }
                 "json_config_set" => {
                     let (key, value) = parse_repo_config_set_arg(p.require_arg()?)?;
-                    Ok(GraftPragma::JsonConfigSet { key, value })
+                    Ok(GraftCommand::JsonConfigSet { key, value })
                 }
                 "config_unset" => {
-                    Ok(GraftPragma::ConfigUnset { key: p.require_arg()?.to_string() })
+                    Ok(GraftCommand::ConfigUnset { key: p.require_arg()?.to_string() })
                 }
                 "json_config_unset" => {
-                    Ok(GraftPragma::JsonConfigUnset { key: p.require_arg()?.to_string() })
+                    Ok(GraftCommand::JsonConfigUnset { key: p.require_arg()?.to_string() })
                 }
-                "debug_volume_hydrate" => Ok(GraftPragma::VolumeHydrate),
-                "version" => Ok(GraftPragma::Version),
+                "debug_volume_hydrate" => Ok(GraftCommand::VolumeHydrate),
+                "version" => Ok(GraftCommand::Version),
                 "debug_volume_import" => {
                     let _ = p.require_arg()?;
-                    Ok(GraftPragma::VolumeImport)
+                    Ok(GraftCommand::VolumeImport)
                 }
                 "debug_volume_export" => {
-                    Ok(GraftPragma::VolumeExport(PathBuf::from(p.require_arg()?)))
+                    Ok(GraftCommand::VolumeExport(PathBuf::from(p.require_arg()?)))
                 }
-                "debug_volume_dump_header" => Ok(GraftPragma::VolumeDumpSqliteHeader),
+                "debug_volume_dump_header" => Ok(GraftCommand::VolumeDumpSqliteHeader),
                 "debug_volume_dump_commit" => {
-                    Ok(GraftPragma::VolumeDumpCommit { logref: parse_or_fail(p.require_arg()?)? })
+                    Ok(GraftCommand::VolumeDumpCommit { logref: parse_or_fail(p.require_arg()?)? })
                 }
-                "debug_log_lsn" => Ok(GraftPragma::DebugLogLsn),
+                "debug_log_lsn" => Ok(GraftCommand::DebugLogLsn),
                 "debug_show_lsn" => {
-                    Ok(GraftPragma::DebugShowLsn { logref: parse_or_fail(p.require_arg()?)? })
+                    Ok(GraftCommand::DebugShowLsn { logref: parse_or_fail(p.require_arg()?)? })
                 }
                 "debug_diff_lsn" => {
                     let (from, to) = parse_debug_diff_lsn_arg(p.require_arg()?)?;
-                    Ok(GraftPragma::DebugDiffLsn { from, to })
+                    Ok(GraftCommand::DebugDiffLsn { from, to })
                 }
-                "log" => Ok(GraftPragma::Log),
+                "log" => Ok(GraftCommand::Log),
                 "debug_volume_checkout_lsn" => {
-                    Ok(GraftPragma::VolumeCheckoutLsn { lsn: parse_or_fail(p.require_arg()?)? })
+                    Ok(GraftCommand::VolumeCheckoutLsn { lsn: parse_or_fail(p.require_arg()?)? })
                 }
                 "debug_volume_reset_to" => {
-                    Ok(GraftPragma::VolumeResetTo { lsn: parse_or_fail(p.require_arg()?)? })
+                    Ok(GraftCommand::VolumeResetTo { lsn: parse_or_fail(p.require_arg()?)? })
                 }
                 "reset" => {
                     let (mode, rev) = parse_repo_reset_arg(p.require_arg()?)?;
-                    Ok(GraftPragma::Reset { rev, mode })
+                    Ok(GraftCommand::Reset { rev, mode })
                 }
                 "json_reset" => {
                     let (mode, rev) = parse_repo_reset_arg(p.require_arg()?)?;
-                    Ok(GraftPragma::JsonReset { rev, mode })
+                    Ok(GraftCommand::JsonReset { rev, mode })
                 }
                 "diff" => {
                     let spec = parse_repo_diff_arg(p.arg)?;
-                    Ok(GraftPragma::RepoDiff { spec })
+                    Ok(GraftCommand::RepoDiff { spec })
                 }
                 "debug_volume_diff" => {
                     let (from, to, mode) = parse_volume_diff_arg(p.require_arg()?)?;
-                    Ok(GraftPragma::VolumeDiff { from, to, mode })
+                    Ok(GraftCommand::VolumeDiff { from, to, mode })
                 }
-                "show" => Ok(GraftPragma::Show { target: p.require_arg()?.to_string() }),
-                "json_log" => Ok(GraftPragma::JsonLog { spec: parse_json_log_arg(p.arg)? }),
+                "show" => Ok(GraftCommand::Show { target: p.require_arg()?.to_string() }),
+                "json_log" => Ok(GraftCommand::JsonLog { spec: parse_json_log_arg(p.arg)? }),
                 "json_diff" => {
                     let spec = parse_repo_diff_arg(p.arg)?;
-                    Ok(GraftPragma::JsonRepoDiff { spec })
+                    Ok(GraftCommand::JsonRepoDiff { spec })
                 }
                 "debug_volume_json_diff" => {
                     let (from, to, mode) = parse_volume_diff_arg(p.require_arg()?)?;
-                    Ok(GraftPragma::VolumeJsonDiff { from, to, mode })
+                    Ok(GraftCommand::VolumeJsonDiff { from, to, mode })
                 }
-                "json_show" => Ok(GraftPragma::JsonShow { target: p.require_arg()?.to_string() }),
-                "debug_volume_json_info" => Ok(GraftPragma::VolumeJsonInfo),
+                "json_show" => Ok(GraftCommand::JsonShow { target: p.require_arg()?.to_string() }),
+                "debug_volume_json_info" => Ok(GraftCommand::VolumeJsonInfo),
                 "debug_volume_table_log" => {
-                    Ok(GraftPragma::VolumeTableLog { table: p.require_arg()?.to_string() })
+                    Ok(GraftCommand::VolumeTableLog { table: p.require_arg()?.to_string() })
                 }
                 "debug_volume_json_table_log" => {
-                    Ok(GraftPragma::VolumeJsonTableLog { table: p.require_arg()?.to_string() })
+                    Ok(GraftCommand::VolumeJsonTableLog { table: p.require_arg()?.to_string() })
                 }
                 "debug_volume_set_message" => {
-                    Ok(GraftPragma::VolumeSetMessage { message: p.require_arg()?.to_string() })
+                    Ok(GraftCommand::VolumeSetMessage { message: p.require_arg()?.to_string() })
                 }
                 _ => Err(pragma_fail(format!("invalid graft pragma `{}`", p.name))),
             };
         }
         Err(PragmaErr::NotFound)
     }
+
+    pub(crate) fn parse_repository(name: &str, argument: Option<&str>) -> Result<Self, ErrCtx> {
+        let full_name = format!("graft_{name}");
+        let input = Pragma { name: &full_name, arg: argument };
+        let command = Self::parse(&input).map_err(|error| match error {
+            PragmaErr::NotFound => ErrCtx::UnknownPragma,
+            PragmaErr::Fail(_, message) => ErrCtx::PragmaErr(
+                message
+                    .unwrap_or_else(|| "invalid repository command".to_string())
+                    .into(),
+            ),
+        })?;
+        if command.is_vfs_pragma() {
+            return Err(ErrCtx::PragmaErr(
+                format!("`{name}` is a VFS command, not a repository command").into(),
+            ));
+        }
+        Ok(command)
+    }
+
+    pub(crate) fn is_vfs_pragma(&self) -> bool {
+        matches!(
+            self,
+            Self::VolumeList
+                | Self::VolumeJsonList
+                | Self::VolumeTags
+                | Self::VolumeSwitch { .. }
+                | Self::VolumeClone { .. }
+                | Self::VolumeFork
+                | Self::VolumeInfo
+                | Self::VolumeStatus
+                | Self::VolumeSnapshot
+                | Self::VolumeFetch
+                | Self::VolumePull
+                | Self::VolumePush
+                | Self::VolumeAudit
+                | Self::VolumeJsonAudit
+                | Self::VolumeHydrate
+                | Self::Version
+                | Self::VolumeImport
+                | Self::VolumeExport(_)
+                | Self::VolumeDumpSqliteHeader
+                | Self::VolumeDumpCommit { .. }
+                | Self::DebugLogLsn
+                | Self::DebugShowLsn { .. }
+                | Self::DebugDiffLsn { .. }
+                | Self::VolumeCheckoutLsn { .. }
+                | Self::VolumeResetTo { .. }
+                | Self::VolumeDiff { .. }
+                | Self::VolumeJsonDiff { .. }
+                | Self::VolumeJsonInfo
+                | Self::VolumeTableLog { .. }
+                | Self::VolumeJsonTableLog { .. }
+                | Self::VolumeSetMessage { .. }
+        )
+    }
 }
 
-impl GraftPragma {
+pub(crate) struct VfsPragma(GraftCommand);
+
+impl TryFrom<&Pragma<'_>> for VfsPragma {
+    type Error = PragmaErr;
+
+    fn try_from(p: &Pragma<'_>) -> Result<Self, Self::Error> {
+        Self::parse(p, false)
+    }
+}
+
+impl VfsPragma {
+    pub(crate) fn parse(
+        p: &Pragma<'_>,
+        allow_repository_commands: bool,
+    ) -> Result<Self, PragmaErr> {
+        let command = GraftCommand::parse(p)?;
+        if command.is_vfs_pragma() || allow_repository_commands {
+            Ok(Self(command))
+        } else {
+            Err(pragma_fail(format!(
+                "repository command `{}` is not available through SQLite; use the graft CLI",
+                p.name
+            )))
+        }
+    }
+
+    pub(crate) fn eval(
+        self,
+        runtime: &Runtime,
+        file: &mut VolFile,
+    ) -> Result<Option<String>, ErrCtx> {
+        self.0.eval(runtime, file)
+    }
+}
+
+impl GraftCommand {
     pub fn eval(self, _runtime: &Runtime, file: &mut VolFile) -> Result<Option<String>, ErrCtx> {
         let runtime = file.runtime().clone();
         match self {
-            GraftPragma::VolumeList => Ok(Some(format_volumes(&runtime, file)?)),
-            GraftPragma::VolumeJsonList => Ok(Some(to_json(&json_volumes(&runtime, file)?)?)),
-            GraftPragma::Tags => {
+            GraftCommand::VolumeList => Ok(Some(format_volumes(&runtime, file)?)),
+            GraftCommand::VolumeJsonList => Ok(Some(to_json(&json_volumes(&runtime, file)?)?)),
+            GraftCommand::Tags => {
                 let repo = repo_for_file(file)?;
                 Ok(Some(format_repo_tags(&repo.tags()?)?))
             }
-            GraftPragma::JsonTags { mode } => {
+            GraftCommand::JsonTags { mode } => {
                 let repo = repo_for_file(file)?;
                 let tags = repo.tags()?;
                 match mode {
@@ -1119,9 +1209,9 @@ impl GraftPragma {
                     }
                 }
             }
-            GraftPragma::VolumeTags => Ok(Some(format_tags(&runtime, file)?)),
+            GraftCommand::VolumeTags => Ok(Some(format_tags(&runtime, file)?)),
 
-            GraftPragma::VolumeClone { remote } => {
+            GraftCommand::VolumeClone { remote } => {
                 if !file.is_idle() {
                     return pragma_err!("cannot clone while there is an open transaction");
                 }
@@ -1139,7 +1229,7 @@ impl GraftPragma {
                 )))
             }
 
-            GraftPragma::VolumeFork => {
+            GraftCommand::VolumeFork => {
                 if !file.is_idle() {
                     return pragma_err!("cannot fork while there is an open transaction");
                 }
@@ -1159,16 +1249,16 @@ impl GraftPragma {
                 }
             }
 
-            GraftPragma::RepoCheckout { spec } => {
+            GraftCommand::RepoCheckout { spec } => {
                 let outcome = run_repo_checkout(&runtime, file, spec)?;
                 Ok(Some(format_checkout_outcome(&outcome)))
             }
-            GraftPragma::JsonRepoCheckout { spec } => {
+            GraftCommand::JsonRepoCheckout { spec } => {
                 let outcome = run_repo_checkout(&runtime, file, spec)?;
                 Ok(Some(to_json(&outcome)?))
             }
 
-            GraftPragma::Restore { spec } => {
+            GraftCommand::Restore { spec } => {
                 if !file.is_idle() {
                     return pragma_err!("cannot restore while there is an open transaction");
                 }
@@ -1176,7 +1266,7 @@ impl GraftPragma {
                 let outcome = restore_repo_path(&runtime, file, &repo, &spec)?;
                 Ok(Some(format_restore_outcome(&outcome)))
             }
-            GraftPragma::JsonRestore { spec } => {
+            GraftCommand::JsonRestore { spec } => {
                 if !file.is_idle() {
                     return pragma_err!("cannot restore while there is an open transaction");
                 }
@@ -1185,7 +1275,7 @@ impl GraftPragma {
                 Ok(Some(to_json(&outcome)?))
             }
 
-            GraftPragma::Export { spec } => {
+            GraftCommand::Export { spec } => {
                 if !file.is_idle() {
                     return pragma_err!("cannot export while there is an open transaction");
                 }
@@ -1196,7 +1286,7 @@ impl GraftPragma {
                     spec.output.display()
                 )))
             }
-            GraftPragma::JsonExport { spec } => {
+            GraftCommand::JsonExport { spec } => {
                 if !file.is_idle() {
                     return pragma_err!("cannot export while there is an open transaction");
                 }
@@ -1214,7 +1304,7 @@ impl GraftPragma {
                 })?))
             }
 
-            GraftPragma::VolumeSwitch { vid, local, remote } => {
+            GraftCommand::VolumeSwitch { vid, local, remote } => {
                 if !file.is_idle() {
                     return pragma_err!("cannot switch while there is an open transaction");
                 }
@@ -1228,20 +1318,20 @@ impl GraftPragma {
                 )))
             }
 
-            GraftPragma::VolumeInfo => Ok(Some(format_volume_info(&runtime, file)?)),
-            GraftPragma::Status { spec } => {
+            GraftCommand::VolumeInfo => Ok(Some(format_volume_info(&runtime, file)?)),
+            GraftCommand::Status { spec } => {
                 let repo = repo_for_file(file)?;
                 let status = repo_status_for_file(&runtime, file, &repo)?;
                 let status = filter_repo_status_by_kind(status, spec.kind);
                 Ok(Some(format_repo_status(&status)?))
             }
-            GraftPragma::VolumeStatus => Ok(Some(format_volume_status(&runtime, file)?)),
+            GraftCommand::VolumeStatus => Ok(Some(format_volume_status(&runtime, file)?)),
 
-            GraftPragma::RepoInit { spec } => {
+            GraftCommand::RepoInit { spec } => {
                 let outcome = run_repo_init(file, spec)?;
                 Ok(Some(format_repo_init_outcome(&outcome)))
             }
-            GraftPragma::JsonRepoInit { spec } => {
+            GraftCommand::JsonRepoInit { spec } => {
                 let outcome = run_repo_init(file, spec)?;
                 Ok(Some(to_json(&JsonInitOutcome {
                     operation: "init",
@@ -1255,7 +1345,7 @@ impl GraftPragma {
                 })?))
             }
 
-            GraftPragma::RepoClone { spec } => {
+            GraftCommand::RepoClone { spec } => {
                 let outcome = run_repo_clone(file, spec)?;
                 Ok(Some(format!(
                     "Cloned origin/{} at {} into {}",
@@ -1264,7 +1354,7 @@ impl GraftPragma {
                     outcome.graft_dir.display()
                 )))
             }
-            GraftPragma::JsonRepoClone { spec } => {
+            GraftCommand::JsonRepoClone { spec } => {
                 let outcome = run_repo_clone(file, spec)?;
                 Ok(Some(to_json(&JsonCloneOutcome {
                     operation: "clone",
@@ -1279,7 +1369,7 @@ impl GraftPragma {
                 })?))
             }
 
-            GraftPragma::JsonStatus { spec } => {
+            GraftCommand::JsonStatus { spec } => {
                 let repo = repo_for_file(file)?;
                 let status = repo_status_for_file(&runtime, file, &repo)?;
                 let status = filter_repo_status_by_kind(status, spec.kind);
@@ -1297,11 +1387,11 @@ impl GraftPragma {
                 })?))
             }
 
-            GraftPragma::Add { spec } => {
+            GraftCommand::Add { spec } => {
                 let entries = run_repo_add(&runtime, file, &spec)?;
                 Ok(Some(format_added_entries(&entries)))
             }
-            GraftPragma::JsonAdd { spec } => {
+            GraftCommand::JsonAdd { spec } => {
                 let entries = run_repo_add(&runtime, file, &spec)?;
                 let repo = repo_for_file(file)?;
                 let kind = spec.kind.map(repo_tracked_path_kind_json_label);
@@ -1336,11 +1426,11 @@ impl GraftPragma {
                 })?))
             }
 
-            GraftPragma::Remove { spec } => {
+            GraftCommand::Remove { spec } => {
                 let paths = run_repo_remove(&runtime, file, &spec)?;
                 Ok(Some(format_removed_paths(&paths)))
             }
-            GraftPragma::JsonRemove { spec } => {
+            GraftCommand::JsonRemove { spec } => {
                 let paths = run_repo_remove(&runtime, file, &spec)?;
                 let repo = repo_for_file(file)?;
                 let (current_head, current_branch) = repo_head_and_branch(&repo)?;
@@ -1353,12 +1443,12 @@ impl GraftPragma {
                 })?))
             }
 
-            GraftPragma::Commit { message } => {
+            GraftCommand::Commit { message } => {
                 let outcome = run_repo_commit(&runtime, file, message)?;
                 let commit = outcome.commit;
                 Ok(Some(format!("[{}] {}", &commit.id[..12], commit.message)))
             }
-            GraftPragma::JsonCommit { message } => {
+            GraftCommand::JsonCommit { message } => {
                 let outcome = run_repo_commit(&runtime, file, message)?;
                 let head = outcome.commit.id.clone();
                 let paths = json_commit_path_changes(&outcome.commit);
@@ -1376,7 +1466,7 @@ impl GraftPragma {
                 })?))
             }
 
-            GraftPragma::Branch { mode } => {
+            GraftCommand::Branch { mode } => {
                 let repo = repo_for_file(file)?;
                 let branches = repo.branches()?;
                 let remote_branches = if mode.includes_remote() {
@@ -1386,7 +1476,7 @@ impl GraftPragma {
                 };
                 Ok(Some(format_branches(&branches, &remote_branches, mode)?))
             }
-            GraftPragma::JsonBranch { mode } => {
+            GraftCommand::JsonBranch { mode } => {
                 let repo = repo_for_file(file)?;
                 let (current_head, current_branch) = repo_head_and_branch(&repo)?;
                 let branches = repo.branches()?;
@@ -1403,83 +1493,83 @@ impl GraftPragma {
                 })?))
             }
 
-            GraftPragma::BranchCreate { name, start_point } => {
+            GraftCommand::BranchCreate { name, start_point } => {
                 let branch = run_repo_branch_create(file, name, start_point)?;
                 Ok(Some(format_branch_created(&branch)))
             }
-            GraftPragma::JsonBranchCreate { name, start_point } => {
+            GraftCommand::JsonBranchCreate { name, start_point } => {
                 let branch = run_repo_branch_create(file, name, start_point)?;
                 let outcome = json_branch_mutation_outcome(file, "branch_create", branch, None)?;
                 Ok(Some(to_json(&outcome)?))
             }
 
-            GraftPragma::BranchDelete { name, force } => {
+            GraftCommand::BranchDelete { name, force } => {
                 let branch = run_repo_branch_delete(file, name, force)?;
                 Ok(Some(format_branch_deleted(&branch, force)))
             }
-            GraftPragma::JsonBranchDelete { name, force } => {
+            GraftCommand::JsonBranchDelete { name, force } => {
                 let branch = run_repo_branch_delete(file, name, force)?;
                 let outcome = json_branch_mutation_outcome(file, "branch_delete", branch, None)?;
                 Ok(Some(to_json(&outcome)?))
             }
 
-            GraftPragma::BranchRename { old, new, force } => {
+            GraftCommand::BranchRename { old, new, force } => {
                 let (old, branch) = run_repo_branch_rename(file, old, new, force)?;
                 Ok(Some(format_branch_renamed(&old, &branch, force)))
             }
-            GraftPragma::JsonBranchRename { old, new, force } => {
+            GraftCommand::JsonBranchRename { old, new, force } => {
                 let (old, branch) = run_repo_branch_rename(file, old, new, force)?;
                 let outcome =
                     json_branch_mutation_outcome(file, "branch_rename", branch, Some(old))?;
                 Ok(Some(to_json(&outcome)?))
             }
 
-            GraftPragma::BranchUpstream { branch, remote, remote_branch } => {
+            GraftCommand::BranchUpstream { branch, remote, remote_branch } => {
                 let branch = run_repo_branch_upstream(file, branch, remote, remote_branch)?;
                 Ok(Some(format_branch_upstream(&branch)))
             }
-            GraftPragma::JsonBranchUpstream { branch, remote, remote_branch } => {
+            GraftCommand::JsonBranchUpstream { branch, remote, remote_branch } => {
                 let branch = run_repo_branch_upstream(file, branch, remote, remote_branch)?;
                 let outcome = json_branch_mutation_outcome(file, "branch_upstream", branch, None)?;
                 Ok(Some(to_json(&outcome)?))
             }
 
-            GraftPragma::BranchUnsetUpstream { branch } => {
+            GraftCommand::BranchUnsetUpstream { branch } => {
                 let branch = run_repo_branch_unset_upstream(file, branch)?;
                 Ok(Some(format_branch_upstream_unset(&branch)))
             }
-            GraftPragma::JsonBranchUnsetUpstream { branch } => {
+            GraftCommand::JsonBranchUnsetUpstream { branch } => {
                 let branch = run_repo_branch_unset_upstream(file, branch)?;
                 let outcome =
                     json_branch_mutation_outcome(file, "branch_unset_upstream", branch, None)?;
                 Ok(Some(to_json(&outcome)?))
             }
 
-            GraftPragma::TagCreate { name, target, message } => {
+            GraftCommand::TagCreate { name, target, message } => {
                 let tag = run_repo_tag_create(file, name, target, message)?;
                 Ok(Some(format_tag_created(&tag)))
             }
-            GraftPragma::JsonTagCreate { name, target, message } => {
+            GraftCommand::JsonTagCreate { name, target, message } => {
                 let tag = run_repo_tag_create(file, name, target, message)?;
                 let outcome = json_tag_mutation_outcome(file, "tag_create", tag)?;
                 Ok(Some(to_json(&outcome)?))
             }
 
-            GraftPragma::TagDelete { name } => {
+            GraftCommand::TagDelete { name } => {
                 let tag = run_repo_tag_delete(file, name)?;
                 Ok(Some(format_tag_deleted(&tag)))
             }
-            GraftPragma::JsonTagDelete { name } => {
+            GraftCommand::JsonTagDelete { name } => {
                 let tag = run_repo_tag_delete(file, name)?;
                 let outcome = json_tag_mutation_outcome(file, "tag_delete", tag)?;
                 Ok(Some(to_json(&outcome)?))
             }
 
-            GraftPragma::SwitchBranch { name, force } => {
+            GraftCommand::SwitchBranch { name, force } => {
                 run_repo_switch_branch(&runtime, file, name.clone(), force)?;
                 Ok(Some(format!("Switched to branch '{name}'")))
             }
-            GraftPragma::JsonSwitchBranch { name, force } => {
+            GraftCommand::JsonSwitchBranch { name, force } => {
                 let outcome = run_repo_switch_branch(&runtime, file, name, force)?;
                 let head = outcome.target.clone();
                 let repo = repo_for_file(file)?;
@@ -1495,11 +1585,11 @@ impl GraftPragma {
                 })?))
             }
 
-            GraftPragma::SwitchCreate { name, start_point, force } => {
+            GraftCommand::SwitchCreate { name, start_point, force } => {
                 let outcome = run_repo_switch_create(&runtime, file, name, start_point, force)?;
                 Ok(Some(format_branch_created(&outcome.branch)))
             }
-            GraftPragma::JsonSwitchCreate { name, start_point, force } => {
+            GraftCommand::JsonSwitchCreate { name, start_point, force } => {
                 let outcome = run_repo_switch_create(&runtime, file, name, start_point, force)?;
                 let head = outcome.branch.target.clone();
                 let repo = repo_for_file(file)?;
@@ -1515,7 +1605,7 @@ impl GraftPragma {
                 })?))
             }
 
-            GraftPragma::Merge { rev } => {
+            GraftCommand::Merge { rev } => {
                 let outcome = run_repo_merge(&runtime, file, &rev)?;
                 let repo = repo_for_file(file)?;
                 Ok(Some(format_merge_outcome_with_row_auto_merge(
@@ -1527,7 +1617,7 @@ impl GraftPragma {
                     None,
                 )?))
             }
-            GraftPragma::JsonMerge { rev } => {
+            GraftCommand::JsonMerge { rev } => {
                 let outcome = run_repo_merge(&runtime, file, &rev)?;
                 let repo = repo_for_file(file)?;
                 let conflict_analysis =
@@ -1546,14 +1636,14 @@ impl GraftPragma {
                 })?))
             }
 
-            GraftPragma::MergeAbort => {
+            GraftCommand::MergeAbort => {
                 let outcome = run_repo_merge_abort(&runtime, file)?;
                 Ok(Some(format!(
                     "Aborted merge; reset HEAD to {}",
                     &outcome.target[..outcome.target.len().min(12)]
                 )))
             }
-            GraftPragma::JsonMergeAbort => {
+            GraftCommand::JsonMergeAbort => {
                 let outcome = run_repo_merge_abort(&runtime, file)?;
                 let head = outcome.target.clone();
                 let repo = repo_for_file(file)?;
@@ -1569,7 +1659,7 @@ impl GraftPragma {
                 })?))
             }
 
-            GraftPragma::MergeContinue { message } => {
+            GraftCommand::MergeContinue { message } => {
                 let outcome = run_repo_merge_continue(&runtime, file, message)?;
                 let commit = outcome.commit;
                 Ok(Some(format!(
@@ -1578,7 +1668,7 @@ impl GraftPragma {
                     commit.message
                 )))
             }
-            GraftPragma::JsonMergeContinue { message } => {
+            GraftCommand::JsonMergeContinue { message } => {
                 let outcome = run_repo_merge_continue(&runtime, file, message)?;
                 let head = outcome.commit.id.clone();
                 let paths = json_commit_path_changes(&outcome.commit);
@@ -1596,12 +1686,12 @@ impl GraftPragma {
                 })?))
             }
 
-            GraftPragma::Conflicts => {
+            GraftCommand::Conflicts => {
                 let repo = repo_for_file(file)?;
                 Ok(Some(format_conflicts(&repo.status()?)?))
             }
 
-            GraftPragma::JsonConflicts => {
+            GraftCommand::JsonConflicts => {
                 let repo = repo_for_file(file)?;
                 let remote = repo_default_remote_store(&repo);
                 Ok(Some(to_json(&repo_conflict_artifacts(
@@ -1609,7 +1699,7 @@ impl GraftPragma {
                 )?)?))
             }
 
-            GraftPragma::Resolve { spec } => {
+            GraftCommand::Resolve { spec } => {
                 if !file.is_idle() {
                     return pragma_err!("cannot resolve while there is an open transaction");
                 }
@@ -1623,7 +1713,7 @@ impl GraftPragma {
                 )))
             }
 
-            GraftPragma::JsonResolveConflict { spec } => {
+            GraftCommand::JsonResolveConflict { spec } => {
                 if !file.is_idle() {
                     return pragma_err!("cannot resolve while there is an open transaction");
                 }
@@ -1646,31 +1736,31 @@ impl GraftPragma {
                 })?))
             }
 
-            GraftPragma::RemoteAdd { name, config } => {
+            GraftCommand::RemoteAdd { name, config } => {
                 let repo = repo_for_file(file)?;
                 let remote = repo.remote_add(&name, config)?;
                 Ok(Some(format_remote(&remote)))
             }
-            GraftPragma::JsonRemoteAdd { name, config } => {
+            GraftCommand::JsonRemoteAdd { name, config } => {
                 let repo = repo_for_file(file)?;
                 let remote = repo.remote_add(&name, config)?;
                 let outcome = json_remote_mutation_outcome(file, "remote_add", remote, None)?;
                 Ok(Some(to_json(&outcome)?))
             }
 
-            GraftPragma::RemoteRemove { name } => {
+            GraftCommand::RemoteRemove { name } => {
                 let repo = repo_for_file(file)?;
                 let remote = repo.remote_remove(&name)?;
                 Ok(Some(format!("Removed remote '{}'", remote.name)))
             }
-            GraftPragma::JsonRemoteRemove { name } => {
+            GraftCommand::JsonRemoteRemove { name } => {
                 let repo = repo_for_file(file)?;
                 let remote = repo.remote_remove(&name)?;
                 let outcome = json_remote_mutation_outcome(file, "remote_remove", remote, None)?;
                 Ok(Some(to_json(&outcome)?))
             }
 
-            GraftPragma::RemoteRename { old, new } => {
+            GraftCommand::RemoteRename { old, new } => {
                 let repo = repo_for_file(file)?;
                 let remote = repo.remote_rename(&old, &new)?;
                 Ok(Some(format!(
@@ -1680,7 +1770,7 @@ impl GraftPragma {
                     remote_config_uri(&remote.config)
                 )))
             }
-            GraftPragma::JsonRemoteRename { old, new } => {
+            GraftCommand::JsonRemoteRename { old, new } => {
                 let repo = repo_for_file(file)?;
                 let remote = repo.remote_rename(&old, &new)?;
                 let outcome =
@@ -1688,19 +1778,19 @@ impl GraftPragma {
                 Ok(Some(to_json(&outcome)?))
             }
 
-            GraftPragma::RemoteGetUrl { name } => {
+            GraftCommand::RemoteGetUrl { name } => {
                 let repo = repo_for_file(file)?;
                 let remote = repo.remote_get_url(&name)?;
                 Ok(Some(remote_config_uri(&remote.config)))
             }
-            GraftPragma::JsonRemoteGetUrl { name } => {
+            GraftCommand::JsonRemoteGetUrl { name } => {
                 let repo = repo_for_file(file)?;
                 let remote = repo.remote_get_url(&name)?;
                 let outcome = json_remote_mutation_outcome(file, "remote_get_url", remote, None)?;
                 Ok(Some(to_json(&outcome)?))
             }
 
-            GraftPragma::RemoteSetUrl { name, config } => {
+            GraftCommand::RemoteSetUrl { name, config } => {
                 let repo = repo_for_file(file)?;
                 let remote = repo.remote_set_url(&name, config)?;
                 Ok(Some(format!(
@@ -1709,19 +1799,19 @@ impl GraftPragma {
                     remote_config_uri(&remote.config)
                 )))
             }
-            GraftPragma::JsonRemoteSetUrl { name, config } => {
+            GraftCommand::JsonRemoteSetUrl { name, config } => {
                 let repo = repo_for_file(file)?;
                 let remote = repo.remote_set_url(&name, config)?;
                 let outcome = json_remote_mutation_outcome(file, "remote_set_url", remote, None)?;
                 Ok(Some(to_json(&outcome)?))
             }
 
-            GraftPragma::RemotePrune { name } => {
+            GraftCommand::RemotePrune { name } => {
                 let repo = repo_for_file(file)?;
                 let outcome = repo.remote_prune(&name)?;
                 Ok(Some(format_remote_prune_outcome(&outcome)?))
             }
-            GraftPragma::JsonRemotePrune { name } => {
+            GraftCommand::JsonRemotePrune { name } => {
                 let repo = repo_for_file(file)?;
                 let outcome = repo.remote_prune(&name)?;
                 let (current_head, current_branch) = repo_head_and_branch(&repo)?;
@@ -1733,7 +1823,7 @@ impl GraftPragma {
                 })?))
             }
 
-            GraftPragma::LsRemote { name } => {
+            GraftCommand::LsRemote { name } => {
                 let repo = repo_for_file(file)?;
                 let default_branch = repo.remote_default_branch(&name)?;
                 let refs = repo.remote_branch_refs(&name)?;
@@ -1743,7 +1833,7 @@ impl GraftPragma {
                     &refs,
                 )?))
             }
-            GraftPragma::JsonLsRemote { name } => {
+            GraftCommand::JsonLsRemote { name } => {
                 let repo = repo_for_file(file)?;
                 let default_branch = repo.remote_default_branch(&name)?;
                 let refs = repo.remote_branch_refs(&name)?;
@@ -1758,11 +1848,11 @@ impl GraftPragma {
                 })?))
             }
 
-            GraftPragma::Remotes => {
+            GraftCommand::Remotes => {
                 let repo = repo_for_file(file)?;
                 Ok(Some(format_remotes(&repo.remotes()?)?))
             }
-            GraftPragma::JsonRemotes => {
+            GraftCommand::JsonRemotes => {
                 let repo = repo_for_file(file)?;
                 let (current_head, current_branch) = repo_head_and_branch(&repo)?;
                 Ok(Some(to_json(&JsonRemoteList {
@@ -1772,22 +1862,22 @@ impl GraftPragma {
                 })?))
             }
 
-            GraftPragma::VolumeSnapshot => {
+            GraftCommand::VolumeSnapshot => {
                 let snapshot = file.snapshot_or_latest()?;
                 Ok(Some(format!("{snapshot:?}")))
             }
 
-            GraftPragma::Fetch { remote, branch, refspec, all } => {
+            GraftCommand::Fetch { remote, branch, refspec, all } => {
                 let repo = repo_for_file(file)?;
                 Ok(Some(run_repo_fetch(&repo, remote, branch, refspec, all)?))
             }
-            GraftPragma::JsonFetch { remote, branch, refspec, all } => {
+            GraftCommand::JsonFetch { remote, branch, refspec, all } => {
                 let repo = repo_for_file(file)?;
                 Ok(Some(run_repo_fetch_json(
                     &repo, remote, branch, refspec, all,
                 )?))
             }
-            GraftPragma::FetchAsync { remote, branch, refspec, all } => {
+            GraftCommand::FetchAsync { remote, branch, refspec, all } => {
                 repo_for_file(file)?;
                 let id = async_jobs().spawn_fetch(
                     PathBuf::from(file.tag.clone()),
@@ -1799,7 +1889,7 @@ impl GraftPragma {
                 );
                 Ok(Some(id))
             }
-            GraftPragma::JsonFetchAsync { remote, branch, refspec, all, mode } => {
+            GraftCommand::JsonFetchAsync { remote, branch, refspec, all, mode } => {
                 repo_for_file(file)?;
                 let id = async_jobs().spawn_fetch(
                     PathBuf::from(file.tag.clone()),
@@ -1814,11 +1904,11 @@ impl GraftPragma {
                     JsonFetchAsyncMode::WithStatus => Ok(Some(async_jobs().json_status(&id)?)),
                 }
             }
-            GraftPragma::JobStatus { id } => Ok(Some(async_jobs().status_json(&id)?)),
-            GraftPragma::JsonJobStatus { id } => Ok(Some(async_jobs().json_status(&id)?)),
-            GraftPragma::JobResult { id } => Ok(Some(async_jobs().result(&id)?)),
-            GraftPragma::JsonJobResult { id } => Ok(Some(async_jobs().result(&id)?)),
-            GraftPragma::Pull { remote, branch, refspec, all } => {
+            GraftCommand::JobStatus { id } => Ok(Some(async_jobs().status_json(&id)?)),
+            GraftCommand::JsonJobStatus { id } => Ok(Some(async_jobs().json_status(&id)?)),
+            GraftCommand::JobResult { id } => Ok(Some(async_jobs().result(&id)?)),
+            GraftCommand::JsonJobResult { id } => Ok(Some(async_jobs().result(&id)?)),
+            GraftCommand::Pull { remote, branch, refspec, all } => {
                 let outcome = run_repo_pull(&runtime, file, remote, branch, refspec, all)?;
                 let repo = repo_for_file(file)?;
                 let checkout_remote = Arc::new(repo.remote_store(&outcome.outcome.remote)?);
@@ -1830,7 +1920,7 @@ impl GraftPragma {
                     Some(checkout_remote),
                 )?))
             }
-            GraftPragma::JsonPull { remote, branch, refspec, all } => {
+            GraftCommand::JsonPull { remote, branch, refspec, all } => {
                 let outcome = run_repo_pull(&runtime, file, remote, branch, refspec, all)?;
                 let repo = repo_for_file(file)?;
                 let remote = repo
@@ -1849,23 +1939,25 @@ impl GraftPragma {
                 })?))
             }
 
-            GraftPragma::Push { remote, branch, refspec, all, force } => {
+            GraftCommand::Push { remote, branch, refspec, all, force } => {
                 let repo = repo_for_file(file)?;
                 let outcome = run_repo_push(&runtime, &repo, remote, branch, refspec, all, force)?;
                 Ok(Some(format_push_command_outcome(&outcome)?))
             }
-            GraftPragma::JsonPush { remote, branch, refspec, all, force } => {
+            GraftCommand::JsonPush { remote, branch, refspec, all, force } => {
                 let repo = repo_for_file(file)?;
                 let outcome = run_repo_push(&runtime, &repo, remote, branch, refspec, all, force)?;
                 Ok(Some(to_json(&json_push_command_outcome(&repo, &outcome)?)?))
             }
-            GraftPragma::VolumeFetch => Ok(Some(fetch_or_pull(&runtime, file, false)?)),
-            GraftPragma::VolumePull => Ok(Some(fetch_or_pull(&runtime, file, true)?)),
-            GraftPragma::VolumePush => Ok(Some(push(&runtime, file)?)),
+            GraftCommand::VolumeFetch => Ok(Some(fetch_or_pull(&runtime, file, false)?)),
+            GraftCommand::VolumePull => Ok(Some(fetch_or_pull(&runtime, file, true)?)),
+            GraftCommand::VolumePush => Ok(Some(push(&runtime, file)?)),
 
-            GraftPragma::VolumeAudit => Ok(Some(format_volume_audit(&runtime, file)?)),
-            GraftPragma::VolumeJsonAudit => Ok(Some(to_json(&json_volume_audit(&runtime, file)?)?)),
-            GraftPragma::RepoAudit { spec } => {
+            GraftCommand::VolumeAudit => Ok(Some(format_volume_audit(&runtime, file)?)),
+            GraftCommand::VolumeJsonAudit => {
+                Ok(Some(to_json(&json_volume_audit(&runtime, file)?)?))
+            }
+            GraftCommand::RepoAudit { spec } => {
                 let repo = repo_for_file(file)?;
                 if spec.repair {
                     let remote = repo_default_remote(&repo, spec.remote.clone())?;
@@ -1875,7 +1967,7 @@ impl GraftPragma {
                     Ok(Some(format_repo_artifact_audit(&repo.audit_artifacts()?)?))
                 }
             }
-            GraftPragma::JsonRepoAudit { spec } => {
+            GraftCommand::JsonRepoAudit { spec } => {
                 let repo = repo_for_file(file)?;
                 let (current_head, current_branch) = repo_head_and_branch(&repo)?;
                 if spec.repair {
@@ -1895,13 +1987,13 @@ impl GraftPragma {
                     })?))
                 }
             }
-            GraftPragma::LargeFileFetch { spec } => {
+            GraftCommand::LargeFileFetch { spec } => {
                 let repo = repo_for_file(file)?;
                 let remote = repo_default_remote(&repo, spec.remote.clone())?;
                 let outcome = repo.fetch_large_file_payloads(&remote, spec.rev.as_deref())?;
                 Ok(Some(format_large_file_fetch_outcome(&outcome)?))
             }
-            GraftPragma::JsonLargeFileFetch { spec, operation } => {
+            GraftCommand::JsonLargeFileFetch { spec, operation } => {
                 let repo = repo_for_file(file)?;
                 let (current_head, current_branch) = repo_head_and_branch(&repo)?;
                 let remote = repo_default_remote(&repo, spec.remote.clone())?;
@@ -1913,12 +2005,12 @@ impl GraftPragma {
                     outcome,
                 })?))
             }
-            GraftPragma::LargeFileStatus { spec } => {
+            GraftCommand::LargeFileStatus { spec } => {
                 let repo = repo_for_file(file)?;
                 let outcome = repo.large_file_payloads_status(spec.rev.as_deref())?;
                 Ok(Some(format_large_file_status_outcome(&outcome)?))
             }
-            GraftPragma::JsonLargeFileStatus { spec, operation } => {
+            GraftCommand::JsonLargeFileStatus { spec, operation } => {
                 let repo = repo_for_file(file)?;
                 let (current_head, current_branch) = repo_head_and_branch(&repo)?;
                 let outcome = repo.large_file_payloads_status(spec.rev.as_deref())?;
@@ -1929,12 +2021,12 @@ impl GraftPragma {
                     outcome,
                 })?))
             }
-            GraftPragma::LargeFilePrune { spec } => {
+            GraftCommand::LargeFilePrune { spec } => {
                 let repo = repo_for_file(file)?;
                 let outcome = repo.prune_large_file_payloads(spec.dry_run)?;
                 Ok(Some(format_large_file_prune_outcome(&outcome)?))
             }
-            GraftPragma::JsonLargeFilePrune { spec, operation } => {
+            GraftCommand::JsonLargeFilePrune { spec, operation } => {
                 let repo = repo_for_file(file)?;
                 let (current_head, current_branch) = repo_head_and_branch(&repo)?;
                 let outcome = repo.prune_large_file_payloads(spec.dry_run)?;
@@ -1945,11 +2037,11 @@ impl GraftPragma {
                     outcome,
                 })?))
             }
-            GraftPragma::StorageGc { spec } => {
+            GraftCommand::StorageGc { spec } => {
                 let outcome = run_repo_storage_gc(&runtime, file, spec.dry_run)?;
                 Ok(Some(format_storage_gc_outcome(&outcome)?))
             }
-            GraftPragma::JsonStorageGc { spec } => {
+            GraftCommand::JsonStorageGc { spec } => {
                 let repo = repo_for_file(file)?;
                 let (current_head, current_branch) = repo_head_and_branch(&repo)?;
                 let outcome = run_repo_storage_gc(&runtime, file, spec.dry_run)?;
@@ -1960,7 +2052,7 @@ impl GraftPragma {
                     outcome,
                 })?))
             }
-            GraftPragma::LsFiles { spec } => {
+            GraftCommand::LsFiles { spec } => {
                 let repo = repo_for_file(file)?;
                 if spec.others {
                     let paths = filter_tracked_paths_by_kind(repo.untracked_paths()?, spec.kind);
@@ -1982,7 +2074,7 @@ impl GraftPragma {
                     Ok(Some(format_repo_tracked_paths(&paths)?))
                 }
             }
-            GraftPragma::JsonLsFiles { spec } => {
+            GraftCommand::JsonLsFiles { spec } => {
                 let repo = repo_for_file(file)?;
                 let (current_head, current_branch) = repo_head_and_branch(&repo)?;
                 let kind = spec.kind.map(repo_tracked_path_kind_json_label);
@@ -2038,11 +2130,11 @@ impl GraftPragma {
                     })?))
                 }
             }
-            GraftPragma::ConfigGet { key } => {
+            GraftCommand::ConfigGet { key } => {
                 let repo = repo_for_file(file)?;
                 Ok(Some(format_repo_config_entry(&repo.config_get(&key)?)?))
             }
-            GraftPragma::JsonConfigGet { key } => {
+            GraftCommand::JsonConfigGet { key } => {
                 let repo = repo_for_file(file)?;
                 let entry = repo.config_get(&key)?;
                 let (current_head, current_branch) = repo_head_and_branch(&repo)?;
@@ -2052,11 +2144,11 @@ impl GraftPragma {
                     entry,
                 })?))
             }
-            GraftPragma::ConfigList => {
+            GraftCommand::ConfigList => {
                 let repo = repo_for_file(file)?;
                 Ok(Some(format_repo_config_entries(&repo.config_list()?)?))
             }
-            GraftPragma::JsonConfigList { mode } => {
+            GraftCommand::JsonConfigList { mode } => {
                 let repo = repo_for_file(file)?;
                 let entries = repo.config_list()?;
                 match mode {
@@ -2071,13 +2163,13 @@ impl GraftPragma {
                     }
                 }
             }
-            GraftPragma::ConfigSet { key, value } => {
+            GraftCommand::ConfigSet { key, value } => {
                 let repo = repo_for_file(file)?;
                 Ok(Some(format_repo_config_entry(
                     &repo.config_set(&key, &value)?,
                 )?))
             }
-            GraftPragma::JsonConfigSet { key, value } => {
+            GraftCommand::JsonConfigSet { key, value } => {
                 let repo = repo_for_file(file)?;
                 let entry = repo.config_set(&key, &value)?;
                 let (current_head, current_branch) = repo_head_and_branch(&repo)?;
@@ -2088,11 +2180,11 @@ impl GraftPragma {
                     entry,
                 })?))
             }
-            GraftPragma::ConfigUnset { key } => {
+            GraftCommand::ConfigUnset { key } => {
                 let repo = repo_for_file(file)?;
                 Ok(Some(format_repo_config_entry(&repo.config_unset(&key)?)?))
             }
-            GraftPragma::JsonConfigUnset { key } => {
+            GraftCommand::JsonConfigUnset { key } => {
                 let repo = repo_for_file(file)?;
                 let entry = repo.config_unset(&key)?;
                 let (current_head, current_branch) = repo_head_and_branch(&repo)?;
@@ -2104,13 +2196,13 @@ impl GraftPragma {
                 })?))
             }
 
-            GraftPragma::VolumeHydrate => {
+            GraftCommand::VolumeHydrate => {
                 let snapshot = file.snapshot_or_latest()?;
                 runtime.snapshot_hydrate(snapshot)?;
                 Ok(None)
             }
 
-            GraftPragma::Version => {
+            GraftCommand::Version => {
                 const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
                 const GITHUB_SHA: Option<&str> = option_env!("GITHUB_SHA");
                 let mut out = format!("Graft Version: {PKG_VERSION}");
@@ -2120,15 +2212,15 @@ impl GraftPragma {
                 Ok(Some(out))
             }
 
-            GraftPragma::VolumeImport => {
+            GraftCommand::VolumeImport => {
                 pragma_err!(
                     "deprecated: use `vacuum into` instead: https://graft.rs/r/graft_import"
                 )
             }
 
-            GraftPragma::VolumeExport(path) => volume_export(&runtime, file, path).map(Some),
+            GraftCommand::VolumeExport(path) => volume_export(&runtime, file, path).map(Some),
 
-            GraftPragma::VolumeDumpSqliteHeader => {
+            GraftCommand::VolumeDumpSqliteHeader => {
                 let reader = runtime.volume_reader(file.vid.clone())?;
                 let page = reader.read_page(PageIdx::FIRST)?;
                 let header = SqliteHeader::read_from_bytes(&page[..100])
@@ -2136,17 +2228,17 @@ impl GraftPragma {
                 Ok(Some(format!("{header:#?}")))
             }
 
-            GraftPragma::VolumeDumpCommit { logref } => {
+            GraftCommand::VolumeDumpCommit { logref } => {
                 format_debug_show_lsn(&runtime, &logref).map(Some)
             }
 
-            GraftPragma::DebugLogLsn => format_debug_log_lsn(&runtime, file).map(Some),
+            GraftCommand::DebugLogLsn => format_debug_log_lsn(&runtime, file).map(Some),
 
-            GraftPragma::DebugShowLsn { logref } => {
+            GraftCommand::DebugShowLsn { logref } => {
                 format_debug_show_lsn(&runtime, &logref).map(Some)
             }
 
-            GraftPragma::DebugDiffLsn { from, to } => {
+            GraftCommand::DebugDiffLsn { from, to } => {
                 if from.log != to.log {
                     return pragma_err!("debug LSN diff requires both refs to use the same log");
                 }
@@ -2154,12 +2246,12 @@ impl GraftPragma {
                 Ok(Some(format_debug_page_diff(&diff)))
             }
 
-            GraftPragma::Log => {
+            GraftCommand::Log => {
                 let repo = repo_for_file(file)?;
                 Ok(Some(format_repo_log(&repo)?))
             }
 
-            GraftPragma::VolumeCheckoutLsn { lsn } => {
+            GraftCommand::VolumeCheckoutLsn { lsn } => {
                 if !file.is_idle() {
                     return pragma_err!("cannot checkout while there is an open transaction");
                 }
@@ -2173,7 +2265,7 @@ impl GraftPragma {
                 )))
             }
 
-            GraftPragma::VolumeResetTo { lsn } => {
+            GraftCommand::VolumeResetTo { lsn } => {
                 if !file.is_idle() {
                     return pragma_err!("cannot reset while there is an open transaction");
                 }
@@ -2188,7 +2280,7 @@ impl GraftPragma {
                 )))
             }
 
-            GraftPragma::Reset { rev, mode } => {
+            GraftCommand::Reset { rev, mode } => {
                 let outcome = run_repo_reset(&runtime, file, &rev, mode)?;
 
                 Ok(Some(format!(
@@ -2197,7 +2289,7 @@ impl GraftPragma {
                     reset_mode_label(mode)
                 )))
             }
-            GraftPragma::JsonReset { rev, mode } => {
+            GraftCommand::JsonReset { rev, mode } => {
                 let outcome = run_repo_reset(&runtime, file, &rev, mode)?;
                 let head = outcome.outcome.target.clone();
                 let repo = repo_for_file(file)?;
@@ -2213,7 +2305,7 @@ impl GraftPragma {
                 })?))
             }
 
-            GraftPragma::VolumeDiff { from, to, mode } => {
+            GraftCommand::VolumeDiff { from, to, mode } => {
                 if !file.is_idle() {
                     return pragma_err!("cannot diff while there is an open transaction");
                 }
@@ -2231,7 +2323,7 @@ impl GraftPragma {
                 }
             }
 
-            GraftPragma::RepoDiff { spec } => {
+            GraftCommand::RepoDiff { spec } => {
                 if !file.is_idle() {
                     return pragma_err!("cannot diff while there is an open transaction");
                 }
@@ -2247,7 +2339,7 @@ impl GraftPragma {
                 }
             }
 
-            GraftPragma::Show { target } => {
+            GraftCommand::Show { target } => {
                 if !file.is_idle() {
                     return pragma_err!("cannot show while there is an open transaction");
                 }
@@ -2256,7 +2348,7 @@ impl GraftPragma {
                 Ok(Some(format_repo_show(&commit)?))
             }
 
-            GraftPragma::JsonLog { spec } => {
+            GraftCommand::JsonLog { spec } => {
                 let repo = repo_for_file(file)?;
                 let (commits, has_more) = match spec.limit {
                     Some(limit) => repo.log_page(limit, spec.after.as_deref())?,
@@ -2280,7 +2372,7 @@ impl GraftPragma {
                 }
             }
 
-            GraftPragma::VolumeJsonDiff { from, to, mode } => {
+            GraftCommand::VolumeJsonDiff { from, to, mode } => {
                 if !file.is_idle() {
                     return pragma_err!("cannot diff while there is an open transaction");
                 }
@@ -2400,7 +2492,7 @@ impl GraftPragma {
                 }
             }
 
-            GraftPragma::JsonRepoDiff { spec } => {
+            GraftCommand::JsonRepoDiff { spec } => {
                 if !file.is_idle() {
                     return pragma_err!("cannot diff while there is an open transaction");
                 }
@@ -2447,7 +2539,7 @@ impl GraftPragma {
                 }
             }
 
-            GraftPragma::JsonShow { target } => {
+            GraftCommand::JsonShow { target } => {
                 if !file.is_idle() {
                     return pragma_err!("cannot show while there is an open transaction");
                 }
@@ -2461,14 +2553,14 @@ impl GraftPragma {
                 })?))
             }
 
-            GraftPragma::VolumeJsonInfo => {
+            GraftCommand::VolumeJsonInfo => {
                 let result = json_volume_info(&runtime, file)?;
                 Ok(Some(serde_json::to_string(&result).map_err(|e| {
                     ErrCtx::PragmaErr(format!("JSON error: {e}").into())
                 })?))
             }
 
-            GraftPragma::VolumeTableLog { table } => {
+            GraftCommand::VolumeTableLog { table } => {
                 let entries = table_log_entries(&runtime, &file.vid, &table)?;
                 if entries.is_empty() {
                     return Ok(Some(format!("No changes found for table '{table}'.")));
@@ -2491,7 +2583,7 @@ impl GraftPragma {
                 Ok(Some(f))
             }
 
-            GraftPragma::VolumeJsonTableLog { table } => {
+            GraftCommand::VolumeJsonTableLog { table } => {
                 let entries = table_log_entries(&runtime, &file.vid, &table)?;
                 let json_entries: Vec<crate::json::JsonTableLogEntry> = entries
                     .iter()
@@ -2507,7 +2599,7 @@ impl GraftPragma {
                 })?))
             }
 
-            GraftPragma::VolumeSetMessage { message } => {
+            GraftCommand::VolumeSetMessage { message } => {
                 file.pending_message = Some(message.clone());
                 Ok(Some(format!("Commit message set: '{message}'")))
             }

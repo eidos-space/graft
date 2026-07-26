@@ -1,6 +1,7 @@
 pub mod file;
 pub mod json;
 pub mod pragma;
+pub mod repo_service;
 pub mod row_level_diff;
 pub mod row_merge;
 pub mod sql_diff;

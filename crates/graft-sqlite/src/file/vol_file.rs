@@ -143,6 +143,29 @@ impl Debug for VolFile {
 }
 
 impl VolFile {
+    pub(crate) fn new_repository_session(
+        runtime: Runtime,
+        tag: String,
+        repo: Option<Repository>,
+        repo_runtimes: Arc<RepoRuntimeRegistry>,
+    ) -> Result<Self, ErrCtx> {
+        let volume = runtime.volume_open(None, None, None)?;
+        Ok(Self::new_workspace_session(
+            runtime,
+            tag,
+            volume.vid,
+            OpenOpts::new(
+                sqlite_plugin::vars::SQLITE_OPEN_MAIN_DB
+                    | sqlite_plugin::vars::SQLITE_OPEN_READWRITE
+                    | sqlite_plugin::vars::SQLITE_OPEN_CREATE,
+            ),
+            Arc::new(Mutex::new(())),
+            repo,
+            repo_runtimes,
+            Arc::new(WorkspaceCoordinator::default()),
+        ))
+    }
+
     pub fn new(
         runtime: Runtime,
         tag: String,
@@ -166,7 +189,7 @@ impl VolFile {
         )
     }
 
-    pub fn new_workspace_session(
+    pub(crate) fn new_workspace_session(
         runtime: Runtime,
         tag: String,
         vid: VolumeId,
