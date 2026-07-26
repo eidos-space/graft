@@ -17,20 +17,30 @@ repository.
 
 ## A database does not appear in status
 
-Make sure the database was written through Graft or stage the physical file
-explicitly.
+Make sure the database contains a committed transaction, then stage the
+physical path.
 
 ```bash
 graft sql --db data.sqlite "INSERT INTO notes(body) VALUES ('hello');"
 graft status
 ```
 
-If another SQLite tool edited the file:
+Any normal SQLite client can edit the file:
 
 ```bash
-sqlite3 data.sqlite "PRAGMA wal_checkpoint(TRUNCATE);"
+sqlite3 data.sqlite "INSERT INTO notes(body) VALUES ('from sqlite3');"
 graft add data.sqlite
 ```
+
+`graft add` reads a consistent SQLite backup and includes committed WAL frames,
+so a manual checkpoint is not required. An uncommitted transaction is not part
+of the staged state.
+
+## Checkout or switch reports that SQLite is busy
+
+Close writers and long-lived read transactions for database paths that the
+operation needs to replace. Graft refuses to rename a new snapshot over a live
+writer and will not delete WAL or shared-memory sidecars that are still in use.
 
 ## A file is stored externally when you expected inline
 

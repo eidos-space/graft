@@ -1,6 +1,6 @@
 ---
 title: JSON Output
-description: Reference for common app-facing JSON fields returned by Graft commands and pragmas.
+description: Reference for common app-facing JSON fields returned by Graft CLI commands.
 ---
 
 Most Graft repository commands have a JSON form. Use it for app UIs,
@@ -13,12 +13,8 @@ graft status --json
 graft diff --json --rows HEAD~1 HEAD data.sqlite
 ```
 
-SQLite uses `graft_json_*` pragmas:
-
-```sql
-PRAGMA graft_json_status;
-PRAGMA graft_json_diff = '--rows HEAD~1 HEAD -- data.sqlite';
-```
+The SQLite extension does not expose repository JSON PRAGMAs. Embedded
+applications should invoke the CLI control plane and decode its JSON response.
 
 ## Repository Position
 

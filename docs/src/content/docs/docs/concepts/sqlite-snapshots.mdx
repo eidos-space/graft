@@ -22,22 +22,31 @@ project/
 `data.sqlite` is the worktree path. The commit stores a snapshot descriptor
 backed by Graft storage under `.graft/`.
 
-## Writing Through Graft
+## Physical Worktree Mode
 
-When you write through the CLI:
+The default mode uses an ordinary SQLite file:
 
 ```bash
 graft sql --db data.sqlite "INSERT INTO notes(body) VALUES ('hello');"
 ```
 
-or through SQLite with `vfs=graft`, SQLite commits advance the current Graft
-database state. That state becomes repository history after staging and
-committing:
+The SQL transaction changes `data.sqlite` and possibly its WAL. It does not
+write Graft storage directly. Staging is the storage boundary:
 
 ```bash
 graft add data.sqlite
 graft commit -m "add note"
 ```
+
+`graft add` uses SQLite's online backup API to capture one committed database
+state. It includes committed WAL frames without checkpointing or modifying the
+source database, normalizes the private snapshot into a standalone rollback-
+journal file, and compares it page by page with the staged or committed base.
+Only changed 4 KiB pages are appended to Graft storage. If nothing changed, the
+existing `CommitFileState` and snapshot are reused.
+
+Rollback-journal databases follow the same path; there simply may be no WAL to
+include. Uncommitted transactions are never staged.
 
 ## Materialized Files
 
@@ -68,12 +77,26 @@ the current Graft volume.
 ## External Edits
 
 If a standard SQLite tool edits a tracked materialized database directly,
-checkpoint WAL data if needed and stage the path:
+commit the transaction and stage the path:
 
 ```bash
-sqlite3 data.sqlite "PRAGMA wal_checkpoint(TRUNCATE);"
+sqlite3 data.sqlite "INSERT INTO notes(body) VALUES ('external edit');"
 graft add data.sqlite
 ```
 
-For app integrations, prefer opening the database through the Graft VFS so
-Graft can track the current database state directly.
+Manual WAL checkpointing is not required. Before checkout, switch, restore, or
+another operation that replaces the worktree file, close long-lived database
+connections. Graft obtains an exclusive SQLite lock, folds a WAL into the old
+main file, removes sidecars, and refuses replacement while another writer is
+active.
+
+## Optional Live VFS Mode
+
+The SQLite extension can open a path with `vfs=graft` when an application wants
+SQLite commits to advance a live Graft Volume directly. This is an advanced
+data-plane mode, not the repository control plane. Repository status, staging,
+history, merge, and sync still use the CLI.
+
+Do not edit the same logical database simultaneously through the Graft VFS and
+the platform's normal file VFS. Choose one write path and close live
+connections before branch operations that replace or rebind database state.

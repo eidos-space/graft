@@ -5,9 +5,10 @@ description: Create a Graft repository, commit SQLite data and files, inspect ro
 
 import { Aside, Steps } from "@astrojs/starlight/components";
 
-The CLI is the easiest way to try Graft. It opens SQLite databases through the
-embedded Graft VFS, so you can create database state, stage it, commit it, and
-diff it without loading the SQLite extension manually.
+The CLI is the easiest way to try Graft. `graft sql` opens an ordinary physical
+SQLite worktree file, while repository commands use Graft's control-plane
+service directly. No SQLite extension or repository PRAGMA transport is
+involved.
 
 <Aside type="tip" title="Prefer zero install?">
   Start with the [Playground](/docs/quickstart/playground/). It runs the same
@@ -34,7 +35,7 @@ diff it without loading the SQLite extension manually.
 
    This creates `.graft/`. It does not create a default SQLite database.
 
-3. Write SQLite data through Graft.
+3. Write SQLite data.
 
    ```bash
    graft sql --db data.sqlite "CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT);"
@@ -48,6 +49,9 @@ diff it without loading the SQLite extension manually.
    ```
 
    `data.sqlite` appears as an unstaged SQLite database snapshot.
+
+   At this point it is still a normal SQLite file. Graft reads it only when a
+   repository command needs to inspect or stage the path.
 
 5. Commit the first app-state version.
 

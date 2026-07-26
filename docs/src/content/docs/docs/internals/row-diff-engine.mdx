@@ -16,13 +16,6 @@ graft diff --rows HEAD~1 HEAD data.sqlite
 graft diff --json --rows HEAD~1 HEAD data.sqlite
 ```
 
-SQLite:
-
-```sql
-PRAGMA graft_diff = '--rows HEAD~1 HEAD -- data.sqlite';
-PRAGMA graft_json_diff = '--rows HEAD~1 HEAD -- data.sqlite';
-```
-
 ## Debug Entry Points
 
 Low-level storage diagnostics can compare raw storage LSNs:
@@ -67,7 +60,7 @@ During merge, the same analysis can produce:
 - blocked reasons
 - apply policy and validation details
 
-This output feeds `graft conflicts --json` and `PRAGMA graft_json_conflicts`.
+This output feeds `graft conflicts --json`.
 
 ## Resolution Layer
 

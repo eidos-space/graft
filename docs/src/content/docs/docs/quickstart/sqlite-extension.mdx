@@ -1,116 +1,94 @@
 ---
 title: SQLite Extension Quickstart
-description: Use Graft from SQLite with the Graft VFS and repository PRAGMA commands.
+description: Use the optional Graft VFS as a live SQLite page-storage data plane.
 ---
 
 import { Aside, Steps } from "@astrojs/starlight/components";
 
-The SQLite extension is the main integration surface for applications. It
-registers a Graft VFS and exposes repository operations through
-`PRAGMA graft_*` commands.
+Most applications should use ordinary SQLite worktree files and the Graft CLI.
+The SQLite extension is for applications that deliberately want SQLite pages to
+live in a Graft Volume while the database is open.
 
-Use it when your app already opens SQLite connections from Electron, Node.js,
-Python, Ruby, Swift, Rust, or another runtime with SQLite support.
+The extension registers `vfs=graft` and exposes version and low-level
+`graft_debug_*` PRAGMAs. Repository commands such as status, add, commit,
+branch, merge, and sync are not SQLite PRAGMAs; run them through the CLI.
 
-<Aside type="tip" title="Evaluate the workflow first">
-  Use the [Playground](/docs/quickstart/playground/) or
-  [CLI Quickstart](/docs/quickstart/cli/) before embedding the extension. The
-  repository model and commands are the same.
+<Aside type="caution" title="Choose one write path">
+  Do not write the same logical database through both the platform file VFS and
+  the Graft VFS. Close live SQLite connections before branch operations that
+  replace or rebind database state.
 </Aside>
 
-## Open A Database Through Graft
+## Initialize The Repository
+
+Create the repository from a shell:
+
+```bash
+mkdir app-state
+cd app-state
+graft init
+```
+
+## Open A Database Through The Graft VFS
 
 In the SQLite shell:
 
 ```sql
 .load ./libgraft_ext
-.open "file:/path/to/project/data.sqlite?vfs=graft"
+.open "file:/path/to/app-state/data.sqlite?vfs=graft"
 ```
 
-Then initialize the repository:
+The absolute path maps to the repository-relative path `data.sqlite`, but its
+live pages are backed by the repository's Graft storage rather than a normal
+worktree file.
 
-```sql
-PRAGMA graft_init;
-```
-
-Repository state is stored under:
-
-```text
-/path/to/project/.graft/
-```
-
-## Basic Workflow
+## Write And Commit
 
 <Steps>
 
-1. Write normal SQLite data.
+1. Write normal SQL through the VFS connection.
 
    ```sql
    CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT NOT NULL);
    INSERT INTO users(name) VALUES ('Alice');
    ```
 
-2. Inspect repository status.
+2. Close the connection, then inspect and stage through the CLI.
 
-   ```sql
-   PRAGMA graft_status;
-   PRAGMA graft_json_status;
+   ```bash
+   graft status
+   graft add data.sqlite
+   graft commit -m "seed users"
    ```
 
-3. Stage the current database snapshot.
+3. Compare repository revisions through the CLI.
 
-   ```sql
-   PRAGMA graft_add;
-   ```
-
-4. Commit the staged snapshot.
-
-   ```sql
-   PRAGMA graft_commit = 'seed users';
-   ```
-
-5. Compare revisions.
-
-   ```sql
-   PRAGMA graft_diff = '--rows HEAD~1 HEAD -- data.sqlite';
-   PRAGMA graft_json_diff = '--rows HEAD~1 HEAD -- data.sqlite';
+   ```bash
+   graft diff --rows HEAD~1 HEAD data.sqlite
+   graft diff --json --rows HEAD~1 HEAD data.sqlite
    ```
 
 </Steps>
 
-## Path-Based Repository Mode
+## Extension Diagnostics
 
-The database path is part of repository identity. Opening
-`/project/data.sqlite` through the Graft VFS maps that database to the
-repo-relative path `data.sqlite` inside `/project`.
-
-Repository commands operate on the worktree, not on an implicit global
-database. A repository can track multiple database paths:
-
-```text
-project/
-  data.sqlite
-  analytics.sqlite
-  .graft/
-```
-
-Stage a specific path:
+The production extension keeps a deliberately small PRAGMA surface:
 
 ```sql
-PRAGMA graft_add = 'analytics.sqlite';
-PRAGMA graft_commit = 'track analytics database';
+PRAGMA graft_version;
+PRAGMA graft_debug_volume_info;
+PRAGMA graft_debug_volume_json_info;
+PRAGMA graft_debug_log_lsn;
 ```
 
-## JSON For Applications
+These commands inspect the open VFS Volume. They do not read or mutate
+repository branches, the index, commits, remotes, or merge state. See
+[VFS PRAGMAs](/docs/reference/pragmas/) for the complete diagnostic surface.
 
-Prefer JSON pragmas for application UI:
+## Default Physical Mode
 
-```sql
-PRAGMA graft_json_status;
-PRAGMA graft_json_diff = '--rows HEAD~1 HEAD -- data.sqlite';
-PRAGMA graft_json_conflicts;
-PRAGMA graft_json_ls_files = '--details';
-```
-
-See [App UI from JSON](/docs/guides/json-ui/) for common UI patterns and
-[SQLite PRAGMAs](/docs/reference/pragmas/) for the full command reference.
+If live Volume storage is not required, skip the extension and open
+`data.sqlite` normally. `graft add` will take a consistent SQLite backup,
+include committed WAL frames, and store only pages that changed from the
+current staged or committed snapshot. This is the recommended integration for
+most applications.

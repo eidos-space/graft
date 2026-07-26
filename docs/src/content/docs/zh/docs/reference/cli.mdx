@@ -3,7 +3,9 @@ title: CLI
 description: graft 命令行接口参考。
 ---
 
-`graft` CLI 用于本地开发、脚本、演示和手动仓库操作。仓库命令和 SQLite 扩展共享同一套语义，因此 CLI 示例可以直接映射到应用内的 `PRAGMA graft_*` 调用。
+`graft` CLI 是 repository control plane，用于本地开发、脚本、应用集成和手动
+仓库操作。它直接调用 repository service，不需要 SQLite 扩展或 repository
+PRAGMA 作为传输层。
 
 ## 全局选项
 
@@ -24,7 +26,8 @@ graft sql --db data.sqlite "CREATE TABLE t(id INTEGER PRIMARY KEY); INSERT INTO 
 cat script.sql | graft sql --db data.sqlite
 ```
 
-`graft sql` 会通过内置 Graft VFS 打开数据库。这是在本地使用 Graft 最简单的方式，不需要手动加载 SQLite 扩展。
+`graft sql` 使用普通 SQLite 连接打开 worktree 中的物理数据库文件。这是在本地
+使用 Graft 最简单的方式，不需要加载 SQLite 扩展。
 
 它要求显式 `--db` 路径和已存在的 `.graft/` 仓库。先在 worktree 里运行一次 `graft init`，再通过 CLI 创建或修改数据库。
 
@@ -116,12 +119,17 @@ graft export --source HEAD~1 --output data.previous.sqlite data.sqlite
 
 不传 `--source` 时，`graft export` 导出指定路径的当前 worktree database state。传 `--source` 时，它导出指定 revision 中保存的数据库 snapshot。输出文件是普通 SQLite 数据库，可以用标准工具打开。
 
-如果你用普通 SQLite 工具修改了 materialized 或 exported SQLite 文件，等写入方关闭并 checkpoint WAL 后，显式暂存这个物理文件：
+如果你用普通 SQLite 工具修改了 materialized 或 exported SQLite 文件，先提交
+SQLite transaction，再显式暂存这个物理文件：
 
 ```bash
-sqlite3 data.sqlite "PRAGMA wal_checkpoint(TRUNCATE);"
 graft add data.sqlite
 ```
+
+`graft add` 会通过 SQLite online backup 读取一致的 committed state，其中包括
+已提交的 WAL frames，不需要手动 checkpoint，也不会修改源数据库。它再按 4 KiB
+page 与 staged/HEAD 基线比较，只写入变化的 pages。未提交 transaction 不会进入
+Graft snapshot。
 
 ## Branches And Tags
 

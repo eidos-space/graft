@@ -50,19 +50,19 @@ Graft volume after export.
 You can inspect exported or materialized files with tools such as `sqlite3`, DB
 Browser for SQLite, Datasette, or app-specific debuggers.
 
-If you edit a tracked materialized file directly, close the writer, checkpoint
-WAL data if needed, and stage the path:
+If you edit a tracked materialized file, commit the transaction and stage the
+path:
 
 ```bash
 sqlite3 data.sqlite "INSERT INTO notes(body) VALUES ('external edit');"
-sqlite3 data.sqlite "PRAGMA wal_checkpoint(TRUNCATE);"
 graft add data.sqlite
 graft commit -m "import external edit"
 ```
 
-For application code, prefer writing through `graft sql --db` or a SQLite
-connection opened with `vfs=graft`. That keeps Graft's current snapshot state
-in sync with SQLite writes.
+`graft add` includes committed WAL frames without checkpointing the source and
+stores only pages that differ from the staged or committed base. Application
+code can therefore use its normal SQLite connection. Use `vfs=graft` only when
+the application deliberately chooses the optional live Volume mode.
 
 ## Disable Materialization
 

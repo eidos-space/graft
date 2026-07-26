@@ -4,19 +4,21 @@ description: How the Graft core, SQLite integration, CLI, repository layer, and 
 ---
 
 This page is for contributors and advanced debugging. Product integrations
-should normally use the CLI, SQLite PRAGMAs, JSON output, and config reference.
+should normally use the CLI, JSON output, and config reference. The SQLite
+extension is an optional data-plane integration.
 
 ## Layers
 
 ```text
 Application
-  SQLite connection using vfs=graft
-  or graft CLI
+  ordinary SQLite connection -> physical worktree database
+  optional SQLite connection using vfs=graft
+  graft CLI / JSON
 
 graft-sqlite
-  VFS
-  PRAGMA parser
-  repository command adapters
+  repository command service (control plane)
+  physical SQLite snapshot/import boundary
+  optional VFS + VFS diagnostic PRAGMAs (data plane)
 
 graft
   repository model
@@ -33,7 +35,7 @@ Remote storage
 | Crate | Role |
 | --- | --- |
 | `graft` | Core storage, repository objects, refs, index, merge, sync, remotes. |
-| `graft-sqlite` | SQLite VFS and repository PRAGMA implementation. |
+| `graft-sqlite` | Repository command service, physical SQLite import boundary, and optional SQLite VFS. |
 | `graft-ext` | Dynamic/static SQLite extension wrapper. |
 | `graft-tool` | CLI that maps arguments to repository operations. |
 | `graft-test` | Integration test harnesses and workloads. |
@@ -41,28 +43,32 @@ Remote storage
 
 ## CLI Flow
 
-Most CLI repository commands are thin wrappers around repository pragmas:
+CLI repository commands call the typed repository service directly:
 
 ```text
-graft status             -> PRAGMA graft_status
-graft add --all          -> PRAGMA graft_add = '--all'
-graft commit -m "msg"    -> PRAGMA graft_commit = 'msg'
-graft diff --rows ...    -> PRAGMA graft_diff = '--rows ...'
+CLI arguments
+  -> RepositoryCommand parser
+  -> repository-scoped runtime/session
+  -> repository operation
 ```
 
-`graft sql --db <path>` opens the database through the embedded Graft VFS and
-executes SQL directly.
+No SQLite connection or PRAGMA is used for that control flow. `graft sql --db
+<path>` separately opens the physical database with ordinary SQLite.
 
 ## Commit Flow
 
 ```text
-SQLite writes through Graft VFS
-  -> current database state advances
-  -> graft add records snapshot/artifact entries in the index
+SQLite commits to a physical database (main file and possibly WAL)
+  -> graft add takes a consistent private SQLite backup
+  -> unchanged pages are reused and changed pages extend Graft storage
+  -> the index records the resulting snapshot descriptor
   -> graft commit writes a tree and commit object
   -> branch ref moves to the new commit
-  -> SQLite snapshots may be materialized back to worktree files
+  -> SQLite snapshots are materialized back to physical worktree files
 ```
+
+The optional Graft VFS skips the physical import step because SQLite writes
+Volume pages directly. It does not expose repository commands.
 
 For file artifacts, staging records inline blobs or external payload pointers.
 
@@ -71,11 +77,13 @@ For file artifacts, staging records inline blobs or external payload pointers.
 ```text
 resolve target commit
   -> compare target tree to current worktree/index state
+  -> acquire SQLite replacement locks and normalize/remove WAL sidecars
   -> materialize tracked SQLite snapshots and files
   -> update HEAD or branch
 ```
 
 Conflicting local work blocks checkout unless the command is explicitly forced.
+An active SQLite writer also blocks physical database replacement.
 
 ## Merge Flow
 

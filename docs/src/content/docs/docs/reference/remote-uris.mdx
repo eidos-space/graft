@@ -11,7 +11,8 @@ graft remote add origin <uri>
 graft remote set-url origin <uri>
 ```
 
-SQLite applications can use the matching remote pragmas.
+Embedded applications can run the same CLI commands and consume `--json`
+output. Remote configuration is not exposed as SQLite PRAGMAs.
 
 ## URI Shapes
 
@@ -22,8 +23,9 @@ SQLite applications can use the matching remote pragmas.
 | `s3://bucket/prefix` | AWS S3-style object storage. |
 | `s3_compatible://bucket/prefix` | S3-compatible storage such as R2 or MinIO. |
 | `s3_compatible://bucket/prefix?endpoint=https://...` | S3-compatible storage with a custom endpoint. |
-| `graft+https://host/api/graft/v1/repos/org/space` | Graft HTTP remote protocol. |
-| `graft+http://127.0.0.1:8787/api/graft/v1/repos/org/space` | Local HTTP remote development. |
+| `https://host/org/space` | Canonical Git-style Graft remote service URL. |
+| `graft+https://host/org/space` | Explicit Graft-over-HTTPS alias. |
+| `graft+http://127.0.0.1:8787/org/space` | Local HTTP remote development. |
 
 ## Filesystem
 
@@ -54,19 +56,22 @@ put access keys, secret keys, or region in the URI query string.
 
 ```bash
 export GRAFT_REMOTE_TOKEN='grt_...'
-graft remote add origin 'graft+https://example.com/api/graft/v1/repos/acme/archive'
+graft remote add origin 'https://example.com/acme/archive'
 ```
+
+Both forms select the same Graft remote service protocol. The explicit
+`graft+https` form remains available for compatibility.
 
 The default token environment variable is `GRAFT_REMOTE_TOKEN`. Use `token_env`
 to choose a different variable:
 
 ```bash
 export GRAFT_ARCHIVE_TOKEN='grt_...'
-graft remote add origin 'graft+https://example.com/api/graft/v1/repos/acme/archive?token_env=GRAFT_ARCHIVE_TOKEN'
+graft remote add origin 'https://example.com/acme/archive?token_env=GRAFT_ARCHIVE_TOKEN'
 ```
 
 HTTP remotes send the token as a bearer token. The server must implement the
-Graft HTTP remote protocol.
+[Remote Service Protocol](/docs/reference/remote-protocol/).
 
 ## Stored Config Examples
 
@@ -95,7 +100,7 @@ HTTP:
 ```toml
 [remotes.origin]
 type = "http"
-url = "https://example.com/api/graft/v1/repos/acme/archive"
+url = "https://example.com/acme/archive"
 token_env = "GRAFT_REMOTE_TOKEN"
 ```
 

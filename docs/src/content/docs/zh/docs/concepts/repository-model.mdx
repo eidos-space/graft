@@ -28,8 +28,9 @@ attachments/report.pdf
 settings.json
 ```
 
-通过 `graft sql --db data.sqlite` 或 `vfs=graft` 打开数据库时，Graft 会把
-绝对路径映射回 `data.sqlite`。
+`graft sql --db data.sqlite` 和其他 SQLite client 一样打开物理文件。
+repository command 会把绝对路径映射回 `data.sqlite`。可选的 `vfs=graft` 模式
+改为把 live pages 存入 Graft Volume，但保持相同的 repository path identity。
 
 ## Index
 
@@ -43,6 +44,10 @@ graft commit -m "save state"
 ```
 
 merge conflict 的 base/ours/theirs stages 也存放在 index 中。
+
+对于物理数据库，`graft add` 通过 SQLite 取得一致 backup，再逐个比较 4 KiB page
+和当前 index 或 `HEAD`。未变化的 page 继续引用原 snapshot，只有变化 page 扩展
+storage history。
 
 ## Commits、Trees、Refs
 

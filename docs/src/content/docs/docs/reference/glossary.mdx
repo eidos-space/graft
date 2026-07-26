@@ -25,8 +25,10 @@ binary files and configured external paths.
 
 ## Graft VFS
 
-The SQLite virtual file system registered by the Graft extension. Opening a
-database through this VFS lets Graft track SQLite snapshots.
+The optional SQLite virtual file system registered by the Graft extension. It
+writes live database pages directly to a Graft Volume. It is a data-plane mode,
+not the repository command API; the default worktree uses ordinary SQLite
+files.
 
 ## Index
 
@@ -47,7 +49,7 @@ worktree.
 
 A named storage backend for repository objects, refs, SQLite storage, and
 external payloads. Examples include `fs://`, `s3_compatible://`, and
-`graft+https://`.
+`https://` (or the explicit `graft+https://` compatibility form).
 
 ## Repository
 

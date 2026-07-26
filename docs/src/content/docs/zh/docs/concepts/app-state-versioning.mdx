@@ -71,4 +71,5 @@ SQLite 仍负责 transaction atomicity。SQLite transaction 成功后，只有�
 | `inline` | 小文本字节直接存入 object database。 |
 | `external` | 大文件或二进制 payload 按 content hash 存放。 |
 
-CLI 和 SQLite PRAGMA 都操作同一套 repository model。
+CLI 直接操作这套 repository model。普通 SQLite 连接只负责读写 worktree
+数据库；需要 live page-storage 时，才选择可选的 Graft VFS。

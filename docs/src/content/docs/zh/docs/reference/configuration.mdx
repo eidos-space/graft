@@ -34,21 +34,15 @@ remote = "origin"
 merge = "refs/heads/main"
 ```
 
-应用通常应该通过 PRAGMA 或 CLI 命令更新配置，而不是手动编辑：
+应用通常应该通过 CLI 命令更新配置，而不是手动编辑：
 
 ```bash
 graft remote add origin fs:///srv/graft/app
 graft branch --set-upstream-to origin/main main
 ```
 
-SQLite 应用可以用 `graft_json_config_get` 和 `graft_json_config_list` 读取结构化
-config entry。`graft_json_config_get` 会在可用时返回 `current_head` 和
-`current_branch`，并和请求的 `key`、`value` 放在同一个对象里；
-`graft_json_config_list` 默认仍保留 legacy entry array。传 `--with-status`
-时，`graft_json_config_list` 会返回 `current_head`、`current_branch` 和
-`entries` 数组。`graft_json_config_set` 和 `graft_json_config_unset` 会返回
-`operation`、可用时的操作后 `current_head` 和 `current_branch`，以及包含
-`key`、`value` 的 `entry` 对象。
+嵌入式应用可以使用 `graft config ... --json` 读取或修改结构化配置，而不必解析
+终端文本。
 
 ## Merge Policy
 
@@ -150,7 +144,12 @@ fs:///absolute/path
 s3://bucket/prefix
 s3_compatible://bucket/prefix
 s3_compatible://bucket/prefix?endpoint=https://account.r2.cloudflarestorage.com
+https://host/namespace/repository
+graft+https://host/namespace/repository
 ```
+
+Graft remote service 使用 Git 风格的 `https://host/namespace/repository`。
+`graft+https` 是显式兼容 alias；`graft+http` 只用于本地或可信开发环境。
 
 `memory` 适合测试，`fs://` 适合本地目录或挂载目录，`s3://` 和 `s3_compatible://` 适合对象存储。Cloudflare R2、MinIO 这类 S3-compatible 服务通常需要显式的 `endpoint` query 参数。
 

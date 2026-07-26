@@ -79,10 +79,8 @@ graft add --all
 graft commit -m "seed notes"
 ```
 
-应用进程通常通过 SQLite 扩展集成：
+应用可以调用带 `--json` 的 CLI，直接消费结构化 status、diff、conflict 和 sync
+结果。SQLite 仍是普通物理 worktree 文件，现有数据库 library 不需要自定义 VFS。
 
-```sql
-PRAGMA graft_json_status;
-PRAGMA graft_add = '--all';
-PRAGMA graft_commit = 'save checkpoint';
-```
+SQLite extension 是可选项：它为明确需要 live page storage 的应用提供 Graft VFS，
+以及 version 和低层 debug PRAGMA。repository 操作仍然属于 CLI control plane。

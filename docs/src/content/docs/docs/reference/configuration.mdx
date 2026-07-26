@@ -34,21 +34,15 @@ remote = "origin"
 merge = "refs/heads/main"
 ```
 
-Applications should normally update config through pragmas or CLI commands instead of editing it by hand:
+Applications should normally update config through CLI commands instead of editing it by hand:
 
 ```bash
 graft remote add origin fs:///srv/graft/app
 graft branch --set-upstream-to origin/main main
 ```
 
-SQLite applications can use `graft_json_config_get` and `graft_json_config_list`
-to read structured config entries. `graft_json_config_get` returns
-`current_head` and `current_branch` when available alongside the requested
-`key` and `value`; `graft_json_config_list` preserves its legacy entry array by
-default. With `--with-status`, `graft_json_config_list` returns `current_head`,
-`current_branch`, and an `entries` array. `graft_json_config_set` and
-`graft_json_config_unset` return `operation`, post-operation `current_head` and
-`current_branch` when available, and an `entry` object with `key` and `value`.
+Embedded applications can use `graft config ... --json` to read or update
+structured config entries without parsing terminal text.
 
 ## Merge Policy
 
@@ -158,9 +152,15 @@ fs:///absolute/path
 s3://bucket/prefix
 s3_compatible://bucket/prefix
 s3_compatible://bucket/prefix?endpoint=https://account.r2.cloudflarestorage.com
+https://host/namespace/repository
+graft+https://host/namespace/repository
 ```
 
 Use `memory` for tests, `fs://` for a local or mounted directory, and `s3://` or `s3_compatible://` for object storage. S3-compatible services such as Cloudflare R2 and MinIO usually need an explicit `endpoint` query parameter.
+
+Use the Git-style `https://host/namespace/repository` form for a Graft remote
+service. `graft+https` is an explicit compatibility alias; `graft+http` is
+available for local or trusted development only.
 
 The exact remote type is stored in `.graft/config.toml` after parsing. For example:
 

@@ -30,9 +30,10 @@ attachments/report.pdf
 settings.json
 ```
 
-When a database is opened through `graft sql --db data.sqlite` or
-`vfs=graft`, Graft maps the absolute file path back to the repo-relative path
-`data.sqlite`.
+`graft sql --db data.sqlite` opens the same physical file as any other SQLite
+client. Repository commands map that absolute path back to the repo-relative
+path `data.sqlite`. The optional `vfs=graft` mode stores live pages in a Graft
+Volume instead, but keeps the same repository path identity.
 
 ## Index
 
@@ -47,6 +48,10 @@ graft commit -m "save state"
 ```
 
 The index is also where unresolved merge stages are stored.
+
+For a physical database, `graft add` asks SQLite for a consistent backup and
+compares its 4 KiB pages with the current index or `HEAD`. Unchanged pages stay
+referenced by the existing snapshot; only changed pages extend storage history.
 
 ## Commits And Trees
 

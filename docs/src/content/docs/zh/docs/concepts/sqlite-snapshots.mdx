@@ -19,7 +19,7 @@ project/
 `data.sqlite` 是 worktree path；commit 里保存的是 `.graft/` 支撑的 snapshot
 descriptor。
 
-## 通过 Graft 写入
+## 物理 Worktree 模式
 
 ```bash
 graft sql --db data.sqlite "INSERT INTO notes(body) VALUES ('hello');"
@@ -27,8 +27,15 @@ graft add data.sqlite
 graft commit -m "add note"
 ```
 
-通过 `graft sql` 或 `vfs=graft` 写入时，SQLite transaction 会推进当前
-Graft database state。stage 和 commit 后，它才成为 repository history。
+SQL transaction 修改 `data.sqlite`，以及可能存在的 WAL；此时不会直接写 Graft
+storage。`graft add` 才是 storage boundary：它通过 SQLite online backup 捕获一个
+committed database state，包含 committed WAL frames，但不会 checkpoint 或修改
+源数据库。private snapshot 会被规范化为 standalone rollback-journal database。
+
+随后 Graft 将每个 4 KiB page 与 staged 或 committed base 比较，只追加变化 page。
+如果没有变化，会复用原 `CommitFileState` 和 snapshot，不产生新的 storage commit。
+rollback-journal database 使用同一流程，只是通常没有 WAL。未提交 transaction 不会
+进入 staged state。
 
 ## Materialized Files
 
@@ -49,3 +56,18 @@ graft export --source HEAD --output data.head.sqlite data.sqlite
 ```
 
 `graft export` 不移动 `HEAD`，不修改 index，也不把导出文件连接到当前 Graft volume。
+
+## Checkout Safety
+
+checkout、switch、restore 或 reset 需要替换物理 database 时，Graft 会取得 SQLite
+exclusive lock、处理旧 WAL、清理 sidecar，再执行 atomic rename。如果其他 writer
+仍然活跃，操作会失败而不是从它下面替换 main file。执行 branch operation 前应关闭
+长时间存在的 database connection。
+
+## 可选 Live VFS 模式
+
+应用明确需要 SQLite commit 直接推进 Graft Volume 时，可以加载 extension 并使用
+`vfs=graft`。这是高级 data-plane 模式，不是 repository control plane；status、
+stage、history、merge 和 sync 仍使用 CLI。
+
+不要让同一个逻辑 database 同时接受普通 file VFS 和 Graft VFS 的写入。

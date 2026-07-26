@@ -17,7 +17,7 @@ row-aware diff、merge 和 remote sync。
   `checkout`、`restore`、`export`、`reset`、`branch`、`switch`、`tag`、
   `merge`、`conflicts`、`resolve`、`remote`、`ls-remote`、`fetch`、`pull`
   和 `push`。
-- SQLite 扩展：通过 `PRAGMA graft_*` 暴露仓库操作。
+- SQLite 扩展：提供可选 Graft VFS、version 和低层 `graft_debug_*` diagnostics。
 - `.graft/` 下的项目本地仓库状态。
 - 一个 worktree 中跟踪多个 SQLite 数据库路径。
 - 与 SQLite snapshot 在同一个 commit tree 中的 text/binary file artifact。
@@ -29,8 +29,8 @@ row-aware diff、merge 和 remote sync。
 
 ## 稳定性边界
 
-面向外部的主要表面是 repository-mode CLI、SQLite repository PRAGMA、配置项
-和 JSON 输出。项目实验阶段这些仍可能变化，但文档围绕这些表面组织。
+面向外部的主要表面是 repository-mode CLI、配置项和 JSON 输出。项目实验阶段
+这些仍可能变化，但文档围绕这些表面组织。
 
 以下内容属于实现细节：
 
@@ -41,6 +41,20 @@ row-aware diff、merge 和 remote sync。
 - Rust 内部模块边界
 
 Internals 文档用于贡献者和高级调试，不是产品级 API 保证。
+
+## SQLite Compatibility
+
+默认 worktree 使用普通 SQLite 文件。外部工具 commit transaction 后，直接运行
+`graft add` 即可；staging snapshot 会包含 committed WAL frames，不需要手动
+checkpoint。
+
+```bash
+sqlite3 data.sqlite "INSERT INTO notes(body) VALUES ('hello');"
+graft add data.sqlite
+```
+
+checkout、switch、restore 或 hard reset 需要替换数据库文件时，应先关闭相关
+connection。Graft 不会在另一个 writer 活跃时覆盖数据库。
 
 ## Release
 

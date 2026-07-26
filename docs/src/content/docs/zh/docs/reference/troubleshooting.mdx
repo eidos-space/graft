@@ -16,7 +16,7 @@ graft sql --db data.sqlite "SELECT 1;"
 
 ## 数据库没有出现在 status 中
 
-确保通过 Graft 写入，或显式 stage 物理文件：
+确保 SQLite transaction 已提交，再显式 stage 物理文件：
 
 ```bash
 graft sql --db data.sqlite "INSERT INTO notes(body) VALUES ('hello');"
@@ -26,9 +26,18 @@ graft status
 外部 SQLite 工具修改后：
 
 ```bash
-sqlite3 data.sqlite "PRAGMA wal_checkpoint(TRUNCATE);"
+sqlite3 data.sqlite "INSERT INTO notes(body) VALUES ('hello');"
 graft add data.sqlite
 ```
+
+`graft add` 会捕获已提交的 WAL frames，不需要手动 checkpoint。未提交的
+transaction 不属于可暂存状态。
+
+## checkout 或 switch 提示数据库正忙
+
+Graft 在替换物理 SQLite 文件前会取得 SQLite 锁、处理 WAL sidecars，并拒绝覆盖
+仍有 active writer 的数据库。先提交或回滚 transaction，关闭写连接，再重试
+checkout、switch、restore、pull 或 merge-continue。
 
 ## 文件被 external 存储
 

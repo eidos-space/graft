@@ -114,13 +114,17 @@ graft commit -m "stop tracking report"
 
 ## External SQLite Edits
 
-If a standard SQLite tool edits a materialized database file directly, close the
-writer, checkpoint WAL if needed, then stage the path:
+Normal SQLite tools are the default way to edit a physical worktree database.
+Commit the transaction, then stage the path:
 
 ```bash
-sqlite3 data.sqlite "PRAGMA wal_checkpoint(TRUNCATE);"
+sqlite3 data.sqlite "INSERT INTO notes(body) VALUES ('hello');"
 graft add data.sqlite
 ```
 
-Writing through `graft sql --db data.sqlite` or `vfs=graft` keeps Graft aware
-of the database snapshot immediately.
+`graft add` captures committed WAL frames through SQLite's online backup API;
+manual checkpointing is unnecessary. It compares the consistent snapshot with
+the staged or committed base and writes only changed 4 KiB pages.
+
+The optional `vfs=graft` mode advances live Graft Volume pages directly. Do not
+mix normal-file writes and Graft-VFS writes for the same logical database.

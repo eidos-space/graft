@@ -38,16 +38,20 @@ graft export --source HEAD~1 --output data.previous.sqlite data.sqlite
 
 ## 使用外部 SQLite 工具
 
-如果直接编辑 tracked materialized file，关闭 writer 后 checkpoint WAL 并 stage：
+普通 SQLite 连接是默认写入方式。提交 SQLite transaction 后直接 stage：
 
 ```bash
 sqlite3 data.sqlite "INSERT INTO notes(body) VALUES ('external edit');"
-sqlite3 data.sqlite "PRAGMA wal_checkpoint(TRUNCATE);"
 graft add data.sqlite
 graft commit -m "import external edit"
 ```
 
-应用代码更推荐通过 `graft sql --db` 或 `vfs=graft` 连接写入。
+`graft add` 使用 SQLite online backup 捕获一致的 committed state，包括已提交的
+WAL frames，不需要手动 checkpoint，也不会修改源数据库。随后它只把相对
+staged/HEAD 基线发生变化的 4 KiB pages 写入 Graft storage。
+
+需要 live page-storage 时可以显式选择 `vfs=graft`，但它是可选数据面，不承载
+repository 命令。
 
 ## 禁用 Materialization
 

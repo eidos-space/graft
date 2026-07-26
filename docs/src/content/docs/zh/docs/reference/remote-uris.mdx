@@ -19,7 +19,9 @@ graft remote set-url origin <uri>
 | `s3://bucket/prefix` | AWS S3-style object storage。 |
 | `s3_compatible://bucket/prefix` | R2、MinIO 等 S3-compatible storage。 |
 | `s3_compatible://bucket/prefix?endpoint=https://...` | 带自定义 endpoint 的 S3-compatible storage。 |
-| `graft+https://host/api/graft/v1/repos/org/space` | Graft HTTP remote protocol。 |
+| `https://host/org/space` | 规范的 Git 风格 Graft remote service URL。 |
+| `graft+https://host/org/space` | 显式 Graft-over-HTTPS 兼容形式。 |
+| `graft+http://127.0.0.1:8787/org/space` | 本地 HTTP remote 开发。 |
 
 ## S3-Compatible
 
@@ -40,14 +42,18 @@ AWS config files。
 
 ```bash
 export GRAFT_REMOTE_TOKEN='grt_...'
-graft remote add origin 'graft+https://example.com/api/graft/v1/repos/acme/archive'
+graft remote add origin 'https://example.com/acme/archive'
 ```
+
+`graft+https://example.com/acme/archive` 仍作为兼容 alias 接受，两种形式使用同一
+remote service protocol。
 
 自定义 token 环境变量：
 
 ```bash
 export GRAFT_ARCHIVE_TOKEN='grt_...'
-graft remote add origin 'graft+https://example.com/api/graft/v1/repos/acme/archive?token_env=GRAFT_ARCHIVE_TOKEN'
+graft remote add origin 'https://example.com/acme/archive?token_env=GRAFT_ARCHIVE_TOKEN'
 ```
 
-HTTP remote 以 bearer token 发送访问密钥。
+HTTP remote 以 bearer token 发送访问密钥。wire contract 见
+[Remote Service 协议](/zh/docs/reference/remote-protocol/)。

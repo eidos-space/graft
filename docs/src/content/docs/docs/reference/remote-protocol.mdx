@@ -1,0 +1,274 @@
+---
+title: Remote Service Protocol
+description: Implementation-independent specification for Graft HTTP remote services.
+---
+
+This document specifies version 1 of the Graft remote service protocol. It is an
+interoperability contract between Graft clients and remote services; it does not
+prescribe a programming language, hosting platform, database, or object store.
+
+The key words **MUST**, **MUST NOT**, **REQUIRED**, **SHOULD**, **SHOULD NOT**,
+and **MAY** are to be interpreted as described by
+[BCP 14](https://www.rfc-editor.org/rfc/rfc8174).
+
+## Repository URLs
+
+The canonical, Git-style repository URL is:
+
+```text
+https://host/<namespace>/<repository>
+```
+
+Clients MUST also accept the explicit transport form:
+
+```text
+graft+https://host/<namespace>/<repository>
+```
+
+`graft+https` selects this protocol but uses HTTPS on the wire. Clients MAY
+accept `graft+http` for local development or trusted networks. Production
+services SHOULD use HTTPS.
+
+The repository path is the protocol base URL. It is opaque to the client and
+MAY contain more than two segments when a service needs a different tenancy
+model. User-facing URLs SHOULD keep the familiar `<namespace>/<repository>`
+shape and MUST NOT expose an internal `/api/...` route or protocol version.
+
+The optional `token_env` query parameter is client-local configuration:
+
+```text
+https://host/acme/archive?token_env=GRAFT_ARCHIVE_TOKEN
+```
+
+The client MUST remove `token_env` before making requests. Tokens MUST NOT be
+placed directly in a repository URL. Version 1 repository URLs MUST NOT contain
+userinfo, fragments, or any other query parameter.
+
+To derive the HTTP base URL, a client removes the `graft+` prefix, removes the
+client-local query, and removes one trailing slash. For example:
+
+```text
+graft+https://host/acme/archive?token_env=GRAFT_ARCHIVE_TOKEN
+-> https://host/acme/archive
+```
+
+## Protocol Version
+
+Every protocol request MUST contain:
+
+```http
+Graft-Protocol: 1
+```
+
+Every response, including an error response, MUST echo the supported version in
+the same header. A service that cannot serve the requested version SHOULD
+return `426 Upgrade Required` and advertise its version in `Graft-Protocol`.
+The version belongs in negotiation metadata, not in the repository URL.
+
+## Authentication
+
+A service MAY require authorization. Version 1 clients support bearer tokens:
+
+```http
+Authorization: Bearer <token>
+```
+
+The default client environment variable is `GRAFT_REMOTE_TOKEN`; `token_env`
+selects another variable. A missing or invalid credential SHOULD return `401`
+with an appropriate `WWW-Authenticate` header. Authorization policy, token
+issuance, tenancy, and ACL storage are service concerns outside this protocol.
+
+## Repository Descriptor
+
+`GET {base}` returns a descriptor for diagnostics and capability discovery:
+
+```json
+{
+  "protocol": "graft-remote",
+  "version": 1,
+  "capabilities": ["range", "list", "put-if-absent", "cas", "cad"]
+}
+```
+
+The descriptor MAY include additional fields. Clients MUST ignore unknown
+fields.
+
+## Object Keys
+
+Operations address opaque, repository-relative object keys. Known version 1
+keys include:
+
+```text
+HEAD
+refs/heads/<branch>
+objects/<fanout>/<object-id>
+objects/pack/<pack-id>.pack
+objects/pack/<pack-id>.idx
+store/files/<fanout>/<object-id>
+logs/<log-id>/commits/<lsn>
+segments/<segment-id>
+```
+
+`HEAD` and `refs/**` are transactional metadata. Content below `objects/**`,
+`store/**`, `logs/**`, and `segments/**` is immutable after creation.
+`locks/**` is reserved and MUST NOT be exposed as repository data.
+
+Each key segment is UTF-8 and is percent-encoded independently. `/` separates
+segments and MUST NOT be percent-encoded as data. Empty segments, `.`, `..`,
+backslashes, NUL, control characters, and invalid percent encodings MUST be
+rejected. A service MAY impose documented key and body limits and return `413`
+or `414` when they are exceeded.
+
+## Operations
+
+All paths below are relative to `{base}`.
+
+| Request | Purpose | Success |
+| --- | --- | --- |
+| `HEAD /raw/<key>` | Test existence and obtain size metadata. | `200 OK` |
+| `GET /raw/<key>` | Read raw bytes. | `200 OK` |
+| `PUT /raw/<key>` | Replace transactional metadata. | `204 No Content` |
+| `DELETE /raw/<key>` | Delete transactional metadata. | `204 No Content` |
+| `PUT /raw-if-not-exists/<key>` | Create an object only when absent. | `204 No Content` |
+| `POST /cas/<key>` | Atomically compare and replace metadata. | `204 No Content` |
+| `POST /cad/<key>` | Atomically compare and delete metadata. | `204 No Content` |
+| `GET /list?prefix=<prefix>` | Recursively list matching keys. | `200 OK` |
+
+Request bodies for `PUT` and `POST /cas` are the new raw bytes and SHOULD use
+`application/octet-stream`. Successful mutation responses have no body.
+A successful `HEAD` response MUST include the byte length that a corresponding
+full `GET` would return in `Content-Length`.
+
+Services MUST support `raw-if-not-exists` for immutable objects. A service
+SHOULD reject unconditional overwrite or deletion of immutable objects. Graft
+publishes data in this order: immutable objects first, pack index after its
+pack, and the ref CAS last. A failed ref update can therefore leave unreachable
+objects but cannot expose an incomplete commit.
+
+Deleting an already absent key through `DELETE /raw` SHOULD succeed so the
+operation remains idempotent.
+
+## Compare Operations
+
+`POST /cas` and `POST /cad` carry the expected value in two headers:
+
+```http
+x-graft-expected-present: true
+x-graft-expected-hex: 6162630a
+```
+
+- `x-graft-expected-present: false` means that the key is expected to be absent;
+  `x-graft-expected-hex` MUST then be present and empty.
+- `x-graft-expected-present: true` means that the current bytes MUST exactly
+  equal the lowercase hexadecimal value. An empty hexadecimal value represents
+  a present, zero-length object and differs from absence.
+- `/cas` replaces the matched value with the request body.
+- `/cad` deletes the matched value and has no request body.
+
+The comparison and mutation MUST be a single atomic operation with respect to
+all clients of the repository. CAS and CAD are REQUIRED for `HEAD` and
+`refs/**`; a service MAY reject them for immutable keys.
+
+## Range Reads
+
+`GET /raw/<key>` MUST support one standard byte range:
+
+```http
+Range: bytes=1024-2047
+```
+
+A valid partial response returns `206 Partial Content`, `Content-Range`,
+`Content-Length`, and `Accept-Ranges: bytes`. An invalid, multiple, or
+unsatisfiable range returns `416 Range Not Satisfiable`. When the object exists,
+that response MUST include `Content-Range: bytes */<size>`. Services SHOULD
+stream large request and response bodies instead of buffering them.
+
+## Listing
+
+`prefix` is encoded as one query component, so a prefix such as `refs/heads/`
+is sent as `refs%2Fheads%2F`. A response page is JSON:
+
+```json
+{
+  "paths": [
+    "refs/heads/feature/search",
+    "refs/heads/main"
+  ],
+  "next_cursor": "opaque-service-value"
+}
+```
+
+Version 1 listing is recursive. A service MAY paginate a response to keep its
+work and memory bounded. When `next_cursor` is present, the client MUST request
+the next page by sending it unchanged as one encoded query component:
+
+```text
+GET /list?prefix=refs%2Fheads%2F&cursor=opaque-service-value
+```
+
+The cursor is opaque to clients. A client MUST NOT parse or construct one. A
+service MUST omit `next_cursor` only after it has returned the final page. The
+optional positive `limit` query parameter is a page-size hint; a service MAY
+clamp it to a smaller documented maximum or reject an out-of-range value with
+`400`. A service that returns the entire result in one page remains conforming,
+and a response without `next_cursor` remains compatible with early clients.
+
+Across a complete traversal, the service MUST return every matching key exactly
+once, using decoded repository-relative paths. Each page and the concatenated
+traversal MUST be sorted by ascending bytewise lexical order. Cursors MUST make
+forward progress and SHOULD expire only after a documented interval.
+
+## Status Codes
+
+| Status | Meaning |
+| --- | --- |
+| `200` | Complete read, descriptor, `HEAD`, or list response. |
+| `204` | Successful mutation. |
+| `206` | Successful byte-range read. |
+| `400` | Malformed path, query, header, or request. |
+| `401` / `403` | Missing credentials or insufficient authorization. |
+| `404` | Repository or object is missing. |
+| `405` | The operation is not allowed for that key. |
+| `409` | CAS or CAD expected bytes did not match. |
+| `412` | `raw-if-not-exists` found an existing object. |
+| `413` / `414` | Service body or key limit exceeded. |
+| `416` | Invalid or unsatisfiable byte range. |
+| `423` | Optional transient lock contention in a locking implementation. |
+| `426` | Unsupported `Graft-Protocol` version. |
+| `429` | Service rate limit; clients may retry with backoff. |
+| `500` / `503` | Server failure or unavailable service configuration. |
+
+`409` and `412` are intentionally different: clients interpret `409` as a
+concurrent ref change and `412` as a create-only collision.
+
+Errors SHOULD use `application/problem+json`. Clients MUST rely on the status
+code and MUST NOT require a particular error-body schema.
+
+## Consistency and Durability
+
+A conforming service MUST provide:
+
+- durable read-after-write storage for successful mutations;
+- create-only atomicity for `raw-if-not-exists`;
+- linearizable CAS and CAD for each transactional key;
+- repository isolation, so one repository cannot read or mutate another;
+- byte-preserving reads and writes;
+- in the absence of concurrent mutations, a complete list traversal in which
+  every write matching the prefix that completed before the first page is
+  visible.
+
+The service MAY store transactional metadata and immutable bytes in different
+systems. These requirements describe observable behavior, not implementation.
+
+## Compatibility
+
+Early documentation used URLs such as:
+
+```text
+graft+https://host/api/graft/v1/repos/acme/archive
+```
+
+Services MAY retain that path as a compatibility alias, but new configuration
+SHOULD use `https://host/acme/archive` (or the explicit `graft+https` form).
+Clients MUST treat the configured repository base as opaque and MUST NOT insert
+the legacy `/api/graft/v1/repos` prefix themselves.

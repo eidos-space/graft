@@ -90,12 +90,10 @@ graft add --all
 graft commit -m "seed notes"
 ```
 
-Applications usually integrate through the SQLite extension:
+Applications can invoke the same CLI with `--json` and consume structured
+status, diff, conflict, and sync results. SQLite itself remains an ordinary
+physical worktree file, so existing database libraries need no custom VFS.
 
-```sql
-PRAGMA graft_json_status;
-PRAGMA graft_add = '--all';
-PRAGMA graft_commit = 'save checkpoint';
-```
-
-The CLI and extension share the same repository semantics.
+The SQLite extension is optional. It provides the Graft VFS for applications
+that deliberately want live page storage, plus version and low-level debug
+PRAGMAs. Repository operations remain in the CLI control plane.

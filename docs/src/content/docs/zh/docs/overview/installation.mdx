@@ -60,6 +60,9 @@ cargo build -p graft-ext --release
 .load ./libgraft_ext
 ```
 
+只有应用明确需要 Graft VFS 作为 live page-storage 数据面时才需要扩展。
+repository 命令不通过 SQLite PRAGMA 暴露；control plane 使用 CLI 及其 JSON 输出。
+
 ## 构建文档
 
 ```bash
@@ -68,5 +71,5 @@ pnpm install
 pnpm build
 ```
 
-下一步先跑 [CLI 快速开始](/zh/docs/quickstart/cli/)，然后看
-[SQLite 扩展快速开始](/zh/docs/quickstart/sqlite-extension/)。
+下一步先跑 [CLI 快速开始](/zh/docs/quickstart/cli/)。需要显式接入可选 Graft VFS
+时，再看 [SQLite 扩展快速开始](/zh/docs/quickstart/sqlite-extension/)。

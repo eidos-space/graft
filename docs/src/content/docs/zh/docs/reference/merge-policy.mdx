@@ -26,11 +26,11 @@ Repository merge 首先看到的是 file-level snapshots。对 modified SQLite �
 - 配置过的 SQLite 内部状态可以安全 resolver
 - 生成的临时数据库通过验证
 
-其他情况会保留为 conflict，交给 `graft_conflicts`、`graft_json_conflicts`、`graft_resolve` 或手动处理。
+其他情况会保留为 conflict，交给 `graft conflicts`、`graft resolve` 或手动处理。
 
 ## Logical Diff Status
 
-`graft diff --json --rows` 和 JSON PRAGMA 输出会包含粗粒度的 `logical_status`，这样应用不需要从 file-level `modified` 自己猜 row 语义。
+`graft diff --json --rows` 会包含粗粒度的 `logical_status`，这样应用不需要从 file-level `modified` 自己猜 row 语义。
 
 | Status | 含义 |
 | --- | --- |
@@ -201,7 +201,7 @@ apply policy 会出现在 conflict analysis JSON 中：
 
 ## Conflict Analysis
 
-`graft_json_status` 和 `graft_json_conflicts` 可以为冲突中的数据库文件包含 row merge analysis。
+`graft --db <path> conflicts --json` 可以为冲突中的数据库文件包含 row merge analysis。
 
 重要字段：
 
@@ -228,7 +228,8 @@ apply policy 会出现在 conflict analysis JSON 中：
 
 ## 实践建议
 
-构建普通 diff UI 时使用 `graft diff --json --rows`。构建 merge UI 时使用 `graft_json_status` 和 `graft_json_conflicts`。
+构建普通 diff UI 时使用 `graft diff --json --rows`。构建 merge UI 时使用
+`graft --db <path> conflicts --json`。
 
 这些状态应该区别展示：
 

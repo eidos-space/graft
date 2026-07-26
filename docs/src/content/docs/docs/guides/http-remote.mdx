@@ -1,14 +1,18 @@
 ---
 title: Connect An HTTP Remote
-description: Connect Graft v0.6.1 to a server that implements the Graft HTTP remote protocol.
+description: Connect Graft to a compatible remote service or deploy the Cloudflare reference service.
 ---
 
-Graft v0.6.1 includes an HTTP remote client. It can fetch and push repository
-objects through a service that implements the Graft HTTP remote protocol.
+Graft can fetch and push repository objects through a service that implements
+the Graft remote service protocol.
 
-Graft does **not** bundle or deploy that server. You need an existing compatible
-service or your own implementation of the protocol described in
-[HTTP Remote Protocol](/docs/internals/http-remote-protocol/).
+The wire contract is the implementation-independent
+[Remote Service Protocol](/docs/reference/remote-protocol/). This repository
+also ships the framework-neutral `@eidos.space/graft-remote` protocol engine,
+the `@eidos.space/graft-remote-hono` routing adapter, the reusable
+`@eidos.space/graft-remote-cloudflare` storage adapter, and a deployable
+[Cloudflare reference service](https://github.com/eidos-space/graft) under
+`services/graft-remote-cloudflare`; Graft does not deploy it automatically.
 
 ## Configure A Remote
 
@@ -17,18 +21,19 @@ Set the bearer token in the process environment, then add the remote:
 ```bash
 export GRAFT_REMOTE_TOKEN='grt_...'
 graft remote add origin \
-  'graft+https://example.com/api/graft/v1/repos/acme/archive'
+  'https://example.com/acme/archive'
 ```
 
-The `graft+https://` prefix selects the Graft HTTP transport. The underlying
-request URL uses normal HTTPS.
+The URL follows the same visible shape as a Git HTTPS remote. The explicit
+`graft+https://example.com/acme/archive` alias selects the same transport and
+remains supported for compatibility.
 
 Use `token_env` when the service token lives in a different variable:
 
 ```bash
 export GRAFT_ARCHIVE_TOKEN='grt_...'
 graft remote add origin \
-  'graft+https://example.com/api/graft/v1/repos/acme/archive?token_env=GRAFT_ARCHIVE_TOKEN'
+  'https://example.com/acme/archive?token_env=GRAFT_ARCHIVE_TOKEN'
 ```
 
 Do not put the token itself in the URI or `.graft/config.toml`.
@@ -47,7 +52,7 @@ On another worktree:
 
 ```bash
 graft clone \
-  'graft+https://example.com/api/graft/v1/repos/acme/archive' \
+  'https://example.com/acme/archive' \
   main
 ```
 
@@ -60,11 +65,25 @@ Use `graft+http://` only for a local server you control:
 ```bash
 export GRAFT_REMOTE_TOKEN='dev-token'
 graft remote add origin \
-  'graft+http://127.0.0.1:8787/api/graft/v1/repos/acme/archive'
+  'graft+http://127.0.0.1:8787/acme/archive'
 ```
 
 For production, use HTTPS and let the service enforce repository authorization,
 object integrity, request limits, and durable storage.
+
+## Deploy The Cloudflare Reference Service
+
+The verification service composes all three packages. The Cloudflare package
+provides authentication helpers, one SQLite Durable Object per repository for
+atomic refs, and R2 storage for immutable bytes. The service README contains
+bucket creation, secret configuration, local development, testing, and
+deployment commands.
+
+For Hono on another platform, install `@eidos.space/graft-remote-hono`, mount
+`createGraftRemote()`, and implement its storage, authentication, and
+authorization interfaces. Other frameworks can build a thin routing adapter on
+`@eidos.space/graft-remote`; the core package has no Hono or Cloudflare
+dependency.
 
 See [Remote URIs](/docs/reference/remote-uris/) for URI syntax and
 [Sync With Remotes](/docs/guides/sync-remotes/) for branch workflows.

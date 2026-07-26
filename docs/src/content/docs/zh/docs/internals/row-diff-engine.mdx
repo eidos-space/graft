@@ -14,12 +14,6 @@ graft diff --rows HEAD~1 HEAD data.sqlite
 graft diff --json --rows HEAD~1 HEAD data.sqlite
 ```
 
-SQLite：
-
-```sql
-PRAGMA graft_json_diff = '--rows HEAD~1 HEAD -- data.sqlite';
-```
-
 ## Debug Entry Points
 
 低层 storage diagnostics 可以比较 raw LSN：

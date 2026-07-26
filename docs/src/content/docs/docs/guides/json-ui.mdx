@@ -3,18 +3,14 @@ title: App UI From JSON
 description: Use Graft JSON output to build status panels, review screens, merge UIs, and payload views.
 ---
 
-Graft's CLI and SQLite extension expose JSON output so applications do not have
-to scrape terminal text. Use JSON for status badges, change review screens,
-merge conflict flows, sync progress, and payload cache views.
+Graft CLI commands expose JSON output so applications do not have to scrape
+terminal text. Use JSON for status badges, change review screens, merge
+conflict flows, sync progress, and payload cache views.
 
 ## Status Panel
 
 ```bash
 graft status --json
-```
-
-```sql
-PRAGMA graft_json_status;
 ```
 
 Useful fields:
@@ -51,10 +47,6 @@ graft diff --json
 graft diff --json --rows HEAD~1 HEAD data.sqlite
 ```
 
-```sql
-PRAGMA graft_json_diff = '--rows HEAD~1 HEAD -- data.sqlite';
-```
-
 Use the top-level `paths` array as the navigation model. Use SQLite row payloads
 inside database entries for detail panes.
 
@@ -63,11 +55,6 @@ inside database entries for detail panes.
 ```bash
 graft conflicts --json
 graft resolve --json --theirs --row docs 42 data.sqlite
-```
-
-```sql
-PRAGMA graft_json_conflicts;
-PRAGMA graft_json_resolve_conflict = '--theirs --row docs 42 data.sqlite';
 ```
 
 Render different controls by path type:

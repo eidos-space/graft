@@ -100,42 +100,37 @@ graft push
 Prebuilt CLI and SQLite extension archives are published on the
 [GitHub releases page](https://github.com/eidos-space/graft/releases).
 
-## Use From SQLite
+## Use With SQLite
 
-The Graft SQLite extension lets applications call repository operations through
-SQLite pragmas, which makes the workflow available from Electron, Node.js,
-Python, Ruby, Swift, and any runtime with native SQLite support.
+The default integration uses ordinary SQLite files. Electron, Node.js, Python,
+Ruby, Swift, Rust, and standard SQLite tools can open the worktree database
+without a custom VFS. After a transaction commits, stage the database with the
+CLI:
 
-```sql
-pragma graft_init;
-pragma graft_add = '--all';
-pragma graft_commit = 'Initial version';
-pragma graft_json_status;
-pragma graft_json_log;
-pragma graft_json_diff = '--rows HEAD';
-pragma graft_json_fetch;
-pragma graft_json_pull;
-pragma graft_json_push;
+```bash
+sqlite3 data.sqlite "INSERT INTO notes(id, body) VALUES ('1', 'hello')"
+graft add data.sqlite
+graft commit -m "Add first note"
 ```
 
-Conflict-oriented pragmas expose structured state for app UIs:
+`graft add` takes a consistent SQLite backup, including committed WAL frames,
+then compares it with the staged or committed snapshot. Only changed 4 KiB
+pages are written to Graft storage; an unchanged database creates no new
+storage commit.
 
-```sql
-pragma graft_json_conflicts;
-pragma graft_json_resolve_conflict = '--theirs assets/model.bin';
-pragma graft_json_resolve_conflict = '--theirs --row docs 42';
-pragma graft_merge_continue = 'Merge remote changes';
-pragma graft_merge_abort;
-```
+The SQLite extension remains available for applications that deliberately want
+the Graft VFS as a live page-storage data plane. It exposes version and
+`graft_debug_*` diagnostics, not repository commands. Use the CLI and its JSON
+output for status, staging, history, merge, and sync.
 
 ## Learn More
 
-- [CLI quickstart](./docs/src/content/docs/docs/get-started/cli.mdx)
-- [SQLite extension guide](./docs/src/content/docs/docs/get-started/sqlite-extension.mdx)
+- [CLI quickstart](./docs/src/content/docs/docs/quickstart/cli.mdx)
+- [SQLite extension guide](./docs/src/content/docs/docs/quickstart/sqlite-extension.mdx)
 - [App state versioning](./docs/src/content/docs/docs/concepts/app-state-versioning.mdx)
 - [Repository model](./docs/src/content/docs/docs/concepts/repository-model.mdx)
 - [CLI reference](./docs/src/content/docs/docs/reference/cli.mdx)
-- [Pragmas reference](./docs/src/content/docs/docs/reference/pragmas.mdx)
+- [VFS pragmas reference](./docs/src/content/docs/docs/reference/pragmas.mdx)
 - [Configuration reference](./docs/src/content/docs/docs/reference/configuration.mdx)
 
 ## Development
