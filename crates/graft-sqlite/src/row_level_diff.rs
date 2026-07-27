@@ -1910,13 +1910,7 @@ fn writable_column_values<'a>(
 
 /// Escape SQL identifier
 pub(crate) fn quote_identifier(id: &str) -> String {
-    if id.chars().all(|c| c.is_alphanumeric() || c == '_')
-        && !id.chars().next().unwrap().is_ascii_digit()
-    {
-        id.to_string()
-    } else {
-        format!("\"{}\"", id.replace('"', "\"\""))
-    }
+    format!("\"{}\"", id.replace('"', "\"\""))
 }
 
 #[cfg(test)]
@@ -1956,7 +1950,7 @@ mod tests {
         };
 
         let sql = diff.to_sql();
-        assert!(sql.contains("INSERT INTO users (rowid, name) VALUES (1, 'Alice')"));
+        assert!(sql.contains("INSERT INTO \"users\" (\"rowid\", \"name\") VALUES (1, 'Alice')"));
         assert!(sql.contains("'Alice'"));
         assert!(sql.contains("'Bob'"));
         assert!(sql.contains("COMMIT"));
@@ -1985,7 +1979,7 @@ mod tests {
         };
 
         let sql = diff.to_sql();
-        assert!(sql.contains("DELETE FROM users WHERE rowid = 1"));
+        assert!(sql.contains("DELETE FROM \"users\" WHERE rowid = 1"));
     }
 
     #[test]
@@ -2012,10 +2006,10 @@ mod tests {
         };
 
         let sql = diff.to_sql();
-        assert!(sql.contains("UPDATE users SET"));
+        assert!(sql.contains("UPDATE \"users\" SET"));
         assert!(sql.contains("'Alicia'"));
         assert!(sql.contains("rowid = 1"));
-        assert!(!sql.contains("SET id ="));
+        assert!(!sql.contains("SET \"id\" ="));
     }
 
     #[test]
@@ -2080,7 +2074,10 @@ mod tests {
             Some(7),
             &row,
         );
-        assert_eq!(sql, "INSERT INTO users (rowid, name) VALUES (7, 'test');");
+        assert_eq!(
+            sql,
+            "INSERT INTO \"users\" (\"rowid\", \"name\") VALUES (7, 'test');"
+        );
     }
 
     #[test]
@@ -2094,7 +2091,10 @@ mod tests {
             Some(7),
             &row,
         );
-        assert_eq!(sql, "INSERT INTO users (rowid, name) VALUES (7, 'test');");
+        assert_eq!(
+            sql,
+            "INSERT INTO \"users\" (\"rowid\", \"name\") VALUES (7, 'test');"
+        );
     }
 
     #[test]
@@ -2108,7 +2108,7 @@ mod tests {
             None,
             &row,
         );
-        assert_eq!(sql, "INSERT INTO users (name) VALUES ('test');");
+        assert_eq!(sql, "INSERT INTO \"users\" (\"name\") VALUES ('test');");
     }
 
     #[test]
@@ -2127,7 +2127,10 @@ mod tests {
             Some(1),
             &row,
         );
-        assert_eq!(sql, "INSERT INTO docs (rowid, body) VALUES (1, 'alpha');");
+        assert_eq!(
+            sql,
+            "INSERT INTO \"docs\" (\"rowid\", \"body\") VALUES (1, 'alpha');"
+        );
     }
 
     #[test]
@@ -2142,13 +2145,16 @@ mod tests {
             1,
             &row,
         );
-        assert_eq!(sql, "UPDATE docs SET body = 'alpha' WHERE rowid = 1;");
+        assert_eq!(
+            sql,
+            "UPDATE \"docs\" SET \"body\" = 'alpha' WHERE rowid = 1;"
+        );
     }
 
     #[test]
     fn test_sql_delete_format() {
         let sql = format_sql_delete("users", 42);
-        assert_eq!(sql, "DELETE FROM users WHERE rowid = 42;");
+        assert_eq!(sql, "DELETE FROM \"users\" WHERE rowid = 42;");
     }
 
     #[test]
@@ -2162,16 +2168,17 @@ mod tests {
             1,
             &row,
         );
-        assert!(sql.contains("UPDATE users SET"));
-        assert!(sql.contains("name = 'new_name'"));
-        assert!(!sql.contains("SET id ="));
+        assert!(sql.contains("UPDATE \"users\" SET"));
+        assert!(sql.contains("\"name\" = 'new_name'"));
+        assert!(!sql.contains("SET \"id\" ="));
     }
 
     #[test]
-    fn test_quote_identifier_simple() {
-        assert_eq!(quote_identifier("users"), "users");
-        assert_eq!(quote_identifier("my_table"), "my_table");
-        assert_eq!(quote_identifier("_col"), "_col");
+    fn test_quote_identifier_quotes_simple_names_and_keywords() {
+        assert_eq!(quote_identifier("users"), "\"users\"");
+        assert_eq!(quote_identifier("my_table"), "\"my_table\"");
+        assert_eq!(quote_identifier("_col"), "\"_col\"");
+        assert_eq!(quote_identifier("Table"), "\"Table\"");
     }
 
     #[test]

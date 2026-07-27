@@ -1209,13 +1209,7 @@ fn strip_leading_identifier(sql: &str) -> &str {
 }
 
 fn quote_identifier(id: &str) -> String {
-    if id.chars().all(|c| c.is_alphanumeric() || c == '_')
-        && !id.chars().next().unwrap_or('_').is_ascii_digit()
-    {
-        id.to_string()
-    } else {
-        format!("\"{}\"", id.replace('"', "\"\""))
-    }
+    crate::row_level_diff::quote_identifier(id)
 }
 
 fn semantic_change_key(

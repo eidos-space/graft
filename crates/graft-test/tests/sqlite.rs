@@ -12904,6 +12904,54 @@ fn test_repo_commit_summary_skips_fts_virtual_tables() {
     runtime.shutdown().unwrap();
 }
 
+#[test]
+fn test_repo_commit_summary_quotes_sql_keyword_identifiers() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("keyword-table.db");
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_path.to_str().unwrap(), None);
+
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE "Table" (
+              "key" TEXT PRIMARY KEY,
+              "select" TEXT NOT NULL
+            ) STRICT, WITHOUT ROWID;
+            INSERT INTO "Table" ("key", "select") VALUES ('one', 'keyword-safe');
+            "#,
+        )
+        .unwrap();
+
+    assert_eq!(
+        pragma_query_string(&sqlite, "graft_add"),
+        "Added keyword-table.db"
+    );
+    let commit: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_commit",
+        "keyword identifiers",
+    ))
+    .expect("keyword-named tables and columns should commit");
+
+    assert_eq!(commit["operation"], "commit");
+    assert_eq!(commit["commit"]["message"], "keyword identifiers");
+
+    let log: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_log"))
+        .expect("keyword-named table summary should be readable");
+    assert_eq!(
+        log[0]["tables"],
+        serde_json::json!([
+            { "name": "Table", "inserts": 1, "deletes": 0, "updates": 0 }
+        ])
+    );
+
+    runtime.shutdown().unwrap();
+}
+
 /// Test that VACUUM INTO can be used to import a non-graft `SQLite` database into Graft.
 /// This is the recommended way to import existing databases as documented at:
 /// <https://graft.rs/r/graft_import>
