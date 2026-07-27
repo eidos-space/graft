@@ -328,9 +328,41 @@ impl Repository {
 
     pub fn is_ignored_worktree_path(&self, path: impl AsRef<Path>) -> Result<bool> {
         let path = path.as_ref();
+        if self.is_internal_worktree_path(path) {
+            return Ok(true);
+        }
         let key = self.worktree_key_for_path(path)?;
         let is_dir = path.is_dir();
         Ok(self.ignore_rules()?.is_ignored(&key, is_dir))
+    }
+
+    pub fn is_internal_worktree_path(&self, path: impl AsRef<Path>) -> bool {
+        let Ok(relative) = path.as_ref().strip_prefix(&self.worktree) else {
+            return false;
+        };
+        if relative.as_os_str().is_empty() {
+            return false;
+        }
+        if relative
+            .components()
+            .any(|component| component.as_os_str() == GRAFT_DIR)
+        {
+            return true;
+        }
+
+        // The browser build mounts an in-memory temporary filesystem at `/tmp`
+        // alongside its OPFS worktree. It is process state, not repository data.
+        #[cfg(all(target_arch = "wasm32", target_os = "emscripten"))]
+        if self.worktree == Path::new("/")
+            && relative
+                .components()
+                .next()
+                .is_some_and(|root| root.as_os_str() == "tmp")
+        {
+            return true;
+        }
+
+        false
     }
 
     pub(super) fn worktree_key_for_path(&self, path: &Path) -> Result<String> {
@@ -1017,11 +1049,11 @@ impl Repository {
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
+            if self.is_internal_worktree_path(&path) {
+                continue;
+            }
             let file_type = entry.file_type()?;
             if file_type.is_dir() {
-                if entry.file_name() == GRAFT_DIR {
-                    continue;
-                }
                 let key = self.worktree_key_for_path(&path)?;
                 if ignore.is_ignored(&key, true) {
                     continue;

@@ -861,6 +861,26 @@ extern "C" fn wasmfs_create_root_dir() -> *mut std::ffi::c_void {
     unsafe { wasmfs_create_opfs_backend() }
 }
 
+#[cfg(all(target_arch = "wasm32", target_os = "emscripten"))]
+#[unsafe(no_mangle)]
+extern "C" fn wasmfs_before_preload() {
+    unsafe extern "C" {
+        fn wasmfs_create_memory_backend() -> *mut std::ffi::c_void;
+        fn wasmfs_create_directory(
+            path: *const std::ffi::c_char,
+            mode: u32,
+            backend: *mut std::ffi::c_void,
+        ) -> std::ffi::c_int;
+    }
+
+    // Replacing WasmFS's default in-memory root with OPFS also replaces its
+    // default `/tmp`. Mount a volatile memory backend there so tempfile users
+    // do not leak scratch databases into the persistent browser worktree.
+    let backend = unsafe { wasmfs_create_memory_backend() };
+    let result = unsafe { wasmfs_create_directory(c"/tmp".as_ptr(), 0o777, backend) };
+    assert_eq!(result, 0, "failed to mount browser temporary directory");
+}
+
 fn run_cli(cli: Cli) -> Result<()> {
     run_command(cli.command, cli.db.as_deref())
 }

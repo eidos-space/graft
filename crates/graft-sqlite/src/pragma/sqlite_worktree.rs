@@ -346,8 +346,24 @@ pub(super) fn prepare_sqlite_path_for_replacement(
         }
         Err(error) => return Err(error.into()),
     }
-    remove_sqlite_sidecars(path)?;
-    Ok(SqliteReplacementGuard { connection: Some(connection) })
+    // OPFS is driven by a single browser worker, so there is no second SQLite
+    // process to exclude. WasmFS cannot safely rename an OPFS file while a
+    // connection still owns its sync access handle: closing that old handle
+    // after the rename can overwrite the replacement. Finish preparation and
+    // release the handle before checkout moves the file.
+    #[cfg(all(target_arch = "wasm32", target_os = "emscripten"))]
+    {
+        connection.execute_batch("ROLLBACK")?;
+        drop(connection);
+        remove_sqlite_sidecars(path)?;
+        return Ok(SqliteReplacementGuard { connection: None });
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "emscripten")))]
+    {
+        remove_sqlite_sidecars(path)?;
+        Ok(SqliteReplacementGuard { connection: Some(connection) })
+    }
 }
 
 fn remove_sqlite_sidecars(path: &Path) -> Result<(), ErrCtx> {

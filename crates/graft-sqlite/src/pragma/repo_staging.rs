@@ -609,11 +609,11 @@ pub(super) fn collect_repo_add_directory_files(
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
+        if repo.is_internal_worktree_path(&path) {
+            continue;
+        }
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
-            if entry.file_name() == graft::repo::GRAFT_DIR {
-                continue;
-            }
             if !force && repo.is_ignored_worktree_path(&path)? {
                 continue;
             }
