@@ -26,7 +26,8 @@ merge plan.
 
 The row-level plan can auto-merge non-conflicting changes when:
 
-- both sides modify supported rowid tables without touching the same logical row
+- both sides modify supported rowid or declared-primary-key rows without
+  touching the same logical row
 - compatible schema additions can be expressed as `ALTER TABLE ... ADD COLUMN`
 - configured internal SQLite changes can be resolved safely
 - the resulting temporary database passes validation
@@ -54,7 +55,7 @@ Example:
   "change": "modified",
   "row_diff_available": true,
   "logical_status": "file_changed_no_supported_logical_changes",
-  "capabilities": ["rowid_table_rows", "schema_entries", "opaque_table_detection"],
+  "capabilities": ["rowid_table_rows", "primary_key_table_rows", "schema_entries", "opaque_table_detection"],
   "limitations": [],
   "tables": []
 }
@@ -73,6 +74,8 @@ The row-level engine reports both capabilities and limitations.
 Current capabilities:
 
 - `rowid_table_rows`: row changes in ordinary rowid tables
+- `primary_key_table_rows`: row changes in `WITHOUT ROWID` tables identified by
+  their declared, typed primary key
 - `schema_entries`: schema entries from `sqlite_schema`
 - `opaque_table_detection`: changed tables that should stay file-level
 - `semantic_insert_keys`: insert conflicts based on configured semantic keys
@@ -81,7 +84,6 @@ Current limitation kinds:
 
 - `virtual_table`
 - `fts_shadow_table`
-- `without_rowid_table`
 - `sqlite_internal_table`
 - `index_btree`
 - `utf16_text_encoding`
@@ -157,9 +159,10 @@ Column-level details can include `add_column`, `drop_column`,
 
 ## Semantic Keys
 
-SQLite rowid is the physical row identity for ordinary rowid tables. Some
-applications also have stable business identifiers, such as `_id`, `id`, or
-`key`.
+SQLite rowid is the physical row identity for ordinary rowid tables.
+`WITHOUT ROWID` tables instead use the declared primary key, including all
+parts of a composite key and their SQLite value types. Some applications also
+have stable business identifiers, such as `_id`, `id`, or `key`.
 
 Semantic keys add an application-level conflict check. For example, two branches
 that insert different rowids with the same `_id` should often conflict even
@@ -179,7 +182,7 @@ only to tables that contain all configured columns.
 
 Row conflict reasons include:
 
-- `row_conflict`: both sides touched the same rowid incompatibly
+- `row_conflict`: both sides touched the same row identity incompatibly
 - `semantic_key_conflict`: both sides inserted or touched rows with the same configured semantic identity
 
 ## Generated Columns
@@ -240,7 +243,7 @@ Important fields:
 | `available` | Whether row-level analysis was available for this file. |
 | `can_auto_merge` | Whether Graft can apply the plan automatically. |
 | `blocked_reasons` | Why auto-merge is blocked. |
-| `row_conflicts` | Rowid or semantic-key conflicts. |
+| `row_conflicts` | Rowid, declared-primary-key, or semantic-key conflicts. |
 | `schema_conflicts` | Schema conflicts with column-level details. |
 | `opaque_changes` | Unsupported or opaque SQLite surfaces that remain unresolved. |
 | `resolved_opaque_change_details` | Opaque/internal changes resolved by policy. |

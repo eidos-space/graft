@@ -65,11 +65,13 @@ SQLite commits to physical database (main file and possibly WAL)
   -> SQLite snapshots are materialized to physical worktree files
 ```
 
-可选 Graft VFS 会直接写 Volume page，因此跳过 physical import；它不暴露 repository
-command。
+可选 Graft VFS 会直接写 Volume page，因此跳过 physical import；这个直接映射要求
+SQLite `page_size=4096`。physical import 可以捕获例如 8 KiB page size 的合法
+数据库，同时仍按 4 KiB Graft chunk 存储其镜像。VFS 不暴露 repository command。
 
 checkout materialize 物理 database 前会取得 SQLite replacement lock、处理 WAL 并清理
 sidecar。活跃 writer 会阻止替换。
 
-merge flow 从 base/ours/theirs tree 开始，对 SQLite 路径做 row/schema
-analysis，对文件 artifact 使用保守 file-level conflicts。
+merge flow 从 base/ours/theirs tree 开始，对 SQLite 路径通过 direct parser fast
+path 或 materialized SQLite compatibility path 做 row/schema analysis，对文件
+artifact 使用保守 file-level conflicts。

@@ -66,7 +66,7 @@ graft diff --json --rows HEAD~1 HEAD data.sqlite
 graft diff --json --content --max-content-bytes 65536 HEAD~1 HEAD notes.md
 ```
 
-在 v0.7.0 中，`diff --content` 会返回一个 changed UTF-8 text artifact 的
+`diff --content` 会返回一个 changed UTF-8 text artifact 的
 bounded content。它要求 `--json`，不能和 `--rows` 或 `--staged` 一起使用；
 未提供 `--max-content-bytes` 时默认上限为 1 MiB。
 
@@ -128,8 +128,9 @@ graft add data.sqlite
 
 `graft add` 会通过 SQLite online backup 读取一致的 committed state，其中包括
 已提交的 WAL frames，不需要手动 checkpoint，也不会修改源数据库。它再按 4 KiB
-page 与 staged/HEAD 基线比较，只写入变化的 pages。未提交 transaction 不会进入
-Graft snapshot。
+Graft storage chunk 与 staged/HEAD 基线比较，只写入变化的 chunks。物理 SQLite
+数据库可以使用更大的合法 page size，例如 8 KiB；这不会改变 Graft 的 4 KiB 存储
+粒度。未提交 transaction 不会进入 Graft snapshot。
 
 ## Branches And Tags
 
@@ -220,6 +221,7 @@ graft --db data.sqlite resolve --manual data.sqlite
 graft --db data.sqlite merge --json <rev>
 graft --db data.sqlite resolve --json --theirs data.sqlite
 graft --db data.sqlite resolve --json --theirs --row docs 42 data.sqlite
+graft --db data.sqlite resolve --json --theirs --row docs '{"space_id":"space-1","id":"doc-1"}' data.sqlite
 ```
 
 conflicts 会以 staged conflict entries 形式存储在 index 中。Graft 可以自动合并
@@ -229,4 +231,6 @@ paths 后用 `graft merge --continue` 提交。
 JSON 形式会返回当前 repository position、path rollups、conflict analysis，以及剩余
 conflict counts，方便 app 侧实现 merge UI。
 `graft resolve` 必须在 `--ours`、`--theirs`、`--manual` 里三选一；
-`--row <table> <rowid>` 可以把 resolution 缩小到单个 SQLite row conflict。
+`--row <table> <identity>` 可以把 resolution 缩小到单个 SQLite row conflict。
+普通 rowid table 传整数 rowid；`WITHOUT ROWID` table 传包含声明主键字段的 JSON
+object。BLOB 主键字段使用 `{ "$blob": "00ff" }`。

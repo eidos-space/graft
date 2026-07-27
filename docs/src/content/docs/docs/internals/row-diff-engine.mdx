@@ -39,7 +39,7 @@ JSON row diff output can include:
   "change": "modified",
   "row_diff_available": true,
   "logical_status": "logical_changes",
-  "capabilities": ["rowid_table_rows", "schema_entries"],
+  "capabilities": ["rowid_table_rows", "primary_key_table_rows", "schema_entries"],
   "limitations": [],
   "tables": []
 }
@@ -47,6 +47,12 @@ JSON row diff output can include:
 
 `logical_status` lets applications distinguish supported logical row changes
 from conservative or unavailable cases.
+
+The engine uses the direct page parser for supported 4 KiB rowid-table paths.
+It materializes snapshots through SQLite when native page size differs or a
+`WITHOUT ROWID` table needs declared-primary-key identity. This keeps the fast
+path while covering legal physical page sizes, `STRICT` schemas, and typed
+composite primary keys.
 
 ## Merge Diagnostics
 

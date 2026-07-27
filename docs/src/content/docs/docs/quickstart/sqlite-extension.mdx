@@ -13,6 +13,10 @@ The extension registers `vfs=graft` and exposes version and low-level
 `graft_debug_*` PRAGMAs. Repository commands such as status, add, commit,
 branch, merge, and sync are not SQLite PRAGMAs; run them through the CLI.
 
+The live VFS write path requires SQLite `page_size=4096`, because each live
+SQLite page maps directly to one Graft page. Physical worktree staging does not
+have this requirement and supports databases with page sizes such as 8 KiB.
+
 <Aside type="caution" title="Choose one write path">
   Do not write the same logical database through both the platform file VFS and
   the Graft VFS. Close live SQLite connections before branch operations that

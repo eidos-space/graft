@@ -50,8 +50,10 @@ graft commit -m "save state"
 The index is also where unresolved merge stages are stored.
 
 For a physical database, `graft add` asks SQLite for a consistent backup and
-compares its 4 KiB pages with the current index or `HEAD`. Unchanged pages stay
-referenced by the existing snapshot; only changed pages extend storage history.
+compares its image in 4 KiB Graft storage chunks with the current index or
+`HEAD`. Unchanged chunks stay referenced by the existing snapshot; only changed
+chunks extend storage history. This storage granularity is independent of the
+physical database's SQLite page size.
 
 ## Commits And Trees
 

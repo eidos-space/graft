@@ -56,8 +56,30 @@ graft conflicts --json
 diff 的顶层 `paths` 适合做导航；SQLite database entries 在 `--rows` 时可以
 包含 row-level payload。
 
-conflict JSON 可包含 `row_conflicts`、`schema_conflicts`、`opaque_changes`、
-`blocked_reasons` 和 `apply_policy`。
+每个 table entry 包含 `columns`、`changes`，声明主键的 table 还会包含
+`primary_key_columns`。普通 rowid table 的 row change 使用 `rowid`；
+`WITHOUT ROWID` table 使用 `key`：
+
+```json
+{
+  "name": "docs",
+  "primary_key_columns": ["space_id", "id"],
+  "changes": [
+    {
+      "op": "update",
+      "key": { "space_id": "space-1", "id": "doc-1" },
+      "old_values": ["space-1", "doc-1", "before"],
+      "values": ["space-1", "doc-1", "after"]
+    }
+  ]
+}
+```
+
+主键 JSON 会保留 identity type。BLOB 主键字段使用 `{ "$blob": "00ff" }`
+这样的显式标记；同一个 `key` object 可以直接传给 `graft resolve --row`。
+
+conflict JSON 可包含 rowid、声明主键或 semantic-key 类型的 `row_conflicts`，
+以及 `schema_conflicts`、`opaque_changes`、`blocked_reasons` 和 `apply_policy`。
 
 ## Files 和 Payloads
 

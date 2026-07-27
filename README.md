@@ -124,8 +124,11 @@ Staging a SQLite database:
 1. Uses SQLite's online backup API to capture a consistent committed state.
 2. Includes committed WAL frames without requiring a manual checkpoint.
 3. Excludes uncommitted transactions.
-4. Compares 4 KiB pages with the staged snapshot or `HEAD`.
-5. Appends only changed pages to Graft storage.
+4. Compares 4 KiB Graft storage chunks with the staged snapshot or `HEAD`.
+5. Appends only changed chunks to Graft storage.
+
+The physical SQLite database may use a larger legal page size, such as
+8 KiB. Graft still deduplicates and stores the captured image in 4 KiB chunks.
 
 The same workflow supports WAL and rollback-journal databases. Commands that
 change the checked-out state materialize snapshots back to physical SQLite
@@ -238,7 +241,8 @@ graft push --json origin main
 
 The SQLite extension provides `vfs=graft` for applications that store live
 SQLite pages in a Graft Volume. It also exposes `graft_version` and
-`graft_debug_*` diagnostics for that volume:
+`graft_debug_*` diagnostics for that volume. This direct live-page path requires
+SQLite `page_size=4096`:
 
 ```sql
 .load ./libgraft_ext

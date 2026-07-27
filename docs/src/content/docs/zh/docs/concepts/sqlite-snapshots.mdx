@@ -32,10 +32,11 @@ storage。`graft add` 才是 storage boundary：它通过 SQLite online backup �
 committed database state，包含 committed WAL frames，但不会 checkpoint 或修改
 源数据库。private snapshot 会被规范化为 standalone rollback-journal database。
 
-随后 Graft 将每个 4 KiB page 与 staged 或 committed base 比较，只追加变化 page。
-如果没有变化，会复用原 `CommitFileState` 和 snapshot，不产生新的 storage commit。
-rollback-journal database 使用同一流程，只是通常没有 WAL。未提交 transaction 不会
-进入 staged state。
+随后 Graft 按 4 KiB Graft storage chunk 与 staged 或 committed base 比较，只追加
+变化 chunk。物理数据库可以使用更大的合法 SQLite page size，例如 8 KiB；存储去重
+粒度仍是 4 KiB。如果没有变化，会复用原 `CommitFileState` 和 snapshot，不产生新的
+storage commit。rollback-journal database 使用同一流程，只是通常没有 WAL。
+未提交 transaction 不会进入 staged state。
 
 ## Materialized Files
 
@@ -68,6 +69,8 @@ exclusive lock、处理旧 WAL、清理 sidecar，再执行 atomic rename。如�
 
 应用明确需要 SQLite commit 直接推进 Graft Volume 时，可以加载 extension 并使用
 `vfs=graft`。这是高级 data-plane 模式，不是 repository control plane；status、
-stage、history、merge 和 sync 仍使用 CLI。
+stage、history、merge 和 sync 仍使用 CLI。与物理 staging 不同，live Graft VFS
+写入路径要求 SQLite `page_size=4096`，因为一个 SQLite page 会直接映射到一个
+Graft page。
 
 不要让同一个逻辑 database 同时接受普通 file VFS 和 Graft VFS 的写入。
