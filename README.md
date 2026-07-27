@@ -61,11 +61,11 @@ files referenced by its rows as one unit.
 
 ## Quickstart
 
-Install Graft v0.7.0:
+Install Graft v0.8.0:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/eidos-space/graft/main/install.sh \
-  | GRAFT_VERSION=0.7.0 sh
+  | GRAFT_VERSION=0.8.0 sh
 
 graft --version
 ```
