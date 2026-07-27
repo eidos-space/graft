@@ -32,11 +32,13 @@ graft diff --json --rows HEAD~1 HEAD data.sqlite
 当前公开概念包括：
 
 - ordinary rowid tables 的 row changes
+- 具有声明主键的 `WITHOUT ROWID` tables 的 row changes，包括 `STRICT` schema
+  中带类型的单列或复合主键
 - `sqlite_schema` 中的 schema entries
 - opaque-table detection
 - semantic keys 产生的 insert conflicts
-- virtual table、FTS shadow table、`WITHOUT ROWID`、SQLite internal table、
-  index B-tree、UTF-16 text、generated columns 等 limitations
+- virtual table、FTS shadow table、SQLite internal table、index B-tree、
+  UTF-16 text、generated columns 等 limitations
 
 Unsupported 不表示忽略，而是输出 caveat 或保持 conservative conflict。
 

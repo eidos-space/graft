@@ -111,7 +111,8 @@ graft sql --db app.sqlite \
 
 ## 可以自动合并什么
 
-- 支持的 rowid table 中的 disjoint row changes
+- 支持的 rowid table，以及按声明主键识别的 `WITHOUT ROWID` table 中的 disjoint
+  row changes；包括 `STRICT` 和复合主键 schema
 - 兼容的 schema additions
 - 配置允许的 SQLite internal changes
 - 应用 merge plan 后通过 validation 的结果
@@ -130,7 +131,11 @@ graft resolve --manual settings.json
 
 ```bash
 graft --db data.sqlite resolve --theirs --row docs 42 data.sqlite
+graft --db data.sqlite resolve --theirs --row docs '{"space_id":"space-1","id":"doc-1"}' data.sqlite
 ```
+
+普通 rowid table 的 identity 是整数 rowid；`WITHOUT ROWID` table 则传包含全部
+声明主键字段的 JSON object。
 
 完成或中止：
 

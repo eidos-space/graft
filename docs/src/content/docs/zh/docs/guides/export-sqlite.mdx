@@ -48,7 +48,8 @@ graft commit -m "import external edit"
 
 `graft add` 使用 SQLite online backup 捕获一致的 committed state，包括已提交的
 WAL frames，不需要手动 checkpoint，也不会修改源数据库。随后它只把相对
-staged/HEAD 基线发生变化的 4 KiB pages 写入 Graft storage。
+staged/HEAD 基线发生变化的 4 KiB Graft storage chunks 写入存储，这个粒度与物理
+数据库的 SQLite page size 无关。
 
 需要 live page-storage 时可以显式选择 `vfs=graft`，但它是可选数据面，不承载
 repository 命令。

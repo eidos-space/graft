@@ -638,6 +638,86 @@ fn parse_repo_diff_arg_supports_row_mode() {
 }
 
 #[test]
+fn parse_repo_resolve_arg_supports_rowid_and_primary_key_identities() {
+    assert_eq!(
+        parse_repo_resolve_arg("--ours --row docs 42 app.db").unwrap(),
+        RepoResolveSpec {
+            side: ResolveSide::Ours,
+            path: Some(PathBuf::from("app.db")),
+            row: Some(RepoResolveRowSpec {
+                table: "docs".to_string(),
+                identity: crate::row_level_diff::RowIdentity::Rowid(42),
+            }),
+        }
+    );
+
+    assert_eq!(
+        parse_repo_resolve_arg(
+            r#"--theirs --row "project docs" '{ "space_id": "space one", "id": "doc-1" }' "my app.eidos""#,
+        )
+        .unwrap(),
+        RepoResolveSpec {
+            side: ResolveSide::Theirs,
+            path: Some(PathBuf::from("my app.eidos")),
+            row: Some(RepoResolveRowSpec {
+                table: "project docs".to_string(),
+                identity: crate::row_level_diff::RowIdentity::PrimaryKey(vec![
+                    crate::row_level_diff::PrimaryKeyPart {
+                        column: "id".to_string(),
+                        value: crate::row_level_diff::PrimaryKeyValue::Text("doc-1".to_string()),
+                    },
+                    crate::row_level_diff::PrimaryKeyPart {
+                        column: "space_id".to_string(),
+                        value: crate::row_level_diff::PrimaryKeyValue::Text(
+                            "space one".to_string(),
+                        ),
+                    },
+                ]),
+            }),
+        }
+    );
+
+    let blob =
+        parse_repo_resolve_arg(r#"--manual --row docs '{"id":{"$blob":"00ff"}}' app.db"#).unwrap();
+    assert!(matches!(
+        blob.row,
+        Some(RepoResolveRowSpec {
+            identity: crate::row_level_diff::RowIdentity::PrimaryKey(ref key),
+            ..
+        }) if key[0].value == crate::row_level_diff::PrimaryKeyValue::Blob(vec![0, 255])
+    ));
+
+    let negative_zero =
+        parse_repo_resolve_arg(r#"--ours --row docs '{"score":-0.0}' app.db"#).unwrap();
+    assert!(matches!(
+        negative_zero.row,
+        Some(RepoResolveRowSpec {
+            identity: crate::row_level_diff::RowIdentity::PrimaryKey(ref key),
+            ..
+        }) if key[0].value == crate::row_level_diff::PrimaryKeyValue::Real(0.0_f64.to_bits())
+    ));
+
+    assert!(parse_repo_resolve_arg("--ours --row docs {} app.db").is_err());
+    assert!(parse_repo_resolve_arg(r#"--ours --row docs '{"id":true}' app.db"#).is_err());
+}
+
+#[test]
+fn primary_key_json_uses_the_resolve_shape_for_blobs() {
+    assert_eq!(
+        crate::json::JsonRowChange::primary_key_value_to_json(
+            &crate::row_level_diff::PrimaryKeyValue::Blob(vec![0, 255]),
+        ),
+        serde_json::json!({"$blob": "00ff"})
+    );
+    assert_eq!(
+        crate::json::JsonRowChange::primary_key_value_to_json(
+            &crate::row_level_diff::PrimaryKeyValue::Text("00ff".to_string()),
+        ),
+        serde_json::json!("00ff")
+    );
+}
+
+#[test]
 fn parse_repo_diff_arg_requires_bounded_single_path_content_mode() {
     assert_eq!(
         parse_repo_diff_arg(Some("--content HEAD~1 HEAD -- notes/readme.md")).unwrap(),

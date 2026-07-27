@@ -196,7 +196,7 @@ pub(super) enum RepoConflictSideState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RepoResolveRowSpec {
     pub(super) table: String,
-    pub(super) rowid: i64,
+    pub(super) identity: crate::row_level_diff::RowIdentity,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

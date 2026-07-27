@@ -12,6 +12,10 @@ extension 注册 `vfs=graft`，并提供 version 和低层 `graft_debug_*` PRAGM
 status、add、commit、branch、merge 和 sync 等 repository command 不再是 SQLite
 PRAGMA，统一通过 CLI 执行。
 
+live VFS 写入路径要求 SQLite `page_size=4096`，因为一个 live SQLite page 会直接
+映射到一个 Graft page。物理 worktree staging 没有这个限制，支持例如 8 KiB
+page size 的数据库。
+
 <Aside type="caution" title="选择一条写入路径">
   不要通过 platform file VFS 和 Graft VFS 同时写同一个逻辑 database。branch
   operation 需要替换或 rebind database state 前，应关闭 live SQLite connection。

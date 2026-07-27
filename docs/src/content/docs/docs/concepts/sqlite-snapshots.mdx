@@ -41,9 +41,11 @@ graft commit -m "add note"
 `graft add` uses SQLite's online backup API to capture one committed database
 state. It includes committed WAL frames without checkpointing or modifying the
 source database, normalizes the private snapshot into a standalone rollback-
-journal file, and compares it page by page with the staged or committed base.
-Only changed 4 KiB pages are appended to Graft storage. If nothing changed, the
-existing `CommitFileState` and snapshot are reused.
+journal file, and compares its image with the staged or committed base in 4 KiB
+Graft storage chunks. Only changed chunks are appended to Graft storage. The
+physical database can use a larger legal SQLite page size, such as 8 KiB; storage
+deduplication remains 4 KiB. If nothing changed, the existing `CommitFileState`
+and snapshot are reused.
 
 Rollback-journal databases follow the same path; there simply may be no WAL to
 include. Uncommitted transactions are never staged.
@@ -95,7 +97,9 @@ active.
 The SQLite extension can open a path with `vfs=graft` when an application wants
 SQLite commits to advance a live Graft Volume directly. This is an advanced
 data-plane mode, not the repository control plane. Repository status, staging,
-history, merge, and sync still use the CLI.
+history, merge, and sync still use the CLI. Unlike physical staging, the live
+Graft VFS write path requires SQLite `page_size=4096` because each SQLite page
+maps directly to one Graft page.
 
 Do not edit the same logical database simultaneously through the Graft VFS and
 the platform's normal file VFS. Choose one write path and close live

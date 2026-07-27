@@ -88,6 +88,29 @@ Useful database fields include:
 | `limitations` | SQLite surfaces that need caveats. |
 | `tables` | Table-level row changes when available. |
 
+Each table entry includes `columns`, `changes`, and, for declared-primary-key
+tables, `primary_key_columns`. A row change uses `rowid` for an ordinary rowid
+table or `key` for a `WITHOUT ROWID` table:
+
+```json
+{
+  "name": "docs",
+  "primary_key_columns": ["space_id", "id"],
+  "changes": [
+    {
+      "op": "update",
+      "key": { "space_id": "space-1", "id": "doc-1" },
+      "old_values": ["space-1", "doc-1", "before"],
+      "values": ["space-1", "doc-1", "after"]
+    }
+  ]
+}
+```
+
+Primary-key JSON preserves identity types. BLOB key parts use an explicit
+marker such as `{ "$blob": "00ff" }`; the same `key` object can be passed to
+`graft resolve --row`.
+
 ## Conflicts
 
 ```bash
@@ -105,7 +128,7 @@ Common fields:
 | `available` | Whether row-level analysis is available for a database conflict. |
 | `can_auto_merge` | Whether the plan can be applied automatically. |
 | `blocked_reasons` | Why auto-merge is blocked. |
-| `row_conflicts` | Rowid or semantic-key conflicts. |
+| `row_conflicts` | Rowid, declared-primary-key, or semantic-key conflicts. |
 | `schema_conflicts` | Schema conflict detail. |
 | `opaque_changes` | Unsupported or opaque SQLite surfaces. |
 | `apply_policy` | SQL apply and validation policy. |

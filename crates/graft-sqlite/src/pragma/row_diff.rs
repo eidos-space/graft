@@ -35,9 +35,12 @@ pub(super) fn row_diff_impl(
 
         for change in &table.changes {
             match change {
-                crate::row_level_diff::RowChange::Insert { .. } => inserts += 1,
-                crate::row_level_diff::RowChange::Delete { .. } => deletes += 1,
-                crate::row_level_diff::RowChange::Update { .. } => updates += 1,
+                crate::row_level_diff::RowChange::Insert { .. }
+                | crate::row_level_diff::RowChange::PrimaryKeyInsert { .. } => inserts += 1,
+                crate::row_level_diff::RowChange::Delete { .. }
+                | crate::row_level_diff::RowChange::PrimaryKeyDelete { .. } => deletes += 1,
+                crate::row_level_diff::RowChange::Update { .. }
+                | crate::row_level_diff::RowChange::PrimaryKeyUpdate { .. } => updates += 1,
             }
         }
 
@@ -91,6 +94,18 @@ pub(super) fn row_diff_impl(
                             .collect::<Vec<_>>()
                             .join(", ")
                     )?;
+                }
+                crate::row_level_diff::RowChange::PrimaryKeyInsert { key, row } => {
+                    writeln!(&mut output, "    [{}] INSERT key={key:?}", i + 1)?;
+                    writeln!(&mut output, "      values: {:?}", row.values)?;
+                }
+                crate::row_level_diff::RowChange::PrimaryKeyDelete { key, .. } => {
+                    writeln!(&mut output, "    [{}] DELETE key={key:?}", i + 1)?;
+                }
+                crate::row_level_diff::RowChange::PrimaryKeyUpdate { key, old_row, new_row } => {
+                    writeln!(&mut output, "    [{}] UPDATE key={key:?}", i + 1)?;
+                    writeln!(&mut output, "      old: {:?}", old_row.values)?;
+                    writeln!(&mut output, "      new: {:?}", new_row.values)?;
                 }
             }
         }
@@ -261,6 +276,7 @@ pub(super) fn json_table_changes(
         .map(|table| crate::json::JsonTableChanges {
             name: table.table_name.clone(),
             columns: table.columns.clone(),
+            primary_key_columns: table.primary_key_columns.clone(),
             changes: table.changes.iter().map(json_row_change).collect(),
         })
         .collect()
@@ -272,7 +288,8 @@ pub(super) fn json_row_change(
     match change {
         crate::row_level_diff::RowChange::Insert { rowid, row } => crate::json::JsonRowChange {
             op: "insert".into(),
-            rowid: *rowid,
+            rowid: Some(*rowid),
+            key: None,
             values: row
                 .values
                 .iter()
@@ -282,7 +299,8 @@ pub(super) fn json_row_change(
         },
         crate::row_level_diff::RowChange::Delete { rowid, row } => crate::json::JsonRowChange {
             op: "delete".into(),
-            rowid: *rowid,
+            rowid: Some(*rowid),
+            key: None,
             values: row
                 .values
                 .iter()
@@ -293,7 +311,53 @@ pub(super) fn json_row_change(
         crate::row_level_diff::RowChange::Update { rowid, old_row, new_row } => {
             crate::json::JsonRowChange {
                 op: "update".into(),
-                rowid: *rowid,
+                rowid: Some(*rowid),
+                key: None,
+                values: new_row
+                    .values
+                    .iter()
+                    .map(crate::json::JsonRowChange::value_to_json)
+                    .collect(),
+                old_values: Some(
+                    old_row
+                        .values
+                        .iter()
+                        .map(crate::json::JsonRowChange::value_to_json)
+                        .collect(),
+                ),
+            }
+        }
+        crate::row_level_diff::RowChange::PrimaryKeyInsert { key, row } => {
+            crate::json::JsonRowChange {
+                op: "insert".into(),
+                rowid: None,
+                key: Some(json_primary_key(key)),
+                values: row
+                    .values
+                    .iter()
+                    .map(crate::json::JsonRowChange::value_to_json)
+                    .collect(),
+                old_values: None,
+            }
+        }
+        crate::row_level_diff::RowChange::PrimaryKeyDelete { key, row } => {
+            crate::json::JsonRowChange {
+                op: "delete".into(),
+                rowid: None,
+                key: Some(json_primary_key(key)),
+                values: row
+                    .values
+                    .iter()
+                    .map(crate::json::JsonRowChange::value_to_json)
+                    .collect(),
+                old_values: None,
+            }
+        }
+        crate::row_level_diff::RowChange::PrimaryKeyUpdate { key, old_row, new_row } => {
+            crate::json::JsonRowChange {
+                op: "update".into(),
+                rowid: None,
+                key: Some(json_primary_key(key)),
                 values: new_row
                     .values
                     .iter()
@@ -311,6 +375,19 @@ pub(super) fn json_row_change(
     }
 }
 
+fn json_primary_key(
+    key: &[crate::row_level_diff::PrimaryKeyPart],
+) -> std::collections::BTreeMap<String, serde_json::Value> {
+    key.iter()
+        .map(|part| {
+            (
+                part.column.clone(),
+                crate::json::JsonRowChange::primary_key_value_to_json(&part.value),
+            )
+        })
+        .collect()
+}
+
 /// Count changes for JSON summary
 pub(super) fn count_changes_json(
     changes: &[crate::row_level_diff::RowChange],
@@ -320,9 +397,12 @@ pub(super) fn count_changes_json(
     let mut updates = 0;
     for change in changes {
         match change {
-            crate::row_level_diff::RowChange::Insert { .. } => inserts += 1,
-            crate::row_level_diff::RowChange::Delete { .. } => deletes += 1,
-            crate::row_level_diff::RowChange::Update { .. } => updates += 1,
+            crate::row_level_diff::RowChange::Insert { .. }
+            | crate::row_level_diff::RowChange::PrimaryKeyInsert { .. } => inserts += 1,
+            crate::row_level_diff::RowChange::Delete { .. }
+            | crate::row_level_diff::RowChange::PrimaryKeyDelete { .. } => deletes += 1,
+            crate::row_level_diff::RowChange::Update { .. }
+            | crate::row_level_diff::RowChange::PrimaryKeyUpdate { .. } => updates += 1,
         }
     }
     (inserts, deletes, updates)

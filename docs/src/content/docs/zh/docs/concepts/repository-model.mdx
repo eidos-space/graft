@@ -45,9 +45,10 @@ graft commit -m "save state"
 
 merge conflict 的 base/ours/theirs stages 也存放在 index 中。
 
-对于物理数据库，`graft add` 通过 SQLite 取得一致 backup，再逐个比较 4 KiB page
-和当前 index 或 `HEAD`。未变化的 page 继续引用原 snapshot，只有变化 page 扩展
-storage history。
+对于物理数据库，`graft add` 通过 SQLite 取得一致 backup，再按 4 KiB Graft
+storage chunk 和当前 index 或 `HEAD` 比较。未变化的 chunk 继续引用原 snapshot，
+只有变化 chunk 扩展 storage history。这个存储粒度独立于物理数据库的 SQLite
+page size。
 
 ## Commits、Trees、Refs
 

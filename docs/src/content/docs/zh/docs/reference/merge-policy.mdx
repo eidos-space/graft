@@ -21,7 +21,7 @@ Repository merge 首先看到的是 file-level snapshots。对 modified SQLite �
 
 满足这些条件时，row-level plan 可以自动合并：
 
-- 两边修改的是支持的 rowid table，且没有触碰同一个逻辑行
+- 两边修改的是支持的 rowid 或声明主键行，且没有触碰同一个逻辑行
 - 兼容的 schema addition 可以表达成 `ALTER TABLE ... ADD COLUMN`
 - 配置过的 SQLite 内部状态可以安全 resolver
 - 生成的临时数据库通过验证
@@ -47,7 +47,7 @@ Repository merge 首先看到的是 file-level snapshots。对 modified SQLite �
   "change": "modified",
   "row_diff_available": true,
   "logical_status": "file_changed_no_supported_logical_changes",
-  "capabilities": ["rowid_table_rows", "schema_entries", "opaque_table_detection"],
+  "capabilities": ["rowid_table_rows", "primary_key_table_rows", "schema_entries", "opaque_table_detection"],
   "limitations": [],
   "tables": []
 }
@@ -64,6 +64,7 @@ row-level 引擎会同时报告 capabilities 和 limitations。
 当前 capabilities：
 
 - `rowid_table_rows`：普通 rowid table 的行变化
+- `primary_key_table_rows`：按声明的带类型主键识别 `WITHOUT ROWID` table 的行变化
 - `schema_entries`：来自 `sqlite_schema` 的 schema entries
 - `opaque_table_detection`：识别需要保持 file-level 的变化表
 - `semantic_insert_keys`：基于配置的 semantic keys 检测 insert 冲突
@@ -72,7 +73,6 @@ row-level 引擎会同时报告 capabilities 和 limitations。
 
 - `virtual_table`
 - `fts_shadow_table`
-- `without_rowid_table`
 - `sqlite_internal_table`
 - `index_btree`
 - `utf16_text_encoding`
@@ -141,7 +141,9 @@ Schema conflict reasons 包括：
 
 ## Semantic Keys
 
-对普通 rowid table，SQLite rowid 是物理行身份。有些应用还有稳定的业务身份，比如 `_id`、`id` 或 `key`。
+对普通 rowid table，SQLite rowid 是物理行身份。`WITHOUT ROWID` table 则使用声明
+主键，包括复合主键的全部字段及其 SQLite value type。有些应用还有稳定的业务身份，
+比如 `_id`、`id` 或 `key`。
 
 Semantic keys 会增加一层应用级 conflict 检测。例如两个分支插入了不同 rowid，但 `_id` 相同，这通常应该冲突，即使 rowid 没有冲突。
 
@@ -158,7 +160,7 @@ table-specific keys 会覆盖该表的 default。default 只会应用到包含�
 
 Row conflict reasons 包括：
 
-- `row_conflict`：两边以不兼容方式触碰了同一个 rowid
+- `row_conflict`：两边以不兼容方式触碰了同一个 row identity
 - `semantic_key_conflict`：两边插入或触碰了具有同一配置语义身份的 rows
 
 ## Generated Columns
@@ -210,7 +212,7 @@ apply policy 会出现在 conflict analysis JSON 中：
 | `available` | 这个文件是否可以做 row-level analysis。 |
 | `can_auto_merge` | Graft 是否可以自动应用这个 plan。 |
 | `blocked_reasons` | auto-merge 被阻止的原因。 |
-| `row_conflicts` | rowid 或 semantic-key conflicts。 |
+| `row_conflicts` | rowid、声明主键或 semantic-key conflicts。 |
 | `schema_conflicts` | 带列级 details 的 schema conflicts。 |
 | `opaque_changes` | 仍未解决的 unsupported 或 opaque SQLite surfaces。 |
 | `resolved_opaque_change_details` | 已由 policy 解决的 opaque/internal changes。 |

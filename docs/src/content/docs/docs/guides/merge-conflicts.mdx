@@ -116,7 +116,8 @@ The merged database contains both branches:
 Graft can auto-merge compatible SQLite changes when the merge policy can
 interpret them safely:
 
-- disjoint row changes in supported rowid tables
+- disjoint row changes in supported rowid tables and declared-primary-key
+  `WITHOUT ROWID` tables, including `STRICT` and composite-key schemas
 - compatible schema additions
 - configured SQLite internal changes such as sequence or index rebuilds
 - changes that pass validation after applying the merge plan
@@ -143,7 +144,11 @@ For SQLite row conflicts, resolve one row:
 
 ```bash
 graft --db data.sqlite resolve --theirs --row docs 42 data.sqlite
+graft --db data.sqlite resolve --theirs --row docs '{"space_id":"space-1","id":"doc-1"}' data.sqlite
 ```
+
+The identity is an integer rowid for an ordinary rowid table, or a JSON object
+containing every declared primary-key column for a `WITHOUT ROWID` table.
 
 Continue after resolving all conflicts:
 
@@ -174,7 +179,7 @@ Important conflict fields include:
 | `path` | Repository path in conflict. |
 | `path_kind` or `kind` | SQLite database, text file, or binary file. |
 | `storage` | SQLite snapshot, inline file, or external payload. |
-| `row_conflicts` | Rowid or semantic-key conflicts. |
+| `row_conflicts` | Rowid, declared-primary-key, or semantic-key conflicts. |
 | `schema_conflicts` | Schema conflicts with column-level detail. |
 | `opaque_changes` | Changed SQLite surfaces Graft did not interpret. |
 | `blocked_reasons` | Why auto-merge did not finish. |

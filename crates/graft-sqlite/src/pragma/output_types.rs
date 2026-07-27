@@ -628,11 +628,18 @@ pub(super) struct JsonRowMergeConflict {
     pub(super) table: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(super) columns: Vec<String>,
-    pub(super) rowid: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) rowid: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) key: Option<BTreeMap<String, serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) ours_rowid: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) theirs_rowid: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) ours_key: Option<BTreeMap<String, serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) theirs_key: Option<BTreeMap<String, serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) semantic_key: Option<Vec<String>>,
     pub(super) ours: &'static str,
@@ -713,6 +720,12 @@ pub(super) struct JsonConflictArtifact {
     pub(super) ours_rowid: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) theirs_rowid: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) key: Option<BTreeMap<String, serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) ours_key: Option<BTreeMap<String, serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) theirs_key: Option<BTreeMap<String, serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) semantic_key: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]

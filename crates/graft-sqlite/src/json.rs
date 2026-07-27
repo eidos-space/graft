@@ -2,6 +2,8 @@
 //! These mirror the internal types but use only serde-serializable primitives,
 //! avoiding the need to add Serialize to every core graft type.
 
+use std::collections::BTreeMap;
+
 use serde::Serialize;
 
 /// Commit log entry (for `graft_json_log`)
@@ -62,7 +64,10 @@ pub struct JsonDiffResult {
 #[derive(Debug, Clone, Serialize)]
 pub struct JsonRowChange {
     pub op: String, // "insert", "delete", "update"
-    pub rowid: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rowid: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<BTreeMap<String, serde_json::Value>>,
     pub values: Vec<serde_json::Value>,
     /// Old values (only present for "update" operations)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -75,6 +80,8 @@ pub struct JsonTableChanges {
     pub name: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub columns: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub primary_key_columns: Vec<String>,
     pub changes: Vec<JsonRowChange>,
 }
 
@@ -202,6 +209,21 @@ impl JsonRowChange {
                 let hex: String = b.iter().map(|byte| format!("{byte:02x}")).collect();
                 serde_json::Value::String(hex)
             }
+        }
+    }
+
+    /// Encode a primary-key value in the same shape accepted by `graft resolve --row`.
+    ///
+    /// BLOBs need an explicit type marker because a bare JSON string represents `SQLite` TEXT.
+    pub fn primary_key_value_to_json(
+        value: &crate::row_level_diff::PrimaryKeyValue,
+    ) -> serde_json::Value {
+        match value {
+            crate::row_level_diff::PrimaryKeyValue::Blob(bytes) => {
+                let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+                serde_json::json!({ "$blob": hex })
+            }
+            _ => Self::value_to_json(&value.to_value()),
         }
     }
 }

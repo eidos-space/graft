@@ -1321,10 +1321,10 @@ pub(super) fn split_pragma_words(arg: &str) -> Result<Vec<String>, PragmaErr> {
         }
 
         if ch == '\\' {
-            if cfg!(windows) {
-                current.push(ch);
-            } else {
+            if quote.is_some() || !cfg!(windows) {
                 escaped = true;
+            } else {
+                current.push(ch);
             }
             in_word = true;
             continue;
@@ -1374,7 +1374,23 @@ fn reject_ambiguous_posix_path_escape(arg: &str) -> Result<(), PragmaErr> {
     #[cfg(not(windows))]
     {
         let mut chars = arg.chars().peekable();
+        let mut quote = None;
+        let mut escaped_in_quote = false;
         while let Some(ch) = chars.next() {
+            if let Some(delimiter) = quote {
+                if escaped_in_quote {
+                    escaped_in_quote = false;
+                } else if ch == '\\' {
+                    escaped_in_quote = true;
+                } else if ch == delimiter {
+                    quote = None;
+                }
+                continue;
+            }
+            if matches!(ch, '\'' | '"') {
+                quote = Some(ch);
+                continue;
+            }
             if ch != '\\' {
                 continue;
             }
@@ -1561,14 +1577,15 @@ pub(super) fn parse_repo_export_arg(arg: &str) -> Result<RepoExportSpec, PragmaE
 }
 
 pub(super) fn parse_repo_resolve_arg(arg: &str) -> Result<RepoResolveSpec, PragmaErr> {
+    reject_ambiguous_posix_path_escape(arg)?;
     let mut side = None;
     let mut row = None;
     let mut path = Vec::new();
-    let parts: Vec<&str> = arg.split_whitespace().collect();
+    let parts = split_pragma_words(arg)?;
     let mut index = 0;
 
     while index < parts.len() {
-        match parts[index] {
+        match parts[index].as_str() {
             "--ours" => {
                 if side.replace(ResolveSide::Ours).is_some() {
                     return Err(pragma_fail("resolve accepts only one side"));
@@ -1594,24 +1611,22 @@ pub(super) fn parse_repo_resolve_arg(arg: &str) -> Result<RepoResolveSpec, Pragm
                 let Some(table) = parts.get(index + 1) else {
                     return Err(pragma_fail("resolve --row requires a table name"));
                 };
-                let Some(rowid) = parts.get(index + 2) else {
-                    return Err(pragma_fail("resolve --row requires a rowid"));
+                let Some(_) = parts.get(index + 2) else {
+                    return Err(pragma_fail("resolve --row requires a row identity"));
                 };
-                let rowid = rowid
-                    .parse::<i64>()
-                    .map_err(|_| pragma_fail("resolve --row rowid must be an integer"))?;
-                row = Some(RepoResolveRowSpec { table: (*table).to_string(), rowid });
+                let identity = parse_row_identity(&parts[index + 2])?;
+                row = Some(RepoResolveRowSpec { table: table.clone(), identity });
                 index += 3;
             }
             "--path" => {
                 let Some(value) = parts.get(index + 1) else {
                     return Err(pragma_fail("resolve --path requires a path"));
                 };
-                path.push(*value);
+                path.push(value.clone());
                 index += 2;
             }
             value => {
-                path.push(value);
+                path.push(value.to_string());
                 index += 1;
             }
         }
@@ -1628,6 +1643,72 @@ pub(super) fn parse_repo_resolve_arg(arg: &str) -> Result<RepoResolveSpec, Pragm
         path: (!path.is_empty()).then(|| PathBuf::from(path.join(" "))),
         row,
     })
+}
+
+fn parse_row_identity(value: &str) -> Result<crate::row_level_diff::RowIdentity, PragmaErr> {
+    if let Ok(rowid) = value.parse::<i64>() {
+        return Ok(crate::row_level_diff::RowIdentity::Rowid(rowid));
+    }
+    let object: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(value).map_err(|_| {
+            pragma_fail(
+                "resolve --row identity must be an integer rowid or a JSON primary-key object",
+            )
+        })?;
+    if object.is_empty() {
+        return Err(pragma_fail(
+            "resolve --row primary-key object must not be empty",
+        ));
+    }
+    let mut key = Vec::with_capacity(object.len());
+    for (column, value) in object {
+        key.push(crate::row_level_diff::PrimaryKeyPart {
+            column,
+            value: primary_key_value_from_json(value)?,
+        });
+    }
+    Ok(crate::row_level_diff::RowIdentity::PrimaryKey(key))
+}
+
+fn primary_key_value_from_json(
+    value: serde_json::Value,
+) -> Result<crate::row_level_diff::PrimaryKeyValue, PragmaErr> {
+    use crate::row_level_diff::PrimaryKeyValue;
+    match value {
+        serde_json::Value::Null => Ok(PrimaryKeyValue::Null),
+        serde_json::Value::Bool(_) | serde_json::Value::Array(_) => Err(pragma_fail(
+            "resolve --row primary-key values must be null, numbers, strings, or {$blob: hex}",
+        )),
+        serde_json::Value::Number(number) => number
+            .as_i64()
+            .map(PrimaryKeyValue::Integer)
+            .or_else(|| {
+                number.as_f64().map(|value| {
+                    let normalized = if value == 0.0 { 0.0 } else { value };
+                    PrimaryKeyValue::Real(normalized.to_bits())
+                })
+            })
+            .ok_or_else(|| pragma_fail("resolve --row primary-key number is out of range")),
+        serde_json::Value::String(value) => Ok(PrimaryKeyValue::Text(value)),
+        serde_json::Value::Object(mut object) => {
+            let Some(serde_json::Value::String(hex)) = object.remove("$blob") else {
+                return Err(pragma_fail(
+                    "resolve --row primary-key objects must use {$blob: hex}",
+                ));
+            };
+            if !object.is_empty() || hex.len() % 2 != 0 {
+                return Err(pragma_fail("resolve --row $blob must be even-length hex"));
+            }
+            let bytes = (0..hex.len())
+                .step_by(2)
+                .map(|index| {
+                    u8::from_str_radix(&hex[index..index + 2], 16)
+                        .map_err(|_| pragma_fail("resolve --row $blob must be valid hex"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(PrimaryKeyValue::Blob(bytes))
+        }
+    }
 }
 
 pub(super) fn parse_branch_delete_arg(arg: &str) -> Result<(String, bool), PragmaErr> {

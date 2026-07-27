@@ -34,11 +34,16 @@ PRAGMA graft_debug_volume_json_diff = '2,4,rows';
   "change": "modified",
   "row_diff_available": true,
   "logical_status": "logical_changes",
-  "capabilities": ["rowid_table_rows", "schema_entries"],
+  "capabilities": ["rowid_table_rows", "primary_key_table_rows", "schema_entries"],
   "limitations": [],
   "tables": []
 }
 ```
+
+支持的 4 KiB rowid-table 路径使用直接 page parser。native page size 不同，或
+`WITHOUT ROWID` table 需要声明主键 identity 时，引擎会通过 SQLite materialize
+snapshot。这样既保留 fast path，也覆盖合法物理 page size、`STRICT` schema 和
+带类型的复合主键。
 
 merge 时，同一分析会产生 row conflicts、schema conflicts、opaque changes、
 blocked reasons 和 apply policy。

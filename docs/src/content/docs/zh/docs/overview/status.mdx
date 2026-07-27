@@ -4,11 +4,11 @@ description: 当前 Graft 的能力、稳定性边界和预期。
 ---
 
 Graft 仍然是实验性项目。本文档以
-[v0.7.0 release](https://github.com/eidos-space/graft/releases/latest)
+[v0.8.0 release](https://github.com/eidos-space/graft/releases/latest)
 为基线，重点是 SQLite 应用状态版本管理：SQLite snapshot、应用文件、
 row-aware diff、merge 和 remote sync。
 
-只存在于开发分支的能力不属于 v0.7.0 文档，除非页面明确标注为未发布。
+只存在于开发分支的能力不属于 v0.8.0 文档，除非页面明确标注为未发布。
 
 ## 当前可用
 
@@ -22,7 +22,8 @@ row-aware diff、merge 和 remote sync。
 - 一个 worktree 中跟踪多个 SQLite 数据库路径。
 - 与 SQLite snapshot 在同一个 commit tree 中的 text/binary file artifact。
 - binary file 和配置路径的 external payload。
-- 支持表面的行级 diff 和 row-aware merge。
+- 普通 rowid table 和声明主键的 `WITHOUT ROWID` table 的行级 diff、row-aware
+  merge 和逐行 resolution，包括 `STRICT` 与复合主键 schema。
 - 面向应用的 JSON 输出。
 - `fs://`、`s3://`、`s3_compatible://` 和 `graft+http(s)://` remotes。
 - 可连接实现 Graft HTTP remote protocol 服务的 HTTP remote client。
@@ -59,7 +60,7 @@ connection。Graft 不会在另一个 writer 活跃时覆盖数据库。
 ## Release
 
 预构建 CLI 和 SQLite extension archive 随
-[v0.7.0 GitHub release](https://github.com/eidos-space/graft/releases/latest)
+[v0.8.0 GitHub release](https://github.com/eidos-space/graft/releases/latest)
 发布。
 
 这个仓库是 [orbitinghail/graft](https://github.com/orbitinghail/graft) 的

@@ -58,9 +58,11 @@ It requires an explicit `--db` path and an existing `.graft/` repository. Use `g
 | `graft reset [--json] [--soft\|--mixed\|--hard] <rev>` | Move the current branch or HEAD. |
 
 When `graft add` stages a physical SQLite path, it takes a consistent online
-backup and compares 4 KiB pages with the current staged or committed snapshot.
-Committed WAL frames are included. Only changed pages extend Graft storage, and
-an unchanged file creates no new storage commit.
+backup and compares 4 KiB Graft storage chunks with the current staged or
+committed snapshot. Committed WAL frames are included. Only changed chunks
+extend Graft storage, and an unchanged file creates no new storage commit. The
+physical SQLite database may use a larger legal page size, such as 8 KiB; that
+does not change Graft's 4 KiB storage granularity.
 
 `graft diff --rows` expands modified SQLite database snapshots into table and
 row changes:
@@ -74,7 +76,7 @@ graft diff --json --rows HEAD~1 HEAD data.sqlite
 graft diff --json --content --max-content-bytes 65536 HEAD~1 HEAD notes.md
 ```
 
-In v0.7.0, `diff --content` returns bounded content for one changed UTF-8 text
+`diff --content` returns bounded content for one changed UTF-8 text
 artifact. It requires `--json`, cannot be combined with `--rows` or `--staged`,
 and uses 1 MiB when `--max-content-bytes` is omitted.
 
@@ -236,6 +238,7 @@ graft --db data.sqlite resolve --manual data.sqlite
 graft --db data.sqlite merge --json <rev>
 graft --db data.sqlite resolve --json --theirs data.sqlite
 graft --db data.sqlite resolve --json --theirs --row docs 42 data.sqlite
+graft --db data.sqlite resolve --json --theirs --row docs '{"space_id":"space-1","id":"doc-1"}' data.sqlite
 ```
 
 Conflicts are stored in the index as staged conflict entries. Graft can
@@ -246,4 +249,7 @@ resolving all paths, commit with `graft merge --continue`.
 The JSON forms return current repository position, path rollups, conflict
 analysis, and remaining conflict counts for app-side merge UIs.
 `graft resolve` accepts exactly one of `--ours`, `--theirs`, or `--manual`;
-`--row <table> <rowid>` narrows the resolution to a single SQLite row conflict.
+`--row <table> <identity>` narrows the resolution to one SQLite row conflict.
+Use an integer rowid for an ordinary rowid table, or a JSON object containing
+the declared primary-key columns for a `WITHOUT ROWID` table. BLOB key parts
+use `{ "$blob": "00ff" }`.

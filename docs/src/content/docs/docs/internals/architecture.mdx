@@ -68,7 +68,10 @@ SQLite commits to a physical database (main file and possibly WAL)
 ```
 
 The optional Graft VFS skips the physical import step because SQLite writes
-Volume pages directly. It does not expose repository commands.
+Volume pages directly. That direct mapping requires SQLite `page_size=4096`.
+Physical import can capture databases with larger legal page sizes, such as
+8 KiB, while still storing their images in 4 KiB Graft chunks. The VFS does not
+expose repository commands.
 
 For file artifacts, staging records inline blobs or external payload pointers.
 
@@ -91,6 +94,7 @@ An active SQLite writer also blocks physical database replacement.
 base tree + ours tree + theirs tree
   -> path-level merge
   -> SQLite row/schema analysis for database paths
+     (direct parser fast path or materialized SQLite compatibility path)
   -> auto-merge compatible database changes
   -> store unresolved stages in the index
   -> merge --continue writes the merge commit
