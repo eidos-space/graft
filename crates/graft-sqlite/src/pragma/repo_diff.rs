@@ -210,7 +210,10 @@ pub(super) fn repo_worktree_diff_for_filter(
             .filter(|key| repo_key_matches_filter(key, filter))
             .cloned(),
     );
-    if !current_key.starts_with(".graft/") && repo_key_matches_filter(&current_key, filter) {
+    if current_key != ".graft"
+        && !current_key.starts_with(".graft/")
+        && repo_key_matches_filter(&current_key, filter)
+    {
         file_keys.insert(current_key.clone());
     }
 
@@ -631,11 +634,11 @@ fn snapshot_table_summary_from_reader(
     reader: &dyn VolumeRead,
     mode: SnapshotSummaryMode,
 ) -> Result<Vec<CommitTableSummary>, ErrCtx> {
-    let scanner = crate::sqlite_parse::TableScanner::new(reader)
-        .map_err(|e| ErrCtx::PragmaErr(format!("Parse error: {e:?}").into()))?;
-    let master = scanner
-        .read_master_table()
-        .map_err(|e| ErrCtx::PragmaErr(format!("Schema error: {e:?}").into()))?;
+    let materialized = crate::row_level_diff::MaterializedSnapshot::from_reader(reader, "summary")
+        .map_err(|error| ErrCtx::PragmaErr(format!("Snapshot error: {error}").into()))?;
+    let connection = materialized.connection();
+    let master = crate::row_level_diff::read_master_table_sqlite(connection, "summary")
+        .map_err(|error| ErrCtx::PragmaErr(format!("Schema error: {error}").into()))?;
     let mut summaries = Vec::new();
     let ignored_tables = crate::row_level_diff::ignored_row_diff_tables(&master, &[]);
 
@@ -643,9 +646,23 @@ fn snapshot_table_summary_from_reader(
         if !crate::row_level_diff::is_diffable_table(&entry, &ignored_tables) {
             continue;
         }
-        let row_count = crate::sqlite_parse::read_all_rows(reader, entry.root_page)
-            .map_err(|e| ErrCtx::PragmaErr(format!("Table read error: {e:?}").into()))?
-            .len();
+        let row_count: i64 = connection
+            .query_row(
+                &format!(
+                    "SELECT count(*) FROM {}",
+                    crate::row_level_diff::quote_identifier(&entry.name)
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| {
+                ErrCtx::PragmaErr(
+                    format!("Could not count rows in table '{}': {error}", entry.name).into(),
+                )
+            })?;
+        let row_count = usize::try_from(row_count).map_err(|_| {
+            ErrCtx::PragmaErr(format!("Invalid row count for table '{}'", entry.name).into())
+        })?;
         let summary = match mode {
             SnapshotSummaryMode::Inserted => table_summary(entry.name, row_count, 0, 0),
             SnapshotSummaryMode::Deleted => table_summary(entry.name, 0, row_count, 0),

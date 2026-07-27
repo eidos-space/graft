@@ -45,9 +45,12 @@ pub fn generate_diff_report(
 
         for change in &table.changes {
             match change {
-                crate::row_level_diff::RowChange::Insert { .. } => inserts += 1,
-                crate::row_level_diff::RowChange::Delete { .. } => deletes += 1,
-                crate::row_level_diff::RowChange::Update { .. } => updates += 1,
+                crate::row_level_diff::RowChange::Insert { .. }
+                | crate::row_level_diff::RowChange::PrimaryKeyInsert { .. } => inserts += 1,
+                crate::row_level_diff::RowChange::Delete { .. }
+                | crate::row_level_diff::RowChange::PrimaryKeyDelete { .. } => deletes += 1,
+                crate::row_level_diff::RowChange::Update { .. }
+                | crate::row_level_diff::RowChange::PrimaryKeyUpdate { .. } => updates += 1,
             }
         }
 

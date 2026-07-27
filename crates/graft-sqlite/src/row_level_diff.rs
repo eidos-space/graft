@@ -2,16 +2,21 @@
 //!
 //! Parses `SQLite` B-tree directly to compare row data between versions
 
-use std::collections::{BTreeMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashSet},
+    fs::File,
+    io::Write,
+};
 
 use crate::sqlite_parse::{
     ColumnInfo, GeneratedColumnKind, KeyConstraintKind, MasterEntry, ParseError, Record,
     TableScanner, Value, read_all_rows,
 };
-use graft::core::{PageIdx, VolumeId, lsn::LSN};
+use graft::core::{PageIdx, VolumeId, lsn::LSN, page::PAGESIZE};
 use graft::rt::runtime::Runtime;
 use graft::snapshot::Snapshot;
 use graft::volume_reader::VolumeRead;
+use rusqlite::{Connection, OpenFlags, types::ValueRef};
 
 /// Coarse logical status for a SQLite snapshot diff.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +41,7 @@ impl LogicalDiffStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowLevelDiffCapability {
     RowidTableRows,
+    PrimaryKeyTableRows,
     SchemaEntries,
     OpaqueTableDetection,
     SemanticInsertKeys,
@@ -45,6 +51,7 @@ impl RowLevelDiffCapability {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::RowidTableRows => "rowid_table_rows",
+            Self::PrimaryKeyTableRows => "primary_key_table_rows",
             Self::SchemaEntries => "schema_entries",
             Self::OpaqueTableDetection => "opaque_table_detection",
             Self::SemanticInsertKeys => "semantic_insert_keys",
@@ -56,7 +63,6 @@ impl RowLevelDiffCapability {
 pub enum RowLevelDiffLimitationKind {
     VirtualTable,
     FtsShadowTable,
-    WithoutRowidTable,
     SqliteInternalTable,
     IndexBtree,
     Utf16TextEncoding,
@@ -68,7 +74,6 @@ impl RowLevelDiffLimitationKind {
         match self {
             Self::VirtualTable => "virtual_table",
             Self::FtsShadowTable => "fts_shadow_table",
-            Self::WithoutRowidTable => "without_rowid_table",
             Self::SqliteInternalTable => "sqlite_internal_table",
             Self::IndexBtree => "index_btree",
             Self::Utf16TextEncoding => "utf16_text_encoding",
@@ -100,6 +105,7 @@ impl Default for RowLevelDiffAnalysis {
         Self {
             capabilities: vec![
                 RowLevelDiffCapability::RowidTableRows,
+                RowLevelDiffCapability::PrimaryKeyTableRows,
                 RowLevelDiffCapability::SchemaEntries,
                 RowLevelDiffCapability::OpaqueTableDetection,
                 RowLevelDiffCapability::SemanticInsertKeys,
@@ -125,6 +131,114 @@ pub enum RowChange {
         old_row: Record,
         new_row: Record,
     },
+    PrimaryKeyInsert {
+        key: Vec<PrimaryKeyPart>,
+        row: Record,
+    },
+    PrimaryKeyDelete {
+        key: Vec<PrimaryKeyPart>,
+        row: Record,
+    },
+    PrimaryKeyUpdate {
+        key: Vec<PrimaryKeyPart>,
+        old_row: Record,
+        new_row: Record,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RowIdentity {
+    Rowid(i64),
+    PrimaryKey(Vec<PrimaryKeyPart>),
+}
+
+impl RowIdentity {
+    pub fn rowid(&self) -> Option<i64> {
+        match self {
+            Self::Rowid(rowid) => Some(*rowid),
+            Self::PrimaryKey(_) => None,
+        }
+    }
+
+    pub fn primary_key(&self) -> Option<&[PrimaryKeyPart]> {
+        match self {
+            Self::Rowid(_) => None,
+            Self::PrimaryKey(key) => Some(key),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PrimaryKeyPart {
+    pub column: String,
+    pub value: PrimaryKeyValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PrimaryKeyValue {
+    Null,
+    Integer(i64),
+    Real(u64),
+    Text(String),
+    Blob(Vec<u8>),
+}
+
+impl PrimaryKeyValue {
+    fn from_value(value: &Value) -> Self {
+        match value {
+            Value::Null => Self::Null,
+            Value::Integer(value) => Self::Integer(*value),
+            Value::Real(value) => {
+                let normalized = if *value == 0.0 { 0.0 } else { *value };
+                Self::Real(normalized.to_bits())
+            }
+            Value::Text(value) => Self::Text(value.clone()),
+            Value::Blob(value) => Self::Blob(value.clone()),
+        }
+    }
+
+    pub fn to_value(&self) -> Value {
+        match self {
+            Self::Null => Value::Null,
+            Self::Integer(value) => Value::Integer(*value),
+            Self::Real(bits) => Value::Real(f64::from_bits(*bits)),
+            Self::Text(value) => Value::Text(value.clone()),
+            Self::Blob(value) => Value::Blob(value.clone()),
+        }
+    }
+
+    fn to_sql(&self) -> String {
+        self.to_value().to_sql()
+    }
+}
+
+impl RowChange {
+    pub fn identity(&self) -> RowIdentity {
+        match self {
+            Self::Insert { rowid, .. }
+            | Self::Delete { rowid, .. }
+            | Self::Update { rowid, .. } => RowIdentity::Rowid(*rowid),
+            Self::PrimaryKeyInsert { key, .. }
+            | Self::PrimaryKeyDelete { key, .. }
+            | Self::PrimaryKeyUpdate { key, .. } => RowIdentity::PrimaryKey(key.clone()),
+        }
+    }
+
+    pub fn rowid(&self) -> Option<i64> {
+        match self.identity() {
+            RowIdentity::Rowid(rowid) => Some(rowid),
+            RowIdentity::PrimaryKey(_) => None,
+        }
+    }
+
+    pub fn primary_key(&self) -> Option<&[PrimaryKeyPart]> {
+        match self {
+            Self::PrimaryKeyInsert { key, .. }
+            | Self::PrimaryKeyDelete { key, .. }
+            | Self::PrimaryKeyUpdate { key, .. } => Some(key),
+            Self::Insert { .. } | Self::Delete { .. } | Self::Update { .. } => None,
+        }
+    }
 }
 
 /// Changes for a single table
@@ -135,6 +249,7 @@ pub struct TableChanges {
     pub rowid_alias: Option<String>,
     pub generated_columns: BTreeMap<String, GeneratedColumnKind>,
     pub semantic_key_columns: Vec<String>,
+    pub primary_key_columns: Vec<String>,
     pub changes: Vec<RowChange>,
 }
 
@@ -210,6 +325,28 @@ impl TableChanges {
                         new_row,
                     ));
                 }
+                RowChange::PrimaryKeyInsert { row, .. } => {
+                    sql.push_str(&format_sql_insert(
+                        &self.table_name,
+                        &self.columns,
+                        self.rowid_alias.as_deref(),
+                        generated_columns,
+                        None,
+                        row,
+                    ));
+                }
+                RowChange::PrimaryKeyDelete { key, .. } => {
+                    sql.push_str(&format_sql_delete_by_primary_key(&self.table_name, key));
+                }
+                RowChange::PrimaryKeyUpdate { key, new_row, .. } => {
+                    sql.push_str(&format_sql_update_by_primary_key(
+                        &self.table_name,
+                        &self.columns,
+                        generated_columns,
+                        key,
+                        new_row,
+                    ));
+                }
             }
             if !sql.ends_with('\n') && !sql.is_empty() {
                 sql.push('\n');
@@ -265,7 +402,6 @@ impl OpaqueChangeKind {
 pub enum OpaqueChangeReason {
     VirtualTable,
     FtsShadowTable,
-    WithoutRowidTable,
     SqliteInternalTable,
     IndexBtree,
 }
@@ -275,7 +411,6 @@ impl OpaqueChangeReason {
         match self {
             Self::VirtualTable => "virtual_table",
             Self::FtsShadowTable => "fts_shadow_table",
-            Self::WithoutRowidTable => "without_rowid_table",
             Self::SqliteInternalTable => "sqlite_internal_table",
             Self::IndexBtree => "index_btree",
         }
@@ -285,7 +420,6 @@ impl OpaqueChangeReason {
         match self {
             Self::VirtualTable => RowLevelDiffLimitationKind::VirtualTable,
             Self::FtsShadowTable => RowLevelDiffLimitationKind::FtsShadowTable,
-            Self::WithoutRowidTable => RowLevelDiffLimitationKind::WithoutRowidTable,
             Self::SqliteInternalTable => RowLevelDiffLimitationKind::SqliteInternalTable,
             Self::IndexBtree => RowLevelDiffLimitationKind::IndexBtree,
         }
@@ -434,6 +568,25 @@ impl RowLevelDiff {
                         report.push_str(&format!("    old: {:?}\n", old_row.values));
                         report.push_str(&format!("    new: {:?}\n", new_row.values));
                     }
+                    RowChange::PrimaryKeyInsert { key, row } => {
+                        report.push_str(&format!(
+                            "  + key {}: {:?}\n",
+                            format_primary_key(key),
+                            row.values
+                        ));
+                    }
+                    RowChange::PrimaryKeyDelete { key, row } => {
+                        report.push_str(&format!(
+                            "  - key {}: {:?}\n",
+                            format_primary_key(key),
+                            row.values
+                        ));
+                    }
+                    RowChange::PrimaryKeyUpdate { key, old_row, new_row } => {
+                        report.push_str(&format!("  ~ key {}:\n", format_primary_key(key)));
+                        report.push_str(&format!("    old: {:?}\n", old_row.values));
+                        report.push_str(&format!("    new: {:?}\n", new_row.values));
+                    }
                 }
             }
             report.push('\n');
@@ -464,9 +617,9 @@ fn count_changes(changes: &[RowChange]) -> (usize, usize, usize) {
 
     for change in changes {
         match change {
-            RowChange::Insert { .. } => inserts += 1,
-            RowChange::Delete { .. } => deletes += 1,
-            RowChange::Update { .. } => updates += 1,
+            RowChange::Insert { .. } | RowChange::PrimaryKeyInsert { .. } => inserts += 1,
+            RowChange::Delete { .. } | RowChange::PrimaryKeyDelete { .. } => deletes += 1,
+            RowChange::Update { .. } | RowChange::PrimaryKeyUpdate { .. } => updates += 1,
         }
     }
 
@@ -543,13 +696,140 @@ fn row_level_diff_checked_out(
     row_level_diff_from_readers(&from_reader, &to_reader, from_lsn, to_lsn)
 }
 
+pub(crate) struct MaterializedSnapshot {
+    _directory: tempfile::TempDir,
+    connection: Connection,
+}
+
+impl MaterializedSnapshot {
+    pub(crate) fn from_reader(
+        reader: &dyn VolumeRead,
+        label: &str,
+    ) -> Result<Self, graft::err::LogicalErr> {
+        let directory = tempfile::tempdir().map_err(|error| {
+            graft::err::LogicalErr::Other(format!(
+                "Failed to create temporary {label} SQLite snapshot: {error}"
+            ))
+        })?;
+        let path = directory.path().join("snapshot.sqlite");
+        let mut file = File::create(&path).map_err(|error| {
+            graft::err::LogicalErr::Other(format!(
+                "Failed to create temporary {label} SQLite file: {error}"
+            ))
+        })?;
+        for page_number in 1..=reader.page_count().to_u32() {
+            let page_idx = PageIdx::try_new(page_number).ok_or_else(|| {
+                graft::err::LogicalErr::Other(format!(
+                    "Invalid page {page_number} while materializing {label} SQLite snapshot"
+                ))
+            })?;
+            let page = reader.read_page(page_idx).map_err(|error| {
+                graft::err::LogicalErr::Other(format!(
+                    "Failed to read page {page_number} from {label} SQLite snapshot: {error}"
+                ))
+            })?;
+            file.write_all(page.as_ref()).map_err(|error| {
+                graft::err::LogicalErr::Other(format!(
+                    "Failed to materialize {label} SQLite snapshot: {error}"
+                ))
+            })?;
+        }
+        file.flush().map_err(|error| {
+            graft::err::LogicalErr::Other(format!(
+                "Failed to flush temporary {label} SQLite snapshot: {error}"
+            ))
+        })?;
+        drop(file);
+
+        let connection = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|error| sqlite_snapshot_err(label, "open", error))?;
+        connection
+            .pragma_update(None, "trusted_schema", false)
+            .map_err(|error| sqlite_snapshot_err(label, "disable trusted schema", error))?;
+        Ok(Self { _directory: directory, connection })
+    }
+
+    pub(crate) fn connection(&self) -> &Connection {
+        &self.connection
+    }
+}
+
+struct MaterializedPair {
+    from: MaterializedSnapshot,
+    to: MaterializedSnapshot,
+}
+
+impl MaterializedPair {
+    fn new(
+        from_reader: &dyn VolumeRead,
+        to_reader: &dyn VolumeRead,
+    ) -> Result<Self, graft::err::LogicalErr> {
+        Ok(Self {
+            from: MaterializedSnapshot::from_reader(from_reader, "source")?,
+            to: MaterializedSnapshot::from_reader(to_reader, "target")?,
+        })
+    }
+}
+
+fn sqlite_snapshot_err(side: &str, action: &str, error: rusqlite::Error) -> graft::err::LogicalErr {
+    graft::err::LogicalErr::Other(format!(
+        "Failed to {action} {side} SQLite snapshot: {error}"
+    ))
+}
+
+fn sqlite_page_size(reader: &dyn VolumeRead) -> Result<u32, graft::err::LogicalErr> {
+    let page = reader.read_page(PageIdx::FIRST).map_err(|error| {
+        graft::err::LogicalErr::Other(format!("Failed to read SQLite header: {error}"))
+    })?;
+    if page.len() < 18 || &page[..16] != b"SQLite format 3\x00" {
+        return Err(graft::err::LogicalErr::Other(
+            "Invalid SQLite header while reading row diff".into(),
+        ));
+    }
+    let bytes = page.as_ref();
+    let raw = u16::from_be_bytes([bytes[16], bytes[17]]);
+    Ok(if raw == 1 { 65_536 } else { u32::from(raw) })
+}
+
+pub(crate) fn read_master_table_sqlite(
+    connection: &Connection,
+    side: &str,
+) -> Result<Vec<MasterEntry>, graft::err::LogicalErr> {
+    let mut statement = connection
+        .prepare(
+            "SELECT type, name, tbl_name, rootpage, coalesce(sql, '') FROM sqlite_schema ORDER BY rowid",
+        )
+        .map_err(|error| sqlite_snapshot_err(side, "prepare sqlite_schema query for", error))?;
+    statement
+        .query_map([], |row| {
+            Ok(MasterEntry {
+                entry_type: row.get(0)?,
+                name: row.get(1)?,
+                table_name: row.get(2)?,
+                root_page: row.get(3)?,
+                sql: row.get(4)?,
+            })
+        })
+        .map_err(|error| sqlite_snapshot_err(side, "query sqlite_schema from", error))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| sqlite_snapshot_err(side, "read sqlite_schema from", error))
+}
+
 fn row_level_diff_from_readers(
     from_reader: &dyn VolumeRead,
     to_reader: &dyn VolumeRead,
     from_lsn: LSN,
     to_lsn: LSN,
 ) -> Result<RowLevelDiff, graft::err::GraftErr> {
-    // Read master table for both versions
+    let native_page_size = PAGESIZE.as_u32();
+    let needs_materialized_schema = sqlite_page_size(from_reader)? != native_page_size
+        || sqlite_page_size(to_reader)? != native_page_size;
+
+    // The direct parser is the fast path for Graft-sized SQLite pages. SQLite itself is the
+    // compatibility path for other legal page sizes and index-organized WITHOUT ROWID tables.
     let from_scanner = TableScanner::new(from_reader).map_err(|e| {
         tracing::error!("Failed to create source scanner: {:?}", e);
         graft::err::LogicalErr::Other(format!("Failed to parse source B-tree: {e:?}"))
@@ -558,12 +838,24 @@ fn row_level_diff_from_readers(
         graft::err::LogicalErr::Other(format!("Failed to parse target B-tree: {e:?}"))
     })?;
 
-    let from_master = from_scanner.read_master_table().map_err(|e| {
-        graft::err::LogicalErr::Other(format!("Failed to read source schema: {e:?}"))
-    })?;
-    let to_master = to_scanner.read_master_table().map_err(|e| {
-        graft::err::LogicalErr::Other(format!("Failed to read target schema: {e:?}"))
-    })?;
+    let mut materialized = needs_materialized_schema
+        .then(|| MaterializedPair::new(from_reader, to_reader))
+        .transpose()?;
+    let (from_master, to_master) = if let Some(pair) = materialized.as_ref() {
+        (
+            read_master_table_sqlite(&pair.from.connection, "source")?,
+            read_master_table_sqlite(&pair.to.connection, "target")?,
+        )
+    } else {
+        (
+            from_scanner.read_master_table().map_err(|e| {
+                graft::err::LogicalErr::Other(format!("Failed to read source schema: {e:?}"))
+            })?,
+            to_scanner.read_master_table().map_err(|e| {
+                graft::err::LogicalErr::Other(format!("Failed to read target schema: {e:?}"))
+            })?,
+        )
+    };
 
     // Compare schema and tables
     let schema_changes = diff_schema_entries(&from_master, &to_master);
@@ -585,7 +877,11 @@ fn row_level_diff_from_readers(
         &to_master,
         &ignored_table_infos,
     );
-    let index_btree_changes = diff_index_btrees(from_reader, to_reader, &from_master, &to_master);
+    let index_btree_changes = if needs_materialized_schema {
+        Vec::new()
+    } else {
+        diff_index_btrees(from_reader, to_reader, &from_master, &to_master)
+    };
     limitations.extend(index_btree_changes.iter().map(|change| {
         RowLevelDiffLimitation::new(change.reason.limitation_kind(), Some(change.name.clone()))
     }));
@@ -623,30 +919,56 @@ fn row_level_diff_from_readers(
             rowid_alias.as_deref(),
         );
         let generated_columns = generated_columns(&column_infos);
-        let columns: Vec<String> = column_infos.into_iter().map(|c| c.name).collect();
+        let parsed_columns: Vec<String> = column_infos.into_iter().map(|c| c.name).collect();
+        let needs_sqlite_rows = needs_materialized_schema
+            || from_entry.is_some_and(is_without_rowid_table)
+            || to_entry.is_some_and(is_without_rowid_table);
 
-        let changes = match (from_entry, to_entry) {
-            (Some(from), Some(to)) => {
-                // Table exists in both, diff rows
-                diff_table_rows(from_reader, to_reader, &from_scanner, &to_scanner, from, to)?
+        let (columns, primary_key_columns, changes) = if needs_sqlite_rows {
+            if materialized.is_none() {
+                materialized = Some(MaterializedPair::new(from_reader, to_reader)?);
             }
-            (Some(from), None) => {
-                // Table deleted, all rows are DELETE
-                let rows = read_all_rows(from_reader, from.root_page)
-                    .map_err(|e| table_read_err("from", from, e))?;
-                rows.into_iter()
+            let pair = materialized
+                .as_ref()
+                .expect("materialized pair initialized");
+            let from_rows = from_entry
+                .map(|entry| read_sqlite_table_rows(&pair.from.connection, entry, "source"))
+                .transpose()?;
+            let to_rows = to_entry
+                .map(|entry| read_sqlite_table_rows(&pair.to.connection, entry, "target"))
+                .transpose()?;
+            let columns = to_rows
+                .as_ref()
+                .or(from_rows.as_ref())
+                .map_or(parsed_columns, |rows| rows.columns.clone());
+            let primary_key_columns = to_rows
+                .as_ref()
+                .or(from_rows.as_ref())
+                .map(|rows| rows.primary_key_columns.clone())
+                .unwrap_or_default();
+            let changes = diff_sqlite_rows(
+                from_rows.map(|rows| rows.rows).unwrap_or_default(),
+                to_rows.map(|rows| rows.rows).unwrap_or_default(),
+            );
+            (columns, primary_key_columns, changes)
+        } else {
+            let changes = match (from_entry, to_entry) {
+                (Some(from), Some(to)) => {
+                    diff_table_rows(from_reader, to_reader, &from_scanner, &to_scanner, from, to)?
+                }
+                (Some(from), None) => read_all_rows(from_reader, from.root_page)
+                    .map_err(|e| table_read_err("from", from, e))?
+                    .into_iter()
                     .map(|(rowid, row)| RowChange::Delete { rowid, row })
-                    .collect()
-            }
-            (None, Some(to)) => {
-                // New table, all rows are INSERT
-                let rows = read_all_rows(to_reader, to.root_page)
-                    .map_err(|e| table_read_err("to", to, e))?;
-                rows.into_iter()
+                    .collect(),
+                (None, Some(to)) => read_all_rows(to_reader, to.root_page)
+                    .map_err(|e| table_read_err("to", to, e))?
+                    .into_iter()
                     .map(|(rowid, row)| RowChange::Insert { rowid, row })
-                    .collect()
-            }
-            (None, None) => vec![],
+                    .collect(),
+                (None, None) => vec![],
+            };
+            (parsed_columns, Vec::new(), changes)
         };
 
         if !changes.is_empty() {
@@ -656,6 +978,7 @@ fn row_level_diff_from_readers(
                 rowid_alias,
                 generated_columns,
                 semantic_key_columns,
+                primary_key_columns,
                 changes,
             });
         }
@@ -831,6 +1154,172 @@ fn diff_table_rows(
     Ok(changes)
 }
 
+struct SqliteTableRows {
+    columns: Vec<String>,
+    primary_key_columns: Vec<String>,
+    rows: BTreeMap<RowIdentity, Record>,
+}
+
+fn read_sqlite_table_rows(
+    connection: &Connection,
+    entry: &MasterEntry,
+    side: &str,
+) -> Result<SqliteTableRows, graft::err::LogicalErr> {
+    let mut metadata = connection
+        .prepare("SELECT cid, name, pk, hidden FROM pragma_table_xinfo(?1) ORDER BY cid")
+        .map_err(|error| sqlite_snapshot_err(side, "prepare table metadata query for", error))?;
+    let column_metadata = metadata
+        .query_map([entry.name.as_str()], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .map_err(|error| sqlite_snapshot_err(side, "query table metadata from", error))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| sqlite_snapshot_err(side, "read table metadata from", error))?;
+    let columns: Vec<String> = column_metadata
+        .iter()
+        .filter(|(_, _, _, hidden)| *hidden != 1)
+        .map(|(_, name, _, _)| name.clone())
+        .collect();
+    let mut primary_key_metadata: Vec<_> = column_metadata
+        .iter()
+        .filter(|(_, _, ordinal, _)| *ordinal > 0)
+        .map(|(_, name, ordinal, _)| (*ordinal, name.clone()))
+        .collect();
+    primary_key_metadata.sort_by_key(|(ordinal, _)| *ordinal);
+    let mut primary_key_columns: Vec<String> = primary_key_metadata
+        .into_iter()
+        .map(|(_, name)| name)
+        .collect();
+    let without_rowid = is_without_rowid_table(entry);
+    if without_rowid && primary_key_columns.is_empty() {
+        return Err(graft::err::LogicalErr::Other(format!(
+            "WITHOUT ROWID table '{}' has no readable primary key",
+            entry.name
+        )));
+    }
+    if !without_rowid {
+        primary_key_columns.clear();
+    }
+
+    let projection = columns
+        .iter()
+        .map(|column| quote_identifier(column))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = if without_rowid {
+        format!("SELECT {projection} FROM {}", quote_identifier(&entry.name))
+    } else {
+        format!(
+            "SELECT rowid, {projection} FROM {}",
+            quote_identifier(&entry.name)
+        )
+    };
+    let mut statement = connection
+        .prepare(&sql)
+        .map_err(|error| sqlite_snapshot_err(side, "prepare table row query for", error))?;
+    let mut query = statement
+        .query([])
+        .map_err(|error| sqlite_snapshot_err(side, "query table rows from", error))?;
+    let mut rows = BTreeMap::new();
+    while let Some(row) = query
+        .next()
+        .map_err(|error| sqlite_snapshot_err(side, "read table rows from", error))?
+    {
+        let value_offset = if without_rowid { 0 } else { 1 };
+        let values = (0..columns.len())
+            .map(|index| sqlite_value(row.get_ref(index + value_offset)?))
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| sqlite_snapshot_err(side, "decode table rows from", error))?;
+        let record = Record { values };
+        let identity = if without_rowid {
+            let mut key = Vec::with_capacity(primary_key_columns.len());
+            for column in &primary_key_columns {
+                let index = columns
+                    .iter()
+                    .position(|candidate| candidate == column)
+                    .ok_or_else(|| {
+                        graft::err::LogicalErr::Other(format!(
+                            "Primary key column '{column}' is missing from table '{}'",
+                            entry.name
+                        ))
+                    })?;
+                key.push(PrimaryKeyPart {
+                    column: column.clone(),
+                    value: PrimaryKeyValue::from_value(&record.values[index]),
+                });
+            }
+            RowIdentity::PrimaryKey(key)
+        } else {
+            RowIdentity::Rowid(
+                row.get(0)
+                    .map_err(|error| sqlite_snapshot_err(side, "read rowid from", error))?,
+            )
+        };
+        rows.insert(identity, record);
+    }
+
+    Ok(SqliteTableRows { columns, primary_key_columns, rows })
+}
+
+fn sqlite_value(value: ValueRef<'_>) -> rusqlite::Result<Value> {
+    Ok(match value {
+        ValueRef::Null => Value::Null,
+        ValueRef::Integer(value) => Value::Integer(value),
+        ValueRef::Real(value) => Value::Real(value),
+        ValueRef::Text(value) => Value::Text(String::from_utf8_lossy(value).into_owned()),
+        ValueRef::Blob(value) => Value::Blob(value.to_vec()),
+    })
+}
+
+fn diff_sqlite_rows(
+    from_rows: BTreeMap<RowIdentity, Record>,
+    to_rows: BTreeMap<RowIdentity, Record>,
+) -> Vec<RowChange> {
+    let mut identities = std::collections::BTreeSet::new();
+    identities.extend(from_rows.keys().cloned());
+    identities.extend(to_rows.keys().cloned());
+    let mut changes = Vec::new();
+    for identity in identities {
+        match (from_rows.get(&identity), to_rows.get(&identity)) {
+            (Some(old_row), Some(new_row)) if old_row != new_row => match identity {
+                RowIdentity::Rowid(rowid) => changes.push(RowChange::Update {
+                    rowid,
+                    old_row: old_row.clone(),
+                    new_row: new_row.clone(),
+                }),
+                RowIdentity::PrimaryKey(key) => changes.push(RowChange::PrimaryKeyUpdate {
+                    key,
+                    old_row: old_row.clone(),
+                    new_row: new_row.clone(),
+                }),
+            },
+            (Some(row), None) => match identity {
+                RowIdentity::Rowid(rowid) => {
+                    changes.push(RowChange::Delete { rowid, row: row.clone() });
+                }
+                RowIdentity::PrimaryKey(key) => {
+                    changes.push(RowChange::PrimaryKeyDelete { key, row: row.clone() })
+                }
+            },
+            (None, Some(row)) => match identity {
+                RowIdentity::Rowid(rowid) => {
+                    changes.push(RowChange::Insert { rowid, row: row.clone() });
+                }
+                RowIdentity::PrimaryKey(key) => {
+                    changes.push(RowChange::PrimaryKeyInsert { key, row: row.clone() })
+                }
+            },
+            _ => {}
+        }
+    }
+    changes
+}
+
 fn changed_table_leaf_pages(
     from_reader: &dyn VolumeRead,
     to_reader: &dyn VolumeRead,
@@ -1002,15 +1491,6 @@ pub(crate) fn ignored_row_diff_table_infos(
         }
 
         if !is_virtual_table(entry) {
-            if is_without_rowid_table(entry) {
-                ignored
-                    .entry(entry.name.clone())
-                    .or_insert_with(|| IgnoredTable {
-                        name: entry.name.clone(),
-                        reason: OpaqueChangeReason::WithoutRowidTable,
-                        owner: None,
-                    });
-            }
             continue;
         }
 
@@ -1120,10 +1600,7 @@ fn opaque_table_change_kind(
         return None;
     }
 
-    if matches!(
-        reason,
-        OpaqueChangeReason::WithoutRowidTable | OpaqueChangeReason::SqliteInternalTable
-    ) {
+    if matches!(reason, OpaqueChangeReason::SqliteInternalTable) {
         return opaque_root_page_change_kind(from_reader, to_reader, from, to);
     }
 
@@ -1327,6 +1804,14 @@ fn format_sql_delete(table: &str, rowid: i64) -> String {
     )
 }
 
+fn format_sql_delete_by_primary_key(table: &str, key: &[PrimaryKeyPart]) -> String {
+    format!(
+        "DELETE FROM {} WHERE {};",
+        quote_identifier(table),
+        primary_key_predicate(key)
+    )
+}
+
 /// Format SQL UPDATE using column names and rowid
 fn format_sql_update(
     table: &str,
@@ -1351,6 +1836,51 @@ fn format_sql_update(
         set_clause.join(", "),
         rowid
     )
+}
+
+fn format_sql_update_by_primary_key(
+    table: &str,
+    columns: &[String],
+    generated_columns: &BTreeMap<String, GeneratedColumnKind>,
+    key: &[PrimaryKeyPart],
+    row: &Record,
+) -> String {
+    let key_columns: HashSet<&str> = key.iter().map(|part| part.column.as_str()).collect();
+    let set_clause: Vec<_> = writable_column_values(columns, generated_columns, row)
+        .into_iter()
+        .filter(|(column, _)| !key_columns.contains(column.as_str()))
+        .map(|(column, value)| format!("{} = {}", quote_identifier(column), value.to_sql()))
+        .collect();
+    if set_clause.is_empty() {
+        return String::new();
+    }
+    format!(
+        "UPDATE {} SET {} WHERE {};",
+        quote_identifier(table),
+        set_clause.join(", "),
+        primary_key_predicate(key)
+    )
+}
+
+fn primary_key_predicate(key: &[PrimaryKeyPart]) -> String {
+    key.iter()
+        .map(|part| match part.value {
+            PrimaryKeyValue::Null => format!("{} IS NULL", quote_identifier(&part.column)),
+            _ => format!(
+                "{} = {}",
+                quote_identifier(&part.column),
+                part.value.to_sql()
+            ),
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ")
+}
+
+fn format_primary_key(key: &[PrimaryKeyPart]) -> String {
+    key.iter()
+        .map(|part| format!("{}={}", quote_identifier(&part.column), part.value.to_sql()))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn writable_column_values<'a>(
@@ -1379,7 +1909,7 @@ fn writable_column_values<'a>(
 }
 
 /// Escape SQL identifier
-fn quote_identifier(id: &str) -> String {
+pub(crate) fn quote_identifier(id: &str) -> String {
     if id.chars().all(|c| c.is_alphanumeric() || c == '_')
         && !id.chars().next().unwrap().is_ascii_digit()
     {
@@ -1410,6 +1940,7 @@ mod tests {
                 rowid_alias: Some("id".into()),
                 generated_columns: BTreeMap::new(),
                 semantic_key_columns: vec![],
+                primary_key_columns: vec![],
                 changes: vec![
                     RowChange::Insert {
                         rowid: 1,
@@ -1444,6 +1975,7 @@ mod tests {
                 rowid_alias: Some("id".into()),
                 generated_columns: BTreeMap::new(),
                 semantic_key_columns: vec![],
+                primary_key_columns: vec![],
                 changes: vec![RowChange::Delete {
                     rowid: 1,
                     row: make_record(vec![Value::Integer(1), Value::Text("Alice".into())]),
@@ -1469,6 +2001,7 @@ mod tests {
                 rowid_alias: Some("id".into()),
                 generated_columns: BTreeMap::new(),
                 semantic_key_columns: vec![],
+                primary_key_columns: vec![],
                 changes: vec![RowChange::Update {
                     rowid: 1,
                     old_row: make_record(vec![Value::Integer(1), Value::Text("Alice".into())]),
@@ -1511,6 +2044,7 @@ mod tests {
             rowid_alias: Some("id".into()),
             generated_columns: BTreeMap::new(),
             semantic_key_columns: vec![],
+            primary_key_columns: vec![],
             changes: vec![
                 RowChange::Insert {
                     rowid: 1,

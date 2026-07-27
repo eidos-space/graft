@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use graft::{repo::CommitFileState, rt::runtime::Runtime};
 
 use crate::row_level_diff::{
-    InsertRowidMode, OpaqueChange, OpaqueChangeReason, RowChange, RowLevelDiff,
+    InsertRowidMode, OpaqueChange, OpaqueChangeReason, RowChange, RowIdentity, RowLevelDiff,
     RowLevelDiffLimitation, SchemaChange, SchemaChangeKind, TableChanges, row_level_diff_snapshots,
 };
 use crate::sqlite_parse::{
@@ -147,9 +147,9 @@ pub struct RowMergeConflict {
     pub reason: RowMergeConflictReason,
     pub table: String,
     pub columns: Vec<String>,
-    pub rowid: i64,
-    pub ours_rowid: i64,
-    pub theirs_rowid: i64,
+    pub identity: RowIdentity,
+    pub ours_identity: RowIdentity,
+    pub theirs_identity: RowIdentity,
     pub semantic_key: Option<Vec<String>>,
     pub ours: RowChangeKind,
     pub theirs: RowChangeKind,
@@ -160,14 +160,14 @@ pub struct RowMergeConflict {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowMergeConflictReason {
-    Rowid,
+    RowIdentity,
     SemanticKey,
 }
 
 impl RowMergeConflictReason {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Rowid => "row_conflict",
+            Self::RowIdentity => "row_conflict",
             Self::SemanticKey => "semantic_key_conflict",
         }
     }
@@ -349,13 +349,13 @@ impl RowMergePlan {
         &self,
         side: RowMergeSide,
         table_name: &str,
-        rowid: i64,
+        identity: &RowIdentity,
     ) -> Option<String> {
         let diff = match side {
             RowMergeSide::Ours => &self.ours_diff,
             RowMergeSide::Theirs => &self.theirs_diff,
         };
-        self.source_row_apply_sql(diff, table_name, rowid)
+        self.source_row_apply_sql(diff, table_name, identity)
     }
 
     fn source_apply_change_count(
@@ -448,13 +448,16 @@ impl RowMergePlan {
         &self,
         diff: &RowLevelDiff,
         table_name: &str,
-        rowid: i64,
+        identity: &RowIdentity,
     ) -> Option<String> {
         let table = diff
             .table_changes
             .iter()
             .find(|table| table.table_name == table_name)?;
-        let row = RowKey { table: table_name.to_string(), rowid };
+        let row = RowKey {
+            table: table_name.to_string(),
+            identity: identity.clone(),
+        };
         if !self.conflict_rows().contains(&row) {
             return None;
         }
@@ -503,11 +506,11 @@ impl RowMergePlan {
         for conflict in &self.analysis.conflicts {
             rows.insert(RowKey {
                 table: conflict.table.clone(),
-                rowid: conflict.ours_rowid,
+                identity: conflict.ours_identity.clone(),
             });
             rows.insert(RowKey {
                 table: conflict.table.clone(),
-                rowid: conflict.theirs_rowid,
+                identity: conflict.theirs_identity.clone(),
             });
         }
         rows
@@ -584,16 +587,16 @@ pub fn plan_snapshot_merge_with_policy(
             continue;
         }
         conflicts.push(RowMergeConflict {
-            reason: RowMergeConflictReason::Rowid,
+            reason: RowMergeConflictReason::RowIdentity,
             table: row.table.clone(),
             columns: if ours_change.columns.is_empty() {
                 theirs_change.columns.clone()
             } else {
                 ours_change.columns.clone()
             },
-            rowid: row.rowid,
-            ours_rowid: row.rowid,
-            theirs_rowid: row.rowid,
+            identity: row.identity.clone(),
+            ours_identity: row.identity.clone(),
+            theirs_identity: row.identity.clone(),
             semantic_key: ours_change
                 .semantic_key
                 .clone()
@@ -678,15 +681,17 @@ fn row_touches(
             .as_deref()
             .unwrap_or(&table.semantic_key_columns);
         for change in &table.changes {
-            let rowid = change.rowid();
             touches.insert(
-                RowKey { table: table.table_name.clone(), rowid },
+                RowKey {
+                    table: table.table_name.clone(),
+                    identity: change.identity(),
+                },
                 RowTouch {
                     kind: change.kind(),
                     change: change.clone(),
                     columns: table.columns.clone(),
                     semantic_key: semantic_change_key(&table.columns, semantic_key_columns, change),
-                    can_omit_insert_rowid: table.rowid_alias.is_none(),
+                    can_omit_insert_rowid: change.rowid().is_some() && table.rowid_alias.is_none(),
                 },
             );
         }
@@ -723,11 +728,11 @@ fn add_semantic_key_conflicts(
             [
                 RowKey {
                     table: conflict.table.clone(),
-                    rowid: conflict.ours_rowid,
+                    identity: conflict.ours_identity.clone(),
                 },
                 RowKey {
                     table: conflict.table.clone(),
-                    rowid: conflict.theirs_rowid,
+                    identity: conflict.theirs_identity.clone(),
                 },
             ]
         })
@@ -759,9 +764,9 @@ fn add_semantic_key_conflicts(
             } else {
                 ours_touch.columns.clone()
             },
-            rowid: ours_row.rowid,
-            ours_rowid: ours_row.rowid,
-            theirs_rowid: theirs_row.rowid,
+            identity: ours_row.identity.clone(),
+            ours_identity: ours_row.identity.clone(),
+            theirs_identity: theirs_row.identity.clone(),
             semantic_key: Some(semantic_key.clone()),
             ours: ours_touch.kind,
             theirs: theirs_touch.kind,
@@ -807,17 +812,25 @@ fn should_remap_theirs_insert_rowid(ours: &RowTouch, theirs: &RowTouch) -> bool 
 
 fn change_base_row(change: &RowChange) -> Option<Record> {
     match change {
-        RowChange::Insert { .. } => None,
-        RowChange::Delete { row, .. } => Some(row.clone()),
-        RowChange::Update { old_row, .. } => Some(old_row.clone()),
+        RowChange::Insert { .. } | RowChange::PrimaryKeyInsert { .. } => None,
+        RowChange::Delete { row, .. } | RowChange::PrimaryKeyDelete { row, .. } => {
+            Some(row.clone())
+        }
+        RowChange::Update { old_row, .. } | RowChange::PrimaryKeyUpdate { old_row, .. } => {
+            Some(old_row.clone())
+        }
     }
 }
 
 fn change_result_row(change: &RowChange) -> Option<Record> {
     match change {
-        RowChange::Insert { row, .. } => Some(row.clone()),
-        RowChange::Delete { .. } => None,
-        RowChange::Update { new_row, .. } => Some(new_row.clone()),
+        RowChange::Insert { row, .. } | RowChange::PrimaryKeyInsert { row, .. } => {
+            Some(row.clone())
+        }
+        RowChange::Delete { .. } | RowChange::PrimaryKeyDelete { .. } => None,
+        RowChange::Update { new_row, .. } | RowChange::PrimaryKeyUpdate { new_row, .. } => {
+            Some(new_row.clone())
+        }
     }
 }
 
@@ -1211,15 +1224,17 @@ fn semantic_change_key(
     change: &RowChange,
 ) -> Option<Vec<String>> {
     let preferred = match change {
-        RowChange::Insert { row, .. } => row,
-        RowChange::Delete { row, .. } => row,
-        RowChange::Update { old_row, .. } => old_row,
+        RowChange::Insert { row, .. } | RowChange::PrimaryKeyInsert { row, .. } => row,
+        RowChange::Delete { row, .. } | RowChange::PrimaryKeyDelete { row, .. } => row,
+        RowChange::Update { old_row, .. } | RowChange::PrimaryKeyUpdate { old_row, .. } => old_row,
     };
     if key_columns.is_empty() {
         return None;
     }
     semantic_record_key(columns, key_columns, preferred).or_else(|| match change {
-        RowChange::Update { new_row, .. } => semantic_record_key(columns, key_columns, new_row),
+        RowChange::Update { new_row, .. } | RowChange::PrimaryKeyUpdate { new_row, .. } => {
+            semantic_record_key(columns, key_columns, new_row)
+        }
         _ => None,
     })
 }
@@ -1254,14 +1269,14 @@ fn semantic_value_key(row: &Record, index: usize) -> Option<String> {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct RowKey {
     table: String,
-    rowid: i64,
+    identity: RowIdentity,
 }
 
 impl RowKey {
     fn from_change(table: &str, change: &RowChange) -> Self {
         Self {
             table: table.to_string(),
-            rowid: change.rowid(),
+            identity: change.identity(),
         }
     }
 }
@@ -1282,24 +1297,15 @@ struct RowTouch {
 }
 
 trait RowChangeExt {
-    fn rowid(&self) -> i64;
     fn kind(&self) -> RowChangeKind;
 }
 
 impl RowChangeExt for RowChange {
-    fn rowid(&self) -> i64 {
-        match self {
-            RowChange::Insert { rowid, .. }
-            | RowChange::Delete { rowid, .. }
-            | RowChange::Update { rowid, .. } => *rowid,
-        }
-    }
-
     fn kind(&self) -> RowChangeKind {
         match self {
-            RowChange::Insert { .. } => RowChangeKind::Insert,
-            RowChange::Delete { .. } => RowChangeKind::Delete,
-            RowChange::Update { .. } => RowChangeKind::Update,
+            RowChange::Insert { .. } | RowChange::PrimaryKeyInsert { .. } => RowChangeKind::Insert,
+            RowChange::Delete { .. } | RowChange::PrimaryKeyDelete { .. } => RowChangeKind::Delete,
+            RowChange::Update { .. } | RowChange::PrimaryKeyUpdate { .. } => RowChangeKind::Update,
         }
     }
 }

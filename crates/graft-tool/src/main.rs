@@ -416,8 +416,8 @@ enum Command {
         #[arg(long)]
         manual: bool,
 
-        /// Resolve one row conflict by table name and rowid
-        #[arg(long, num_args = 2, value_names = ["TABLE", "ROWID"])]
+        /// Resolve one row conflict by table name and rowid or JSON primary-key object
+        #[arg(long, num_args = 2, value_names = ["TABLE", "IDENTITY"])]
         row: Option<Vec<String>>,
 
         /// Optional repository-relative path; defaults to the database path
@@ -2283,9 +2283,12 @@ fn quote_pragma_path(path: &Path) -> Result<String> {
     let raw = path
         .to_str()
         .with_context(|| format!("repository path `{}` is not valid UTF-8", path.display()))?;
-    #[cfg(not(windows))]
-    let raw = raw.replace('"', "\\\"");
-    Ok(format!("\"{raw}\""))
+    Ok(quote_pragma_word(raw))
+}
+
+fn quote_pragma_word(raw: &str) -> String {
+    let escaped = raw.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
 }
 
 fn repo_export_arg(source: Option<&str>, output: &Path, path: Option<&Path>) -> String {
@@ -2315,17 +2318,17 @@ fn repo_resolve_arg(
     };
     let mut arg = side.to_string();
     if let Some(row) = row {
-        let [table, rowid] = row else {
-            bail!("resolve --row requires table and rowid");
+        let [table, identity] = row else {
+            bail!("resolve --row requires table and row identity");
         };
         arg.push_str(" --row ");
-        arg.push_str(table);
+        arg.push_str(&quote_pragma_word(table));
         arg.push(' ');
-        arg.push_str(rowid);
+        arg.push_str(&quote_pragma_word(identity));
     }
     if let Some(path) = path {
         arg.push(' ');
-        arg.push_str(&path.display().to_string());
+        arg.push_str(&quote_pragma_path(path)?);
     }
     Ok(arg)
 }
@@ -2602,7 +2605,7 @@ mod tests {
         assert_eq!(path, Some(PathBuf::from("app.db")));
         assert_eq!(
             repo_resolve_arg(ours, theirs, manual, row.as_deref(), path.as_deref()).unwrap(),
-            "--ours app.db"
+            "--ours \"app.db\""
         );
     }
 
@@ -2621,7 +2624,7 @@ mod tests {
         assert_eq!(path, Some(PathBuf::from("app.db")));
         assert_eq!(
             repo_resolve_arg(ours, theirs, manual, row.as_deref(), path.as_deref()).unwrap(),
-            "--manual app.db"
+            "--manual \"app.db\""
         );
 
         let cli = Cli::try_parse_from([
@@ -2640,9 +2643,28 @@ mod tests {
         assert_eq!(path, Some(PathBuf::from("app.db")));
         assert_eq!(
             repo_resolve_arg(ours, theirs, manual, row.as_deref(), path.as_deref()).unwrap(),
-            "--theirs --row docs 42 app.db"
+            "--theirs --row \"docs\" \"42\" \"app.db\""
         );
         assert_eq!(resolve_pragma(json), "json_resolve_conflict");
+    }
+
+    #[test]
+    fn serializes_resolve_row_with_spaced_table_and_path() {
+        let row = vec![
+            "project docs".to_string(),
+            r#"{"space_id":"space one","id":"doc-1"}"#.to_string(),
+        ];
+        assert_eq!(
+            repo_resolve_arg(
+                false,
+                true,
+                false,
+                Some(&row),
+                Some(Path::new("my app.eidos")),
+            )
+            .unwrap(),
+            r#"--theirs --row "project docs" "{\"space_id\":\"space one\",\"id\":\"doc-1\"}" "my app.eidos""#
+        );
     }
 
     #[test]
@@ -2702,7 +2724,7 @@ mod tests {
         assert_eq!(path, Some(PathBuf::from("app.db")));
         assert_eq!(
             repo_resolve_arg(ours, theirs, manual, row.as_deref(), path.as_deref()).unwrap(),
-            "--theirs app.db"
+            "--theirs \"app.db\""
         );
         assert_eq!(resolve_pragma(json), "json_resolve_conflict");
     }

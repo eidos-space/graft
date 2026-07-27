@@ -319,7 +319,10 @@ pub(super) fn format_repo_status(status: &RepoStatus) -> Result<String, ErrCtx> 
     }
     if !status.unstaged_changes.is_empty() {
         writeln!(&mut f, "Changes not staged for commit.")?;
-        writeln!(&mut f, "  (use 'pragma graft_add' to stage)")?;
+        writeln!(
+            &mut f,
+            "  (use 'graft add <path>' or 'graft add --all' to stage)"
+        )?;
         for change in &status.unstaged_changes {
             writeln!(
                 &mut f,
@@ -330,7 +333,10 @@ pub(super) fn format_repo_status(status: &RepoStatus) -> Result<String, ErrCtx> 
         }
     } else if !status.unstaged.is_empty() {
         writeln!(&mut f, "Changes not staged for commit.")?;
-        writeln!(&mut f, "  (use 'pragma graft_add' to stage)")?;
+        writeln!(
+            &mut f,
+            "  (use 'graft add <path>' or 'graft add --all' to stage)"
+        )?;
         for path in &status.unstaged {
             writeln!(&mut f, "  {path}")?;
         }
@@ -837,7 +843,7 @@ pub(super) fn format_conflicts(status: &RepoStatus) -> Result<String, ErrCtx> {
     writeln!(&mut f)?;
     writeln!(
         &mut f,
-        "Resolve a path with `pragma graft_resolve = \"--ours [path]\"`, `pragma graft_resolve = \"--theirs [path]\"`, or `pragma graft_resolve = \"--manual [path]\"`."
+        "Resolve a path with `graft resolve --ours <path>`, `graft resolve --theirs <path>`, or `graft resolve --manual <path>`."
     )?;
     Ok(f)
 }

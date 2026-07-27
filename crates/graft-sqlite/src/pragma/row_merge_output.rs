@@ -99,9 +99,9 @@ pub(super) fn format_current_file_row_merge_analysis(
         for conflict in &analysis.conflicts {
             writeln!(
                 &mut f,
-                "    {} rowid={} (ours {}, theirs {})",
+                "    {} {} (ours {}, theirs {})",
                 conflict.table,
-                conflict.rowid,
+                row_identity_label(&conflict.identity),
                 row_change_kind_label(conflict.ours),
                 row_change_kind_label(conflict.theirs)
             )?;
@@ -203,20 +203,35 @@ pub(super) fn current_file_row_merge_analysis(
         .analysis
         .conflicts
         .iter()
-        .map(|conflict| JsonRowMergeConflict {
-            reason: conflict.reason.as_str(),
-            table: conflict.table.clone(),
-            columns: conflict.columns.clone(),
-            rowid: conflict.rowid,
-            ours_rowid: (conflict.ours_rowid != conflict.rowid).then_some(conflict.ours_rowid),
-            theirs_rowid: (conflict.theirs_rowid != conflict.rowid)
-                .then_some(conflict.theirs_rowid),
-            semantic_key: conflict.semantic_key.clone(),
-            ours: row_change_kind_label(conflict.ours),
-            theirs: row_change_kind_label(conflict.theirs),
-            base_row: json_record_values_opt(conflict.base_row.as_ref()),
-            ours_row: json_record_values_opt(conflict.ours_row.as_ref()),
-            theirs_row: json_record_values_opt(conflict.theirs_row.as_ref()),
+        .map(|conflict| {
+            let (rowid, key) = json_row_identity(&conflict.identity);
+            let (ours_rowid, ours_key) = json_row_identity(&conflict.ours_identity);
+            let (theirs_rowid, theirs_key) = json_row_identity(&conflict.theirs_identity);
+            JsonRowMergeConflict {
+                reason: conflict.reason.as_str(),
+                table: conflict.table.clone(),
+                columns: conflict.columns.clone(),
+                rowid,
+                key,
+                ours_rowid: (conflict.ours_identity != conflict.identity)
+                    .then_some(ours_rowid)
+                    .flatten(),
+                theirs_rowid: (conflict.theirs_identity != conflict.identity)
+                    .then_some(theirs_rowid)
+                    .flatten(),
+                ours_key: (conflict.ours_identity != conflict.identity)
+                    .then_some(ours_key)
+                    .flatten(),
+                theirs_key: (conflict.theirs_identity != conflict.identity)
+                    .then_some(theirs_key)
+                    .flatten(),
+                semantic_key: conflict.semantic_key.clone(),
+                ours: row_change_kind_label(conflict.ours),
+                theirs: row_change_kind_label(conflict.theirs),
+                base_row: json_record_values_opt(conflict.base_row.as_ref()),
+                ours_row: json_record_values_opt(conflict.ours_row.as_ref()),
+                theirs_row: json_record_values_opt(conflict.theirs_row.as_ref()),
+            }
         })
         .collect();
     let schema_conflicts: Vec<JsonSchemaMergeConflict> = plan
@@ -468,7 +483,7 @@ pub(super) fn repo_path_conflict_artifacts(
                 .get(&row_conflict_resolution_key(
                     key,
                     &conflict.table,
-                    conflict.rowid,
+                    &conflict.identity,
                 ))
                 .and_then(|label| match label.as_str() {
                     "ours" => Some("ours"),
@@ -476,7 +491,12 @@ pub(super) fn repo_path_conflict_artifacts(
                     _ => None,
                 });
             artifacts.push(JsonConflictArtifact {
-                id: format!("{}:row:{}:{}", key, conflict.table, conflict.rowid),
+                id: format!(
+                    "{}:row:{}:{}",
+                    key,
+                    conflict.table,
+                    row_identity_label(&conflict.identity)
+                ),
                 path: key.to_string(),
                 path_kind: "sqlite_database",
                 storage: path_storage_label,
@@ -490,10 +510,20 @@ pub(super) fn repo_path_conflict_artifacts(
                 resolution,
                 table: Some(conflict.table.clone()),
                 columns: Some(conflict.columns.clone()).filter(|columns| !columns.is_empty()),
-                rowid: Some(conflict.rowid),
-                ours_rowid: (conflict.ours_rowid != conflict.rowid).then_some(conflict.ours_rowid),
-                theirs_rowid: (conflict.theirs_rowid != conflict.rowid)
-                    .then_some(conflict.theirs_rowid),
+                rowid: conflict.identity.rowid(),
+                ours_rowid: (conflict.ours_identity != conflict.identity)
+                    .then(|| conflict.ours_identity.rowid())
+                    .flatten(),
+                theirs_rowid: (conflict.theirs_identity != conflict.identity)
+                    .then(|| conflict.theirs_identity.rowid())
+                    .flatten(),
+                key: json_row_identity(&conflict.identity).1,
+                ours_key: (conflict.ours_identity != conflict.identity)
+                    .then(|| json_row_identity(&conflict.ours_identity).1)
+                    .flatten(),
+                theirs_key: (conflict.theirs_identity != conflict.identity)
+                    .then(|| json_row_identity(&conflict.theirs_identity).1)
+                    .flatten(),
                 semantic_key: conflict.semantic_key.clone(),
                 name: None,
                 entry_type: None,
@@ -524,6 +554,9 @@ pub(super) fn repo_path_conflict_artifacts(
                 rowid: None,
                 ours_rowid: None,
                 theirs_rowid: None,
+                key: None,
+                ours_key: None,
+                theirs_key: None,
                 semantic_key: None,
                 name: Some(conflict.name.clone()),
                 entry_type: Some(conflict.entry_type.clone()),
@@ -554,6 +587,9 @@ pub(super) fn repo_path_conflict_artifacts(
                 rowid: None,
                 ours_rowid: None,
                 theirs_rowid: None,
+                key: None,
+                ours_key: None,
+                theirs_key: None,
                 semantic_key: None,
                 name: Some(change.name.clone()),
                 entry_type: None,
@@ -618,6 +654,9 @@ pub(super) fn file_conflict_artifact(
         rowid: None,
         ours_rowid: None,
         theirs_rowid: None,
+        key: None,
+        ours_key: None,
+        theirs_key: None,
         semantic_key: None,
         name: None,
         entry_type: None,
@@ -643,6 +682,27 @@ pub(super) fn json_record_values_opt(
             .map(crate::json::JsonRowChange::value_to_json)
             .collect()
     })
+}
+
+fn json_row_identity(
+    identity: &crate::row_level_diff::RowIdentity,
+) -> (Option<i64>, Option<BTreeMap<String, serde_json::Value>>) {
+    match identity {
+        crate::row_level_diff::RowIdentity::Rowid(rowid) => (Some(*rowid), None),
+        crate::row_level_diff::RowIdentity::PrimaryKey(key) => (
+            None,
+            Some(
+                key.iter()
+                    .map(|part| {
+                        (
+                            part.column.clone(),
+                            crate::json::JsonRowChange::primary_key_value_to_json(&part.value),
+                        )
+                    })
+                    .collect(),
+            ),
+        ),
+    }
 }
 
 pub(super) fn json_schema_column_changes(
@@ -681,9 +741,6 @@ pub(super) fn opaque_conflict_message(
         }
         crate::row_level_diff::OpaqueChangeReason::FtsShadowTable => {
             "FTS shadow table changes must be rebuilt or resolved with their owner table"
-        }
-        crate::row_level_diff::OpaqueChangeReason::WithoutRowidTable => {
-            "WITHOUT ROWID table changes are outside row-level merge support"
         }
         crate::row_level_diff::OpaqueChangeReason::SqliteInternalTable => {
             "SQLite internal table changes require an explicit resolver policy"

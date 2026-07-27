@@ -2415,67 +2415,7 @@ impl GraftCommand {
                                 .map_err(|e| {
                                     ErrCtx::PragmaErr(format!("Diff error: {e:?}").into())
                                 })?;
-                        let tables: Vec<crate::json::JsonTableChanges> = diff
-                            .table_changes
-                            .iter()
-                            .map(|t| {
-                                let changes: Vec<crate::json::JsonRowChange> = t
-                                    .changes
-                                    .iter()
-                                    .map(|c| match c {
-                                        crate::row_level_diff::RowChange::Insert { rowid, row } => {
-                                            crate::json::JsonRowChange {
-                                                op: "insert".into(),
-                                                rowid: *rowid,
-                                                values: row
-                                                    .values
-                                                    .iter()
-                                                    .map(crate::json::JsonRowChange::value_to_json)
-                                                    .collect(),
-                                                old_values: None,
-                                            }
-                                        }
-                                        crate::row_level_diff::RowChange::Delete { rowid, row } => {
-                                            crate::json::JsonRowChange {
-                                                op: "delete".into(),
-                                                rowid: *rowid,
-                                                values: row
-                                                    .values
-                                                    .iter()
-                                                    .map(crate::json::JsonRowChange::value_to_json)
-                                                    .collect(),
-                                                old_values: None,
-                                            }
-                                        }
-                                        crate::row_level_diff::RowChange::Update {
-                                            rowid,
-                                            old_row,
-                                            new_row,
-                                        } => crate::json::JsonRowChange {
-                                            op: "update".into(),
-                                            rowid: *rowid,
-                                            values: new_row
-                                                .values
-                                                .iter()
-                                                .map(crate::json::JsonRowChange::value_to_json)
-                                                .collect(),
-                                            old_values: Some(
-                                                old_row
-                                                    .values
-                                                    .iter()
-                                                    .map(crate::json::JsonRowChange::value_to_json)
-                                                    .collect(),
-                                            ),
-                                        },
-                                    })
-                                    .collect();
-                                crate::json::JsonTableChanges {
-                                    name: t.table_name.clone(),
-                                    columns: t.columns.clone(),
-                                    changes,
-                                }
-                            })
-                            .collect();
+                        let tables = json_table_changes(&diff.table_changes);
                         let result = crate::json::JsonRowDiffResult {
                             from_lsn: from.to_u64(),
                             to_lsn: to.to_u64(),

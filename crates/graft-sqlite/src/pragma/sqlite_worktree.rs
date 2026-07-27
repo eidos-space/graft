@@ -134,12 +134,14 @@ fn validate_sqlite_header(path: &Path, header: &[u8; 100]) -> Result<(), ErrCtx>
     }
 
     let sqlite_page_size = sqlite_page_size_from_header(header);
-    let graft_page_size = PAGESIZE.as_usize() as u32;
-    if sqlite_page_size != graft_page_size {
-        return Err(ErrCtx::PragmaErr(format!(
-            "cannot store SQLite database `{}`: page size is {sqlite_page_size} bytes, but Graft requires {graft_page_size} bytes",
-            path.display()
-        ).into()));
+    if !(512..=65_536).contains(&sqlite_page_size) || !sqlite_page_size.is_power_of_two() {
+        return Err(ErrCtx::PragmaErr(
+            format!(
+                "SQLite database `{}` declares invalid page size {sqlite_page_size}",
+                path.display()
+            )
+            .into(),
+        ));
     }
     Ok(())
 }

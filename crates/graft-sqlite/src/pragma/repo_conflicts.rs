@@ -180,16 +180,15 @@ pub(super) fn resolve_repo_row_conflict(
             "row conflict resolution is not available with schema or opaque conflicts".into(),
         ));
     }
-    let requested_conflict = plan
-        .analysis
-        .conflicts
-        .iter()
-        .find(|conflict| conflict.table == row.table && conflict.rowid == row.rowid);
+    let requested_conflict = plan.analysis.conflicts.iter().find(|conflict| {
+        conflict.table == row.table && row_identities_match(&conflict.identity, &row.identity)
+    });
     let Some(requested_conflict) = requested_conflict else {
         return Err(ErrCtx::PragmaErr(
             format!(
-                "path `{key}` has no row conflict for {} rowid={}",
-                row.table, row.rowid
+                "path `{key}` has no row conflict for {} {}",
+                row.table,
+                row_identity_label(&row.identity)
             )
             .into(),
         ));
@@ -197,15 +196,16 @@ pub(super) fn resolve_repo_row_conflict(
     if requested_conflict.reason == crate::row_merge::RowMergeConflictReason::SemanticKey {
         return Err(ErrCtx::PragmaErr(
             format!(
-                "semantic key conflict for {} rowid={} requires manual file resolution",
-                row.table, row.rowid
+                "semantic key conflict for {} {} requires manual file resolution",
+                row.table,
+                row_identity_label(&row.identity)
             )
             .into(),
         ));
     }
 
     resolution_state.rows.insert(
-        row_conflict_resolution_key(key, &row.table, row.rowid),
+        row_conflict_resolution_key(key, &row.table, &requested_conflict.identity),
         side.label().to_string(),
     );
     let merged = materialize_row_conflict_resolution_state(
@@ -231,6 +231,30 @@ pub(super) fn resolve_repo_row_conflict(
 
     write_row_conflict_resolution_state(repo, &resolution_state)?;
     Ok(key.to_string())
+}
+
+fn row_identities_match(
+    left: &crate::row_level_diff::RowIdentity,
+    right: &crate::row_level_diff::RowIdentity,
+) -> bool {
+    match (left, right) {
+        (
+            crate::row_level_diff::RowIdentity::Rowid(left),
+            crate::row_level_diff::RowIdentity::Rowid(right),
+        ) => left == right,
+        (
+            crate::row_level_diff::RowIdentity::PrimaryKey(left),
+            crate::row_level_diff::RowIdentity::PrimaryKey(right),
+        ) => {
+            left.len() == right.len()
+                && left.iter().all(|left_part| {
+                    right.iter().any(|right_part| {
+                        left_part.column == right_part.column && left_part.value == right_part.value
+                    })
+                })
+        }
+        _ => false,
+    }
 }
 
 pub(super) fn row_resolved_conflict_file_state(
@@ -273,18 +297,20 @@ pub(super) fn materialize_row_conflict_resolution_state(
 ) -> Result<CommitFileState, ErrCtx> {
     let mut sql = plan.theirs_apply_sql();
     for conflict in &plan.analysis.conflicts {
-        let selection_key = row_conflict_resolution_key(key, &conflict.table, conflict.rowid);
+        let selection_key = row_conflict_resolution_key(key, &conflict.table, &conflict.identity);
         let Some(selection) = resolution_state.rows.get(&selection_key) else {
             continue;
         };
         let Some(side) = row_merge_side_from_label(selection) else {
             continue;
         };
-        let Some(row_sql) = plan.conflict_apply_sql(side, &conflict.table, conflict.rowid) else {
+        let Some(row_sql) = plan.conflict_apply_sql(side, &conflict.table, &conflict.identity)
+        else {
             return Err(ErrCtx::PragmaErr(
                 format!(
-                    "could not generate row resolution for {} rowid={}",
-                    conflict.table, conflict.rowid
+                    "could not generate row resolution for {} {}",
+                    conflict.table,
+                    row_identity_label(&conflict.identity)
                 )
                 .into(),
             ));
@@ -309,7 +335,7 @@ pub(super) fn unresolved_row_conflict_count(
                 .contains_key(&row_conflict_resolution_key(
                     key,
                     &conflict.table,
-                    conflict.rowid,
+                    &conflict.identity,
                 ))
         })
         .count()
@@ -374,8 +400,47 @@ pub(super) fn plan_repo_snapshot_merge(
     )?)
 }
 
-pub(super) fn row_conflict_resolution_key(path: &str, table: &str, rowid: i64) -> String {
-    format!("{path}\u{1f}{table}\u{1f}{rowid}")
+pub(super) fn row_conflict_resolution_key(
+    path: &str,
+    table: &str,
+    identity: &crate::row_level_diff::RowIdentity,
+) -> String {
+    format!("{path}\u{1f}{table}\u{1f}{}", row_identity_token(identity))
+}
+
+pub(super) fn row_identity_label(identity: &crate::row_level_diff::RowIdentity) -> String {
+    match identity {
+        crate::row_level_diff::RowIdentity::Rowid(rowid) => format!("rowid={rowid}"),
+        crate::row_level_diff::RowIdentity::PrimaryKey(key) => {
+            let values = key
+                .iter()
+                .map(|part| format!("{}={:?}", part.column, part.value.to_value()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("key=({values})")
+        }
+    }
+}
+
+fn row_identity_token(identity: &crate::row_level_diff::RowIdentity) -> String {
+    match identity {
+        crate::row_level_diff::RowIdentity::Rowid(rowid) => format!("rowid:{rowid}"),
+        crate::row_level_diff::RowIdentity::PrimaryKey(key) => {
+            let key = key
+                .iter()
+                .map(|part| {
+                    (
+                        part.column.clone(),
+                        crate::json::JsonRowChange::primary_key_value_to_json(&part.value),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            format!(
+                "key:{}",
+                serde_json::to_string(&key).expect("primary key serializes")
+            )
+        }
+    }
 }
 
 pub(super) fn row_conflict_resolution_state_path(repo: &Repository) -> PathBuf {

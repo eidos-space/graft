@@ -413,7 +413,7 @@ fn import_physical_sqlite_file_as_volume(
     if sqlite_page_size != graft_page_size {
         return Err(ErrCtx::PragmaErr(
             format!(
-                "SQLite database `{}` uses page size {sqlite_page_size}, but Graft requires {graft_page_size}",
+                "SQLite database `{}` uses page size {sqlite_page_size}, but the Graft VFS write path requires {graft_page_size}",
                 path.display()
             )
             .into(),

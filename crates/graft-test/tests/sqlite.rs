@@ -6495,7 +6495,7 @@ fn test_repo_checkout_path_rejects_untracked_file_overwrite() {
 }
 
 #[test]
-fn test_repo_add_physical_sqlite_file_rejects_non_graft_page_size() {
+fn test_repo_add_and_diff_physical_sqlite_file_with_8192_page_size() {
     graft_test::ensure_test_env();
 
     let temp_dir = tempfile::tempdir().unwrap();
@@ -6513,15 +6513,43 @@ fn test_repo_add_physical_sqlite_file_rejects_non_graft_page_size() {
             .execute_batch(
                 r#"
                 PRAGMA page_size=8192;
-                CREATE TABLE external_data (id INTEGER PRIMARY KEY);
+                CREATE TABLE external_data (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+                INSERT INTO external_data (id, name) VALUES (1, 'v1');
                 "#,
             )
             .unwrap();
     }
 
-    let err = pragma_arg_error(&sqlite, "graft_add", "external.db");
-    assert!(err.contains("page size is 8192 bytes"), "{err}");
-    assert!(err.contains("Graft requires 4096 bytes"), "{err}");
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_add", "external.db"),
+        "Added external.db"
+    );
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "external v1").contains("external v1"));
+
+    {
+        let external = Connection::open(&external_db).unwrap();
+        external
+            .execute("UPDATE external_data SET name = 'v2' WHERE id = 1", [])
+            .unwrap();
+    }
+
+    let diff: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_diff",
+        "--rows HEAD -- external.db",
+    ))
+    .expect("8192-byte-page SQLite row diff should be available");
+    let file = &diff["files"][0];
+    assert_eq!(file["path"], "external.db");
+    assert_eq!(file["row_diff_available"], true, "{diff}");
+    assert_eq!(file["logical_status"], "logical_changes", "{diff}");
+    assert_eq!(file["tables"][0]["name"], "external_data", "{diff}");
+    assert_eq!(file["tables"][0]["changes"][0]["op"], "update", "{diff}");
+    assert_eq!(
+        file["tables"][0]["changes"][0]["values"],
+        serde_json::json!([1, "v2"]),
+        "{diff}"
+    );
 
     runtime.shutdown().unwrap();
 }
@@ -10404,7 +10432,7 @@ fn test_repo_resolve_materializes_physical_sqlite_conflict_side() {
 
     let conflicts = pragma_query_string(&sqlite, "graft_conflicts");
     assert!(conflicts.contains("external.db"));
-    assert!(conflicts.contains("--theirs [path]"));
+    assert!(conflicts.contains("graft resolve --theirs <path>"));
     let conflicts: Value =
         serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_conflicts"))
             .expect("graft_json_conflicts should return conflict artifact JSON");
@@ -11251,7 +11279,7 @@ fn test_repo_row_merge_reports_schema_modify_conflict_reason() {
 }
 
 #[test]
-fn test_repo_row_merge_reports_opaque_conflict_artifact_details() {
+fn test_repo_row_auto_merge_supports_strict_without_rowid_composite_primary_keys() {
     graft_test::ensure_test_env();
 
     let temp_dir = tempfile::tempdir().unwrap();
@@ -11265,106 +11293,178 @@ fn test_repo_row_merge_reports_opaque_conflict_artifact_details() {
     sqlite
         .execute_batch(
             r#"
-            CREATE TABLE repo_opaque_marker (
-              id INTEGER PRIMARY KEY,
-              body TEXT NOT NULL
-            );
-            CREATE TABLE repo_opaque_docs (
-              id TEXT PRIMARY KEY,
-              body TEXT NOT NULL
-            ) WITHOUT ROWID;
-            INSERT INTO repo_opaque_marker (id, body) VALUES (1, 'base');
-            INSERT INTO repo_opaque_docs (id, body) VALUES ('doc-1', 'base');
+            CREATE TABLE repo_primary_key_docs (
+              space_id TEXT NOT NULL,
+              id TEXT NOT NULL,
+              body TEXT NOT NULL,
+              PRIMARY KEY (space_id, id)
+            ) STRICT, WITHOUT ROWID;
+            INSERT INTO repo_primary_key_docs (space_id, id, body) VALUES
+              ('space-1', 'doc-1', 'base one'),
+              ('space-1', 'doc-2', 'base two');
             "#,
         )
         .unwrap();
     pragma_query_string(&sqlite, "graft_add");
-    assert!(pragma_arg_string(&sqlite, "graft_commit", "base opaque docs").contains("base"));
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "base primary key docs").contains("base"));
 
     assert!(
-        pragma_arg_string(
-            &sqlite,
-            "graft_branch_create",
-            "feature/opaque-without-rowid"
-        )
-        .contains("feature")
+        pragma_arg_string(&sqlite, "graft_branch_create", "feature/primary-key")
+            .contains("feature")
     );
     assert!(
-        pragma_arg_string(
-            &sqlite,
-            "graft_switch_branch",
-            "feature/opaque-without-rowid"
-        )
-        .contains("feature")
+        pragma_arg_string(&sqlite, "graft_switch_branch", "feature/primary-key")
+            .contains("feature")
     );
     sqlite
         .execute(
-            "UPDATE repo_opaque_docs SET body = 'feature' WHERE id = 'doc-1'",
+            "UPDATE repo_primary_key_docs SET body = 'feature one' WHERE space_id = 'space-1' AND id = 'doc-1'",
             [],
         )
         .unwrap();
     pragma_query_string(&sqlite, "graft_add");
     assert!(
-        pragma_arg_string(&sqlite, "graft_commit", "feature opaque update").contains("feature")
+        pragma_arg_string(&sqlite, "graft_commit", "feature primary key update")
+            .contains("feature")
     );
 
     assert!(pragma_arg_string(&sqlite, "graft_switch_branch", "main").contains("main"));
     sqlite
         .execute(
-            "UPDATE repo_opaque_marker SET body = 'main' WHERE id = 1",
+            "UPDATE repo_primary_key_docs SET body = 'main two' WHERE space_id = 'space-1' AND id = 'doc-2'",
             [],
         )
         .unwrap();
     pragma_query_string(&sqlite, "graft_add");
-    assert!(pragma_arg_string(&sqlite, "graft_commit", "main marker update").contains("main"));
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "main primary key update").contains("main"));
 
-    let merge = pragma_arg_string(&sqlite, "graft_merge", "feature/opaque-without-rowid");
+    let merge = pragma_arg_string(&sqlite, "graft_merge", "feature/primary-key");
+    assert!(merge.contains("Row-level auto-merged app.db:"), "{merge}");
+    assert!(
+        merge.contains("applied 1 row change(s) from theirs"),
+        "{merge}"
+    );
+    assert!(!merge.contains("Unmerged paths:"), "{merge}");
+
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return JSON");
+    assert_eq!(
+        status["conflicted"].as_array().unwrap().len(),
+        0,
+        "{status}"
+    );
+    assert_eq!(status["staged"][0], "app.db", "{status}");
+
+    let rows: Vec<(String, String)> = {
+        let mut statement = sqlite
+            .prepare("SELECT id, body FROM repo_primary_key_docs ORDER BY id")
+            .unwrap();
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    assert_eq!(
+        rows,
+        vec![
+            ("doc-1".to_string(), "feature one".to_string()),
+            ("doc-2".to_string(), "main two".to_string()),
+        ]
+    );
+
+    let continued = pragma_arg_string(&sqlite, "graft_merge_continue", "merge primary key changes");
+    assert!(continued.contains("Merge commit"), "{continued}");
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_repo_row_conflict_resolves_without_rowid_primary_key_selector() {
+    graft_test::ensure_test_env();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("app.db");
+    let db_name = db_path.to_str().unwrap();
+
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite(db_name, None);
+    assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
+    sqlite
+        .execute_batch(
+            r#"
+            CREATE TABLE repo_primary_key_conflict (
+              space_id TEXT NOT NULL,
+              id TEXT NOT NULL,
+              body TEXT NOT NULL,
+              PRIMARY KEY (space_id, id)
+            ) STRICT, WITHOUT ROWID;
+            INSERT INTO repo_primary_key_conflict (space_id, id, body)
+            VALUES ('space-1', 'doc-1', 'base');
+            "#,
+        )
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "base key conflict").contains("base"));
+
+    assert!(
+        pragma_arg_string(&sqlite, "graft_branch_create", "feature/key-conflict")
+            .contains("feature")
+    );
+    assert!(
+        pragma_arg_string(&sqlite, "graft_switch_branch", "feature/key-conflict")
+            .contains("feature")
+    );
+    sqlite
+        .execute(
+            "UPDATE repo_primary_key_conflict SET body = 'feature' WHERE space_id = 'space-1' AND id = 'doc-1'",
+            [],
+        )
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "feature key update").contains("feature"));
+
+    assert!(pragma_arg_string(&sqlite, "graft_switch_branch", "main").contains("main"));
+    sqlite
+        .execute(
+            "UPDATE repo_primary_key_conflict SET body = 'main' WHERE space_id = 'space-1' AND id = 'doc-1'",
+            [],
+        )
+        .unwrap();
+    pragma_query_string(&sqlite, "graft_add");
+    assert!(pragma_arg_string(&sqlite, "graft_commit", "main key update").contains("main"));
+
+    let merge = pragma_arg_string(&sqlite, "graft_merge", "feature/key-conflict");
     assert!(merge.contains("Unmerged paths:"), "{merge}");
 
     let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
         .expect("graft_json_status should return JSON");
-    assert_eq!(status["conflict_analysis"]["can_auto_merge"], false);
-    assert_eq!(status["conflict_analysis"]["opaque_changes"], 1);
-    assert!(
-        status["conflict_analysis"]["blocked_reasons"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|reason| reason == "opaque_changes"),
-        "opaque changes should block auto merge: {status}"
+    let conflict = &status["conflict_analysis"]["row_conflicts"][0];
+    assert_eq!(conflict["table"], "repo_primary_key_conflict", "{status}");
+    assert_eq!(
+        conflict["key"],
+        serde_json::json!({"space_id": "space-1", "id": "doc-1"}),
+        "{status}"
     );
-    assert!(
-        status["conflict_analysis"]["limitations"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|limitation| {
-                limitation["kind"] == "without_rowid_table"
-                    && limitation["subject"] == "repo_opaque_docs"
-            }),
-        "merge analysis should expose unsupported opaque surface: {status}"
-    );
+    assert!(conflict.get("rowid").is_none(), "{status}");
 
-    let conflicts: Value =
-        serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_conflicts"))
-            .expect("graft_json_conflicts should return JSON");
-    let artifact = conflicts["conflicts"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|artifact| artifact["kind"] == "opaque")
-        .expect("opaque conflict artifact should be present");
-    assert_eq!(artifact["reason"], "without_rowid_table");
-    assert_eq!(artifact["name"], "repo_opaque_docs");
-    assert_eq!(artifact["change"], "modified");
-    assert_eq!(artifact["status"], "unresolved");
-    assert!(
-        artifact["message"]
-            .as_str()
-            .unwrap()
-            .contains("WITHOUT ROWID"),
-        "opaque artifact message should explain resolver boundary: {conflicts}"
+    let resolved = pragma_arg_string(
+        &sqlite,
+        "graft_resolve",
+        r#"--theirs --row repo_primary_key_conflict '{"id":"doc-1","space_id":"space-1"}'"#,
     );
+    assert!(resolved.contains("Resolved"), "{resolved}");
+    let body: String = sqlite
+        .query_row(
+            "SELECT body FROM repo_primary_key_conflict WHERE space_id = 'space-1' AND id = 'doc-1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(body, "feature");
+
+    let continued = pragma_arg_string(&sqlite, "graft_merge_continue", "resolve key conflict");
+    assert!(continued.contains("Merge commit"), "{continued}");
 
     runtime.shutdown().unwrap();
 }
@@ -12428,7 +12528,7 @@ fn test_repo_row_diff_reports_file_changed_without_supported_logical_changes() {
 }
 
 #[test]
-fn test_json_row_diff_reports_without_rowid_as_unsupported_surface() {
+fn test_json_row_diff_reports_without_rowid_primary_key_updates() {
     graft_test::ensure_test_env();
 
     let mut runtime = GraftTestRuntime::with_memory_remote();
@@ -12472,22 +12572,32 @@ fn test_json_row_diff_reports_without_rowid_as_unsupported_surface() {
         format!("{from_lsn},{to_lsn},rows"),
     ))
     .expect("row diff should return JSON for WITHOUT ROWID changes");
-    assert_eq!(diff["logical_status"], "unsupported_logical_surface");
-    assert_eq!(diff["tables"].as_array().unwrap().len(), 0);
+    assert_eq!(diff["logical_status"], "logical_changes");
+    let table = diff["tables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|table| table["name"] == "without_rowid_docs")
+        .expect("WITHOUT ROWID table should have logical row changes");
+    assert_eq!(table["primary_key_columns"], serde_json::json!(["id"]));
+    let change = &table["changes"][0];
+    assert_eq!(change["op"], "update");
+    assert_eq!(change["key"], serde_json::json!({ "id": "doc-1" }));
+    assert!(change.get("rowid").is_none());
+    assert_eq!(change["old_values"], serde_json::json!(["doc-1", "alpha"]));
+    assert_eq!(change["values"], serde_json::json!(["doc-1", "beta"]));
     assert!(
-        diff["opaque_changes"]
+        !diff["opaque_changes"]
             .as_array()
             .unwrap()
             .iter()
             .any(|change| {
-                change["name"] == "without_rowid_docs"
-                    && change["reason"] == "without_rowid_table"
-                    && change["change"] == "modified"
+                change["name"] == "without_rowid_docs" && change["reason"] == "without_rowid_table"
             }),
-        "WITHOUT ROWID table changes should be opaque: {diff}"
+        "WITHOUT ROWID table changes should not remain opaque: {diff}"
     );
     assert!(
-        diff["limitations"]
+        !diff["limitations"]
             .as_array()
             .unwrap()
             .iter()
@@ -12495,7 +12605,15 @@ fn test_json_row_diff_reports_without_rowid_as_unsupported_surface() {
                 limitation["kind"] == "without_rowid_table"
                     && limitation["subject"] == "without_rowid_docs"
             }),
-        "WITHOUT ROWID limitation should be explicit: {diff}"
+        "supported WITHOUT ROWID tables should not be limitations: {diff}"
+    );
+    assert!(
+        diff["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|capability| capability == "primary_key_table_rows"),
+        "WITHOUT ROWID support should be advertised: {diff}"
     );
 
     runtime.shutdown().unwrap();
