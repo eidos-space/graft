@@ -232,7 +232,9 @@ An annotated `graft-sdk-vX.Y.Z` tag on a commit already merged into `main` start
 `.github/workflows/sdk-release.yml`. The workflow builds every advertised target, tests each
 binary on Node.js 20 and 24, assembles and verifies all optional packages, publishes platform
 packages before the root package, creates a GitHub SDK release with checksums, then installs the
-public root package on every supported platform and opens a repository session.
+public root package on every supported platform and opens a repository session. After each npm
+publish, the job allows up to ten minutes for the immutable version to become visible through the
+registry read path before it advances to the next package.
 
 See [`RELEASE.md`](https://github.com/eidos-space/graft/blob/main/RELEASE.md) for the first-publish
 credential bootstrap, npm trusted publisher configuration, partial-release recovery, and

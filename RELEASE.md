@@ -115,6 +115,12 @@ npm versions are immutable and multi-package publication is not atomic. If the w
 4. the release script skips versions already visible on npm and publishes only missing packages;
 5. never publish different bytes under a platform/version that already exists.
 
+New package names can return a successful publish response before their packument is visible from
+the registry read path. The release script polls for up to ten minutes after every publish and logs
+progress once per minute. Do not retry while that visibility check is active: an early retry can
+receive `E403` because the immutable version already exists even though `npm view` still returns
+`E404`.
+
 The root package is always published last, after all platform packages are visible. If the root
 exists while a platform package is missing, publish that unchanged platform artifact immediately
 or deprecate the incomplete root version.
