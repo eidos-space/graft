@@ -34,9 +34,10 @@ pub(super) fn run_repo_checkout(
             verify_repo_checkout_plan(runtime, &plan, None)?;
             let previous_files = current_repo_files_for_checkout(&repo)?;
             let previous_artifacts = current_repo_artifacts_for_checkout(&repo)?;
-            let _sqlite_replacement_guards =
+            let mut _sqlite_replacement_guards =
                 preflight_workspace_checkout(&repo, &plan, &previous_files)?;
             let id = repo.apply_detach_plan(&rev, &plan)?;
+            release_sqlite_guards_for_filesystem_change(&mut _sqlite_replacement_guards);
             checkout_repo_plan(
                 runtime,
                 file,
@@ -411,7 +412,7 @@ pub(super) fn run_repo_reset(
     } else {
         Vec::new()
     };
-    let _sqlite_replacement_guards = matches!(mode, ResetMode::Hard)
+    let mut _sqlite_replacement_guards = matches!(mode, ResetMode::Hard)
         .then(|| preflight_workspace_checkout(&repo, &plan.checkout, &previous_files))
         .transpose()?;
     let outcome = repo.apply_reset_plan(&plan)?;
@@ -441,6 +442,9 @@ pub(super) fn run_repo_reset(
             }
         }
         ResetMode::Hard => {
+            if let Some(guards) = _sqlite_replacement_guards.as_mut() {
+                release_sqlite_guards_for_filesystem_change(guards);
+            }
             checkout_repo_plan(
                 runtime,
                 file,
@@ -859,6 +863,12 @@ pub(super) fn preflight_workspace_checkout(
         repo.verify_artifact_state(state)?;
     }
     Ok(guards)
+}
+
+pub(super) fn release_sqlite_guards_for_filesystem_change(guards: &mut [SqliteReplacementGuard]) {
+    for guard in guards {
+        guard.release_for_filesystem_change();
+    }
 }
 
 struct WorkspacePhysicalBackups {
@@ -1995,11 +2005,10 @@ fn write_sqlite_file_to_path_inner(
         })();
 
         match write_result.and_then(|()| {
-            let _replacement_guard = prepare_replacement
+            let replacement_guard = prepare_replacement
                 .then(|| prepare_sqlite_path_for_replacement(path))
                 .transpose()?;
-            std::fs::rename(&tmp, path)?;
-            Ok(())
+            replace_prepared_sqlite_file(&tmp, path, replacement_guard)
         }) {
             Ok(()) => return Ok(()),
             Err(err) => {
@@ -2016,6 +2025,59 @@ fn write_sqlite_file_to_path_inner(
         )
         .into(),
     ))
+}
+
+fn replace_prepared_sqlite_file(
+    temporary: &Path,
+    destination: &Path,
+    guard: Option<SqliteReplacementGuard>,
+) -> Result<(), ErrCtx> {
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _guard = guard;
+        std::fs::rename(temporary, destination)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let mut guard = guard;
+        if let Some(guard) = guard.as_mut() {
+            guard.release_for_filesystem_change();
+        }
+
+        let backup = temporary.with_extension("graft-replaced");
+        match std::fs::rename(destination, &backup) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::rename(temporary, destination)?;
+                return Ok(());
+            }
+            Err(err) => return Err(err.into()),
+        }
+
+        if let Err(replace_error) = std::fs::rename(temporary, destination) {
+            if let Err(restore_error) = std::fs::rename(&backup, destination) {
+                return Err(ErrCtx::PragmaErr(
+                    format!(
+                        "failed to replace SQLite database `{}`: {replace_error}; \
+                         failed to restore the original database: {restore_error}",
+                        destination.display()
+                    )
+                    .into(),
+                ));
+            }
+            return Err(replace_error.into());
+        }
+
+        if let Err(err) = std::fs::remove_file(&backup) {
+            tracing::warn!(
+                path = %backup.display(),
+                "failed to remove replaced SQLite backup: {err}"
+            );
+        }
+        Ok(())
+    }
 }
 
 pub(super) fn write_repo_file_state_to_path(
@@ -2132,4 +2194,23 @@ fn checkout_merged_repo_paths(
         &previous_artifacts,
         remote,
     )
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn prepared_sqlite_replacement_overwrites_an_existing_windows_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("worktree.sqlite");
+        let temporary = directory.path().join("checkout.sqlite");
+        std::fs::write(&destination, b"old").unwrap();
+        std::fs::write(&temporary, b"new").unwrap();
+
+        replace_prepared_sqlite_file(&temporary, &destination, None).unwrap();
+
+        assert_eq!(std::fs::read(destination).unwrap(), b"new");
+        assert!(!temporary.exists());
+    }
 }

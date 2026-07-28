@@ -1,0 +1,99 @@
+---
+title: Node.js 与 Electron SDK
+description: 在 Node.js 与 Electron 中常驻 Graft repository session，不再为每次调用启动 CLI 子进程。
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+`@eidos.space/graft` 是 Graft 面向 Node.js 与 Electron 的进程内 SDK。它在多次调用之间
+保留 repository runtime，复用 CLI 同一套 Rust repository 实现和官方 Remote，并通过
+ABI-stable Node-API 8 native class 暴露。
+
+它与 Git 生态的设计类比是 `libgit2 → Graft Rust session core`、
+`NodeGit → ABI-stable Node-API addon`。这只是帮助理解生命周期的类比，不是依赖；SDK
+不会复制 Git/Graft 协议，也不是 daemon 或 JSON-stdin CLI wrapper。
+
+## 安装与打开
+
+```sh
+pnpm add @eidos.space/graft
+```
+
+```js
+const { RepositorySession } = require("@eidos.space/graft")
+
+const session = await RepositorySession.open(spaceRoot)
+try {
+  await session.init()
+  const status = await session.status()
+  const changes = await session.diff({ rows: true })
+} finally {
+  await session.close()
+}
+```
+
+每个 canonical repository path 保留一个 session。同一 session 的调用完整串行；不同
+repository 的 session 可以并行。native 工作在 libuv worker thread 上运行，不阻塞
+JavaScript 主线程。
+
+## Electron 进程边界
+
+SDK 应由 Electron utility process 直接加载，不进入 renderer。repository path、credential
+和 native class 留在 typed IPC 后面，并由 utility process 生命周期持有 session map。
+
+Electron 打包需要把 `*.node` 放在 ASAR 外。npm 根包会按当前主机选择精确版本的 optional
+binary package；首版覆盖 macOS arm64/x64、Linux glibc arm64/x64 和 Windows x64，不在
+安装阶段编译或下载二进制。
+
+## Worktree materialization
+
+| 操作 | 会替换、新建或删除 tracked worktree 文件 |
+| --- | --- |
+| `init`、`status`、`addAll`、`commit`、`diff`、`history` | 否 |
+| `configureRemote`、`push`、`fetch` | 否 |
+| `restore`、`pull`、`cloneRepository` | **是** |
+
+materializing 操作前先阻止新的应用写入、排空 transaction，并关闭受影响的 SQLite
+handle；SDK promise 结束后重新打开并验证。Graft repository session 本身可以继续常驻。
+应用 gate 可调用 `operationMaterializesWorktree(name)` 读取这份契约。
+
+<Aside type="caution" title="一个 repository writer">
+  同一 repository 的第二个 SDK session 或外部 Graft writer 会收到
+  `GRAFT_SDK_REPOSITORY_BUSY`。不要高频重试，应关闭旧 owner 或提示用户停止外部 writer。
+</Aside>
+
+## Credential
+
+HTTP bearer token 必须显式注入并只保存在内存：
+
+```js
+await session.configureRemote({
+  name: "origin",
+  url: "https://sync.example.com/org/space",
+  bearerToken,
+})
+
+session.setHttpBearerToken("origin", rotatedToken)
+session.clearHttpBearerToken("origin")
+```
+
+SDK 不读取 `GRAFT_REMOTE_TOKEN`，不把 token 写入 repository config 或 URL，并从错误中
+脱敏。CLI 仍保留环境变量兼容路径，但应用不应把它作为 SDK credential transport。
+
+## Close、reopen、crash 与取消
+
+`close()` 会拒绝排队中的工作，等待当前命令完成，释放 runtime，并且可以重复调用。
+`reopen()` 从持久状态重新构建 runtime。utility process 崩溃后由操作系统释放 storage lock；
+替代进程直接打开新 session，不需要 daemon lease 或 PID 文件。
+
+异步方法接受 `AbortSignal`。取消只终止尚未开始的队列任务；native repository command
+一旦开始就正常完成，避免暴露部分执行的 mutation。
+
+调用方应按 `error.code` 分支，例如 `GRAFT_SDK_SESSION_CLOSED`、
+`GRAFT_SDK_SESSION_CLOSING`、`GRAFT_SDK_REPOSITORY_BUSY` 与
+`GRAFT_SDK_REPOSITORY_COMMAND`。
+
+首个公开 API 覆盖 `init`、`open`、`status`、`addAll`、`commit`、`diff`、`history`、
+`restore`、`configureRemote`、`push`、`fetch`、`pull` 与 `cloneRepository`。参数和返回类型
+见 package [README](https://github.com/eidos-space/graft) 和
+TypeScript declaration。

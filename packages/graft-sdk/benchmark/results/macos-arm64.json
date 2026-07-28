@@ -1,0 +1,57 @@
+{
+  "schema": "graft-sdk-benchmark-v1",
+  "generated_at": "2026-07-28T05:26:18.571Z",
+  "environment": {
+    "platform": "darwin",
+    "arch": "arm64",
+    "node": "v24.18.0",
+    "iterations": 30,
+    "graft_binary": "/Users/mayne/.codex/worktrees/7637/graft/target/release/graft"
+  },
+  "milliseconds": {
+    "sdk_open_status_close_cold": {
+      "first": 423.889,
+      "min": 394.93,
+      "p50": 420.122,
+      "p95": 439.99,
+      "max": 457.895,
+      "mean": 419.426
+    },
+    "sdk_status_hot": {
+      "first": 3.069,
+      "min": 0.924,
+      "p50": 1.326,
+      "p95": 2.444,
+      "max": 3.069,
+      "mean": 1.424
+    },
+    "sdk_diff_hot": {
+      "first": 1.353,
+      "min": 0.893,
+      "p50": 1,
+      "p95": 1.147,
+      "max": 1.353,
+      "mean": 1.016
+    },
+    "cli_status_process_cold": {
+      "first": 424.317,
+      "min": 409.818,
+      "p50": 425.436,
+      "p95": 456.215,
+      "max": 508.755,
+      "mean": 430.07
+    },
+    "cli_diff_process_cold": {
+      "first": 424.407,
+      "min": 404.957,
+      "p50": 429.85,
+      "p95": 448.446,
+      "max": 466.699,
+      "mean": 430.737
+    }
+  },
+  "speedup": {
+    "status_p50": 320.84162895927597,
+    "diff_p50": 429.85
+  }
+}

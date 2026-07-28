@@ -386,7 +386,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b30fa8254caad766fc03cb0ccae691e14bf3bd72bfff27f72802ce729551b3d6"
 dependencies = [
  "async-trait",
- "convert_case",
+ "convert_case 0.6.0",
  "json5",
  "pathdiff",
  "ron",
@@ -436,6 +436,15 @@ name = "convert_case"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec182b0ca2f35d8fc196cf3404988fd8b8c739a4d270ff118a398feb0cbec1ca"
+dependencies = [
+ "unicode-segmentation",
+]
+
+[[package]]
+name = "convert_case"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "affbf0190ed2caf063e3def54ff444b449371d55c58e513a95ab98eca50adb49"
 dependencies = [
  "unicode-segmentation",
 ]
@@ -556,6 +565,12 @@ dependencies = [
  "ctor-proc-macro",
  "dtor",
 ]
+
+[[package]]
+name = "ctor"
+version = "1.0.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9bb72bb94fdc1bd619f4c18cc91ecf6302aeb333d31b3c6ec0bb841cd920209"
 
 [[package]]
 name = "ctor-proc-macro"
@@ -981,7 +996,7 @@ dependencies = [
 
 [[package]]
 name = "graft"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "assert_matches",
  "base64",
@@ -1019,6 +1034,7 @@ dependencies = [
  "tryiter",
  "xxhash-rust",
  "zerocopy",
+ "zeroize",
  "zstd",
 ]
 
@@ -1036,7 +1052,7 @@ dependencies = [
 
 [[package]]
 name = "graft-ext"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "config",
  "graft",
@@ -1049,8 +1065,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "graft-sdk"
+version = "0.1.0"
+dependencies = [
+ "graft",
+ "graft-sqlite",
+ "parking_lot",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
+name = "graft-sdk-node"
+version = "0.1.0"
+dependencies = [
+ "graft-sdk",
+ "napi",
+ "napi-build",
+ "napi-derive",
+ "serde_json",
+]
+
+[[package]]
 name = "graft-sqlite"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "bytes",
  "enum_dispatch",
@@ -1071,7 +1112,7 @@ dependencies = [
 
 [[package]]
 name = "graft-test"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1094,7 +1135,7 @@ dependencies = [
 
 [[package]]
 name = "graft-tool"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1107,7 +1148,7 @@ dependencies = [
 
 [[package]]
 name = "graft-tracing"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "tracing",
  "tracing-subscriber",
@@ -1803,6 +1844,69 @@ dependencies = [
 ]
 
 [[package]]
+name = "napi"
+version = "3.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "de33522036981030a75c231829566bc63414e08101a6f5ff4ac6cef19c8e0941"
+dependencies = [
+ "bitflags",
+ "ctor 1.0.11",
+ "futures",
+ "napi-build",
+ "napi-sys",
+ "nohash-hasher",
+ "rustc-hash",
+]
+
+[[package]]
+name = "napi-build"
+version = "2.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c9c366d2c8c60b86fa632df75f745509b52f9128f91a6bad4c796e44abb505e1"
+
+[[package]]
+name = "napi-derive"
+version = "3.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a49c513341a61a16a10af6efcce46b30d0822ba2d4fb197d24d33dfc199c78d5"
+dependencies = [
+ "convert_case 0.11.0",
+ "ctor 1.0.11",
+ "napi-derive-backend",
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "napi-derive-backend"
+version = "6.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4747005fa3e2c9989ac45a723a514c5db2411238b72981a3cda4c701a9dfea17"
+dependencies = [
+ "convert_case 0.11.0",
+ "proc-macro2",
+ "quote",
+ "semver",
+ "syn",
+]
+
+[[package]]
+name = "napi-sys"
+version = "3.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "85fbf1fa9f1babfe396d74bbbf52b3643770243e8f5b0b46715d4caf7f0dfc9a"
+dependencies = [
+ "libloading",
+]
+
+[[package]]
+name = "nohash-hasher"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2bf50223579dc7cdcfb3bfcacf7069ff68243f8c363f62ffa99cf000a6b9c451"
+
+[[package]]
 name = "nom"
 version = "7.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1915,7 +2019,7 @@ name = "opendal"
 version = "0.55.0"
 source = "git+https://github.com/apache/opendal?rev=06f088d93e38e1150a3f1558f327ec0252446302#06f088d93e38e1150a3f1558f327ec0252446302"
 dependencies = [
- "ctor",
+ "ctor 0.6.3",
  "opendal-core",
  "opendal-layer-concurrent-limit",
  "opendal-layer-logging",

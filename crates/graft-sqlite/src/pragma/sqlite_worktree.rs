@@ -255,6 +255,21 @@ pub(super) struct SqliteReplacementGuard {
     connection: Option<Connection>,
 }
 
+impl SqliteReplacementGuard {
+    /// Releases Graft's own `SQLite` handle before changing the directory entry on Windows.
+    ///
+    /// `SQLite`'s Windows VFS does not request delete sharing for database handles, so keeping this
+    /// guard open would make `rename` and `remove_file` fail with `ERROR_ACCESS_DENIED`. The
+    /// exclusive-lock preflight still rejects an active external transaction. On Unix we retain
+    /// the handle through the filesystem operation, preserving the stronger no-writer race guard.
+    pub(super) fn release_for_filesystem_change(&mut self) {
+        #[cfg(target_os = "windows")]
+        if let Some(connection) = self.connection.take() {
+            let _ = connection.execute_batch("ROLLBACK");
+        }
+    }
+}
+
 impl Drop for SqliteReplacementGuard {
     fn drop(&mut self) {
         if let Some(connection) = self.connection.take() {

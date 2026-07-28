@@ -67,7 +67,7 @@ use crate::{
         LogId, VolumeId, byte_unit::ByteUnit, commit_hash::CommitHash, lsn::LSN, lsn::LSNRangeExt,
         page_count::PageCount,
     },
-    remote::{RemoteConfig, RemoteErr},
+    remote::{RemoteConfig, RemoteCredentials, RemoteErr},
     snapshot::Snapshot,
 };
 
@@ -1435,11 +1435,31 @@ struct WorktreeState {
     deleted: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct Repository {
     worktree: PathBuf,
     graft_dir: PathBuf,
+    remote_credentials: RemoteCredentials,
 }
+
+impl fmt::Debug for Repository {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Repository")
+            .field("worktree", &self.worktree)
+            .field("graft_dir", &self.graft_dir)
+            .field("remote_credentials", &self.remote_credentials)
+            .finish()
+    }
+}
+
+impl PartialEq for Repository {
+    fn eq(&self, other: &Self) -> bool {
+        self.worktree == other.worktree && self.graft_dir == other.graft_dir
+    }
+}
+
+impl Eq for Repository {}
 
 impl Repository {
     pub fn init(worktree: impl AsRef<Path>) -> Result<Self> {
@@ -1448,7 +1468,11 @@ impl Repository {
 
         let worktree = fs::canonicalize(worktree)?;
         let graft_dir = worktree.join(GRAFT_DIR);
-        let repo = Self { worktree, graft_dir };
+        let repo = Self {
+            worktree,
+            graft_dir,
+            remote_credentials: RemoteCredentials::environment(),
+        };
 
         repo.create_layout()?;
 
@@ -1477,7 +1501,11 @@ impl Repository {
             return Err(RepoErr::NotFound(worktree));
         }
 
-        let repo = Self { worktree, graft_dir };
+        let repo = Self {
+            worktree,
+            graft_dir,
+            remote_credentials: RemoteCredentials::environment(),
+        };
         repo.ensure_supported_format()?;
         Ok(repo)
     }
@@ -1516,6 +1544,12 @@ impl Repository {
 
     pub fn file_store_dir(&self) -> PathBuf {
         self.graft_dir.join(DIR_STORE_FILES)
+    }
+
+    /// Returns this repository with the supplied in-memory remote credential policy.
+    pub fn with_remote_credentials(mut self, remote_credentials: RemoteCredentials) -> Self {
+        self.remote_credentials = remote_credentials;
+        self
     }
 
     pub fn object_store(&self) -> object::LooseObjectStore {

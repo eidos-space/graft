@@ -110,6 +110,11 @@ export const sidebar = [
         slug: "docs/guides/http-remote",
       },
       {
+        label: "Node.js And Electron SDK",
+        translations: { "zh-CN": "Node.js 与 Electron SDK" },
+        slug: "docs/guides/node-electron-sdk",
+      },
+      {
         label: "Export SQLite Files",
         translations: { "zh-CN": "导出 SQLite 文件" },
         slug: "docs/guides/export-sqlite",

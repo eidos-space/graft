@@ -16,8 +16,10 @@ pub(super) fn run_repo_switch_branch(
     let previous_files = current_repo_files_for_checkout(&repo)?;
     let previous_artifacts = current_repo_artifacts_for_checkout(&repo)?;
     let paths = checkout_plan_path_actions(&plan, &previous_files, &previous_artifacts);
-    let _sqlite_replacement_guards = preflight_workspace_checkout(&repo, &plan, &previous_files)?;
+    let mut _sqlite_replacement_guards =
+        preflight_workspace_checkout(&repo, &plan, &previous_files)?;
     repo.apply_switch_branch_plan(&name, &plan)?;
+    release_sqlite_guards_for_filesystem_change(&mut _sqlite_replacement_guards);
     checkout_repo_plan(
         runtime,
         file,
@@ -47,9 +49,10 @@ pub(super) fn run_repo_switch_create(
     let previous_files = current_repo_files_for_checkout(&repo)?;
     let previous_artifacts = current_repo_artifacts_for_checkout(&repo)?;
     let paths = checkout_plan_path_actions(&plan.checkout, &previous_files, &previous_artifacts);
-    let _sqlite_replacement_guards =
+    let mut _sqlite_replacement_guards =
         preflight_workspace_checkout(&repo, &plan.checkout, &previous_files)?;
     let branch = repo.apply_switch_new_branch_plan(&plan)?;
+    release_sqlite_guards_for_filesystem_change(&mut _sqlite_replacement_guards);
     checkout_repo_plan(
         runtime,
         file,

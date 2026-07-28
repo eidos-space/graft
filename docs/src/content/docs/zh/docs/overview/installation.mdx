@@ -5,20 +5,21 @@ description: 安装 Graft CLI、从源码构建，并获取 SQLite 扩展。
 
 import { Aside } from "@astrojs/starlight/components";
 
-最快的试用方式是 CLI。应用集成时再加载 SQLite extension 或静态链接扩展。
+最快的试用方式是 CLI。应用集成时可加载 SQLite extension、静态链接扩展，或使用常驻
+Node.js/Electron SDK。
 
 ## 安装 CLI
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/eidos-space/graft/main/install.sh \
-  | GRAFT_VERSION=0.8.0 sh
+  | GRAFT_VERSION=0.9.0 sh
 graft --version
-# graft 0.8.0
+# graft 0.9.0
 ```
 
 <Aside type="note" title="最新 release">
-  去掉 `GRAFT_VERSION=0.8.0` 会安装最新已发布版本；它的行为可能比本站描述的
-  v0.8.0 更新。
+  去掉 `GRAFT_VERSION=0.9.0` 会安装最新已发布版本；它的行为可能比本站描述的
+  v0.9.0 更新。
 </Aside>
 
 也可以从
@@ -70,6 +71,15 @@ cd docs
 pnpm install
 pnpm build
 ```
+
+## 安装 Node.js 与 Electron SDK
+
+```bash
+pnpm add @eidos.space/graft
+```
+
+npm package 提供长生命周期的进程内 repository session 和预构建 Node-API 8 binary。
+继续阅读 [Node.js 与 Electron SDK](/zh/docs/guides/node-electron-sdk/)。
 
 下一步先跑 [CLI 快速开始](/zh/docs/quickstart/cli/)。需要显式接入可选 Graft VFS
 时，再看 [SQLite 扩展快速开始](/zh/docs/quickstart/sqlite-extension/)。

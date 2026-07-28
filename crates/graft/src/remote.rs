@@ -1,4 +1,10 @@
-use std::{collections::HashSet, env, future, ops::Range, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    env, fmt, future,
+    ops::Range,
+    sync::Arc,
+    time::Duration,
+};
 
 use crate::core::{LogId, SegmentId, cbe::CBE64, commit::Commit, lsn::LSN};
 use bilrost::{Message, OwnedMessage};
@@ -14,8 +20,10 @@ use opendal::{
     raw::HttpClient,
     services::{Fs, Memory, S3},
 };
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 pub mod segment;
 
@@ -81,6 +89,161 @@ pub enum RemoteErr {
     CompareAndSwap { path: String },
 }
 
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+pub enum RemoteCredentialErr {
+    #[error("remote credential name must be a non-empty repository remote name")]
+    InvalidRemoteName,
+
+    #[error("HTTP bearer token must not be empty")]
+    EmptyBearerToken,
+
+    #[error("environment-backed remote credentials cannot be changed")]
+    EnvironmentCredentialsReadOnly,
+}
+
+#[derive(Clone)]
+struct BearerToken(Zeroizing<String>);
+
+impl BearerToken {
+    fn new(token: String) -> Self {
+        Self(Zeroizing::new(token))
+    }
+
+    fn expose(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl fmt::Debug for BearerToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("[redacted bearer token]")
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoteCredentialMode {
+    Environment,
+    Explicit,
+}
+
+/// In-memory credentials used when constructing repository remotes.
+///
+/// [`Self::explicit`] never reads process environment variables. Clones share the same protected
+/// store so a long-lived repository session can rotate or clear a bearer token without writing it
+/// into repository config.
+#[derive(Clone)]
+pub struct RemoteCredentials {
+    mode: RemoteCredentialMode,
+    http_bearer_tokens: Arc<RwLock<HashMap<String, BearerToken>>>,
+}
+
+impl fmt::Debug for RemoteCredentials {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RemoteCredentials")
+            .field("mode", &self.mode)
+            .field(
+                "http_bearer_token_count",
+                &self.http_bearer_tokens.read().len(),
+            )
+            .finish()
+    }
+}
+
+impl Default for RemoteCredentials {
+    fn default() -> Self {
+        Self::explicit()
+    }
+}
+
+impl RemoteCredentials {
+    /// Creates an explicit-only credential store that never falls back to process environment.
+    pub fn explicit() -> Self {
+        Self {
+            mode: RemoteCredentialMode::Explicit,
+            http_bearer_tokens: Arc::default(),
+        }
+    }
+
+    /// Creates the legacy CLI credential policy that reads the configured token environment
+    /// variable, falling back to `GRAFT_REMOTE_TOKEN`.
+    ///
+    /// Embedders should use [`Self::explicit`] instead.
+    pub fn environment() -> Self {
+        Self {
+            mode: RemoteCredentialMode::Environment,
+            http_bearer_tokens: Arc::default(),
+        }
+    }
+
+    /// Sets a bearer token for one repository remote name, such as `origin`.
+    pub fn set_http_bearer_token(
+        &self,
+        remote_name: &str,
+        token: String,
+    ) -> std::result::Result<(), RemoteCredentialErr> {
+        if self.mode != RemoteCredentialMode::Explicit {
+            return Err(RemoteCredentialErr::EnvironmentCredentialsReadOnly);
+        }
+        if !valid_credential_remote_name(remote_name) {
+            return Err(RemoteCredentialErr::InvalidRemoteName);
+        }
+        if token.is_empty() {
+            return Err(RemoteCredentialErr::EmptyBearerToken);
+        }
+        self.http_bearer_tokens
+            .write()
+            .insert(remote_name.to_string(), BearerToken::new(token));
+        Ok(())
+    }
+
+    /// Clears the bearer token for one repository remote name.
+    pub fn clear_http_bearer_token(
+        &self,
+        remote_name: &str,
+    ) -> std::result::Result<(), RemoteCredentialErr> {
+        if self.mode != RemoteCredentialMode::Explicit {
+            return Err(RemoteCredentialErr::EnvironmentCredentialsReadOnly);
+        }
+        if !valid_credential_remote_name(remote_name) {
+            return Err(RemoteCredentialErr::InvalidRemoteName);
+        }
+        self.http_bearer_tokens.write().remove(remote_name);
+        Ok(())
+    }
+
+    /// Redacts every bearer token held by this store from an error or diagnostic message.
+    pub fn redact(&self, message: &str) -> String {
+        self.http_bearer_tokens
+            .read()
+            .values()
+            .fold(message.to_string(), |redacted, token| {
+                redacted.replace(token.expose(), "[redacted]")
+            })
+    }
+
+    fn http_bearer_token(&self, remote_name: &str, token_env: Option<&str>) -> Option<BearerToken> {
+        match self.mode {
+            RemoteCredentialMode::Explicit => {
+                self.http_bearer_tokens.read().get(remote_name).cloned()
+            }
+            RemoteCredentialMode::Environment => token_env
+                .or(Some("GRAFT_REMOTE_TOKEN"))
+                .and_then(|name| env::var(name).ok())
+                .filter(|token| !token.is_empty())
+                .map(BearerToken::new),
+        }
+    }
+}
+
+fn valid_credential_remote_name(remote_name: &str) -> bool {
+    !remote_name.is_empty()
+        && !remote_name
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+        && !remote_name.contains(['/', '\\'])
+}
+
 impl RemoteErr {
     fn objectstore_err_kind(&self) -> Option<opendal::ErrorKind> {
         if let RemoteErr::ObjectStore(err) = self {
@@ -138,6 +301,15 @@ impl RemoteConfig {
     pub fn build(self) -> Result<Remote> {
         Remote::with_config(self)
     }
+
+    /// Builds a remote using only the supplied credential policy.
+    pub fn build_with_credentials(
+        self,
+        remote_name: &str,
+        credentials: &RemoteCredentials,
+    ) -> Result<Remote> {
+        Remote::with_config_and_credentials(self, remote_name, credentials)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -155,7 +327,7 @@ enum RemoteBackend {
 struct HttpRemote {
     client: reqwest::Client,
     url: String,
-    token: Option<String>,
+    token: Option<BearerToken>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -167,6 +339,14 @@ struct HttpListResponse {
 
 impl Remote {
     pub fn with_config(config: RemoteConfig) -> Result<Self> {
+        Self::with_config_and_credentials(config, "", &RemoteCredentials::environment())
+    }
+
+    pub fn with_config_and_credentials(
+        config: RemoteConfig,
+        remote_name: &str,
+        credentials: &RemoteCredentials,
+    ) -> Result<Self> {
         let backend = match config {
             RemoteConfig::Memory => Operator::new(Memory::default())?.finish(),
             RemoteConfig::Fs { root } => Operator::new(Fs::default().root(&root))?.finish(),
@@ -194,8 +374,9 @@ impl Remote {
                     .finish()
             }
             RemoteConfig::Http { url, token_env } => {
+                let token = credentials.http_bearer_token(remote_name, token_env.as_deref());
                 return Ok(Self {
-                    backend: RemoteBackend::Http(HttpRemote::new(url, token_env)?),
+                    backend: RemoteBackend::Http(HttpRemote::new(url, token)?),
                 });
             }
         };
@@ -601,17 +782,12 @@ impl Remote {
 }
 
 impl HttpRemote {
-    fn new(url: String, token_env: Option<String>) -> Result<Self> {
+    fn new(url: String, token: Option<BearerToken>) -> Result<Self> {
         let client = reqwest::ClientBuilder::new()
             .http1_only()
             .hickory_dns(true)
             .connect_timeout(Duration::from_secs(5))
             .build()?;
-        let token = token_env
-            .as_deref()
-            .or(Some("GRAFT_REMOTE_TOKEN"))
-            .and_then(|name| env::var(name).ok())
-            .filter(|token| !token.is_empty());
         Ok(Self {
             client,
             url: url.trim_end_matches('/').to_string(),
@@ -642,7 +818,7 @@ impl HttpRemote {
             .request(method, url)
             .header(GRAFT_PROTOCOL_HEADER, GRAFT_PROTOCOL_VERSION);
         if let Some(token) = &self.token {
-            request.bearer_auth(token)
+            request.bearer_auth(token.expose())
         } else {
             request
         }
@@ -913,6 +1089,46 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    #[test]
+    fn explicit_credentials_are_in_memory_only_and_redacted() {
+        let credentials = RemoteCredentials::explicit();
+        credentials
+            .set_http_bearer_token("origin", "sdk-secret-token".to_string())
+            .unwrap();
+        let remote = RemoteConfig::Http {
+            url: "https://example.com/org/repo".to_string(),
+            token_env: Some("IGNORED_BY_EXPLICIT_CREDENTIALS".to_string()),
+        }
+        .build_with_credentials("origin", &credentials)
+        .unwrap();
+        let RemoteBackend::Http(http) = &remote.backend else {
+            panic!("expected HTTP remote");
+        };
+        assert_eq!(
+            http.token.as_ref().map(BearerToken::expose),
+            Some("sdk-secret-token")
+        );
+        assert!(!format!("{remote:?}").contains("sdk-secret-token"));
+        assert_eq!(
+            credentials.redact("request failed for sdk-secret-token"),
+            "request failed for [redacted]"
+        );
+    }
+
+    #[test]
+    fn explicit_credentials_do_not_fall_back_to_token_env() {
+        let remote = RemoteConfig::Http {
+            url: "https://example.com/org/repo".to_string(),
+            token_env: Some("SOME_PROCESS_TOKEN".to_string()),
+        }
+        .build_with_credentials("origin", &RemoteCredentials::explicit())
+        .unwrap();
+        let RemoteBackend::Http(http) = &remote.backend else {
+            panic!("expected HTTP remote");
+        };
+        assert!(http.token.is_none());
+    }
+
     async fn serve_http_response(
         status: &str,
         protocol_versions: &[&str],
@@ -949,6 +1165,33 @@ mod tests {
             String::from_utf8(request).unwrap()
         });
         (format!("http://{address}/org/repo"), task)
+    }
+
+    #[tokio::test]
+    async fn http_remote_sends_explicit_in_memory_bearer_token() {
+        let credentials = RemoteCredentials::explicit();
+        credentials
+            .set_http_bearer_token("origin", "sdk-request-secret".to_string())
+            .unwrap();
+        let (url, request) = serve_http_response("204 No Content", &["1"]).await;
+        let remote = RemoteConfig::Http {
+            url,
+            token_env: Some("IGNORED_BY_EXPLICIT_CREDENTIALS".to_string()),
+        }
+        .build_with_credentials("origin", &credentials)
+        .unwrap();
+        let RemoteBackend::Http(http) = &remote.backend else {
+            panic!("expected HTTP remote");
+        };
+
+        assert!(http.has_raw("objects/one").await.unwrap());
+        let request = request.await.unwrap();
+        assert!(
+            request
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("Authorization: Bearer sdk-request-secret"))
+        );
+        assert!(!format!("{remote:?}").contains("sdk-request-secret"));
     }
 
     #[tokio::test]

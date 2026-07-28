@@ -6,7 +6,7 @@ description: Install the Graft CLI, build from source, and get the SQLite extens
 import { Aside } from "@astrojs/starlight/components";
 
 The fastest way to try Graft is the CLI. Applications can later load the
-SQLite extension or link the extension statically.
+SQLite extension, or use the resident Node.js/Electron SDK.
 
 ## Install The CLI
 
@@ -14,19 +14,19 @@ Install the version documented by this site:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/eidos-space/graft/main/install.sh \
-  | GRAFT_VERSION=0.8.0 sh
+  | GRAFT_VERSION=0.9.0 sh
 ```
 
 Then check the binary:
 
 ```bash
 graft --version
-# graft 0.8.0
+# graft 0.9.0
 ```
 
 <Aside type="note" title="Latest release">
-  Omit `GRAFT_VERSION=0.8.0` to install the latest published release. Its
-  behavior may be newer than this v0.8.0 documentation.
+  Omit `GRAFT_VERSION=0.9.0` to install the latest published release. Its
+  behavior may be newer than this v0.9.0 documentation.
 </Aside>
 
 Prebuilt archives are also available from the
@@ -83,6 +83,15 @@ cd docs
 pnpm install
 pnpm build
 ```
+
+## Install The Node.js And Electron SDK
+
+```bash
+pnpm add @eidos.space/graft
+```
+
+The npm package provides long-lived in-process repository sessions and prebuilt Node-API 8
+binaries. Continue with the [Node.js and Electron SDK guide](/docs/guides/node-electron-sdk/).
 
 ## Next
 
