@@ -12,6 +12,10 @@ const packageDirectories = (await fs.readdir(path.join(packageRoot, "npm")))
   .map((directory) => path.join(packageRoot, "npm", directory))
 const releaseTag = rootPackage.version.includes("-") ? "next" : "latest"
 const dryRun = process.env.GRAFT_SDK_RELEASE_DRY_RUN === "1"
+const visibilityPollIntervalMs = 5_000
+const visibilityPollAttempts = 120
+const visibilityTimeoutSeconds =
+  (visibilityPollAttempts * visibilityPollIntervalMs) / 1_000
 
 for (const directory of [...packageDirectories, packageRoot]) {
   const metadata = JSON.parse(
@@ -53,11 +57,24 @@ async function published(name, version) {
 }
 
 async function waitUntilPublished(name, version) {
-  for (let attempt = 0; attempt < 12; attempt += 1) {
-    if (await published(name, version)) return
-    await new Promise((resolve) => setTimeout(resolve, 5_000))
+  for (let attempt = 1; attempt <= visibilityPollAttempts; attempt += 1) {
+    if (await published(name, version)) {
+      console.log(`Registry visible: ${name}@${version}`)
+      return
+    }
+    if (attempt % 12 === 0) {
+      const elapsedSeconds = (attempt * visibilityPollIntervalMs) / 1_000
+      console.log(
+        `Waiting for npm registry visibility: ${name}@${version} (${elapsedSeconds}s)`
+      )
+    }
+    if (attempt < visibilityPollAttempts) {
+      await new Promise((resolve) => setTimeout(resolve, visibilityPollIntervalMs))
+    }
   }
-  throw new Error(`${name}@${version} was not visible after publication`)
+  throw new Error(
+    `${name}@${version} was not visible after ${visibilityTimeoutSeconds}s`
+  )
 }
 
 function command(executable, arguments_, options = {}) {
