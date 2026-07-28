@@ -865,7 +865,7 @@ pub(super) fn preflight_workspace_checkout(
     Ok(guards)
 }
 
-fn release_sqlite_guards_for_filesystem_change(guards: &mut [SqliteReplacementGuard]) {
+pub(super) fn release_sqlite_guards_for_filesystem_change(guards: &mut [SqliteReplacementGuard]) {
     for guard in guards {
         guard.release_for_filesystem_change();
     }

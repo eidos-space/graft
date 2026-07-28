@@ -13,9 +13,10 @@ pub(super) fn run_repo_merge_abort(
     let previous_files = current_repo_files_for_checkout(&repo)?;
     let previous_artifacts = current_repo_artifacts_for_checkout(&repo)?;
     let paths = checkout_plan_path_actions(&plan.checkout, &previous_files, &previous_artifacts);
-    let _sqlite_replacement_guards =
+    let mut _sqlite_replacement_guards =
         preflight_workspace_checkout(&repo, &plan.checkout, &previous_files)?;
     let target = repo.apply_merge_abort_plan(&plan)?;
+    release_sqlite_guards_for_filesystem_change(&mut _sqlite_replacement_guards);
     checkout_repo_plan(
         runtime,
         file,
@@ -70,9 +71,10 @@ pub(super) fn run_repo_merge(
     ensure_checkout_plan_preserves_untracked_paths(runtime, file, &repo, &plan.checkout)?;
     let previous_files = current_repo_files_for_checkout(&repo)?;
     let previous_artifacts = current_repo_artifacts_for_checkout(&repo)?;
-    let _sqlite_replacement_guards =
+    let mut _sqlite_replacement_guards =
         preflight_workspace_checkout(&repo, &plan.checkout, &previous_files)?;
     let mut outcome = repo.apply_merge_plan(&plan)?;
+    release_sqlite_guards_for_filesystem_change(&mut _sqlite_replacement_guards);
     checkout_merge_outcome(
         runtime,
         file,

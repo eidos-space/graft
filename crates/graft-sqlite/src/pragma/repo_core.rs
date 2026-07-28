@@ -101,9 +101,10 @@ pub(super) fn run_repo_clone(
         let previous_files = BTreeMap::new();
         let previous_artifacts = BTreeMap::new();
         let paths = checkout_plan_path_actions(&plan, &previous_files, &previous_artifacts);
-        let _sqlite_replacement_guards =
+        let mut _sqlite_replacement_guards =
             preflight_workspace_checkout(&repo, &plan, &previous_files)?;
         repo.apply_switch_branch_plan(&branch, &plan)?;
+        release_sqlite_guards_for_filesystem_change(&mut _sqlite_replacement_guards);
         checkout_repo_plan(
             &runtime,
             file,
