@@ -14,7 +14,7 @@ impl Repository {
             .get(remote)
             .cloned()
             .ok_or_else(|| RepoErr::RemoteNotFound(remote.to_string()))?;
-        Ok(config.build()?)
+        Ok(config.build_with_credentials(remote, &self.remote_credentials)?)
     }
 
     pub(super) fn remote_branch_refs_from_store(

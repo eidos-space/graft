@@ -17,6 +17,7 @@ use graft::core::{
     page_count::PageCount,
 };
 use graft::{
+    remote::RemoteCredentials,
     repo::Repository,
     rt::runtime::Runtime,
     snapshot::Snapshot,
@@ -121,6 +122,7 @@ pub struct VolFile {
     pub vid: VolumeId,
     opts: OpenOpts,
     pub repo: Option<Repository>,
+    remote_credentials: RemoteCredentials,
     repo_runtimes: Arc<RepoRuntimeRegistry>,
     workspace: Arc<WorkspaceCoordinator>,
     binding_enabled: bool,
@@ -235,6 +237,7 @@ impl VolFile {
             vid,
             opts,
             repo,
+            remote_credentials: RemoteCredentials::environment(),
             repo_runtimes,
             workspace,
             binding_enabled,
@@ -263,11 +266,24 @@ impl VolFile {
         }
     }
 
+    pub(crate) fn remote_credentials(&self) -> &RemoteCredentials {
+        &self.remote_credentials
+    }
+
+    pub(crate) fn set_remote_credentials(&mut self, credentials: RemoteCredentials) {
+        self.remote_credentials = credentials.clone();
+        self.repo = self
+            .repo
+            .take()
+            .map(|repo| repo.with_remote_credentials(credentials));
+    }
+
     pub fn attach_repo(&mut self, repo: Repository) -> Result<(), ErrCtx> {
         if !self.is_idle() {
             return Err(ErrCtx::InvalidVolumeState);
         }
 
+        let repo = repo.with_remote_credentials(self.remote_credentials.clone());
         let runtime = self.repo_runtimes.runtime_for(&repo)?;
         self.switch_runtime(runtime)?;
         self.repo = Some(repo);
@@ -279,6 +295,7 @@ impl VolFile {
             return Err(ErrCtx::InvalidVolumeState);
         }
 
+        let repo = repo.with_remote_credentials(self.remote_credentials.clone());
         let runtime = self.repo_runtimes.runtime_for(&repo)?;
         if !self.binding_enabled {
             self.switch_runtime(runtime)?;

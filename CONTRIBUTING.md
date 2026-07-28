@@ -53,10 +53,14 @@ To build and run Graft, ensure you have the following dependencies installed:
 | just          | [just]                 |
 | cargo nextest | [nextest]              |
 | clang + llvm  | System package manager |
+| Node.js 24    | [nodejs.org]            |
+| pnpm 10       | [pnpm]                  |
 
 [rustup]: https://rustup.rs/
 [just]: https://github.com/casey/just
 [nextest]: https://nexte.st/docs/installation/pre-built-binaries/
+[nodejs.org]: https://nodejs.org/
+[pnpm]: https://pnpm.io/installation
 
 > [!IMPORTANT]
 > Graft uses [`bindgen`] to generate Rust bindings for SQLite, which requires a working installation of Clang and LLVM. If you're not sure whether your system is set up correctly, follow the [official bindgen setup guide] for instructions tailored to your platform. This step is essential—missing or misconfigured Clang will cause build failures when compiling the `graft-sqlite` and `graft-sqlite-extension` crates.
@@ -75,6 +79,11 @@ cargo nextest run runtime_sanity
 
 # Run SQLite tests
 just run sqlite test
+
+# Build and test the resident Node.js/Electron SDK
+pnpm install --frozen-lockfile
+pnpm --dir packages/graft-sdk build:native
+pnpm --dir packages/graft-sdk test
 ```
 
 Next, if you'd like to run Graft locally you can use `just run sqlite shell` to spin up a SQLite shell.
@@ -104,6 +113,9 @@ Our automated PR checks verify that:
 - All unit tests pass, which can be done locally by running `just test`
 - The code has been formatted correctly, according to `cargo fmt`.
 - There are no linting errors, according to `cargo clippy`.
+- Every advertised SDK native target builds and passes the Node.js 20/24
+  session contract; the npm package assembly gate must also pass when SDK
+  paths change.
 
 ## Licensing
 

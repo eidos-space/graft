@@ -1,0 +1,122 @@
+---
+title: Node.js And Electron SDK
+description: Keep Graft repository sessions resident in Node.js and Electron without CLI subprocesses.
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+`@eidos.space/graft` is Graft's in-process SDK for Node.js and Electron. It keeps repository state
+resident across calls, uses the same Rust repository implementation and official remotes as the
+CLI, and exposes an ABI-stable Node-API 8 native class.
+
+The design relationship is `libgit2 → Graft Rust session core` and
+`NodeGit → ABI-stable Node-API addon`. This is an analogy, not a dependency: the SDK does not copy
+Git or Graft protocols and is not a daemon or JSON-stdin CLI wrapper.
+
+## Install And Open
+
+```sh
+pnpm add @eidos.space/graft
+```
+
+```js
+const { RepositorySession } = require("@eidos.space/graft")
+
+const session = await RepositorySession.open(spaceRoot)
+try {
+  await session.init()
+  const status = await session.status()
+  const changes = await session.diff({ rows: true })
+} finally {
+  await session.close()
+}
+```
+
+Keep one session for each canonical repository path. Calls on one session serialize for their full
+duration; sessions for different repositories can run in parallel. Native work runs on libuv
+worker threads, outside the JavaScript main thread.
+
+## Electron Process Boundary
+
+Load the SDK in an Electron utility process, not the renderer. Keep repository paths, credentials,
+and the native class behind typed IPC. The utility process lifetime should own the session map:
+
+```js
+const sessions = new Map()
+
+export async function openSpace(id, root) {
+  const session = await RepositorySession.open(root)
+  sessions.set(id, session)
+  return session.status()
+}
+
+export async function closeSpace(id) {
+  const session = sessions.get(id)
+  sessions.delete(id)
+  await session?.close()
+}
+```
+
+Electron packaging must unpack `*.node` from ASAR. The npm root package selects an exact-version
+optional binary package for macOS arm64/x64, Linux glibc arm64/x64, or Windows x64. There is no
+install-time compiler or binary downloader.
+
+## Worktree Materialization
+
+| Operation | Replaces, creates, or removes tracked worktree files |
+| --- | --- |
+| `init`, `status`, `addAll`, `commit`, `diff`, `history` | No |
+| `configureRemote`, `push`, `fetch` | No |
+| `restore`, `pull`, `cloneRepository` | **Yes** |
+
+Before a materializing operation, stop new application writes, drain transactions, and close the
+affected SQLite handles. Reopen and validate those handles after the SDK promise settles. The Graft
+repository session itself can stay resident. `operationMaterializesWorktree(name)` exposes this
+contract to an application gate.
+
+<Aside type="caution" title="One repository writer">
+  A second SDK session or external Graft writer for the same repository receives
+  `GRAFT_SDK_REPOSITORY_BUSY`. Do not retry in a tight loop; close the stale owner or ask the user
+  to stop the external writer.
+</Aside>
+
+## Credentials
+
+Pass HTTP credentials explicitly and keep them in memory:
+
+```js
+await session.configureRemote({
+  name: "origin",
+  url: "https://sync.example.com/org/space",
+  bearerToken,
+})
+
+session.setHttpBearerToken("origin", rotatedToken)
+session.clearHttpBearerToken("origin")
+```
+
+The SDK never reads `GRAFT_REMOTE_TOKEN`, never writes a bearer token to repository config or a
+URL, and redacts credentials from errors. The CLI retains its environment-variable compatibility
+path, but applications should not use it as SDK credential transport.
+
+## Close, Reopen, Crash, And Cancel
+
+`close()` rejects queued work, waits for the in-flight command, releases the repository runtime,
+and is idempotent. `reopen()` reconstructs the runtime from durable state. If a utility process
+crashes, the OS releases the storage lock; a replacement process opens a fresh session without a
+daemon lease or PID recovery file.
+
+Async methods accept an `AbortSignal`. Cancellation stops work that is still queued. Once a native
+repository command starts, it completes normally to avoid exposing a partially interrupted
+mutation.
+
+Handle errors by `error.code`, including `GRAFT_SDK_SESSION_CLOSED`,
+`GRAFT_SDK_SESSION_CLOSING`, `GRAFT_SDK_REPOSITORY_BUSY`, and
+`GRAFT_SDK_REPOSITORY_COMMAND`.
+
+## API
+
+The first stable surface covers `init`, `open`, `status`, `addAll`, `commit`, `diff`, `history`,
+`restore`, `configureRemote`, `push`, `fetch`, `pull`, and `cloneRepository`. See the package
+[README](https://github.com/eidos-space/graft/tree/main/packages/graft-sdk) and TypeScript
+declarations for options and result types.

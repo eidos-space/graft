@@ -1,0 +1,65 @@
+{
+  "name": "@eidos.space/graft",
+  "version": "0.1.0",
+  "description": "Long-lived in-process Graft repository sessions for Node.js and Electron.",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/eidos-space/graft.git",
+    "directory": "packages/graft-sdk"
+  },
+  "homepage": "https://github.com/eidos-space/graft/tree/main/packages/graft-sdk",
+  "bugs": "https://github.com/eidos-space/graft/issues",
+  "keywords": [
+    "graft",
+    "sqlite",
+    "electron",
+    "node-api",
+    "napi-rs"
+  ],
+  "main": "index.js",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "require": "./index.js",
+      "default": "./index.js"
+    }
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build:native": "./scripts/build-native.sh",
+    "test": "node --test test/*.test.js",
+    "bench": "node benchmark/cli-vs-sdk.mjs",
+    "release:create-packages": "napi create-npm-dirs --npm-dir npm",
+    "release:collect": "napi artifacts --output-dir artifacts --npm-dir npm",
+    "release:prepare": "node scripts/prepare-release-metadata.mjs",
+    "release:verify": "node scripts/verify-release-packages.mjs",
+    "release:publish": "node scripts/publish-release-packages.mjs"
+  },
+  "napi": {
+    "binaryName": "graft-sdk",
+    "targets": [
+      "aarch64-apple-darwin",
+      "x86_64-apple-darwin",
+      "aarch64-unknown-linux-gnu",
+      "x86_64-unknown-linux-gnu",
+      "x86_64-pc-windows-msvc"
+    ]
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "3.7.4"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true,
+    "registry": "https://registry.npmjs.org/"
+  }
+}

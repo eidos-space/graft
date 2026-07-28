@@ -5,7 +5,11 @@
 
 use std::{path::Path, sync::Arc};
 
-use graft::{remote::RemoteConfig, repo::Repository, setup::setup_graft_temporary};
+use graft::{
+    remote::{RemoteConfig, RemoteCredentialErr, RemoteCredentials},
+    repo::Repository,
+    setup::setup_graft_temporary,
+};
 
 use crate::{
     file::vol_file::VolFile,
@@ -41,15 +45,31 @@ pub fn execute_repository_command(
     service.execute(command)
 }
 
-struct RepositoryCommandService {
+/// A long-lived repository command service.
+///
+/// Opening retains the repository-scoped runtime and its local storage lock until this value is
+/// dropped. Callers must serialize [`Self::execute`] within one service; separate services for
+/// separate repositories may execute concurrently.
+pub struct RepositoryCommandService {
     file: VolFile,
+    credentials: RemoteCredentials,
 }
 
 impl RepositoryCommandService {
-    fn open(target: &Path) -> Result<Self, ErrCtx> {
+    /// Opens a service with the legacy CLI environment credential policy.
+    pub fn open(target: &Path) -> Result<Self, ErrCtx> {
+        Self::open_with_credentials(target, RemoteCredentials::environment())
+    }
+
+    /// Opens a service with an explicit credential policy supplied by an embedder.
+    pub fn open_with_credentials(
+        target: &Path,
+        credentials: RemoteCredentials,
+    ) -> Result<Self, ErrCtx> {
         let base_runtime = setup_graft_temporary(RemoteConfig::Memory, None)?;
         let runtimes = Arc::new(RepoRuntimeRegistry::new(base_runtime.clone()));
-        let repo = discover_target_repository(target);
+        let repo = discover_target_repository(target)
+            .map(|repo| repo.with_remote_credentials(credentials.clone()));
         let runtime = match &repo {
             Some(repo) => runtimes.runtime_for(repo)?,
             None => base_runtime,
@@ -62,19 +82,40 @@ impl RepositoryCommandService {
             .as_ref()
             .filter(|repo| target != repo.graft_dir())
             .map(|_| target.to_path_buf());
-        let file = VolFile::new_repository_session(
+        let mut file = VolFile::new_repository_session(
             runtime,
             session_path.to_string_lossy().into_owned(),
             repository_database,
             repo,
             runtimes,
         )?;
-        Ok(Self { file })
+        file.set_remote_credentials(credentials.clone());
+        Ok(Self { file, credentials })
     }
 
-    fn execute(&mut self, command: RepositoryCommand) -> Result<Option<String>, ErrCtx> {
+    /// Executes one parsed repository command against the retained runtime.
+    pub fn execute(&mut self, command: RepositoryCommand) -> Result<Option<String>, ErrCtx> {
         let runtime = self.file.runtime().clone();
         command.command.eval(&runtime, &mut self.file)
+    }
+
+    /// Injects or rotates an HTTP bearer token without writing it to repository config.
+    pub fn set_http_bearer_token(
+        &self,
+        remote_name: &str,
+        token: String,
+    ) -> Result<(), RemoteCredentialErr> {
+        self.credentials.set_http_bearer_token(remote_name, token)
+    }
+
+    /// Clears an injected HTTP bearer token.
+    pub fn clear_http_bearer_token(&self, remote_name: &str) -> Result<(), RemoteCredentialErr> {
+        self.credentials.clear_http_bearer_token(remote_name)
+    }
+
+    /// Redacts all credentials held by this service from a diagnostic string.
+    pub fn redact(&self, message: &str) -> String {
+        self.credentials.redact(message)
     }
 }
 

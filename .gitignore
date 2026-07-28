@@ -3,6 +3,11 @@
 /dist/
 /distx/
 /node_modules/
+packages/graft-sdk/native/*.node
+packages/graft-sdk/*.node
+packages/graft-sdk/artifacts/
+packages/graft-sdk/npm/
+packages/graft-sdk/node_modules/
 **/*.rs.bk
 *.pdb
 .env

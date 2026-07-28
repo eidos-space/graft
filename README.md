@@ -57,15 +57,17 @@ files referenced by its rows as one unit.
   state.
 - Sync through filesystem, S3-compatible, and Graft HTTP remotes.
 - Expose JSON results for application UIs, automation, and agent workflows.
+- Embed long-lived repository sessions in Node.js and Electron through the ABI-stable
+  `@eidos.space/graft` Node-API package.
 - Verify and maintain repositories with `audit`, `gc`, and `payload` commands.
 
 ## Quickstart
 
-Install Graft v0.8.1:
+Install Graft v0.9.0:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/eidos-space/graft/main/install.sh \
-  | GRAFT_VERSION=0.8.1 sh
+  | GRAFT_VERSION=0.9.0 sh
 
 graft --version
 ```
@@ -105,6 +107,33 @@ graft log --json
 `graft init` creates `.graft/`. SQLite-specific commands take an explicit
 `--db` path; repository-wide commands discover `.graft/` from the current
 directory.
+
+## Node.js And Electron SDK
+
+Applications that need a long-lived repository handle should load the SDK directly instead of
+starting a CLI process for each command:
+
+```sh
+pnpm add @eidos.space/graft
+```
+
+```js
+const { RepositorySession } = require("@eidos.space/graft")
+
+const session = await RepositorySession.open(spaceRoot)
+try {
+  const status = await session.status()
+  const diff = await session.diff({ rows: true })
+} finally {
+  await session.close()
+}
+```
+
+One session serializes operations for one repository; sessions for different repositories can run
+in parallel. `restore`, `pull`, and `cloneRepository` materialize worktree files, so Electron apps
+must close affected SQLite handles before those calls and reopen them afterward. See the
+[resident SDK guide](https://graft.eidos.space/docs/guides/node-electron-sdk/) for lifecycle,
+credentials, cancellation, and packaging details.
 
 ## SQLite Snapshots
 
@@ -228,8 +257,8 @@ The repository includes reusable TypeScript components for remote services:
 
 ## Application Integration
 
-The CLI is Graft's repository control plane. Commands support structured JSON
-for desktop applications, web services, scripts, and agents:
+The CLI and resident SDK are Graft's repository control-plane surfaces. CLI
+commands support structured JSON for scripts, agents, and one-shot automation:
 
 ```sh
 graft status --json
@@ -250,9 +279,10 @@ SQLite `page_size=4096`:
 PRAGMA graft_version;
 ```
 
-Repository status, staging, commits, branches, merges, and remotes are handled
-through the CLI. A logical database should use either its physical worktree
-file or the Graft VFS as its write path.
+Repository status, staging, commits, history, restore, and remotes can also be
+handled through `@eidos.space/graft` without starting CLI subprocesses. A
+logical database should use either its physical worktree file or the Graft VFS
+as its write path.
 
 ## Documentation
 
@@ -265,6 +295,8 @@ file or the Graft VFS as its write path.
 - [CLI reference](https://graft.eidos.space/docs/reference/cli/)
 - [Remote service protocol](https://graft.eidos.space/docs/reference/remote-protocol/)
 - [VFS PRAGMAs](https://graft.eidos.space/docs/reference/pragmas/)
+- [Resident SDK architecture](./docs/sdk-architecture.md)
+- [Release process](./RELEASE.md)
 
 ## Development
 
@@ -279,6 +311,9 @@ cargo build -p graft-ext --release
 
 pnpm check:remote
 pnpm test:remote
+
+pnpm --dir packages/graft-sdk build:native
+pnpm --dir packages/graft-sdk test
 
 cd docs
 pnpm build

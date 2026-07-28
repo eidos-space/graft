@@ -57,7 +57,8 @@ pub(super) fn repo_for_file(file: &mut VolFile) -> Result<Repository, ErrCtx> {
             &file.tag,
         ))));
     }
-    let repo = Repository::discover_for_file(&file.tag)?;
+    let repo = Repository::discover_for_file(&file.tag)?
+        .with_remote_credentials(file.remote_credentials().clone());
     file.repo = Some(repo.clone());
     Ok(repo)
 }
@@ -76,7 +77,8 @@ pub(super) fn run_repo_clone(
     let repo = match spec.worktree.as_ref() {
         Some(worktree) => Repository::init(resolve_repo_worktree_arg(file, worktree)?)?,
         None => Repository::init_for_file(&file.tag)?,
-    };
+    }
+    .with_remote_credentials(file.remote_credentials().clone());
     let graft_dir = repo.graft_dir().to_path_buf();
     let mut attached = false;
     let result = (|| {
