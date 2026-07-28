@@ -242,9 +242,9 @@ test(
       const applicationDatabase = new DatabaseSync(databasePath)
       assert.equal((await session.status()).dirty, false)
       assert.deepEqual((await session.diff({ rows: true })).paths, [])
-      applicationDatabase
-        .prepare("INSERT INTO projects (name) VALUES (?)")
-        .run("Beta")
+      applicationDatabase.exec(
+        "INSERT INTO projects (name) VALUES ('Beta')"
+      )
       assert.equal((await session.status()).dirty, true)
       const expectedHead = (await session.status()).current_head
 
@@ -258,13 +258,8 @@ test(
       const reopenedDatabase = new DatabaseSync(databasePath, {
         readOnly: true,
       })
-      assert.equal(
-        reopenedDatabase
-          .prepare("SELECT COUNT(*) AS count FROM projects")
-          .get().count,
-        1
-      )
       reopenedDatabase.close()
+      assert.equal(readCount(databasePath, "projects"), 1)
       assert.equal((await session.status()).dirty, false)
       await session.close()
     })
@@ -296,24 +291,55 @@ test("AbortSignal cancels queued work without interrupting an in-flight command"
 })
 
 function createDatabase(databasePath, table, rows) {
-  const database = new DatabaseSync(databasePath)
-  database.exec(
-    `CREATE TABLE ${table} (id INTEGER PRIMARY KEY, name TEXT NOT NULL)`
-  )
-  const insert = database.prepare(
-    `INSERT INTO ${table} (name) VALUES (?)`
-  )
-  for (const row of rows) insert.run(...row)
-  database.close()
+  runSqliteHelper({ action: "create", databasePath, table, rows })
 }
 
 function readCount(databasePath, table) {
-  const database = new DatabaseSync(databasePath, { readOnly: true })
-  const count = database
-    .prepare(`SELECT COUNT(*) AS count FROM ${table}`)
-    .get().count
-  database.close()
-  return count
+  return Number(runSqliteHelper({ action: "count", databasePath, table }))
+}
+
+function runSqliteHelper(command) {
+  assert.match(command.table, /^[A-Za-z_][A-Za-z0-9_]*$/)
+  // sqlite3_close_v2 may keep a Windows file handle alive while prepared
+  // statements await GC. A utility-process exit gives materialization tests
+  // the same deterministic handle release that Electron provides.
+  const helper = String.raw`
+    const { DatabaseSync } = require("node:sqlite")
+    const command = JSON.parse(process.argv[1])
+    const database = new DatabaseSync(command.databasePath, {
+      readOnly: command.action === "count",
+    })
+    try {
+      if (command.action === "create") {
+        database.exec(
+          "CREATE TABLE " + command.table +
+          " (id INTEGER PRIMARY KEY, name TEXT NOT NULL)"
+        )
+        const insert = database.prepare(
+          "INSERT INTO " + command.table + " (name) VALUES (?)"
+        )
+        for (const row of command.rows) insert.run(...row)
+      } else {
+        const count = database
+          .prepare("SELECT COUNT(*) AS count FROM " + command.table)
+          .get().count
+        process.stdout.write(String(count))
+      }
+    } finally {
+      database.close()
+    }
+  `
+  const result = spawnSync(
+    process.execPath,
+    ["-e", helper, JSON.stringify(command)],
+    { encoding: "utf8" }
+  )
+  assert.equal(
+    result.status,
+    0,
+    `node:sqlite helper failed: ${result.stderr || result.stdout}`
+  )
+  return result.stdout.trim()
 }
 
 async function withTemporaryDirectory(prefix, operation) {
