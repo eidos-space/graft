@@ -70,7 +70,7 @@ packaging harnesses at an explicit addon path.
 Published packages use the standard native optional-dependency model: the root package contains
 the JavaScript wrapper, declarations, and README; each platform package contains exactly one
 `.node` binary plus `os`, `cpu`, and (on Linux) `libc` constraints. Consumers do not need a Rust
-toolchain and the package has no install script.
+toolchain or system SQLite library, and the package has no install script.
 
 ## Use
 
