@@ -372,7 +372,7 @@ test(
   }
 )
 
-test("AbortSignal cancels queued work without interrupting an in-flight command", async () => {
+test("AbortSignal cancels queued work and leaves the session usable", async () => {
   await withTemporaryDirectory("graft-sdk-abort-", async (root) => {
     const session = await RepositorySession.open(root)
     await session.init()

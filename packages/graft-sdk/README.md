@@ -269,6 +269,10 @@ database. It reports cold/hot median and p95 latency, JSON request/response byte
 cancellation latency, and safe SDK telemetry. Set `GRAFT_SDK_LARGE_FIXTURE` to retain/reuse the
 fixture and `GRAFT_SDK_LARGE_ITERATIONS` to control repetitions.
 
+The large-repository results and profiler comparison are checked in as
+[`benchmark/results/large-repository.md`](benchmark/results/large-repository.md), with the machine-
+readable final run in [`benchmark/results/large-macos-arm64.json`](benchmark/results/large-macos-arm64.json).
+
 The checked-in macOS arm64 baseline is
 [`benchmark/results/macos-arm64.json`](https://github.com/eidos-space/graft/blob/main/packages/graft-sdk/benchmark/results/macos-arm64.json). For 30 iterations on
 the recorded machine, median hot SDK calls were 1.326 ms for `status` and 1.000 ms for `diff`,

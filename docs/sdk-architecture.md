@@ -80,8 +80,9 @@ state; there is no daemon lease, socket, stdin stream, or PID registry to recove
 
 ## Worktree and application database handles
 
-Only `restore`, `pull`, and `cloneRepository` can replace tracked physical worktree files. Eidos
-must close affected application SQLite handles before these calls and reopen them afterward.
+Only `restore`, `restorePaths`, `pull`, and `cloneRepository` can replace tracked physical
+worktree files. Eidos must close affected application SQLite handles before these calls and reopen
+them afterward.
 `init` writes `.graft`, while `fetch`, `push`, and remote configuration change only repository or
 remote state.
 

@@ -167,7 +167,13 @@ function mutateDatabase(databasePath) {
 
 async function runBenchmark(root) {
   await restoreFixtureDatabase(root)
-  const coldStatus = await sample(iterations, async () => {
+  const processColdStatus = await sampleChildOperations(
+    iterations,
+    "cold-status",
+    root,
+    longTimeoutMs
+  )
+  const sessionColdStatus = await sample(iterations, async () => {
     const session = await RepositorySession.open(root)
     try {
       return await session.status()
@@ -177,6 +183,11 @@ async function runBenchmark(root) {
   })
 
   const session = await RepositorySession.open(root)
+  if (typeof session.statusIncremental === "function") {
+    await session.statusIncremental()
+  } else {
+    await session.status()
+  }
   const hotStatus = await sample(iterations, () => session.status())
   const cleanStatus = hotStatus.values.at(-1)
   assert.equal(cleanStatus.dirty, false)
@@ -191,12 +202,14 @@ async function runBenchmark(root) {
     typeof session.statusIncremental === "function"
       ? await timed(() => session.statusIncremental())
       : await timed(() => session.status())
-  const pathDiff =
+  const pathDiffSamples =
     typeof session.diffPaths === "function"
-      ? await timed(() =>
+      ? await sample(iterations, () =>
           session.diffPaths({ paths: ["project.eidos"], rows: true, limit: 10 })
         )
-      : await timed(() => session.diff({ path: "project.eidos", rows: true }))
+      : await sample(iterations, () =>
+          session.diff({ path: "project.eidos", rows: true })
+        )
   await session.close()
 
   const fullDiff = await runTimedChild("working-diff", root, longTimeoutMs)
@@ -220,14 +233,15 @@ async function runBenchmark(root) {
       iterations,
     },
     milliseconds: {
-      status_cold: summarize(coldStatus.milliseconds),
+      status_process_cold: summarize(processColdStatus.milliseconds),
+      status_session_cold: summarize(sessionColdStatus.milliseconds),
       status_hot: summarize(hotStatus.milliseconds),
       history_legacy_limit_1: round(historyOne.milliseconds),
       history_summaries_50: summarySamples
         ? summarize(summarySamples.milliseconds)
         : null,
       changed_status: round(changedStatus.milliseconds),
-      changed_path_diff: round(pathDiff.milliseconds),
+      changed_path_diff: summarize(pathDiffSamples.milliseconds),
       working_diff: fullDiff.milliseconds,
       cancellation_rejection: cancellation.result?.cancellation_rejection_ms ?? null,
       cancellation_session_reusable:
@@ -245,19 +259,30 @@ async function runBenchmark(root) {
         rows: true,
         limit: 10,
       }),
-      changed_path_diff_response: jsonBytes(pathDiff.value),
+      changed_path_diff_response: jsonBytes(pathDiffSamples.values.at(-1)),
       working_diff_response: fullDiff.result?.response_bytes ?? null,
     },
     rss: {
       parent_peak_bytes: peakRssBytes(),
+      process_cold_status_peak_bytes: Math.max(
+        ...processColdStatus.values.map((value) => value.peak_rss_bytes)
+      ),
       working_diff_peak_bytes: fullDiff.result?.peak_rss_bytes ?? null,
       cancellation_peak_bytes: cancellation.result?.peak_rss_bytes ?? null,
     },
     telemetry: {
       status: changedStatus.value.telemetry ?? null,
-      diff: pathDiff.value.telemetry ?? null,
+      diff: pathDiffSamples.values.at(-1).telemetry ?? null,
       history: summarySamples?.values.at(-1)?.telemetry ?? null,
-      inventory,
+      inventory: inventory
+        ? {
+            kind: inventory.kind,
+            total_matching: inventory.total_matching,
+            has_more: inventory.has_more,
+            migration: inventory.migration,
+            telemetry: inventory.telemetry,
+          }
+        : null,
     },
     timeouts: {
       working_diff: fullDiff.timedOut,
@@ -295,6 +320,15 @@ async function runOptionalOperation(root, operation) {
 async function runChildOperation(operation, root) {
   const session = await RepositorySession.open(root)
   try {
+    if (operation === "cold-status") {
+      const measured = await timed(() => session.status())
+      writeChildResult({
+        operation_milliseconds: round(measured.milliseconds),
+        response_bytes: jsonBytes(measured.value),
+        peak_rss_bytes: peakRssBytes(),
+      })
+      return
+    }
     if (operation === "working-diff") {
       const measured = await timed(() => session.diff({ rows: true }))
       writeChildResult({
@@ -304,6 +338,9 @@ async function runChildOperation(operation, root) {
       return
     }
     if (operation === "cancellation") {
+      if (typeof session.statusIncremental === "function") {
+        await session.statusIncremental()
+      }
       const controller = new AbortController()
       const started = performance.now()
       const pending = session.diff({ rows: true, signal: controller.signal })
@@ -316,7 +353,11 @@ async function runChildOperation(operation, root) {
         rejectedAt = performance.now()
       }
       assert.notEqual(rejectedAt, undefined)
-      await session.status()
+      if (typeof session.statusIncremental === "function") {
+        await session.statusIncremental()
+      } else {
+        await session.status()
+      }
       writeChildResult({
         cancellation_rejection_ms: round(rejectedAt - started),
         cancellation_session_reusable_ms: round(performance.now() - rejectedAt),
@@ -373,6 +414,18 @@ async function sample(count, operation) {
     const measured = await timed(operation)
     milliseconds.push(measured.milliseconds)
     values.push(measured.value)
+  }
+  return { milliseconds, values }
+}
+
+async function sampleChildOperations(count, operation, root, timeoutMs) {
+  const milliseconds = []
+  const values = []
+  for (let index = 0; index < count; index += 1) {
+    const child = await runTimedChild(operation, root, timeoutMs)
+    assert.equal(child.timedOut, false)
+    milliseconds.push(child.result.operation_milliseconds)
+    values.push(child.result)
   }
   return { milliseconds, values }
 }
