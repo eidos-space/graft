@@ -371,12 +371,13 @@ pub(super) fn stage_repo_add_path(
                 worktree: repo.worktree().to_path_buf(),
             }));
         }
-        if !force && repo.is_ignored_worktree_path(&directory)? {
-            return ignored_add_path_error(repo, &directory);
-        }
-
         let directory_key = repo_directory_key(repo, &directory)?;
         if !force {
+            if repo.is_ignored_worktree_path(&directory)?
+                && tracked_repo_keys_under_directory(repo, &directory_key)?.is_empty()
+            {
+                return ignored_add_path_error(repo, &directory);
+            }
             let owned_status;
             let status = match status {
                 Some(status) => status,
@@ -431,7 +432,9 @@ pub(super) fn stage_repo_add_path(
     }
 
     let (key, physical_path) = repo_physical_path_arg(repo, path)?;
-    if !force && repo.is_ignored_worktree_path(&physical_path)? {
+    let is_tracked =
+        repo.index_files()?.contains_key(&key) || repo.index_artifacts()?.contains_key(&key);
+    if !force && !is_tracked && repo.is_ignored_worktree_path(&physical_path)? {
         return ignored_add_path_error(repo, &physical_path);
     }
     let mut entries = stage_repo_add_topology_removals(repo, &key)?;

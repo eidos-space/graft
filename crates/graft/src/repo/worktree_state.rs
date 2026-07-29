@@ -333,7 +333,7 @@ impl Repository {
         }
         let key = self.worktree_key_for_path(path)?;
         let is_dir = path.is_dir();
-        Ok(self.ignore_rules()?.is_ignored(&key, is_dir))
+        self.ignore_rules()?.is_ignored(&key, is_dir)
     }
 
     pub fn is_internal_worktree_path(&self, path: impl AsRef<Path>) -> bool {
@@ -1032,7 +1032,8 @@ impl Repository {
     fn scan_worktree_files(&self) -> Result<BTreeMap<String, ScannedWorktreePath>> {
         let mut paths = BTreeMap::new();
         let ignore = self.ignore_rules()?;
-        self.collect_worktree_files(&self.worktree, &ignore, &mut paths)?;
+        let mut matchers = vec![ignore.root()];
+        self.collect_worktree_files(&self.worktree, &ignore, &mut matchers, &mut paths)?;
         Ok(paths)
     }
 
@@ -1040,6 +1041,7 @@ impl Repository {
         &self,
         dir: &Path,
         ignore: &IgnoreRules,
+        matchers: &mut Vec<ignore::gitignore::Gitignore>,
         out: &mut BTreeMap<String, ScannedWorktreePath>,
     ) -> Result<()> {
         if !dir.is_dir() {
@@ -1054,14 +1056,16 @@ impl Repository {
             }
             let file_type = entry.file_type()?;
             if file_type.is_dir() {
-                let key = self.worktree_key_for_path(&path)?;
-                if ignore.is_ignored(&key, true) {
+                if IgnoreRules::matches(matchers, &path, true) {
                     continue;
                 }
-                self.collect_worktree_files(&path, ignore, out)?;
+                matchers.push(ignore.rules_for_directory(&path)?);
+                let result = self.collect_worktree_files(&path, ignore, matchers, out);
+                matchers.pop();
+                result?;
             } else if file_type.is_file() {
                 let key = self.worktree_key_for_path(&path)?;
-                if ignore.is_ignored(&key, false) {
+                if IgnoreRules::matches(matchers, &path, false) {
                     continue;
                 }
                 let is_sqlite = is_sqlite_database_file(&path)?;

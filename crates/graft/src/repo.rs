@@ -73,6 +73,7 @@ use crate::{
 
 pub const GRAFT_DIR: &str = ".graft";
 pub const GRAFT_IGNORE_FILE: &str = ".graftignore";
+pub const GIT_IGNORE_FILE: &str = ".gitignore";
 pub const REPOSITORY_FORMAT_VERSION: u32 = 2;
 pub const OBJECT_FORMAT: &str = "blake3";
 pub const DEFAULT_TEXT_DIFF_CONTENT_LIMIT: ByteUnit = ByteUnit::MB;
@@ -201,6 +202,9 @@ pub enum RepoErr {
 
     #[error("path `{path}` has an unsupported repository identity: {reason}")]
     UnsupportedPathIdentity { path: String, reason: &'static str },
+
+    #[error("failed to load ignore rules: {0}")]
+    Ignore(#[from] ignore::Error),
 
     #[error("path `{path}` does not exist in revision `{rev}`")]
     PathNotFoundInRevision { path: String, rev: String },

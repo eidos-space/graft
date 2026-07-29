@@ -26,6 +26,7 @@ fjall = { workspace = true }
 foldhash = { workspace = true }
 futures = { workspace = true }
 hashbrown = { workspace = true }
+ignore = { workspace = true }
 itertools = { workspace = true }
 lz4_flex = { workspace = true }
 parking_lot = { workspace = true }

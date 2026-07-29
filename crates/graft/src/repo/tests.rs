@@ -729,6 +729,105 @@ fn status_scans_worktree_files_as_untracked() {
 }
 
 #[test]
+fn gitignore_rules_follow_git_syntax_and_nested_precedence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = Repository::init(tmp.path()).unwrap();
+    for directory in [
+        "blocked",
+        "docs",
+        "generated/nested",
+        "logs",
+        "nested/deeper",
+        "open",
+    ] {
+        fs::create_dir_all(tmp.path().join(directory)).unwrap();
+    }
+
+    fs::write(
+        tmp.path().join(GIT_IGNORE_FILE),
+        concat!(
+            "# Git-style ignore rules\n",
+            ".gitignore\n",
+            "*.tmp\n",
+            "!important.tmp\n",
+            "/root-only.txt\n",
+            "blocked/\n",
+            "!blocked/keep.txt\n",
+            "open/*\n",
+            "!open/keep.txt\n",
+            "generated/**\n",
+            "graft-priority.txt\n",
+            "logs/?.txt\n",
+            "docs/[ab].md\n",
+            "\\#literal\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        tmp.path().join(GRAFT_IGNORE_FILE),
+        "!graft-priority.txt\n.graftignore\n",
+    )
+    .unwrap();
+    fs::write(
+        tmp.path().join("nested").join(GIT_IGNORE_FILE),
+        "*.json\n!keep.tmp\n/local.txt\n",
+    )
+    .unwrap();
+
+    for (path, content) in [
+        ("#literal", "ignored"),
+        ("blocked/keep.txt", "still ignored"),
+        ("docs/a.md", "ignored"),
+        ("docs/c.md", "visible"),
+        ("generated/nested/data.bin", "ignored"),
+        ("graft-priority.txt", "visible"),
+        ("ignored.tmp", "ignored"),
+        ("important.tmp", "visible"),
+        ("logs/a.txt", "ignored"),
+        ("logs/ab.txt", "visible"),
+        ("nested/deeper/local.txt", "visible"),
+        ("nested/drop.json", "ignored"),
+        ("nested/keep.tmp", "visible"),
+        ("nested/local.txt", "ignored"),
+        ("nested/root-only.txt", "visible"),
+        ("open/drop.txt", "ignored"),
+        ("open/keep.txt", "visible"),
+        ("root-only.txt", "ignored"),
+    ] {
+        fs::write(tmp.path().join(path), content).unwrap();
+    }
+
+    let paths = repo
+        .untracked_paths()
+        .unwrap()
+        .into_iter()
+        .map(|path| path.path)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        paths,
+        vec![
+            "docs/c.md",
+            "graft-priority.txt",
+            "important.tmp",
+            "logs/ab.txt",
+            "nested/deeper/local.txt",
+            "nested/keep.tmp",
+            "nested/root-only.txt",
+            "open/keep.txt",
+        ]
+    );
+    assert!(
+        repo.is_ignored_worktree_path(repo.worktree().join("blocked/keep.txt"))
+            .unwrap()
+    );
+    assert!(
+        !repo
+            .is_ignored_worktree_path(repo.worktree().join("nested/keep.tmp"))
+            .unwrap()
+    );
+}
+
+#[test]
 fn status_limits_untracked_paths_to_configured_track_roots() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = Repository::init(tmp.path()).unwrap();
