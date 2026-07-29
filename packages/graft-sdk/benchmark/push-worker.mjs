@@ -181,6 +181,7 @@ function runCli(args) {
     timeout: 120_000,
   })
   if (result.status !== 0) {
+    writeSafeTraces(result.stderr)
     const outcome =
       result.error?.code === "ETIMEDOUT"
         ? "timed out"
@@ -189,6 +190,14 @@ function runCli(args) {
   }
   if (result.stdout.trim()) JSON.parse(result.stdout)
   return result
+}
+
+function writeSafeTraces(stderr) {
+  for (const line of stderr.split(/\r?\n/)) {
+    if (line.startsWith("graft-push-trace ")) {
+      process.stderr.write(`${line}\n`)
+    }
+  }
 }
 
 function createDatabase(databasePath) {

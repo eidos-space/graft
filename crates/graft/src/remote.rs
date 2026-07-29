@@ -141,6 +141,7 @@ pub struct RemoteCredentials {
     mode: RemoteCredentialMode,
     http_bearer_tokens: Arc<RwLock<HashMap<String, BearerToken>>>,
     http_client: Arc<RwLock<Option<reqwest::Client>>>,
+    http_upload_client: Arc<RwLock<Option<reqwest::Client>>>,
 }
 
 impl fmt::Debug for RemoteCredentials {
@@ -155,6 +156,10 @@ impl fmt::Debug for RemoteCredentials {
             .field(
                 "http_client_initialized",
                 &self.http_client.read().is_some(),
+            )
+            .field(
+                "http_upload_client_initialized",
+                &self.http_upload_client.read().is_some(),
             )
             .finish()
     }
@@ -173,6 +178,7 @@ impl RemoteCredentials {
             mode: RemoteCredentialMode::Explicit,
             http_bearer_tokens: Arc::default(),
             http_client: Arc::default(),
+            http_upload_client: Arc::default(),
         }
     }
 
@@ -185,6 +191,7 @@ impl RemoteCredentials {
             mode: RemoteCredentialMode::Environment,
             http_bearer_tokens: Arc::default(),
             http_client: Arc::default(),
+            http_upload_client: Arc::default(),
         }
     }
 
@@ -256,12 +263,23 @@ impl RemoteCredentials {
         let mut client = self.http_client.write();
         Ok(client.get_or_insert(candidate).clone())
     }
+
+    fn http_upload_client(&self) -> Result<reqwest::Client> {
+        if let Some(client) = self.http_upload_client.read().clone() {
+            return Ok(client);
+        }
+
+        let candidate = build_http_client()?;
+        let mut client = self.http_upload_client.write();
+        Ok(client.get_or_insert(candidate).clone())
+    }
 }
 
 fn build_http_client() -> std::result::Result<reqwest::Client, reqwest::Error> {
     reqwest::ClientBuilder::new()
         // HTTP/2 request-body multiplexing stalls behind common local proxies.
-        // Reuse a small HTTP/1.1 pool across the entire repository session.
+        // Reuse dedicated read and mutation HTTP/1.1 pools across the entire
+        // repository session so proxies never mix PUT bodies into read streams.
         .http1_only()
         .hickory_dns(true)
         .connect_timeout(Duration::from_secs(5))
@@ -359,6 +377,7 @@ enum RemoteBackend {
 #[derive(Debug, Clone)]
 struct HttpRemote {
     client: reqwest::Client,
+    upload_client: reqwest::Client,
     url: String,
     token: Option<BearerToken>,
 }
@@ -418,10 +437,11 @@ impl Remote {
             RemoteConfig::Http { url, token_env } => {
                 let token = credentials.http_bearer_token(remote_name, token_env.as_deref());
                 return Ok(Self {
-                    backend: RemoteBackend::Http(HttpRemote::with_client(
+                    backend: RemoteBackend::Http(HttpRemote::with_clients(
                         url,
                         token,
                         credentials.http_client()?,
+                        credentials.http_upload_client()?,
                     )),
                 });
             }
@@ -833,9 +853,20 @@ impl HttpRemote {
         Ok(Self::with_client(url, token, build_http_client()?))
     }
 
+    #[cfg(test)]
     fn with_client(url: String, token: Option<BearerToken>, client: reqwest::Client) -> Self {
+        Self::with_clients(url, token, client.clone(), client)
+    }
+
+    fn with_clients(
+        url: String,
+        token: Option<BearerToken>,
+        client: reqwest::Client,
+        upload_client: reqwest::Client,
+    ) -> Self {
         Self {
             client,
+            upload_client,
             url: url.trim_end_matches('/').to_string(),
             token,
         }
@@ -859,8 +890,20 @@ impl HttpRemote {
     }
 
     fn request(&self, method: reqwest::Method, url: String) -> reqwest::RequestBuilder {
-        let request = self
-            .client
+        self.request_with(&self.client, method, url)
+    }
+
+    fn upload_request(&self, method: reqwest::Method, url: String) -> reqwest::RequestBuilder {
+        self.request_with(&self.upload_client, method, url)
+    }
+
+    fn request_with(
+        &self,
+        client: &reqwest::Client,
+        method: reqwest::Method,
+        url: String,
+    ) -> reqwest::RequestBuilder {
+        let request = client
             .request(method, url)
             .header(GRAFT_PROTOCOL_HEADER, GRAFT_PROTOCOL_VERSION);
         if let Some(token) = &self.token {
@@ -1062,7 +1105,7 @@ impl HttpRemote {
         let request_bytes = bytes.len() as u64;
         let response = self
             .send(
-                self.request(reqwest::Method::PUT, self.raw_url("raw", path))
+                self.upload_request(reqwest::Method::PUT, self.raw_url("raw", path))
                     .body(bytes),
                 "put",
                 Some(request_bytes),
@@ -1076,7 +1119,7 @@ impl HttpRemote {
         let request_bytes = bytes.len() as u64;
         let response = self
             .send(
-                self.request(
+                self.upload_request(
                     reqwest::Method::PUT,
                     self.raw_url("raw-if-not-exists", path),
                 )
@@ -1109,7 +1152,7 @@ impl HttpRemote {
         ));
         let response = self
             .send(
-                self.request(
+                self.upload_request(
                     reqwest::Method::PUT,
                     self.raw_url("raw-if-not-exists", path),
                 )
@@ -1126,7 +1169,7 @@ impl HttpRemote {
     async fn delete_raw(&self, path: &str) -> Result<()> {
         let response = self
             .send(
-                self.request(reqwest::Method::DELETE, self.raw_url("raw", path)),
+                self.upload_request(reqwest::Method::DELETE, self.raw_url("raw", path)),
                 "delete",
                 Some(0),
             )
@@ -1144,7 +1187,7 @@ impl HttpRemote {
         let request_bytes = bytes.len() as u64;
         let response = self
             .send(
-                self.request(reqwest::Method::POST, self.raw_url("cas", path))
+                self.upload_request(reqwest::Method::POST, self.raw_url("cas", path))
                     .header("x-graft-expected-present", expected.is_some().to_string())
                     .header(
                         "x-graft-expected-hex",
@@ -1162,7 +1205,7 @@ impl HttpRemote {
     async fn compare_and_delete_raw(&self, path: &str, expected: Option<&[u8]>) -> Result<()> {
         let response = self
             .send(
-                self.request(reqwest::Method::POST, self.raw_url("cad", path))
+                self.upload_request(reqwest::Method::POST, self.raw_url("cad", path))
                     .header("x-graft-expected-present", expected.is_some().to_string())
                     .header(
                         "x-graft-expected-hex",
@@ -1416,6 +1459,60 @@ mod tests {
         assert!(first.has_segment(&SegmentId::random()).await.unwrap());
         assert!(second.has_segment(&SegmentId::random()).await.unwrap());
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn repository_credentials_separate_read_and_upload_connections() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut read_stream, _) = listener.accept().await.unwrap();
+            read_http_headers(&mut read_stream).await;
+            read_stream
+                .write_all(
+                    b"HTTP/1.1 204 No Content\r\nGraft-Protocol: 1\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await
+                .unwrap();
+
+            let (mut upload_stream, _) =
+                tokio::time::timeout(Duration::from_secs(1), listener.accept())
+                    .await
+                    .expect("upload reused the read connection")
+                    .unwrap();
+            read_http_headers(&mut upload_stream).await;
+            upload_stream
+                .write_all(
+                    b"HTTP/1.1 204 No Content\r\nGraft-Protocol: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+        let remote = RemoteConfig::Http {
+            url: format!("http://{address}/org/repo"),
+            token_env: None,
+        }
+        .build_with_credentials("origin", &RemoteCredentials::explicit())
+        .unwrap();
+
+        assert!(remote.has_segment(&SegmentId::random()).await.unwrap());
+        remote
+            .put_raw_if_not_exists("objects/one", Bytes::from_static(b"one"))
+            .await
+            .unwrap();
+        server.await.unwrap();
+    }
+
+    async fn read_http_headers(stream: &mut tokio::net::TcpStream) {
+        let mut request = Vec::new();
+        loop {
+            let mut buffer = [0_u8; 1024];
+            let read = stream.read(&mut buffer).await.unwrap();
+            request.extend_from_slice(&buffer[..read]);
+            if read == 0 || request.windows(4).any(|window| window == b"\r\n\r\n") {
+                return;
+            }
+        }
     }
 
     #[tokio::test]

@@ -11,12 +11,19 @@ const runs = []
 
 for (const target of targets) {
   for (const mode of modes) {
+    const modeRemote =
+      process.env[
+        `GRAFT_PUSH_BENCH_HTTP_REMOTE_${mode.replaceAll("-", "_").toUpperCase()}`
+      ] ?? process.env.GRAFT_PUSH_BENCH_HTTP_REMOTE
     const result = spawnSync(process.execPath, [worker], {
       encoding: "utf8",
       env: {
         ...process.env,
         GRAFT_PUSH_BENCH_MODE: mode,
         GRAFT_PUSH_BENCH_TARGET: target,
+        ...(target === "http"
+          ? { GRAFT_PUSH_BENCH_HTTP_REMOTE: modeRemote }
+          : {}),
         GRAFT_PUSH_BENCH_ITERATIONS: String(iterations),
         GRAFT_PUSH_TRACE: "1",
         NO_COLOR: "1",
