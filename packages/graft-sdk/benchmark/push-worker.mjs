@@ -181,7 +181,11 @@ function runCli(args) {
     timeout: 120_000,
   })
   if (result.status !== 0) {
-    throw new Error(`CLI ${args[0]} failed with status ${result.status ?? "unknown"}`)
+    const outcome =
+      result.error?.code === "ETIMEDOUT"
+        ? "timed out"
+        : `failed with status ${result.status ?? "unknown"}`
+    throw new Error(`CLI ${args[0]} ${outcome}`)
   }
   if (result.stdout.trim()) JSON.parse(result.stdout)
   return result

@@ -21,7 +21,6 @@ use crate::{
 };
 
 const SEGMENT_EXISTS_CONCURRENCY: usize = 5;
-const SNAPSHOT_UPLOAD_CONCURRENCY: usize = 5;
 
 /// Publishes the commits and segments referenced by a snapshot to a remote,
 /// preserving the snapshot's original log IDs and LSNs.
@@ -92,12 +91,13 @@ async fn push_snapshots(
     ]);
 
     let upload_trace = crate::trace::PushTraceSpan::new("sqlite_snapshot_http_upload");
+    let upload_concurrency = remote.snapshot_upload_concurrency();
     let result = stream::iter(uploads)
         .map(|upload| {
             let remote = remote.clone();
             async move { upload_snapshot_upload(remote, upload).await }
         })
-        .buffer_unordered(SNAPSHOT_UPLOAD_CONCURRENCY)
+        .buffer_unordered(upload_concurrency)
         .try_collect()
         .await;
     if result.is_ok() {
@@ -108,15 +108,7 @@ async fn push_snapshots(
 
 async fn upload_snapshot_upload(remote: Arc<Remote>, upload: SnapshotUpload) -> Result<()> {
     if let Some((sid, chunks)) = upload.segment {
-        let segment_remote = remote.clone();
-        let commit_remote = remote;
-        let (segment_result, commit_result) = tokio::join!(
-            async move { segment_remote.put_segment(&sid, chunks).await },
-            upload_snapshot_commit(commit_remote, upload.commit)
-        );
-        segment_result?;
-        commit_result?;
-        return Ok(());
+        remote.put_segment(&sid, chunks).await?;
     }
 
     upload_snapshot_commit(remote, upload.commit).await

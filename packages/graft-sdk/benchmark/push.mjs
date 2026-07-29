@@ -25,10 +25,11 @@ for (const target of targets) {
       timeout: 30 * 60 * 1000,
     })
     if (result.status !== 0) {
+      const lastTrace = lastSafeTrace(result.stderr)
       throw new Error(
         `Push benchmark worker failed for ${target}/${mode} with status ${
           result.status ?? "unknown"
-        }`
+        }${lastTrace === undefined ? "" : ` after ${JSON.stringify(lastTrace)}`}`
       )
     }
     const report = JSON.parse(result.stdout)
@@ -43,6 +44,24 @@ for (const target of targets) {
       })
     }
   }
+}
+
+function lastSafeTrace(stderr) {
+  let last
+  for (const line of stderr.split(/\r?\n/)) {
+    if (!line.startsWith("graft-push-trace ")) continue
+    const event = JSON.parse(line.slice("graft-push-trace ".length))
+    last = {
+      event: event.event,
+      ...(event.operation ? { operation: event.operation } : {}),
+      ...(event.phase ? { phase: event.phase } : {}),
+      ...(event.status !== undefined ? { status: event.status } : {}),
+      ...(event.duration_ms !== undefined
+        ? { duration_ms: event.duration_ms }
+        : {}),
+    }
+  }
+  return last
 }
 
 const groups = new Map()

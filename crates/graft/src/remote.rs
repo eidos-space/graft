@@ -265,6 +265,7 @@ fn build_http_client() -> std::result::Result<reqwest::Client, reqwest::Error> {
         .http1_only()
         .hickory_dns(true)
         .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(30))
         .build()
 }
 
@@ -370,6 +371,15 @@ struct HttpListResponse {
 }
 
 impl Remote {
+    pub(crate) fn snapshot_upload_concurrency(&self) -> usize {
+        match &self.backend {
+            // A single HTTP/1 connection is materially more reliable through
+            // high-latency proxies and lets the shared client reuse TLS state.
+            RemoteBackend::Http(_) => 1,
+            RemoteBackend::ObjectStore(_) => REMOTE_CONCURRENCY,
+        }
+    }
+
     pub fn with_config(config: RemoteConfig) -> Result<Self> {
         Self::with_config_and_credentials(config, "", &RemoteCredentials::environment())
     }
@@ -1246,6 +1256,20 @@ fn remote_lock_path(path: &str) -> String {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn http_snapshot_uploads_are_serialized() {
+        let http = RemoteConfig::Http {
+            url: "https://example.com/org/repo".to_string(),
+            token_env: None,
+        }
+        .build()
+        .unwrap();
+        let memory = RemoteConfig::Memory.build().unwrap();
+
+        assert_eq!(http.snapshot_upload_concurrency(), 1);
+        assert_eq!(memory.snapshot_upload_concurrency(), REMOTE_CONCURRENCY);
+    }
 
     #[test]
     fn explicit_credentials_are_in_memory_only_and_redacted() {
