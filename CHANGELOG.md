@@ -1,5 +1,19 @@
 # Changelog
 
+## Graft 0.10.0 — 2026-07-29
+
+### Added
+
+- Graft now reads `.gitignore` files from the repository root and nested
+  directories using Git-compatible matching syntax and precedence.
+
+### Changed
+
+- `.graftignore` now uses the same matching syntax as `.gitignore` and takes
+  precedence when both files define rules in the same directory.
+- Ignored untracked paths still require `graft add --force`, while changes to
+  already tracked paths can be staged normally.
+
 ## Graft 0.9.0 — 2026-07-28
 
 ### Added
