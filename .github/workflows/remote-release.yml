@@ -1,0 +1,253 @@
+name: Release Graft Remote packages
+
+on:
+  pull_request:
+    branches: ["main"]
+    paths:
+      - ".github/workflows/remote-release.yml"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - "scripts/remote-release.mjs"
+      - "scripts/remote-release.test.mjs"
+      - "packages/graft-remote/**"
+      - "packages/graft-remote-hono/**"
+      - "packages/graft-remote-cloudflare/**"
+      - "services/graft-remote-cloudflare/**"
+  push:
+    tags:
+      - "graft-remote-v*"
+  workflow_dispatch:
+
+concurrency:
+  group: graft-remote-release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  metadata:
+    name: Resolve Remote release metadata
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+      is_release: ${{ steps.meta.outputs.is_release }}
+    steps:
+      - name: Checkout release commit
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate tag, commit, and package versions
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="$(node -p "require('./packages/graft-remote/package.json').version")"
+          is_release="false"
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            version="${GITHUB_REF_NAME#graft-remote-v}"
+            is_release="true"
+          fi
+          version_regex='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
+          if [[ ! "$version" =~ $version_regex ]]; then
+            echo "::error::Remote release tag must match graft-remote-vX.Y.Z or a SemVer prerelease"
+            exit 1
+          fi
+
+          if [[ "$is_release" == "true" ]]; then
+            git fetch --no-tags origin main:refs/remotes/origin/main
+            head_commit="$(git rev-parse HEAD)"
+            if ! git merge-base --is-ancestor "$head_commit" origin/main; then
+              echo "::error::release commit $head_commit is not reachable from origin/main"
+              exit 1
+            fi
+            if ! git ls-remote --exit-code origin "refs/tags/${GITHUB_REF_NAME}^{}" >/dev/null; then
+              echo "::error::release tag ${GITHUB_REF_NAME} must be annotated"
+              exit 1
+            fi
+          fi
+
+          node scripts/remote-release.mjs validate "$version"
+          prerelease="false"
+          [[ "$version" == *-* ]] && prerelease="true"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+          echo "is_release=$is_release" >> "$GITHUB_OUTPUT"
+
+  package:
+    name: Test and package Remote libraries
+    needs: metadata
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@41ff72655975bd51cab0327fa583b6e92b6d3061 # v4.2.0
+        with:
+          version: 10.14.0
+
+      - uses: actions/setup-node@395ad3262231945c25e8478fd5baf05154b1d79f # v6
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck and test Remote packages
+        run: |
+          pnpm check:remote
+          pnpm test:remote
+          node --test scripts/remote-release.test.mjs
+
+      - name: Build verified release archives
+        run: |
+          node scripts/remote-release.mjs prepare "${{ needs.metadata.outputs.version }}"
+          node scripts/remote-release.mjs verify "${{ needs.metadata.outputs.version }}"
+
+      - name: Validate the Cloudflare deployment bundle
+        run: pnpm --filter graft-remote-cloudflare-verification exec wrangler deploy --dry-run --outdir /tmp/graft-remote-worker
+
+      - name: Upload exact release archives
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: graft-remote-${{ needs.metadata.outputs.version }}
+          path: release-assets/graft-remote
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish npm packages and GitHub release
+    needs: [metadata, package]
+    if: needs.metadata.outputs.is_release == 'true'
+    runs-on: ubuntu-24.04
+    environment: npm
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@395ad3262231945c25e8478fd5baf05154b1d79f # v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Install npm with trusted-publishing support
+        run: npm install --global npm@11.16.0
+
+      - name: Download verified release archives
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: graft-remote-${{ needs.metadata.outputs.version }}
+          path: release-assets/graft-remote
+
+      - name: Verify downloaded release archives
+        run: node scripts/remote-release.mjs verify "${{ needs.metadata.outputs.version }}"
+
+      - name: Publish dependency-safe package sequence
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: node scripts/remote-release.mjs publish "${{ needs.metadata.outputs.version }}"
+
+      - name: Create or update Remote GitHub release
+        uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2
+        with:
+          name: Graft Remote v${{ needs.metadata.outputs.version }}
+          tag_name: ${{ github.ref_name }}
+          target_commitish: ${{ github.sha }}
+          prerelease: ${{ needs.metadata.outputs.prerelease }}
+          make_latest: false
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          files: release-assets/graft-remote/*
+
+  verify-published:
+    name: Verify npm install on Node.js ${{ matrix.node }}
+    needs: [metadata, publish]
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 24]
+    steps:
+      - uses: actions/setup-node@395ad3262231945c25e8478fd5baf05154b1d79f # v6
+        with:
+          node-version: ${{ matrix.node }}
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Install and import public packages
+        env:
+          REMOTE_VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          fixture="$(mktemp -d)"
+          cd "$fixture"
+          npm init -y >/dev/null
+          npm install --ignore-scripts \
+            "@eidos.space/graft-remote@${REMOTE_VERSION}" \
+            "@eidos.space/graft-remote-hono@${REMOTE_VERSION}" \
+            hono
+          node --input-type=module <<'NODE'
+          import { createGraftRemoteHandler } from '@eidos.space/graft-remote'
+          import { createGraftRemote } from '@eidos.space/graft-remote-hono'
+          if (typeof createGraftRemoteHandler !== 'function' || typeof createGraftRemote !== 'function') {
+            throw new Error('published Remote packages did not expose the expected API')
+          }
+          NODE
+
+  verify-cloudflare-published:
+    name: Verify public Cloudflare package bundle
+    needs: [metadata, publish]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/setup-node@395ad3262231945c25e8478fd5baf05154b1d79f # v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Install and bundle the public Cloudflare package
+        env:
+          REMOTE_VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          fixture="$(mktemp -d)"
+          cd "$fixture"
+          npm init -y >/dev/null
+          npm install --ignore-scripts \
+            "@eidos.space/graft-remote@${REMOTE_VERSION}" \
+            "@eidos.space/graft-remote-cloudflare@${REMOTE_VERSION}" \
+            wrangler@4.67.0
+          cat > index.js <<'WORKER'
+          import { RepositoryDurableObject } from '@eidos.space/graft-remote-cloudflare'
+          export { RepositoryDurableObject }
+          export default { fetch() { return new Response('ok') } }
+          WORKER
+          cat > wrangler.jsonc <<'CONFIG'
+          {
+            "name": "graft-remote-public-package-smoke",
+            "main": "index.js",
+            "compatibility_date": "2026-07-29",
+            "compatibility_flags": ["nodejs_compat"],
+            "durable_objects": {
+              "bindings": [
+                { "name": "REPOSITORIES", "class_name": "RepositoryDurableObject" }
+              ]
+            },
+            "migrations": [
+              { "tag": "v1", "new_sqlite_classes": ["RepositoryDurableObject"] }
+            ]
+          }
+          CONFIG
+          npx wrangler deploy --dry-run --outdir dist
