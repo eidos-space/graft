@@ -8,6 +8,7 @@ const repositoryRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   "..",
 );
+const releaseAssetsRoot = path.join(repositoryRoot, "release-assets");
 
 export const remotePackages = [
   {
@@ -36,6 +37,17 @@ export function releaseTagForVersion(version) {
 
 export function archiveName(packageName, version) {
   return `${packageName.slice(1).replace("/", "-")}-${version}.tgz`;
+}
+
+export function resolveReleaseRoot(outputDirectory) {
+  const releaseRoot = path.resolve(repositoryRoot, outputDirectory);
+  if (
+    releaseRoot === releaseAssetsRoot ||
+    !releaseRoot.startsWith(`${releaseAssetsRoot}${path.sep}`)
+  ) {
+    throw new Error("Remote release output must be inside release-assets/");
+  }
+  return releaseRoot;
 }
 
 export function validatePackageMetadata(metadataByName, expectedVersion) {
@@ -92,7 +104,7 @@ async function validate(expectedVersion) {
 
 async function prepare(expectedVersion, outputDirectory) {
   await readSourceMetadata(expectedVersion);
-  const releaseRoot = path.resolve(repositoryRoot, outputDirectory);
+  const releaseRoot = resolveReleaseRoot(outputDirectory);
   await fs.rm(releaseRoot, { recursive: true, force: true });
   await fs.mkdir(releaseRoot, { recursive: true });
 
@@ -128,7 +140,7 @@ async function prepare(expectedVersion, outputDirectory) {
 
 async function verify(expectedVersion, outputDirectory) {
   await readSourceMetadata(expectedVersion);
-  const releaseRoot = path.resolve(repositoryRoot, outputDirectory);
+  const releaseRoot = resolveReleaseRoot(outputDirectory);
   const expectedArchives = remotePackages.map(({ name }) =>
     archiveName(name, expectedVersion),
   );
@@ -211,7 +223,7 @@ async function verify(expectedVersion, outputDirectory) {
 
 async function publish(expectedVersion, outputDirectory) {
   await verify(expectedVersion, outputDirectory);
-  const releaseRoot = path.resolve(repositoryRoot, outputDirectory);
+  const releaseRoot = resolveReleaseRoot(outputDirectory);
   const releaseTag = releaseTagForVersion(expectedVersion);
   const dryRun = process.env.GRAFT_REMOTE_RELEASE_DRY_RUN === "1";
 

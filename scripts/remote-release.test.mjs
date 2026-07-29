@@ -7,6 +7,7 @@ import {
   archiveName,
   releaseTagForVersion,
   remotePackages,
+  resolveReleaseRoot,
   validatePackageMetadata,
 } from "./remote-release.mjs";
 
@@ -33,6 +34,19 @@ test("derives deterministic scoped package archive names", () => {
     archiveName("@eidos.space/graft-remote-cloudflare", "0.1.0"),
     "eidos.space-graft-remote-cloudflare-0.1.0.tgz",
   );
+});
+
+test("limits destructive preparation to the release-assets directory", () => {
+  assert.equal(
+    resolveReleaseRoot("release-assets/graft-remote"),
+    path.join(repositoryRoot, "release-assets/graft-remote"),
+  );
+  assert.throws(
+    () => resolveReleaseRoot("release-assets"),
+    /inside release-assets/,
+  );
+  assert.throws(() => resolveReleaseRoot("."), /inside release-assets/);
+  assert.throws(() => resolveReleaseRoot("/"), /inside release-assets/);
 });
 
 test("validates the checked-in Remote package release contract", async () => {

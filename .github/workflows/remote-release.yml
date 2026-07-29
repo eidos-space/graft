@@ -228,7 +228,7 @@ jobs:
           npm install --ignore-scripts \
             "@eidos.space/graft-remote@${REMOTE_VERSION}" \
             "@eidos.space/graft-remote-cloudflare@${REMOTE_VERSION}" \
-            wrangler@4.67.0
+            wrangler@4.113.0
           cat > index.js <<'WORKER'
           import { RepositoryDurableObject } from '@eidos.space/graft-remote-cloudflare'
           export { RepositoryDurableObject }
