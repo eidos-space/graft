@@ -70,6 +70,31 @@ test("repeated status and diff reuse one native session without a CLI", async ()
   })
 })
 
+test("incremental status exposes a stable session generation", async () => {
+  await withTemporaryDirectory("graft-sdk-generation-", async (root) => {
+    const session = await RepositorySession.open(root)
+    await session.init()
+    const note = path.join(root, "note.txt")
+    await fs.writeFile(note, "one\n")
+    await session.addAll()
+    await session.commit("baseline")
+
+    const first = await session.statusIncremental()
+    const hot = await session.statusIncremental()
+    assert.equal(first.status.dirty, false)
+    assert.equal(hot.generation, first.generation)
+    assert.equal(hot.change_token, first.change_token)
+    assert.equal(hot.telemetry.status_cache_hit, true)
+
+    await fs.writeFile(note, "two\n")
+    const changed = await session.statusIncremental()
+    assert.equal(changed.status.dirty, true)
+    assert.ok(changed.generation > hot.generation)
+    assert.equal(changed.telemetry.status_cache_hit, false)
+    await session.close()
+  })
+})
+
 test(
   "adds, commits, pushes, and clones a multi-file Space",
   nodeSqliteTest,

@@ -309,7 +309,7 @@ pub(super) fn repo_key_matches_filter(key: &str, filter: &str) -> bool {
             .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
-pub(super) fn repo_status_for_file(
+pub(crate) fn repo_status_for_file(
     runtime: &Runtime,
     file: &VolFile,
     repo: &Repository,

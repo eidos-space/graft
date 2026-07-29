@@ -47,7 +47,7 @@ pub(super) fn format_repo_init_outcome(outcome: &RepoInitOutcome) -> String {
     )
 }
 
-pub(super) fn repo_for_file(file: &mut VolFile) -> Result<Repository, ErrCtx> {
+pub(crate) fn repo_for_file(file: &mut VolFile) -> Result<Repository, ErrCtx> {
     if let Some(repo) = &file.repo {
         return Ok(repo.clone());
     }

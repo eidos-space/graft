@@ -46,6 +46,22 @@ export interface CloneOptions extends OperationOptions {
 
 export type GraftJson = Record<string, unknown> | unknown[]
 
+export interface StatusTelemetry {
+  duration_us: number
+  paths_examined: number
+  metadata_cache_hits: number
+  metadata_cache_misses: number
+  tree_cache_hit: boolean
+  status_cache_hit: boolean
+}
+
+export interface IncrementalStatusResult {
+  generation: number
+  change_token: string
+  status: GraftJson
+  telemetry: StatusTelemetry
+}
+
 export class GraftSdkError extends Error {
   readonly code: string
   readonly cause?: unknown
@@ -70,6 +86,9 @@ export class RepositorySession {
 
   init(options?: OperationOptions): Promise<GraftJson>
   status(options?: OperationOptions): Promise<GraftJson>
+  statusIncremental(
+    options?: OperationOptions
+  ): Promise<IncrementalStatusResult>
   addAll(options?: OperationOptions): Promise<GraftJson>
   commit(message: string, options?: OperationOptions): Promise<GraftJson>
   diff(options?: DiffOptions): Promise<GraftJson>

@@ -62,6 +62,10 @@ class RepositorySession {
     return callJson(() => this.#native.status(signal))
   }
 
+  async statusIncremental({ signal } = {}) {
+    return callJson(() => this.#native.statusIncremental(signal))
+  }
+
   async addAll({ signal } = {}) {
     return callJson(() => this.#native.addAll(signal))
   }

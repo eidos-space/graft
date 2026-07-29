@@ -5,11 +5,15 @@
 //! reimplementing repository or remote protocols.
 
 use std::{
+    collections::BTreeMap,
+    fs,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU8, Ordering},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use graft::remote::{RemoteCredentialErr, RemoteCredentials};
+use graft::repo::{CommitArtifactState, CommitFileState, RepoStatus, Repository, index::Index};
 use graft_sqlite::{
     repo_service::{RepositoryCommand, RepositoryCommandService},
     vfs::ErrCtx,
@@ -84,6 +88,24 @@ impl SdkError {
 
 pub type Result<T> = std::result::Result<T, SdkError>;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatusTelemetry {
+    pub duration_us: u64,
+    pub paths_examined: usize,
+    pub metadata_cache_hits: usize,
+    pub metadata_cache_misses: usize,
+    pub tree_cache_hit: bool,
+    pub status_cache_hit: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IncrementalStatusResult {
+    pub generation: u64,
+    pub change_token: String,
+    pub status: RepoStatus,
+    pub telemetry: StatusTelemetry,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RepositoryOperation {
@@ -137,6 +159,51 @@ pub struct RemoteConfigureOptions {
 
 struct SessionState {
     service: Option<RepositoryCommandService>,
+    status_cache: IncrementalStatusCache,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileFingerprint {
+    is_file: bool,
+    len: u64,
+    modified_ns: Option<u128>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanoseconds: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TrackedFingerprint {
+    main: Option<FileFingerprint>,
+    wal: Option<FileFingerprint>,
+    shm: Option<FileFingerprint>,
+    journal: Option<FileFingerprint>,
+}
+
+#[derive(Default)]
+struct IncrementalStatusCache {
+    initialized: bool,
+    head_target: Option<String>,
+    index: Index,
+    files: BTreeMap<String, CommitFileState>,
+    artifacts: BTreeMap<String, CommitArtifactState>,
+    tracked_fingerprints: BTreeMap<String, TrackedFingerprint>,
+    untracked_fingerprints: BTreeMap<String, FileFingerprint>,
+    status: Option<RepoStatus>,
+    generation: u64,
+}
+
+impl IncrementalStatusCache {
+    fn invalidate(&mut self) {
+        let generation = self.generation;
+        *self = Self::default();
+        self.generation = generation;
+    }
 }
 
 /// One long-lived repository session.
@@ -167,7 +234,10 @@ impl RepositorySession {
             target: repository_session_target(target.as_ref()),
             credentials: RemoteCredentials::explicit(),
             lifecycle: AtomicU8::new(LIFECYCLE_CLOSED),
-            state: Mutex::new(SessionState { service: None }),
+            state: Mutex::new(SessionState {
+                service: None,
+                status_cache: IncrementalStatusCache::default(),
+            }),
         }
     }
 
@@ -232,6 +302,7 @@ impl RepositorySession {
 
         let mut state = self.state.lock();
         state.service = None;
+        state.status_cache = IncrementalStatusCache::default();
         self.lifecycle.store(LIFECYCLE_CLOSED, Ordering::Release);
         Ok(())
     }
@@ -241,6 +312,7 @@ impl RepositorySession {
         self.lifecycle.store(LIFECYCLE_CLOSING, Ordering::Release);
         let mut state = self.state.lock();
         state.service = None;
+        state.status_cache = IncrementalStatusCache::default();
         self.lifecycle.store(LIFECYCLE_OPENING, Ordering::Release);
 
         match RepositoryCommandService::open_with_credentials(
@@ -273,22 +345,35 @@ impl RepositorySession {
     }
 
     pub fn init(&self) -> Result<Value> {
-        self.execute_json("json_init", None)
+        self.execute_json_mutating("json_init", None)
     }
 
     pub fn status(&self) -> Result<Value> {
-        self.execute_json("json_status", None)
+        serde_json::to_value(self.status_incremental()?.status).map_err(|error| {
+            SdkError::new(
+                SdkErrorCode::InvalidResponse,
+                format!("could not encode repository status: {error}"),
+            )
+        })
+    }
+
+    pub fn status_incremental(&self) -> Result<IncrementalStatusResult> {
+        self.with_state(|state| {
+            let SessionState { service, status_cache } = state;
+            let service = service.as_mut().ok_or_else(session_closed_error)?;
+            refresh_incremental_status(service, status_cache)
+        })
     }
 
     pub fn add_all(&self) -> Result<Value> {
-        self.execute_json("json_add", Some("--all"))
+        self.execute_json_mutating("json_add", Some("--all"))
     }
 
     pub fn commit(&self, message: &str) -> Result<Value> {
         if message.trim().is_empty() {
             return Err(invalid_argument("commit message must not be empty"));
         }
-        self.execute_json("json_commit", Some(message))
+        self.execute_json_mutating("json_commit", Some(message))
     }
 
     pub fn diff(&self, options: &DiffOptions) -> Result<Value> {
@@ -324,7 +409,7 @@ impl RepositorySession {
         }
         parts.push("--".to_string());
         parts.push(quote_pragma_path(&options.path)?);
-        self.execute_json("json_restore", Some(&parts.join(" ")))
+        self.execute_json_mutating("json_restore", Some(&parts.join(" ")))
     }
 
     pub fn configure_remote(&self, options: &RemoteConfigureOptions) -> Result<Value> {
@@ -334,7 +419,7 @@ impl RepositorySession {
             self.set_http_bearer_token(&options.name, token.clone())?;
         }
 
-        self.with_service(|service| {
+        let result = self.with_service(|service| {
             let remotes = execute_json(service, "json_remotes", None)?;
             let existing_url = remote_url(&remotes, &options.name)?;
             match existing_url {
@@ -364,7 +449,11 @@ impl RepositorySession {
                 execute_json(service, "json_branch_upstream", Some(&argument))?;
             }
             execute_json(service, "json_remotes", None)
-        })
+        });
+        if result.is_ok() {
+            let _ = self.invalidate_status_cache();
+        }
+        result
     }
 
     pub fn push(&self, remote: Option<&str>, branch: Option<&str>) -> Result<Value> {
@@ -374,12 +463,12 @@ impl RepositorySession {
 
     pub fn fetch(&self, remote: Option<&str>, branch: Option<&str>) -> Result<Value> {
         let argument = remote_branch_argument(remote, branch)?;
-        self.execute_json("json_fetch", argument.as_deref())
+        self.execute_json_mutating("json_fetch", argument.as_deref())
     }
 
     pub fn pull(&self, remote: Option<&str>, branch: Option<&str>) -> Result<Value> {
         let argument = remote_branch_argument(remote, branch)?;
-        self.execute_json("json_pull", argument.as_deref())
+        self.execute_json_mutating("json_pull", argument.as_deref())
     }
 
     pub fn clone_repository(
@@ -399,17 +488,41 @@ impl RepositorySession {
             }
             None => remote_url.to_string(),
         };
-        self.execute_json("json_clone", Some(&argument))
+        self.execute_json_mutating("json_clone", Some(&argument))
     }
 
     fn execute_json(&self, name: &str, argument: Option<&str>) -> Result<Value> {
         self.with_service(|service| execute_json(service, name, argument))
     }
 
+    fn execute_json_mutating(&self, name: &str, argument: Option<&str>) -> Result<Value> {
+        self.with_state(|state| {
+            let SessionState { service, status_cache } = state;
+            let service = service.as_mut().ok_or_else(session_closed_error)?;
+            let value = execute_json(service, name, argument)?;
+            status_cache.invalidate();
+            Ok(value)
+        })
+    }
+
+    fn invalidate_status_cache(&self) -> Result<()> {
+        self.with_state(|state| {
+            state.status_cache.invalidate();
+            Ok(())
+        })
+    }
+
     fn with_service<T>(
         &self,
         operation: impl FnOnce(&mut RepositoryCommandService) -> Result<T>,
     ) -> Result<T> {
+        self.with_state(|state| {
+            let service = state.service.as_mut().ok_or_else(session_closed_error)?;
+            operation(service)
+        })
+    }
+
+    fn with_state<T>(&self, operation: impl FnOnce(&mut SessionState) -> Result<T>) -> Result<T> {
         match self.lifecycle.load(Ordering::Acquire) {
             LIFECYCLE_CLOSED => return Err(session_closed_error()),
             LIFECYCLE_OPENING => return Err(session_opening_error()),
@@ -422,8 +535,7 @@ impl RepositorySession {
         if self.lifecycle.load(Ordering::Acquire) != LIFECYCLE_OPEN {
             return Err(session_closing_error());
         }
-        let service = state.service.as_mut().ok_or_else(session_closed_error)?;
-        operation(service).map_err(|error| self.redact_error(error))
+        operation(&mut state).map_err(|error| self.redact_error(error))
     }
 
     fn command_error(&self, error: ErrCtx) -> SdkError {
@@ -449,8 +561,247 @@ impl Drop for RepositorySession {
     fn drop(&mut self) {
         self.lifecycle.store(LIFECYCLE_CLOSING, Ordering::Release);
         self.state.get_mut().service = None;
+        self.state.get_mut().status_cache = IncrementalStatusCache::default();
         self.lifecycle.store(LIFECYCLE_CLOSED, Ordering::Release);
     }
+}
+
+fn refresh_incremental_status(
+    service: &mut RepositoryCommandService,
+    cache: &mut IncrementalStatusCache,
+) -> Result<IncrementalStatusResult> {
+    let started = Instant::now();
+    let repo = service.repository().map_err(repository_command_error)?;
+    let head_target = repo.head_target().map_err(repo_error)?;
+    let index = repo.read_index().map_err(repo_error)?;
+    let tree_cache_hit = cache.initialized && cache.head_target == head_target;
+    let same_repository_state = cache.initialized && tree_cache_hit && cache.index == index;
+
+    if same_repository_state {
+        let tracked = tracked_fingerprints(&repo, &cache.files, &cache.artifacts)?;
+        let untracked = visible_untracked_fingerprints(&repo, &cache.files, &cache.artifacts)?;
+        let metadata_cache_hits = matching_fingerprint_count(&cache.tracked_fingerprints, &tracked)
+            + matching_fingerprint_count(&cache.untracked_fingerprints, &untracked);
+        let paths_examined = tracked.len() + untracked.len();
+        if tracked == cache.tracked_fingerprints && untracked == cache.untracked_fingerprints {
+            let status = cache
+                .status
+                .clone()
+                .expect("initialized status cache contains a status");
+            return Ok(incremental_status_result(
+                cache,
+                status,
+                started,
+                StatusTelemetry {
+                    duration_us: 0,
+                    paths_examined,
+                    metadata_cache_hits,
+                    metadata_cache_misses: 0,
+                    tree_cache_hit,
+                    status_cache_hit: true,
+                },
+            ));
+        }
+    }
+
+    let previous_status = cache.status.clone();
+    let status = service.status().map_err(repository_command_error)?;
+    if !same_repository_state {
+        cache.files = repo.index_files().map_err(repo_error)?;
+        cache.artifacts = repo.index_artifacts().map_err(repo_error)?;
+    }
+    cache.tracked_fingerprints = tracked_fingerprints(&repo, &cache.files, &cache.artifacts)?;
+    cache.untracked_fingerprints =
+        visible_untracked_fingerprints(&repo, &cache.files, &cache.artifacts)?;
+    cache.head_target = head_target;
+    cache.index = index;
+    cache.initialized = true;
+    if status_changed(previous_status.as_ref(), &status)? {
+        cache.generation = cache.generation.saturating_add(1).max(1);
+    }
+    cache.status = Some(status.clone());
+    let paths_examined = cache.tracked_fingerprints.len() + cache.untracked_fingerprints.len();
+    Ok(incremental_status_result(
+        cache,
+        status,
+        started,
+        StatusTelemetry {
+            duration_us: 0,
+            paths_examined,
+            metadata_cache_hits: 0,
+            metadata_cache_misses: paths_examined,
+            tree_cache_hit,
+            status_cache_hit: false,
+        },
+    ))
+}
+
+fn incremental_status_result(
+    cache: &IncrementalStatusCache,
+    status: RepoStatus,
+    started: Instant,
+    mut telemetry: StatusTelemetry,
+) -> IncrementalStatusResult {
+    telemetry.duration_us = elapsed_us(started);
+    let head = cache.head_target.as_deref().unwrap_or("unborn");
+    IncrementalStatusResult {
+        generation: cache.generation,
+        change_token: format!("{head}:{}", cache.generation),
+        status,
+        telemetry,
+    }
+}
+
+fn tracked_fingerprints(
+    repo: &Repository,
+    files: &BTreeMap<String, CommitFileState>,
+    artifacts: &BTreeMap<String, CommitArtifactState>,
+) -> Result<BTreeMap<String, TrackedFingerprint>> {
+    let mut fingerprints = BTreeMap::new();
+    for key in files.keys() {
+        fingerprints.insert(
+            key.clone(),
+            tracked_fingerprint(repo.worktree().join(key), true)?,
+        );
+    }
+    for key in artifacts.keys() {
+        fingerprints.insert(
+            key.clone(),
+            tracked_fingerprint(repo.worktree().join(key), false)?,
+        );
+    }
+    Ok(fingerprints)
+}
+
+fn tracked_fingerprint(path: PathBuf, sqlite: bool) -> Result<TrackedFingerprint> {
+    let main = fingerprint_path(&path)?;
+    let sidecar = |suffix: &str| {
+        fingerprint_path(PathBuf::from(format!(
+            "{}{}",
+            path.to_string_lossy(),
+            suffix
+        )))
+    };
+    Ok(TrackedFingerprint {
+        main,
+        wal: sqlite.then(|| sidecar("-wal")).transpose()?.flatten(),
+        shm: sqlite.then(|| sidecar("-shm")).transpose()?.flatten(),
+        journal: sqlite.then(|| sidecar("-journal")).transpose()?.flatten(),
+    })
+}
+
+fn fingerprint_path(path: impl AsRef<Path>) -> Result<Option<FileFingerprint>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            #[cfg(unix)]
+            use std::os::unix::fs::MetadataExt;
+
+            Ok(Some(FileFingerprint {
+                is_file: metadata.file_type().is_file(),
+                len: metadata.len(),
+                modified_ns: metadata.modified().ok().and_then(system_time_ns),
+                #[cfg(unix)]
+                device: metadata.dev(),
+                #[cfg(unix)]
+                inode: metadata.ino(),
+                #[cfg(unix)]
+                changed_seconds: metadata.ctime(),
+                #[cfg(unix)]
+                changed_nanoseconds: metadata.ctime_nsec(),
+            }))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(repository_command_error(error.into())),
+    }
+}
+
+fn system_time_ns(time: SystemTime) -> Option<u128> {
+    time.duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|value| value.as_nanos())
+}
+
+fn visible_untracked_fingerprints(
+    repo: &Repository,
+    files: &BTreeMap<String, CommitFileState>,
+    artifacts: &BTreeMap<String, CommitArtifactState>,
+) -> Result<BTreeMap<String, FileFingerprint>> {
+    let mut visible = BTreeMap::new();
+    collect_visible_files(repo, repo.worktree(), &mut visible)?;
+    visible.retain(|key, _| {
+        !files.contains_key(key) && !artifacts.contains_key(key) && !is_sqlite_sidecar_key(key)
+    });
+    Ok(visible)
+}
+
+fn collect_visible_files(
+    repo: &Repository,
+    directory: &Path,
+    visible: &mut BTreeMap<String, FileFingerprint>,
+) -> Result<()> {
+    if !directory.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(directory).map_err(|error| repository_command_error(error.into()))? {
+        let entry = entry.map_err(|error| repository_command_error(error.into()))?;
+        let path = entry.path();
+        if repo.is_internal_worktree_path(&path) {
+            continue;
+        }
+        let file_type = entry
+            .file_type()
+            .map_err(|error| repository_command_error(error.into()))?;
+        if repo.is_ignored_worktree_path(&path).map_err(repo_error)? {
+            continue;
+        }
+        if file_type.is_dir() {
+            collect_visible_files(repo, &path, visible)?;
+        } else if file_type.is_file() {
+            let key = repo.file_key(&path).map_err(repo_error)?;
+            let fingerprint = fingerprint_path(&path)?
+                .expect("directory entry remains present while it is fingerprinted");
+            visible.insert(key, fingerprint);
+        }
+    }
+    Ok(())
+}
+
+fn matching_fingerprint_count<K: Ord, V: PartialEq>(
+    previous: &BTreeMap<K, V>,
+    current: &BTreeMap<K, V>,
+) -> usize {
+    current
+        .iter()
+        .filter(|(key, value)| previous.get(key).is_some_and(|prior| prior == *value))
+        .count()
+}
+
+fn status_changed(previous: Option<&RepoStatus>, current: &RepoStatus) -> Result<bool> {
+    let Some(previous) = previous else {
+        return Ok(true);
+    };
+    let previous = serde_json::to_vec(previous).map_err(status_encode_error)?;
+    let current = serde_json::to_vec(current).map_err(status_encode_error)?;
+    Ok(previous != current)
+}
+
+fn status_encode_error(error: serde_json::Error) -> SdkError {
+    SdkError::new(
+        SdkErrorCode::InvalidResponse,
+        format!("could not encode repository status: {error}"),
+    )
+}
+
+fn is_sqlite_sidecar_key(key: &str) -> bool {
+    key.ends_with("-wal") || key.ends_with("-shm") || key.ends_with("-journal")
+}
+
+fn elapsed_us(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
+fn repo_error(error: graft::repo::RepoErr) -> SdkError {
+    repository_command_error(error.into())
 }
 
 fn execute_json(
@@ -688,7 +1039,6 @@ fn session_closing_error() -> SdkError {
 #[cfg(test)]
 mod tests {
     use std::{
-        fs,
         sync::{Arc, Barrier, mpsc},
         thread,
         time::Duration,
@@ -738,6 +1088,35 @@ mod tests {
         );
         session.reopen().unwrap();
         assert_eq!(session.status().unwrap()["dirty"], json!(false));
+    }
+
+    #[test]
+    fn incremental_status_reuses_metadata_and_advances_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let note = directory.path().join("note.txt");
+        let session = RepositorySession::new(directory.path());
+        session.open().unwrap();
+        session.init().unwrap();
+        fs::write(&note, "one\n").unwrap();
+        session.add_all().unwrap();
+        session.commit("initial").unwrap();
+
+        let first = session.status_incremental().unwrap();
+        assert!(!first.telemetry.status_cache_hit);
+        assert!(!first.status.dirty);
+        let second = session.status_incremental().unwrap();
+        assert!(second.telemetry.status_cache_hit);
+        assert_eq!(second.generation, first.generation);
+        assert_eq!(second.change_token, first.change_token);
+
+        fs::write(&note, "two\n").unwrap();
+        let changed = session.status_incremental().unwrap();
+        assert!(!changed.telemetry.status_cache_hit);
+        assert!(changed.status.dirty);
+        assert!(changed.generation > second.generation);
+        let hot = session.status_incremental().unwrap();
+        assert!(hot.telemetry.status_cache_hit);
+        assert_eq!(hot.generation, changed.generation);
     }
 
     #[test]

@@ -7,13 +7,16 @@ use std::{path::Path, sync::Arc};
 
 use graft::{
     remote::{RemoteConfig, RemoteCredentialErr, RemoteCredentials},
-    repo::Repository,
+    repo::{CommitFileState, RepoStatus, Repository},
     setup::setup_graft_temporary,
 };
 
 use crate::{
     file::vol_file::VolFile,
-    pragma::GraftCommand,
+    pragma::{
+        GraftCommand, repo_core::repo_for_file, repo_diff::repo_status_for_file,
+        sqlite_worktree::physical_sqlite_file_matches_state,
+    },
     vfs::{ErrCtx, RepoRuntimeRegistry},
 };
 
@@ -98,6 +101,27 @@ impl RepositoryCommandService {
         self.credentials.reset_http_clients();
         let runtime = self.file.runtime().clone();
         command.command.eval(&runtime, &mut self.file)
+    }
+
+    /// Returns the repository retained by this service, discovering it after `init` when needed.
+    pub fn repository(&mut self) -> Result<Repository, ErrCtx> {
+        repo_for_file(&mut self.file)
+    }
+
+    /// Computes the repository status while retaining the service runtime.
+    pub fn status(&mut self) -> Result<RepoStatus, ErrCtx> {
+        let runtime = self.file.runtime().clone();
+        let repo = repo_for_file(&mut self.file)?;
+        repo_status_for_file(&runtime, &self.file, &repo)
+    }
+
+    /// Compares a physical SQLite worktree file with its tracked snapshot.
+    pub fn physical_sqlite_matches(
+        &self,
+        path: &Path,
+        expected: &CommitFileState,
+    ) -> Result<bool, ErrCtx> {
+        physical_sqlite_file_matches_state(self.file.runtime(), path, expected)
     }
 
     /// Injects or rotates an HTTP bearer token without writing it to repository config.

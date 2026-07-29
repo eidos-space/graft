@@ -48,6 +48,7 @@ pub struct CloneOptions {
 enum JsonOperation {
     Init,
     Status,
+    StatusIncremental,
     AddAll,
     Commit {
         message: String,
@@ -94,9 +95,15 @@ impl Task for JsonTask {
     type JsValue = String;
 
     fn compute(&mut self) -> Result<Self::Output> {
+        if matches!(self.operation, JsonOperation::StatusIncremental) {
+            let value = self.session.status_incremental().map_err(napi_error)?;
+            return serde_json::to_string(&value)
+                .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
+        }
         let value = match &mut self.operation {
             JsonOperation::Init => self.session.init(),
             JsonOperation::Status => self.session.status(),
+            JsonOperation::StatusIncremental => unreachable!("handled before JSON value dispatch"),
             JsonOperation::AddAll => self.session.add_all(),
             JsonOperation::Commit { message } => self.session.commit(message),
             JsonOperation::Diff { options } => self.session.diff(options),
@@ -219,6 +226,11 @@ impl NodeRepositorySession {
     #[napi]
     pub fn status(&self, signal: Option<AbortSignal>) -> AsyncTask<JsonTask> {
         json_task(self, JsonOperation::Status, signal)
+    }
+
+    #[napi]
+    pub fn status_incremental(&self, signal: Option<AbortSignal>) -> AsyncTask<JsonTask> {
+        json_task(self, JsonOperation::StatusIncremental, signal)
     }
 
     #[napi]

@@ -236,7 +236,7 @@ impl VolumeRead for PhysicalSqliteReader {
     }
 }
 
-pub(super) fn physical_sqlite_file_matches_state(
+pub(crate) fn physical_sqlite_file_matches_state(
     runtime: &Runtime,
     path: &Path,
     expected: &CommitFileState,
