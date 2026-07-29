@@ -225,14 +225,16 @@ Rollback only the Sync Worker, from the Eidos repository:
 
 ```sh
 pnpm --dir apps/graft-remote exec wrangler rollback \
-  f2c958bf-d10f-4960-9d7d-2d1aabbd1d6e \
-  --env staging -m 'Rollback safe timing headers'
+  922a7ab3-bc2d-4650-bce6-6d43312512be \
+  --env staging -m 'Rollback failure-log hardening'
 ```
 
-Use the pre-change deployment ID instead to remove both optimization rounds.
-Do not roll back `eidos-space-staging` as part of this change: its current
-userinfo outage came from a separate, concurrent staging deployment and was
-reproduced against both old and new Sync Worker versions.
+Use `f2c958bf-d10f-4960-9d7d-2d1aabbd1d6e` to remove timing and log hardening
+while retaining the object-write optimization. Use the pre-change deployment
+ID to remove every optimization round. Do not roll back `eidos-space-staging`
+as part of this change: its current userinfo outage came from a separate,
+concurrent staging deployment and was reproduced against both old and new Sync
+Worker versions.
 
 ## Correctness gates
 
