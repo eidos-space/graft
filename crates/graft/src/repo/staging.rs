@@ -420,6 +420,41 @@ impl Repository {
         Ok(RepoHistorySummaryPage { commits, has_more: false, next_cursor })
     }
 
+    /// Lazily hydrates one commit and returns a bounded page of paths changed from its first
+    /// parent. A root commit is compared with an empty tree.
+    pub fn commit_changed_paths_page(
+        &self,
+        revision: &str,
+        limit: usize,
+        after: Option<&str>,
+    ) -> Result<RepoCommitChangedPathsPage> {
+        cancellation_checkpoint()?;
+        let revision = self.resolve_revision(revision)?;
+        let commit = self.read_commit(&revision)?;
+        cancellation_checkpoint()?;
+
+        let parent = commit.parents.first().cloned();
+        let mut paths = commit.changes;
+        paths.sort_by(|left, right| left.path.cmp(&right.path));
+        let total_changed_paths = paths.len();
+        if let Some(after) = after {
+            paths.retain(|change| change.path.as_str() > after);
+        }
+        let has_more = paths.len() > limit;
+        paths.truncate(limit);
+        let next_cursor = paths.last().map(|change| change.path.clone());
+        cancellation_checkpoint()?;
+
+        Ok(RepoCommitChangedPathsPage {
+            revision,
+            parent,
+            paths,
+            total_changed_paths,
+            has_more,
+            next_cursor,
+        })
+    }
+
     /// Reads only the canonical commit object. Use [`Self::read_commit`] for lazy details.
     pub fn read_commit_summary(&self, id: &str) -> Result<RepoCommitSummary> {
         let id = object::ObjectId::from_str(id)?;

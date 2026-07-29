@@ -1,12 +1,12 @@
 use std::{path::PathBuf, sync::Arc};
 
 use graft_sdk::{
-    CancellationToken, DiffOptions as CoreDiffOptions, DiffPathsOptions as CoreDiffPathsOptions,
-    InventoryKind, InventoryOptions as CoreInventoryOptions,
-    RemoteConfigureOptions as CoreRemoteConfigureOptions, RepositoryOperation,
-    RepositorySession as CoreRepositorySession, RestoreOptions as CoreRestoreOptions,
-    RestorePathsOptions as CoreRestorePathsOptions, SdkError,
-    StagePathsOptions as CoreStagePathsOptions,
+    CancellationToken, CommitChangedPathsOptions as CoreCommitChangedPathsOptions,
+    DiffOptions as CoreDiffOptions, DiffPathsOptions as CoreDiffPathsOptions, InventoryKind,
+    InventoryOptions as CoreInventoryOptions, RemoteConfigureOptions as CoreRemoteConfigureOptions,
+    RepositoryOperation, RepositorySession as CoreRepositorySession,
+    RestoreOptions as CoreRestoreOptions, RestorePathsOptions as CoreRestorePathsOptions, SdkError,
+    StagePathsOptions as CoreStagePathsOptions, UntrackPathsOptions as CoreUntrackPathsOptions,
 };
 use napi::{
     Env, Error, Result, Status, Task,
@@ -28,7 +28,16 @@ pub struct DiffOptions {
 pub struct DiffPathsOptions {
     pub paths: Vec<String>,
     pub rows: Option<bool>,
+    pub root: Option<String>,
     pub from: Option<String>,
+    pub to: Option<String>,
+    pub limit: Option<u32>,
+    pub after: Option<String>,
+}
+
+#[napi(object)]
+pub struct CommitChangedPathsOptions {
+    pub revision: String,
     pub limit: Option<u32>,
     pub after: Option<String>,
 }
@@ -46,6 +55,12 @@ pub struct StagePathsOptions {
     pub paths: Vec<String>,
     pub expected_head: Option<String>,
     pub force: Option<bool>,
+}
+
+#[napi(object)]
+pub struct UntrackPathsOptions {
+    pub paths: Vec<String>,
+    pub expected_head: Option<String>,
 }
 
 #[napi(object)]
@@ -87,6 +102,9 @@ enum JsonOperation {
     StagePaths {
         options: CoreStagePathsOptions,
     },
+    UntrackPaths {
+        options: CoreUntrackPathsOptions,
+    },
     Commit {
         message: String,
     },
@@ -106,6 +124,9 @@ enum JsonOperation {
     },
     CommitDetails {
         revision: String,
+    },
+    CommitChangedPaths {
+        options: CoreCommitChangedPathsOptions,
     },
     IsIgnoredPath {
         path: PathBuf,
@@ -181,8 +202,21 @@ impl JsonTask {
             return serde_json::to_string(&value)
                 .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
         }
+        if let JsonOperation::CommitChangedPaths { options } = &self.operation {
+            let value = self
+                .session
+                .commit_changed_paths(options)
+                .map_err(napi_error)?;
+            return serde_json::to_string(&value)
+                .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
+        }
         if let JsonOperation::StagePaths { options } = &self.operation {
             let value = self.session.stage_paths(options).map_err(napi_error)?;
+            return serde_json::to_string(&value)
+                .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
+        }
+        if let JsonOperation::UntrackPaths { options } = &self.operation {
+            let value = self.session.untrack_paths(options).map_err(napi_error)?;
             return serde_json::to_string(&value)
                 .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
         }
@@ -209,6 +243,9 @@ impl JsonTask {
             JsonOperation::StagePaths { .. } => {
                 unreachable!("handled before JSON value dispatch")
             }
+            JsonOperation::UntrackPaths { .. } => {
+                unreachable!("handled before JSON value dispatch")
+            }
             JsonOperation::Commit { message } => self.session.commit(message),
             JsonOperation::Diff { options } => self.session.diff(options),
             JsonOperation::DiffPaths { .. } => {
@@ -221,6 +258,9 @@ impl JsonTask {
                 unreachable!("handled before JSON value dispatch")
             }
             JsonOperation::CommitDetails { revision } => self.session.commit_details(revision),
+            JsonOperation::CommitChangedPaths { .. } => {
+                unreachable!("handled before JSON value dispatch")
+            }
             JsonOperation::IsIgnoredPath { .. } | JsonOperation::Inventory { .. } => {
                 unreachable!("handled before JSON value dispatch")
             }
@@ -371,6 +411,24 @@ impl NodeRepositorySession {
     }
 
     #[napi]
+    pub fn untrack_paths(
+        &self,
+        options: UntrackPathsOptions,
+        signal: Option<AbortSignal>,
+    ) -> AsyncTask<JsonTask> {
+        json_task(
+            self,
+            JsonOperation::UntrackPaths {
+                options: CoreUntrackPathsOptions {
+                    paths: options.paths.into_iter().map(PathBuf::from).collect(),
+                    expected_head: options.expected_head,
+                },
+            },
+            signal,
+        )
+    }
+
+    #[napi]
     pub fn commit(&self, message: String, signal: Option<AbortSignal>) -> AsyncTask<JsonTask> {
         json_task(self, JsonOperation::Commit { message }, signal)
     }
@@ -404,7 +462,9 @@ impl NodeRepositorySession {
                 options: CoreDiffPathsOptions {
                     paths: options.paths.into_iter().map(PathBuf::from).collect(),
                     rows: options.rows.unwrap_or(false),
+                    root: options.root,
                     from: options.from,
+                    to: options.to,
                     limit: options.limit.unwrap_or(100) as usize,
                     after: options.after,
                 },
@@ -454,6 +514,25 @@ impl NodeRepositorySession {
         signal: Option<AbortSignal>,
     ) -> AsyncTask<JsonTask> {
         json_task(self, JsonOperation::CommitDetails { revision }, signal)
+    }
+
+    #[napi]
+    pub fn commit_changed_paths(
+        &self,
+        options: CommitChangedPathsOptions,
+        signal: Option<AbortSignal>,
+    ) -> AsyncTask<JsonTask> {
+        json_task(
+            self,
+            JsonOperation::CommitChangedPaths {
+                options: CoreCommitChangedPathsOptions {
+                    revision: options.revision,
+                    limit: options.limit.unwrap_or(100) as usize,
+                    after: options.after,
+                },
+            },
+            signal,
+        )
     }
 
     #[napi]
@@ -618,12 +697,14 @@ pub fn operation_materializes_worktree(operation: String) -> Result<bool> {
         "status_incremental" | "statusIncremental" => RepositoryOperation::StatusIncremental,
         "add_all" | "addAll" => RepositoryOperation::AddAll,
         "stage_paths" | "stagePaths" => RepositoryOperation::StagePaths,
+        "untrack_paths" | "untrackPaths" => RepositoryOperation::UntrackPaths,
         "commit" => RepositoryOperation::Commit,
         "diff" => RepositoryOperation::Diff,
         "diff_paths" | "diffPaths" => RepositoryOperation::DiffPaths,
         "history" => RepositoryOperation::History,
         "history_summaries" | "historySummaries" => RepositoryOperation::HistorySummaries,
         "commit_details" | "commitDetails" => RepositoryOperation::CommitDetails,
+        "commit_changed_paths" | "commitChangedPaths" => RepositoryOperation::CommitChangedPaths,
         "is_ignored_path" | "isIgnoredPath" => RepositoryOperation::IsIgnoredPath,
         "inventory" => RepositoryOperation::Inventory,
         "restore" => RepositoryOperation::Restore,

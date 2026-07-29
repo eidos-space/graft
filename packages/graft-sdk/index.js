@@ -75,6 +75,11 @@ class RepositorySession {
     return callJson(() => this.#native.stagePaths(stageOptions, signal))
   }
 
+  async untrackPaths(options) {
+    const { signal, ...untrackOptions } = options
+    return callJson(() => this.#native.untrackPaths(untrackOptions, signal))
+  }
+
   async commit(message, { signal } = {}) {
     return callJson(() => this.#native.commit(message, signal))
   }
@@ -101,6 +106,11 @@ class RepositorySession {
 
   async commitDetails(revision, { signal } = {}) {
     return callJson(() => this.#native.commitDetails(revision, signal))
+  }
+
+  async commitChangedPaths(options) {
+    const { signal, ...pathOptions } = options
+    return callJson(() => this.#native.commitChangedPaths(pathOptions, signal))
   }
 
   async isIgnoredPath(path, { signal } = {}) {

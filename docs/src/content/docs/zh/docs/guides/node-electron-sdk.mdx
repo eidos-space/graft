@@ -49,9 +49,10 @@ binary package；首版覆盖 macOS arm64/x64、Linux glibc arm64/x64 和 Window
 
 | 操作 | 会替换、新建或删除 tracked worktree 文件 |
 | --- | --- |
-| `init`、`status`、`addAll`、`commit`、`diff`、`history` | 否 |
+| `init`、`status`、`statusIncremental`、`addAll`、`stagePaths`、`untrackPaths`、`commit` | 否 |
+| `diff`、`diffPaths`、`history`、`historySummaries`、`commitDetails`、`commitChangedPaths`、`inventory` | 否 |
 | `configureRemote`、`push`、`fetch` | 否 |
-| `restore`、`pull`、`cloneRepository` | **是** |
+| `restore`、`restorePaths`、`pull`、`cloneRepository` | **是** |
 
 materializing 操作前先阻止新的应用写入、排空 transaction，并关闭受影响的 SQLite
 handle；SDK promise 结束后重新打开并验证。Graft repository session 本身可以继续常驻。
@@ -86,14 +87,18 @@ SDK 不读取 `GRAFT_REMOTE_TOKEN`，不把 token 写入 repository config 或 U
 `reopen()` 从持久状态重新构建 runtime。utility process 崩溃后由操作系统释放 storage lock；
 替代进程直接打开新 session，不需要 daemon lease 或 PID 文件。
 
-异步方法接受 `AbortSignal`。取消只终止尚未开始的队列任务；native repository command
-一旦开始就正常完成，避免暴露部分执行的 mutation。
+异步方法接受 `AbortSignal`。队列中和尚在执行的长循环都会协作检查取消信号；取消后
+同一 session 仍可继续使用。批量 mutation 可能完成前缀，重试前应重新读取 status。
 
 调用方应按 `error.code` 分支，例如 `GRAFT_SDK_SESSION_CLOSED`、
 `GRAFT_SDK_SESSION_CLOSING`、`GRAFT_SDK_REPOSITORY_BUSY` 与
 `GRAFT_SDK_REPOSITORY_COMMAND`。
 
-首个公开 API 覆盖 `init`、`open`、`status`、`addAll`、`commit`、`diff`、`history`、
-`restore`、`configureRemote`、`push`、`fetch`、`pull` 与 `cloneRepository`。参数和返回类型
-见 package [README](https://github.com/eidos-space/graft) 和
-TypeScript declaration。
+历史列表应使用不读取 tree/blob 的 `historySummaries`。展开 checkpoint 时，再调用最多
+100 条一页的 `commitChangedPaths`；普通 commit 用返回的 `parent` 和 `revision` 作为
+`diffPaths` 的 `from`/`to`，root commit 使用 `root: revision`。
+
+后来添加 ignore 不会自动取消已追踪文件。先用 `inventory({ kind: "tracked_ignored" })`
+诊断并审核，再调用 `untrackPaths({ paths, expectedHead })`。该操作只移除 index entry，
+拒绝目录，不会删除或替换工作区文件；被 ignore 的文件也不会被后续 `addAll` 重新加入。
+参数和返回类型见 package [README](https://github.com/eidos-space/graft) 和 TypeScript declaration。

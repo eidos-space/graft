@@ -607,6 +607,19 @@ pub struct RepoHistorySummaryPage {
     pub next_cursor: Option<String>,
 }
 
+/// One bounded page of paths changed from a commit's first parent to the commit.
+///
+/// Root commits compare against an empty tree and therefore have no `parent`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoCommitChangedPathsPage {
+    pub revision: String,
+    pub parent: Option<String>,
+    pub paths: Vec<CommitPathChange>,
+    pub total_changed_paths: usize,
+    pub has_more: bool,
+    pub next_cursor: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitPathChange {
     pub path: String,

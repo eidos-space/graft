@@ -7,7 +7,10 @@ use std::{path::Path, sync::Arc};
 
 use graft::{
     remote::{RemoteConfig, RemoteCredentialErr, RemoteCredentials},
-    repo::{CommitFileState, CommitObject, RepoHistorySummaryPage, RepoStatus, Repository},
+    repo::{
+        CommitFileState, CommitObject, RepoCommitChangedPathsPage, RepoHistorySummaryPage,
+        RepoStatus, Repository,
+    },
     setup::setup_graft_temporary,
 };
 
@@ -131,6 +134,18 @@ impl RepositoryCommandService {
         let repo = self.repository()?;
         let id = repo.resolve_revision(revision)?;
         repo.read_commit(&id).map_err(Into::into)
+    }
+
+    /// Lazily hydrates one commit's first-parent path changes and returns a bounded page.
+    pub fn commit_changed_paths(
+        &mut self,
+        revision: &str,
+        limit: usize,
+        after: Option<&str>,
+    ) -> Result<RepoCommitChangedPathsPage, ErrCtx> {
+        self.repository()?
+            .commit_changed_paths_page(revision, limit, after)
+            .map_err(Into::into)
     }
 
     /// Compares a physical SQLite worktree file with its tracked snapshot.

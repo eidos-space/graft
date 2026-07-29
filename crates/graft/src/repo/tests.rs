@@ -702,6 +702,72 @@ fn history_summary_page_is_lightweight_paginated_and_carries_path_counts() {
 }
 
 #[test]
+fn commit_changed_paths_pages_root_and_first_parent_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = Repository::init(tmp.path()).unwrap();
+    for name in ["a.txt", "b.txt", "c.txt"] {
+        let path = tmp.path().join(name);
+        fs::write(&path, "first\n").unwrap();
+        repo.stage_artifact_path(&path).unwrap();
+    }
+    let root = repo.commit_staged("root").unwrap();
+
+    let first_page = repo.commit_changed_paths_page(&root.id, 2, None).unwrap();
+    assert_eq!(first_page.revision, root.id);
+    assert_eq!(first_page.parent, None);
+    assert_eq!(first_page.total_changed_paths, 3);
+    assert_eq!(
+        first_page
+            .paths
+            .iter()
+            .map(|change| change.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a.txt", "b.txt"]
+    );
+    assert!(first_page.has_more);
+
+    let second_page = repo
+        .commit_changed_paths_page(&root.id, 2, first_page.next_cursor.as_deref())
+        .unwrap();
+    assert_eq!(
+        second_page
+            .paths
+            .iter()
+            .map(|change| change.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["c.txt"]
+    );
+    assert!(!second_page.has_more);
+
+    let changed = tmp.path().join("a.txt");
+    fs::write(&changed, "second\n").unwrap();
+    repo.stage_artifact_path(&changed).unwrap();
+    let child = repo.commit_staged("child").unwrap();
+    let child_page = repo
+        .commit_changed_paths_page(&child.id, 100, None)
+        .unwrap();
+    assert_eq!(child_page.parent.as_deref(), Some(root.id.as_str()));
+    assert_eq!(child_page.paths.len(), 1);
+    assert_eq!(child_page.paths[0].path, "a.txt");
+    assert_eq!(child_page.paths[0].change, RepoFileChange::Modified);
+
+    let token = CancellationToken::new();
+    token.cancel();
+    assert!(matches!(
+        with_cancellation(&token, || repo
+            .commit_changed_paths_page(&child.id, 100, None)),
+        Err(RepoErr::Cancelled)
+    ));
+    assert_eq!(
+        repo.commit_changed_paths_page(&child.id, 100, None)
+            .unwrap()
+            .paths
+            .len(),
+        1
+    );
+}
+
+#[test]
 fn cancellation_scope_returns_cancelled_without_poisoning_repository() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = Repository::init(tmp.path()).unwrap();

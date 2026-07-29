@@ -39,12 +39,14 @@ test("exposes ABI-stable SDK metadata and materialization contract", () => {
     "statusIncremental",
     "addAll",
     "stagePaths",
+    "untrackPaths",
     "commit",
     "diff",
     "diffPaths",
     "history",
     "historySummaries",
     "commitDetails",
+    "commitChangedPaths",
     "isIgnoredPath",
     "inventory",
     "configureRemote",
@@ -115,7 +117,7 @@ test("incremental SDK pages history, diffs, ignore inventory, and batch mutation
     await fs.writeFile(path.join(root, "node_modules", "pkg", "index.js"), "one\n")
     await fs.writeFile(path.join(root, "note.txt"), "one\n")
     await session.addAll()
-    await session.commit("baseline")
+    const baselineCommit = await session.commit("baseline")
 
     await fs.writeFile(path.join(root, ".gitignore"), "node_modules/\n")
     await session.addAll()
@@ -127,6 +129,72 @@ test("incremental SDK pages history, diffs, ignore inventory, and batch mutation
     assert.equal(history.telemetry.tree_objects_read, 0)
     assert.equal(history.telemetry.blob_objects_read, 0)
     assert.equal((await session.commitDetails(history.commits[0].id)).id, history.commits[0].id)
+
+    const rootFirstPage = await session.commitChangedPaths({
+      revision: baselineCommit.commit.id,
+      limit: 1,
+    })
+    assert.equal(rootFirstPage.parent, null)
+    assert.equal(rootFirstPage.total_changed_paths, 2)
+    assert.equal(rootFirstPage.paths.length, 1)
+    assert.equal(rootFirstPage.has_more, true)
+    assert.equal(rootFirstPage.telemetry.blob_objects_read, 0)
+    const rootSecondPage = await session.commitChangedPaths({
+      revision: baselineCommit.commit.id,
+      limit: 1,
+      after: rootFirstPage.next_cursor,
+    })
+    assert.equal(rootSecondPage.paths.length, 1)
+    assert.equal(rootSecondPage.has_more, false)
+    const rootPaths = [...rootFirstPage.paths, ...rootSecondPage.paths].map(
+      ({ path: changedPath }) => changedPath
+    )
+    const rootDiff = await session.diffPaths({
+      paths: rootPaths,
+      root: baselineCommit.commit.id,
+      limit: 100,
+    })
+    assert.equal(rootDiff.paths.length, 2)
+
+    const commitPaths = await session.commitChangedPaths({
+      revision: ignoredCommit.commit.id,
+      limit: 100,
+    })
+    assert.equal(commitPaths.parent, baselineCommit.commit.id)
+    assert.deepEqual(
+      commitPaths.paths.map(({ path: changedPath }) => changedPath),
+      [".gitignore"]
+    )
+    const commitDiff = await session.diffPaths({
+      paths: commitPaths.paths.map(({ path: changedPath }) => changedPath),
+      from: commitPaths.parent,
+      to: commitPaths.revision,
+      limit: 100,
+    })
+    assert.equal(commitDiff.paths.length, 1)
+    await assert.rejects(
+      session.commitChangedPaths({
+        revision: ignoredCommit.commit.id,
+        limit: 101,
+      }),
+      /between 1 and 100/
+    )
+    const historyAbort = new AbortController()
+    const historyRunning = Array.from({ length: 24 }, () => session.diff({ rows: true }))
+    const queuedHistory = session.commitChangedPaths({
+      revision: ignoredCommit.commit.id,
+      signal: historyAbort.signal,
+    })
+    historyAbort.abort()
+    await assert.rejects(
+      queuedHistory,
+      (error) => error.name === "AbortError"
+    )
+    await Promise.all(historyRunning)
+    assert.equal(
+      (await session.commitChangedPaths({ revision: ignoredCommit.commit.id })).paths.length,
+      1
+    )
 
     const ignored = await session.isIgnoredPath("node_modules/pkg/index.js")
     assert.equal(ignored.is_ignored, true)
@@ -172,6 +240,56 @@ test("incremental SDK pages history, diffs, ignore inventory, and batch mutation
     assert.equal(restored.paths.length, 2)
     assert.equal(restored.materializes_worktree, true)
     assert.equal(await fs.readFile(path.join(root, "note.txt"), "utf8"), "one\n")
+
+    await assert.rejects(
+      session.untrackPaths({ paths: ["node_modules"], expectedHead }),
+      /directory/
+    )
+    await assert.rejects(
+      session.untrackPaths({ paths: Array.from({ length: 1001 }, (_, index) => `p-${index}`) }),
+      /exceeds 1000/
+    )
+    await assert.rejects(
+      session.untrackPaths({ paths: ["node_modules/pkg/index.js"], expectedHead: "deadbeef" }),
+      /HEAD changed/
+    )
+    const untrackAbort = new AbortController()
+    const untrackRunning = Array.from({ length: 24 }, () => session.diff({ rows: true }))
+    const queuedUntrack = session.untrackPaths({
+      paths: ["node_modules/pkg/index.js"],
+      expectedHead,
+      signal: untrackAbort.signal,
+    })
+    untrackAbort.abort()
+    await assert.rejects(
+      queuedUntrack,
+      (error) => error.name === "AbortError"
+    )
+    await Promise.all(untrackRunning)
+    const untracked = await session.untrackPaths({
+      paths: ["node_modules/pkg/index.js"],
+      expectedHead,
+    })
+    assert.equal(untracked.paths.length, 1)
+    assert.equal(untracked.paths[0].path, "node_modules/pkg/index.js")
+    assert.equal(untracked.materializes_worktree, false)
+    assert.equal(
+      await fs.readFile(path.join(root, "node_modules", "pkg", "index.js"), "utf8"),
+      "one\n"
+    )
+    await session.addAll()
+    const ignoredAfterUntrack = await session.isIgnoredPath("node_modules/pkg/index.js")
+    assert.equal(ignoredAfterUntrack.is_ignored, true)
+    assert.equal(ignoredAfterUntrack.is_tracked, false)
+    assert.deepEqual(
+      (
+        await session.inventory({
+          kind: "tracked_ignored",
+          limit: 10,
+        })
+      ).items,
+      []
+    )
     await session.close()
   })
 })

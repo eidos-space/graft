@@ -29,6 +29,7 @@ const LIFECYCLE_OPENING: u8 = 1;
 const LIFECYCLE_OPEN: u8 = 2;
 const LIFECYCLE_CLOSING: u8 = 3;
 const MAX_HISTORY_SUMMARY_PAGE_SIZE: usize = 500;
+const MAX_COMMIT_CHANGED_PATH_PAGE_SIZE: usize = 100;
 const MAX_DIFF_PATH_PAGE_SIZE: usize = 100;
 const MAX_DIFF_PATH_REQUEST_SIZE: usize = 10_000;
 const MAX_BATCH_MUTATION_PATHS: usize = 1_000;
@@ -135,6 +136,33 @@ pub struct HistorySummariesResult {
     pub telemetry: HistoryTelemetry,
 }
 
+#[derive(Debug, Clone)]
+pub struct CommitChangedPathsOptions {
+    pub revision: String,
+    pub limit: usize,
+    pub after: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitChangedPathsTelemetry {
+    pub duration_us: u64,
+    pub paths_examined: usize,
+    pub items_returned: usize,
+    pub tree_objects_read: usize,
+    pub blob_objects_read: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitChangedPathsResult {
+    pub revision: String,
+    pub parent: Option<String>,
+    pub paths: Vec<graft::repo::CommitPathChange>,
+    pub total_changed_paths: usize,
+    pub has_more: bool,
+    pub next_cursor: Option<String>,
+    pub telemetry: CommitChangedPathsTelemetry,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InventoryKind {
@@ -198,12 +226,14 @@ pub enum RepositoryOperation {
     StatusIncremental,
     AddAll,
     StagePaths,
+    UntrackPaths,
     Commit,
     Diff,
     DiffPaths,
     History,
     HistorySummaries,
     CommitDetails,
+    CommitChangedPaths,
     IsIgnoredPath,
     Inventory,
     Restore,
@@ -239,7 +269,9 @@ pub struct DiffOptions {
 pub struct DiffPathsOptions {
     pub paths: Vec<PathBuf>,
     pub rows: bool,
+    pub root: Option<String>,
     pub from: Option<String>,
+    pub to: Option<String>,
     pub limit: usize,
     pub after: Option<String>,
 }
@@ -279,6 +311,12 @@ pub struct StagePathsOptions {
     pub paths: Vec<PathBuf>,
     pub expected_head: Option<String>,
     pub force: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct UntrackPathsOptions {
+    pub paths: Vec<PathBuf>,
+    pub expected_head: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -576,6 +614,69 @@ impl RepositorySession {
         })
     }
 
+    /// Removes explicit files from the index without deleting or replacing worktree files.
+    pub fn untrack_paths(&self, options: &UntrackPathsOptions) -> Result<BatchPathsResult> {
+        let paths = normalize_batch_paths(&options.paths)?;
+        if let Some(expected_head) = &options.expected_head {
+            validate_revision(expected_head)?;
+        }
+        self.with_state(|state| {
+            let SessionState { service, status_cache } = state;
+            let service = service.as_mut().ok_or_else(session_closed_error)?;
+            let repo = service.repository().map_err(repository_command_error)?;
+            if let Some(expected_head) = &options.expected_head {
+                let actual = repo.head_target().map_err(repo_error)?;
+                if actual.as_deref() != Some(expected_head) {
+                    return Err(invalid_argument(format!(
+                        "cannot untrack because HEAD changed: expected {expected_head}, found {}",
+                        actual.as_deref().unwrap_or("unborn")
+                    )));
+                }
+            }
+
+            let tracked = repo
+                .index_files()
+                .map_err(repo_error)?
+                .into_keys()
+                .chain(repo.index_artifacts().map_err(repo_error)?.into_keys())
+                .collect::<std::collections::BTreeSet<_>>();
+            for path in &paths {
+                graft::repo::cancellation_checkpoint().map_err(repo_error)?;
+                let physical = repo.worktree().join(path);
+                let is_physical_directory = fs::symlink_metadata(&physical)
+                    .is_ok_and(|metadata| metadata.file_type().is_dir());
+                let directory_prefix = format!("{path}/");
+                let is_tracked_directory = tracked
+                    .range(directory_prefix.clone()..)
+                    .next()
+                    .is_some_and(|candidate| candidate.starts_with(&directory_prefix));
+                if is_physical_directory || is_tracked_directory {
+                    return Err(invalid_argument(format!(
+                        "untrack path `{path}` is a directory; provide explicit tracked file paths"
+                    )));
+                }
+            }
+
+            let operation = (|| {
+                let mut results = Vec::with_capacity(paths.len());
+                for path in paths {
+                    graft::repo::cancellation_checkpoint().map_err(repo_error)?;
+                    let argument = format!("--cached -- {}", quote_pragma_path(Path::new(&path))?);
+                    results.push(BatchPathResult {
+                        path,
+                        result: execute_json(service, "json_rm", Some(&argument))?,
+                    });
+                }
+                Ok(BatchPathsResult {
+                    paths: results,
+                    materializes_worktree: false,
+                })
+            })();
+            status_cache.invalidate();
+            operation
+        })
+    }
+
     pub fn commit(&self, message: &str) -> Result<Value> {
         if message.trim().is_empty() {
             return Err(invalid_argument("commit message must not be empty"));
@@ -603,9 +704,13 @@ impl RepositorySession {
                 "diff path limit must be between 1 and {MAX_DIFF_PATH_PAGE_SIZE}"
             )));
         }
-        if let Some(from) = &options.from {
-            validate_revision(from)?;
-        }
+        diff_argument(&DiffOptions {
+            rows: options.rows,
+            root: options.root.clone(),
+            from: options.from.clone(),
+            to: options.to.clone(),
+            ..DiffOptions::default()
+        })?;
 
         let started = Instant::now();
         let mut paths = options
@@ -633,7 +738,9 @@ impl RepositorySession {
             }
             let diff = self.diff(&DiffOptions {
                 rows: options.rows,
+                root: options.root.clone(),
                 from: options.from.clone(),
+                to: options.to.clone(),
                 path: Some(PathBuf::from(&path)),
                 ..DiffOptions::default()
             })?;
@@ -712,6 +819,47 @@ impl RepositorySession {
                 .commit_details(revision)
                 .map_err(repository_command_error)?;
             serde_json::to_value(commit).map_err(status_encode_error)
+        })
+    }
+
+    /// Lazily hydrates one commit and returns a bounded first-parent changed-path page.
+    pub fn commit_changed_paths(
+        &self,
+        options: &CommitChangedPathsOptions,
+    ) -> Result<CommitChangedPathsResult> {
+        validate_revision(&options.revision)?;
+        if options.limit == 0 || options.limit > MAX_COMMIT_CHANGED_PATH_PAGE_SIZE {
+            return Err(invalid_argument(format!(
+                "commit changed path limit must be between 1 and {MAX_COMMIT_CHANGED_PATH_PAGE_SIZE}"
+            )));
+        }
+        let after = options
+            .after
+            .as_deref()
+            .map(|path| normalize_requested_path(Path::new(path)))
+            .transpose()?;
+        let started = Instant::now();
+        self.with_service(|service| {
+            let page = service
+                .commit_changed_paths(&options.revision, options.limit, after.as_deref())
+                .map_err(repository_command_error)?;
+            let tree_objects_read = if page.parent.is_some() { 2 } else { 1 };
+            let items_returned = page.paths.len();
+            Ok(CommitChangedPathsResult {
+                revision: page.revision,
+                parent: page.parent,
+                paths: page.paths,
+                total_changed_paths: page.total_changed_paths,
+                has_more: page.has_more,
+                next_cursor: page.next_cursor,
+                telemetry: CommitChangedPathsTelemetry {
+                    duration_us: elapsed_us(started),
+                    paths_examined: page.total_changed_paths,
+                    items_returned,
+                    tree_objects_read,
+                    blob_objects_read: 0,
+                },
+            })
         })
     }
 
@@ -1658,10 +1806,12 @@ mod tests {
         assert!(!RepositoryOperation::DiffPaths.materializes_worktree());
         assert!(!RepositoryOperation::AddAll.materializes_worktree());
         assert!(!RepositoryOperation::StagePaths.materializes_worktree());
+        assert!(!RepositoryOperation::UntrackPaths.materializes_worktree());
         assert!(!RepositoryOperation::Commit.materializes_worktree());
         assert!(!RepositoryOperation::History.materializes_worktree());
         assert!(!RepositoryOperation::HistorySummaries.materializes_worktree());
         assert!(!RepositoryOperation::CommitDetails.materializes_worktree());
+        assert!(!RepositoryOperation::CommitChangedPaths.materializes_worktree());
         assert!(!RepositoryOperation::IsIgnoredPath.materializes_worktree());
         assert!(!RepositoryOperation::Inventory.materializes_worktree());
         assert!(!RepositoryOperation::RemoteConfigure.materializes_worktree());
@@ -1721,6 +1871,86 @@ mod tests {
         let hot = session.status_incremental().unwrap();
         assert!(hot.telemetry.status_cache_hit);
         assert_eq!(hot.generation, changed.generation);
+    }
+
+    #[test]
+    fn untrack_paths_keeps_ignored_files_and_honors_cas_limits_and_cancellation() {
+        let directory = tempfile::tempdir().unwrap();
+        let generated_directory = directory.path().join("generated");
+        let generated_file = generated_directory.join("cache.txt");
+        fs::create_dir_all(&generated_directory).unwrap();
+        fs::write(&generated_file, "keep me\n").unwrap();
+
+        let session = RepositorySession::new(directory.path());
+        session.open().unwrap();
+        session.init().unwrap();
+        session.add_all().unwrap();
+        session.commit("track generated file").unwrap();
+        fs::write(directory.path().join(".gitignore"), "generated/\n").unwrap();
+        session.add_all().unwrap();
+        session.commit("ignore generated files").unwrap();
+        let expected_head = session.status().unwrap()["current_head"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let directory_error = session
+            .untrack_paths(&UntrackPathsOptions {
+                paths: vec![PathBuf::from("generated")],
+                expected_head: Some(expected_head.clone()),
+            })
+            .unwrap_err();
+        assert_eq!(directory_error.code(), SdkErrorCode::InvalidArgument);
+
+        let too_many_error = session
+            .untrack_paths(&UntrackPathsOptions {
+                paths: (0..=MAX_BATCH_MUTATION_PATHS)
+                    .map(|index| PathBuf::from(format!("path-{index}")))
+                    .collect(),
+                expected_head: None,
+            })
+            .unwrap_err();
+        assert_eq!(too_many_error.code(), SdkErrorCode::InvalidArgument);
+
+        let cas_error = session
+            .untrack_paths(&UntrackPathsOptions {
+                paths: vec![PathBuf::from("generated/cache.txt")],
+                expected_head: Some("deadbeef".to_string()),
+            })
+            .unwrap_err();
+        assert_eq!(cas_error.code(), SdkErrorCode::InvalidArgument);
+
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let cancellation_error = with_cancellation(&cancelled, || {
+            session.untrack_paths(&UntrackPathsOptions {
+                paths: vec![PathBuf::from("generated/cache.txt")],
+                expected_head: Some(expected_head.clone()),
+            })
+        })
+        .unwrap_err();
+        assert_eq!(cancellation_error.code(), SdkErrorCode::Cancelled);
+
+        let untracked = session
+            .untrack_paths(&UntrackPathsOptions {
+                paths: vec![PathBuf::from("generated/cache.txt")],
+                expected_head: Some(expected_head.clone()),
+            })
+            .unwrap();
+        assert_eq!(untracked.paths.len(), 1);
+        assert!(!untracked.materializes_worktree);
+        assert_eq!(fs::read_to_string(&generated_file).unwrap(), "keep me\n");
+
+        session.add_all().unwrap();
+        let ignored = session
+            .is_ignored_path(Path::new("generated/cache.txt"))
+            .unwrap();
+        assert!(ignored.is_ignored);
+        assert!(!ignored.is_tracked);
+        assert_eq!(
+            session.status().unwrap()["current_head"],
+            json!(expected_head)
+        );
     }
 
     #[test]

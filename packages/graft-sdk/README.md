@@ -39,7 +39,7 @@ repositories have independent locks and can run concurrently.
 pnpm add @eidos.space/graft
 ```
 
-The root package selects one optional native package for the current host. Release `0.1.x`
+The root package selects one optional native package for the current host. The release workflow
 publishes and tests Node-API 8 binaries for macOS arm64/x64, Linux glibc arm64/x64, and Windows
 x64. Linux musl and other platform/CPU combinations fail explicitly instead of compiling during
 install or downloading an unverified binary.
@@ -126,12 +126,14 @@ files in the Space. Changes confined to `.graft` are not counted.
 | `statusIncremental` | Inspect status with a stable generation/change token and safe cache telemetry | No |
 | `addAll` | Read/import the current worktree into the index | No |
 | `stagePaths` | Stage up to 1,000 explicit paths in one serialized SDK call | No |
+| `untrackPaths` | Remove up to 1,000 explicit files from the index without touching the worktree | No |
 | `commit` | Advance repository history | No |
 | `diff` | Compare worktree, index, or revisions | No |
 | `diffPaths` | Diff a page of explicit changed file paths (up to 100) | No |
 | `history` | Read commit history and status | No |
 | `historySummaries` | Read up to 500 lightweight commit summaries without trees/blobs | No |
 | `commitDetails` | Lazily hydrate one full commit | No |
+| `commitChangedPaths` | Lazily page one commit's first-parent changed paths (up to 100) | No |
 | `isIgnoredPath` | Apply nested `.gitignore` / `.graftignore` semantics | No |
 | `inventory` | Page tracked, untracked, ignored, or tracked-and-ignored paths | No |
 | `restore` | Replace selected paths from a revision | **Yes** |
@@ -181,9 +183,32 @@ session and should invalidate host snapshots, not serve as durable repository ob
 
 `historySummaries({ limit, after })` returns only commit id, parents, message, timestamp, table
 counts, and optional path counts. It never reads a commit tree or blob. Commits created before path
-counts were added return `path_changes: null` and `path_counts_complete: false`; use
-`commitDetails(id)` only when a user opens one commit. The `next_cursor` is the last returned commit
-id.
+counts were added return `path_changes: null` and `path_counts_complete: false`. The `next_cursor`
+is the last returned commit id.
+
+When a user opens a commit, `commitChangedPaths({ revision, limit, after })` lazily reads that one
+commit and returns a bounded, path-sorted first-parent change inventory. It reads commit trees but
+no file blobs. A root commit has `parent: null` and compares against an empty tree. Merge commits
+compare against their first parent, matching the summary counts. Page size is at most 100.
+
+Use the returned paths to request only the historical diffs the UI will render:
+
+```js
+const page = await session.commitChangedPaths({ revision, limit: 100 })
+const paths = page.paths.map(({ path }) => path)
+const diff = page.parent
+  ? await session.diffPaths({
+      paths,
+      from: page.parent,
+      to: page.revision,
+      rows: true,
+      limit: 100,
+    })
+  : await session.diffPaths({ paths, root: page.revision, rows: true, limit: 100 })
+```
+
+`commitDetails(id)` remains available for compatible callers that deliberately need the full
+tree-backed commit payload; history lists should not use it.
 
 For working changes, pass `status.status.paths` to `diffPaths`. The API accepts normalized explicit
 file paths, sorts/deduplicates them, and pages them with `limit`/`after`; directories are rejected so
@@ -192,8 +217,12 @@ but an unfiltered working diff is now driven by the status change set instead of
 
 `inventory({ kind })` supports `tracked`, `untracked`, `ignored`, and `tracked_ignored`. The last form
 is the migration diagnostic for repositories that added ignore rules after committing generated
-trees. Ignore rules never untrack an existing path. Review the bounded pages, then explicitly remove
-the approved paths from the index; the SDK never performs that migration implicitly.
+trees. Ignore rules never untrack an existing path. Review the bounded pages, then pass approved
+explicit files to `untrackPaths({ paths, expectedHead })`. It rejects directories, non-normalized
+paths, more than 1,000 inputs, and a stale `expectedHead`. Each returned item has its own structured
+repository result. The operation removes only index entries: physical files are never deleted or
+replaced, `materializes_worktree` is `false`, and files covered by ignore rules remain ignored by
+later `addAll` calls. The SDK never performs this migration implicitly.
 
 Telemetry contains only durations, counts, and cache/object-read facts. It never contains bearer
 tokens or absolute user paths.
@@ -201,12 +230,12 @@ tokens or absolute user paths.
 ## Cancellation, conflicts, and errors
 
 Every asynchronous method accepts `{ signal }`. Aborting still cancels queued Node/libuv work and
-also flips a cooperative token for work already running. Status, diff, history, stage, restore,
-inventory, tree hydration, and SQLite page loops check that token. Cancellation rejects with an
-`AbortError`; the retained session remains open and usable. A cancelled multi-path mutation can
-leave a completed prefix, but every individual index write or worktree replacement remains valid.
-Call status before retrying. `close()` keeps its existing contract: it waits for the in-flight
-operation and does not implicitly cancel it.
+also flips a cooperative token for work already running. Status, diff, history, changed-path
+hydration, stage, untrack, restore, inventory, tree hydration, and SQLite page loops check that
+token. Cancellation rejects with an `AbortError`; the retained session remains open and usable. A
+cancelled multi-path mutation can leave a completed prefix, but every individual index write or
+worktree replacement remains valid. Call status before retrying. `close()` keeps its existing
+contract: it waits for the in-flight operation and does not implicitly cancel it.
 
 Repository conflicts and command results retain Graft's existing JSON schema. The binding
 stabilizes transport/lifecycle failures as `GraftSdkError` with codes such as:

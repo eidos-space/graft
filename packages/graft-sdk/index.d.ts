@@ -16,7 +16,12 @@ export interface DiffOptions extends OperationOptions {
 export interface DiffPathsOptions extends OperationOptions {
   paths: string[]
   rows?: boolean
+  /** Compare an empty tree to this root commit. Mutually exclusive with from/to. */
+  root?: string
+  /** Compare this revision to `to`, or to the worktree when `to` is omitted. */
   from?: string
+  /** Historical comparison target. Requires `from`. */
+  to?: string
   /** Maximum explicit paths returned per page. Range: 1–100. */
   limit?: number
   /** Last path from the preceding page. */
@@ -39,6 +44,13 @@ export interface StagePathsOptions extends OperationOptions {
   paths: string[]
   expectedHead?: string
   force?: boolean
+}
+
+export interface UntrackPathsOptions extends OperationOptions {
+  /** One to 1,000 normalized explicit file paths. Directories are rejected. */
+  paths: string[]
+  /** Compare-and-swap guard; the operation fails if HEAD differs. */
+  expectedHead?: string
 }
 
 export interface RestorePathsOptions extends OperationOptions {
@@ -163,6 +175,39 @@ export interface HistorySummariesResult {
   telemetry: HistoryTelemetry
 }
 
+export interface CommitChangedPathsOptions extends OperationOptions {
+  revision: string
+  /** Maximum changed paths returned per page. Range: 1–100. */
+  limit?: number
+  /** Last path from the preceding page. */
+  after?: string
+}
+
+export interface CommitPathChange {
+  path: string
+  change: "added" | "modified" | "deleted"
+  kind: "sqlite_database" | "text_file" | "binary_file"
+  storage: "sqlite_snapshot" | "inline" | "external"
+}
+
+export interface CommitChangedPathsResult {
+  /** Resolved commit id. */
+  revision: string
+  /** First parent id, or null when this is a root commit. */
+  parent: string | null
+  paths: CommitPathChange[]
+  total_changed_paths: number
+  has_more: boolean
+  next_cursor: string | null
+  telemetry: {
+    duration_us: number
+    paths_examined: number
+    items_returned: number
+    tree_objects_read: number
+    blob_objects_read: 0
+  }
+}
+
 export interface PathDiffResult {
   path: string
   diff: GraftJson
@@ -266,6 +311,7 @@ export class RepositorySession {
   ): Promise<IncrementalStatusResult>
   addAll(options?: OperationOptions): Promise<GraftJson>
   stagePaths(options: StagePathsOptions): Promise<BatchPathsResult>
+  untrackPaths(options: UntrackPathsOptions): Promise<BatchPathsResult>
   commit(message: string, options?: OperationOptions): Promise<GraftJson>
   diff(options?: DiffOptions): Promise<GraftJson>
   diffPaths(options: DiffPathsOptions): Promise<DiffPathsResult>
@@ -275,6 +321,9 @@ export class RepositorySession {
     revision: string,
     options?: OperationOptions
   ): Promise<GraftJson>
+  commitChangedPaths(
+    options: CommitChangedPathsOptions
+  ): Promise<CommitChangedPathsResult>
   isIgnoredPath(
     path: string,
     options?: OperationOptions

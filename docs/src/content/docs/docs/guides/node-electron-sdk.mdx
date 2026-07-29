@@ -69,8 +69,8 @@ install-time compiler or binary downloader.
 
 | Operation | Replaces, creates, or removes tracked worktree files |
 | --- | --- |
-| `init`, `status`, `statusIncremental`, `addAll`, `stagePaths`, `commit` | No |
-| `diff`, `diffPaths`, `history`, `historySummaries`, `commitDetails`, `inventory` | No |
+| `init`, `status`, `statusIncremental`, `addAll`, `stagePaths`, `untrackPaths`, `commit` | No |
+| `diff`, `diffPaths`, `history`, `historySummaries`, `commitDetails`, `commitChangedPaths`, `inventory` | No |
 | `configureRemote`, `push`, `fetch` | No |
 | `restore`, `restorePaths`, `pull`, `cloneRepository` | **Yes** |
 
@@ -113,8 +113,8 @@ daemon lease or PID recovery file.
 
 Async methods accept an `AbortSignal`. Cancellation stops queued work and cooperatively interrupts
 long-running repository loops after start. It rejects with `AbortError`; the same retained session
-remains usable. A cancelled multi-path stage or restore can complete a prefix, so read status before
-retrying. `close()` still waits and never implicitly cancels an operation.
+remains usable. A cancelled multi-path stage, untrack, or restore can complete a prefix, so read
+status before retrying. `close()` still waits and never implicitly cancels an operation.
 
 Handle errors by `error.code`, including `GRAFT_SDK_SESSION_CLOSED`,
 `GRAFT_SDK_SESSION_CLOSING`, `GRAFT_SDK_REPOSITORY_BUSY`, and
@@ -122,9 +122,15 @@ Handle errors by `error.code`, including `GRAFT_SDK_SESSION_CLOSED`,
 
 ## API
 
-The incremental surface adds generation-cached `statusIncremental`, paged `historySummaries` plus
-lazy `commitDetails`, explicit-path `diffPaths`, batch `stagePaths` / `restorePaths`, and shared
-ignore/inventory queries. `tracked_ignored` inventory is diagnostic: adding an ignore rule never
-untracks an already committed path. See the package
+The incremental surface adds generation-cached `statusIncremental`, paged `historySummaries`, lazy
+bounded `commitChangedPaths`, and explicit-path `diffPaths`. For a normal commit, diff those paths
+with `from: page.parent, to: page.revision`; for a root commit use `root: page.revision`.
+`historySummaries` itself never reads trees or blobs.
+
+Batch `stagePaths`, `untrackPaths`, and `restorePaths` plus shared ignore/inventory queries avoid
+host-side protocol copies. `tracked_ignored` inventory is diagnostic: adding an ignore rule never
+untracks an already committed path. After review, call
+`untrackPaths({ paths, expectedHead })`; it removes only index entries, rejects directories, never
+deletes physical files, and ignored files are not re-added by `addAll`. See the package
 [README](https://github.com/eidos-space/graft) and TypeScript
 declarations for options and result types.
