@@ -4,6 +4,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use bilrost::Message;
 use futures::{StreamExt, TryStreamExt, stream};
 use tokio::task::spawn_blocking;
 
@@ -34,30 +35,88 @@ pub struct SnapshotsPush {
     pub snapshots: Vec<Snapshot>,
 }
 
+#[derive(Debug)]
 struct SnapshotUpload {
     commit: Commit,
     segment: Option<(SegmentId, Vec<Bytes>)>,
 }
 
+#[derive(Debug, Default)]
+pub struct PreparedSnapshotPush {
+    uploads: Vec<SnapshotUpload>,
+    segment_bytes: u64,
+}
+
+impl PreparedSnapshotPush {
+    pub(crate) fn into_bundle_objects(
+        self,
+    ) -> crate::remote::Result<Vec<crate::remote::RemoteBundleObject>> {
+        let mut objects = Vec::new();
+        for upload in self.uploads {
+            if let Some((sid, chunks)) = upload.segment {
+                objects.push(crate::remote::RemoteBundleObject::new(
+                    format!("segments/{}", sid.serialize()),
+                    chunks,
+                    true,
+                )?);
+            }
+            let commit_path = format!(
+                "logs/{}/commits/{}",
+                upload.commit.log().serialize(),
+                crate::core::cbe::CBE64::from(upload.commit.lsn()).to_string(),
+            );
+            objects.push(crate::remote::RemoteBundleObject::new(
+                commit_path,
+                [upload.commit.encode_to_bytes()],
+                false,
+            )?);
+        }
+        Ok(objects)
+    }
+
+    async fn publish(self, remote: Arc<Remote>) -> Result<()> {
+        let upload_trace = crate::trace::PushTraceSpan::new("sqlite_snapshot_http_upload");
+        let upload_concurrency = remote.snapshot_upload_concurrency();
+        let result = stream::iter(self.uploads)
+            .map(|upload| {
+                let remote = remote.clone();
+                async move { upload_snapshot_upload(remote, upload).await }
+            })
+            .buffer_unordered(upload_concurrency)
+            .try_collect()
+            .await;
+        if result.is_ok() {
+            upload_trace.finish(&[("segment_bytes", self.segment_bytes)]);
+        }
+        result
+    }
+}
+
 impl Action for SnapshotPush {
     async fn run(self, storage: Arc<FjallStorage>, remote: Arc<Remote>) -> Result<()> {
-        push_snapshots(storage, remote, vec![self.snapshot]).await
+        prepare_snapshots(storage, remote.clone(), vec![self.snapshot])
+            .await?
+            .publish(remote)
+            .await
     }
 }
 
 impl Action for SnapshotsPush {
     async fn run(self, storage: Arc<FjallStorage>, remote: Arc<Remote>) -> Result<()> {
-        push_snapshots(storage, remote, self.snapshots).await
+        prepare_snapshots(storage, remote.clone(), self.snapshots)
+            .await?
+            .publish(remote)
+            .await
     }
 }
 
-async fn push_snapshots(
+pub(crate) async fn prepare_snapshots(
     storage: Arc<FjallStorage>,
     remote: Arc<Remote>,
     snapshots: Vec<Snapshot>,
-) -> Result<()> {
+) -> Result<PreparedSnapshotPush> {
     if snapshots.is_empty() {
-        return Ok(());
+        return Ok(PreparedSnapshotPush::default());
     }
 
     let collect_trace = crate::trace::PushTraceSpan::new("sqlite_snapshot_collect");
@@ -90,20 +149,7 @@ async fn push_snapshots(
         ("segment_bytes", segment_bytes),
     ]);
 
-    let upload_trace = crate::trace::PushTraceSpan::new("sqlite_snapshot_http_upload");
-    let upload_concurrency = remote.snapshot_upload_concurrency();
-    let result = stream::iter(uploads)
-        .map(|upload| {
-            let remote = remote.clone();
-            async move { upload_snapshot_upload(remote, upload).await }
-        })
-        .buffer_unordered(upload_concurrency)
-        .try_collect()
-        .await;
-    if result.is_ok() {
-        upload_trace.finish(&[("segment_bytes", segment_bytes)]);
-    }
-    result
+    Ok(PreparedSnapshotPush { uploads, segment_bytes })
 }
 
 async fn upload_snapshot_upload(remote: Arc<Remote>, upload: SnapshotUpload) -> Result<()> {

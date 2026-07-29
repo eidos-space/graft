@@ -432,6 +432,33 @@ pub(super) fn publish_repo_branch_snapshots(
     stop_at: Option<&str>,
 ) -> Result<(), ErrCtx> {
     let remote_store = Arc::new(repo.remote_store(remote)?);
+    let snapshots = repo_branch_snapshots(runtime, repo, remote, branch, stop_at)?;
+    runtime.snapshots_push_to(snapshots, remote_store)?;
+
+    Ok(())
+}
+
+pub(super) fn prepare_repo_branch_snapshot_push(
+    runtime: &Runtime,
+    repo: &Repository,
+    remote: &str,
+    branch: &str,
+    stop_at: Option<&str>,
+    remote_store: Arc<Remote>,
+) -> Result<graft::PreparedSnapshotPush, ErrCtx> {
+    let snapshots = repo_branch_snapshots(runtime, repo, remote, branch, stop_at)?;
+    runtime
+        .snapshots_prepare_push_to(snapshots, remote_store)
+        .map_err(ErrCtx::from)
+}
+
+fn repo_branch_snapshots(
+    runtime: &Runtime,
+    repo: &Repository,
+    remote: &str,
+    branch: &str,
+    stop_at: Option<&str>,
+) -> Result<Vec<graft::snapshot::Snapshot>, ErrCtx> {
     let mut stop_commits = BTreeSet::<String>::new();
     if let Some(stop_at) = stop_at {
         stop_commits.insert(stop_at.to_string());
@@ -476,9 +503,7 @@ pub(super) fn publish_repo_branch_snapshots(
         }
     }
 
-    runtime.snapshots_push_to(snapshots, remote_store)?;
-
-    Ok(())
+    Ok(snapshots)
 }
 
 pub(super) fn repo_remote_reachable_commits_known_locally(
