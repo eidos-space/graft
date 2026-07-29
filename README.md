@@ -1,67 +1,69 @@
+> [!NOTE]
+> Graft began as a fork of
+> [orbitinghail/graft](https://github.com/orbitinghail/graft). Its original
+> transactional storage engine now powers this project's SQLite storage layer.
+> This repository is independently maintained and is no longer a GitHub fork.
+
 # Graft
 
-**Version control for SQLite-backed applications and their files.**
+**Version control for SQLite-backed application state.**
 
+[Try the Playground](https://graft.eidos.space/playground/) ·
 [Documentation](https://graft.eidos.space/) ·
 [Releases](https://github.com/eidos-space/graft/releases) ·
 [CLI reference](https://graft.eidos.space/docs/reference/cli/)
 
-Graft records SQLite databases and app-owned files as coherent application
-states. It provides Git-like history, branches, diffs, merges, restore, and
-remote sync while keeping SQLite databases usable as ordinary files.
+Graft gives SQLite databases and app-owned files one coherent history. It adds
+Git-like commits, branches, row-level diffs, merges, restore, and remote sync.
+The default workflow uses ordinary SQLite files and libraries—no custom VFS is
+required.
 
-```text
-SQLite owns transactions.
-Graft owns history.
-```
+## Why Graft?
 
-## Repository Model
-
-A Graft repository lives alongside the application worktree:
+Application state rarely lives in one table or one file:
 
 ```text
 app-data/
   data.sqlite
-  search.sqlite
   settings.json
   attachments/
-    note-42.png
-    contract.pdf
-  .graft/
+    avatar.png
+    invoice.pdf
 ```
 
-Applications read and write the files under `app-data/`. Graft stores repository
-metadata, refs, staged state, typed objects, SQLite page history, and external
-payload caches under `.graft/`.
+SQLite keeps each database transaction consistent, but it does not give the
+whole directory version history. Git can track the directory, but it usually
+treats a SQLite database as an opaque binary file.
 
-Each commit contains one typed tree:
+Graft records the database and its related files together:
 
-```text
-data.sqlite                 SQLite snapshot
-settings.json               inline file
-attachments/contract.pdf    external file payload
-```
+| Need | What Graft provides |
+| --- | --- |
+| Review database changes | Table- and row-level SQLite diffs |
+| Store database history incrementally | Reuse unchanged 4 KiB chunks and append only changed data instead of copying the entire database |
+| Save a coherent app state | One commit for databases and their related files |
+| Experiment safely | Branches, tags, restore, and automatic merges for compatible changes |
+| Handle conflicts in an app | Structured conflicts and JSON output |
+| Move history between devices | Filesystem, S3-compatible, and HTTP remotes |
+| Embed repository workflows | A Node.js/Electron SDK with long-lived sessions |
 
-This lets a branch, restore, merge, or remote sync move the database and the
-files referenced by its rows as one unit.
+Graft is a good fit for local-first apps, AI-assisted editing, user-visible
+history, checkpoints, change review, and applications whose database rows refer
+to files outside SQLite.
 
-## Capabilities
+Graft is not a replacement for SQLite transactions, application authorization,
+real-time query replication, or Git source control.
 
-- Track multiple SQLite databases, text files, binary files, and external
-  payloads in one repository.
-- Stage and commit application state with `status`, `add`, `rm`, `commit`,
-  `log`, `show`, `checkout`, `restore`, `export`, and `reset`.
-- Compare SQLite snapshots by table and row with `diff --rows`.
-- Create branches and tags, switch worktrees, and merge compatible row changes.
-- Represent unresolved file, schema, and row conflicts as structured repository
-  state.
-- Sync through filesystem, S3-compatible, and Graft HTTP remotes.
-- Expose JSON results for application UIs, automation, and agent workflows.
-- Embed long-lived repository sessions in Node.js and Electron through the ABI-stable
-  `@eidos.space/graft` Node-API package.
-- Verify and maintain repositories with `audit`, `gc`, and `payload` commands.
+## Try Graft
 
-## Quickstart
+### In your browser
+
+The [Graft Playground](https://graft.eidos.space/playground/) runs the real CLI
+in WebAssembly and stores everything in the browser. It is the fastest way to
+explore commits, branches, SQLite row diffs, and conflicts without installing
+anything.
+
+### On your machine
 
 Install Graft v0.9.0:
 
@@ -72,11 +74,15 @@ curl -fsSL https://raw.githubusercontent.com/eidos-space/graft/main/install.sh \
 graft --version
 ```
 
-Create a repository and commit a SQLite database together with an app file:
+Omit `GRAFT_VERSION=0.9.0` to install the latest published release. Prebuilt
+archives are available on the
+[releases page](https://github.com/eidos-space/graft/releases).
+
+Create a repository containing a SQLite database and an app-owned file:
 
 ```sh
-mkdir app-data
-cd app-data
+mkdir graft-demo
+cd graft-demo
 
 graft init
 graft sql --db data.sqlite \
@@ -89,137 +95,110 @@ printf 'hello\n' > attachments/readme.txt
 
 graft status
 graft add --all
-graft commit -m "Seed app state"
+graft commit -m "Save initial app state"
 ```
 
-Create another version and inspect its row-level changes:
+Make another database change and inspect it as rows instead of binary bytes:
 
 ```sh
 graft sql --db data.sqlite \
   "INSERT INTO notes(body) VALUES ('second note');"
+
 graft add data.sqlite
 graft commit -m "Add second note"
 
 graft diff --rows HEAD~1 HEAD data.sqlite
-graft log --json
+graft log
 ```
 
-`graft init` creates `.graft/`. SQLite-specific commands take an explicit
-`--db` path; repository-wide commands discover `.graft/` from the current
-directory.
+You now have two restorable versions of the database and its related files.
+Continue with the
+[CLI quickstart](https://graft.eidos.space/docs/quickstart/cli/) to try
+branches, merges, and restore.
 
-## Node.js And Electron SDK
+## How It Works
 
-Applications that need a long-lived repository handle should load the SDK directly instead of
-starting a CLI process for each command:
+A Graft repository lives beside your application's normal worktree:
+
+```text
+app-data/
+  data.sqlite          normal SQLite file
+  settings.json        normal app file
+  attachments/
+  .graft/              history, index, refs, objects, and payload cache
+```
+
+The basic workflow is familiar:
+
+1. Your application writes to SQLite and its files as usual.
+2. `graft add` captures a consistent committed SQLite snapshot and stages
+   files.
+3. `graft commit` records those paths as one application state.
+4. Diff, branch, merge, restore, and sync operate on that history.
+
+For physical SQLite files, staging includes committed WAL frames without
+requiring a manual checkpoint. Graft compares the captured image in 4 KiB
+storage chunks and reuses unchanged data.
+
+Commands that change the checked-out state materialize database snapshots and
+files back into the worktree. Close long-lived SQLite connections before
+`switch`, `checkout`, `restore`, `pull`, merge completion, or a hard
+reset. Graft refuses to replace a database while another writer holds it.
+
+## Use Graft With an Existing SQLite App
+
+The CLI works with the same physical database file as `sqlite3` or your
+application's SQLite library:
+
+```sh
+sqlite3 data.sqlite \
+  "INSERT INTO notes(body) VALUES ('written by sqlite3');"
+
+graft add data.sqlite
+graft commit -m "Import SQLite transaction"
+```
+
+No custom VFS is required for this workflow. Add other app-owned paths with
+`graft add <path>` or stage the whole worktree with `graft add --all`.
+
+## Choose an Integration
+
+Start with the CLI unless your application needs a more specialized boundary.
+
+| Integration | Use it when |
+| --- | --- |
+| [CLI](https://graft.eidos.space/docs/quickstart/cli/) | You are evaluating Graft, scripting workflows, or running one-shot commands. |
+| CLI with [JSON output](https://graft.eidos.space/docs/reference/json-output/) | Your application or agent needs structured status, diff, history, conflict, or sync results. |
+| [Node.js/Electron SDK](https://graft.eidos.space/docs/guides/node-electron-sdk/) | A Node.js or Electron app needs a long-lived in-process repository session. |
+| [SQLite extension](https://graft.eidos.space/docs/quickstart/sqlite-extension/) | Your application deliberately wants live SQLite pages stored through `vfs=graft`. |
+| [Remote service packages](https://graft.eidos.space/docs/guides/http-remote/) | You want to host the Graft HTTP remote protocol. |
+
+Install the resident Node.js/Electron SDK with:
 
 ```sh
 pnpm add @eidos.space/graft
 ```
 
-```js
-const { RepositorySession } = require("@eidos.space/graft")
+## Common Workflows
 
-const session = await RepositorySession.open(spaceRoot)
-try {
-  const status = await session.status()
-  const diff = await session.diff({ rows: true })
-} finally {
-  await session.close()
-}
-```
+| Workflow | Commands |
+| --- | --- |
+| Inspect state | `status`, `log`, `show`, `diff --rows` |
+| Record state | `add`, `rm`, `commit` |
+| Move through history | `checkout`, `restore`, `export`, `reset` |
+| Work with branches | `branch`, `switch`, `merge`, `conflicts`, `resolve` |
+| Synchronize | `remote`, `ls-remote`, `fetch`, `pull`, `push` |
+| Maintain storage | `audit`, `gc`, `payload` |
 
-One session serializes operations for one repository; sessions for different repositories can run
-in parallel. `restore`, `pull`, and `cloneRepository` materialize worktree files, so Electron apps
-must close affected SQLite handles before those calls and reopen them afterward. See the
-[resident SDK guide](https://graft.eidos.space/docs/guides/node-electron-sdk/) for lifecycle,
-credentials, cancellation, and packaging details.
-
-## SQLite Snapshots
-
-`graft sql --db data.sqlite` and standard SQLite libraries open the same
-physical worktree file. After an application transaction commits, stage the
-database path:
-
-```sh
-sqlite3 data.sqlite \
-  "INSERT INTO notes(body) VALUES ('written by sqlite3');"
-graft add data.sqlite
-graft commit -m "Import SQLite transaction"
-```
-
-Staging a SQLite database:
-
-1. Uses SQLite's online backup API to capture a consistent committed state.
-2. Includes committed WAL frames without requiring a manual checkpoint.
-3. Excludes uncommitted transactions.
-4. Compares 4 KiB Graft storage chunks with the staged snapshot or `HEAD`.
-5. Appends only changed chunks to Graft storage.
-
-The physical SQLite database may use a larger legal page size, such as
-8 KiB. Graft still deduplicates and stores the captured image in 4 KiB chunks.
-
-The same workflow supports WAL and rollback-journal databases. Commands that
-change the checked-out state materialize snapshots back to physical SQLite
-files. Close long-lived database connections before `switch`, `checkout`,
-`restore`, `pull`, merge completion, or hard reset; Graft refuses to replace a
-database while another writer holds it.
-
-## Branches, Diffs, And Merges
-
-Branches cover every tracked database and file in the worktree:
-
-```sh
-graft switch -c feature/search
-
-graft sql --db data.sqlite \
-  "INSERT INTO notes(body) VALUES ('branch note');"
-graft add --all
-graft commit -m "Add search data"
-
-graft switch main
-graft --db data.sqlite merge feature/search
-```
-
-When supported tables contain disjoint row edits, Graft can merge them and
-stage the result. Row identity comes from SQLite `rowid` for ordinary tables
-and the declared primary key for `WITHOUT ROWID` tables, including composite
-keys and `STRICT` tables. Same-row edits, schema changes, opaque SQLite
-surfaces, and conflicting file changes remain explicit conflicts for the
-application or user to resolve.
-
-If a merge stops with conflicts:
-
-```sh
-graft --db data.sqlite conflicts --json
-graft --db data.sqlite resolve --ours data.sqlite
-graft merge --continue -m "Merge feature/search"
-```
-
-## Files And External Payloads
-
-Small files are stored in repository objects. Large files and configured paths
-use content-addressed payloads under `.graft/store/files` and are transferred
-with repository sync.
-
-```sh
-graft config set files.external_paths "assets/**, attachments/**"
-graft add --all
-
-graft payload status --json HEAD
-graft payload fetch --remote origin HEAD
-graft payload prune
-```
-
-Database rows and the file payloads they reference therefore share the same
-commit history without requiring large binary content inside SQLite.
+See the [CLI reference](https://graft.eidos.space/docs/reference/cli/) for
+arguments, JSON schemas, and examples.
 
 ## Remotes
 
-Graft supports these remote URI families:
+Graft supports local filesystem, S3, S3-compatible object storage, and Graft
+HTTP remotes:
 
 ```text
-memory
 fs:///absolute/path
 s3://bucket/prefix
 s3_compatible://bucket/prefix?endpoint=https://...
@@ -227,62 +206,24 @@ https://host/namespace/repository
 graft+http://127.0.0.1:8787/namespace/repository
 ```
 
-Configure and use an HTTPS remote with a bearer token:
-
 ```sh
 export GRAFT_REMOTE_TOKEN='grt_...'
 
 graft remote add origin https://example.com/acme/archive
-graft ls-remote origin
 graft push origin main
-graft fetch origin main
 graft pull origin main
 ```
 
-Tokens come from the environment and are not stored in the remote URL. The
-[Graft Remote Service Protocol](https://graft.eidos.space/docs/reference/remote-protocol/)
-defines the versioned HTTP contract, atomic ref operations, immutable objects,
-range reads, listing, and error behavior.
+Bearer tokens come from the environment and are not stored in remote URLs. See
+[Sync with remotes](https://graft.eidos.space/docs/guides/sync-remotes/) and
+the [HTTP remote guide](https://graft.eidos.space/docs/guides/http-remote/).
 
-The repository includes reusable TypeScript components for remote services:
+## Project Status
 
-- [`@eidos.space/graft-remote`](./packages/graft-remote): framework-neutral
-  protocol engine and types.
-- [`@eidos.space/graft-remote-hono`](./packages/graft-remote-hono): Hono routing
-  adapter.
-- [`@eidos.space/graft-remote-cloudflare`](./packages/graft-remote-cloudflare):
-  Cloudflare authentication and storage adapters.
-- [`services/graft-remote-cloudflare`](./services/graft-remote-cloudflare):
-  deployable reference service using Durable Objects and R2.
-
-## Application Integration
-
-The CLI and resident SDK are Graft's repository control-plane surfaces. CLI
-commands support structured JSON for scripts, agents, and one-shot automation:
-
-```sh
-graft status --json
-graft diff --json --rows HEAD~1 HEAD data.sqlite
-graft log --json --limit 50
-graft --db data.sqlite conflicts --json
-graft push --json origin main
-```
-
-The SQLite extension provides `vfs=graft` for applications that store live
-SQLite pages in a Graft Volume. It also exposes `graft_version` and
-`graft_debug_*` diagnostics for that volume. This direct live-page path requires
-SQLite `page_size=4096`:
-
-```sql
-.load ./libgraft_ext
-.open "file:/absolute/path/to/app-data/data.sqlite?vfs=graft"
-PRAGMA graft_version;
-```
-
-Repository status, staging, commits, history, restore, and remotes can also be
-handled through `@eidos.space/graft` without starting CLI subprocesses. A
-logical database should use either its physical worktree file or the Graft VFS
-as its write path.
+Graft is experimental. The CLI, repository configuration, JSON output,
+Node.js/Electron SDK, and remote service protocol are the intended integration
+surfaces. Storage layouts, object serialization, debug PRAGMAs, and internal
+Rust module boundaries are implementation details and may change.
 
 ## Documentation
 
@@ -291,46 +232,23 @@ as its write path.
 - [Repository model](https://graft.eidos.space/docs/concepts/repository-model/)
 - [SQLite snapshots](https://graft.eidos.space/docs/concepts/sqlite-snapshots/)
 - [Track databases and files](https://graft.eidos.space/docs/guides/track-databases-and-files/)
-- [Connect an HTTP remote](https://graft.eidos.space/docs/guides/http-remote/)
+- [Diff rows and files](https://graft.eidos.space/docs/guides/diff-rows-and-files/)
+- [Merge conflicts](https://graft.eidos.space/docs/guides/merge-conflicts/)
+- [Node.js and Electron SDK](https://graft.eidos.space/docs/guides/node-electron-sdk/)
 - [CLI reference](https://graft.eidos.space/docs/reference/cli/)
-- [Remote service protocol](https://graft.eidos.space/docs/reference/remote-protocol/)
-- [VFS PRAGMAs](https://graft.eidos.space/docs/reference/pragmas/)
-- [Resident SDK architecture](./docs/sdk-architecture.md)
-- [Release process](./RELEASE.md)
+- [Performance benchmarks](./crates/graft-bench/README.md)
 
-## Development
+## Contributing
+
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for the development workflow and
+coding guidelines.
 
 ```sh
 just test
-cargo nextest run
-just run sqlite test
 cargo check
 cargo fmt
 cargo clippy
-cargo build -p graft-ext --release
-
-pnpm check:remote
-pnpm test:remote
-
-pnpm --dir packages/graft-sdk build:native
-pnpm --dir packages/graft-sdk test
-
-cd docs
-pnpm build
 ```
-
-See [CONTRIBUTING.md](./CONTRIBUTING.md) for coding style and development
-workflow.
-
-## Project Status
-
-Graft is experimental. The CLI, repository configuration, JSON output, and
-remote service protocol are its intended integration surfaces. Storage LSNs,
-page and segment layouts, debug PRAGMAs, object serialization, and internal
-module boundaries are implementation details.
-
-Graft is built on the transactional storage engine from
-[`orbitinghail/graft`](https://github.com/orbitinghail/graft).
 
 ## License
 
