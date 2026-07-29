@@ -2,9 +2,10 @@
 
 Date: 2026-07-29
 
-Status: DONE_WITH_CONCERNS — implementation and local correctness/performance
-work are complete; deployed after-measurements are blocked by the independent
-staging identity outage described below.
+Status: DONE_WITH_REMAINING_PERFORMANCE_GAP — staging authorization is healthy,
+the client and Worker changes are deployed/tested on staging, and the full
+matrix has reproducible after-measurements. Reliability improved, but CLI and
+resident SDK incremental HTTP pushes still miss the proposed latency budgets.
 
 Scope: the Graft CLI, `@eidos.space/graft` `RepositorySession`, the public
 HTTP Remote protocol, and the staging Sync Worker. All benchmarks used
@@ -13,16 +14,19 @@ resource was read, mutated, or benchmarked.
 
 ## Outcome
 
-The slow incremental push is not primarily SQLite row-diff, hashing, or local
-object discovery. A resident SDK session completes the entire local equivalent
-of a no-op push in 1.4 ms median, a one-line push in 22.8 ms, and a one-row
-SQLite push in 38.1 ms. The pre-change staging medians from Shanghai were
-1.565 s, 4.769 s, and 6.512 s respectively.
+The slow incremental push is not primarily SQLite row-diff, hashing, local
+object discovery, or payload size. A resident SDK session completes the entire
+local equivalent of a no-op push in 1.4 ms median, a one-line push in 22.8 ms,
+and a one-row SQLite push in 38.1 ms. On current staging from Shanghai, the
+corresponding resident HTTP medians are 1.370 s, 3.855 s, and 5.228 s. The
+one-row request body is only about 2.1 KiB median but requires six serialized
+HTTP requests.
 
 The dominant cause was compounded Remote request latency:
 
-1. The push constructed three independent HTTP connection pools: remote-head
-   discovery, SQLite snapshot publication, and object/ref publication.
+1. The original push constructed three independent HTTP connection pools:
+   remote-head discovery, SQLite snapshot publication, and object/ref
+   publication.
 2. HTTP/1.1 requests within each phase were serialized. A one-row push used
    five top-level Remote requests in the observed trace.
 3. Every top-level request repeated identity authorization and repository
@@ -31,17 +35,28 @@ The dominant cause was compounded Remote request latency:
    read R2 metadata again, and committed or observed usage. A request without
    a content length additionally staged the body through a temporary R2
    multipart object.
-5. From the Shanghai test path, a new TLS connection cost approximately
+5. From the Shanghai test path, a new TLS connection costs approximately
    0.62-0.90 s through the configured network path. A reused connection cost
    approximately 0.30-0.33 s per top-level request.
 
-Existing-history traversal is a separate possible contributor to the reported
+The first attempt to share a single long-lived HTTP/1 pool exposed a separate
+reliability defect in this network path: a small PUT could hang when it reused a
+read connection, and a resident session's next push could hang when it reused
+the previous command's GET connection. The final client uses separate read and
+mutation pools within one command, drains missing GET bodies, and starts fresh
+pools at each top-level repository command. This removes the observed hangs
+without changing protocol or publication ordering, but deliberately gives up
+cross-push connection reuse on affected proxies.
+
+Existing-history traversal is a separate contributor to first/new-branch
+pushes and a possible contributor to the reported
 15-second incident. Incremental pushes stop graph traversal at the known remote
 head and do not enumerate all remote object IDs. First pushes do enumerate the
-reachable local history. The disposable reproduction reached 12.60 s for a
-first push and 8.23 s for the representative larger incremental case, so the
-incident magnitude is consistent with request fan-out plus first/history work,
-but the original Space was intentionally not inspected.
+reachable local history. A deliberately reused disposable repository with
+roughly 100 accumulated objects spent 19.67 s in object negotiation and took
+25.04 s overall. A fresh current CLI first push took 12.54 s. The incident
+magnitude is therefore consistent with request fan-out plus existing-history
+work, but the original Space was intentionally not inspected.
 
 ## Phase attribution
 
@@ -84,8 +99,9 @@ Local phase traces corroborate the attribution:
 
 ## Benchmark matrix
 
-The machine was Apple arm64, Node 24.18, with the HTTP route originating in
-Shanghai. Times are wall-clock seconds unless marked `ms`. Incremental cells
+The machine was Apple arm64 with the HTTP route originating in Shanghai. The
+pre-change and local baselines used Node 24.18; the final staging matrix used
+Node 26.0. Times are wall-clock seconds unless marked `ms`. Incremental cells
 use 10 runs and report median/p95. First-push cells are single diagnostic runs.
 
 ### Pre-change CLI baseline
@@ -114,31 +130,66 @@ intended low-latency path.
 
 ### Post-change staging
 
-The exact post-change staging matrix is pending restoration of the separate
-staging identity service. At measurement time its userinfo route returned 404,
-causing both the optimized Sync Worker and a controlled rollback to the prior
-Sync Worker to return 503. Safe timing responses attribute only 3-13 ms to
-Worker-side authorization before failure; the client still observes roughly
-0.9-1.4 s, independently confirming the network/edge component.
+Staging identity was isolated onto the local `staging` branch, deployed as
+version `e6011c7d-433d-44b3-b605-97333ff29a55`, and verified with the disposable
+read/write smoke account. Sync Worker version
+`57ee312a-dccf-4aa1-b00b-1edcd796505b` was then deployed and passed descriptor,
+push, clone, content, commit, and usage verification. The following fresh-Remote
+results were measured from Shanghai on 2026-07-29. Incremental cells are 10
+runs; first push is one run.
 
-The account/identity repository contains the expected userinfo implementation
-only as part of a large, unrelated dirty worktree. Current deployed account
-version `24a9a0d5-2468-40b5-9cf6-b7b4c517035b` still returns 404. Deploying
-that dirty tree or rolling the whole account service back would violate the
-isolation rule and could disrupt concurrent staging work, so neither action was
-taken.
+| Mode | First | No-op p50/p95 | Text p50/p95 | SQLite row p50/p95 | 256 KiB p50/p95 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| CLI cold | 12.539 s | 1.745/2.292 s | 7.777/15.777 s | 6.954/9.896 s | 5.888/9.090 s |
+| SDK cold | 7.580 s | 1.650/3.505 s | 4.277/4.697 s | 5.979/7.005 s | 5.633/6.063 s |
+| SDK resident | 8.301 s | 1.370/1.492 s | 3.855/4.209 s | 5.228/8.100 s | 5.293/5.559 s |
 
-Do not use the pre-change values as a claimed post-change improvement. Run the
-checked-in harness once staging authorization is healthy and append its JSON
-summary here:
+The CLI comparison is intentionally not presented as a blanket improvement.
+Versus the pre-change CLI run, first push improved 0.5% and the representative
+change improved 28.5% at p50, but no-op p50 regressed 11.5%, text p50 regressed
+63.1%, and SQLite-row p50 regressed 6.8%. The text CLI run included large Worker
+and R2 outliers, with 4.007 s median and 12.967 s p95 summed Worker time. These
+results show material staging variance and no proven small-change CLI speedup.
+
+The current resident SDK path versus the old CLI incident baseline is more
+favorable at p50: no-op is 12.5% faster, text 19.2% faster, SQLite row 19.7%
+faster, and 256 KiB 35.7% faster. That is a cross-mode comparison, not a claim
+that the HTTP protocol itself improved by those percentages. SQLite-row p95
+regressed 14.4% because one run spent 3.000 s in authorization.
+
+The checked-in harness can reproduce individual modes without losing completed
+results when another mode fails:
 
 ```sh
 GRAFT_PUSH_BENCH_HTTP_REMOTE='<disposable remote>' \
 GRAFT_REMOTE_TOKEN='<staging token>' \
 GRAFT_CLI_PATH=target/release/graft \
 GRAFT_PUSH_BENCH_ITERATIONS=10 \
+GRAFT_PUSH_BENCH_TARGETS=http \
+GRAFT_PUSH_BENCH_MODES=sdk-warm \
 pnpm --dir packages/graft-sdk bench:push
 ```
+
+### Current request and timing attribution
+
+The table uses resident SDK medians, which avoid CLI process noise. Request and
+response bytes include only bodies reported by the safe trace, not HTTP/TLS
+framing.
+
+| Case | Requests | Request bytes | Push p50 | HTTP client sum | Worker total sum | Network/client-edge remainder |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| No-op | 1 | 0 B | 1.370 s | 1.363 s | 0.151 s | 1.212 s (88.5%) |
+| Text | 4 | 1,506 B | 3.855 s | 3.837 s | 1.120 s | 2.717 s (70.5%) |
+| SQLite row | 6 | 2,096 B | 5.228 s | 5.200 s | 2.155 s | 3.045 s (58.3%) |
+| 256 KiB | 5 | 264,578 B | 5.293 s | 5.266 s | 1.584 s | 3.682 s (69.6%) |
+
+For the median SQLite-row run, authorization sums to 0.500 s and repository
+directory lookup to 0.075 s. The remaining approximately 1.580 s of Worker time
+is chiefly Durable Object/R2 quota and object work. The 3.045 s client-minus-
+Worker remainder is DNS/TCP/TLS/proxy/edge RTT, response delivery, and client
+scheduling. This preserves the required separation: eidos.space authorization
+is material but is not the majority of elapsed time; data-plane request fan-out
+and R2/DO work plus geographic network latency dominate.
 
 ### Geographic control
 
@@ -158,16 +209,24 @@ Cloudflare API confirmed that no persistent probe Worker exists.
 
 ## Implemented client changes
 
-- `RemoteCredentials` now lazily shares one `reqwest::Client` across all Remote
-  instances derived from the same repository/session credentials. Tokens stay
-  on each Remote and can still be rotated; debug output exposes only whether a
-  client was initialized.
+- `RemoteCredentials` now lazily shares dedicated read/control and
+  upload/mutation `reqwest::Client` pools across every Remote built during one
+  top-level command. Tokens stay on each Remote and can still be rotated; debug
+  output exposes only whether a pool was initialized.
+- Resident repository sessions reset both pools between commands. This retains
+  intra-push connection reuse while avoiding the reproducible cross-command
+  stale connection hang on the Shanghai proxy path. Missing GET response bodies
+  are explicitly drained before a connection can return to the pool.
 - Immutable upload streams now carry exact `Content-Length` without copying
   their content into memory. This avoids the Worker's unknown-length multipart
   staging path.
-- The HTTP client retains HTTP/1.1 and uses DNS caching plus a bounded connect
-  timeout. HTTP/2 was tested, but the available network proxy produced stalls
-  and high outliers, so it was not shipped.
+- SQLite snapshot segment and commit publication is serialized so a snapshot
+  commit cannot be visible before its segment. General objectstore concurrency
+  remains five; HTTP snapshot upload concurrency is one.
+- The HTTP client retains HTTP/1.1 and uses DNS caching, a five-second connect
+  timeout, and a 30-second total request timeout. HTTP/2 was tested, but the
+  available network proxy produced stalls and high outliers, so it was not
+  shipped.
 - `GRAFT_PUSH_TRACE=1` emits newline-delimited, schema-versioned JSON for fixed
   phase names and HTTP operation names. It reports duration, status, byte
   counts, generated correlation ID, and only the `auth`, `directory`, and
@@ -175,7 +234,9 @@ Cloudflare API confirmed that no persistent probe Worker exists.
   repository paths, user paths, or row/file contents.
 - The repeatable benchmark covers CLI cold, SDK cold, and resident SDK modes;
   local and HTTP Remotes; first/no-op/text/SQLite-row/representative changes;
-  and aggregates median/p95, requests, bytes, and client/server timing.
+  and aggregates median/p95, requests, bytes, and client/server timing. It can
+  select a target/mode, emits only safe worker progress, and reports the last
+  case/run/operation on failure.
 
 ## Implemented staging changes
 
@@ -211,11 +272,17 @@ Staging is `eidos-graft-remote-staging` with:
 
 No production deployment, production data, package publication, new R2 bucket,
 or additional persistent environment was created. The short-lived geographic
-probe left no Worker resource. The benchmark's immutable objects are disposable
-staging-only data and are expected to remain below 10 MiB for a full three-mode
-matrix.
+probe left no Worker resource. Repeated fresh-Remote retries created
+`perf-final-*` and `perf-diag-*` staging repositories containing only synthetic
+benchmark data. The management API currently has no repository-delete endpoint,
+so their tens of MiB of R2/metadata data could not be removed safely. The cost
+is small but nonzero; adding an authenticated staging cleanup API is a follow-up.
 
-Current staging Sync deployment: `7c2003fb-f781-4cdb-837c-475440b51d26`.
+Current staging Sync deployment: `57ee312a-dccf-4aa1-b00b-1edcd796505b`.
+Current staging identity deployment:
+`e6011c7d-433d-44b3-b605-97333ff29a55`.
+The immediately prior Sync deployment is
+`7c2003fb-f781-4cdb-837c-475440b51d26`.
 The safe-timing deployment before error-log hardening is
 `922a7ab3-bc2d-4650-bce6-6d43312512be`. The object-write-only optimized deployment is
 `f2c958bf-d10f-4960-9d7d-2d1aabbd1d6e`. The full pre-change Sync deployment is
@@ -225,32 +292,46 @@ Rollback only the Sync Worker, from the Eidos repository:
 
 ```sh
 pnpm --dir apps/graft-remote exec wrangler rollback \
-  922a7ab3-bc2d-4650-bce6-6d43312512be \
-  --env staging -m 'Rollback failure-log hardening'
+  7c2003fb-f781-4cdb-837c-475440b51d26 \
+  --env staging -m 'Rollback Sync performance changes'
 ```
 
 Use `f2c958bf-d10f-4960-9d7d-2d1aabbd1d6e` to remove timing and log hardening
 while retaining the object-write optimization. Use the pre-change deployment
-ID to remove every optimization round. Do not roll back `eidos-space-staging`
-as part of this change: its current userinfo outage came from a separate,
-concurrent staging deployment and was reproduced against both old and new Sync
-Worker versions.
+ID to remove every Sync optimization round.
+
+If the identity staging changes must also be rolled back, run from the
+eidos.space repository only after Sync has been rolled back or verified against
+the older identity contract:
+
+```sh
+pnpm exec wrangler rollback \
+  24a9a0d5-2468-40b5-9cf6-b7b4c517035b \
+  --env staging -m 'Rollback hosted Sync identity changes'
+```
 
 ## Correctness gates
 
 The following passed after the changes:
 
 - `just test`: 590 repository tests, 81 vendor doc tests, one Graft doc test,
-  and all SQL integration scripts;
-- 14 focused HTTP Remote tests, including shared connection reuse, exact
-  content length, early `412` without fully reading the body, CAS behavior,
-  credential redaction, and `Server-Timing` filtering;
+  and all SQL integration scripts on the integrated topic branch;
+- final focused suites: 196 Graft core tests plus its doc test and 73
+  `graft-sqlite` library tests;
+- 17 focused HTTP Remote tests, including within-command reuse, command-boundary
+  pool reset, read/upload pool isolation, missing-body drain, exact content
+  length, early `412` without fully reading the body, CAS behavior, credential
+  redaction, and `Server-Timing` filtering;
 - push/snapshot tests and crash-after-remote-commit recovery;
 - clone, fetch, pull, multi-file/workspace, force-push, non-fast-forward,
   snapshot integrity, and SQLite row-diff/merge tests in the full suite;
 - eight native `RepositorySession` SDK tests;
 - 14 staging Worker tests plus TypeScript checking;
-- all seven core protocol, one Hono adapter, and nine Cloudflare adapter tests.
+- all seven core protocol, one Hono adapter, and nine Cloudflare adapter tests;
+- staging smoke verification and a real authenticated CLI provision/push/clone/
+  content/commit/usage round trip;
+- the final 10-run resident staging matrix, including recovery from the
+  previously reproducible cross-command timeout.
 
 `cargo fmt --all -- --check`, `cargo check --workspace --all-targets`, and
 targeted Clippy with `--no-deps` pass. Whole-workspace Clippy remains blocked by
@@ -259,7 +340,7 @@ including missing package metadata across existing workspace crates.
 
 ## Budgets and remaining work
 
-Proposed budgets, to be ratified by the post-change staging matrix:
+Proposed budgets and current disposition:
 
 | Path                                | No-op p50/p95 | Incremental text/row p50/p95 |
 | ----------------------------------- | ------------: | ---------------------------: |
@@ -268,19 +349,29 @@ Proposed budgets, to be ratified by the post-change staging matrix:
 | Resident SDK, staging, warm session |   0.75/1.25 s |                    2.0/3.0 s |
 | CLI, staging, cold process          |    1.75/2.5 s |                    3.0/4.5 s |
 
+Local paths meet budget. Staging no-op resident p50 is close but p95 misses;
+resident text and SQLite incremental pushes, and every cold CLI incremental
+path, miss budget. These budgets should remain targets rather than being raised
+to match the current implementation.
+
 Remaining risks and follow-ups:
 
-- Staging after-numbers and the interrupted-upload retry must be rerun after
-  the independent identity route is restored. Until then the performance
-  outcome is evidence-backed locally and structurally, but not yet proven end
-  to end on the deployed service.
-- Geographic latency is material in the isolated probe. Run the full
-  authenticated matrix from a second client region after identity recovery
-  before changing storage placement.
+- The interrupted-upload/ref-failure recovery gates passed in the repository
+  suite, but a fault-injected authenticated staging run is still recommended;
+  production-equivalent fault injection was not added to the public service.
+- Geographic latency is material in the isolated two-path probe. The full
+  authenticated push matrix was measured only from Shanghai; run it from a
+  second authenticated client region before changing storage placement.
 - The public protocol still requires several serialized publications for an
   incremental change. If warm-session p95 misses budget after these changes,
-  the next measured optimization should be an optional batch negotiation/write
-  extension with fallback to protocol v1, not weaker CAS or publication order.
+  as it does here, the next measured optimization should be an optional batch
+  negotiation/write extension with fallback to protocol v1, not weaker CAS or
+  publication order.
 - Short-lived server-side authorization or directory caching could save tens
-  of milliseconds per request, but entitlement revocation and repository
-  deletion semantics must be specified before adding it.
+  to hundreds of milliseconds per push, but entitlement revocation and
+  repository deletion semantics must be specified before adding it. It will not
+  remove the multi-second geographic/request-fan-out remainder by itself.
+- Staging Worker/R2 variance is high enough that p95 is not controlled. Add
+  per-R2-operation `Server-Timing` or internal sampled telemetry, then evaluate
+  batched immutable existence/write operations and parallel work only where
+  pack-before-index and segment-before-commit ordering remain explicit.
