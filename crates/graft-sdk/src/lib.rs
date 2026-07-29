@@ -13,6 +13,7 @@ use std::{
 };
 
 use graft::remote::{RemoteCredentialErr, RemoteCredentials};
+pub use graft::repo::CancellationToken;
 use graft::repo::{CommitArtifactState, CommitFileState, RepoStatus, Repository, index::Index};
 use graft_sqlite::{
     repo_service::{RepositoryCommand, RepositoryCommandService},
@@ -27,6 +28,11 @@ const LIFECYCLE_CLOSED: u8 = 0;
 const LIFECYCLE_OPENING: u8 = 1;
 const LIFECYCLE_OPEN: u8 = 2;
 const LIFECYCLE_CLOSING: u8 = 3;
+const MAX_HISTORY_SUMMARY_PAGE_SIZE: usize = 500;
+const MAX_DIFF_PATH_PAGE_SIZE: usize = 100;
+const MAX_DIFF_PATH_REQUEST_SIZE: usize = 10_000;
+const MAX_BATCH_MUTATION_PATHS: usize = 1_000;
+const MAX_INVENTORY_PAGE_SIZE: usize = 1_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -45,6 +51,7 @@ pub enum SdkErrorCode {
     SessionClosing,
     SessionAlreadyOpen,
     RepositoryBusy,
+    Cancelled,
     InvalidArgument,
     InvalidResponse,
     RepositoryCommand,
@@ -58,6 +65,7 @@ impl SdkErrorCode {
             Self::SessionClosing => "GRAFT_SDK_SESSION_CLOSING",
             Self::SessionAlreadyOpen => "GRAFT_SDK_SESSION_ALREADY_OPEN",
             Self::RepositoryBusy => "GRAFT_SDK_REPOSITORY_BUSY",
+            Self::Cancelled => "GRAFT_SDK_CANCELLED",
             Self::InvalidArgument => "GRAFT_SDK_INVALID_ARGUMENT",
             Self::InvalidResponse => "GRAFT_SDK_INVALID_RESPONSE",
             Self::RepositoryCommand => "GRAFT_SDK_REPOSITORY_COMMAND",
@@ -88,6 +96,11 @@ impl SdkError {
 
 pub type Result<T> = std::result::Result<T, SdkError>;
 
+/// Installs a cancellation token for one synchronous SDK operation on the current worker thread.
+pub fn with_cancellation<T>(token: &CancellationToken, operation: impl FnOnce() -> T) -> T {
+    graft::repo::with_cancellation(token, operation)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusTelemetry {
     pub duration_us: u64,
@@ -106,16 +119,95 @@ pub struct IncrementalStatusResult {
     pub telemetry: StatusTelemetry,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryTelemetry {
+    pub duration_us: u64,
+    pub commits_returned: usize,
+    pub tree_objects_read: usize,
+    pub blob_objects_read: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistorySummariesResult {
+    pub commits: Vec<graft::repo::RepoCommitSummary>,
+    pub has_more: bool,
+    pub next_cursor: Option<String>,
+    pub telemetry: HistoryTelemetry,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InventoryKind {
+    Tracked,
+    Untracked,
+    Ignored,
+    TrackedIgnored,
+}
+
+#[derive(Debug, Clone)]
+pub struct InventoryOptions {
+    pub kind: InventoryKind,
+    pub limit: usize,
+    pub after: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InventoryItem {
+    pub path: String,
+    pub tracked: bool,
+    pub ignored: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IgnoreMigrationDiagnostic {
+    pub ignored_rules_do_not_untrack: bool,
+    pub tracked_ignored_paths: usize,
+    pub recommendation: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InventoryTelemetry {
+    pub duration_us: u64,
+    pub paths_examined: usize,
+    pub items_returned: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InventoryResult {
+    pub kind: InventoryKind,
+    pub items: Vec<InventoryItem>,
+    pub total_matching: usize,
+    pub has_more: bool,
+    pub next_cursor: Option<String>,
+    pub migration: Option<IgnoreMigrationDiagnostic>,
+    pub telemetry: InventoryTelemetry,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IgnoredPathResult {
+    pub path: String,
+    pub is_ignored: bool,
+    pub is_tracked: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RepositoryOperation {
     Init,
     Status,
+    StatusIncremental,
     AddAll,
+    StagePaths,
     Commit,
     Diff,
+    DiffPaths,
     History,
+    HistorySummaries,
+    CommitDetails,
+    IsIgnoredPath,
+    Inventory,
     Restore,
+    RestorePaths,
     RemoteConfigure,
     Push,
     Fetch,
@@ -126,7 +218,10 @@ pub enum RepositoryOperation {
 impl RepositoryOperation {
     /// Whether the operation can replace, create, or remove physical worktree files.
     pub const fn materializes_worktree(self) -> bool {
-        matches!(self, Self::Restore | Self::Pull | Self::Clone)
+        matches!(
+            self,
+            Self::Restore | Self::RestorePaths | Self::Pull | Self::Clone
+        )
     }
 }
 
@@ -141,11 +236,69 @@ pub struct DiffOptions {
 }
 
 #[derive(Debug, Clone)]
+pub struct DiffPathsOptions {
+    pub paths: Vec<PathBuf>,
+    pub rows: bool,
+    pub from: Option<String>,
+    pub limit: usize,
+    pub after: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PathDiffResult {
+    pub path: String,
+    pub diff: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiffTelemetry {
+    pub duration_us: u64,
+    pub requested_paths: usize,
+    pub returned_paths: usize,
+    pub changed_paths: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiffPathsResult {
+    pub paths: Vec<PathDiffResult>,
+    pub has_more: bool,
+    pub next_cursor: Option<String>,
+    pub telemetry: DiffTelemetry,
+}
+
+#[derive(Debug, Clone)]
 pub struct RestoreOptions {
     pub source: Option<String>,
     pub expected_head: Option<String>,
     pub require_clean: bool,
     pub path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct StagePathsOptions {
+    pub paths: Vec<PathBuf>,
+    pub expected_head: Option<String>,
+    pub force: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct RestorePathsOptions {
+    pub source: Option<String>,
+    pub expected_head: Option<String>,
+    pub require_clean: bool,
+    pub paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchPathResult {
+    pub path: String,
+    pub result: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchPathsResult {
+    pub paths: Vec<BatchPathResult>,
+    pub materializes_worktree: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -349,11 +502,19 @@ impl RepositorySession {
     }
 
     pub fn status(&self) -> Result<Value> {
-        serde_json::to_value(self.status_incremental()?.status).map_err(|error| {
-            SdkError::new(
-                SdkErrorCode::InvalidResponse,
-                format!("could not encode repository status: {error}"),
-            )
+        self.with_state(|state| {
+            let SessionState { service, status_cache } = state;
+            let service = service.as_mut().ok_or_else(session_closed_error)?;
+            let incremental = refresh_incremental_status(service, status_cache)?;
+            if incremental.status.has_conflicts {
+                return execute_json(service, "json_status", None);
+            }
+            let current_branch = service
+                .repository()
+                .map_err(repository_command_error)?
+                .current_branch()
+                .map_err(repo_error)?;
+            legacy_status_value(incremental.status, current_branch)
         })
     }
 
@@ -369,6 +530,52 @@ impl RepositorySession {
         self.execute_json_mutating("json_add", Some("--all"))
     }
 
+    /// Stages a bounded path collection under one serialized session operation.
+    pub fn stage_paths(&self, options: &StagePathsOptions) -> Result<BatchPathsResult> {
+        let paths = normalize_batch_paths(&options.paths)?;
+        if let Some(expected_head) = &options.expected_head {
+            validate_revision(expected_head)?;
+        }
+        self.with_state(|state| {
+            let SessionState { service, status_cache } = state;
+            let service = service.as_mut().ok_or_else(session_closed_error)?;
+            if let Some(expected_head) = &options.expected_head {
+                let actual = service
+                    .repository()
+                    .map_err(repository_command_error)?
+                    .head_target()
+                    .map_err(repo_error)?;
+                if actual.as_deref() != Some(expected_head) {
+                    return Err(invalid_argument(format!(
+                        "cannot stage because HEAD changed: expected {expected_head}, found {}",
+                        actual.as_deref().unwrap_or("unborn")
+                    )));
+                }
+            }
+            let operation = (|| {
+                let mut results = Vec::with_capacity(paths.len());
+                for path in paths {
+                    graft::repo::cancellation_checkpoint().map_err(repo_error)?;
+                    let argument = if options.force {
+                        format!("--force -- {}", quote_pragma_path(Path::new(&path))?)
+                    } else {
+                        format!("-- {}", quote_pragma_path(Path::new(&path))?)
+                    };
+                    results.push(BatchPathResult {
+                        path,
+                        result: execute_json(service, "json_add", Some(&argument))?,
+                    });
+                }
+                Ok(BatchPathsResult {
+                    paths: results,
+                    materializes_worktree: false,
+                })
+            })();
+            status_cache.invalidate();
+            operation
+        })
+    }
+
     pub fn commit(&self, message: &str) -> Result<Value> {
         if message.trim().is_empty() {
             return Err(invalid_argument("commit message must not be empty"));
@@ -379,6 +586,75 @@ impl RepositorySession {
     pub fn diff(&self, options: &DiffOptions) -> Result<Value> {
         let argument = diff_argument(options)?;
         self.execute_json("json_diff", argument.as_deref())
+    }
+
+    /// Computes worktree diffs only for an explicit, bounded page of file paths.
+    pub fn diff_paths(&self, options: &DiffPathsOptions) -> Result<DiffPathsResult> {
+        if options.paths.is_empty() {
+            return Err(invalid_argument("diff paths must not be empty"));
+        }
+        if options.paths.len() > MAX_DIFF_PATH_REQUEST_SIZE {
+            return Err(invalid_argument(format!(
+                "diff paths request exceeds {MAX_DIFF_PATH_REQUEST_SIZE} paths"
+            )));
+        }
+        if options.limit == 0 || options.limit > MAX_DIFF_PATH_PAGE_SIZE {
+            return Err(invalid_argument(format!(
+                "diff path limit must be between 1 and {MAX_DIFF_PATH_PAGE_SIZE}"
+            )));
+        }
+        if let Some(from) = &options.from {
+            validate_revision(from)?;
+        }
+
+        let started = Instant::now();
+        let mut paths = options
+            .paths
+            .iter()
+            .map(|path| normalize_requested_path(path))
+            .collect::<Result<Vec<_>>>()?;
+        paths.sort();
+        paths.dedup();
+        if let Some(after) = &options.after {
+            paths.retain(|path| path > after);
+        }
+        let requested_paths = paths.len();
+        let has_more = paths.len() > options.limit;
+        paths.truncate(options.limit);
+
+        let mut results = Vec::with_capacity(paths.len());
+        for path in paths {
+            graft::repo::cancellation_checkpoint().map_err(repo_error)?;
+            let physical = self.target.parent().unwrap_or(&self.target).join(&path);
+            if fs::symlink_metadata(&physical).is_ok_and(|metadata| metadata.file_type().is_dir()) {
+                return Err(invalid_argument(format!(
+                    "diff path `{path}` is a directory; provide explicit changed file paths"
+                )));
+            }
+            let diff = self.diff(&DiffOptions {
+                rows: options.rows,
+                from: options.from.clone(),
+                path: Some(PathBuf::from(&path)),
+                ..DiffOptions::default()
+            })?;
+            results.push(PathDiffResult { path, diff });
+        }
+        let changed_paths = results
+            .iter()
+            .filter(|entry| value_changed_path_count(&entry.diff) > 0)
+            .count();
+        let next_cursor = results.last().map(|entry| entry.path.clone());
+        Ok(DiffPathsResult {
+            telemetry: DiffTelemetry {
+                duration_us: elapsed_us(started),
+                requested_paths,
+                returned_paths: results.len(),
+                changed_paths,
+            },
+            paths: results,
+            has_more,
+            next_cursor,
+        })
     }
 
     pub fn history(&self, limit: usize, after: Option<&str>) -> Result<Value> {
@@ -392,6 +668,175 @@ impl RepositorySession {
             argument.push_str(after);
         }
         self.execute_json("json_log", Some(&argument))
+    }
+
+    /// Returns a bounded summary page. Commit trees and blobs are never read by this operation.
+    pub fn history_summaries(
+        &self,
+        limit: usize,
+        after: Option<&str>,
+    ) -> Result<HistorySummariesResult> {
+        if limit == 0 || limit > MAX_HISTORY_SUMMARY_PAGE_SIZE {
+            return Err(invalid_argument(format!(
+                "history summary limit must be between 1 and {MAX_HISTORY_SUMMARY_PAGE_SIZE}"
+            )));
+        }
+        if let Some(after) = after {
+            validate_revision(after)?;
+        }
+        let started = Instant::now();
+        self.with_service(|service| {
+            let page = service
+                .history_summaries(limit, after)
+                .map_err(repository_command_error)?;
+            let commits_returned = page.commits.len();
+            Ok(HistorySummariesResult {
+                commits: page.commits,
+                has_more: page.has_more,
+                next_cursor: page.next_cursor,
+                telemetry: HistoryTelemetry {
+                    duration_us: elapsed_us(started),
+                    commits_returned,
+                    tree_objects_read: 0,
+                    blob_objects_read: 0,
+                },
+            })
+        })
+    }
+
+    /// Lazily loads the full tree-backed commit payload for one revision.
+    pub fn commit_details(&self, revision: &str) -> Result<Value> {
+        validate_revision(revision)?;
+        self.with_service(|service| {
+            let commit = service
+                .commit_details(revision)
+                .map_err(repository_command_error)?;
+            serde_json::to_value(commit).map_err(status_encode_error)
+        })
+    }
+
+    /// Evaluates one path with Graft's nested `.gitignore` and `.graftignore` semantics.
+    pub fn is_ignored_path(&self, path: &Path) -> Result<IgnoredPathResult> {
+        let key = normalize_requested_path(path)?;
+        self.with_service(|service| {
+            let repo = service.repository().map_err(repository_command_error)?;
+            let mut matcher = repo.ignore_matcher().map_err(repo_error)?;
+            let physical = repo.worktree().join(&key);
+            let is_dir =
+                fs::symlink_metadata(&physical).is_ok_and(|metadata| metadata.file_type().is_dir());
+            let is_ignored = matcher.is_ignored(&key, is_dir).map_err(repo_error)?;
+            let is_tracked = repo.index_files().map_err(repo_error)?.contains_key(&key)
+                || repo
+                    .index_artifacts()
+                    .map_err(repo_error)?
+                    .contains_key(&key);
+            Ok(IgnoredPathResult { path: key, is_ignored, is_tracked })
+        })
+    }
+
+    /// Returns one bounded inventory page. Ignored scans reuse one nested-rule matcher.
+    pub fn inventory(&self, options: &InventoryOptions) -> Result<InventoryResult> {
+        if options.limit == 0 || options.limit > MAX_INVENTORY_PAGE_SIZE {
+            return Err(invalid_argument(format!(
+                "inventory limit must be between 1 and {MAX_INVENTORY_PAGE_SIZE}"
+            )));
+        }
+        let started = Instant::now();
+        self.with_state(|state| {
+            let SessionState {
+                service,
+                status_cache,
+            } = state;
+            let service = service.as_mut().ok_or_else(session_closed_error)?;
+            refresh_incremental_status(service, status_cache)?;
+            let repo = service.repository().map_err(repository_command_error)?;
+            let tracked = status_cache
+                .files
+                .keys()
+                .chain(status_cache.artifacts.keys())
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>();
+            let mut matcher = repo.ignore_matcher().map_err(repo_error)?;
+            let mut paths_examined = 0;
+            let mut candidates = match options.kind {
+                InventoryKind::Tracked => tracked.iter().cloned().collect::<Vec<_>>(),
+                InventoryKind::Untracked => {
+                    status_cache.untracked_fingerprints.keys().cloned().collect()
+                }
+                InventoryKind::TrackedIgnored => {
+                    let mut paths = Vec::new();
+                    for path in &tracked {
+                        graft::repo::cancellation_checkpoint().map_err(repo_error)?;
+                        paths_examined += 1;
+                        if matcher.is_ignored(path, false).map_err(repo_error)? {
+                            paths.push(path.clone());
+                        }
+                    }
+                    paths
+                }
+                InventoryKind::Ignored => {
+                    let mut paths = Vec::new();
+                    collect_ignored_files(
+                        &repo,
+                        &mut matcher,
+                        repo.worktree(),
+                        false,
+                        &mut paths,
+                        &mut paths_examined,
+                    )?;
+                    paths
+                }
+            };
+            if paths_examined == 0 {
+                paths_examined = candidates.len();
+            }
+            candidates.sort();
+            candidates.dedup();
+            let total_matching = candidates.len();
+            if let Some(after) = &options.after {
+                candidates.retain(|path| path > after);
+            }
+            let has_more = candidates.len() > options.limit;
+            candidates.truncate(options.limit);
+            let mut items = Vec::with_capacity(candidates.len());
+            for path in candidates {
+                graft::repo::cancellation_checkpoint().map_err(repo_error)?;
+                let ignored = match options.kind {
+                    InventoryKind::Ignored | InventoryKind::TrackedIgnored => true,
+                    InventoryKind::Untracked => false,
+                    InventoryKind::Tracked => {
+                        matcher.is_ignored(&path, false).map_err(repo_error)?
+                    }
+                };
+                items.push(InventoryItem {
+                    tracked: tracked.contains(&path),
+                    path,
+                    ignored,
+                });
+            }
+            let next_cursor = items.last().map(|item| item.path.clone());
+            let migration = (options.kind == InventoryKind::TrackedIgnored).then(|| {
+                IgnoreMigrationDiagnostic {
+                    ignored_rules_do_not_untrack: true,
+                    tracked_ignored_paths: total_matching,
+                    recommendation: "Remove paths from the index explicitly after reviewing this page; adding an ignore rule never untracks existing paths.".to_string(),
+                }
+            });
+            let items_returned = items.len();
+            Ok(InventoryResult {
+                kind: options.kind,
+                items,
+                total_matching,
+                has_more,
+                next_cursor,
+                migration,
+                telemetry: InventoryTelemetry {
+                    duration_us: elapsed_us(started),
+                    paths_examined,
+                    items_returned,
+                },
+            })
+        })
     }
 
     pub fn restore(&self, options: &RestoreOptions) -> Result<Value> {
@@ -410,6 +855,49 @@ impl RepositorySession {
         parts.push("--".to_string());
         parts.push(quote_pragma_path(&options.path)?);
         self.execute_json_mutating("json_restore", Some(&parts.join(" ")))
+    }
+
+    /// Restores a bounded path collection under one serialized session operation.
+    pub fn restore_paths(&self, options: &RestorePathsOptions) -> Result<BatchPathsResult> {
+        let paths = normalize_batch_paths(&options.paths)?;
+        if let Some(source) = &options.source {
+            validate_revision(source)?;
+        }
+        if let Some(expected_head) = &options.expected_head {
+            validate_revision(expected_head)?;
+        }
+        self.with_state(|state| {
+            let SessionState { service, status_cache } = state;
+            let service = service.as_mut().ok_or_else(session_closed_error)?;
+            let operation = (|| {
+                let mut results = Vec::with_capacity(paths.len());
+                for path in paths {
+                    graft::repo::cancellation_checkpoint().map_err(repo_error)?;
+                    let mut parts = Vec::new();
+                    if let Some(source) = &options.source {
+                        parts.push(format!("--source {source}"));
+                    }
+                    if let Some(expected_head) = &options.expected_head {
+                        parts.push(format!("--expected-head {expected_head}"));
+                    }
+                    if options.require_clean {
+                        parts.push("--require-clean".to_string());
+                    }
+                    parts.push("--".to_string());
+                    parts.push(quote_pragma_path(Path::new(&path))?);
+                    results.push(BatchPathResult {
+                        path,
+                        result: execute_json(service, "json_restore", Some(&parts.join(" ")))?,
+                    });
+                }
+                Ok(BatchPathsResult {
+                    paths: results,
+                    materializes_worktree: true,
+                })
+            })();
+            status_cache.invalidate();
+            operation
+        })
     }
 
     pub fn configure_remote(&self, options: &RemoteConfigureOptions) -> Result<Value> {
@@ -499,9 +987,9 @@ impl RepositorySession {
         self.with_state(|state| {
             let SessionState { service, status_cache } = state;
             let service = service.as_mut().ok_or_else(session_closed_error)?;
-            let value = execute_json(service, name, argument)?;
+            let result = execute_json(service, name, argument);
             status_cache.invalidate();
-            Ok(value)
+            result
         })
     }
 
@@ -652,6 +1140,24 @@ fn incremental_status_result(
     }
 }
 
+fn legacy_status_value(status: RepoStatus, current_branch: Option<String>) -> Result<Value> {
+    let current_head = status.head_target.clone();
+    let mut value = serde_json::to_value(status).map_err(status_encode_error)?;
+    let object = value.as_object_mut().ok_or_else(|| {
+        SdkError::new(
+            SdkErrorCode::InvalidResponse,
+            "repository status did not encode as an object",
+        )
+    })?;
+    if let Some(current_head) = current_head {
+        object.insert("current_head".to_string(), Value::String(current_head));
+    }
+    if let Some(current_branch) = current_branch {
+        object.insert("current_branch".to_string(), Value::String(current_branch));
+    }
+    Ok(value)
+}
+
 fn tracked_fingerprints(
     repo: &Repository,
     files: &BTreeMap<String, CommitFileState>,
@@ -659,12 +1165,14 @@ fn tracked_fingerprints(
 ) -> Result<BTreeMap<String, TrackedFingerprint>> {
     let mut fingerprints = BTreeMap::new();
     for key in files.keys() {
+        graft::repo::cancellation_checkpoint().map_err(repo_error)?;
         fingerprints.insert(
             key.clone(),
             tracked_fingerprint(repo.worktree().join(key), true)?,
         );
     }
     for key in artifacts.keys() {
+        graft::repo::cancellation_checkpoint().map_err(repo_error)?;
         fingerprints.insert(
             key.clone(),
             tracked_fingerprint(repo.worktree().join(key), false)?,
@@ -743,6 +1251,7 @@ fn collect_visible_files(
         return Ok(());
     }
     for entry in fs::read_dir(directory).map_err(|error| repository_command_error(error.into()))? {
+        graft::repo::cancellation_checkpoint().map_err(repo_error)?;
         let entry = entry.map_err(|error| repository_command_error(error.into()))?;
         let path = entry.path();
         if repo.is_internal_worktree_path(&path) {
@@ -761,6 +1270,42 @@ fn collect_visible_files(
             let fingerprint = fingerprint_path(&path)?
                 .expect("directory entry remains present while it is fingerprinted");
             visible.insert(key, fingerprint);
+        }
+    }
+    Ok(())
+}
+
+fn collect_ignored_files(
+    repo: &Repository,
+    matcher: &mut graft::repo::RepoIgnoreMatcher,
+    directory: &Path,
+    inherited_ignore: bool,
+    ignored: &mut Vec<String>,
+    paths_examined: &mut usize,
+) -> Result<()> {
+    if !directory.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(directory).map_err(|error| repository_command_error(error.into()))? {
+        graft::repo::cancellation_checkpoint().map_err(repo_error)?;
+        let entry = entry.map_err(|error| repository_command_error(error.into()))?;
+        let path = entry.path();
+        if repo.is_internal_worktree_path(&path) {
+            continue;
+        }
+        *paths_examined = (*paths_examined).saturating_add(1);
+        let file_type = entry
+            .file_type()
+            .map_err(|error| repository_command_error(error.into()))?;
+        let key = repo.file_key(&path).map_err(repo_error)?;
+        let ignored_here = inherited_ignore
+            || matcher
+                .is_ignored(&key, file_type.is_dir())
+                .map_err(repo_error)?;
+        if file_type.is_dir() {
+            collect_ignored_files(repo, matcher, &path, ignored_here, ignored, paths_examined)?;
+        } else if file_type.is_file() && ignored_here {
+            ignored.push(key);
         }
     }
     Ok(())
@@ -800,6 +1345,54 @@ fn elapsed_us(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
+fn normalize_requested_path(path: &Path) -> Result<String> {
+    if path.as_os_str().is_empty() || path.is_absolute() {
+        return Err(invalid_argument(
+            "diff paths must be non-empty repository-relative paths",
+        ));
+    }
+    if path
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(invalid_argument(format!(
+            "diff path `{}` is not a normalized repository-relative path",
+            path.display()
+        )));
+    }
+    let key = path
+        .to_str()
+        .ok_or_else(|| invalid_argument("diff paths must be valid UTF-8"))?
+        .replace('\\', "/");
+    graft::repo::validate_repo_path_identity(&key).map_err(repo_error)?;
+    Ok(key)
+}
+
+fn normalize_batch_paths(paths: &[PathBuf]) -> Result<Vec<String>> {
+    if paths.is_empty() {
+        return Err(invalid_argument("path collection must not be empty"));
+    }
+    if paths.len() > MAX_BATCH_MUTATION_PATHS {
+        return Err(invalid_argument(format!(
+            "path collection exceeds {MAX_BATCH_MUTATION_PATHS} paths"
+        )));
+    }
+    let mut normalized = paths
+        .iter()
+        .map(|path| normalize_requested_path(path))
+        .collect::<Result<Vec<_>>>()?;
+    normalized.sort();
+    normalized.dedup();
+    Ok(normalized)
+}
+
+fn value_changed_path_count(value: &Value) -> usize {
+    value
+        .get("paths")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len)
+}
+
 fn repo_error(error: graft::repo::RepoErr) -> SdkError {
     repository_command_error(error.into())
 }
@@ -828,6 +1421,9 @@ fn execute_json(
 }
 
 fn repository_command_error(error: ErrCtx) -> SdkError {
+    if matches!(&error, ErrCtx::Repo(graft::repo::RepoErr::Cancelled)) {
+        return SdkError::new(SdkErrorCode::Cancelled, "operation cancelled");
+    }
     let message = error.to_string();
     let lowercase = message.to_ascii_lowercase();
     let code = if lowercase.contains("locked")
@@ -1052,14 +1648,22 @@ mod tests {
     #[test]
     fn operation_materialization_contract_is_explicit() {
         assert!(RepositoryOperation::Restore.materializes_worktree());
+        assert!(RepositoryOperation::RestorePaths.materializes_worktree());
         assert!(RepositoryOperation::Pull.materializes_worktree());
         assert!(RepositoryOperation::Clone.materializes_worktree());
         assert!(!RepositoryOperation::Init.materializes_worktree());
         assert!(!RepositoryOperation::Status.materializes_worktree());
+        assert!(!RepositoryOperation::StatusIncremental.materializes_worktree());
         assert!(!RepositoryOperation::Diff.materializes_worktree());
+        assert!(!RepositoryOperation::DiffPaths.materializes_worktree());
         assert!(!RepositoryOperation::AddAll.materializes_worktree());
+        assert!(!RepositoryOperation::StagePaths.materializes_worktree());
         assert!(!RepositoryOperation::Commit.materializes_worktree());
         assert!(!RepositoryOperation::History.materializes_worktree());
+        assert!(!RepositoryOperation::HistorySummaries.materializes_worktree());
+        assert!(!RepositoryOperation::CommitDetails.materializes_worktree());
+        assert!(!RepositoryOperation::IsIgnoredPath.materializes_worktree());
+        assert!(!RepositoryOperation::Inventory.materializes_worktree());
         assert!(!RepositoryOperation::RemoteConfigure.materializes_worktree());
         assert!(!RepositoryOperation::Push.materializes_worktree());
         assert!(!RepositoryOperation::Fetch.materializes_worktree());

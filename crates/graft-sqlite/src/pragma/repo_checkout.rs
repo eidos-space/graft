@@ -1080,10 +1080,12 @@ pub(super) fn restore_repo_keys(
 ) -> Result<JsonRestoreOutcome, ErrCtx> {
     if spec.staged {
         for key in &keys {
+            graft::repo::cancellation_checkpoint()?;
             restore_key_path_detail(repo, spec, key)?;
         }
         let mut restored = Vec::with_capacity(keys.len());
         for key in keys {
+            graft::repo::cancellation_checkpoint()?;
             restored.push(restore_repo_key(runtime, file, repo, spec, &key)?);
         }
         return json_restore_outcome(repo, spec, restored);
@@ -1103,6 +1105,7 @@ pub(super) fn restore_repo_keys(
             .then_with(|| left.key.cmp(&right.key))
     });
     for entry in deletions {
+        graft::repo::cancellation_checkpoint()?;
         apply_restored_repo_key(runtime, file, repo, &entry.key, entry.restored.as_ref())?;
     }
     let mut restorations = plan
@@ -1115,10 +1118,12 @@ pub(super) fn restore_repo_keys(
             .then_with(|| left.key.cmp(&right.key))
     });
     for entry in restorations {
+        graft::repo::cancellation_checkpoint()?;
         prepare_restore_repo_key_target(repo, &entry.key)?;
         apply_restored_repo_key(runtime, file, repo, &entry.key, entry.restored.as_ref())?;
     }
     for entry in &plan {
+        graft::repo::cancellation_checkpoint()?;
         update_restored_worktree_state_key(runtime, repo, &entry.key, entry.restored.as_ref())?;
     }
     json_restore_outcome(

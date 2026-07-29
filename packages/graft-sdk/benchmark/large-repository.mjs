@@ -306,10 +306,7 @@ async function runChildOperation(operation, root) {
     if (operation === "cancellation") {
       const controller = new AbortController()
       const started = performance.now()
-      const pending =
-        typeof session.diffPaths === "function"
-          ? session.diffPaths({ paths: ["node_modules"], signal: controller.signal })
-          : session.diff({ rows: true, signal: controller.signal })
+      const pending = session.diff({ rows: true, signal: controller.signal })
       setTimeout(() => controller.abort(), 50)
       let rejectedAt
       try {
@@ -418,7 +415,7 @@ function jsonBytes(value) {
 
 function peakRssBytes() {
   const maxRss = process.resourceUsage().maxRSS
-  return process.platform === "darwin" ? maxRss : maxRss * 1024
+  return maxRss * 1024
 }
 
 function round(value) {

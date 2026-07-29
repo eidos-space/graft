@@ -549,6 +549,7 @@ impl Repository {
         message: &str,
         timestamp_ms: u64,
         tables: Vec<CommitTableSummary>,
+        path_changes: Option<CommitPathChangeCounts>,
     ) -> Result<object::CommitObject> {
         let parents = parents
             .iter()
@@ -563,6 +564,7 @@ impl Repository {
             committer: signature,
             repo_format_version: REPOSITORY_FORMAT_VERSION,
             tables,
+            path_changes,
             message: message.to_string(),
         })
     }

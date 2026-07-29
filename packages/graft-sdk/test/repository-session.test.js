@@ -25,16 +25,28 @@ const {
 
 test("exposes ABI-stable SDK metadata and materialization contract", () => {
   assert.equal(sdkVersion(), "0.1.0")
-  for (const operation of ["restore", "pull", "cloneRepository"]) {
+  for (const operation of [
+    "restore",
+    "restorePaths",
+    "pull",
+    "cloneRepository",
+  ]) {
     assert.equal(operationMaterializesWorktree(operation), true)
   }
   for (const operation of [
     "init",
     "status",
+    "statusIncremental",
     "addAll",
+    "stagePaths",
     "commit",
     "diff",
+    "diffPaths",
     "history",
+    "historySummaries",
+    "commitDetails",
+    "isIgnoredPath",
+    "inventory",
     "configureRemote",
     "push",
     "fetch",
@@ -91,6 +103,75 @@ test("incremental status exposes a stable session generation", async () => {
     assert.equal(changed.status.dirty, true)
     assert.ok(changed.generation > hot.generation)
     assert.equal(changed.telemetry.status_cache_hit, false)
+    await session.close()
+  })
+})
+
+test("incremental SDK pages history, diffs, ignore inventory, and batch mutations", async () => {
+  await withTemporaryDirectory("graft-sdk-incremental-", async (root) => {
+    const session = await RepositorySession.open(root)
+    await session.init()
+    await fs.mkdir(path.join(root, "node_modules", "pkg"), { recursive: true })
+    await fs.writeFile(path.join(root, "node_modules", "pkg", "index.js"), "one\n")
+    await fs.writeFile(path.join(root, "note.txt"), "one\n")
+    await session.addAll()
+    await session.commit("baseline")
+
+    await fs.writeFile(path.join(root, ".gitignore"), "node_modules/\n")
+    await session.addAll()
+    const ignoredCommit = await session.commit("ignore dependencies")
+    const history = await session.historySummaries({ limit: 1 })
+    assert.equal(history.commits.length, 1)
+    assert.equal(history.commits[0].id, ignoredCommit.commit.id)
+    assert.equal(history.commits[0].path_counts_complete, true)
+    assert.equal(history.telemetry.tree_objects_read, 0)
+    assert.equal(history.telemetry.blob_objects_read, 0)
+    assert.equal((await session.commitDetails(history.commits[0].id)).id, history.commits[0].id)
+
+    const ignored = await session.isIgnoredPath("node_modules/pkg/index.js")
+    assert.equal(ignored.is_ignored, true)
+    assert.equal(ignored.is_tracked, true)
+    const inventory = await session.inventory({
+      kind: "tracked_ignored",
+      limit: 10,
+    })
+    assert.deepEqual(
+      inventory.items.map((item) => item.path),
+      ["node_modules/pkg/index.js"]
+    )
+    assert.equal(inventory.migration.ignored_rules_do_not_untrack, true)
+
+    await fs.writeFile(path.join(root, "note.txt"), "two\n")
+    await fs.writeFile(path.join(root, "node_modules", "pkg", "index.js"), "two\n")
+    const firstDiffPage = await session.diffPaths({
+      paths: ["note.txt", "node_modules/pkg/index.js"],
+      limit: 1,
+    })
+    assert.equal(firstDiffPage.paths.length, 1)
+    assert.equal(firstDiffPage.has_more, true)
+    const secondDiffPage = await session.diffPaths({
+      paths: ["note.txt", "node_modules/pkg/index.js"],
+      limit: 1,
+      after: firstDiffPage.next_cursor,
+    })
+    assert.equal(secondDiffPage.paths.length, 1)
+    assert.equal(secondDiffPage.has_more, false)
+
+    const expectedHead = (await session.status()).current_head
+    const staged = await session.stagePaths({
+      paths: ["note.txt", "node_modules/pkg/index.js"],
+      expectedHead,
+    })
+    assert.equal(staged.paths.length, 2)
+    assert.equal(staged.materializes_worktree, false)
+    const restored = await session.restorePaths({
+      source: "HEAD",
+      expectedHead,
+      paths: ["note.txt", "node_modules/pkg/index.js"],
+    })
+    assert.equal(restored.paths.length, 2)
+    assert.equal(restored.materializes_worktree, true)
+    assert.equal(await fs.readFile(path.join(root, "note.txt"), "utf8"), "one\n")
     await session.close()
   })
 })

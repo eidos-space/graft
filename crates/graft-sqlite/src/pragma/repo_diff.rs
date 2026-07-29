@@ -181,7 +181,7 @@ pub(super) fn repo_worktree_diff_for_filter(
     let mut file_keys = BTreeSet::new();
     let mut artifact_keys = BTreeSet::new();
 
-    if let Some(_) = rev {
+    if rev.is_some() {
         let commit = repo.read_commit(&from)?;
         file_keys.extend(
             commit
@@ -197,27 +197,47 @@ pub(super) fn repo_worktree_diff_for_filter(
                 .filter(|key| repo_key_matches_filter(key, filter))
                 .cloned(),
         );
-    }
-    file_keys.extend(
-        index_files
-            .keys()
-            .filter(|key| repo_key_matches_filter(key, filter))
-            .cloned(),
-    );
-    artifact_keys.extend(
-        index_artifacts
-            .keys()
-            .filter(|key| repo_key_matches_filter(key, filter))
-            .cloned(),
-    );
-    if current_key != ".graft"
-        && !current_key.starts_with(".graft/")
-        && repo_key_matches_filter(&current_key, filter)
-    {
-        file_keys.insert(current_key.clone());
+        file_keys.extend(
+            index_files
+                .keys()
+                .filter(|key| repo_key_matches_filter(key, filter))
+                .cloned(),
+        );
+        artifact_keys.extend(
+            index_artifacts
+                .keys()
+                .filter(|key| repo_key_matches_filter(key, filter))
+                .cloned(),
+        );
+        if current_key != ".graft"
+            && !current_key.starts_with(".graft/")
+            && repo_key_matches_filter(&current_key, filter)
+        {
+            file_keys.insert(current_key.clone());
+        }
+    } else {
+        // Working diff is driven by the status change set. Hydrating every tracked path here made
+        // a one-path change quadratic because each per-path diff cloned the full tree maps.
+        let status = repo_status_for_file(runtime, file, repo)?;
+        for change in status
+            .unstaged_changes
+            .into_iter()
+            .filter(|change| repo_key_matches_filter(&change.path, filter))
+        {
+            graft::repo::cancellation_checkpoint()?;
+            if change.path == current_key
+                || index_files.contains_key(&change.path)
+                || change.kind == RepoTrackedPathKind::SqliteDatabase
+            {
+                file_keys.insert(change.path);
+            } else {
+                artifact_keys.insert(change.path);
+            }
+        }
     }
 
     for key in file_keys {
+        graft::repo::cancellation_checkpoint()?;
         let physical_path = repo.worktree().join(&key);
         let path_diff = if key == current_key {
             let state = current_repo_file_state(runtime, file)?;
@@ -266,6 +286,7 @@ pub(super) fn repo_worktree_diff_for_filter(
     }
 
     for key in artifact_keys {
+        graft::repo::cancellation_checkpoint()?;
         let physical_path = repo.worktree().join(&key);
         let path_diff = match std::fs::symlink_metadata(&physical_path) {
             Ok(metadata) if metadata.file_type().is_file() => {
@@ -327,6 +348,7 @@ pub(crate) fn repo_status_for_file(
         Err(err) => return Err(err.into()),
     };
     for change in &mut status.unstaged_changes {
+        graft::repo::cancellation_checkpoint()?;
         if change.path == current_key || repo_key_volume_id(runtime, repo, &change.path)?.is_some()
         {
             change.kind = RepoTrackedPathKind::SqliteDatabase;
@@ -350,6 +372,7 @@ pub(crate) fn repo_status_for_file(
             || change.change == RepoWorktreeChangeKind::Untracked
     });
     for (key, expected_state) in tracked {
+        graft::repo::cancellation_checkpoint()?;
         if key == current_key
             || status
                 .unstaged_changes

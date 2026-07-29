@@ -1,9 +1,12 @@
 use std::{path::PathBuf, sync::Arc};
 
 use graft_sdk::{
-    DiffOptions as CoreDiffOptions, RemoteConfigureOptions as CoreRemoteConfigureOptions,
-    RepositoryOperation, RepositorySession as CoreRepositorySession,
-    RestoreOptions as CoreRestoreOptions, SdkError,
+    CancellationToken, DiffOptions as CoreDiffOptions, DiffPathsOptions as CoreDiffPathsOptions,
+    InventoryKind, InventoryOptions as CoreInventoryOptions,
+    RemoteConfigureOptions as CoreRemoteConfigureOptions, RepositoryOperation,
+    RepositorySession as CoreRepositorySession, RestoreOptions as CoreRestoreOptions,
+    RestorePathsOptions as CoreRestorePathsOptions, SdkError,
+    StagePathsOptions as CoreStagePathsOptions,
 };
 use napi::{
     Env, Error, Result, Status, Task,
@@ -22,11 +25,42 @@ pub struct DiffOptions {
 }
 
 #[napi(object)]
+pub struct DiffPathsOptions {
+    pub paths: Vec<String>,
+    pub rows: Option<bool>,
+    pub from: Option<String>,
+    pub limit: Option<u32>,
+    pub after: Option<String>,
+}
+
+#[napi(object)]
 pub struct RestoreOptions {
     pub source: Option<String>,
     pub expected_head: Option<String>,
     pub require_clean: Option<bool>,
     pub path: String,
+}
+
+#[napi(object)]
+pub struct StagePathsOptions {
+    pub paths: Vec<String>,
+    pub expected_head: Option<String>,
+    pub force: Option<bool>,
+}
+
+#[napi(object)]
+pub struct RestorePathsOptions {
+    pub source: Option<String>,
+    pub expected_head: Option<String>,
+    pub require_clean: Option<bool>,
+    pub paths: Vec<String>,
+}
+
+#[napi(object)]
+pub struct InventoryOptions {
+    pub kind: Option<String>,
+    pub limit: Option<u32>,
+    pub after: Option<String>,
 }
 
 #[napi(object)]
@@ -50,18 +84,40 @@ enum JsonOperation {
     Status,
     StatusIncremental,
     AddAll,
+    StagePaths {
+        options: CoreStagePathsOptions,
+    },
     Commit {
         message: String,
     },
     Diff {
         options: CoreDiffOptions,
     },
+    DiffPaths {
+        options: CoreDiffPathsOptions,
+    },
     History {
         limit: usize,
         after: Option<String>,
     },
+    HistorySummaries {
+        limit: usize,
+        after: Option<String>,
+    },
+    CommitDetails {
+        revision: String,
+    },
+    IsIgnoredPath {
+        path: PathBuf,
+    },
+    Inventory {
+        options: CoreInventoryOptions,
+    },
     Restore {
         options: CoreRestoreOptions,
+    },
+    RestorePaths {
+        options: CoreRestorePathsOptions,
     },
     ConfigureRemote {
         options: CoreRemoteConfigureOptions,
@@ -88,6 +144,7 @@ enum JsonOperation {
 pub struct JsonTask {
     session: Arc<CoreRepositorySession>,
     operation: JsonOperation,
+    cancellation: CancellationToken,
 }
 
 impl Task for JsonTask {
@@ -95,8 +152,52 @@ impl Task for JsonTask {
     type JsValue = String;
 
     fn compute(&mut self) -> Result<Self::Output> {
+        let cancellation = self.cancellation.clone();
+        graft_sdk::with_cancellation(&cancellation, || self.compute_inner())
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        Ok(output)
+    }
+}
+
+impl JsonTask {
+    fn compute_inner(&mut self) -> Result<String> {
         if matches!(self.operation, JsonOperation::StatusIncremental) {
             let value = self.session.status_incremental().map_err(napi_error)?;
+            return serde_json::to_string(&value)
+                .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
+        }
+        if let JsonOperation::HistorySummaries { limit, after } = &self.operation {
+            let value = self
+                .session
+                .history_summaries(*limit, after.as_deref())
+                .map_err(napi_error)?;
+            return serde_json::to_string(&value)
+                .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
+        }
+        if let JsonOperation::DiffPaths { options } = &self.operation {
+            let value = self.session.diff_paths(options).map_err(napi_error)?;
+            return serde_json::to_string(&value)
+                .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
+        }
+        if let JsonOperation::StagePaths { options } = &self.operation {
+            let value = self.session.stage_paths(options).map_err(napi_error)?;
+            return serde_json::to_string(&value)
+                .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
+        }
+        if let JsonOperation::RestorePaths { options } = &self.operation {
+            let value = self.session.restore_paths(options).map_err(napi_error)?;
+            return serde_json::to_string(&value)
+                .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
+        }
+        if let JsonOperation::IsIgnoredPath { path } = &self.operation {
+            let value = self.session.is_ignored_path(path).map_err(napi_error)?;
+            return serde_json::to_string(&value)
+                .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
+        }
+        if let JsonOperation::Inventory { options } = &self.operation {
+            let value = self.session.inventory(options).map_err(napi_error)?;
             return serde_json::to_string(&value)
                 .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
         }
@@ -105,12 +206,28 @@ impl Task for JsonTask {
             JsonOperation::Status => self.session.status(),
             JsonOperation::StatusIncremental => unreachable!("handled before JSON value dispatch"),
             JsonOperation::AddAll => self.session.add_all(),
+            JsonOperation::StagePaths { .. } => {
+                unreachable!("handled before JSON value dispatch")
+            }
             JsonOperation::Commit { message } => self.session.commit(message),
             JsonOperation::Diff { options } => self.session.diff(options),
+            JsonOperation::DiffPaths { .. } => {
+                unreachable!("handled before JSON value dispatch")
+            }
             JsonOperation::History { limit, after } => {
                 self.session.history(*limit, after.as_deref())
             }
+            JsonOperation::HistorySummaries { .. } => {
+                unreachable!("handled before JSON value dispatch")
+            }
+            JsonOperation::CommitDetails { revision } => self.session.commit_details(revision),
+            JsonOperation::IsIgnoredPath { .. } | JsonOperation::Inventory { .. } => {
+                unreachable!("handled before JSON value dispatch")
+            }
             JsonOperation::Restore { options } => self.session.restore(options),
+            JsonOperation::RestorePaths { .. } => {
+                unreachable!("handled before JSON value dispatch")
+            }
             JsonOperation::ConfigureRemote { options } => self.session.configure_remote(options),
             JsonOperation::Push { remote, branch } => {
                 self.session.push(remote.as_deref(), branch.as_deref())
@@ -128,10 +245,6 @@ impl Task for JsonTask {
         .map_err(napi_error)?;
         serde_json::to_string(&value)
             .map_err(|error| Error::new(Status::GenericFailure, error.to_string()))
-    }
-
-    fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
-        Ok(output)
     }
 }
 
@@ -239,6 +352,25 @@ impl NodeRepositorySession {
     }
 
     #[napi]
+    pub fn stage_paths(
+        &self,
+        options: StagePathsOptions,
+        signal: Option<AbortSignal>,
+    ) -> AsyncTask<JsonTask> {
+        json_task(
+            self,
+            JsonOperation::StagePaths {
+                options: CoreStagePathsOptions {
+                    paths: options.paths.into_iter().map(PathBuf::from).collect(),
+                    expected_head: options.expected_head,
+                    force: options.force.unwrap_or(false),
+                },
+            },
+            signal,
+        )
+    }
+
+    #[napi]
     pub fn commit(&self, message: String, signal: Option<AbortSignal>) -> AsyncTask<JsonTask> {
         json_task(self, JsonOperation::Commit { message }, signal)
     }
@@ -261,6 +393,27 @@ impl NodeRepositorySession {
     }
 
     #[napi]
+    pub fn diff_paths(
+        &self,
+        options: DiffPathsOptions,
+        signal: Option<AbortSignal>,
+    ) -> AsyncTask<JsonTask> {
+        json_task(
+            self,
+            JsonOperation::DiffPaths {
+                options: CoreDiffPathsOptions {
+                    paths: options.paths.into_iter().map(PathBuf::from).collect(),
+                    rows: options.rows.unwrap_or(false),
+                    from: options.from,
+                    limit: options.limit.unwrap_or(100) as usize,
+                    after: options.after,
+                },
+            },
+            signal,
+        )
+    }
+
+    #[napi]
     pub fn history(
         &self,
         limit: Option<u32>,
@@ -278,6 +431,77 @@ impl NodeRepositorySession {
     }
 
     #[napi]
+    pub fn history_summaries(
+        &self,
+        limit: Option<u32>,
+        after: Option<String>,
+        signal: Option<AbortSignal>,
+    ) -> AsyncTask<JsonTask> {
+        json_task(
+            self,
+            JsonOperation::HistorySummaries {
+                limit: limit.unwrap_or(50) as usize,
+                after,
+            },
+            signal,
+        )
+    }
+
+    #[napi]
+    pub fn commit_details(
+        &self,
+        revision: String,
+        signal: Option<AbortSignal>,
+    ) -> AsyncTask<JsonTask> {
+        json_task(self, JsonOperation::CommitDetails { revision }, signal)
+    }
+
+    #[napi]
+    pub fn is_ignored_path(
+        &self,
+        path: String,
+        signal: Option<AbortSignal>,
+    ) -> AsyncTask<JsonTask> {
+        json_task(
+            self,
+            JsonOperation::IsIgnoredPath { path: PathBuf::from(path) },
+            signal,
+        )
+    }
+
+    #[napi]
+    pub fn inventory(
+        &self,
+        options: Option<InventoryOptions>,
+        signal: Option<AbortSignal>,
+    ) -> Result<AsyncTask<JsonTask>> {
+        let options = options.unwrap_or(InventoryOptions { kind: None, limit: None, after: None });
+        let kind = match options.kind.as_deref().unwrap_or("tracked_ignored") {
+            "tracked" => InventoryKind::Tracked,
+            "untracked" => InventoryKind::Untracked,
+            "ignored" => InventoryKind::Ignored,
+            "tracked_ignored" | "trackedIgnored" => InventoryKind::TrackedIgnored,
+            value => {
+                return Err(Error::new(
+                    Status::InvalidArg,
+                    format!("unknown inventory kind `{value}`"),
+                ));
+            }
+        };
+        Ok(json_task(
+            self,
+            JsonOperation::Inventory {
+                options: CoreInventoryOptions {
+                    kind,
+                    limit: options.limit.unwrap_or(100) as usize,
+                    after: options.after,
+                },
+            },
+            signal,
+        ))
+    }
+
+    #[napi]
     pub fn restore(
         &self,
         options: RestoreOptions,
@@ -291,6 +515,26 @@ impl NodeRepositorySession {
                     expected_head: options.expected_head,
                     require_clean: options.require_clean.unwrap_or(false),
                     path: PathBuf::from(options.path),
+                },
+            },
+            signal,
+        )
+    }
+
+    #[napi]
+    pub fn restore_paths(
+        &self,
+        options: RestorePathsOptions,
+        signal: Option<AbortSignal>,
+    ) -> AsyncTask<JsonTask> {
+        json_task(
+            self,
+            JsonOperation::RestorePaths {
+                options: CoreRestorePathsOptions {
+                    source: options.source,
+                    expected_head: options.expected_head,
+                    require_clean: options.require_clean.unwrap_or(false),
+                    paths: options.paths.into_iter().map(PathBuf::from).collect(),
                 },
             },
             signal,
@@ -371,11 +615,19 @@ pub fn operation_materializes_worktree(operation: String) -> Result<bool> {
     let operation = match operation.as_str() {
         "init" => RepositoryOperation::Init,
         "status" => RepositoryOperation::Status,
+        "status_incremental" | "statusIncremental" => RepositoryOperation::StatusIncremental,
         "add_all" | "addAll" => RepositoryOperation::AddAll,
+        "stage_paths" | "stagePaths" => RepositoryOperation::StagePaths,
         "commit" => RepositoryOperation::Commit,
         "diff" => RepositoryOperation::Diff,
+        "diff_paths" | "diffPaths" => RepositoryOperation::DiffPaths,
         "history" => RepositoryOperation::History,
+        "history_summaries" | "historySummaries" => RepositoryOperation::HistorySummaries,
+        "commit_details" | "commitDetails" => RepositoryOperation::CommitDetails,
+        "is_ignored_path" | "isIgnoredPath" => RepositoryOperation::IsIgnoredPath,
+        "inventory" => RepositoryOperation::Inventory,
         "restore" => RepositoryOperation::Restore,
+        "restore_paths" | "restorePaths" => RepositoryOperation::RestorePaths,
         "remote_configure" | "configureRemote" => RepositoryOperation::RemoteConfigure,
         "push" => RepositoryOperation::Push,
         "fetch" => RepositoryOperation::Fetch,
@@ -415,10 +667,16 @@ fn json_task(
     operation: JsonOperation,
     signal: Option<AbortSignal>,
 ) -> AsyncTask<JsonTask> {
+    let cancellation = CancellationToken::new();
+    if let Some(signal) = signal.as_ref() {
+        let abort_token = cancellation.clone();
+        signal.on_abort(move || abort_token.cancel());
+    }
     AsyncTask::with_optional_signal(
         JsonTask {
             session: session.session.clone(),
             operation,
+            cancellation,
         },
         signal,
     )

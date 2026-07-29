@@ -109,10 +109,12 @@ legacy direct-repository entry points.
 
 ## Cancellation and conflicts
 
-The binding uses Node-API async work with an optional `AbortSignal`. Node can cancel a queued task,
-but cannot safely preempt a blocking Graft command already executing. The contract is therefore
-“cancel before start”; started operations complete normally. Repository mutations never expose a
-partially interrupted SDK result.
+The binding uses Node-API async work with an optional `AbortSignal`. Node cancels queued tasks; an
+abort after start also flips a shared cooperative token. Repository status, diff, history, stage,
+restore, inventory, tree hydration, and SQLite page loops check that token and return a dedicated
+cancelled error, which the JavaScript wrapper normalizes to `AbortError`. The retained runtime stays
+valid for the next call. Multi-path mutations may complete a prefix, but each index write and
+individual worktree replacement remains valid and observable through the next status.
 
 Graft's existing JSON command outcomes remain the source of truth for merge/pull/restore conflicts.
 The binding adds stable lifecycle, invalid-argument, repository-busy, repository-command, and

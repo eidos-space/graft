@@ -464,6 +464,7 @@ pub(super) fn stage_repo_add_topology_removals(
             && (repo_key_is_under_directory(candidate, key)
                 || repo_key_is_under_directory(key, candidate))
     }) {
+        graft::repo::cancellation_checkpoint()?;
         let tracked_at_head = head.as_ref().is_some_and(|commit| {
             commit.files.contains_key(&conflict) || commit.artifacts.contains_key(&conflict)
         });
@@ -503,6 +504,7 @@ pub(super) fn stage_repo_add_changes(
     let mut prepared_entries = Vec::with_capacity(changes.len());
 
     for change in changes {
+        graft::repo::cancellation_checkpoint()?;
         match change.change {
             RepoWorktreeChangeKind::Modified | RepoWorktreeChangeKind::Untracked => {
                 let physical_path = repo.worktree().join(&change.path);
@@ -610,6 +612,7 @@ pub(super) fn collect_repo_add_directory_files(
     out: &mut BTreeSet<String>,
 ) -> Result<(), ErrCtx> {
     for entry in std::fs::read_dir(dir)? {
+        graft::repo::cancellation_checkpoint()?;
         let entry = entry?;
         let path = entry.path();
         if repo.is_internal_worktree_path(&path) {

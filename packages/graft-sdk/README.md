@@ -79,8 +79,12 @@ const { RepositorySession } = require("@eidos.space/graft")
 
 const session = await RepositorySession.open(spaceRoot)
 try {
-  const status = await session.status()
-  const diff = await session.diff({ rows: true })
+  const status = await session.statusIncremental()
+  const diff = await session.diffPaths({
+    paths: status.status.paths.map(({ path }) => path),
+    rows: true,
+    limit: 100,
+  })
 } finally {
   await session.close()
 }
@@ -119,11 +123,19 @@ files in the Space. Changes confined to `.graft` are not counted.
 | `open`, `close`, `reopen` | Manage the retained repository runtime | No |
 | `init` | Initialize `.graft` metadata | No |
 | `status` | Inspect worktree and index state | No |
+| `statusIncremental` | Inspect status with a stable generation/change token and safe cache telemetry | No |
 | `addAll` | Read/import the current worktree into the index | No |
+| `stagePaths` | Stage up to 1,000 explicit paths in one serialized SDK call | No |
 | `commit` | Advance repository history | No |
 | `diff` | Compare worktree, index, or revisions | No |
+| `diffPaths` | Diff a page of explicit changed file paths (up to 100) | No |
 | `history` | Read commit history and status | No |
+| `historySummaries` | Read up to 500 lightweight commit summaries without trees/blobs | No |
+| `commitDetails` | Lazily hydrate one full commit | No |
+| `isIgnoredPath` | Apply nested `.gitignore` / `.graftignore` semantics | No |
+| `inventory` | Page tracked, untracked, ignored, or tracked-and-ignored paths | No |
 | `restore` | Replace selected paths from a revision | **Yes** |
+| `restorePaths` | Restore up to 1,000 explicit paths in one serialized SDK call | **Yes** |
 | `configureRemote` | Persist remote URL/upstream metadata | No |
 | `push` | Send objects/refs to a remote | No |
 | `fetch` | Receive objects/refs into `.graft` | No |
@@ -131,9 +143,9 @@ files in the Space. Changes confined to `.graft` are not counted.
 | `cloneRepository` | Populate a new worktree from a remote | **Yes** |
 
 `operationMaterializesWorktree(name)` exposes this contract to the Eidos gate. Before `restore`,
-`pull`, or `cloneRepository`, Eidos must checkpoint and close application SQLite handles for paths
-that can be replaced. Reopen those application handles after the SDK promise settles. The Graft
-repository session itself stays open during the operation.
+`restorePaths`, `pull`, or `cloneRepository`, Eidos must checkpoint and close application SQLite
+handles for paths that can be replaced. `stagePaths` never materializes the worktree. Reopen
+application handles after the SDK promise settles; the Graft repository session itself stays open.
 
 `addAll` reads SQLite files and their committed/WAL state but does not replace them. Eidos should
 still checkpoint its application databases before snapshotting when it needs a deterministic
@@ -159,12 +171,42 @@ repository state. No stale daemon registration or PID file is involved.
 Dropping the JavaScript native object releases its Rust `Arc`, but Eidos should always await
 `close()` during orderly Space shutdown so lifecycle errors are observable.
 
+## Incremental status, history, diff, and inventory
+
+`statusIncremental()` fingerprints tracked files and SQLite sidecars with metadata. When HEAD,
+index, visible-untracked inventory, and file metadata are unchanged, it reuses the prior status and
+does not hash file contents. `generation` advances only when the semantic status changes;
+`change_token` combines that session generation with HEAD. Tokens are stable within an open
+session and should invalidate host snapshots, not serve as durable repository object IDs.
+
+`historySummaries({ limit, after })` returns only commit id, parents, message, timestamp, table
+counts, and optional path counts. It never reads a commit tree or blob. Commits created before path
+counts were added return `path_changes: null` and `path_counts_complete: false`; use
+`commitDetails(id)` only when a user opens one commit. The `next_cursor` is the last returned commit
+id.
+
+For working changes, pass `status.status.paths` to `diffPaths`. The API accepts normalized explicit
+file paths, sorts/deduplicates them, and pages them with `limit`/`after`; directories are rejected so
+a request cannot accidentally expand to an unbounded tree. The legacy `diff()` remains compatible,
+but an unfiltered working diff is now driven by the status change set instead of every tracked path.
+
+`inventory({ kind })` supports `tracked`, `untracked`, `ignored`, and `tracked_ignored`. The last form
+is the migration diagnostic for repositories that added ignore rules after committing generated
+trees. Ignore rules never untrack an existing path. Review the bounded pages, then explicitly remove
+the approved paths from the index; the SDK never performs that migration implicitly.
+
+Telemetry contains only durations, counts, and cache/object-read facts. It never contains bearer
+tokens or absolute user paths.
+
 ## Cancellation, conflicts, and errors
 
-Every asynchronous method accepts `{ signal }`. Aborting cancels work that is still queued in the
-Node/libuv async-work queue. Once a Graft operation has started, it is not preempted: its result or
-error wins, avoiding partially interrupted repository mutations. Closing likewise waits for the
-in-flight operation instead of canceling it.
+Every asynchronous method accepts `{ signal }`. Aborting still cancels queued Node/libuv work and
+also flips a cooperative token for work already running. Status, diff, history, stage, restore,
+inventory, tree hydration, and SQLite page loops check that token. Cancellation rejects with an
+`AbortError`; the retained session remains open and usable. A cancelled multi-path mutation can
+leave a completed prefix, but every individual index write or worktree replacement remains valid.
+Call status before retrying. `close()` keeps its existing contract: it waits for the in-flight
+operation and does not implicitly cancel it.
 
 Repository conflicts and command results retain Graft's existing JSON schema. The binding
 stabilizes transport/lifecycle failures as `GraftSdkError` with codes such as:
@@ -172,6 +214,7 @@ stabilizes transport/lifecycle failures as `GraftSdkError` with codes such as:
 - `GRAFT_SDK_SESSION_CLOSED`
 - `GRAFT_SDK_SESSION_CLOSING`
 - `GRAFT_SDK_REPOSITORY_BUSY`
+- `GRAFT_SDK_CANCELLED` (normalized to `AbortError` by the JavaScript wrapper)
 - `GRAFT_SDK_INVALID_ARGUMENT`
 - `GRAFT_SDK_REPOSITORY_COMMAND`
 
@@ -207,6 +250,7 @@ Build the release CLI and addon, then run:
 ```sh
 cargo build --release -p graft-tool
 pnpm --dir packages/graft-sdk bench
+pnpm --dir packages/graft-sdk bench:large
 ```
 
 `GRAFT_SDK_BENCH_ITERATIONS` controls repetition (default 30), and `GRAFT_CLI_PATH` may select a
@@ -218,6 +262,12 @@ specific CLI binary. The benchmark reports first/min/p50/p95/max/mean for:
 
 The benchmark deliberately closes the retained SDK session before each CLI sample because the
 repository lock correctly excludes a second writer/runtime.
+
+`bench:large` creates a repeatable 46,665-path history, including 46,318 paths that become ignored
+only after they were tracked, nested `.graftignore` rules, 51 commits, and one changed `.eidos`
+database. It reports cold/hot median and p95 latency, JSON request/response bytes, peak RSS,
+cancellation latency, and safe SDK telemetry. Set `GRAFT_SDK_LARGE_FIXTURE` to retain/reuse the
+fixture and `GRAFT_SDK_LARGE_ITERATIONS` to control repetitions.
 
 The checked-in macOS arm64 baseline is
 [`benchmark/results/macos-arm64.json`](https://github.com/eidos-space/graft/blob/main/packages/graft-sdk/benchmark/results/macos-arm64.json). For 30 iterations on

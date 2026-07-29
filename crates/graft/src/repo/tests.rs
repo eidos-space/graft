@@ -671,6 +671,50 @@ fn log_page_stops_after_a_bounded_window_and_resumes_after_cursor() {
 }
 
 #[test]
+fn history_summary_page_is_lightweight_paginated_and_carries_path_counts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = Repository::init(tmp.path()).unwrap();
+    let note = tmp.path().join("note.txt");
+
+    fs::write(&note, "first\n").unwrap();
+    repo.stage_artifact_path(&note).unwrap();
+    let first = repo.commit_staged("first").unwrap();
+    fs::write(&note, "second\n").unwrap();
+    repo.stage_artifact_path(&note).unwrap();
+    let second = repo.commit_staged("second").unwrap();
+
+    let first_page = repo.history_summary_page(1, None).unwrap();
+    assert!(first_page.has_more);
+    assert_eq!(first_page.next_cursor.as_deref(), Some(second.id.as_str()));
+    assert_eq!(first_page.commits[0].message, "second");
+    assert!(first_page.commits[0].path_counts_complete);
+    assert_eq!(
+        first_page.commits[0].path_changes,
+        Some(CommitPathChangeCounts { added: 0, modified: 1, deleted: 0 })
+    );
+
+    let second_page = repo
+        .history_summary_page(1, first_page.next_cursor.as_deref())
+        .unwrap();
+    assert!(!second_page.has_more);
+    assert_eq!(second_page.commits[0].id, first.id);
+    assert_eq!(second_page.commits[0].path_changes.unwrap().added, 1);
+}
+
+#[test]
+fn cancellation_scope_returns_cancelled_without_poisoning_repository() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = Repository::init(tmp.path()).unwrap();
+    fs::write(tmp.path().join("note.txt"), "content\n").unwrap();
+
+    let token = CancellationToken::new();
+    token.cancel();
+    let cancelled = with_cancellation(&token, || repo.status());
+    assert!(matches!(cancelled, Err(RepoErr::Cancelled)));
+    assert!(repo.status().is_ok());
+}
+
+#[test]
 fn status_scans_worktree_files_as_untracked() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = Repository::init(tmp.path()).unwrap();

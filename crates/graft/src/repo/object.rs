@@ -694,6 +694,7 @@ pub struct CommitObject {
     pub committer: Signature,
     pub repo_format_version: u32,
     pub tables: Vec<CommitTableSummary>,
+    pub path_changes: Option<CommitPathChangeCounts>,
     pub message: String,
 }
 
@@ -703,6 +704,19 @@ pub struct CommitTableSummary {
     pub inserts: usize,
     pub deletes: usize,
     pub updates: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitPathChangeCounts {
+    pub added: usize,
+    pub modified: usize,
+    pub deleted: usize,
+}
+
+impl CommitPathChangeCounts {
+    pub fn total(self) -> usize {
+        self.added + self.modified + self.deleted
+    }
 }
 
 impl CommitObject {
@@ -732,6 +746,12 @@ impl CommitObject {
                 table.updates
             ));
         }
+        if let Some(counts) = self.path_changes {
+            out.push_str(&format!(
+                "path-changes {} {} {}\n",
+                counts.added, counts.modified, counts.deleted
+            ));
+        }
         out.push_str(&format!("\n{}", self.message));
         out
     }
@@ -750,6 +770,7 @@ impl CommitObject {
         let mut committer = SignatureBuilder::default();
         let mut repo_format_version = None;
         let mut tables = Vec::new();
+        let mut path_changes = None;
 
         for line in headers.lines() {
             let Some((key, value)) = line.split_once(' ') else {
@@ -771,6 +792,9 @@ impl CommitObject {
                 "committer-tz" => committer.tz = Some(value.to_string()),
                 "graft-version" => repo_format_version = Some(parse_value(value, "commit")?),
                 "table" => tables.push(parse_commit_table_summary(value)?),
+                "path-changes" => {
+                    path_changes = Some(parse_commit_path_change_counts(value)?);
+                }
                 _ => {
                     return Err(ObjectErr::InvalidObject {
                         kind: "commit",
@@ -788,9 +812,19 @@ impl CommitObject {
             repo_format_version: repo_format_version
                 .ok_or_else(|| missing("commit", "graft-version"))?,
             tables,
+            path_changes,
             message: message.to_string(),
         })
     }
+}
+
+fn parse_commit_path_change_counts(value: &str) -> Result<CommitPathChangeCounts> {
+    let mut parts = value.split(' ');
+    let added = parse_field(parts.next(), "commit", "added path count")?;
+    let modified = parse_field(parts.next(), "commit", "modified path count")?;
+    let deleted = parse_field(parts.next(), "commit", "deleted path count")?;
+    ensure_no_extra(parts, "commit")?;
+    Ok(CommitPathChangeCounts { added, modified, deleted })
 }
 
 fn encode_commit_table_name(name: &str) -> String {

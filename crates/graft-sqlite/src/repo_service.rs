@@ -7,7 +7,7 @@ use std::{path::Path, sync::Arc};
 
 use graft::{
     remote::{RemoteConfig, RemoteCredentialErr, RemoteCredentials},
-    repo::{CommitFileState, RepoStatus, Repository},
+    repo::{CommitFileState, CommitObject, RepoHistorySummaryPage, RepoStatus, Repository},
     setup::setup_graft_temporary,
 };
 
@@ -113,6 +113,24 @@ impl RepositoryCommandService {
         let runtime = self.file.runtime().clone();
         let repo = repo_for_file(&mut self.file)?;
         repo_status_for_file(&runtime, &self.file, &repo)
+    }
+
+    /// Lists commit metadata without hydrating any commit trees or blobs.
+    pub fn history_summaries(
+        &mut self,
+        limit: usize,
+        after: Option<&str>,
+    ) -> Result<RepoHistorySummaryPage, ErrCtx> {
+        self.repository()?
+            .history_summary_page(limit, after)
+            .map_err(Into::into)
+    }
+
+    /// Hydrates the full details for one commit on demand.
+    pub fn commit_details(&mut self, revision: &str) -> Result<CommitObject, ErrCtx> {
+        let repo = self.repository()?;
+        let id = repo.resolve_revision(revision)?;
+        repo.read_commit(&id).map_err(Into::into)
     }
 
     /// Compares a physical SQLite worktree file with its tracked snapshot.

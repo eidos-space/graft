@@ -346,6 +346,10 @@ impl Repository {
         self.ignore_rules()?.is_ignored(&key, is_dir)
     }
 
+    pub fn ignore_matcher(&self) -> Result<RepoIgnoreMatcher> {
+        Ok(self.ignore_rules()?.matcher())
+    }
+
     pub fn is_internal_worktree_path(&self, path: impl AsRef<Path>) -> bool {
         let Ok(relative) = path.as_ref().strip_prefix(&self.worktree) else {
             return false;
@@ -644,6 +648,7 @@ impl Repository {
         let mut files = BTreeMap::new();
         let mut artifacts = BTreeMap::new();
         for entry in tree.entries {
+            cancellation_checkpoint()?;
             match entry.mode {
                 object::TreeEntryMode::SqliteDatabase => {
                     let object = self.object_store().read(&entry.oid)?;
@@ -906,6 +911,7 @@ impl Repository {
             changes.insert(path, (change, kind, storage));
         }
         for path in state.deleted {
+            cancellation_checkpoint()?;
             if tracked.contains_key(&path) {
                 changes.insert(
                     path,
@@ -927,6 +933,7 @@ impl Repository {
             }
         }
         for (path, expected) in &tracked_artifacts {
+            cancellation_checkpoint()?;
             if changes.contains_key(path) {
                 continue;
             }
@@ -969,6 +976,7 @@ impl Repository {
             }
         }
         for path in self.configured_untracked_paths_for_index(index)? {
+            cancellation_checkpoint()?;
             changes.entry(path.path).or_insert((
                 RepoWorktreeChangeKind::Untracked,
                 path.kind,
@@ -1011,6 +1019,7 @@ impl Repository {
         let mut paths = Vec::new();
 
         for (path, scanned) in self.scan_worktree_files()? {
+            cancellation_checkpoint()?;
             if tracked.contains_key(&path) || tracked_artifacts.contains_key(&path) {
                 continue;
             }
@@ -1079,6 +1088,7 @@ impl Repository {
         }
 
         for entry in fs::read_dir(dir)? {
+            cancellation_checkpoint()?;
             let entry = entry?;
             let path = entry.path();
             if self.is_internal_worktree_path(&path) {

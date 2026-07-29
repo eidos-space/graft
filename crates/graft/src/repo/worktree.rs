@@ -1,5 +1,6 @@
 use std::{
     borrow::Cow,
+    collections::BTreeMap,
     fs,
     io::Read,
     path::{Path, PathBuf},
@@ -21,6 +22,46 @@ pub(super) struct IgnoreRules {
     root: Gitignore,
 }
 
+/// Reusable nested `.gitignore` / `.graftignore` matcher for bounded SDK scans.
+#[derive(Debug, Clone)]
+pub struct RepoIgnoreMatcher {
+    worktree: PathBuf,
+    root: Gitignore,
+    directory_rules: BTreeMap<PathBuf, Gitignore>,
+}
+
+impl RepoIgnoreMatcher {
+    pub fn is_ignored(&mut self, key: &str, is_dir: bool) -> Result<bool> {
+        let key = normalize_repo_path_key(key)?;
+        if key.is_empty() {
+            return Ok(false);
+        }
+        let mut matchers = vec![self.root.clone()];
+        let mut path = self.worktree.clone();
+        let mut components = Path::new(&key).components().peekable();
+        while let Some(component) = components.next() {
+            path.push(component);
+            let has_descendants = components.peek().is_some();
+            let component_is_dir = has_descendants || is_dir;
+            if IgnoreRules::matches(&matchers, &path, component_is_dir) {
+                return Ok(true);
+            }
+            if has_descendants {
+                let rules = match self.directory_rules.get(&path) {
+                    Some(rules) => rules.clone(),
+                    None => {
+                        let rules = IgnoreRules::load_directory(&path)?;
+                        self.directory_rules.insert(path.clone(), rules.clone());
+                        rules
+                    }
+                };
+                matchers.push(rules);
+            }
+        }
+        Ok(false)
+    }
+}
+
 impl IgnoreRules {
     pub(super) fn load(worktree: &Path) -> Result<Self> {
         Ok(Self {
@@ -30,25 +71,15 @@ impl IgnoreRules {
     }
 
     pub(super) fn is_ignored(&self, key: &str, is_dir: bool) -> Result<bool> {
-        if key.is_empty() {
-            return Ok(false);
-        }
+        self.matcher().is_ignored(key, is_dir)
+    }
 
-        let mut matchers = vec![self.root.clone()];
-        let mut path = self.worktree.clone();
-        let mut components = Path::new(key).components().peekable();
-        while let Some(component) = components.next() {
-            path.push(component);
-            let has_descendants = components.peek().is_some();
-            let component_is_dir = has_descendants || is_dir;
-            if Self::matches(&matchers, &path, component_is_dir) {
-                return Ok(true);
-            }
-            if has_descendants {
-                matchers.push(Self::load_directory(&path)?);
-            }
+    pub(super) fn matcher(&self) -> RepoIgnoreMatcher {
+        RepoIgnoreMatcher {
+            worktree: self.worktree.clone(),
+            root: self.root.clone(),
+            directory_rules: BTreeMap::new(),
         }
-        Ok(false)
     }
 
     pub(super) fn root(&self) -> Gitignore {
