@@ -58,6 +58,19 @@ graft add data.sqlite
 graft add attachments/report.pdf
 ```
 
+## 忽略 Worktree 路径
+
+Graft 默认读取 repository 根目录及各级子目录中的 `.gitignore`。规则遵循 Git
+的匹配语法和优先级，包括 `!` 否定、`/` 锚定、仅目录规则、`**`、`?`、字符类、
+注释和转义。与 Git 一致，如果父目录已被排除，就不能重新包含其中的文件。
+
+Graft 继续支持 `.graftignore`，其语法与 `.gitignore` 相同。同一目录中同时存在
+两个文件时，`.graftignore` 的规则优先；更深目录中的规则优先于父目录规则。
+
+忽略规则只影响 untracked path 的发现和普通 add；已经由 Graft 跟踪的路径仍会
+报告并可 stage 其变更。若要显式添加被忽略的 untracked path，请使用
+`graft add --force path`。
+
 ## 查看文件清单
 
 ```bash

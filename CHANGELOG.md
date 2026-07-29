@@ -1,5 +1,20 @@
 # Changelog
 
+## Graft 0.10.0 — 2026-07-29
+
+### Added
+
+- You can now reuse root and nested `.gitignore` files to keep generated or
+  local-only worktree paths out of Graft with Git-compatible matching rules.
+
+### Changed
+
+- `.graftignore` now uses the same matching syntax as `.gitignore` and takes
+  precedence when both files define rules in the same directory.
+- You can stage changes to already tracked paths normally even when a later
+  ignore rule matches them; ignored untracked paths still require
+  `graft add --force`.
+
 ## Graft 0.9.0 — 2026-07-28
 
 ### Added

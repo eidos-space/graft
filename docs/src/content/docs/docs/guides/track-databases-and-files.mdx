@@ -69,6 +69,23 @@ graft add data.sqlite
 graft add attachments/report.pdf
 ```
 
+## Ignore Worktree Paths
+
+Graft reads `.gitignore` files from the repository root and descendant
+directories by default. Rules use Git's matching syntax and precedence,
+including `!` negation, `/` anchoring, directory-only patterns, `**`, `?`,
+character classes, comments, and escapes. As in Git, a file cannot be
+re-included when one of its parent directories is excluded.
+
+The Graft-specific `.graftignore` filename remains supported with the same
+syntax. When both files exist in one directory, `.graftignore` rules take
+precedence over `.gitignore` rules. Rules in deeper directories take precedence
+over rules inherited from their parents.
+
+Ignore rules affect untracked path discovery and ordinary adds; paths already
+tracked by Graft continue to report and stage changes. Use
+`graft add --force path` to add an ignored, untracked path intentionally.
+
 ## Inspect Tracked And Untracked Paths
 
 ```bash

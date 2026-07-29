@@ -5364,7 +5364,7 @@ fn test_repo_merge_large_file_conflicts_report_path_kind() {
 }
 
 #[test]
-fn test_repo_pragmas_add_ignored_regular_files_requires_force() {
+fn test_repo_pragmas_add_gitignored_regular_files_requires_force() {
     graft_test::ensure_test_env();
 
     let temp_dir = tempfile::tempdir().unwrap();
@@ -5376,8 +5376,8 @@ fn test_repo_pragmas_add_ignored_regular_files_requires_force() {
     assert!(pragma_query_string(&sqlite, "graft_init").contains(".graft"));
 
     std::fs::write(
-        temp_dir.path().join(".graftignore"),
-        "*.tmp\nignored/\n.graftignore\n",
+        temp_dir.path().join(".gitignore"),
+        "*.tmp\nignored/\n.gitignore\n",
     )
     .unwrap();
     std::fs::write(temp_dir.path().join("secret.tmp"), "local scratch").unwrap();
@@ -5411,6 +5411,17 @@ fn test_repo_pragmas_add_ignored_regular_files_requires_force() {
         .expect("graft_json_status should return repo status JSON");
     assert_eq!(status["staged"][0], "ignored/note.txt");
     assert_eq!(status["staged"][1], "secret.tmp");
+
+    pragma_arg_string(&sqlite, "graft_commit", "track forced paths");
+    std::fs::write(temp_dir.path().join("secret.tmp"), "updated scratch").unwrap();
+    let status: Value = serde_json::from_str(&pragma_query_string(&sqlite, "graft_json_status"))
+        .expect("graft_json_status should return repo status JSON");
+    assert_eq!(status["unstaged_changes"][0]["path"], "secret.tmp");
+    assert_eq!(status["unstaged_changes"][0]["change"], "modified");
+    assert_eq!(
+        pragma_arg_string(&sqlite, "graft_add", "secret.tmp"),
+        "Added secret.tmp"
+    );
 
     runtime.shutdown().unwrap();
 }

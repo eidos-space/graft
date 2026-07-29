@@ -62,16 +62,16 @@ Graft 不能替代 SQLite 事务、应用授权、实时查询复制或用于源
 
 ### 在本地
 
-安装 Graft v0.9.0：
+安装 Graft v0.10.0：
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/eidos-space/graft/main/install.sh \
-  | GRAFT_VERSION=0.9.0 sh
+  | GRAFT_VERSION=0.10.0 sh
 
 graft --version
 ```
 
-移除 `GRAFT_VERSION=0.9.0` 即可安装最新发布版本。也可以从
+移除 `GRAFT_VERSION=0.10.0` 即可安装最新发布版本。也可以从
 [Releases](https://github.com/eidos-space/graft/releases) 下载预构建文件。
 
 创建一个同时包含 SQLite 数据库和应用自有文件的仓库：

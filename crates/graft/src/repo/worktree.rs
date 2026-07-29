@@ -1,86 +1,91 @@
-use std::{borrow::Cow, fs, io::Read, path::Path};
+use std::{
+    borrow::Cow,
+    fs,
+    io::Read,
+    path::{Path, PathBuf},
+};
+
+use ignore::{
+    Match,
+    gitignore::{Gitignore, GitignoreBuilder},
+};
 
 use super::{
-    CONTENT_CLASS_SAMPLE_BYTES, FileConfig, GRAFT_IGNORE_FILE, RepoPathStorage,
+    CONTENT_CLASS_SAMPLE_BYTES, FileConfig, GIT_IGNORE_FILE, GRAFT_IGNORE_FILE, RepoPathStorage,
     RepoTrackedPathKind, Result, SQLITE_DATABASE_MAGIC,
 };
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub(super) struct IgnoreRules {
-    patterns: Vec<IgnorePattern>,
+    worktree: PathBuf,
+    root: Gitignore,
 }
 
 impl IgnoreRules {
     pub(super) fn load(worktree: &Path) -> Result<Self> {
-        let path = worktree.join(GRAFT_IGNORE_FILE);
-        let raw = match fs::read_to_string(path) {
-            Ok(raw) => raw,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
-            Err(err) => return Err(err.into()),
-        };
         Ok(Self {
-            patterns: raw.lines().filter_map(IgnorePattern::parse).collect(),
+            worktree: worktree.to_path_buf(),
+            root: Self::load_directory(worktree)?,
         })
     }
 
-    pub(super) fn is_ignored(&self, key: &str, is_dir: bool) -> bool {
-        !key.is_empty()
-            && self
-                .patterns
-                .iter()
-                .any(|pattern| pattern.matches(key, is_dir))
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct IgnorePattern {
-    pattern: String,
-    dir_only: bool,
-    anchored: bool,
-    has_slash: bool,
-}
-
-impl IgnorePattern {
-    fn parse(line: &str) -> Option<Self> {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') || line.starts_with('!') {
-            return None;
+    pub(super) fn is_ignored(&self, key: &str, is_dir: bool) -> Result<bool> {
+        if key.is_empty() {
+            return Ok(false);
         }
-        let dir_only = line.ends_with('/');
-        let anchored = line.starts_with('/');
-        let pattern = line
-            .trim_start_matches('/')
-            .trim_end_matches('/')
-            .trim_start_matches("./");
-        let pattern = normalize_repo_path(pattern);
-        if pattern.is_empty() {
-            return None;
+
+        let mut matchers = vec![self.root.clone()];
+        let mut path = self.worktree.clone();
+        let mut components = Path::new(key).components().peekable();
+        while let Some(component) = components.next() {
+            path.push(component);
+            let has_descendants = components.peek().is_some();
+            let component_is_dir = has_descendants || is_dir;
+            if Self::matches(&matchers, &path, component_is_dir) {
+                return Ok(true);
+            }
+            if has_descendants {
+                matchers.push(Self::load_directory(&path)?);
+            }
         }
-        let has_slash = pattern.contains('/');
-        Some(Self { pattern, dir_only, anchored, has_slash })
+        Ok(false)
     }
 
-    fn matches(&self, key: &str, is_dir: bool) -> bool {
-        if self.anchored || self.has_slash {
-            return self.matches_anchored(key, is_dir);
-        }
+    pub(super) fn root(&self) -> Gitignore {
+        self.root.clone()
+    }
 
-        let components = key.split('/').collect::<Vec<_>>();
-        for (index, component) in components.iter().enumerate() {
-            let component_is_dir = index + 1 < components.len() || is_dir;
-            if wildcard_match(&self.pattern, component) && (!self.dir_only || component_is_dir) {
-                return true;
+    pub(super) fn rules_for_directory(&self, directory: &Path) -> Result<Gitignore> {
+        Self::load_directory(directory)
+    }
+
+    pub(super) fn matches(matchers: &[Gitignore], path: &Path, is_dir: bool) -> bool {
+        for matcher in matchers.iter().rev() {
+            match matcher.matched(path, is_dir) {
+                Match::Ignore(_) => return true,
+                Match::Whitelist(_) => return false,
+                Match::None => {}
             }
         }
         false
     }
 
-    fn matches_anchored(&self, key: &str, is_dir: bool) -> bool {
-        if wildcard_match(&self.pattern, key) && (!self.dir_only || is_dir) {
-            return true;
+    fn load_directory(directory: &Path) -> Result<Gitignore> {
+        let mut builder = GitignoreBuilder::new(directory);
+        for file_name in [GIT_IGNORE_FILE, GRAFT_IGNORE_FILE] {
+            let path = directory.join(file_name);
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.is_file() => {
+                    if let Some(err) = builder.add(path) {
+                        return Err(err.into());
+                    }
+                }
+                Ok(_) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
+            }
         }
-        key.strip_prefix(&self.pattern)
-            .is_some_and(|suffix| suffix.starts_with('/'))
+        Ok(builder.build()?)
     }
 }
 

@@ -67,16 +67,16 @@ anything.
 
 ### On your machine
 
-Install Graft v0.9.0:
+Install Graft v0.10.0:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/eidos-space/graft/main/install.sh \
-  | GRAFT_VERSION=0.9.0 sh
+  | GRAFT_VERSION=0.10.0 sh
 
 graft --version
 ```
 
-Omit `GRAFT_VERSION=0.9.0` to install the latest published release. Prebuilt
+Omit `GRAFT_VERSION=0.10.0` to install the latest published release. Prebuilt
 archives are available on the
 [releases page](https://github.com/eidos-space/graft/releases).
 
