@@ -264,6 +264,78 @@ a local scheduling outlier.
 | SDK cold | 470.8 ms | 422.1/443.9 ms | 454.2/700.2 ms | 459.2/477.9 ms | 455.7/462.8 ms |
 | SDK resident rerun | 33.7 ms | 1.5/1.8 ms | 23.5/27.6 ms | 37.5/40.3 ms | 37.9/39.2 ms |
 
+## Git-style generic receive-bundle round
+
+The second Git-style round extends the receive operation to every immutable
+object needed by a normal single-branch push. The optional `receive-bundle`
+request starts with a bounded JSON manifest and then streams SQLite segments,
+SQLite storage commits, external file payloads, the object pack, and its index
+as exact-length frames. The Remote writes frames in manifest order and performs
+the ref compare-and-swap last. This preserves segment-before-storage-commit,
+pack-before-index, and objects-before-ref publication without buffering the
+whole request.
+
+Old Remotes remain compatible: a protocol-valid `404` or `405` falls back to
+individual immutable uploads plus `receive-pack`. A pre-existing object with
+different bytes falls back to the original upload/read/equality check instead
+of treating `412 Precondition Failed` as success. The manifest is capped at 16
+KiB and 256 objects, and truncated or trailing bodies cannot publish the ref.
+
+Only the staging Sync Worker was deployed. Version
+`5ed2bc57-ae34-4a23-86ff-5d8c18318a82` passed an authenticated disposable
+push/clone/content/usage round trip before measurement. The following
+fresh-Remote matrix was measured from Shanghai on 2026-07-30 with the final
+client. Incremental cells contain 10 runs; first push contains one run.
+
+| Mode | First | No-op p50/p95 | Text p50/p95 | SQLite row p50/p95 | 256 KiB p50/p95 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| CLI cold | 6.347 s | 1.670/2.256 s | 3.719/4.199 s | 3.908/4.338 s | 4.266/4.964 s |
+| SDK cold | 5.747 s | 1.641/3.456 s | 3.975/5.831 s | 3.936/4.258 s | 4.081/6.604 s |
+| SDK resident | 5.307 s | 1.246/1.499 s | 3.576/7.103 s | 3.158/4.251 s | 3.828/4.829 s |
+
+Against `receive-pack`, resident SQLite row improved from 5.107/7.426 s to
+3.158/4.251 s, a 38.2% p50 and 42.8% p95 reduction. The 256 KiB case improved
+24.0%/46.2%. CLI SQLite row improved 34.9%/47.1%, and CLI 256 KiB improved
+22.5%/30.1%. Text keeps the same two-request shape and its resident p95
+regressed because of staging variance, so this is not evidence of a uniform
+text-change tail-latency improvement. The original approximately 15 s incident
+and this fresh disposable CLI result are not controlled equivalents, but the
+current 3.908/4.338 s result is about 74% below that observed duration.
+
+| Case | Requests: original / receive-pack / receive-bundle | Request bytes p50 | Push p50 | HTTP client sum | Worker total sum | Client-edge remainder |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| No-op | 1 / 1 / 1 | 0 B | 1.246 s | 1.240 s | 0.133 s | 1.107 s (89.3%) |
+| Text | 4 / 2 / 2 | 1,441 B | 3.576 s | 3.561 s | 1.337 s | 2.224 s (62.5%) |
+| SQLite row | 6 / 4 / 2 | 2,235 B | 3.158 s | 3.139 s | 1.865 s | 1.274 s (40.6%) |
+| 256 KiB | 5 / 3 / 2 | 264,665 B | 3.828 s | 3.795 s | 1.704 s | 2.091 s (55.1%) |
+
+For the median resident SQLite row, authorization sums to 0.198 s and
+repository directory lookup to 0.027 s. Approximately 1.640 s of Worker time is
+therefore data-plane object/quota/R2/ref work; another 1.274 s is outside the
+Worker. Batching removed two complete authenticated Worker invocations but did
+not reduce the payload materially.
+
+The bundle POST alone reuses the ref-read client's HTTP/1.1 connection. A
+controlled 10-run resident comparison against the otherwise identical
+split-pool build improved SQLite row from 3.997/5.334 s to 3.844/4.470 s
+(3.8%/16.2%) and 256 KiB from 4.494/6.539 s to 3.659/5.926 s
+(18.6%/9.4%), with no connection stalls. Legacy uploads and receive-pack retain
+the isolated upload pool because broader reuse had previously stalled on the
+available proxy path.
+
+The final local `fs://` matrix shows that the additional manifest and framing
+work did not move the bottleneck into the client:
+
+| Mode | First | No-op p50/p95 | Text p50/p95 | SQLite row p50/p95 | 256 KiB p50/p95 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| CLI cold | 425.8 ms | 419.1/441.9 ms | 437.8/452.8 ms | 538.1/592.1 ms | 442.0/512.0 ms |
+| SDK cold | 451.9 ms | 412.1/433.9 ms | 444.2/455.1 ms | 458.9/473.2 ms | 442.0/460.9 ms |
+| SDK resident | 35.3 ms | 1.4/3.8 ms | 24.0/26.2 ms | 35.8/42.4 ms | 38.1/39.8 ms |
+
+The resident SQLite client work is about 36 ms versus 3.158 s on staging. The
+HTTP path therefore accounts for approximately 99% of the measured incremental
+push latency on this network path.
+
 ## Implemented client changes
 
 - `RemoteCredentials` now lazily shares dedicated read/control and
@@ -298,6 +370,14 @@ a local scheduling outlier.
   pack, index, and final ref CAS share one request body and one Worker
   invocation. Protocol-valid old Remotes continue to work through automatic
   `404`/`405` fallback.
+- Normal single-branch publication uses `receive-bundle` when advertised:
+  SQLite snapshot objects, external payloads, pack, index, and final ref CAS
+  share one ordered streaming request. Old-Remote and immutable-collision
+  fallbacks retain the existing verification behavior. Refspec and `--all`
+  publication continue through the established path.
+- The bundle POST reuses the ref-read connection. Other mutation requests stay
+  on the isolated upload pool, limiting the change to the controlled path that
+  completed the 10-run staging experiment without stalls.
 
 ## Implemented staging changes
 
@@ -321,6 +401,9 @@ a local scheduling outlier.
   truncated or trailing bodies abort before ref publication, existing immutable
   objects are idempotent, and quota accounting uses each object's declared
   length rather than the combined request length.
+- Receive-bundle applies the same direct-streaming and ref-last rules to every
+  manifest object. Quota accounting is performed per frame, including retries
+  of existing objects, rather than charging the combined request body.
 
 The public Remote protocol remains backward compatible through an optional v1
 capability. Immutable writes still use create-only semantics; packs still
@@ -345,10 +428,11 @@ benchmark data. The management API currently has no repository-delete endpoint,
 so their tens of MiB of R2/metadata data could not be removed safely. The cost
 is small but nonzero; adding an authenticated staging cleanup API is a follow-up.
 
-Current staging Sync deployment: `2da2d1b4-c851-42db-8b7c-6fe010871021`.
+Current staging Sync deployment: `5ed2bc57-ae34-4a23-86ff-5d8c18318a82`.
 Current staging identity deployment:
 `e6011c7d-433d-44b3-b605-97333ff29a55`.
-The immediately prior Sync deployment is
+The immediately prior Sync deployment is the receive-pack build
+`2da2d1b4-c851-42db-8b7c-6fe010871021`; its predecessor is
 `57ee312a-dccf-4aa1-b00b-1edcd796505b`.
 The safe-timing deployment before error-log hardening is
 `922a7ab3-bc2d-4650-bce6-6d43312512be`. The object-write-only optimized deployment is
@@ -359,8 +443,8 @@ Rollback only the Sync Worker, from the Eidos repository:
 
 ```sh
 pnpm --dir apps/graft-remote exec wrangler rollback \
-  57ee312a-dccf-4aa1-b00b-1edcd796505b \
-  --env staging -m 'Rollback receive-pack staging deployment'
+  2da2d1b4-c851-42db-8b7c-6fe010871021 \
+  --env staging -m 'Rollback receive-bundle staging deployment'
 ```
 
 Use `f2c958bf-d10f-4960-9d7d-2d1aabbd1d6e` to remove timing and log hardening
@@ -383,7 +467,7 @@ The following passed after the changes:
 
 - `just test`: 590 repository tests, 81 vendor doc tests, one Graft doc test,
   and all SQL integration scripts on the integrated topic branch;
-- final focused suites: 198 Graft core tests plus its doc test and 73
+- final focused suites: 201 Graft core tests plus its doc test and 73
   `graft-sqlite` library tests;
 - 17 focused HTTP Remote tests, including within-command reuse, command-boundary
   pool reset, read/upload pool isolation, missing-body drain, exact content
@@ -393,8 +477,8 @@ The following passed after the changes:
 - clone, fetch, pull, multi-file/workspace, force-push, non-fast-forward,
   snapshot integrity, and SQLite row-diff/merge tests in the full suite;
 - eight native `RepositorySession` SDK tests;
-- 15 staging Worker tests plus TypeScript checking;
-- all nine core protocol, one Hono adapter, and nine Cloudflare adapter tests;
+- 16 staging Worker tests plus TypeScript checking;
+- all ten core protocol, one Hono adapter, and nine Cloudflare adapter tests;
 - staging smoke verification and a real authenticated CLI provision/push/clone/
   content/commit/usage round trip;
 - the final 10-run resident staging matrix, including recovery from the
@@ -402,6 +486,10 @@ The following passed after the changes:
 - receive-pack request framing, exact concatenated bodies, old-Remote fallback,
   duplicate immutable retry, quota delta, truncated-body ref safety, and direct
   R2 streaming tests.
+- receive-bundle framing and limits, ordered object publication, collision and
+  old-Remote fallback, exact concatenated bodies, connection reuse, per-object
+  quota accounting, retry idempotence, truncated/trailing-body ref safety, and
+  direct R2 streaming tests.
 
 `cargo fmt --all -- --check`, `cargo check --workspace --all-targets`, and
 targeted Clippy with `--no-deps` pass. Whole-workspace Clippy remains blocked by
@@ -419,10 +507,11 @@ Proposed budgets and current disposition:
 | Resident SDK, staging, warm session |   0.75/1.25 s |                    2.0/3.0 s |
 | CLI, staging, cold process          |    1.75/2.5 s |                    3.0/4.5 s |
 
-Local paths meet budget. Staging no-op resident p50 is close but p95 misses;
-resident text and SQLite incremental pushes, and every cold CLI incremental
-path, miss budget. These budgets should remain targets rather than being raised
-to match the current implementation.
+Local paths meet budget. Staging resident no-op and incremental text/SQLite
+pushes still miss their p50/p95 budgets. Cold CLI incremental p50 also misses,
+although the final text, SQLite, and 256 KiB p95 values are within the 4.5 s
+tail budget. These budgets should remain targets rather than being raised to
+match the current implementation.
 
 Remaining risks and follow-ups:
 
