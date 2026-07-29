@@ -162,24 +162,48 @@ pub(super) fn run_repo_push(
     all: bool,
     force: bool,
 ) -> Result<PushCommandOutcome, ErrCtx> {
+    let push_trace = graft::trace::PushTraceSpan::new("push_total");
     if let Some(refspec) = refspec {
         let remote = repo_default_remote(repo, remote)?;
+        let snapshot_trace = graft::trace::PushTraceSpan::new("snapshot_publish");
         publish_repo_refspec_snapshots(runtime, repo, &remote, &refspec)?;
+        snapshot_trace.finish(&[]);
+        let object_trace = graft::trace::PushTraceSpan::new("object_and_ref_publish");
         let outcome = repo.push_refspec_with_force(&remote, &refspec, force)?;
+        let commits = outcome
+            .branches
+            .iter()
+            .map(|branch| branch.commits)
+            .sum::<usize>() as u64;
+        object_trace.finish(&[("commits", commits)]);
+        push_trace.finish(&[("commits", commits)]);
         Ok(PushCommandOutcome::Many(outcome))
     } else if all {
         let remote = repo_default_remote(repo, remote)?;
+        let snapshot_trace = graft::trace::PushTraceSpan::new("snapshot_publish");
         publish_repo_all_branch_snapshots(runtime, repo, &remote)?;
+        snapshot_trace.finish(&[]);
+        let object_trace = graft::trace::PushTraceSpan::new("object_and_ref_publish");
         let outcome = repo.push_all_with_force(&remote, force)?;
+        let commits = outcome
+            .branches
+            .iter()
+            .map(|branch| branch.commits)
+            .sum::<usize>() as u64;
+        object_trace.finish(&[("commits", commits)]);
+        push_trace.finish(&[("commits", commits)]);
         Ok(PushCommandOutcome::Many(outcome))
     } else {
         let (remote, local_branch, remote_branch) = repo_push_branches(repo, remote, branch)?;
+        let remote_head_trace = graft::trace::PushTraceSpan::new("remote_head_read");
         let remote_head = repo.remote_branch_head_state(&remote, &remote_branch)?;
+        remote_head_trace.finish(&[]);
         let tracking_head = if !force {
             repo.remote_tracking_ref(&remote, &remote_branch)?
         } else {
             None
         };
+        let snapshot_trace = graft::trace::PushTraceSpan::new("snapshot_publish");
         publish_repo_branch_snapshots(
             runtime,
             repo,
@@ -187,6 +211,8 @@ pub(super) fn run_repo_push(
             &local_branch,
             tracking_head.as_deref().or(remote_head.head.as_deref()),
         )?;
+        snapshot_trace.finish(&[]);
+        let object_trace = graft::trace::PushTraceSpan::new("object_and_ref_publish");
         let outcome = repo.push_branch_with_force_and_remote_head(
             &remote,
             &local_branch,
@@ -194,6 +220,8 @@ pub(super) fn run_repo_push(
             force,
             remote_head,
         )?;
+        object_trace.finish(&[("commits", outcome.commits as u64)]);
+        push_trace.finish(&[("commits", outcome.commits as u64)]);
         Ok(PushCommandOutcome::One(outcome))
     }
 }

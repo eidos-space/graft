@@ -2,8 +2,11 @@ use std::{
     collections::{HashMap, HashSet},
     env, fmt, future,
     ops::Range,
-    sync::Arc,
-    time::Duration,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 use crate::core::{LogId, SegmentId, cbe::CBE64, commit::Commit, lsn::LSN};
@@ -30,6 +33,8 @@ pub mod segment;
 const REMOTE_CONCURRENCY: usize = 5;
 const GRAFT_PROTOCOL_HEADER: &str = "Graft-Protocol";
 const GRAFT_PROTOCOL_VERSION: &str = "1";
+const GRAFT_REQUEST_ID_HEADER: &str = "X-Graft-Request-Id";
+static HTTP_REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 enum RemotePath<'a> {
     /// Commits are stored at `/logs/{logid}/commits/{CBE64 hex LSN}`
@@ -135,6 +140,7 @@ enum RemoteCredentialMode {
 pub struct RemoteCredentials {
     mode: RemoteCredentialMode,
     http_bearer_tokens: Arc<RwLock<HashMap<String, BearerToken>>>,
+    http_client: Arc<RwLock<Option<reqwest::Client>>>,
 }
 
 impl fmt::Debug for RemoteCredentials {
@@ -145,6 +151,10 @@ impl fmt::Debug for RemoteCredentials {
             .field(
                 "http_bearer_token_count",
                 &self.http_bearer_tokens.read().len(),
+            )
+            .field(
+                "http_client_initialized",
+                &self.http_client.read().is_some(),
             )
             .finish()
     }
@@ -162,6 +172,7 @@ impl RemoteCredentials {
         Self {
             mode: RemoteCredentialMode::Explicit,
             http_bearer_tokens: Arc::default(),
+            http_client: Arc::default(),
         }
     }
 
@@ -173,6 +184,7 @@ impl RemoteCredentials {
         Self {
             mode: RemoteCredentialMode::Environment,
             http_bearer_tokens: Arc::default(),
+            http_client: Arc::default(),
         }
     }
 
@@ -234,6 +246,26 @@ impl RemoteCredentials {
                 .map(BearerToken::new),
         }
     }
+
+    fn http_client(&self) -> Result<reqwest::Client> {
+        if let Some(client) = self.http_client.read().clone() {
+            return Ok(client);
+        }
+
+        let candidate = build_http_client()?;
+        let mut client = self.http_client.write();
+        Ok(client.get_or_insert(candidate).clone())
+    }
+}
+
+fn build_http_client() -> std::result::Result<reqwest::Client, reqwest::Error> {
+    reqwest::ClientBuilder::new()
+        // HTTP/2 request-body multiplexing stalls behind common local proxies.
+        // Reuse a small HTTP/1.1 pool across the entire repository session.
+        .http1_only()
+        .hickory_dns(true)
+        .connect_timeout(Duration::from_secs(5))
+        .build()
 }
 
 fn valid_credential_remote_name(remote_name: &str) -> bool {
@@ -376,7 +408,11 @@ impl Remote {
             RemoteConfig::Http { url, token_env } => {
                 let token = credentials.http_bearer_token(remote_name, token_env.as_deref());
                 return Ok(Self {
-                    backend: RemoteBackend::Http(HttpRemote::new(url, token)?),
+                    backend: RemoteBackend::Http(HttpRemote::with_client(
+                        url,
+                        token,
+                        credentials.http_client()?,
+                    )),
                 });
             }
         };
@@ -782,17 +818,17 @@ impl Remote {
 }
 
 impl HttpRemote {
+    #[cfg(test)]
     fn new(url: String, token: Option<BearerToken>) -> Result<Self> {
-        let client = reqwest::ClientBuilder::new()
-            .http1_only()
-            .hickory_dns(true)
-            .connect_timeout(Duration::from_secs(5))
-            .build()?;
-        Ok(Self {
+        Ok(Self::with_client(url, token, build_http_client()?))
+    }
+
+    fn with_client(url: String, token: Option<BearerToken>, client: reqwest::Client) -> Self {
+        Self {
             client,
             url: url.trim_end_matches('/').to_string(),
             token,
-        })
+        }
     }
 
     fn raw_url(&self, kind: &str, path: &str) -> String {
@@ -821,6 +857,53 @@ impl HttpRemote {
             request.bearer_auth(token.expose())
         } else {
             request
+        }
+    }
+
+    async fn send(
+        &self,
+        request: reqwest::RequestBuilder,
+        operation: &'static str,
+        request_bytes: Option<u64>,
+    ) -> Result<reqwest::Response> {
+        let request_id = format!(
+            "{:x}-{:x}",
+            std::process::id(),
+            HTTP_REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        );
+        let started = Instant::now();
+        let result = request
+            .header(GRAFT_REQUEST_ID_HEADER, &request_id)
+            .send()
+            .await;
+        match result {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let response_bytes = response.content_length();
+                let server_timings = safe_server_timings(response.headers());
+                crate::trace::emit_http(crate::trace::HttpTrace {
+                    operation,
+                    request_id: &request_id,
+                    duration: started.elapsed(),
+                    status: Some(status),
+                    request_bytes,
+                    response_bytes,
+                    server_timings: &server_timings,
+                });
+                Ok(response)
+            }
+            Err(err) => {
+                crate::trace::emit_http(crate::trace::HttpTrace {
+                    operation,
+                    request_id: &request_id,
+                    duration: started.elapsed(),
+                    status: None,
+                    request_bytes,
+                    response_bytes: None,
+                    server_timings: &[],
+                });
+                Err(RemoteErr::HttpTransport(err))
+            }
         }
     }
 
@@ -868,10 +951,12 @@ impl HttpRemote {
 
     async fn has_raw(&self, path: &str) -> Result<bool> {
         let response = self
-            .request(reqwest::Method::HEAD, self.raw_url("raw", path))
-            .send()
-            .await
-            .map_err(RemoteErr::HttpTransport)?;
+            .send(
+                self.request(reqwest::Method::HEAD, self.raw_url("raw", path)),
+                "head",
+                Some(0),
+            )
+            .await?;
         if response.status().as_u16() == 404 {
             Self::check_protocol(&response, path)?;
             return Ok(false);
@@ -882,10 +967,12 @@ impl HttpRemote {
 
     async fn get_raw(&self, path: &str) -> Result<Option<Bytes>> {
         let response = self
-            .request(reqwest::Method::GET, self.raw_url("raw", path))
-            .send()
-            .await
-            .map_err(RemoteErr::HttpTransport)?;
+            .send(
+                self.request(reqwest::Method::GET, self.raw_url("raw", path)),
+                "get",
+                Some(0),
+            )
+            .await?;
         if response.status().as_u16() == 404 {
             Self::check_protocol(&response, path)?;
             return Ok(None);
@@ -906,14 +993,16 @@ impl HttpRemote {
                 message: "empty byte range".to_string(),
             })?;
         let response = self
-            .request(reqwest::Method::GET, self.raw_url("raw", path))
-            .header(
-                reqwest::header::RANGE,
-                format!("bytes={}-{}", range.start, end),
+            .send(
+                self.request(reqwest::Method::GET, self.raw_url("raw", path))
+                    .header(
+                        reqwest::header::RANGE,
+                        format!("bytes={}-{}", range.start, end),
+                    ),
+                "range_get",
+                Some(0),
             )
-            .send()
-            .await
-            .map_err(RemoteErr::HttpTransport)?;
+            .await?;
         let response = Self::check_response(response, path).await?;
         response.bytes().await.map_err(RemoteErr::HttpTransport)
     }
@@ -925,13 +1014,15 @@ impl HttpRemote {
 
         loop {
             let response = self
-                .request(
-                    reqwest::Method::GET,
-                    self.list_url(prefix, cursor.as_deref()),
+                .send(
+                    self.request(
+                        reqwest::Method::GET,
+                        self.list_url(prefix, cursor.as_deref()),
+                    ),
+                    "list",
+                    Some(0),
                 )
-                .send()
-                .await
-                .map_err(RemoteErr::HttpTransport)?;
+                .await?;
             let response = Self::check_response(response, prefix).await?;
             let bytes = response.bytes().await.map_err(RemoteErr::HttpTransport)?;
             let page: HttpListResponse =
@@ -958,26 +1049,32 @@ impl HttpRemote {
     }
 
     async fn put_raw(&self, path: &str, bytes: Bytes) -> Result<()> {
+        let request_bytes = bytes.len() as u64;
         let response = self
-            .request(reqwest::Method::PUT, self.raw_url("raw", path))
-            .body(bytes)
-            .send()
-            .await
-            .map_err(RemoteErr::HttpTransport)?;
+            .send(
+                self.request(reqwest::Method::PUT, self.raw_url("raw", path))
+                    .body(bytes),
+                "put",
+                Some(request_bytes),
+            )
+            .await?;
         Self::check_response(response, path).await?;
         Ok(())
     }
 
     async fn put_raw_if_not_exists(&self, path: &str, bytes: Bytes) -> Result<()> {
+        let request_bytes = bytes.len() as u64;
         let response = self
-            .request(
-                reqwest::Method::PUT,
-                self.raw_url("raw-if-not-exists", path),
+            .send(
+                self.request(
+                    reqwest::Method::PUT,
+                    self.raw_url("raw-if-not-exists", path),
+                )
+                .body(bytes),
+                "immutable_put",
+                Some(request_bytes),
             )
-            .body(bytes)
-            .send()
-            .await
-            .map_err(RemoteErr::HttpTransport)?;
+            .await?;
         Self::check_response(response, path).await?;
         Ok(())
     }
@@ -988,28 +1085,42 @@ impl HttpRemote {
         chunks: I,
     ) -> Result<()> {
         let chunks = chunks.into_iter().collect::<Vec<_>>();
+        let content_length = chunks.iter().try_fold(0_usize, |total, chunk| {
+            total
+                .checked_add(chunk.len())
+                .ok_or_else(|| RemoteErr::HttpStatus {
+                    status: 413,
+                    path: path.to_string(),
+                    message: "streamed upload length exceeds usize".to_string(),
+                })
+        })?;
         let body = reqwest::Body::wrap_stream(stream::iter(
             chunks.into_iter().map(Ok::<Bytes, std::io::Error>),
         ));
         let response = self
-            .request(
-                reqwest::Method::PUT,
-                self.raw_url("raw-if-not-exists", path),
+            .send(
+                self.request(
+                    reqwest::Method::PUT,
+                    self.raw_url("raw-if-not-exists", path),
+                )
+                .header(reqwest::header::CONTENT_LENGTH, content_length)
+                .body(body),
+                "immutable_put",
+                Some(content_length as u64),
             )
-            .body(body)
-            .send()
-            .await
-            .map_err(RemoteErr::HttpTransport)?;
+            .await?;
         Self::check_response(response, path).await?;
         Ok(())
     }
 
     async fn delete_raw(&self, path: &str) -> Result<()> {
         let response = self
-            .request(reqwest::Method::DELETE, self.raw_url("raw", path))
-            .send()
-            .await
-            .map_err(RemoteErr::HttpTransport)?;
+            .send(
+                self.request(reqwest::Method::DELETE, self.raw_url("raw", path)),
+                "delete",
+                Some(0),
+            )
+            .await?;
         Self::check_response(response, path).await?;
         Ok(())
     }
@@ -1020,34 +1131,81 @@ impl HttpRemote {
         expected: Option<&[u8]>,
         bytes: Bytes,
     ) -> Result<()> {
+        let request_bytes = bytes.len() as u64;
         let response = self
-            .request(reqwest::Method::POST, self.raw_url("cas", path))
-            .header("x-graft-expected-present", expected.is_some().to_string())
-            .header(
-                "x-graft-expected-hex",
-                expected.map(hex_encode).unwrap_or_default(),
+            .send(
+                self.request(reqwest::Method::POST, self.raw_url("cas", path))
+                    .header("x-graft-expected-present", expected.is_some().to_string())
+                    .header(
+                        "x-graft-expected-hex",
+                        expected.map(hex_encode).unwrap_or_default(),
+                    )
+                    .body(bytes),
+                "compare_and_swap",
+                Some(request_bytes),
             )
-            .body(bytes)
-            .send()
-            .await
-            .map_err(RemoteErr::HttpTransport)?;
+            .await?;
         Self::check_response(response, path).await?;
         Ok(())
     }
 
     async fn compare_and_delete_raw(&self, path: &str, expected: Option<&[u8]>) -> Result<()> {
         let response = self
-            .request(reqwest::Method::POST, self.raw_url("cad", path))
-            .header("x-graft-expected-present", expected.is_some().to_string())
-            .header(
-                "x-graft-expected-hex",
-                expected.map(hex_encode).unwrap_or_default(),
+            .send(
+                self.request(reqwest::Method::POST, self.raw_url("cad", path))
+                    .header("x-graft-expected-present", expected.is_some().to_string())
+                    .header(
+                        "x-graft-expected-hex",
+                        expected.map(hex_encode).unwrap_or_default(),
+                    ),
+                "compare_and_delete",
+                Some(0),
             )
-            .send()
-            .await
-            .map_err(RemoteErr::HttpTransport)?;
+            .await?;
         Self::check_response(response, path).await?;
         Ok(())
+    }
+}
+
+fn safe_server_timings(headers: &reqwest::header::HeaderMap) -> Vec<(&'static str, f64)> {
+    let mut timings = Vec::new();
+    for value in headers.get_all("server-timing") {
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+        for metric in value.split(',') {
+            let mut parts = metric.trim().split(';');
+            let Some(name) = parts.next().and_then(safe_server_timing_name) else {
+                continue;
+            };
+            let Some(duration) = parts.find_map(|parameter| {
+                parameter
+                    .trim()
+                    .strip_prefix("dur=")
+                    .and_then(|value| value.parse::<f64>().ok())
+                    .filter(|value| value.is_finite() && *value >= 0.0)
+            }) else {
+                continue;
+            };
+            if let Some(existing) = timings
+                .iter_mut()
+                .find(|(existing_name, _)| *existing_name == name)
+            {
+                existing.1 = duration;
+            } else {
+                timings.push((name, duration));
+            }
+        }
+    }
+    timings
+}
+
+fn safe_server_timing_name(value: &str) -> Option<&'static str> {
+    match value {
+        "auth" => Some("auth"),
+        "directory" => Some("directory"),
+        "total" => Some("total"),
+        _ => None,
     }
 }
 
@@ -1192,6 +1350,108 @@ mod tests {
                 .any(|line| line.eq_ignore_ascii_case("Authorization: Bearer sdk-request-secret"))
         );
         assert!(!format!("{remote:?}").contains("sdk-request-secret"));
+    }
+
+    #[tokio::test]
+    async fn repository_credentials_reuse_http_connections_across_remotes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            for _ in 0..2 {
+                let mut request = Vec::new();
+                loop {
+                    let mut buffer = [0_u8; 1024];
+                    let read = stream.read(&mut buffer).await.unwrap();
+                    request.extend_from_slice(&buffer[..read]);
+                    if read == 0 || request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                stream
+                    .write_all(
+                        b"HTTP/1.1 204 No Content\r\nGraft-Protocol: 1\r\nContent-Length: 0\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        let credentials = RemoteCredentials::explicit();
+        let config = RemoteConfig::Http {
+            url: format!("http://{address}/org/repo"),
+            token_env: None,
+        };
+        let first = config
+            .clone()
+            .build_with_credentials("origin", &credentials)
+            .unwrap();
+        let second = config
+            .build_with_credentials("origin", &credentials)
+            .unwrap();
+
+        assert!(first.has_segment(&SegmentId::random()).await.unwrap());
+        assert!(second.has_segment(&SegmentId::random()).await.unwrap());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn streamed_http_upload_sends_exact_content_length() {
+        let (url, request) = serve_http_response("204 No Content", &["1"]).await;
+        let remote = HttpRemote::new(url, None).unwrap();
+
+        remote
+            .put_raw_if_not_exists_stream(
+                "segments/example",
+                [Bytes::from_static(b"abc"), Bytes::from_static(b"de")],
+            )
+            .await
+            .unwrap();
+        let request = request.await.unwrap();
+        assert!(
+            request
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("Content-Length: 5"))
+        );
+        assert!(
+            !request
+                .lines()
+                .any(|line| { line.eq_ignore_ascii_case("Transfer-Encoding: chunked") })
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_http_upload_completes_when_remote_rejects_before_reading_body() {
+        let (url, request) = serve_http_response("412 Precondition Failed", &["1"]).await;
+        let remote = HttpRemote::new(url, None).unwrap();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            remote.put_raw_if_not_exists_stream(
+                "segments/example",
+                [Bytes::from(vec![7_u8; 64 * 1024])],
+            ),
+        )
+        .await
+        .expect("fixed-length upload stalled after an early response")
+        .unwrap_err();
+        assert!(result.precondition_failed());
+        request.await.unwrap();
+    }
+
+    #[test]
+    fn server_timing_trace_accepts_only_known_numeric_metrics() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "server-timing",
+            "auth;dur=2.5;desc=secret, directory;dur=3, private_path;dur=999, total;dur=7"
+                .parse()
+                .unwrap(),
+        );
+
+        assert_eq!(
+            safe_server_timings(&headers),
+            vec![("auth", 2.5), ("directory", 3.0), ("total", 7.0)]
+        );
     }
 
     #[tokio::test]

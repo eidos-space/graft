@@ -61,29 +61,49 @@ async fn push_snapshots(
         return Ok(());
     }
 
+    let collect_trace = crate::trace::PushTraceSpan::new("sqlite_snapshot_collect");
     let commits = spawn_blocking({
         let storage = storage.clone();
         move || collect_snapshots_commits(storage, snapshots)
     })
     .await
     .expect("snapshot upload commit collection task failed")?;
+    collect_trace.finish(&[("commits", commits.len() as u64)]);
+    let negotiation_trace = crate::trace::PushTraceSpan::new("sqlite_segment_negotiation");
     let existing_segments = if commits.len() > 1 {
         existing_remote_segments(remote.clone(), &commits).await?
     } else {
         BTreeSet::new()
     };
+    negotiation_trace.finish(&[("existing_segments", existing_segments.len() as u64)]);
+    let build_trace = crate::trace::PushTraceSpan::new("sqlite_snapshot_build");
     let uploads = spawn_blocking(move || build_uploads(storage, commits, existing_segments))
         .await
         .expect("snapshot upload build task failed")?;
+    let segment_bytes = uploads
+        .iter()
+        .filter_map(|upload| upload.segment.as_ref())
+        .flat_map(|(_, chunks)| chunks)
+        .map(|chunk| chunk.len() as u64)
+        .sum();
+    build_trace.finish(&[
+        ("uploads", uploads.len() as u64),
+        ("segment_bytes", segment_bytes),
+    ]);
 
-    stream::iter(uploads)
+    let upload_trace = crate::trace::PushTraceSpan::new("sqlite_snapshot_http_upload");
+    let result = stream::iter(uploads)
         .map(|upload| {
             let remote = remote.clone();
             async move { upload_snapshot_upload(remote, upload).await }
         })
         .buffer_unordered(SNAPSHOT_UPLOAD_CONCURRENCY)
         .try_collect()
-        .await
+        .await;
+    if result.is_ok() {
+        upload_trace.finish(&[("segment_bytes", segment_bytes)]);
+    }
+    result
 }
 
 async fn upload_snapshot_upload(remote: Arc<Remote>, upload: SnapshotUpload) -> Result<()> {
