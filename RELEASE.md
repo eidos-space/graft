@@ -58,7 +58,7 @@ binary and tests it on Node.js 20 and 24.
 From a clean checkout of the merged `origin/main` commit:
 
 ```sh
-version=0.1.0
+version=0.2.0
 test "$(node -p "require('./packages/graft-sdk/package.json').version")" = "$version"
 git tag -a "graft-sdk-v${version}" -m "Graft SDK v${version}"
 git push origin "graft-sdk-v${version}"
