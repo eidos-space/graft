@@ -3,14 +3,21 @@ import path from "node:path"
 
 const worker = path.join(import.meta.dirname, "push-worker.mjs")
 const iterations = positiveInteger(process.env.GRAFT_PUSH_BENCH_ITERATIONS, 10)
-const targets = process.env.GRAFT_PUSH_BENCH_HTTP_REMOTE
-  ? ["fs", "http"]
-  : ["fs"]
-const modes = ["cli-cold", "sdk-cold", "sdk-warm"]
+const targets = selectedChoices(
+  "GRAFT_PUSH_BENCH_TARGETS",
+  ["fs", "http"],
+  process.env.GRAFT_PUSH_BENCH_HTTP_REMOTE ? ["fs", "http"] : ["fs"]
+)
+const modes = selectedChoices(
+  "GRAFT_PUSH_BENCH_MODES",
+  ["cli-cold", "sdk-cold", "sdk-warm"],
+  ["cli-cold", "sdk-cold", "sdk-warm"]
+)
 const runs = []
 
 for (const target of targets) {
   for (const mode of modes) {
+    progress("start", target, mode)
     const modeRemote =
       process.env[
         `GRAFT_PUSH_BENCH_HTTP_REMOTE_${mode.replaceAll("-", "_").toUpperCase()}`
@@ -50,15 +57,25 @@ for (const target of targets) {
         ...(traces.get(key) ?? emptyTrace()),
       })
     }
+    progress("complete", target, mode)
   }
 }
 
 function lastSafeTrace(stderr) {
   let last
+  let lastHttp
+  let lastSample
   for (const line of stderr.split(/\r?\n/)) {
+    if (line.startsWith("graft-bench-marker ")) {
+      const marker = JSON.parse(line.slice("graft-bench-marker ".length))
+      if (marker.event === "start") {
+        lastSample = { case: marker.case, run: marker.run }
+      }
+      continue
+    }
     if (!line.startsWith("graft-push-trace ")) continue
     const event = JSON.parse(line.slice("graft-push-trace ".length))
-    last = {
+    const trace = {
       event: event.event,
       ...(event.operation ? { operation: event.operation } : {}),
       ...(event.phase ? { phase: event.phase } : {}),
@@ -67,8 +84,17 @@ function lastSafeTrace(stderr) {
         ? { duration_ms: event.duration_ms }
         : {}),
     }
+    last = trace
+    if (event.event === "http_request") lastHttp = trace
   }
-  return last
+  const trace = lastHttp ?? last
+  return trace === undefined ? lastSample : { ...lastSample, ...trace }
+}
+
+function progress(event, target, mode) {
+  process.stderr.write(
+    `graft-bench-progress ${JSON.stringify({ event, target, mode })}\n`
+  )
 }
 
 const groups = new Map()
@@ -189,4 +215,17 @@ function positiveInteger(value, fallback) {
     throw new Error("GRAFT_PUSH_BENCH_ITERATIONS must be a positive integer")
   }
   return parsed
+}
+
+function selectedChoices(name, choices, fallback) {
+  const value = process.env[name]?.trim()
+  if (!value) return fallback
+  const selected = [...new Set(value.split(",").map((item) => item.trim()))]
+  if (
+    selected.length === 0 ||
+    selected.some((item) => !choices.includes(item))
+  ) {
+    throw new Error(`${name} must contain only: ${choices.join(", ")}`)
+  }
+  return selected
 }

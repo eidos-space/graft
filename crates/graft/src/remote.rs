@@ -241,6 +241,16 @@ impl RemoteCredentials {
             })
     }
 
+    /// Starts the next top-level repository command with fresh HTTP connection pools.
+    ///
+    /// Remotes already built from this store retain their clients, so requests within one command
+    /// still reuse connections. Repository sessions call this between commands because some
+    /// HTTP/1.1 proxies leave otherwise idle pooled connections unusable.
+    pub fn reset_http_clients(&self) {
+        *self.http_client.write() = None;
+        *self.http_upload_client.write() = None;
+    }
+
     fn http_bearer_token(&self, remote_name: &str, token_env: Option<&str>) -> Option<BearerToken> {
         match self.mode {
             RemoteCredentialMode::Explicit => {
@@ -1028,12 +1038,21 @@ impl HttpRemote {
             .await?;
         if response.status().as_u16() == 404 {
             Self::check_protocol(&response, path)?;
+            Self::drain_response(response).await?;
             return Ok(None);
         }
         let response = Self::check_response(response, path).await?;
         Ok(Some(
             response.bytes().await.map_err(RemoteErr::HttpTransport)?,
         ))
+    }
+
+    async fn drain_response(response: reqwest::Response) -> Result<()> {
+        let mut body = response.bytes_stream();
+        while let Some(chunk) = body.next().await {
+            chunk.map_err(RemoteErr::HttpTransport)?;
+        }
+        Ok(())
     }
 
     async fn get_raw_range(&self, path: &str, range: Range<u64>) -> Result<Bytes> {
@@ -1458,6 +1477,73 @@ mod tests {
 
         assert!(first.has_segment(&SegmentId::random()).await.unwrap());
         assert!(second.has_segment(&SegmentId::random()).await.unwrap());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resetting_repository_credentials_starts_a_fresh_read_connection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                read_http_headers(&mut stream).await;
+                stream
+                    .write_all(
+                        b"HTTP/1.1 204 No Content\r\nGraft-Protocol: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        let credentials = RemoteCredentials::explicit();
+        let config = RemoteConfig::Http {
+            url: format!("http://{address}/org/repo"),
+            token_env: None,
+        };
+        let first = config
+            .clone()
+            .build_with_credentials("origin", &credentials)
+            .unwrap();
+        assert!(first.has_segment(&SegmentId::random()).await.unwrap());
+
+        credentials.reset_http_clients();
+        let second = config
+            .build_with_credentials("origin", &credentials)
+            .unwrap();
+        assert!(second.has_segment(&SegmentId::random()).await.unwrap());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn missing_get_drains_body_before_reusing_connection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_http_headers(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nGraft-Protocol: 1\r\nContent-Length: 7\r\n\r\nmissing",
+                )
+                .await
+                .unwrap();
+            read_http_headers(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nGraft-Protocol: 1\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                )
+                .await
+                .unwrap();
+        });
+        let remote = HttpRemote::new(format!("http://{address}/org/repo"), None).unwrap();
+
+        assert_eq!(remote.get_raw("refs/heads/main").await.unwrap(), None);
+        let bytes = tokio::time::timeout(Duration::from_secs(1), remote.get_raw("refs/heads/main"))
+            .await
+            .expect("second GET did not reuse the drained response connection")
+            .unwrap();
+        assert_eq!(bytes, Some(Bytes::from_static(b"ok")));
         server.await.unwrap();
     }
 
