@@ -91,6 +91,7 @@ issuance, tenancy, and ACL storage are service concerns outside this protocol.
     "list",
     "put-if-absent",
     "receive-pack",
+    "receive-bundle",
     "cas",
     "cad"
   ]
@@ -130,17 +131,18 @@ or `414` when they are exceeded.
 
 All paths below are relative to `{base}`.
 
-| Request                        | Purpose                                              | Success          |
-| ------------------------------ | ---------------------------------------------------- | ---------------- |
-| `HEAD /raw/<key>`              | Test existence and obtain size metadata.             | `200 OK`         |
-| `GET /raw/<key>`               | Read raw bytes.                                      | `200 OK`         |
-| `PUT /raw/<key>`               | Replace transactional metadata.                      | `204 No Content` |
-| `DELETE /raw/<key>`            | Delete transactional metadata.                       | `204 No Content` |
-| `PUT /raw-if-not-exists/<key>` | Create an object only when absent.                   | `204 No Content` |
-| `POST /receive-pack/<ref-key>` | Publish one object pack and atomically update a ref. | `204 No Content` |
-| `POST /cas/<key>`              | Atomically compare and replace metadata.             | `204 No Content` |
-| `POST /cad/<key>`              | Atomically compare and delete metadata.              | `204 No Content` |
-| `GET /list?prefix=<prefix>`    | Recursively list matching keys.                      | `200 OK`         |
+| Request                          | Purpose                                              | Success          |
+| -------------------------------- | ---------------------------------------------------- | ---------------- |
+| `HEAD /raw/<key>`                | Test existence and obtain size metadata.             | `200 OK`         |
+| `GET /raw/<key>`                 | Read raw bytes.                                      | `200 OK`         |
+| `PUT /raw/<key>`                 | Replace transactional metadata.                      | `204 No Content` |
+| `DELETE /raw/<key>`              | Delete transactional metadata.                       | `204 No Content` |
+| `PUT /raw-if-not-exists/<key>`   | Create an object only when absent.                   | `204 No Content` |
+| `POST /receive-pack/<ref-key>`   | Publish one object pack and atomically update a ref. | `204 No Content` |
+| `POST /receive-bundle/<ref-key>` | Publish immutable objects, a pack, and a ref.        | `204 No Content` |
+| `POST /cas/<key>`                | Atomically compare and replace metadata.             | `204 No Content` |
+| `POST /cad/<key>`                | Atomically compare and delete metadata.              | `204 No Content` |
+| `GET /list?prefix=<prefix>`      | Recursively list matching keys.                      | `200 OK`         |
 
 Request bodies for `PUT` and `POST /cas` are the new raw bytes and SHOULD use
 `application/octet-stream`. Successful mutation responses have no body.
@@ -185,6 +187,46 @@ MAY leave unreachable immutable objects. Services advertise support with the
 `receive-pack` descriptor capability. Clients MUST preserve the individual
 `raw-if-not-exists` plus `/cas` sequence as a fallback for services that return
 `404` or `405` for this optional operation.
+
+## Receive Bundle
+
+`receive-bundle` is an optional version 1 capability that extends
+`receive-pack` with immutable objects that the pack references, such as SQLite
+segments, SQLite storage commits, and external file payloads. It uses all
+`receive-pack` headers plus:
+
+```http
+x-graft-bundle-manifest-bytes: <decimal manifest byte length>
+```
+
+The body contains the UTF-8 JSON manifest, each declared object in manifest
+order, the pack, and the index. A manifest has this shape:
+
+```json
+{
+  "version": 1,
+  "objects": [
+    { "path": "segments/example", "bytes": 4096, "allow_existing": true },
+    {
+      "path": "logs/example/commits/0000000000000001",
+      "bytes": 128,
+      "allow_existing": false
+    }
+  ]
+}
+```
+
+Every path MUST be an immutable repository key and MUST occur at most once.
+`Content-Length` MUST equal the manifest length, all object lengths, pack
+length, and index length. The service MUST create objects in manifest order,
+then the pack, then the index, and perform the ref CAS last. A malformed,
+truncated, or trailing body MUST NOT update the ref.
+
+`allow_existing: true` treats an existing object as an idempotent success.
+`false` returns `412` so the client can use the individual v1 path to read and
+verify the collision before retrying publication. Clients MUST fall back to
+individual immutable writes followed by `receive-pack` or `/cas` when
+`receive-bundle` returns `404` or `405`.
 
 ## Compare Operations
 

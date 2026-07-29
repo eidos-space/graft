@@ -19,8 +19,8 @@ use crate::{
     remote::Remote,
     rt::{
         action::{
-            Action, FetchLog, FetchSegment, HydrateSnapshot, RemoteCommit, SnapshotPush,
-            SnapshotsPush,
+            Action, FetchLog, FetchSegment, HydrateSnapshot, PreparedSnapshotPush, RemoteCommit,
+            SnapshotPush, SnapshotsPush,
         },
         task::{autosync::AutosyncTask, supervise},
     },
@@ -392,6 +392,20 @@ impl Runtime {
 
     pub fn snapshots_push_to(&self, snapshots: Vec<Snapshot>, remote: Arc<Remote>) -> Result<()> {
         self.run_action_with_remote(SnapshotsPush { snapshots }, remote)
+    }
+
+    pub fn snapshots_prepare_push_to(
+        &self,
+        snapshots: Vec<Snapshot>,
+        remote: Arc<Remote>,
+    ) -> Result<PreparedSnapshotPush> {
+        self.inner
+            .tokio
+            .block_on(crate::rt::action::prepare_snapshots(
+                self.inner.storage.clone(),
+                remote,
+                snapshots,
+            ))
     }
 
     pub fn snapshot_fetch_from(&self, snapshot: &Snapshot, remote: Arc<Remote>) -> Result<()> {

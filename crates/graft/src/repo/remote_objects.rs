@@ -256,13 +256,13 @@ impl Repository {
             ("objects", object_count),
             ("external_payloads", external_count),
         ]);
-        let large_file_trace = crate::trace::PushTraceSpan::new("large_file_upload");
-        self.push_large_file_contents(remote, external_payloads)?;
+        let large_file_trace = crate::trace::PushTraceSpan::new("large_file_prepare");
+        let bundle_objects = self.prepare_large_file_contents(external_payloads)?;
         large_file_trace.finish(&[("objects", external_count), ("bytes", external_bytes)]);
         let pack_trace = crate::trace::PushTraceSpan::new("object_pack_build");
         let pack = self.prepare_object_pack(objects)?;
         pack_trace.finish(&[("objects", object_count)]);
-        Ok(PreparedObjectPush { commits: count, pack })
+        Ok(PreparedObjectPush { commits: count, pack, bundle_objects })
     }
 
     pub(super) fn commit_ancestors_inclusive(&self, head: &str) -> Result<BTreeSet<String>> {
@@ -347,21 +347,21 @@ impl Repository {
         Ok(())
     }
 
-    pub(super) fn push_large_file_contents(
+    pub(super) fn prepare_large_file_contents(
         &self,
-        remote: &crate::remote::Remote,
         external_payloads: BTreeMap<object::ObjectId, u64>,
-    ) -> Result<()> {
+    ) -> Result<Vec<crate::remote::RemoteBundleObject>> {
+        let mut objects = Vec::with_capacity(external_payloads.len());
         for (id, size) in external_payloads {
             let bytes = self.read_large_file_content(&id, size)?;
             let path = large_file_content_relative_path(&id);
-            match block_on_remote(remote.put_raw_if_not_exists(&path, bytes)) {
-                Ok(()) => {}
-                Err(RepoErr::Remote(err)) if err.precondition_failed() => {}
-                Err(err) => return Err(err),
-            }
+            objects.push(crate::remote::RemoteBundleObject::new(
+                path,
+                [Bytes::from(bytes)],
+                true,
+            )?);
         }
-        Ok(())
+        Ok(objects)
     }
 
     pub(super) fn prepare_object_pack(
@@ -603,4 +603,5 @@ impl Repository {
 pub(super) struct PreparedObjectPush {
     pub(super) commits: usize,
     pub(super) pack: Option<crate::remote::RemoteObjectPack>,
+    pub(super) bundle_objects: Vec<crate::remote::RemoteBundleObject>,
 }

@@ -38,6 +38,7 @@ const RECEIVE_PACK_HEADER_PACK_ID: &str = "x-graft-pack-id";
 const RECEIVE_PACK_HEADER_PACK_BYTES: &str = "x-graft-pack-bytes";
 const RECEIVE_PACK_HEADER_INDEX_BYTES: &str = "x-graft-index-bytes";
 const RECEIVE_PACK_HEADER_REPLACEMENT_HEX: &str = "x-graft-ref-replacement-hex";
+const RECEIVE_BUNDLE_HEADER_MANIFEST_BYTES: &str = "x-graft-bundle-manifest-bytes";
 static HTTP_REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 enum RemotePath<'a> {
@@ -412,6 +413,63 @@ pub(crate) struct RemoteObjectPack {
     index: Bytes,
 }
 
+#[derive(Debug)]
+pub(crate) struct RemoteBundleObject {
+    path: String,
+    chunks: Vec<Bytes>,
+    content_length: usize,
+    allow_existing: bool,
+}
+
+impl RemoteBundleObject {
+    pub(crate) fn new(
+        path: String,
+        chunks: impl IntoIterator<Item = Bytes>,
+        allow_existing: bool,
+    ) -> Result<Self> {
+        let chunks = chunks.into_iter().collect::<Vec<_>>();
+        let content_length = chunks.iter().try_fold(0_usize, |total, chunk| {
+            total
+                .checked_add(chunk.len())
+                .ok_or_else(|| RemoteErr::HttpStatus {
+                    status: 413,
+                    path: path.clone(),
+                    message: "bundled object length exceeds usize".to_string(),
+                })
+        })?;
+        Ok(Self {
+            path,
+            chunks,
+            content_length,
+            allow_existing,
+        })
+    }
+
+    fn bytes(&self) -> Bytes {
+        if self.chunks.len() == 1 {
+            return self.chunks[0].clone();
+        }
+        let mut bytes = Vec::with_capacity(self.content_length);
+        for chunk in &self.chunks {
+            bytes.extend_from_slice(chunk);
+        }
+        Bytes::from(bytes)
+    }
+}
+
+#[derive(Serialize)]
+struct ReceiveBundleManifest<'a> {
+    version: u8,
+    objects: Vec<ReceiveBundleManifestObject<'a>>,
+}
+
+#[derive(Serialize)]
+struct ReceiveBundleManifestObject<'a> {
+    path: &'a str,
+    bytes: usize,
+    allow_existing: bool,
+}
+
 impl RemoteObjectPack {
     pub(crate) fn new(id: String, pack: Bytes, index: Bytes) -> Self {
         Self {
@@ -427,6 +485,7 @@ impl RemoteObjectPack {
 enum HttpReceivePackResult {
     Published,
     Unsupported,
+    RetryIndividually,
 }
 
 impl Remote {
@@ -791,7 +850,7 @@ impl Remote {
                 .await?
             {
                 HttpReceivePackResult::Published => return Ok(()),
-                HttpReceivePackResult::Unsupported => {}
+                HttpReceivePackResult::Unsupported | HttpReceivePackResult::RetryIndividually => {}
             }
         }
 
@@ -800,6 +859,61 @@ impl Remote {
         }
         self.compare_and_swap_raw(ref_path, expected, replacement)
             .await
+    }
+
+    pub(crate) async fn publish_object_bundle_and_ref(
+        &self,
+        objects: Vec<RemoteBundleObject>,
+        pack: Option<RemoteObjectPack>,
+        ref_path: &str,
+        expected: Option<&[u8]>,
+        replacement: impl Into<Bytes>,
+    ) -> Result<()> {
+        let replacement = replacement.into();
+        if objects.is_empty() {
+            return self
+                .publish_object_pack_and_ref(pack, ref_path, expected, replacement)
+                .await;
+        }
+
+        if let (RemoteBackend::Http(remote), Some(pack)) = (&self.backend, pack.as_ref()) {
+            match remote
+                .receive_bundle(&objects, pack, ref_path, expected, replacement.clone())
+                .await?
+            {
+                HttpReceivePackResult::Published => return Ok(()),
+                HttpReceivePackResult::Unsupported | HttpReceivePackResult::RetryIndividually => {}
+            }
+        }
+
+        self.put_bundle_objects(&objects).await?;
+        self.publish_object_pack_and_ref(pack, ref_path, expected, replacement)
+            .await
+    }
+
+    async fn put_bundle_objects(&self, objects: &[RemoteBundleObject]) -> Result<()> {
+        for object in objects {
+            let bytes = object.bytes();
+            match self
+                .put_raw_if_not_exists(&object.path, bytes.clone())
+                .await
+            {
+                Ok(()) => {}
+                Err(err) if err.precondition_failed() && object.allow_existing => {}
+                Err(err) if err.precondition_failed() => {
+                    let existing = self.get_raw(&object.path).await?;
+                    if existing.as_ref() != Some(&bytes) {
+                        return Err(RemoteErr::HttpStatus {
+                            status: 412,
+                            path: object.path.clone(),
+                            message: "remote immutable object has conflicting content".to_string(),
+                        });
+                    }
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(())
     }
 
     async fn put_pack_objects(&self, pack: &RemoteObjectPack) -> Result<()> {
@@ -1308,6 +1422,110 @@ impl HttpRemote {
         Ok(HttpReceivePackResult::Published)
     }
 
+    async fn receive_bundle(
+        &self,
+        objects: &[RemoteBundleObject],
+        pack: &RemoteObjectPack,
+        ref_path: &str,
+        expected: Option<&[u8]>,
+        replacement: Bytes,
+    ) -> Result<HttpReceivePackResult> {
+        let manifest = ReceiveBundleManifest {
+            version: 1,
+            objects: objects
+                .iter()
+                .map(|object| ReceiveBundleManifestObject {
+                    path: &object.path,
+                    bytes: object.content_length,
+                    allow_existing: object.allow_existing,
+                })
+                .collect(),
+        };
+        let manifest = serde_json::to_vec(&manifest).map_err(|err| RemoteErr::HttpStatus {
+            status: 500,
+            path: ref_path.to_string(),
+            message: format!("failed to encode receive-bundle manifest: {err}"),
+        })?;
+        if manifest.len() > 16 * 1024 {
+            return Err(RemoteErr::HttpStatus {
+                status: 413,
+                path: ref_path.to_string(),
+                message: "receive-bundle manifest exceeds 16 KiB".to_string(),
+            });
+        }
+
+        let object_bytes = objects.iter().try_fold(0_usize, |total, object| {
+            total.checked_add(object.content_length)
+        });
+        let content_length = manifest
+            .len()
+            .checked_add(object_bytes.ok_or_else(|| RemoteErr::HttpStatus {
+                status: 413,
+                path: ref_path.to_string(),
+                message: "receive-bundle object length exceeds usize".to_string(),
+            })?)
+            .and_then(|length| length.checked_add(pack.pack.len()))
+            .and_then(|length| length.checked_add(pack.index.len()))
+            .ok_or_else(|| RemoteErr::HttpStatus {
+                status: 413,
+                path: ref_path.to_string(),
+                message: "receive-bundle body length exceeds usize".to_string(),
+            })?;
+        let chunks = std::iter::once(Bytes::from(manifest.clone()))
+            .chain(
+                objects
+                    .iter()
+                    .flat_map(|object| object.chunks.iter().cloned()),
+            )
+            .chain([pack.pack.clone(), pack.index.clone()])
+            .collect::<Vec<_>>();
+        let body = reqwest::Body::wrap_stream(stream::iter(
+            chunks.into_iter().map(Ok::<Bytes, std::io::Error>),
+        ));
+        let response = self
+            .send(
+                // A receive-bundle is the only mutation after the ref read in the fast path.
+                // Reuse that connection like Git smart HTTP; legacy PUTs and fallbacks retain
+                // the isolated upload pool because mixed proxy traffic previously stalled.
+                self.request(
+                    reqwest::Method::POST,
+                    self.raw_url("receive-bundle", ref_path),
+                )
+                .header(reqwest::header::CONTENT_LENGTH, content_length)
+                .header(RECEIVE_BUNDLE_HEADER_MANIFEST_BYTES, manifest.len())
+                .header(RECEIVE_PACK_HEADER_PACK_ID, &pack.id)
+                .header(RECEIVE_PACK_HEADER_PACK_BYTES, pack.pack.len())
+                .header(RECEIVE_PACK_HEADER_INDEX_BYTES, pack.index.len())
+                .header(
+                    RECEIVE_PACK_HEADER_REPLACEMENT_HEX,
+                    hex_encode(&replacement),
+                )
+                .header("x-graft-expected-present", expected.is_some().to_string())
+                .header(
+                    "x-graft-expected-hex",
+                    expected.map(hex_encode).unwrap_or_default(),
+                )
+                .body(body),
+                "receive_bundle",
+                Some(content_length as u64),
+            )
+            .await?;
+        Self::check_protocol(&response, ref_path)?;
+        match response.status().as_u16() {
+            404 | 405 => {
+                Self::drain_response(response).await?;
+                return Ok(HttpReceivePackResult::Unsupported);
+            }
+            412 => {
+                Self::drain_response(response).await?;
+                return Ok(HttpReceivePackResult::RetryIndividually);
+            }
+            _ => {}
+        }
+        Self::check_response(response, ref_path).await?;
+        Ok(HttpReceivePackResult::Published)
+    }
+
     async fn delete_raw(&self, path: &str) -> Result<()> {
         let response = self
             .send(
@@ -1673,6 +1891,162 @@ mod tests {
         assert!(request_lines[1].starts_with("PUT /org/repo/raw-if-not-exists/objects/pack/"));
         assert!(request_lines[2].starts_with("PUT /org/repo/raw-if-not-exists/objects/pack/"));
         assert!(request_lines[3].starts_with("POST /org/repo/cas/refs/heads/main "));
+    }
+
+    #[tokio::test]
+    async fn receive_bundle_publishes_extra_objects_pack_index_and_ref_in_one_request() {
+        let (url, requests) = serve_http_exchanges(&["204 No Content"]).await;
+        let remote = RemoteConfig::Http { url, token_env: None }.build().unwrap();
+        let pack_id = "c".repeat(64);
+        remote
+            .publish_object_bundle_and_ref(
+                vec![
+                    RemoteBundleObject::new(
+                        "segments/example".to_string(),
+                        [Bytes::from_static(b"segment")],
+                        true,
+                    )
+                    .unwrap(),
+                    RemoteBundleObject::new(
+                        "logs/example/commits/0000000000000001".to_string(),
+                        [Bytes::from_static(b"commit")],
+                        false,
+                    )
+                    .unwrap(),
+                ],
+                Some(RemoteObjectPack::new(
+                    pack_id,
+                    Bytes::from_static(b"pack"),
+                    Bytes::from_static(b"idx"),
+                )),
+                "refs/heads/main",
+                None,
+                "new\n",
+            )
+            .await
+            .unwrap();
+
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let headers = String::from_utf8_lossy(&requests[0]);
+        assert!(headers.starts_with("POST /org/repo/receive-bundle/refs/heads/main "));
+        let manifest_len = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case(RECEIVE_BUNDLE_HEADER_MANIFEST_BYTES)
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap();
+        let body = http_request_body(&requests[0]);
+        let manifest: serde_json::Value = serde_json::from_slice(&body[..manifest_len]).unwrap();
+        assert_eq!(manifest["objects"].as_array().unwrap().len(), 2);
+        assert_eq!(&body[manifest_len..], b"segmentcommitpackidx");
+    }
+
+    #[tokio::test]
+    async fn receive_bundle_falls_back_to_objects_then_receive_pack() {
+        let (url, requests) =
+            serve_http_exchanges(&["404 Not Found", "204 No Content", "204 No Content"]).await;
+        let remote = RemoteConfig::Http { url, token_env: None }.build().unwrap();
+        remote
+            .publish_object_bundle_and_ref(
+                vec![
+                    RemoteBundleObject::new(
+                        "segments/example".to_string(),
+                        [Bytes::from_static(b"segment")],
+                        true,
+                    )
+                    .unwrap(),
+                ],
+                Some(RemoteObjectPack::new(
+                    "d".repeat(64),
+                    Bytes::from_static(b"pack"),
+                    Bytes::from_static(b"idx"),
+                )),
+                "refs/heads/main",
+                None,
+                "new\n",
+            )
+            .await
+            .unwrap();
+
+        let request_lines = requests
+            .await
+            .unwrap()
+            .iter()
+            .map(|request| {
+                String::from_utf8_lossy(request)
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        assert!(request_lines[0].starts_with("POST /org/repo/receive-bundle/"));
+        assert!(request_lines[1].starts_with("PUT /org/repo/raw-if-not-exists/segments/example"));
+        assert!(request_lines[2].starts_with("POST /org/repo/receive-pack/"));
+    }
+
+    #[tokio::test]
+    async fn receive_bundle_reuses_the_ref_read_connection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let read = read_http_request(&mut stream).await;
+            assert!(
+                String::from_utf8_lossy(&read).starts_with("GET /org/repo/raw/refs/heads/main ")
+            );
+            stream
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nGraft-Protocol: 1\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await
+                .unwrap();
+
+            let bundle = read_http_request(&mut stream).await;
+            assert!(
+                String::from_utf8_lossy(&bundle)
+                    .starts_with("POST /org/repo/receive-bundle/refs/heads/main ")
+            );
+            stream
+                .write_all(
+                    b"HTTP/1.1 204 No Content\r\nGraft-Protocol: 1\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+        let remote = RemoteConfig::Http {
+            url: format!("http://{address}/org/repo"),
+            token_env: None,
+        }
+        .build()
+        .unwrap();
+
+        assert!(remote.get_raw("refs/heads/main").await.unwrap().is_none());
+        remote
+            .publish_object_bundle_and_ref(
+                vec![
+                    RemoteBundleObject::new(
+                        "segments/example".to_string(),
+                        [Bytes::from_static(b"segment")],
+                        true,
+                    )
+                    .unwrap(),
+                ],
+                Some(RemoteObjectPack::new(
+                    "e".repeat(64),
+                    Bytes::from_static(b"pack"),
+                    Bytes::from_static(b"idx"),
+                )),
+                "refs/heads/main",
+                None,
+                "new\n",
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
     }
 
     #[tokio::test]

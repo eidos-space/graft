@@ -13,7 +13,13 @@ action!(fetch_segment, FetchSegment);
 action!(fetch_log, FetchLog);
 action!(hydrate_snapshot, HydrateSnapshot);
 action!(remote_commit, RemoteCommit);
-action!(snapshot_push, SnapshotPush, SnapshotsPush);
+action!(
+    snapshot_push,
+    PreparedSnapshotPush,
+    SnapshotPush,
+    SnapshotsPush
+);
+pub(crate) use snapshot_push::prepare_snapshots;
 
 pub type Result<T> = std::result::Result<T, GraftErr>;
 
