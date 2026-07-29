@@ -34,6 +34,10 @@ const REMOTE_CONCURRENCY: usize = 5;
 const GRAFT_PROTOCOL_HEADER: &str = "Graft-Protocol";
 const GRAFT_PROTOCOL_VERSION: &str = "1";
 const GRAFT_REQUEST_ID_HEADER: &str = "X-Graft-Request-Id";
+const RECEIVE_PACK_HEADER_PACK_ID: &str = "x-graft-pack-id";
+const RECEIVE_PACK_HEADER_PACK_BYTES: &str = "x-graft-pack-bytes";
+const RECEIVE_PACK_HEADER_INDEX_BYTES: &str = "x-graft-index-bytes";
+const RECEIVE_PACK_HEADER_REPLACEMENT_HEX: &str = "x-graft-ref-replacement-hex";
 static HTTP_REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 enum RemotePath<'a> {
@@ -399,6 +403,32 @@ struct HttpListResponse {
     next_cursor: Option<String>,
 }
 
+#[derive(Debug)]
+pub(crate) struct RemoteObjectPack {
+    id: String,
+    pack_path: String,
+    pack: Bytes,
+    index_path: String,
+    index: Bytes,
+}
+
+impl RemoteObjectPack {
+    pub(crate) fn new(id: String, pack: Bytes, index: Bytes) -> Self {
+        Self {
+            pack_path: format!("objects/pack/{id}.pack"),
+            index_path: format!("objects/pack/{id}.idx"),
+            id,
+            pack,
+            index,
+        }
+    }
+}
+
+enum HttpReceivePackResult {
+    Published,
+    Unsupported,
+}
+
 impl Remote {
     pub(crate) fn snapshot_upload_concurrency(&self) -> usize {
         match &self.backend {
@@ -745,6 +775,45 @@ impl Remote {
             Err(err) if err.is_not_found() => Ok(()),
             Err(err) => Err(err),
         }
+    }
+
+    pub(crate) async fn publish_object_pack_and_ref(
+        &self,
+        pack: Option<RemoteObjectPack>,
+        ref_path: &str,
+        expected: Option<&[u8]>,
+        replacement: impl Into<Bytes>,
+    ) -> Result<()> {
+        let replacement = replacement.into();
+        if let (RemoteBackend::Http(remote), Some(pack)) = (&self.backend, pack.as_ref()) {
+            match remote
+                .receive_pack(pack, ref_path, expected, replacement.clone())
+                .await?
+            {
+                HttpReceivePackResult::Published => return Ok(()),
+                HttpReceivePackResult::Unsupported => {}
+            }
+        }
+
+        if let Some(pack) = pack.as_ref() {
+            self.put_pack_objects(pack).await?;
+        }
+        self.compare_and_swap_raw(ref_path, expected, replacement)
+            .await
+    }
+
+    async fn put_pack_objects(&self, pack: &RemoteObjectPack) -> Result<()> {
+        for (path, bytes) in [
+            (&pack.pack_path, pack.pack.clone()),
+            (&pack.index_path, pack.index.clone()),
+        ] {
+            match self.put_raw_if_not_exists(path, bytes).await {
+                Ok(()) => {}
+                Err(err) if err.precondition_failed() => {}
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(())
     }
 
     #[tracing::instrument(level = "trace", err(level = "debug"), skip(self, expected))]
@@ -1185,6 +1254,60 @@ impl HttpRemote {
         Ok(())
     }
 
+    async fn receive_pack(
+        &self,
+        pack: &RemoteObjectPack,
+        ref_path: &str,
+        expected: Option<&[u8]>,
+        replacement: Bytes,
+    ) -> Result<HttpReceivePackResult> {
+        let content_length = pack
+            .pack
+            .len()
+            .checked_add(pack.index.len())
+            .ok_or_else(|| RemoteErr::HttpStatus {
+                status: 413,
+                path: ref_path.to_string(),
+                message: "receive-pack body length exceeds usize".to_string(),
+            })?;
+        let body = reqwest::Body::wrap_stream(stream::iter(
+            [pack.pack.clone(), pack.index.clone()]
+                .into_iter()
+                .map(Ok::<Bytes, std::io::Error>),
+        ));
+        let response = self
+            .send(
+                self.upload_request(
+                    reqwest::Method::POST,
+                    self.raw_url("receive-pack", ref_path),
+                )
+                .header(reqwest::header::CONTENT_LENGTH, content_length)
+                .header(RECEIVE_PACK_HEADER_PACK_ID, &pack.id)
+                .header(RECEIVE_PACK_HEADER_PACK_BYTES, pack.pack.len())
+                .header(RECEIVE_PACK_HEADER_INDEX_BYTES, pack.index.len())
+                .header(
+                    RECEIVE_PACK_HEADER_REPLACEMENT_HEX,
+                    hex_encode(&replacement),
+                )
+                .header("x-graft-expected-present", expected.is_some().to_string())
+                .header(
+                    "x-graft-expected-hex",
+                    expected.map(hex_encode).unwrap_or_default(),
+                )
+                .body(body),
+                "receive_pack",
+                Some(content_length as u64),
+            )
+            .await?;
+        Self::check_protocol(&response, ref_path)?;
+        if matches!(response.status().as_u16(), 404 | 405) {
+            Self::drain_response(response).await?;
+            return Ok(HttpReceivePackResult::Unsupported);
+        }
+        Self::check_response(response, ref_path).await?;
+        Ok(HttpReceivePackResult::Published)
+    }
+
     async fn delete_raw(&self, path: &str) -> Result<()> {
         let response = self
             .send(
@@ -1409,6 +1532,147 @@ mod tests {
             String::from_utf8(request).unwrap()
         });
         (format!("http://{address}/org/repo"), task)
+    }
+
+    async fn serve_http_exchanges(
+        statuses: &[&str],
+    ) -> (String, tokio::task::JoinHandle<Vec<Vec<u8>>>) {
+        let statuses = statuses.iter().map(ToString::to_string).collect::<Vec<_>>();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let mut requests = Vec::with_capacity(statuses.len());
+            for status in statuses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                requests.push(read_http_request(&mut stream).await);
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nGraft-Protocol: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+            requests
+        });
+        (format!("http://{address}/org/repo"), task)
+    }
+
+    async fn read_http_request(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let mut request = Vec::new();
+        let mut request_bytes = None;
+        loop {
+            let mut buffer = [0_u8; 4096];
+            let read = stream.read(&mut buffer).await.unwrap();
+            if read == 0 {
+                return request;
+            }
+            request.extend_from_slice(&buffer[..read]);
+            if request_bytes.is_none()
+                && let Some(header_end) =
+                    request.windows(4).position(|window| window == b"\r\n\r\n")
+            {
+                let header_bytes = header_end + 4;
+                request_bytes = Some(header_bytes + http_content_length(&request[..header_bytes]));
+            }
+            if request_bytes.is_some_and(|expected| request.len() >= expected) {
+                return request;
+            }
+        }
+    }
+
+    fn http_content_length(headers: &[u8]) -> usize {
+        String::from_utf8_lossy(headers)
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap_or(0)
+    }
+
+    fn http_request_body(request: &[u8]) -> &[u8] {
+        let header_end = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .unwrap();
+        &request[header_end + 4..]
+    }
+
+    #[tokio::test]
+    async fn receive_pack_publishes_pack_index_and_ref_in_one_request() {
+        let (url, requests) = serve_http_exchanges(&["204 No Content"]).await;
+        let remote = RemoteConfig::Http { url, token_env: None }.build().unwrap();
+        let pack_id = "a".repeat(64);
+        remote
+            .publish_object_pack_and_ref(
+                Some(RemoteObjectPack::new(
+                    pack_id.clone(),
+                    Bytes::from_static(b"pack"),
+                    Bytes::from_static(b"idx"),
+                )),
+                "refs/heads/main",
+                None,
+                "new\n",
+            )
+            .await
+            .unwrap();
+
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let headers = String::from_utf8_lossy(&requests[0]);
+        assert!(headers.starts_with("POST /org/repo/receive-pack/refs/heads/main "));
+        assert!(
+            headers
+                .lines()
+                .any(|line| { line.eq_ignore_ascii_case(&format!("x-graft-pack-id: {pack_id}")) })
+        );
+        assert!(
+            headers
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("content-length: 7"))
+        );
+        assert_eq!(http_request_body(&requests[0]), b"packidx");
+    }
+
+    #[tokio::test]
+    async fn receive_pack_falls_back_to_v1_object_and_cas_requests() {
+        let (url, requests) = serve_http_exchanges(&[
+            "404 Not Found",
+            "204 No Content",
+            "204 No Content",
+            "204 No Content",
+        ])
+        .await;
+        let remote = RemoteConfig::Http { url, token_env: None }.build().unwrap();
+        let pack_id = "b".repeat(64);
+        remote
+            .publish_object_pack_and_ref(
+                Some(RemoteObjectPack::new(
+                    pack_id,
+                    Bytes::from_static(b"pack"),
+                    Bytes::from_static(b"idx"),
+                )),
+                "refs/heads/main",
+                None,
+                "new\n",
+            )
+            .await
+            .unwrap();
+
+        let requests = requests.await.unwrap();
+        let request_lines = requests
+            .iter()
+            .map(|request| {
+                String::from_utf8_lossy(request)
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        assert!(request_lines[0].starts_with("POST /org/repo/receive-pack/"));
+        assert!(request_lines[1].starts_with("PUT /org/repo/raw-if-not-exists/objects/pack/"));
+        assert!(request_lines[2].starts_with("PUT /org/repo/raw-if-not-exists/objects/pack/"));
+        assert!(request_lines[3].starts_with("POST /org/repo/cas/refs/heads/main "));
     }
 
     #[tokio::test]

@@ -186,7 +186,7 @@ impl Repository {
         remote: &crate::remote::Remote,
         head: &str,
         stop_at: Option<&str>,
-    ) -> Result<usize> {
+    ) -> Result<PreparedObjectPush> {
         let negotiation_trace = crate::trace::PushTraceSpan::new("object_negotiation");
         let remote_objects = if stop_at.is_some() {
             BTreeSet::new()
@@ -259,10 +259,10 @@ impl Repository {
         let large_file_trace = crate::trace::PushTraceSpan::new("large_file_upload");
         self.push_large_file_contents(remote, external_payloads)?;
         large_file_trace.finish(&[("objects", external_count), ("bytes", external_bytes)]);
-        let pack_trace = crate::trace::PushTraceSpan::new("object_pack_upload");
-        self.push_object_pack(remote, objects)?;
+        let pack_trace = crate::trace::PushTraceSpan::new("object_pack_build");
+        let pack = self.prepare_object_pack(objects)?;
         pack_trace.finish(&[("objects", object_count)]);
-        Ok(count)
+        Ok(PreparedObjectPush { commits: count, pack })
     }
 
     pub(super) fn commit_ancestors_inclusive(&self, head: &str) -> Result<BTreeSet<String>> {
@@ -364,13 +364,12 @@ impl Repository {
         Ok(())
     }
 
-    pub(super) fn push_object_pack(
+    pub(super) fn prepare_object_pack(
         &self,
-        remote: &crate::remote::Remote,
         objects: BTreeMap<object::ObjectId, Vec<u8>>,
-    ) -> Result<()> {
+    ) -> Result<Option<crate::remote::RemoteObjectPack>> {
         if objects.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
 
         let mut pack = REMOTE_OBJECT_PACK_MAGIC.to_vec();
@@ -396,17 +395,11 @@ impl Repository {
                 message: format!("failed to encode pack index: {err}"),
             })?;
 
-        match block_on_remote(remote.put_raw_if_not_exists(&pack_path, pack)) {
-            Ok(()) => {}
-            Err(RepoErr::Remote(err)) if err.precondition_failed() => {}
-            Err(err) => return Err(err),
-        }
-        match block_on_remote(remote.put_raw_if_not_exists(&index_path, index_bytes)) {
-            Ok(()) => {}
-            Err(RepoErr::Remote(err)) if err.precondition_failed() => {}
-            Err(err) => return Err(err),
-        }
-        Ok(())
+        Ok(Some(crate::remote::RemoteObjectPack::new(
+            pack_id,
+            Bytes::from(pack),
+            Bytes::from(index_bytes),
+        )))
     }
 
     pub(super) fn fetch_object_graph(
@@ -605,4 +598,9 @@ impl Repository {
         }
         Ok(files)
     }
+}
+
+pub(super) struct PreparedObjectPush {
+    pub(super) commits: usize,
+    pub(super) pack: Option<crate::remote::RemoteObjectPack>,
 }
