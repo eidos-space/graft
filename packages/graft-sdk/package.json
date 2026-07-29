@@ -38,6 +38,7 @@
     "build:native": "./scripts/build-native.sh",
     "test": "node --test test/*.test.js",
     "bench": "node benchmark/cli-vs-sdk.mjs",
+    "bench:large": "node benchmark/large-repository.mjs",
     "bench:push": "node benchmark/push.mjs",
     "release:create-packages": "napi create-npm-dirs --npm-dir npm",
     "release:collect": "napi artifacts --output-dir artifacts --npm-dir npm",
