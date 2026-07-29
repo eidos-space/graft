@@ -77,6 +77,7 @@ ACL 存储不属于本协议。
     "list",
     "put-if-absent",
     "receive-pack",
+    "receive-bundle",
     "cas",
     "cad"
   ]
@@ -112,17 +113,18 @@ encoding 必须被拒绝。服务可以公布 key/body 限制，并在超限时�
 
 下表 path 都相对于 `{base}`：
 
-| Request                        | 用途                                  | 成功状态         |
-| ------------------------------ | ------------------------------------- | ---------------- |
-| `HEAD /raw/<key>`              | 检查存在性和大小。                    | `200 OK`         |
-| `GET /raw/<key>`               | 读取原始字节。                        | `200 OK`         |
-| `PUT /raw/<key>`               | 替换事务元数据。                      | `204 No Content` |
-| `DELETE /raw/<key>`            | 删除事务元数据。                      | `204 No Content` |
-| `PUT /raw-if-not-exists/<key>` | 仅当对象不存在时创建。                | `204 No Content` |
-| `POST /receive-pack/<ref-key>` | 发布一个 object pack 并原子更新 ref。 | `204 No Content` |
-| `POST /cas/<key>`              | 原子 compare-and-swap。               | `204 No Content` |
-| `POST /cad/<key>`              | 原子 compare-and-delete。             | `204 No Content` |
-| `GET /list?prefix=<prefix>`    | 递归列举 key。                        | `200 OK`         |
+| Request                          | 用途                                  | 成功状态         |
+| -------------------------------- | ------------------------------------- | ---------------- |
+| `HEAD /raw/<key>`                | 检查存在性和大小。                    | `200 OK`         |
+| `GET /raw/<key>`                 | 读取原始字节。                        | `200 OK`         |
+| `PUT /raw/<key>`                 | 替换事务元数据。                      | `204 No Content` |
+| `DELETE /raw/<key>`              | 删除事务元数据。                      | `204 No Content` |
+| `PUT /raw-if-not-exists/<key>`   | 仅当对象不存在时创建。                | `204 No Content` |
+| `POST /receive-pack/<ref-key>`   | 发布一个 object pack 并原子更新 ref。 | `204 No Content` |
+| `POST /receive-bundle/<ref-key>` | 发布不可变对象、pack 并原子更新 ref。 | `204 No Content` |
+| `POST /cas/<key>`                | 原子 compare-and-swap。               | `204 No Content` |
+| `POST /cad/<key>`                | 原子 compare-and-delete。             | `204 No Content` |
+| `GET /list?prefix=<prefix>`      | 递归列举 key。                        | `200 OK`         |
 
 `PUT` 和 `POST /cas` 的 body 是新的原始字节，应该使用
 `application/octet-stream`。mutation 成功响应没有 body。
@@ -159,6 +161,41 @@ expected-value 规则与 `/cas` 相同。不匹配时返回 `409`，且可以留
 对象。服务通过 descriptor 中的 `receive-pack` capability 声明支持。面对不支持该
 可选操作并返回 `404`/`405` 的服务，client 必须回退到独立的
 `raw-if-not-exists` 加 `/cas` 流程。
+
+## Receive Bundle
+
+`receive-bundle` 是 version 1 的可选 capability，在 `receive-pack` 之外还可携带
+pack 引用的不可变对象，例如 SQLite segment、SQLite storage commit 和外部文件
+payload。它使用全部 `receive-pack` header，并增加：
+
+```http
+x-graft-bundle-manifest-bytes: <manifest 的十进制字节数>
+```
+
+body 依次包含 UTF-8 JSON manifest、manifest 顺序声明的每个对象、pack 和 index。
+manifest 结构如下：
+
+```json
+{
+  "version": 1,
+  "objects": [
+    { "path": "segments/example", "bytes": 4096, "allow_existing": true },
+    {
+      "path": "logs/example/commits/0000000000000001",
+      "bytes": 128,
+      "allow_existing": false
+    }
+  ]
+}
+```
+
+每个 path 必须是不可变 repository key，且最多出现一次。`Content-Length` 必须等于
+manifest、全部对象、pack 和 index 的长度之和。服务必须按 manifest 顺序创建对象，
+再创建 pack 和 index，最后执行 ref CAS。body 非法、截断或含多余字节时不得更新 ref。
+
+`allow_existing: true` 把已有对象视为幂等成功；`false` 则返回 `412`，让 client
+通过独立的 version 1 路径读取并校验冲突后再重试发布。`receive-bundle` 返回 `404`
+或 `405` 时，client 必须回退到逐个不可变对象写入，再调用 `receive-pack` 或 `/cas`。
 
 ## Compare 操作
 
