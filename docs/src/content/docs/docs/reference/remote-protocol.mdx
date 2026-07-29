@@ -86,7 +86,14 @@ issuance, tenancy, and ACL storage are service concerns outside this protocol.
 {
   "protocol": "graft-remote",
   "version": 1,
-  "capabilities": ["range", "list", "put-if-absent", "cas", "cad"]
+  "capabilities": [
+    "range",
+    "list",
+    "put-if-absent",
+    "receive-pack",
+    "cas",
+    "cad"
+  ]
 }
 ```
 
@@ -123,16 +130,17 @@ or `414` when they are exceeded.
 
 All paths below are relative to `{base}`.
 
-| Request | Purpose | Success |
-| --- | --- | --- |
-| `HEAD /raw/<key>` | Test existence and obtain size metadata. | `200 OK` |
-| `GET /raw/<key>` | Read raw bytes. | `200 OK` |
-| `PUT /raw/<key>` | Replace transactional metadata. | `204 No Content` |
-| `DELETE /raw/<key>` | Delete transactional metadata. | `204 No Content` |
-| `PUT /raw-if-not-exists/<key>` | Create an object only when absent. | `204 No Content` |
-| `POST /cas/<key>` | Atomically compare and replace metadata. | `204 No Content` |
-| `POST /cad/<key>` | Atomically compare and delete metadata. | `204 No Content` |
-| `GET /list?prefix=<prefix>` | Recursively list matching keys. | `200 OK` |
+| Request                        | Purpose                                              | Success          |
+| ------------------------------ | ---------------------------------------------------- | ---------------- |
+| `HEAD /raw/<key>`              | Test existence and obtain size metadata.             | `200 OK`         |
+| `GET /raw/<key>`               | Read raw bytes.                                      | `200 OK`         |
+| `PUT /raw/<key>`               | Replace transactional metadata.                      | `204 No Content` |
+| `DELETE /raw/<key>`            | Delete transactional metadata.                       | `204 No Content` |
+| `PUT /raw-if-not-exists/<key>` | Create an object only when absent.                   | `204 No Content` |
+| `POST /receive-pack/<ref-key>` | Publish one object pack and atomically update a ref. | `204 No Content` |
+| `POST /cas/<key>`              | Atomically compare and replace metadata.             | `204 No Content` |
+| `POST /cad/<key>`              | Atomically compare and delete metadata.              | `204 No Content` |
+| `GET /list?prefix=<prefix>`    | Recursively list matching keys.                      | `200 OK`         |
 
 Request bodies for `PUT` and `POST /cas` are the new raw bytes and SHOULD use
 `application/octet-stream`. Successful mutation responses have no body.
@@ -147,6 +155,36 @@ objects but cannot expose an incomplete commit.
 
 Deleting an already absent key through `DELETE /raw` SHOULD succeed so the
 operation remains idempotent.
+
+## Receive Pack
+
+`receive-pack` is an optional version 1 capability that collapses pack upload,
+index upload, and the final ref CAS into one authenticated request. The request
+is:
+
+```http
+POST /receive-pack/refs/heads/main
+Content-Length: <pack-bytes + index-bytes>
+x-graft-pack-id: <64 lowercase hexadecimal characters>
+x-graft-pack-bytes: <decimal byte length>
+x-graft-index-bytes: <decimal byte length>
+x-graft-ref-replacement-hex: <lowercase hexadecimal ref bytes>
+x-graft-expected-present: true
+x-graft-expected-hex: <lowercase hexadecimal expected ref bytes>
+```
+
+The body is the exact pack bytes immediately followed by the exact index bytes.
+`Content-Length` MUST equal the sum of the two declared lengths. The service
+MUST stream and create the pack at `objects/pack/<pack-id>.pack`, then stream and
+create the index at `objects/pack/<pack-id>.idx`, and only then perform the ref
+CAS. Existing immutable pack or index objects are treated as an idempotent
+success. A malformed or truncated body MUST NOT update the ref.
+
+The expected-value rules are identical to `/cas`. A mismatch returns `409` and
+MAY leave unreachable immutable objects. Services advertise support with the
+`receive-pack` descriptor capability. Clients MUST preserve the individual
+`raw-if-not-exists` plus `/cas` sequence as a fallback for services that return
+`404` or `405` for this optional operation.
 
 ## Compare Operations
 
@@ -190,10 +228,7 @@ is sent as `refs%2Fheads%2F`. A response page is JSON:
 
 ```json
 {
-  "paths": [
-    "refs/heads/feature/search",
-    "refs/heads/main"
-  ],
+  "paths": ["refs/heads/feature/search", "refs/heads/main"],
   "next_cursor": "opaque-service-value"
 }
 ```
@@ -220,23 +255,23 @@ forward progress and SHOULD expire only after a documented interval.
 
 ## Status Codes
 
-| Status | Meaning |
-| --- | --- |
-| `200` | Complete read, descriptor, `HEAD`, or list response. |
-| `204` | Successful mutation. |
-| `206` | Successful byte-range read. |
-| `400` | Malformed path, query, header, or request. |
-| `401` / `403` | Missing credentials or insufficient authorization. |
-| `404` | Repository or object is missing. |
-| `405` | The operation is not allowed for that key. |
-| `409` | CAS or CAD expected bytes did not match. |
-| `412` | `raw-if-not-exists` found an existing object. |
-| `413` / `414` | Service body or key limit exceeded. |
-| `416` | Invalid or unsatisfiable byte range. |
-| `423` | Optional transient lock contention in a locking implementation. |
-| `426` | Unsupported `Graft-Protocol` version. |
-| `429` | Service rate limit; clients may retry with backoff. |
-| `500` / `503` | Server failure or unavailable service configuration. |
+| Status        | Meaning                                                         |
+| ------------- | --------------------------------------------------------------- |
+| `200`         | Complete read, descriptor, `HEAD`, or list response.            |
+| `204`         | Successful mutation.                                            |
+| `206`         | Successful byte-range read.                                     |
+| `400`         | Malformed path, query, header, or request.                      |
+| `401` / `403` | Missing credentials or insufficient authorization.              |
+| `404`         | Repository or object is missing.                                |
+| `405`         | The operation is not allowed for that key.                      |
+| `409`         | CAS or CAD expected bytes did not match.                        |
+| `412`         | `raw-if-not-exists` found an existing object.                   |
+| `413` / `414` | Service body or key limit exceeded.                             |
+| `416`         | Invalid or unsatisfiable byte range.                            |
+| `423`         | Optional transient lock contention in a locking implementation. |
+| `426`         | Unsupported `Graft-Protocol` version.                           |
+| `429`         | Service rate limit; clients may retry with backoff.             |
+| `500` / `503` | Server failure or unavailable service configuration.            |
 
 `409` and `412` are intentionally different: clients interpret `409` as a
 concurrent ref change and `412` as a create-only collision.

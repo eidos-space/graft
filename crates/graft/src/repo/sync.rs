@@ -313,13 +313,17 @@ impl Repository {
             });
         }
 
-        let commits = self.push_commit_chain(&remote_store, &head, remote_head.as_deref())?;
+        let prepared = self.push_commit_chain(&remote_store, &head, remote_head.as_deref())?;
         let head_path = format!("refs/heads/{remote_branch}");
-        match block_on_remote(remote_store.compare_and_swap_raw(
+        let publication_trace = crate::trace::PushTraceSpan::new("remote_publication");
+        let publication = block_on_remote(remote_store.publish_object_pack_and_ref(
+            prepared.pack,
             &head_path,
             remote_head_raw.as_deref(),
             format!("{head}\n"),
-        )) {
+        ));
+        publication_trace.finish(&[]);
+        match publication {
             Ok(()) => {}
             Err(RepoErr::Remote(RemoteErr::CompareAndSwap { .. } | RemoteErr::LockBusy { .. })) => {
                 return Err(RepoErr::RemoteRefChanged {
@@ -339,7 +343,7 @@ impl Repository {
             local_branch: local_branch.to_string(),
             remote_branch: remote_branch.to_string(),
             head,
-            commits,
+            commits: prepared.commits,
             forced: force,
             deleted: false,
         })
