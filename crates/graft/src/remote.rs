@@ -1484,7 +1484,10 @@ impl HttpRemote {
         ));
         let response = self
             .send(
-                self.upload_request(
+                // A receive-bundle is the only mutation after the ref read in the fast path.
+                // Reuse that connection like Git smart HTTP; legacy PUTs and fallbacks retain
+                // the isolated upload pool because mixed proxy traffic previously stalled.
+                self.request(
                     reqwest::Method::POST,
                     self.raw_url("receive-bundle", ref_path),
                 )
@@ -1983,6 +1986,67 @@ mod tests {
         assert!(request_lines[0].starts_with("POST /org/repo/receive-bundle/"));
         assert!(request_lines[1].starts_with("PUT /org/repo/raw-if-not-exists/segments/example"));
         assert!(request_lines[2].starts_with("POST /org/repo/receive-pack/"));
+    }
+
+    #[tokio::test]
+    async fn receive_bundle_reuses_the_ref_read_connection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let read = read_http_request(&mut stream).await;
+            assert!(
+                String::from_utf8_lossy(&read).starts_with("GET /org/repo/raw/refs/heads/main ")
+            );
+            stream
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nGraft-Protocol: 1\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await
+                .unwrap();
+
+            let bundle = read_http_request(&mut stream).await;
+            assert!(
+                String::from_utf8_lossy(&bundle)
+                    .starts_with("POST /org/repo/receive-bundle/refs/heads/main ")
+            );
+            stream
+                .write_all(
+                    b"HTTP/1.1 204 No Content\r\nGraft-Protocol: 1\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+        let remote = RemoteConfig::Http {
+            url: format!("http://{address}/org/repo"),
+            token_env: None,
+        }
+        .build()
+        .unwrap();
+
+        assert!(remote.get_raw("refs/heads/main").await.unwrap().is_none());
+        remote
+            .publish_object_bundle_and_ref(
+                vec![
+                    RemoteBundleObject::new(
+                        "segments/example".to_string(),
+                        [Bytes::from_static(b"segment")],
+                        true,
+                    )
+                    .unwrap(),
+                ],
+                Some(RemoteObjectPack::new(
+                    "e".repeat(64),
+                    Bytes::from_static(b"pack"),
+                    Bytes::from_static(b"idx"),
+                )),
+                "refs/heads/main",
+                None,
+                "new\n",
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
     }
 
     #[tokio::test]
