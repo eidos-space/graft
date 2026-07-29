@@ -2,7 +2,8 @@ use std::{path::PathBuf, sync::Arc};
 
 use graft_sdk::{
     CancellationToken, CommitChangedPathsOptions as CoreCommitChangedPathsOptions,
-    DiffOptions as CoreDiffOptions, DiffPathsOptions as CoreDiffPathsOptions, InventoryKind,
+    DiffOptions as CoreDiffOptions, DiffPathsOptions as CoreDiffPathsOptions,
+    IgnoredPathsOptions as CoreIgnoredPathsOptions, InventoryKind,
     InventoryOptions as CoreInventoryOptions, RemoteConfigureOptions as CoreRemoteConfigureOptions,
     RepositoryOperation, RepositorySession as CoreRepositorySession,
     RestoreOptions as CoreRestoreOptions, RestorePathsOptions as CoreRestorePathsOptions, SdkError,
@@ -79,6 +80,11 @@ pub struct InventoryOptions {
 }
 
 #[napi(object)]
+pub struct IgnoredPathsOptions {
+    pub paths: Vec<String>,
+}
+
+#[napi(object)]
 pub struct RemoteConfigureOptions {
     pub name: String,
     pub url: String,
@@ -130,6 +136,9 @@ enum JsonOperation {
     },
     IsIgnoredPath {
         path: PathBuf,
+    },
+    IsIgnoredPaths {
+        options: CoreIgnoredPathsOptions,
     },
     Inventory {
         options: CoreInventoryOptions,
@@ -230,6 +239,11 @@ impl JsonTask {
             return serde_json::to_string(&value)
                 .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
         }
+        if let JsonOperation::IsIgnoredPaths { options } = &self.operation {
+            let value = self.session.is_ignored_paths(options).map_err(napi_error)?;
+            return serde_json::to_string(&value)
+                .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
+        }
         if let JsonOperation::Inventory { options } = &self.operation {
             let value = self.session.inventory(options).map_err(napi_error)?;
             return serde_json::to_string(&value)
@@ -261,7 +275,9 @@ impl JsonTask {
             JsonOperation::CommitChangedPaths { .. } => {
                 unreachable!("handled before JSON value dispatch")
             }
-            JsonOperation::IsIgnoredPath { .. } | JsonOperation::Inventory { .. } => {
+            JsonOperation::IsIgnoredPath { .. }
+            | JsonOperation::IsIgnoredPaths { .. }
+            | JsonOperation::Inventory { .. } => {
                 unreachable!("handled before JSON value dispatch")
             }
             JsonOperation::Restore { options } => self.session.restore(options),
@@ -549,6 +565,23 @@ impl NodeRepositorySession {
     }
 
     #[napi]
+    pub fn is_ignored_paths(
+        &self,
+        options: IgnoredPathsOptions,
+        signal: Option<AbortSignal>,
+    ) -> AsyncTask<JsonTask> {
+        json_task(
+            self,
+            JsonOperation::IsIgnoredPaths {
+                options: CoreIgnoredPathsOptions {
+                    paths: options.paths.into_iter().map(PathBuf::from).collect(),
+                },
+            },
+            signal,
+        )
+    }
+
+    #[napi]
     pub fn inventory(
         &self,
         options: Option<InventoryOptions>,
@@ -706,6 +739,7 @@ pub fn operation_materializes_worktree(operation: String) -> Result<bool> {
         "commit_details" | "commitDetails" => RepositoryOperation::CommitDetails,
         "commit_changed_paths" | "commitChangedPaths" => RepositoryOperation::CommitChangedPaths,
         "is_ignored_path" | "isIgnoredPath" => RepositoryOperation::IsIgnoredPath,
+        "is_ignored_paths" | "isIgnoredPaths" => RepositoryOperation::IsIgnoredPaths,
         "inventory" => RepositoryOperation::Inventory,
         "restore" => RepositoryOperation::Restore,
         "restore_paths" | "restorePaths" => RepositoryOperation::RestorePaths,

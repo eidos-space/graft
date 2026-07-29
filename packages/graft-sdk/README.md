@@ -135,6 +135,7 @@ files in the Space. Changes confined to `.graft` are not counted.
 | `commitDetails` | Lazily hydrate one full commit | No |
 | `commitChangedPaths` | Lazily page one commit's first-parent changed paths (up to 100) | No |
 | `isIgnoredPath` | Apply nested `.gitignore` / `.graftignore` semantics | No |
+| `isIgnoredPaths` | Apply shared ignore/index caches to up to 1,000 file or directory paths | No |
 | `inventory` | Page tracked, untracked, ignored, or tracked-and-ignored paths | No |
 | `restore` | Replace selected paths from a revision | **Yes** |
 | `restorePaths` | Restore up to 1,000 explicit paths in one serialized SDK call | **Yes** |
@@ -224,6 +225,17 @@ repository result. The operation removes only index entries: physical files are 
 replaced, `materializes_worktree` is `false`, and files covered by ignore rules remain ignored by
 later `addAll` calls. The SDK never performs this migration implicitly.
 
+Explorer-style callers should send up to 1,000 visible entries in one
+`isIgnoredPaths({ paths, signal })` call instead of serializing one native task per entry. Each
+result includes `is_directory` and `has_tracked_descendants`. An ignored directory with tracked
+descendants must remain traversable so the host can expose and migrate those tracked files; an
+ignored directory without tracked descendants may be pruned. The batch preserves request order.
+
+The retained session caches the tracked index, compiled nested ignore rules, and the complete
+`tracked_ignored` classification. Ignore-source metadata invalidates the matcher and inventory when
+a loaded `.gitignore` or `.graftignore` changes. `inventory.telemetry` reports separate inventory,
+index, and matcher cache hits; a hot cached page examines zero tracked paths.
+
 Telemetry contains only durations, counts, and cache/object-read facts. It never contains bearer
 tokens or absolute user paths.
 
@@ -231,11 +243,11 @@ tokens or absolute user paths.
 
 Every asynchronous method accepts `{ signal }`. Aborting still cancels queued Node/libuv work and
 also flips a cooperative token for work already running. Status, diff, history, changed-path
-hydration, stage, untrack, restore, inventory, tree hydration, and SQLite page loops check that
-token. Cancellation rejects with an `AbortError`; the retained session remains open and usable. A
-cancelled multi-path mutation can leave a completed prefix, but every individual index write or
-worktree replacement remains valid. Call status before retrying. `close()` keeps its existing
-contract: it waits for the in-flight operation and does not implicitly cancel it.
+hydration, batch ignore queries, stage, untrack, restore, inventory, tree hydration, and SQLite page
+loops check that token. Cancellation rejects with an `AbortError`; the retained session remains
+open and usable. A cancelled multi-path mutation can leave a completed prefix, but every individual
+index write or worktree replacement remains valid. Call status before retrying. `close()` keeps its
+existing contract: it waits for the in-flight operation and does not implicitly cancel it.
 
 Repository conflicts and command results retain Graft's existing JSON schema. The binding
 stabilizes transport/lifecycle failures as `GraftSdkError` with codes such as:

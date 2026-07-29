@@ -34,6 +34,7 @@ const MAX_DIFF_PATH_PAGE_SIZE: usize = 100;
 const MAX_DIFF_PATH_REQUEST_SIZE: usize = 10_000;
 const MAX_BATCH_MUTATION_PATHS: usize = 1_000;
 const MAX_INVENTORY_PAGE_SIZE: usize = 1_000;
+const MAX_IGNORE_QUERY_PATHS: usize = 1_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -198,6 +199,9 @@ pub struct InventoryTelemetry {
     pub duration_us: u64,
     pub paths_examined: usize,
     pub items_returned: usize,
+    pub inventory_cache_hit: bool,
+    pub index_cache_hit: bool,
+    pub ignore_matcher_cache_hit: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -216,6 +220,27 @@ pub struct IgnoredPathResult {
     pub path: String,
     pub is_ignored: bool,
     pub is_tracked: bool,
+    pub is_directory: bool,
+    pub has_tracked_descendants: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct IgnoredPathsOptions {
+    pub paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IgnoredPathsTelemetry {
+    pub duration_us: u64,
+    pub paths_examined: usize,
+    pub index_cache_hit: bool,
+    pub ignore_matcher_cache_hit: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IgnoredPathsResult {
+    pub paths: Vec<IgnoredPathResult>,
+    pub telemetry: IgnoredPathsTelemetry,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -235,6 +260,7 @@ pub enum RepositoryOperation {
     CommitDetails,
     CommitChangedPaths,
     IsIgnoredPath,
+    IsIgnoredPaths,
     Inventory,
     Restore,
     RestorePaths,
@@ -379,6 +405,7 @@ struct TrackedFingerprint {
 #[derive(Default)]
 struct IncrementalStatusCache {
     initialized: bool,
+    index_metadata_initialized: bool,
     head_target: Option<String>,
     index: Index,
     files: BTreeMap<String, CommitFileState>,
@@ -387,6 +414,8 @@ struct IncrementalStatusCache {
     untracked_fingerprints: BTreeMap<String, FileFingerprint>,
     status: Option<RepoStatus>,
     generation: u64,
+    ignore_matcher: Option<graft::repo::RepoIgnoreMatcher>,
+    tracked_ignored_paths: Option<Vec<String>>,
 }
 
 impl IncrementalStatusCache {
@@ -865,20 +894,57 @@ impl RepositorySession {
 
     /// Evaluates one path with Graft's nested `.gitignore` and `.graftignore` semantics.
     pub fn is_ignored_path(&self, path: &Path) -> Result<IgnoredPathResult> {
-        let key = normalize_requested_path(path)?;
-        self.with_service(|service| {
+        self.is_ignored_paths(&IgnoredPathsOptions { paths: vec![path.to_path_buf()] })?
+            .paths
+            .into_iter()
+            .next()
+            .ok_or_else(|| invalid_argument("ignore path query must not be empty"))
+    }
+
+    /// Evaluates a bounded path collection with shared ignore and tracked-index caches.
+    pub fn is_ignored_paths(&self, options: &IgnoredPathsOptions) -> Result<IgnoredPathsResult> {
+        let paths = normalize_ignore_query_paths(&options.paths)?;
+        let started = Instant::now();
+        self.with_state(|state| {
+            let SessionState { service, status_cache } = state;
+            let service = service.as_mut().ok_or_else(session_closed_error)?;
+            let index_cache_hit = ensure_index_metadata(service, status_cache)?;
             let repo = service.repository().map_err(repository_command_error)?;
-            let mut matcher = repo.ignore_matcher().map_err(repo_error)?;
-            let physical = repo.worktree().join(&key);
-            let is_dir =
-                fs::symlink_metadata(&physical).is_ok_and(|metadata| metadata.file_type().is_dir());
-            let is_ignored = matcher.is_ignored(&key, is_dir).map_err(repo_error)?;
-            let is_tracked = repo.index_files().map_err(repo_error)?.contains_key(&key)
-                || repo
-                    .index_artifacts()
-                    .map_err(repo_error)?
-                    .contains_key(&key);
-            Ok(IgnoredPathResult { path: key, is_ignored, is_tracked })
+            let ignore_matcher_cache_hit = ensure_ignore_matcher(&repo, status_cache)?;
+            let files = &status_cache.files;
+            let artifacts = &status_cache.artifacts;
+            let matcher = status_cache
+                .ignore_matcher
+                .as_mut()
+                .expect("ignore matcher cache was initialized");
+            let mut results = Vec::with_capacity(paths.len());
+            for path in paths {
+                graft::repo::cancellation_checkpoint().map_err(repo_error)?;
+                let has_tracked_descendants =
+                    cached_path_has_tracked_descendants(files, artifacts, &path);
+                let is_directory = has_tracked_descendants
+                    || fs::symlink_metadata(repo.worktree().join(&path))
+                        .is_ok_and(|metadata| metadata.file_type().is_dir());
+                results.push(IgnoredPathResult {
+                    is_ignored: matcher
+                        .is_ignored(&path, is_directory)
+                        .map_err(repo_error)?,
+                    is_tracked: cached_path_is_tracked(files, artifacts, &path),
+                    is_directory,
+                    has_tracked_descendants,
+                    path,
+                });
+            }
+            let paths_examined = results.len();
+            Ok(IgnoredPathsResult {
+                paths: results,
+                telemetry: IgnoredPathsTelemetry {
+                    duration_us: elapsed_us(started),
+                    paths_examined,
+                    index_cache_hit,
+                    ignore_matcher_cache_hit,
+                },
+            })
         })
     }
 
@@ -896,37 +962,65 @@ impl RepositorySession {
                 status_cache,
             } = state;
             let service = service.as_mut().ok_or_else(session_closed_error)?;
-            refresh_incremental_status(service, status_cache)?;
+            let index_cache_hit = if options.kind == InventoryKind::Untracked {
+                refresh_incremental_status(service, status_cache)?
+                    .telemetry
+                    .status_cache_hit
+            } else {
+                ensure_index_metadata(service, status_cache)?
+            };
             let repo = service.repository().map_err(repository_command_error)?;
-            let tracked = status_cache
+            let ignore_matcher_cache_hit = ensure_ignore_matcher(&repo, status_cache)?;
+            let mut tracked = status_cache
                 .files
                 .keys()
                 .chain(status_cache.artifacts.keys())
                 .cloned()
-                .collect::<std::collections::BTreeSet<_>>();
-            let mut matcher = repo.ignore_matcher().map_err(repo_error)?;
+                .collect::<Vec<_>>();
+            tracked.sort();
+            tracked.dedup();
             let mut paths_examined = 0;
+            let mut inventory_cache_hit = false;
             let mut candidates = match options.kind {
-                InventoryKind::Tracked => tracked.iter().cloned().collect::<Vec<_>>(),
+                InventoryKind::Tracked => {
+                    paths_examined = tracked.len();
+                    tracked.clone()
+                }
                 InventoryKind::Untracked => {
-                    status_cache.untracked_fingerprints.keys().cloned().collect()
+                    let paths = status_cache.untracked_fingerprints.keys().cloned().collect::<Vec<_>>();
+                    paths_examined = paths.len();
+                    paths
                 }
                 InventoryKind::TrackedIgnored => {
-                    let mut paths = Vec::new();
-                    for path in &tracked {
-                        graft::repo::cancellation_checkpoint().map_err(repo_error)?;
-                        paths_examined += 1;
-                        if matcher.is_ignored(path, false).map_err(repo_error)? {
-                            paths.push(path.clone());
+                    if let Some(paths) = &status_cache.tracked_ignored_paths {
+                        inventory_cache_hit = true;
+                        paths.clone()
+                    } else {
+                        let matcher = status_cache
+                            .ignore_matcher
+                            .as_mut()
+                            .expect("ignore matcher cache was initialized");
+                        let mut paths = Vec::new();
+                        for path in &tracked {
+                            graft::repo::cancellation_checkpoint().map_err(repo_error)?;
+                            paths_examined += 1;
+                            if matcher.is_ignored(path, false).map_err(repo_error)? {
+                                paths.push(path.clone());
+                            }
                         }
+                        status_cache.tracked_ignored_paths = Some(paths.clone());
+                        paths
                     }
-                    paths
                 }
                 InventoryKind::Ignored => {
                     let mut paths = Vec::new();
+                    let matcher = status_cache
+                        .ignore_matcher
+                        .as_mut()
+                        .expect("ignore matcher cache was initialized");
                     collect_ignored_files(
                         &repo,
-                        &mut matcher,
+                        matcher,
                         repo.worktree(),
                         false,
                         &mut paths,
@@ -935,9 +1029,6 @@ impl RepositorySession {
                     paths
                 }
             };
-            if paths_examined == 0 {
-                paths_examined = candidates.len();
-            }
             candidates.sort();
             candidates.dedup();
             let total_matching = candidates.len();
@@ -952,12 +1043,19 @@ impl RepositorySession {
                 let ignored = match options.kind {
                     InventoryKind::Ignored | InventoryKind::TrackedIgnored => true,
                     InventoryKind::Untracked => false,
-                    InventoryKind::Tracked => {
-                        matcher.is_ignored(&path, false).map_err(repo_error)?
-                    }
+                    InventoryKind::Tracked => status_cache
+                        .ignore_matcher
+                        .as_mut()
+                        .expect("ignore matcher cache was initialized")
+                        .is_ignored(&path, false)
+                        .map_err(repo_error)?,
                 };
                 items.push(InventoryItem {
-                    tracked: tracked.contains(&path),
+                    tracked: cached_path_is_tracked(
+                        &status_cache.files,
+                        &status_cache.artifacts,
+                        &path,
+                    ),
                     path,
                     ignored,
                 });
@@ -982,6 +1080,9 @@ impl RepositorySession {
                     duration_us: elapsed_us(started),
                     paths_examined,
                     items_returned,
+                    inventory_cache_hit,
+                    index_cache_hit,
+                    ignore_matcher_cache_hit,
                 },
             })
         })
@@ -1202,6 +1303,39 @@ impl Drop for RepositorySession {
     }
 }
 
+fn ensure_index_metadata(
+    service: &mut RepositoryCommandService,
+    cache: &mut IncrementalStatusCache,
+) -> Result<bool> {
+    let repo = service.repository().map_err(repository_command_error)?;
+    let head_target = repo.head_target().map_err(repo_error)?;
+    let index = repo.read_index().map_err(repo_error)?;
+    if cache.index_metadata_initialized && cache.head_target == head_target && cache.index == index
+    {
+        return Ok(true);
+    }
+    cache.files = repo.index_files().map_err(repo_error)?;
+    cache.artifacts = repo.index_artifacts().map_err(repo_error)?;
+    cache.head_target = head_target;
+    cache.index = index;
+    cache.index_metadata_initialized = true;
+    cache.tracked_ignored_paths = None;
+    Ok(false)
+}
+
+fn ensure_ignore_matcher(repo: &Repository, cache: &mut IncrementalStatusCache) -> Result<bool> {
+    let cache_hit = match cache.ignore_matcher.as_ref() {
+        Some(matcher) => matcher.rules_unchanged().map_err(repo_error)?,
+        None => false,
+    };
+    if cache_hit {
+        return Ok(true);
+    }
+    cache.ignore_matcher = Some(repo.ignore_matcher().map_err(repo_error)?);
+    cache.tracked_ignored_paths = None;
+    Ok(false)
+}
+
 fn refresh_incremental_status(
     service: &mut RepositoryCommandService,
     cache: &mut IncrementalStatusCache,
@@ -1210,6 +1344,10 @@ fn refresh_incremental_status(
     let repo = service.repository().map_err(repository_command_error)?;
     let head_target = repo.head_target().map_err(repo_error)?;
     let index = repo.read_index().map_err(repo_error)?;
+    let index_changed = !cache.index_metadata_initialized || cache.index != index;
+    if index_changed {
+        cache.tracked_ignored_paths = None;
+    }
     let tree_cache_hit = cache.initialized && cache.head_target == head_target;
     let same_repository_state = cache.initialized && tree_cache_hit && cache.index == index;
 
@@ -1251,6 +1389,7 @@ fn refresh_incremental_status(
         visible_untracked_fingerprints(&repo, &cache.files, &cache.artifacts)?;
     cache.head_target = head_target;
     cache.index = index;
+    cache.index_metadata_initialized = true;
     cache.initialized = true;
     if status_changed(previous_status.as_ref(), &status)? {
         cache.generation = cache.generation.saturating_add(1).max(1);
@@ -1534,6 +1673,44 @@ fn normalize_batch_paths(paths: &[PathBuf]) -> Result<Vec<String>> {
     Ok(normalized)
 }
 
+fn normalize_ignore_query_paths(paths: &[PathBuf]) -> Result<Vec<String>> {
+    if paths.is_empty() {
+        return Err(invalid_argument("ignore path collection must not be empty"));
+    }
+    if paths.len() > MAX_IGNORE_QUERY_PATHS {
+        return Err(invalid_argument(format!(
+            "ignore path collection exceeds {MAX_IGNORE_QUERY_PATHS} paths"
+        )));
+    }
+    paths
+        .iter()
+        .map(|path| normalize_requested_path(path))
+        .collect()
+}
+
+fn cached_path_is_tracked(
+    files: &BTreeMap<String, CommitFileState>,
+    artifacts: &BTreeMap<String, CommitArtifactState>,
+    path: &str,
+) -> bool {
+    files.contains_key(path) || artifacts.contains_key(path)
+}
+
+fn cached_path_has_tracked_descendants(
+    files: &BTreeMap<String, CommitFileState>,
+    artifacts: &BTreeMap<String, CommitArtifactState>,
+    path: &str,
+) -> bool {
+    let prefix = format!("{path}/");
+    map_has_key_with_prefix(files, &prefix) || map_has_key_with_prefix(artifacts, &prefix)
+}
+
+fn map_has_key_with_prefix<V>(map: &BTreeMap<String, V>, prefix: &str) -> bool {
+    map.range(prefix.to_string()..)
+        .next()
+        .is_some_and(|(candidate, _)| candidate.starts_with(prefix))
+}
+
 fn value_changed_path_count(value: &Value) -> usize {
     value
         .get("paths")
@@ -1813,6 +1990,7 @@ mod tests {
         assert!(!RepositoryOperation::CommitDetails.materializes_worktree());
         assert!(!RepositoryOperation::CommitChangedPaths.materializes_worktree());
         assert!(!RepositoryOperation::IsIgnoredPath.materializes_worktree());
+        assert!(!RepositoryOperation::IsIgnoredPaths.materializes_worktree());
         assert!(!RepositoryOperation::Inventory.materializes_worktree());
         assert!(!RepositoryOperation::RemoteConfigure.materializes_worktree());
         assert!(!RepositoryOperation::Push.materializes_worktree());
@@ -1871,6 +2049,112 @@ mod tests {
         let hot = session.status_incremental().unwrap();
         assert!(hot.telemetry.status_cache_hit);
         assert_eq!(hot.generation, changed.generation);
+    }
+
+    #[test]
+    fn batch_ignore_queries_preserve_tracked_directories_and_cache_inventory() {
+        let directory = tempfile::tempdir().unwrap();
+        let nested = directory.path().join("nested");
+        let generated = nested.join("generated");
+        fs::create_dir_all(&generated).unwrap();
+        fs::write(generated.join("cache.txt"), "tracked\n").unwrap();
+        fs::write(nested.join("note.txt"), "tracked\n").unwrap();
+
+        let session = RepositorySession::new(directory.path());
+        session.open().unwrap();
+        session.init().unwrap();
+        session.add_all().unwrap();
+        session.commit("track nested files").unwrap();
+        fs::write(nested.join(".gitignore"), "generated/\n").unwrap();
+        session.add_all().unwrap();
+        session.commit("ignore generated files").unwrap();
+
+        let queried = session
+            .is_ignored_paths(&IgnoredPathsOptions {
+                paths: [
+                    "nested",
+                    "nested/generated",
+                    "nested/generated/cache.txt",
+                    "nested/note.txt",
+                ]
+                .map(PathBuf::from)
+                .to_vec(),
+            })
+            .unwrap();
+        assert!(!queried.telemetry.index_cache_hit);
+        assert_eq!(queried.paths.len(), 4);
+        assert!(queried.paths[0].is_directory);
+        assert!(queried.paths[0].has_tracked_descendants);
+        assert!(!queried.paths[0].is_ignored);
+        assert!(queried.paths[1].is_directory);
+        assert!(queried.paths[1].has_tracked_descendants);
+        assert!(queried.paths[1].is_ignored);
+        assert!(!queried.paths[1].is_tracked);
+        assert!(!queried.paths[2].is_directory);
+        assert!(!queried.paths[2].has_tracked_descendants);
+        assert!(queried.paths[2].is_ignored);
+        assert!(queried.paths[2].is_tracked);
+        assert!(!queried.paths[3].is_ignored);
+        assert!(queried.paths[3].is_tracked);
+
+        let first_inventory = session
+            .inventory(&InventoryOptions {
+                kind: InventoryKind::TrackedIgnored,
+                limit: 1,
+                after: None,
+            })
+            .unwrap();
+        assert!(!first_inventory.telemetry.inventory_cache_hit);
+        assert_eq!(first_inventory.total_matching, 1);
+        assert_eq!(first_inventory.items[0].path, "nested/generated/cache.txt");
+        let hot_inventory = session
+            .inventory(&InventoryOptions {
+                kind: InventoryKind::TrackedIgnored,
+                limit: 1,
+                after: None,
+            })
+            .unwrap();
+        assert!(hot_inventory.telemetry.inventory_cache_hit);
+        assert!(hot_inventory.telemetry.index_cache_hit);
+        assert!(hot_inventory.telemetry.ignore_matcher_cache_hit);
+        assert_eq!(hot_inventory.telemetry.paths_examined, 0);
+
+        fs::write(nested.join(".gitignore"), "other/\n").unwrap();
+        let refreshed_inventory = session
+            .inventory(&InventoryOptions {
+                kind: InventoryKind::TrackedIgnored,
+                limit: 1,
+                after: None,
+            })
+            .unwrap();
+        assert!(!refreshed_inventory.telemetry.inventory_cache_hit);
+        assert!(!refreshed_inventory.telemetry.ignore_matcher_cache_hit);
+        assert_eq!(refreshed_inventory.total_matching, 0);
+
+        let too_many = session
+            .is_ignored_paths(&IgnoredPathsOptions {
+                paths: (0..=MAX_IGNORE_QUERY_PATHS)
+                    .map(|index| PathBuf::from(format!("path-{index}")))
+                    .collect(),
+            })
+            .unwrap_err();
+        assert_eq!(too_many.code(), SdkErrorCode::InvalidArgument);
+
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let cancellation_error = with_cancellation(&cancelled, || {
+            session.is_ignored_paths(&IgnoredPathsOptions { paths: vec![PathBuf::from("nested")] })
+        })
+        .unwrap_err();
+        assert_eq!(cancellation_error.code(), SdkErrorCode::Cancelled);
+        assert_eq!(
+            session
+                .is_ignored_paths(&IgnoredPathsOptions { paths: vec![PathBuf::from("nested")] })
+                .unwrap()
+                .paths
+                .len(),
+            1
+        );
     }
 
     #[test]

@@ -196,6 +196,24 @@ async function runBenchmark(root) {
     typeof session.historySummaries === "function"
       ? await sample(iterations, () => session.historySummaries({ limit: 50 }))
       : undefined
+  const ignoreBatchPaths = largeIgnoreBatchPaths()
+  const ignoreBatchFirst = await timed(() =>
+    session.isIgnoredPaths({ paths: ignoreBatchPaths })
+  )
+  assert.equal(ignoreBatchFirst.value.paths.length, 1_000)
+  assert.equal(ignoreBatchFirst.value.paths[0].is_directory, true)
+  assert.equal(ignoreBatchFirst.value.paths[0].has_tracked_descendants, true)
+  const ignoreBatchSamples = await sample(iterations, () =>
+    session.isIgnoredPaths({ paths: ignoreBatchPaths })
+  )
+  const inventoryFirst = await timed(() =>
+    session.inventory({ kind: "tracked_ignored", limit: 5 })
+  )
+  const inventorySamples = await sample(iterations, () =>
+    session.inventory({ kind: "tracked_ignored", limit: 5 })
+  )
+  assert.equal(inventoryFirst.value.total_matching, 46_358)
+  assert.equal(inventorySamples.values.at(-1).telemetry.paths_examined, 0)
 
   mutateDatabase(path.join(root, "project.eidos"))
   const changedStatus =
@@ -214,7 +232,6 @@ async function runBenchmark(root) {
 
   const fullDiff = await runTimedChild("working-diff", root, longTimeoutMs)
   const cancellation = await runTimedChild("cancellation", root, longTimeoutMs)
-  const inventory = await runOptionalOperation(root, "inventory")
 
   return {
     schema: "graft-sdk-large-repository-benchmark-v1",
@@ -240,6 +257,10 @@ async function runBenchmark(root) {
       history_summaries_50: summarySamples
         ? summarize(summarySamples.milliseconds)
         : null,
+      ignore_batch_1000_first: round(ignoreBatchFirst.milliseconds),
+      ignore_batch_1000_hot: summarize(ignoreBatchSamples.milliseconds),
+      tracked_ignored_inventory_first: round(inventoryFirst.milliseconds),
+      tracked_ignored_inventory_hot: summarize(inventorySamples.milliseconds),
       changed_status: round(changedStatus.milliseconds),
       changed_path_diff: summarize(pathDiffSamples.milliseconds),
       working_diff: fullDiff.milliseconds,
@@ -253,6 +274,11 @@ async function runBenchmark(root) {
       history_summaries_50_response: summarySamples
         ? jsonBytes(summarySamples.values.at(-1))
         : null,
+      ignore_batch_1000_request: jsonBytes({ paths: ignoreBatchPaths }),
+      ignore_batch_1000_response: jsonBytes(ignoreBatchSamples.values.at(-1)),
+      tracked_ignored_inventory_response: jsonBytes(
+        inventorySamples.values.at(-1)
+      ),
       changed_status_response: jsonBytes(changedStatus.value),
       changed_path_diff_request: jsonBytes({
         paths: ["project.eidos"],
@@ -274,15 +300,15 @@ async function runBenchmark(root) {
       status: changedStatus.value.telemetry ?? null,
       diff: pathDiffSamples.values.at(-1).telemetry ?? null,
       history: summarySamples?.values.at(-1)?.telemetry ?? null,
-      inventory: inventory
-        ? {
-            kind: inventory.kind,
-            total_matching: inventory.total_matching,
-            has_more: inventory.has_more,
-            migration: inventory.migration,
-            telemetry: inventory.telemetry,
-          }
-        : null,
+      ignore_batch: ignoreBatchSamples.values.at(-1).telemetry,
+      inventory: {
+        first: inventoryFirst.value.telemetry,
+        hot: inventorySamples.values.at(-1).telemetry,
+        kind: inventorySamples.values.at(-1).kind,
+        total_matching: inventorySamples.values.at(-1).total_matching,
+        has_more: inventorySamples.values.at(-1).has_more,
+        migration: inventorySamples.values.at(-1).migration,
+      },
     },
     timeouts: {
       working_diff: fullDiff.timedOut,
@@ -300,18 +326,6 @@ async function restoreFixtureDatabase(root) {
     } else {
       await session.restore({ source: "HEAD", path: "project.eidos" })
     }
-  } finally {
-    await session.close()
-  }
-}
-
-async function runOptionalOperation(root, operation) {
-  const session = await RepositorySession.open(root)
-  try {
-    if (operation === "inventory" && typeof session.inventory === "function") {
-      return await session.inventory({ limit: 100 })
-    }
-    return null
   } finally {
     await session.close()
   }
@@ -369,6 +383,22 @@ async function runChildOperation(operation, root) {
   } finally {
     await session.close()
   }
+}
+
+function largeIgnoreBatchPaths() {
+  const paths = ["node_modules"]
+  for (let index = 0; index < 999; index += 1) {
+    const packageIndex = Math.floor(index / 64)
+    const fileIndex = index % 64
+    paths.push(
+      path.join(
+        "node_modules",
+        `package-${packageIndex.toString().padStart(4, "0")}`,
+        `file-${fileIndex.toString().padStart(2, "0")}.js`
+      )
+    )
+  }
+  return paths
 }
 
 function writeChildResult(value) {

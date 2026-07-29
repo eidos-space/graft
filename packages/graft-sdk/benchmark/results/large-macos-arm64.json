@@ -1,6 +1,6 @@
 {
   "schema": "graft-sdk-large-repository-benchmark-v1",
-  "generated_at": "2026-07-29T22:35:26.297Z",
+  "generated_at": "2026-07-29T23:38:22.608Z",
   "fixture": {
     "tracked_paths": 46665,
     "ignored_node_modules_paths": 46318,
@@ -11,7 +11,7 @@
   "environment": {
     "platform": "darwin",
     "arch": "arm64",
-    "node": "v24.18.1",
+    "node": "v24.11.1",
     "iterations": 7,
     "cpu": "Apple M2",
     "memory_bytes": 25769803776,
@@ -19,69 +19,90 @@
   },
   "milliseconds": {
     "status_process_cold": {
-      "first": 2495.325,
-      "min": 2485.856,
-      "p50": 2498.766,
-      "p95": 2531.688,
-      "max": 2531.688,
-      "mean": 2505.288
+      "first": 2481.031,
+      "min": 2468.705,
+      "p50": 2482.648,
+      "p95": 2538.332,
+      "max": 2538.332,
+      "mean": 2494.33
     },
     "status_session_cold": {
-      "first": 1112.122,
-      "min": 1090.745,
-      "p50": 1112.122,
-      "p95": 1193.217,
-      "max": 1193.217,
-      "mean": 1130.101
+      "first": 1181.045,
+      "min": 1092.441,
+      "p50": 1181.045,
+      "p95": 1199.315,
+      "max": 1199.315,
+      "mean": 1163.479
     },
     "status_hot": {
-      "first": 101.091,
-      "min": 100.091,
-      "p50": 101.165,
-      "p95": 105.368,
-      "max": 105.368,
-      "mean": 101.831
+      "first": 104.937,
+      "min": 102.837,
+      "p50": 104.055,
+      "p95": 106.23,
+      "max": 106.23,
+      "mean": 104.398
     },
-    "history_legacy_limit_1": 569.572,
+    "history_legacy_limit_1": 588.287,
     "history_summaries_50": {
-      "first": 7.555,
-      "min": 0.715,
-      "p50": 0.721,
-      "p95": 7.555,
-      "max": 7.555,
-      "mean": 1.708
+      "first": 6.058,
+      "min": 0.697,
+      "p50": 0.732,
+      "p95": 6.058,
+      "max": 6.058,
+      "mean": 1.553
     },
-    "changed_status": 685.119,
+    "ignore_batch_1000_first": 3.495,
+    "ignore_batch_1000_hot": {
+      "first": 2.581,
+      "min": 2.221,
+      "p50": 2.311,
+      "p95": 2.581,
+      "max": 2.581,
+      "mean": 2.354
+    },
+    "tracked_ignored_inventory_first": 24.394,
+    "tracked_ignored_inventory_hot": {
+      "first": 7.972,
+      "min": 7.972,
+      "p50": 8.861,
+      "p95": 9.351,
+      "max": 9.351,
+      "mean": 8.679
+    },
+    "changed_status": 708.784,
     "changed_path_diff": {
-      "first": 637.55,
-      "min": 631.062,
-      "p50": 637.55,
-      "p95": 647.938,
-      "max": 647.938,
-      "mean": 639.171
+      "first": 658.544,
+      "min": 656.244,
+      "p50": 658.901,
+      "p95": 666.361,
+      "max": 666.361,
+      "mean": 659.492
     },
-    "working_diff": 5130.062,
-    "cancellation_rejection": 280.001,
-    "cancellation_session_reusable": 101.731
+    "working_diff": 3456.474,
+    "cancellation_rejection": 290.114,
+    "cancellation_session_reusable": 102.618
   },
   "bytes": {
     "status_response": 828,
     "history_legacy_limit_1_response": 11146927,
     "history_summaries_50_response": 14260,
+    "ignore_batch_1000_request": 38987,
+    "ignore_batch_1000_response": 137096,
+    "tracked_ignored_inventory_response": 851,
     "changed_status_response": 1310,
     "changed_path_diff_request": 50,
     "changed_path_diff_response": 857,
     "working_diff_response": 674
   },
   "rss": {
-    "parent_peak_bytes": 333676544,
-    "process_cold_status_peak_bytes": 195149824,
-    "working_diff_peak_bytes": 224591872,
-    "cancellation_peak_bytes": 252575744
+    "parent_peak_bytes": 373489664,
+    "process_cold_status_peak_bytes": 194052096,
+    "working_diff_peak_bytes": 214827008,
+    "cancellation_peak_bytes": 250724352
   },
   "telemetry": {
     "status": {
-      "duration_us": 685026,
+      "duration_us": 708653,
       "paths_examined": 46665,
       "metadata_cache_hits": 0,
       "metadata_cache_misses": 46665,
@@ -89,18 +110,40 @@
       "status_cache_hit": false
     },
     "diff": {
-      "duration_us": 643805,
+      "duration_us": 659045,
       "requested_paths": 1,
       "returned_paths": 1,
       "changed_paths": 1
     },
     "history": {
-      "duration_us": 667,
+      "duration_us": 675,
       "commits_returned": 50,
       "tree_objects_read": 0,
       "blob_objects_read": 0
     },
+    "ignore_batch": {
+      "duration_us": 1690,
+      "paths_examined": 1000,
+      "index_cache_hit": true,
+      "ignore_matcher_cache_hit": true
+    },
     "inventory": {
+      "first": {
+        "duration_us": 21921,
+        "paths_examined": 46665,
+        "items_returned": 5,
+        "inventory_cache_hit": false,
+        "index_cache_hit": true,
+        "ignore_matcher_cache_hit": true
+      },
+      "hot": {
+        "duration_us": 5617,
+        "paths_examined": 0,
+        "items_returned": 5,
+        "inventory_cache_hit": true,
+        "index_cache_hit": true,
+        "ignore_matcher_cache_hit": true
+      },
       "kind": "tracked_ignored",
       "total_matching": 46358,
       "has_more": true,
@@ -108,17 +151,12 @@
         "ignored_rules_do_not_untrack": true,
         "tracked_ignored_paths": 46358,
         "recommendation": "Remove paths from the index explicitly after reviewing this page; adding an ignore rule never untracks existing paths."
-      },
-      "telemetry": {
-        "duration_us": 749933,
-        "paths_examined": 46665,
-        "items_returned": 100
       }
     }
   },
   "timeouts": {
     "working_diff": false,
     "cancellation": false,
-    "long_operation_timeout_ms": 10000
+    "long_operation_timeout_ms": 60000
   }
 }

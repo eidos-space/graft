@@ -70,7 +70,7 @@ install-time compiler or binary downloader.
 | Operation | Replaces, creates, or removes tracked worktree files |
 | --- | --- |
 | `init`, `status`, `statusIncremental`, `addAll`, `stagePaths`, `untrackPaths`, `commit` | No |
-| `diff`, `diffPaths`, `history`, `historySummaries`, `commitDetails`, `commitChangedPaths`, `inventory` | No |
+| `diff`, `diffPaths`, `history`, `historySummaries`, `commitDetails`, `commitChangedPaths`, `isIgnoredPaths`, `inventory` | No |
 | `configureRemote`, `push`, `fetch` | No |
 | `restore`, `restorePaths`, `pull`, `cloneRepository` | **Yes** |
 
@@ -134,3 +134,8 @@ untracks an already committed path. After review, call
 deletes physical files, and ignored files are not re-added by `addAll`. See the package
 [README](https://github.com/eidos-space/graft) and TypeScript
 declarations for options and result types.
+
+Explorer traversal should batch at most 1,000 entries with `isIgnoredPaths`. For directories, use
+`has_tracked_descendants`: do not prune an ignored directory while it still contains indexed files.
+The retained session caches the tracked-and-ignored inventory and invalidates it when a loaded
+ignore file or the SDK-managed index changes.

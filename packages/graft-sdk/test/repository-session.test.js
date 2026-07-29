@@ -48,6 +48,7 @@ test("exposes ABI-stable SDK metadata and materialization contract", () => {
     "commitDetails",
     "commitChangedPaths",
     "isIgnoredPath",
+    "isIgnoredPaths",
     "inventory",
     "configureRemote",
     "push",
@@ -199,6 +200,37 @@ test("incremental SDK pages history, diffs, ignore inventory, and batch mutation
     const ignored = await session.isIgnoredPath("node_modules/pkg/index.js")
     assert.equal(ignored.is_ignored, true)
     assert.equal(ignored.is_tracked, true)
+    assert.equal(ignored.is_directory, false)
+    const ignoredBatch = await session.isIgnoredPaths({
+      paths: ["node_modules", "node_modules/pkg/index.js", "note.txt"],
+    })
+    assert.equal(ignoredBatch.paths.length, 3)
+    assert.equal(ignoredBatch.paths[0].is_ignored, true)
+    assert.equal(ignoredBatch.paths[0].is_directory, true)
+    assert.equal(ignoredBatch.paths[0].has_tracked_descendants, true)
+    assert.equal(ignoredBatch.paths[0].is_tracked, false)
+    assert.equal(ignoredBatch.paths[1].is_ignored, true)
+    assert.equal(ignoredBatch.paths[1].is_tracked, true)
+    assert.equal(ignoredBatch.paths[2].is_ignored, false)
+    await assert.rejects(
+      session.isIgnoredPaths({
+        paths: Array.from({ length: 1001 }, (_, index) => `query-${index}`),
+      }),
+      /exceeds 1000/
+    )
+    const ignoreAbort = new AbortController()
+    const ignoreRunning = Array.from({ length: 24 }, () => session.diff({ rows: true }))
+    const queuedIgnore = session.isIgnoredPaths({
+      paths: ["node_modules"],
+      signal: ignoreAbort.signal,
+    })
+    ignoreAbort.abort()
+    await assert.rejects(
+      queuedIgnore,
+      (error) => error.name === "AbortError"
+    )
+    await Promise.all(ignoreRunning)
+    assert.equal((await session.isIgnoredPaths({ paths: ["node_modules"] })).paths.length, 1)
     const inventory = await session.inventory({
       kind: "tracked_ignored",
       limit: 10,
@@ -208,6 +240,13 @@ test("incremental SDK pages history, diffs, ignore inventory, and batch mutation
       ["node_modules/pkg/index.js"]
     )
     assert.equal(inventory.migration.ignored_rules_do_not_untrack, true)
+    assert.equal(inventory.telemetry.inventory_cache_hit, false)
+    const hotInventory = await session.inventory({
+      kind: "tracked_ignored",
+      limit: 10,
+    })
+    assert.equal(hotInventory.telemetry.inventory_cache_hit, true)
+    assert.equal(hotInventory.telemetry.paths_examined, 0)
 
     await fs.writeFile(path.join(root, "note.txt"), "two\n")
     await fs.writeFile(path.join(root, "node_modules", "pkg", "index.js"), "two\n")

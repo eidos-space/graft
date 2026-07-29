@@ -50,7 +50,7 @@ binary package；首版覆盖 macOS arm64/x64、Linux glibc arm64/x64 和 Window
 | 操作 | 会替换、新建或删除 tracked worktree 文件 |
 | --- | --- |
 | `init`、`status`、`statusIncremental`、`addAll`、`stagePaths`、`untrackPaths`、`commit` | 否 |
-| `diff`、`diffPaths`、`history`、`historySummaries`、`commitDetails`、`commitChangedPaths`、`inventory` | 否 |
+| `diff`、`diffPaths`、`history`、`historySummaries`、`commitDetails`、`commitChangedPaths`、`isIgnoredPaths`、`inventory` | 否 |
 | `configureRemote`、`push`、`fetch` | 否 |
 | `restore`、`restorePaths`、`pull`、`cloneRepository` | **是** |
 
@@ -102,3 +102,8 @@ SDK 不读取 `GRAFT_REMOTE_TOKEN`，不把 token 写入 repository config 或 U
 诊断并审核，再调用 `untrackPaths({ paths, expectedHead })`。该操作只移除 index entry，
 拒绝目录，不会删除或替换工作区文件；被 ignore 的文件也不会被后续 `addAll` 重新加入。
 参数和返回类型见 package [README](https://github.com/eidos-space/graft) 和 TypeScript declaration。
+
+Explorer 应通过 `isIgnoredPaths` 一次查询最多 1,000 个 entry，不要逐项跨 utility process
+调用。目录结果包含 `has_tracked_descendants`；ignored 目录仍有 tracked descendant 时不可
+剪枝。常驻 session 会缓存 index、嵌套 ignore matcher 与 `tracked_ignored` inventory，并在
+ignore 文件或 SDK index 变化后失效。

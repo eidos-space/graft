@@ -935,6 +935,19 @@ fn gitignore_rules_follow_git_syntax_and_nested_precedence() {
             .is_ignored_worktree_path(repo.worktree().join("nested/keep.tmp"))
             .unwrap()
     );
+
+    let mut matcher = repo.ignore_matcher().unwrap();
+    assert!(matcher.is_ignored("nested/drop.json", false).unwrap());
+    assert!(!matcher.is_ignored("nested/keep.tmp", false).unwrap());
+    assert!(matcher.rules_unchanged().unwrap());
+    fs::write(tmp.path().join("nested").join(GIT_IGNORE_FILE), "other/\n").unwrap();
+    assert!(!matcher.rules_unchanged().unwrap());
+    let mut refreshed_matcher = repo.ignore_matcher().unwrap();
+    assert!(
+        !refreshed_matcher
+            .is_ignored("nested/drop.json", false)
+            .unwrap()
+    );
 }
 
 #[test]

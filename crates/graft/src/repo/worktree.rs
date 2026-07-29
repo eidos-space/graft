@@ -4,6 +4,7 @@ use std::{
     fs,
     io::Read,
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use ignore::{
@@ -20,6 +21,7 @@ use super::{
 pub(super) struct IgnoreRules {
     worktree: PathBuf,
     root: Gitignore,
+    root_sources: DirectoryIgnoreFingerprint,
 }
 
 /// Reusable nested `.gitignore` / `.graftignore` matcher for bounded SDK scans.
@@ -28,7 +30,24 @@ pub struct RepoIgnoreMatcher {
     worktree: PathBuf,
     root: Gitignore,
     directory_rules: BTreeMap<PathBuf, Gitignore>,
+    rule_sources: BTreeMap<PathBuf, DirectoryIgnoreFingerprint>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IgnoreFileFingerprint {
+    len: u64,
+    modified_ns: Option<u128>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanoseconds: i64,
+}
+
+type DirectoryIgnoreFingerprint = [Option<IgnoreFileFingerprint>; 2];
 
 impl RepoIgnoreMatcher {
     pub fn is_ignored(&mut self, key: &str, is_dir: bool) -> Result<bool> {
@@ -36,37 +55,62 @@ impl RepoIgnoreMatcher {
         if key.is_empty() {
             return Ok(false);
         }
-        let mut matchers = vec![self.root.clone()];
+        let mut rule_directories = Vec::new();
         let mut path = self.worktree.clone();
         let mut components = Path::new(&key).components().peekable();
         while let Some(component) = components.next() {
             path.push(component);
             let has_descendants = components.peek().is_some();
             let component_is_dir = has_descendants || is_dir;
-            if IgnoreRules::matches(&matchers, &path, component_is_dir) {
+            if self.matches(&rule_directories, &path, component_is_dir) {
                 return Ok(true);
             }
             if has_descendants {
-                let rules = match self.directory_rules.get(&path) {
-                    Some(rules) => rules.clone(),
-                    None => {
-                        let rules = IgnoreRules::load_directory(&path)?;
-                        self.directory_rules.insert(path.clone(), rules.clone());
-                        rules
-                    }
-                };
-                matchers.push(rules);
+                if !self.directory_rules.contains_key(&path) {
+                    let (rules, sources) = IgnoreRules::load_directory(&path)?;
+                    self.directory_rules.insert(path.clone(), rules);
+                    self.rule_sources.insert(path.clone(), sources);
+                }
+                rule_directories.push(path.clone());
             }
         }
         Ok(false)
+    }
+
+    /// Returns false when an ignore source loaded by this matcher changed on disk.
+    pub fn rules_unchanged(&self) -> Result<bool> {
+        for (directory, expected) in &self.rule_sources {
+            super::cancellation_checkpoint()?;
+            if &IgnoreRules::source_fingerprint(directory)? != expected {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn matches(&self, rule_directories: &[PathBuf], path: &Path, is_dir: bool) -> bool {
+        for directory in rule_directories.iter().rev() {
+            let matcher = self
+                .directory_rules
+                .get(directory)
+                .expect("visited ignore directory has loaded rules");
+            match matcher.matched(path, is_dir) {
+                Match::Ignore(_) => return true,
+                Match::Whitelist(_) => return false,
+                Match::None => {}
+            }
+        }
+        matches!(self.root.matched(path, is_dir), Match::Ignore(_))
     }
 }
 
 impl IgnoreRules {
     pub(super) fn load(worktree: &Path) -> Result<Self> {
+        let (root, root_sources) = Self::load_directory(worktree)?;
         Ok(Self {
             worktree: worktree.to_path_buf(),
-            root: Self::load_directory(worktree)?,
+            root,
+            root_sources,
         })
     }
 
@@ -75,10 +119,13 @@ impl IgnoreRules {
     }
 
     pub(super) fn matcher(&self) -> RepoIgnoreMatcher {
+        let mut rule_sources = BTreeMap::new();
+        rule_sources.insert(self.worktree.clone(), self.root_sources.clone());
         RepoIgnoreMatcher {
             worktree: self.worktree.clone(),
             root: self.root.clone(),
             directory_rules: BTreeMap::new(),
+            rule_sources,
         }
     }
 
@@ -87,7 +134,7 @@ impl IgnoreRules {
     }
 
     pub(super) fn rules_for_directory(&self, directory: &Path) -> Result<Gitignore> {
-        Self::load_directory(directory)
+        Self::load_directory(directory).map(|(rules, _)| rules)
     }
 
     pub(super) fn matches(matchers: &[Gitignore], path: &Path, is_dir: bool) -> bool {
@@ -101,23 +148,61 @@ impl IgnoreRules {
         false
     }
 
-    fn load_directory(directory: &Path) -> Result<Gitignore> {
+    fn load_directory(directory: &Path) -> Result<(Gitignore, DirectoryIgnoreFingerprint)> {
         let mut builder = GitignoreBuilder::new(directory);
-        for file_name in [GIT_IGNORE_FILE, GRAFT_IGNORE_FILE] {
+        let sources = Self::source_fingerprint(directory)?;
+        for (file_name, source) in [GIT_IGNORE_FILE, GRAFT_IGNORE_FILE]
+            .into_iter()
+            .zip(sources.iter())
+        {
+            if source.is_none() {
+                continue;
+            }
             let path = directory.join(file_name);
-            match fs::symlink_metadata(&path) {
-                Ok(metadata) if metadata.is_file() => {
-                    if let Some(err) = builder.add(path) {
-                        return Err(err.into());
-                    }
-                }
-                Ok(_) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => return Err(err.into()),
+            if let Some(err) = builder.add(path) {
+                return Err(err.into());
             }
         }
-        Ok(builder.build()?)
+        Ok((builder.build()?, sources))
     }
+
+    fn source_fingerprint(directory: &Path) -> Result<DirectoryIgnoreFingerprint> {
+        let mut sources = [None, None];
+        for (index, file_name) in [GIT_IGNORE_FILE, GRAFT_IGNORE_FILE].into_iter().enumerate() {
+            let path = directory.join(file_name);
+            sources[index] = match fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.is_file() => Some(ignore_file_fingerprint(&metadata)),
+                Ok(_) => None,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            };
+        }
+        Ok(sources)
+    }
+}
+
+fn ignore_file_fingerprint(metadata: &fs::Metadata) -> IgnoreFileFingerprint {
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+
+    IgnoreFileFingerprint {
+        len: metadata.len(),
+        modified_ns: metadata.modified().ok().and_then(system_time_ns),
+        #[cfg(unix)]
+        device: metadata.dev(),
+        #[cfg(unix)]
+        inode: metadata.ino(),
+        #[cfg(unix)]
+        changed_seconds: metadata.ctime(),
+        #[cfg(unix)]
+        changed_nanoseconds: metadata.ctime_nsec(),
+    }
+}
+
+fn system_time_ns(time: SystemTime) -> Option<u128> {
+    time.duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|value| value.as_nanos())
 }
 
 pub(super) fn wildcard_match(pattern: &str, text: &str) -> bool {

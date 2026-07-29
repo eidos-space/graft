@@ -117,6 +117,11 @@ class RepositorySession {
     return callJson(() => this.#native.isIgnoredPath(path, signal))
   }
 
+  async isIgnoredPaths(options) {
+    const { signal, ...pathOptions } = options
+    return callJson(() => this.#native.isIgnoredPaths(pathOptions, signal))
+  }
+
   async inventory(options = {}) {
     const { kind = "tracked_ignored", limit = 100, after, signal } = options
     return callJson(() => this.#native.inventory({ kind, limit, after }, signal))

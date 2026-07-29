@@ -273,6 +273,9 @@ export interface InventoryResult {
     duration_us: number
     paths_examined: number
     items_returned: number
+    inventory_cache_hit: boolean
+    index_cache_hit: boolean
+    ignore_matcher_cache_hit: boolean
   }
 }
 
@@ -280,6 +283,25 @@ export interface IgnoredPathResult {
   path: string
   is_ignored: boolean
   is_tracked: boolean
+  /** True for a physical directory or a path with tracked descendants. */
+  is_directory: boolean
+  /** True when the index contains one or more files below this directory path. */
+  has_tracked_descendants: boolean
+}
+
+export interface IgnoredPathsOptions extends OperationOptions {
+  /** One to 1,000 normalized repository-relative file or directory paths. */
+  paths: string[]
+}
+
+export interface IgnoredPathsResult {
+  paths: IgnoredPathResult[]
+  telemetry: {
+    duration_us: number
+    paths_examined: number
+    index_cache_hit: boolean
+    ignore_matcher_cache_hit: boolean
+  }
 }
 
 export class GraftSdkError extends Error {
@@ -328,6 +350,7 @@ export class RepositorySession {
     path: string,
     options?: OperationOptions
   ): Promise<IgnoredPathResult>
+  isIgnoredPaths(options: IgnoredPathsOptions): Promise<IgnoredPathsResult>
   inventory(options?: InventoryOptions): Promise<InventoryResult>
   restore(options: RestoreOptions): Promise<GraftJson>
   restorePaths(options: RestorePathsOptions): Promise<BatchPathsResult>

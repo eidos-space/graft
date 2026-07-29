@@ -1,6 +1,6 @@
 # Large-repository SDK benchmark
 
-Measured on 2026-07-30 with an Apple M2, 24 GiB RAM, macOS 15.7.3, Node.js 24.18.1,
+Measured on 2026-07-30 with an Apple M2, 24 GiB RAM, macOS 15.7.3, Node.js 24.11.1,
 and a release-mode Node-API addon. Each distribution contains seven samples. The persistent
 fixture has exactly 46,665 tracked paths: 46,318 under `node_modules`, 40 under a nested generated
 directory, 305 other tracked files, `.gitignore`, and a nested `.graftignore`. The ignore rules
@@ -16,11 +16,14 @@ RSS is the process high-water mark. The checked-in JSON contains the complete sa
 
 | Operation | Baseline | Final p50 | Final p95 | Budget | Result |
 | --- | ---: | ---: | ---: | ---: | --- |
-| Process-cold status | 8,655.9 ms | 2,498.8 ms | 2,531.7 ms | reported | — |
-| Unchanged hot status | 8,273.7 ms | 101.2 ms | 105.4 ms | <250 ms | pass |
-| One changed `.eidos` path diff | 11,261.0 ms | 637.6 ms | 647.9 ms | <1,000 ms | pass |
-| 50 history summaries | >60,000 ms for legacy default history | 0.72 ms | 7.56 ms | <500 ms | pass |
-| Abort rejection | >60,000 ms / blocked session | 280.0 ms | single cancellation sample | <500 ms | pass |
+| Process-cold status | 8,655.9 ms | 2,482.6 ms | 2,538.3 ms | reported | — |
+| Unchanged hot status | 8,273.7 ms | 104.1 ms | 106.2 ms | <250 ms | pass |
+| 1,000-path ignore batch | >30,000 ms with serialized single-path calls | 2.3 ms | 2.6 ms | <100 ms hot | pass |
+| First tracked-and-ignored page after status | 7,570.0 ms | 24.4 ms | single first sample | <1,000 ms | pass |
+| Hot tracked-and-ignored page | 7,570.0 ms | 8.9 ms | 9.4 ms | <100 ms | pass |
+| One changed `.eidos` path diff | 11,261.0 ms | 658.9 ms | 666.4 ms | <1,000 ms | pass |
+| 50 history summaries | >60,000 ms for legacy default history | 0.73 ms | 6.06 ms | <500 ms | pass |
+| Abort rejection | >60,000 ms / blocked session | 290.1 ms | single cancellation sample | <500 ms | pass |
 
 The history-summary response is 14,260 bytes (budget <1 MiB) and reads zero tree and zero blob
 objects. The explicit diff request is 50 bytes and its response is 857 bytes. Status responses are
@@ -28,11 +31,17 @@ objects. The explicit diff request is 50 bytes and its response is 857 bytes. St
 `history({limit: 1})` still returns 11,146,927 bytes; callers should migrate list views to
 `historySummaries` and hydrate a selected commit with `commitDetails`.
 
-Peak RSS was 186.1 MiB for a process-cold status child, 214.2 MiB for the bounded legacy working
-diff child, 240.9 MiB for the cancellation child, and 318.2 MiB for the parent process that ran all
-seven-sample distributions. After cancellation, the next incremental status completed in 101.7 ms,
+The 1,000-path ignore request is 38,987 bytes and its response is 137,096 bytes. The five-item
+tracked-and-ignored inventory page is 851 bytes. Its first call after resident status examines all
+46,665 tracked paths once; later pages report `inventory_cache_hit: true` and `paths_examined: 0`.
+Batch results distinguish a physical or index-derived directory and report whether it has tracked
+descendants, so an ignored directory containing indexed files is not incorrectly pruned.
+
+Peak RSS was 185.1 MiB for a process-cold status child, 204.9 MiB for the bounded legacy working
+diff child, 239.1 MiB for the cancellation child, and 356.2 MiB for the parent process that ran all
+seven-sample distributions. After cancellation, the next incremental status completed in 102.6 ms,
 showing that the resident session remained usable. The tracked-and-ignored diagnostic counted
-46,358 paths and returned a bounded 100-item page.
+46,358 paths and returned a bounded five-item page.
 
 ## Profiler evidence and changes
 
@@ -47,5 +56,11 @@ status cache, and drives working diff from changed paths. History summaries walk
 without tree/blob hydration, while cooperative cancellation checkpoints cover tree hydration,
 status, diff, history, stage, restore, inventory, and SQLite page loops. No budget was relaxed.
 
-The legacy unfiltered working diff also improved from a >60 second timeout to 5.13 seconds, but it
+For ignore-heavy traversal, the retained session now also caches the tracked index, compiled root
+and nested ignore matchers, and the complete tracked-and-ignored classification. Matcher evaluation
+borrows compiled rules instead of cloning them for every tracked path. Source fingerprints
+invalidate loaded `.gitignore` and `.graftignore` rules, while HEAD/index comparison invalidates
+inventory after an external writer. Telemetry exposes only duration, counts, and cache-hit booleans.
+
+The legacy unfiltered working diff also improved from a >60 second timeout to 3.46 seconds, but it
 remains a compatibility API. Latency-sensitive hosts should use the bounded changed-path API.
