@@ -4,6 +4,8 @@
 > transactional storage engine now powers this project's SQLite storage layer.
 > This repository is independently maintained and is no longer a GitHub fork.
 
+**English** · [简体中文](./README.zh-CN.md)
+
 # Graft
 
 **Version control for SQLite-backed application state.**
