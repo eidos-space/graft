@@ -1,19 +1,16 @@
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt::{self, Display},
     fs,
     path::{Path, PathBuf},
     str::FromStr,
+    sync::{Arc, Mutex, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(unix)]
-use std::{
-    collections::HashMap,
-    os::unix::fs::MetadataExt,
-    sync::{Mutex, OnceLock},
-};
+use std::os::unix::fs::MetadataExt;
 
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream};

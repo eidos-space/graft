@@ -1,5 +1,15 @@
 use super::*;
 
+const COMMIT_TREE_CACHE_MAX_ENTRIES: usize = 16;
+
+type CachedCommitTreeState = Arc<(
+    BTreeMap<String, CommitFileState>,
+    BTreeMap<String, CommitArtifactState>,
+)>;
+
+static COMMIT_TREE_CACHE: OnceLock<Mutex<HashMap<(PathBuf, String), CachedCommitTreeState>>> =
+    OnceLock::new();
+
 #[derive(Debug, Clone, Copy)]
 struct ScannedWorktreePath {
     is_sqlite: bool,
@@ -612,6 +622,17 @@ impl Repository {
         BTreeMap<String, CommitFileState>,
         BTreeMap<String, CommitArtifactState>,
     )> {
+        let cache_key = (self.graft_dir.clone(), id.to_string());
+        let cached = COMMIT_TREE_CACHE
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&cache_key)
+            .cloned();
+        if let Some(cached) = cached {
+            return Ok((cached.0.clone(), cached.1.clone()));
+        }
+
         let object = self.object_store().read(id)?;
         let object::Object::Tree(tree) = object else {
             return Err(RepoErr::Object(object::ObjectErr::InvalidObject {
@@ -650,7 +671,16 @@ impl Repository {
                 }
             }
         }
-        Ok((files, artifacts))
+        let state = Arc::new((files, artifacts));
+        let cache = COMMIT_TREE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut cache = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if cache.len() >= COMMIT_TREE_CACHE_MAX_ENTRIES && !cache.contains_key(&cache_key) {
+            cache.clear();
+        }
+        cache.insert(cache_key, state.clone());
+        Ok((state.0.clone(), state.1.clone()))
     }
 
     pub fn read_index(&self) -> Result<index::Index> {
