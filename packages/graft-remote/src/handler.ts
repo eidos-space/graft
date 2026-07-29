@@ -53,19 +53,16 @@ export function createGraftRemoteHandler<AdapterContext = undefined, Principal =
       if (options.onError !== undefined) {
         try {
           await options.onError(error, request);
-        } catch (reportingError) {
+        } catch {
           console.error(
             JSON.stringify({
               message: "graft remote error reporter failed",
-              error: errorMessage(reportingError),
             }),
           );
         }
       }
       if (!(error instanceof GraftProtocolError)) {
-        console.error(
-          JSON.stringify({ message: "unhandled graft remote error", error: errorMessage(error) }),
-        );
+        console.error(JSON.stringify({ message: "unhandled graft remote error" }));
       }
       return errorResponse(error);
     }
@@ -407,8 +404,4 @@ function objectNotFound(): GraftProtocolError {
 
 function backendContractError(message: string): GraftProtocolError {
   return new GraftProtocolError(500, "backend_contract_error", message);
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }

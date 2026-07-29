@@ -298,6 +298,36 @@ describe("createGraftRemoteHandler", () => {
     );
     expect(encodedSlash.status).toBe(400);
   });
+
+  it("does not log backend or error-reporter details", async () => {
+    const messages: string[] = [];
+    const originalError = console.error;
+    console.error = (...values: unknown[]) => messages.push(values.join(" "));
+    try {
+      const app = createGraftRemoteHandler({
+        backend() {
+          throw new Error("storage-secret repository/path");
+        },
+        onError() {
+          throw new Error("reporter-secret bearer-token");
+        },
+      });
+      const response = await handlerFetch(app, "/private/repository", {
+        headers: { "Graft-Protocol": "1" },
+      });
+      expect(response.status).toBe(500);
+    } finally {
+      console.error = originalError;
+    }
+
+    const logged = messages.join("\n");
+    expect(logged).toContain("graft remote error reporter failed");
+    expect(logged).toContain("unhandled graft remote error");
+    expect(logged).not.toContain("storage-secret");
+    expect(logged).not.toContain("repository/path");
+    expect(logged).not.toContain("reporter-secret");
+    expect(logged).not.toContain("bearer-token");
+  });
 });
 
 async function handlerFetch(
