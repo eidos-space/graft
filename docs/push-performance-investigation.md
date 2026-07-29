@@ -2,6 +2,10 @@
 
 Date: 2026-07-29
 
+Status: DONE_WITH_CONCERNS — implementation and local correctness/performance
+work are complete; deployed after-measurements are blocked by the independent
+staging identity outage described below.
+
 Scope: the Graft CLI, `@eidos.space/graft` `RepositorySession`, the public
 HTTP Remote protocol, and the staging Sync Worker. All benchmarks used
 disposable repositories and branches. No user-owned Space or production
@@ -116,6 +120,13 @@ causing both the optimized Sync Worker and a controlled rollback to the prior
 Sync Worker to return 503. Safe timing responses attribute only 3-13 ms to
 Worker-side authorization before failure; the client still observes roughly
 0.9-1.4 s, independently confirming the network/edge component.
+
+The account/identity repository contains the expected userinfo implementation
+only as part of a large, unrelated dirty worktree. Current deployed account
+version `24a9a0d5-2468-40b5-9cf6-b7b4c517035b` still returns 404. Deploying
+that dirty tree or rolling the whole account service back would violate the
+isolation rule and could disrupt concurrent staging work, so neither action was
+taken.
 
 Do not use the pre-change values as a claimed post-change improvement. Run the
 checked-in harness once staging authorization is healthy and append its JSON
@@ -237,7 +248,7 @@ The following passed after the changes:
   snapshot integrity, and SQLite row-diff/merge tests in the full suite;
 - eight native `RepositorySession` SDK tests;
 - 14 staging Worker tests plus TypeScript checking;
-- all six core protocol, one Hono adapter, and nine Cloudflare adapter tests.
+- all seven core protocol, one Hono adapter, and nine Cloudflare adapter tests.
 
 `cargo fmt --all -- --check`, `cargo check --workspace --all-targets`, and
 targeted Clippy with `--no-deps` pass. Whole-workspace Clippy remains blocked by
