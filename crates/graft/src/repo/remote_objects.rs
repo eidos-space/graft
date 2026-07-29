@@ -186,12 +186,15 @@ impl Repository {
         remote: &crate::remote::Remote,
         head: &str,
         stop_at: Option<&str>,
-    ) -> Result<usize> {
+    ) -> Result<PreparedObjectPush> {
+        let negotiation_trace = crate::trace::PushTraceSpan::new("object_negotiation");
         let remote_objects = if stop_at.is_some() {
             BTreeSet::new()
         } else {
             self.remote_object_ids(remote)?
         };
+        negotiation_trace.finish(&[("remote_objects", remote_objects.len() as u64)]);
+        let discovery_trace = crate::trace::PushTraceSpan::new("object_discovery_and_hash");
         let stop_commits = stop_at
             .map(|id| self.commit_ancestors_inclusive(id))
             .transpose()?
@@ -214,7 +217,7 @@ impl Repository {
             }
 
             let Some(bytes) = self.object_store().read_raw(&object_id)? else {
-                return Err(RepoErr::CommitNotFound(id.clone()));
+                return Err(RepoErr::CommitNotFound(id));
             };
             let object = object::Object::decode(&bytes)?;
             let actual = object::ObjectId::for_bytes(&bytes);
@@ -245,9 +248,21 @@ impl Repository {
         }
 
         let count = commits.len();
-        self.push_large_file_contents(remote, external_payloads)?;
-        self.push_object_pack(remote, objects)?;
-        Ok(count)
+        let object_count = objects.len() as u64;
+        let external_count = external_payloads.len() as u64;
+        let external_bytes = external_payloads.values().copied().sum();
+        discovery_trace.finish(&[
+            ("commits", count as u64),
+            ("objects", object_count),
+            ("external_payloads", external_count),
+        ]);
+        let large_file_trace = crate::trace::PushTraceSpan::new("large_file_prepare");
+        let bundle_objects = self.prepare_large_file_contents(external_payloads)?;
+        large_file_trace.finish(&[("objects", external_count), ("bytes", external_bytes)]);
+        let pack_trace = crate::trace::PushTraceSpan::new("object_pack_build");
+        let pack = self.prepare_object_pack(objects)?;
+        pack_trace.finish(&[("objects", object_count)]);
+        Ok(PreparedObjectPush { commits: count, pack, bundle_objects })
     }
 
     pub(super) fn commit_ancestors_inclusive(&self, head: &str) -> Result<BTreeSet<String>> {
@@ -332,30 +347,29 @@ impl Repository {
         Ok(())
     }
 
-    pub(super) fn push_large_file_contents(
+    pub(super) fn prepare_large_file_contents(
         &self,
-        remote: &crate::remote::Remote,
         external_payloads: BTreeMap<object::ObjectId, u64>,
-    ) -> Result<()> {
+    ) -> Result<Vec<crate::remote::RemoteBundleObject>> {
+        let mut objects = Vec::with_capacity(external_payloads.len());
         for (id, size) in external_payloads {
             let bytes = self.read_large_file_content(&id, size)?;
             let path = large_file_content_relative_path(&id);
-            match block_on_remote(remote.put_raw_if_not_exists(&path, bytes)) {
-                Ok(()) => {}
-                Err(RepoErr::Remote(err)) if err.precondition_failed() => {}
-                Err(err) => return Err(err),
-            }
+            objects.push(crate::remote::RemoteBundleObject::new(
+                path,
+                [Bytes::from(bytes)],
+                true,
+            )?);
         }
-        Ok(())
+        Ok(objects)
     }
 
-    pub(super) fn push_object_pack(
+    pub(super) fn prepare_object_pack(
         &self,
-        remote: &crate::remote::Remote,
         objects: BTreeMap<object::ObjectId, Vec<u8>>,
-    ) -> Result<()> {
+    ) -> Result<Option<crate::remote::RemoteObjectPack>> {
         if objects.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
 
         let mut pack = REMOTE_OBJECT_PACK_MAGIC.to_vec();
@@ -372,7 +386,7 @@ impl Repository {
         let index_path = format!("{DIR_OBJECTS_PACK}/{pack_id}.idx");
         let index = RemoteObjectPackIndex {
             version: REMOTE_OBJECT_PACK_VERSION,
-            pack: pack_path.clone(),
+            pack: pack_path,
             objects: entries,
         };
         let index_bytes =
@@ -381,17 +395,11 @@ impl Repository {
                 message: format!("failed to encode pack index: {err}"),
             })?;
 
-        match block_on_remote(remote.put_raw_if_not_exists(&pack_path, pack)) {
-            Ok(()) => {}
-            Err(RepoErr::Remote(err)) if err.precondition_failed() => {}
-            Err(err) => return Err(err),
-        }
-        match block_on_remote(remote.put_raw_if_not_exists(&index_path, index_bytes)) {
-            Ok(()) => {}
-            Err(RepoErr::Remote(err)) if err.precondition_failed() => {}
-            Err(err) => return Err(err),
-        }
-        Ok(())
+        Ok(Some(crate::remote::RemoteObjectPack::new(
+            pack_id,
+            Bytes::from(pack),
+            Bytes::from(index_bytes),
+        )))
     }
 
     pub(super) fn fetch_object_graph(
@@ -590,4 +598,10 @@ impl Repository {
         }
         Ok(files)
     }
+}
+
+pub(super) struct PreparedObjectPush {
+    pub(super) commits: usize,
+    pub(super) pack: Option<crate::remote::RemoteObjectPack>,
+    pub(super) bundle_objects: Vec<crate::remote::RemoteBundleObject>,
 }

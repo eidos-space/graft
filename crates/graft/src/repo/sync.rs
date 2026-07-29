@@ -278,6 +278,25 @@ impl Repository {
         force: bool,
         remote_head: RemoteBranchHead,
     ) -> Result<PushOutcome> {
+        self.push_branch_with_force_remote_head_and_snapshots(
+            remote,
+            local_branch,
+            remote_branch,
+            force,
+            remote_head,
+            crate::PreparedSnapshotPush::default(),
+        )
+    }
+
+    pub fn push_branch_with_force_remote_head_and_snapshots(
+        &self,
+        remote: &str,
+        local_branch: &str,
+        remote_branch: &str,
+        force: bool,
+        remote_head: RemoteBranchHead,
+        snapshots: crate::PreparedSnapshotPush,
+    ) -> Result<PushOutcome> {
         validate_remote_name(remote)?;
         validate_ref_name(local_branch)?;
         validate_ref_name(remote_branch)?;
@@ -313,13 +332,20 @@ impl Repository {
             });
         }
 
-        let commits = self.push_commit_chain(&remote_store, &head, remote_head.as_deref())?;
+        let mut prepared = self.push_commit_chain(&remote_store, &head, remote_head.as_deref())?;
+        let mut bundle_objects = snapshots.into_bundle_objects()?;
+        bundle_objects.append(&mut prepared.bundle_objects);
         let head_path = format!("refs/heads/{remote_branch}");
-        match block_on_remote(remote_store.compare_and_swap_raw(
+        let publication_trace = crate::trace::PushTraceSpan::new("remote_publication");
+        let publication = block_on_remote(remote_store.publish_object_bundle_and_ref(
+            bundle_objects,
+            prepared.pack,
             &head_path,
             remote_head_raw.as_deref(),
             format!("{head}\n"),
-        )) {
+        ));
+        publication_trace.finish(&[]);
+        match publication {
             Ok(()) => {}
             Err(RepoErr::Remote(RemoteErr::CompareAndSwap { .. } | RemoteErr::LockBusy { .. })) => {
                 return Err(RepoErr::RemoteRefChanged {
@@ -339,7 +365,7 @@ impl Repository {
             local_branch: local_branch.to_string(),
             remote_branch: remote_branch.to_string(),
             head,
-            commits,
+            commits: prepared.commits,
             forced: force,
             deleted: false,
         })

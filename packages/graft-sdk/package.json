@@ -1,6 +1,6 @@
 {
   "name": "@eidos.space/graft",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Long-lived in-process Graft repository sessions for Node.js and Electron.",
   "license": "MIT OR Apache-2.0",
   "repository": {
@@ -38,6 +38,7 @@
     "build:native": "./scripts/build-native.sh",
     "test": "node --test test/*.test.js",
     "bench": "node benchmark/cli-vs-sdk.mjs",
+    "bench:push": "node benchmark/push.mjs",
     "release:create-packages": "napi create-npm-dirs --npm-dir npm",
     "release:collect": "napi artifacts --output-dir artifacts --npm-dir npm",
     "release:prepare": "node scripts/prepare-release-metadata.mjs",

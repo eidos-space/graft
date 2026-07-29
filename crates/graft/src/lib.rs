@@ -7,6 +7,8 @@ pub mod rt {
 
     mod action;
     mod task;
+
+    pub use action::PreparedSnapshotPush;
 }
 
 pub mod core;
@@ -20,6 +22,7 @@ pub mod remote;
 pub mod repo;
 pub mod setup;
 pub mod snapshot;
+pub mod trace;
 pub mod volume;
 pub mod volume_reader;
 pub mod volume_writer;
@@ -31,6 +34,7 @@ pub mod testutil;
 pub mod fault;
 
 pub use err::{GraftErr, LogicalErr};
+pub use rt::PreparedSnapshotPush;
 pub use rt::runtime::{CommitInfo, DiffResult as PageDiffResult};
 
 // re-export static_assertions for macros

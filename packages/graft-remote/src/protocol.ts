@@ -10,11 +10,20 @@ export const GRAFT_REMOTE_CAPABILITIES = [
   "list",
   "list-cursor",
   "put-if-absent",
+  "receive-pack",
+  "receive-bundle",
   "cas",
   "cad",
 ] as const;
 
 const MAX_OBJECT_PATH_BYTES = 768;
+export const RECEIVE_PACK_ID_BYTES = 64;
+export const RECEIVE_PACK_HEADER_PACK_ID = "x-graft-pack-id";
+export const RECEIVE_PACK_HEADER_PACK_BYTES = "x-graft-pack-bytes";
+export const RECEIVE_PACK_HEADER_INDEX_BYTES = "x-graft-index-bytes";
+export const RECEIVE_PACK_HEADER_REPLACEMENT_HEX = "x-graft-ref-replacement-hex";
+export const RECEIVE_BUNDLE_HEADER_MANIFEST_BYTES = "x-graft-bundle-manifest-bytes";
+export const MAX_RECEIVE_BUNDLE_OBJECTS = 256;
 const REPOSITORY_SEGMENT = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,62}[A-Za-z0-9])?$/;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
@@ -72,11 +81,7 @@ export function validateObjectPath(path: string): string {
     validatePathSegment(segment);
   }
   if (path === "locks" || path.startsWith("locks/")) {
-    throw new GraftProtocolError(
-      400,
-      "reserved_object_path",
-      "The locks namespace is reserved",
-    );
+    throw new GraftProtocolError(400, "reserved_object_path", "The locks namespace is reserved");
   }
   return path;
 }
@@ -97,11 +102,7 @@ export function validateObjectPrefix(prefix: string): string {
     validatePathSegment(segment);
   }
   if (prefix === "locks" || prefix.startsWith("locks/")) {
-    throw new GraftProtocolError(
-      400,
-      "reserved_object_path",
-      "The locks namespace is reserved",
-    );
+    throw new GraftProtocolError(400, "reserved_object_path", "The locks namespace is reserved");
   }
   return prefix;
 }
@@ -191,11 +192,7 @@ export function parseExpectedHeaders(headers: Headers): Uint8Array<ArrayBuffer> 
     );
   }
   if (hex === null) {
-    throw new GraftProtocolError(
-      400,
-      "invalid_expected_value",
-      "x-graft-expected-hex is required",
-    );
+    throw new GraftProtocolError(400, "invalid_expected_value", "x-graft-expected-hex is required");
   }
   if (present === "false") {
     if (hex !== "") {
@@ -217,6 +214,151 @@ export function parseExpectedHeaders(headers: Headers): Uint8Array<ArrayBuffer> 
   const bytes = new Uint8Array(new ArrayBuffer(hex.length / 2));
   for (let index = 0; index < bytes.length; index += 1) {
     bytes[index] = Number.parseInt(hex.slice(index * 2, index * 2 + 2), 16);
+  }
+  return bytes;
+}
+
+export function parseReceivePackHeaders(headers: Headers): {
+  packId: string;
+  packBytes: number;
+  indexBytes: number;
+  replacement: Uint8Array<ArrayBuffer>;
+} {
+  const packId = headers.get(RECEIVE_PACK_HEADER_PACK_ID);
+  if (packId === null || !new RegExp(`^[0-9a-f]{${RECEIVE_PACK_ID_BYTES}}$`).test(packId)) {
+    throw new GraftProtocolError(
+      400,
+      "invalid_receive_pack",
+      `${RECEIVE_PACK_HEADER_PACK_ID} must be a lowercase ${RECEIVE_PACK_ID_BYTES}-character object id`,
+    );
+  }
+  const packBytes = parseLengthHeader(headers, RECEIVE_PACK_HEADER_PACK_BYTES);
+  const indexBytes = parseLengthHeader(headers, RECEIVE_PACK_HEADER_INDEX_BYTES);
+  const replacementHex = headers.get(RECEIVE_PACK_HEADER_REPLACEMENT_HEX);
+  if (replacementHex === null) {
+    throw new GraftProtocolError(
+      400,
+      "invalid_receive_pack",
+      `${RECEIVE_PACK_HEADER_REPLACEMENT_HEX} is required`,
+    );
+  }
+  const replacement = decodeLowerHex(replacementHex, RECEIVE_PACK_HEADER_REPLACEMENT_HEX);
+  return { packId, packBytes, indexBytes, replacement };
+}
+
+export interface ReceiveBundleObject {
+  path: string;
+  bytes: number;
+  allowExisting: boolean;
+}
+
+export function parseReceiveBundleManifest(value: Uint8Array): ReceiveBundleObject[] {
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(decoder.decode(value));
+  } catch {
+    throw new GraftProtocolError(
+      400,
+      "invalid_receive_bundle",
+      "Receive-bundle manifest must be valid UTF-8 JSON",
+    );
+  }
+  if (typeof decoded !== "object" || decoded === null || Array.isArray(decoded)) {
+    throw invalidReceiveBundleManifest();
+  }
+  const record = decoded as Record<string, unknown>;
+  if (
+    record.version !== 1 ||
+    !Array.isArray(record.objects) ||
+    record.objects.length === 0 ||
+    record.objects.length > MAX_RECEIVE_BUNDLE_OBJECTS ||
+    Object.keys(record).some((key) => key !== "version" && key !== "objects")
+  ) {
+    throw invalidReceiveBundleManifest();
+  }
+
+  const paths = new Set<string>();
+  return record.objects.map((entry) => {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+      throw invalidReceiveBundleManifest();
+    }
+    const object = entry as Record<string, unknown>;
+    if (
+      typeof object.path !== "string" ||
+      typeof object.bytes !== "number" ||
+      !Number.isSafeInteger(object.bytes) ||
+      object.bytes < 0 ||
+      typeof object.allow_existing !== "boolean" ||
+      Object.keys(object).some(
+        (key) => key !== "path" && key !== "bytes" && key !== "allow_existing",
+      )
+    ) {
+      throw invalidReceiveBundleManifest();
+    }
+    const path = validateObjectPath(object.path);
+    if (!isImmutablePath(path) || paths.has(path)) {
+      throw invalidReceiveBundleManifest();
+    }
+    paths.add(path);
+    return {
+      path,
+      bytes: object.bytes,
+      allowExisting: object.allow_existing,
+    };
+  });
+}
+
+export function parseReceiveBundleManifestLength(headers: Headers): number {
+  const length = parseLengthHeader(headers, RECEIVE_BUNDLE_HEADER_MANIFEST_BYTES);
+  if (length === 0 || length > MAX_METADATA_BYTES) {
+    throw new GraftProtocolError(
+      400,
+      "invalid_receive_bundle",
+      `${RECEIVE_BUNDLE_HEADER_MANIFEST_BYTES} must be between 1 and ${MAX_METADATA_BYTES}`,
+    );
+  }
+  return length;
+}
+
+function invalidReceiveBundleManifest(): GraftProtocolError {
+  return new GraftProtocolError(
+    400,
+    "invalid_receive_bundle",
+    "Receive-bundle manifest is invalid",
+  );
+}
+
+function parseLengthHeader(headers: Headers, name: string): number {
+  const value = headers.get(name);
+  if (value === null || !/^(?:0|[1-9]\d*)$/.test(value)) {
+    throw new GraftProtocolError(
+      400,
+      "invalid_receive_pack",
+      `${name} must be a non-negative decimal integer`,
+    );
+  }
+  const length = Number(value);
+  if (!Number.isSafeInteger(length)) {
+    throw new GraftProtocolError(413, "receive_pack_too_large", `${name} exceeds the safe limit`);
+  }
+  return length;
+}
+
+function decodeLowerHex(value: string, name: string): Uint8Array<ArrayBuffer> {
+  if (
+    value.length > MAX_METADATA_BYTES * 2 ||
+    value.length % 2 !== 0 ||
+    !/^[0-9a-f]*$/.test(value)
+  ) {
+    throw new GraftProtocolError(
+      400,
+      "invalid_receive_pack",
+      `${name} must be lowercase hexadecimal within the metadata size limit`,
+    );
+  }
+  const bytes = new Uint8Array(new ArrayBuffer(value.length / 2));
+  for (let index = 0; index < bytes.length; index += 1) {
+    bytes[index] = Number.parseInt(value.slice(index * 2, index * 2 + 2), 16);
   }
   return bytes;
 }
@@ -366,10 +508,10 @@ function decodeListCursor(value: string): ListCursor {
     if (!/^[A-Za-z0-9_-]+$/.test(value)) {
       throw new Error("invalid base64url");
     }
-    const padded = value.replaceAll("-", "+").replaceAll("_", "/").padEnd(
-      Math.ceil(value.length / 4) * 4,
-      "=",
-    );
+    const padded = value
+      .replaceAll("-", "+")
+      .replaceAll("_", "/")
+      .padEnd(Math.ceil(value.length / 4) * 4, "=");
     const binary = atob(padded);
     const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
     const parsed: unknown = JSON.parse(decoder.decode(bytes));

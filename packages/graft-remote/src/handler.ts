@@ -12,6 +12,9 @@ import {
   isTransactionalPath,
   jsonResponse,
   parseExpectedHeaders,
+  parseReceiveBundleManifest,
+  parseReceiveBundleManifestLength,
+  parseReceivePackHeaders,
   parseRangeHeader,
   protocolHeaders,
   readLimitedBody,
@@ -38,6 +41,8 @@ import type {
 const OPERATIONS = new Set<GraftRemoteOperation>([
   "raw",
   "raw-if-not-exists",
+  "receive-pack",
+  "receive-bundle",
   "cas",
   "cad",
   "list",
@@ -53,19 +58,16 @@ export function createGraftRemoteHandler<AdapterContext = undefined, Principal =
       if (options.onError !== undefined) {
         try {
           await options.onError(error, request);
-        } catch (reportingError) {
+        } catch {
           console.error(
             JSON.stringify({
               message: "graft remote error reporter failed",
-              error: errorMessage(reportingError),
             }),
           );
         }
       }
       if (!(error instanceof GraftProtocolError)) {
-        console.error(
-          JSON.stringify({ message: "unhandled graft remote error", error: errorMessage(error) }),
-        );
+        console.error(JSON.stringify({ message: "unhandled graft remote error" }));
       }
       return errorResponse(error);
     }
@@ -142,6 +144,10 @@ async function handleRequest<AdapterContext, Principal>(
       return raw(input.request, backend, path);
     case "raw-if-not-exists":
       return putIfAbsent(input.request, backend, path);
+    case "receive-pack":
+      return receivePack(input.request, backend, path);
+    case "receive-bundle":
+      return receiveBundle(input.request, backend, path);
     case "cas":
       return compareAndSwap(input.request, backend, path);
     case "cad":
@@ -170,7 +176,11 @@ function parseObjectPath(
     return undefined;
   }
   if (value === undefined) {
-    throw new GraftProtocolError(400, "missing_object_path", "The operation requires an object path");
+    throw new GraftProtocolError(
+      400,
+      "missing_object_path",
+      "The operation requires an object path",
+    );
   }
   return validateObjectPath(value);
 }
@@ -196,6 +206,10 @@ function validateMethodAndAction(
       throw methodNotAllowed("GET, HEAD, PUT, DELETE");
     case "raw-if-not-exists":
       requireMethod(method, "PUT");
+      return "write";
+    case "receive-pack":
+    case "receive-bundle":
+      requireMethod(method, "POST");
       return "write";
     case "cas":
     case "cad":
@@ -294,6 +308,285 @@ async function putIfAbsent(
     throw new GraftProtocolError(412, "precondition_failed", "Object already exists");
   }
   return emptyResponse();
+}
+
+async function receivePack(
+  request: Request,
+  backend: GraftRepositoryBackend,
+  refPath: string,
+): Promise<Response> {
+  requireTransactionalPath(refPath);
+  const expected = parseExpectedHeaders(request.headers);
+  const { packId, packBytes, indexBytes, replacement } = parseReceivePackHeaders(request.headers);
+  const bodyBytes = checkedReceivePackBodyBytes(packBytes, indexBytes);
+  requireReceiveContentLength(request.headers, bodyBytes);
+  if (request.body === null) {
+    throw new GraftProtocolError(400, "invalid_receive_pack_body", "Receive-pack body is missing");
+  }
+
+  const source = new ReceivePackBodySource(request.body.getReader());
+  let consumed = false;
+  try {
+    await receivePackObject(backend, source, `objects/pack/${packId}.pack`, packBytes);
+    await receivePackObject(backend, source, `objects/pack/${packId}.idx`, indexBytes);
+    await source.requireEnd();
+    consumed = true;
+  } finally {
+    if (consumed) source.release();
+    else await source.abort();
+  }
+
+  if (!(await backend.compareAndSwap(refPath, expected, replacement))) {
+    throw new GraftProtocolError(409, "compare_failed", "Object changed during compare-and-swap");
+  }
+  return emptyResponse();
+}
+
+async function receiveBundle(
+  request: Request,
+  backend: GraftRepositoryBackend,
+  refPath: string,
+): Promise<Response> {
+  requireTransactionalPath(refPath);
+  const expected = parseExpectedHeaders(request.headers);
+  const { packId, packBytes, indexBytes, replacement } = parseReceivePackHeaders(request.headers);
+  const manifestBytes = parseReceiveBundleManifestLength(request.headers);
+  if (request.body === null) {
+    throw new GraftProtocolError(
+      400,
+      "invalid_receive_bundle_body",
+      "Receive-bundle body is missing",
+    );
+  }
+
+  const source = new ReceivePackBodySource(request.body.getReader());
+  let consumed = false;
+  try {
+    const manifest = parseReceiveBundleManifest(await source.readExact(manifestBytes));
+    const bodyBytes = checkedReceiveBodyBytes([
+      manifestBytes,
+      ...manifest.map((object) => object.bytes),
+      packBytes,
+      indexBytes,
+    ]);
+    requireReceiveContentLength(request.headers, bodyBytes);
+    for (const object of manifest) {
+      await receivePackObject(backend, source, object.path, object.bytes, object.allowExisting);
+    }
+    await receivePackObject(backend, source, `objects/pack/${packId}.pack`, packBytes);
+    await receivePackObject(backend, source, `objects/pack/${packId}.idx`, indexBytes);
+    await source.requireEnd();
+    consumed = true;
+  } finally {
+    if (consumed) source.release();
+    else await source.abort();
+  }
+
+  if (!(await backend.compareAndSwap(refPath, expected, replacement))) {
+    throw new GraftProtocolError(409, "compare_failed", "Object changed during compare-and-swap");
+  }
+  return emptyResponse();
+}
+
+async function receivePackObject(
+  backend: GraftRepositoryBackend,
+  source: ReceivePackBodySource,
+  path: string,
+  contentLength: number,
+  allowExisting = true,
+): Promise<void> {
+  const part = source.part(contentLength);
+  const created = await backend.putIfAbsent(path, part.stream, "immutable", {
+    contentLength,
+  });
+  await part.finish(created);
+  if (!created && !allowExisting) {
+    throw new GraftProtocolError(
+      412,
+      "precondition_failed",
+      "Bundled object already exists and requires client verification",
+    );
+  }
+}
+
+function checkedReceivePackBodyBytes(packBytes: number, indexBytes: number): number {
+  return checkedReceiveBodyBytes([packBytes, indexBytes]);
+}
+
+function checkedReceiveBodyBytes(lengths: number[]): number {
+  let total = 0;
+  for (const length of lengths) {
+    total += length;
+    if (!Number.isSafeInteger(total)) {
+      throw new GraftProtocolError(
+        413,
+        "receive_pack_too_large",
+        "Receive body exceeds the safe limit",
+      );
+    }
+  }
+  if (!Number.isSafeInteger(total)) {
+    throw new GraftProtocolError(
+      413,
+      "receive_pack_too_large",
+      "Receive body exceeds the safe limit",
+    );
+  }
+  return total;
+}
+
+function requireReceiveContentLength(headers: Headers, expected: number): void {
+  const value = headers.get("content-length");
+  if (value === null || !/^(?:0|[1-9]\d*)$/.test(value) || Number(value) !== expected) {
+    throw new GraftProtocolError(
+      400,
+      "invalid_receive_pack_body",
+      "Content-Length must equal the declared receive body lengths",
+    );
+  }
+}
+
+class ReceivePackBodySource {
+  readonly #reader: ReadableStreamDefaultReader<Uint8Array>;
+  #buffer: Uint8Array | undefined;
+  #active = false;
+
+  constructor(reader: ReadableStreamDefaultReader<Uint8Array>) {
+    this.#reader = reader;
+  }
+
+  part(length: number): ReceivePackBodyPart {
+    if (this.#active) {
+      throw backendContractError("Receive-pack body parts must be consumed in order");
+    }
+    this.#active = true;
+    return new ReceivePackBodyPart(this, length);
+  }
+
+  async read(maxBytes: number): Promise<Uint8Array | null> {
+    const buffered = this.#buffer;
+    if (buffered !== undefined) {
+      this.#buffer = undefined;
+      return this.split(buffered, maxBytes);
+    }
+    const result = await this.#reader.read();
+    return result.done ? null : this.split(result.value, maxBytes);
+  }
+
+  async readExact(length: number): Promise<Uint8Array<ArrayBuffer>> {
+    if (this.#active) {
+      throw backendContractError("Receive-pack body part was not released");
+    }
+    const bytes = new Uint8Array(new ArrayBuffer(length));
+    let offset = 0;
+    while (offset < length) {
+      const chunk = await this.read(length - offset);
+      if (chunk === null) {
+        throw new GraftProtocolError(
+          400,
+          "invalid_receive_bundle_body",
+          "Receive-bundle body is truncated",
+        );
+      }
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return bytes;
+  }
+
+  finishPart(): void {
+    this.#active = false;
+  }
+
+  async requireEnd(): Promise<void> {
+    if (this.#active) {
+      throw backendContractError("Receive-pack body part was not released");
+    }
+    if ((await this.read(1)) !== null) {
+      throw new GraftProtocolError(
+        400,
+        "invalid_receive_pack_body",
+        "Receive-pack body contains trailing bytes",
+      );
+    }
+  }
+
+  release(): void {
+    this.#reader.releaseLock();
+  }
+
+  async abort(): Promise<void> {
+    try {
+      await this.#reader.cancel("receive-pack aborted");
+    } catch {
+      // Preserve the protocol or backend failure that aborted publication.
+    }
+    this.#reader.releaseLock();
+  }
+
+  private split(bytes: Uint8Array, maxBytes: number): Uint8Array {
+    if (bytes.byteLength <= maxBytes) return bytes;
+    this.#buffer = bytes.subarray(maxBytes);
+    return bytes.subarray(0, maxBytes);
+  }
+}
+
+class ReceivePackBodyPart {
+  readonly stream: ReadableStream<Uint8Array>;
+  readonly #source: ReceivePackBodySource;
+  #remaining: number;
+
+  constructor(source: ReceivePackBodySource, length: number) {
+    this.#source = source;
+    this.#remaining = length;
+    this.stream = new ReadableStream<Uint8Array>(
+      {
+        pull: async (controller) => await this.pull(controller),
+        cancel: () => undefined,
+      },
+      { highWaterMark: 0 },
+    );
+  }
+
+  async finish(created: boolean): Promise<void> {
+    if (this.#remaining !== 0 && this.stream.locked) {
+      throw backendContractError("Immutable backend retained the receive-pack body reader");
+    }
+    if (created && this.#remaining !== 0) {
+      throw backendContractError("Immutable backend did not consume the created object body");
+    }
+    while (this.#remaining !== 0) {
+      const bytes = await this.#source.read(this.#remaining);
+      if (bytes === null) this.truncated();
+      this.#remaining -= bytes.byteLength;
+    }
+    this.#source.finishPart();
+  }
+
+  private async pull(controller: ReadableStreamDefaultController<Uint8Array>): Promise<void> {
+    if (this.#remaining === 0) {
+      controller.close();
+      return;
+    }
+    const bytes = await this.#source.read(this.#remaining);
+    if (bytes === null) {
+      controller.error(
+        new GraftProtocolError(400, "invalid_receive_pack_body", "Receive-pack body is truncated"),
+      );
+      return;
+    }
+    this.#remaining -= bytes.byteLength;
+    controller.enqueue(bytes);
+    if (this.#remaining === 0) controller.close();
+  }
+
+  private truncated(): never {
+    throw new GraftProtocolError(
+      400,
+      "invalid_receive_pack_body",
+      "Receive-pack body is truncated",
+    );
+  }
 }
 
 async function compareAndSwap(
@@ -407,8 +700,4 @@ function objectNotFound(): GraftProtocolError {
 
 function backendContractError(message: string): GraftProtocolError {
   return new GraftProtocolError(500, "backend_contract_error", message);
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }

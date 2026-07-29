@@ -95,6 +95,7 @@ impl RepositoryCommandService {
 
     /// Executes one parsed repository command against the retained runtime.
     pub fn execute(&mut self, command: RepositoryCommand) -> Result<Option<String>, ErrCtx> {
+        self.credentials.reset_http_clients();
         let runtime = self.file.runtime().clone();
         command.command.eval(&runtime, &mut self.file)
     }

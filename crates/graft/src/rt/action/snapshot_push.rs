@@ -4,6 +4,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use bilrost::Message;
 use futures::{StreamExt, TryStreamExt, stream};
 use tokio::task::spawn_blocking;
 
@@ -21,7 +22,6 @@ use crate::{
 };
 
 const SEGMENT_EXISTS_CONCURRENCY: usize = 5;
-const SNAPSHOT_UPLOAD_CONCURRENCY: usize = 5;
 
 /// Publishes the commits and segments referenced by a snapshot to a remote,
 /// preserving the snapshot's original log IDs and LSNs.
@@ -35,68 +35,126 @@ pub struct SnapshotsPush {
     pub snapshots: Vec<Snapshot>,
 }
 
+#[derive(Debug)]
 struct SnapshotUpload {
     commit: Commit,
     segment: Option<(SegmentId, Vec<Bytes>)>,
 }
 
+#[derive(Debug, Default)]
+pub struct PreparedSnapshotPush {
+    uploads: Vec<SnapshotUpload>,
+    segment_bytes: u64,
+}
+
+impl PreparedSnapshotPush {
+    pub(crate) fn into_bundle_objects(
+        self,
+    ) -> crate::remote::Result<Vec<crate::remote::RemoteBundleObject>> {
+        let mut objects = Vec::new();
+        for upload in self.uploads {
+            if let Some((sid, chunks)) = upload.segment {
+                objects.push(crate::remote::RemoteBundleObject::new(
+                    format!("segments/{}", sid.serialize()),
+                    chunks,
+                    true,
+                )?);
+            }
+            let commit_path = format!(
+                "logs/{}/commits/{}",
+                upload.commit.log().serialize(),
+                crate::core::cbe::CBE64::from(upload.commit.lsn()),
+            );
+            objects.push(crate::remote::RemoteBundleObject::new(
+                commit_path,
+                [upload.commit.encode_to_bytes()],
+                false,
+            )?);
+        }
+        Ok(objects)
+    }
+
+    async fn publish(self, remote: Arc<Remote>) -> Result<()> {
+        let upload_trace = crate::trace::PushTraceSpan::new("sqlite_snapshot_http_upload");
+        let upload_concurrency = remote.snapshot_upload_concurrency();
+        let result = stream::iter(self.uploads)
+            .map(|upload| {
+                let remote = remote.clone();
+                async move { upload_snapshot_upload(remote, upload).await }
+            })
+            .buffer_unordered(upload_concurrency)
+            .try_collect()
+            .await;
+        if result.is_ok() {
+            upload_trace.finish(&[("segment_bytes", self.segment_bytes)]);
+        }
+        result
+    }
+}
+
 impl Action for SnapshotPush {
     async fn run(self, storage: Arc<FjallStorage>, remote: Arc<Remote>) -> Result<()> {
-        push_snapshots(storage, remote, vec![self.snapshot]).await
+        prepare_snapshots(storage, remote.clone(), vec![self.snapshot])
+            .await?
+            .publish(remote)
+            .await
     }
 }
 
 impl Action for SnapshotsPush {
     async fn run(self, storage: Arc<FjallStorage>, remote: Arc<Remote>) -> Result<()> {
-        push_snapshots(storage, remote, self.snapshots).await
+        prepare_snapshots(storage, remote.clone(), self.snapshots)
+            .await?
+            .publish(remote)
+            .await
     }
 }
 
-async fn push_snapshots(
+pub(crate) async fn prepare_snapshots(
     storage: Arc<FjallStorage>,
     remote: Arc<Remote>,
     snapshots: Vec<Snapshot>,
-) -> Result<()> {
+) -> Result<PreparedSnapshotPush> {
     if snapshots.is_empty() {
-        return Ok(());
+        return Ok(PreparedSnapshotPush::default());
     }
 
+    let collect_trace = crate::trace::PushTraceSpan::new("sqlite_snapshot_collect");
     let commits = spawn_blocking({
         let storage = storage.clone();
         move || collect_snapshots_commits(storage, snapshots)
     })
     .await
     .expect("snapshot upload commit collection task failed")?;
+    collect_trace.finish(&[("commits", commits.len() as u64)]);
+    let negotiation_trace = crate::trace::PushTraceSpan::new("sqlite_segment_negotiation");
     let existing_segments = if commits.len() > 1 {
         existing_remote_segments(remote.clone(), &commits).await?
     } else {
         BTreeSet::new()
     };
+    negotiation_trace.finish(&[("existing_segments", existing_segments.len() as u64)]);
+    let build_trace = crate::trace::PushTraceSpan::new("sqlite_snapshot_build");
     let uploads = spawn_blocking(move || build_uploads(storage, commits, existing_segments))
         .await
         .expect("snapshot upload build task failed")?;
+    let segment_bytes = uploads
+        .iter()
+        .filter_map(|upload| upload.segment.as_ref())
+        .flat_map(|(_, chunks)| chunks)
+        .map(|chunk| chunk.len() as u64)
+        .sum();
+    build_trace.finish(&[
+        ("uploads", uploads.len() as u64),
+        ("segment_bytes", segment_bytes),
+    ]);
 
-    stream::iter(uploads)
-        .map(|upload| {
-            let remote = remote.clone();
-            async move { upload_snapshot_upload(remote, upload).await }
-        })
-        .buffer_unordered(SNAPSHOT_UPLOAD_CONCURRENCY)
-        .try_collect()
-        .await
+    Ok(PreparedSnapshotPush { uploads, segment_bytes })
 }
 
 async fn upload_snapshot_upload(remote: Arc<Remote>, upload: SnapshotUpload) -> Result<()> {
     if let Some((sid, chunks)) = upload.segment {
-        let segment_remote = remote.clone();
-        let commit_remote = remote;
-        let (segment_result, commit_result) = tokio::join!(
-            async move { segment_remote.put_segment(&sid, chunks).await },
-            upload_snapshot_commit(commit_remote, upload.commit)
-        );
-        segment_result?;
-        commit_result?;
-        return Ok(());
+        remote.put_segment(&sid, chunks).await?;
     }
 
     upload_snapshot_commit(remote, upload.commit).await

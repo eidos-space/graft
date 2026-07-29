@@ -24,7 +24,7 @@ const {
 } = require("..")
 
 test("exposes ABI-stable SDK metadata and materialization contract", () => {
-  assert.equal(sdkVersion(), "0.1.0")
+  assert.equal(sdkVersion(), "0.2.0")
   for (const operation of ["restore", "pull", "cloneRepository"]) {
     assert.equal(operationMaterializesWorktree(operation), true)
   }
