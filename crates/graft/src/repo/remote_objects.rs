@@ -187,11 +187,14 @@ impl Repository {
         head: &str,
         stop_at: Option<&str>,
     ) -> Result<usize> {
+        let negotiation_trace = crate::trace::PushTraceSpan::new("object_negotiation");
         let remote_objects = if stop_at.is_some() {
             BTreeSet::new()
         } else {
             self.remote_object_ids(remote)?
         };
+        negotiation_trace.finish(&[("remote_objects", remote_objects.len() as u64)]);
+        let discovery_trace = crate::trace::PushTraceSpan::new("object_discovery_and_hash");
         let stop_commits = stop_at
             .map(|id| self.commit_ancestors_inclusive(id))
             .transpose()?
@@ -245,8 +248,20 @@ impl Repository {
         }
 
         let count = commits.len();
+        let object_count = objects.len() as u64;
+        let external_count = external_payloads.len() as u64;
+        let external_bytes = external_payloads.values().copied().sum();
+        discovery_trace.finish(&[
+            ("commits", count as u64),
+            ("objects", object_count),
+            ("external_payloads", external_count),
+        ]);
+        let large_file_trace = crate::trace::PushTraceSpan::new("large_file_upload");
         self.push_large_file_contents(remote, external_payloads)?;
+        large_file_trace.finish(&[("objects", external_count), ("bytes", external_bytes)]);
+        let pack_trace = crate::trace::PushTraceSpan::new("object_pack_upload");
         self.push_object_pack(remote, objects)?;
+        pack_trace.finish(&[("objects", object_count)]);
         Ok(count)
     }
 

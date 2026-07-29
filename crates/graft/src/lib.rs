@@ -20,6 +20,7 @@ pub mod remote;
 pub mod repo;
 pub mod setup;
 pub mod snapshot;
+pub mod trace;
 pub mod volume;
 pub mod volume_reader;
 pub mod volume_writer;
