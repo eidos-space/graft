@@ -207,6 +207,63 @@ is material when the protocol performs several serialized requests. The
 remote-dev probe was stopped, its temporary source was deleted, and the
 Cloudflare API confirmed that no persistent probe Worker exists.
 
+## Git-style receive-pack round
+
+The next optimization follows Git smart HTTP's publish shape: advertise/read
+the current ref, send the new pack, and update the ref as one receive operation.
+Graft v1 now advertises an optional `receive-pack` capability. A supporting
+Remote accepts the object pack and index in one length-delimited stream, writes
+both immutable objects in order, and performs the ref compare-and-swap only
+after both writes succeed. A client that receives a protocol-valid `404` or
+`405` drains the response and falls back to the original pack PUT, index PUT,
+and CAS sequence.
+
+Only the staging Sync Worker was deployed for this round. Version
+`2da2d1b4-c851-42db-8b7c-6fe010871021` passed an authenticated
+provision/push/clone/content/usage round trip before measurement. The following
+fresh-Remote matrix was measured from Shanghai on 2026-07-30. Incremental cells
+are 10 runs; first push is one run.
+
+| Mode | First | No-op p50/p95 | Text p50/p95 | SQLite row p50/p95 | 256 KiB p50/p95 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| CLI cold | 7.632 s | 1.728/2.344 s | 3.897/4.994 s | 6.002/8.203 s | 5.503/7.105 s |
+| SDK cold | 7.377 s | 1.893/2.344 s | 4.053/5.293 s | 5.572/6.803 s | 5.738/7.901 s |
+| SDK resident | 6.782 s | 1.250/2.392 s | 3.530/4.192 s | 5.107/7.426 s | 5.039/8.972 s |
+
+Against the immediately preceding staging matrix, CLI text improved 49.9% at
+p50 and 68.3% at p95. CLI SQLite-row improved 13.7%/17.1%, and the 256 KiB case
+improved 6.5%/21.8%. CLI no-op, whose request path is unchanged, moved only
+1.0% at p50 and regressed 2.3% at p95. Resident SDK text improved 8.4%/0.4%
+and SQLite-row improved 2.3%/8.3%. Resident no-op and 256 KiB p95 regressed by
+60.3% and 61.4% respectively despite improved p50, which is evidence of
+staging/network variance rather than a claim of uniformly controlled tail
+latency.
+
+| Case | Requests before/after | Request bytes p50 | Push p50 | HTTP client sum | Worker total sum | Client-edge remainder |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| No-op | 1 / 1 | 0 B | 1.250 s | 1.244 s | 0.124 s | 1.120 s (90.0%) |
+| Text | 4 / 2 | 1,441 B | 3.530 s | 3.512 s | 1.211 s | 2.301 s (65.5%) |
+| SQLite row | 6 / 4 | 2,031 B | 5.107 s | 5.083 s | 2.249 s | 2.834 s (55.8%) |
+| 256 KiB | 5 / 3 | 264,514 B | 5.039 s | 5.008 s | 1.672 s | 3.336 s (66.6%) |
+
+The byte count is effectively unchanged; the measured win comes from removing
+two serialized HTTP/auth/directory/Worker invocations. SQLite still performs a
+segment PUT and storage-commit PUT before receive-pack, and external large-file
+content still has its own PUT. Extending the streamed immutable-object bundle
+to those object classes is the next Git-like request-fan-out reduction, but it
+requires a generic framed manifest and must retain segment-before-commit and
+ref-last publication semantics.
+
+The post-change local `fs://` control remains within the existing budget. A
+separate resident rerun was used after the full-matrix 256 KiB cell encountered
+a local scheduling outlier.
+
+| Mode | First | No-op p50/p95 | Text p50/p95 | SQLite row p50/p95 | 256 KiB p50/p95 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| CLI cold | 472.0 ms | 437.9/460.0 ms | 452.1/483.8 ms | 474.8/489.9 ms | 466.1/477.2 ms |
+| SDK cold | 470.8 ms | 422.1/443.9 ms | 454.2/700.2 ms | 459.2/477.9 ms | 455.7/462.8 ms |
+| SDK resident rerun | 33.7 ms | 1.5/1.8 ms | 23.5/27.6 ms | 37.5/40.3 ms | 37.9/39.2 ms |
+
 ## Implemented client changes
 
 - `RemoteCredentials` now lazily shares dedicated read/control and
@@ -237,6 +294,10 @@ Cloudflare API confirmed that no persistent probe Worker exists.
   and aggregates median/p95, requests, bytes, and client/server timing. It can
   select a target/mode, emits only safe worker progress, and reports the last
   case/run/operation on failure.
+- HTTP publication uses the optional `receive-pack` capability when advertised:
+  pack, index, and final ref CAS share one request body and one Worker
+  invocation. Protocol-valid old Remotes continue to work through automatic
+  `404`/`405` fallback.
 
 ## Implemented staging changes
 
@@ -255,10 +316,16 @@ Cloudflare API confirmed that no persistent probe Worker exists.
 - Unexpected failures are logged by fixed operation class. Raw error text,
   repository/object paths, request URLs, bearer data, and user identifiers are
   excluded in both the protocol package and the staging application.
+- Receive-pack splits the request stream into bounded pack and index
+  substreams. Cloudflare `FixedLengthStream` preserves direct streaming into R2;
+  truncated or trailing bodies abort before ref publication, existing immutable
+  objects are idempotent, and quota accounting uses each object's declared
+  length rather than the combined request length.
 
-The public Remote protocol is unchanged. Immutable writes still use create-only
-semantics; packs still publish before indexes; refs still publish last using a
-compare-and-swap in the repository Durable Object.
+The public Remote protocol remains backward compatible through an optional v1
+capability. Immutable writes still use create-only semantics; packs still
+publish before indexes; refs still publish last using a compare-and-swap in the
+repository Durable Object.
 
 ## Staging architecture and rollback
 
@@ -278,11 +345,11 @@ benchmark data. The management API currently has no repository-delete endpoint,
 so their tens of MiB of R2/metadata data could not be removed safely. The cost
 is small but nonzero; adding an authenticated staging cleanup API is a follow-up.
 
-Current staging Sync deployment: `57ee312a-dccf-4aa1-b00b-1edcd796505b`.
+Current staging Sync deployment: `2da2d1b4-c851-42db-8b7c-6fe010871021`.
 Current staging identity deployment:
 `e6011c7d-433d-44b3-b605-97333ff29a55`.
 The immediately prior Sync deployment is
-`7c2003fb-f781-4cdb-837c-475440b51d26`.
+`57ee312a-dccf-4aa1-b00b-1edcd796505b`.
 The safe-timing deployment before error-log hardening is
 `922a7ab3-bc2d-4650-bce6-6d43312512be`. The object-write-only optimized deployment is
 `f2c958bf-d10f-4960-9d7d-2d1aabbd1d6e`. The full pre-change Sync deployment is
@@ -292,8 +359,8 @@ Rollback only the Sync Worker, from the Eidos repository:
 
 ```sh
 pnpm --dir apps/graft-remote exec wrangler rollback \
-  7c2003fb-f781-4cdb-837c-475440b51d26 \
-  --env staging -m 'Rollback Sync performance changes'
+  57ee312a-dccf-4aa1-b00b-1edcd796505b \
+  --env staging -m 'Rollback receive-pack staging deployment'
 ```
 
 Use `f2c958bf-d10f-4960-9d7d-2d1aabbd1d6e` to remove timing and log hardening
@@ -316,7 +383,7 @@ The following passed after the changes:
 
 - `just test`: 590 repository tests, 81 vendor doc tests, one Graft doc test,
   and all SQL integration scripts on the integrated topic branch;
-- final focused suites: 196 Graft core tests plus its doc test and 73
+- final focused suites: 198 Graft core tests plus its doc test and 73
   `graft-sqlite` library tests;
 - 17 focused HTTP Remote tests, including within-command reuse, command-boundary
   pool reset, read/upload pool isolation, missing-body drain, exact content
@@ -326,12 +393,15 @@ The following passed after the changes:
 - clone, fetch, pull, multi-file/workspace, force-push, non-fast-forward,
   snapshot integrity, and SQLite row-diff/merge tests in the full suite;
 - eight native `RepositorySession` SDK tests;
-- 14 staging Worker tests plus TypeScript checking;
-- all seven core protocol, one Hono adapter, and nine Cloudflare adapter tests;
+- 15 staging Worker tests plus TypeScript checking;
+- all nine core protocol, one Hono adapter, and nine Cloudflare adapter tests;
 - staging smoke verification and a real authenticated CLI provision/push/clone/
   content/commit/usage round trip;
 - the final 10-run resident staging matrix, including recovery from the
   previously reproducible cross-command timeout.
+- receive-pack request framing, exact concatenated bodies, old-Remote fallback,
+  duplicate immutable retry, quota delta, truncated-body ref safety, and direct
+  R2 streaming tests.
 
 `cargo fmt --all -- --check`, `cargo check --workspace --all-targets`, and
 targeted Clippy with `--no-deps` pass. Whole-workspace Clippy remains blocked by
@@ -362,11 +432,11 @@ Remaining risks and follow-ups:
 - Geographic latency is material in the isolated two-path probe. The full
   authenticated push matrix was measured only from Shanghai; run it from a
   second authenticated client region before changing storage placement.
-- The public protocol still requires several serialized publications for an
-  incremental change. If warm-session p95 misses budget after these changes,
-  as it does here, the next measured optimization should be an optional batch
-  negotiation/write extension with fallback to protocol v1, not weaker CAS or
-  publication order.
+- The optional receive-pack extension removes two serialized publications, but
+  SQLite and external payloads remain outside its object bundle. If
+  warm-session p95 misses budget after these changes, as it does here, the next
+  measured optimization should generalize the framed immutable-object bundle
+  with fallback to base protocol v1, not weaken CAS or publication order.
 - Short-lived server-side authorization or directory caching could save tens
   to hundreds of milliseconds per push, but entitlement revocation and
   repository deletion semantics must be specified before adding it. It will not
