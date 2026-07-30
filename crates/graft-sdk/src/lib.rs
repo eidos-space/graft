@@ -6,13 +6,14 @@
 
 use std::{
     collections::BTreeMap,
-    fs,
+    fs::{self, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU8, Ordering},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-use graft::remote::{RemoteCredentialErr, RemoteCredentials};
+use graft::remote::{RemoteConfig, RemoteCredentialErr, RemoteCredentials};
 pub use graft::repo::CancellationToken;
 use graft::repo::{CommitArtifactState, CommitFileState, RepoStatus, Repository, index::Index};
 use graft_sqlite::{
@@ -35,6 +36,11 @@ const MAX_DIFF_PATH_REQUEST_SIZE: usize = 10_000;
 const MAX_BATCH_MUTATION_PATHS: usize = 1_000;
 const MAX_INVENTORY_PAGE_SIZE: usize = 1_000;
 const MAX_IGNORE_QUERY_PATHS: usize = 1_000;
+// Bump whenever persisted path classification semantics change.
+const STATUS_SNAPSHOT_SCHEMA_VERSION: u32 = 2;
+const MAX_STATUS_SNAPSHOTS: usize = 4;
+const STATUS_SNAPSHOT_MAX_BYTES: u64 = 256 * 1024 * 1024;
+const WORKTREE_STABILITY_ATTEMPTS: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -56,6 +62,7 @@ pub enum SdkErrorCode {
     Cancelled,
     InvalidArgument,
     InvalidResponse,
+    RepositoryStale,
     RepositoryCommand,
 }
 
@@ -70,6 +77,7 @@ impl SdkErrorCode {
             Self::Cancelled => "GRAFT_SDK_CANCELLED",
             Self::InvalidArgument => "GRAFT_SDK_INVALID_ARGUMENT",
             Self::InvalidResponse => "GRAFT_SDK_INVALID_RESPONSE",
+            Self::RepositoryStale => "GRAFT_SDK_REPOSITORY_STALE",
             Self::RepositoryCommand => "GRAFT_SDK_REPOSITORY_COMMAND",
         }
     }
@@ -111,6 +119,9 @@ pub struct StatusTelemetry {
     pub metadata_cache_misses: usize,
     pub tree_cache_hit: bool,
     pub status_cache_hit: bool,
+    pub persistent_snapshot_hit: bool,
+    pub persistent_snapshot_saved: bool,
+    pub stability_retries: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -243,6 +254,44 @@ pub struct IgnoredPathsResult {
     pub telemetry: IgnoredPathsTelemetry,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepositoryMetadataTelemetry {
+    pub duration_us: u64,
+    pub paths_examined: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepositoryMetadataResult {
+    pub current_head: Option<String>,
+    pub current_branch: Option<String>,
+    pub upstream: Option<graft::repo::BranchUpstream>,
+    pub repository_format_version: u32,
+    pub object_format: String,
+    pub telemetry: RepositoryMetadataTelemetry,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SafeRemoteKind {
+    Memory,
+    Fs,
+    S3Compatible,
+    Http,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SafeRemoteInfo {
+    pub name: String,
+    pub kind: SafeRemoteKind,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListRemotesResult {
+    pub remotes: Vec<SafeRemoteInfo>,
+    pub telemetry: RepositoryMetadataTelemetry,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RepositoryOperation {
@@ -262,6 +311,8 @@ pub enum RepositoryOperation {
     IsIgnoredPath,
     IsIgnoredPaths,
     Inventory,
+    RepositoryMetadata,
+    ListRemotes,
     Restore,
     RestorePaths,
     RemoteConfigure,
@@ -381,7 +432,7 @@ struct SessionState {
     status_cache: IncrementalStatusCache,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct FileFingerprint {
     is_file: bool,
     len: u64,
@@ -396,7 +447,7 @@ struct FileFingerprint {
     changed_nanoseconds: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct TrackedFingerprint {
     main: Option<FileFingerprint>,
     wal: Option<FileFingerprint>,
@@ -418,6 +469,24 @@ struct IncrementalStatusCache {
     generation: u64,
     ignore_matcher: Option<graft::repo::RepoIgnoreMatcher>,
     tracked_ignored_paths: Option<Vec<String>>,
+    persistent_snapshot_attempted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedStatusSnapshot {
+    schema_version: u32,
+    repository_format_version: u32,
+    object_format: String,
+    repository_metadata_fingerprint: String,
+    ignore_source_fingerprint: String,
+    head_target: Option<String>,
+    index: Index,
+    files: BTreeMap<String, CommitFileState>,
+    artifacts: BTreeMap<String, CommitArtifactState>,
+    tracked_fingerprints: BTreeMap<String, TrackedFingerprint>,
+    untracked_fingerprints: BTreeMap<String, FileFingerprint>,
+    status: RepoStatus,
+    generation: u64,
 }
 
 impl IncrementalStatusCache {
@@ -595,6 +664,58 @@ impl RepositorySession {
         })
     }
 
+    /// Reads ref and repository format metadata without classifying the worktree.
+    pub fn repository_metadata(&self) -> Result<RepositoryMetadataResult> {
+        let started = Instant::now();
+        self.with_service(|service| {
+            graft::repo::cancellation_checkpoint().map_err(repo_error)?;
+            let repo = service.repository().map_err(repository_command_error)?;
+            let current_head = repo.head_target().map_err(repo_error)?;
+            let current_branch = repo.current_branch().map_err(repo_error)?;
+            let upstream = current_branch
+                .as_deref()
+                .map(|branch| repo.branch_upstream(branch))
+                .transpose()
+                .map_err(repo_error)?
+                .flatten();
+            let config = repo.config().map_err(repo_error)?;
+            graft::repo::cancellation_checkpoint().map_err(repo_error)?;
+            Ok(RepositoryMetadataResult {
+                current_head,
+                current_branch,
+                upstream,
+                repository_format_version: config.core.repository_format_version,
+                object_format: config.extensions.object_format,
+                telemetry: RepositoryMetadataTelemetry {
+                    duration_us: elapsed_us(started),
+                    paths_examined: 0,
+                },
+            })
+        })
+    }
+
+    /// Returns credential-free remote configuration without classifying the worktree.
+    pub fn list_remotes(&self) -> Result<ListRemotesResult> {
+        let started = Instant::now();
+        self.with_service(|service| {
+            graft::repo::cancellation_checkpoint().map_err(repo_error)?;
+            let repo = service.repository().map_err(repository_command_error)?;
+            let mut remotes = Vec::new();
+            for remote in repo.remotes().map_err(repo_error)? {
+                graft::repo::cancellation_checkpoint().map_err(repo_error)?;
+                let (kind, url) = safe_remote_projection(&remote.config);
+                remotes.push(SafeRemoteInfo { name: remote.name, kind, url });
+            }
+            Ok(ListRemotesResult {
+                remotes,
+                telemetry: RepositoryMetadataTelemetry {
+                    duration_us: elapsed_us(started),
+                    paths_examined: 0,
+                },
+            })
+        })
+    }
+
     pub fn add_all(&self) -> Result<Value> {
         self.execute_json_mutating("json_add", Some("--all"))
     }
@@ -761,12 +882,6 @@ impl RepositorySession {
         let mut results = Vec::with_capacity(paths.len());
         for path in paths {
             graft::repo::cancellation_checkpoint().map_err(repo_error)?;
-            let physical = self.target.parent().unwrap_or(&self.target).join(&path);
-            if fs::symlink_metadata(&physical).is_ok_and(|metadata| metadata.file_type().is_dir()) {
-                return Err(invalid_argument(format!(
-                    "diff path `{path}` is a directory; provide explicit changed file paths"
-                )));
-            }
             let diff = self.diff(&DiffOptions {
                 rows: options.rows,
                 root: options.root.clone(),
@@ -1281,15 +1396,7 @@ impl RepositorySession {
 
     fn command_error(&self, error: ErrCtx) -> SdkError {
         let message = self.credentials.redact(&error.to_string());
-        let lowercase = message.to_ascii_lowercase();
-        let code = if lowercase.contains("locked")
-            || lowercase.contains("database lock")
-            || lowercase.contains("already held")
-        {
-            SdkErrorCode::RepositoryBusy
-        } else {
-            SdkErrorCode::RepositoryCommand
-        };
+        let code = sdk_error_code_for_message(&message);
         SdkError::new(code, message)
     }
 
@@ -1344,10 +1451,44 @@ fn refresh_incremental_status(
     service: &mut RepositoryCommandService,
     cache: &mut IncrementalStatusCache,
 ) -> Result<IncrementalStatusResult> {
+    for attempt in 0..WORKTREE_STABILITY_ATTEMPTS {
+        match refresh_incremental_status_once(service, cache) {
+            Ok(mut result) => {
+                result.telemetry.stability_retries = attempt;
+                return Ok(result);
+            }
+            Err(error)
+                if error.code() == SdkErrorCode::RepositoryStale
+                    && attempt + 1 < WORKTREE_STABILITY_ATTEMPTS =>
+            {
+                cache.invalidate();
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("bounded status stability loop always returns")
+}
+
+fn refresh_incremental_status_once(
+    service: &mut RepositoryCommandService,
+    cache: &mut IncrementalStatusCache,
+) -> Result<IncrementalStatusResult> {
     let started = Instant::now();
     let repo = service.repository().map_err(repository_command_error)?;
     let head_target = repo.head_target().map_err(repo_error)?;
     let index = repo.read_index().map_err(repo_error)?;
+    let persistent_snapshot_hit = if cache.persistent_snapshot_attempted {
+        false
+    } else {
+        cache.persistent_snapshot_attempted = true;
+        match load_persistent_status_snapshot(&repo, cache, &head_target, &index) {
+            Ok(hit) => hit,
+            Err(error) => {
+                cache.persistent_snapshot_attempted = false;
+                return Err(error);
+            }
+        }
+    };
     let index_changed = !cache.index_metadata_initialized || cache.index != index;
     if index_changed {
         cache.tracked_ignored_paths = None;
@@ -1356,8 +1497,11 @@ fn refresh_incremental_status(
     let same_repository_state = cache.initialized && tree_cache_hit && cache.index == index;
 
     if same_repository_state {
-        let tracked = tracked_fingerprints(&repo, &cache.files, &cache.artifacts)?;
-        let untracked = visible_untracked_fingerprints(&repo, &cache.files, &cache.artifacts)?;
+        let (tracked, untracked) = if persistent_snapshot_hit {
+            stable_worktree_fingerprints(&repo, &cache.files, &cache.artifacts)?
+        } else {
+            worktree_fingerprints(&repo, &cache.files, &cache.artifacts)?
+        };
         let metadata_cache_hits = matching_fingerprint_count(&cache.tracked_fingerprints, &tracked)
             + matching_fingerprint_count(&cache.untracked_fingerprints, &untracked);
         let paths_examined = tracked.len() + untracked.len();
@@ -1377,20 +1521,45 @@ fn refresh_incremental_status(
                     metadata_cache_misses: 0,
                     tree_cache_hit,
                     status_cache_hit: true,
+                    persistent_snapshot_hit,
+                    persistent_snapshot_saved: false,
+                    stability_retries: 0,
                 },
             ));
         }
     }
 
     let previous_status = cache.status.clone();
+    let before_files = repo.index_files().map_err(repo_error)?;
+    let before_artifacts = repo.index_artifacts().map_err(repo_error)?;
+    let (before_tracked, before_untracked) =
+        worktree_fingerprints(&repo, &before_files, &before_artifacts)?;
     let status = service.status().map_err(repository_command_error)?;
-    if !same_repository_state {
-        cache.files = repo.index_files().map_err(repo_error)?;
-        cache.artifacts = repo.index_artifacts().map_err(repo_error)?;
+    let after_head = repo.head_target().map_err(repo_error)?;
+    let after_index = repo.read_index().map_err(repo_error)?;
+    if after_head != head_target || after_index != index {
+        return Err(repository_stale_error(
+            "repository refs or index changed while status was being collected",
+        ));
     }
-    cache.tracked_fingerprints = tracked_fingerprints(&repo, &cache.files, &cache.artifacts)?;
-    cache.untracked_fingerprints =
-        visible_untracked_fingerprints(&repo, &cache.files, &cache.artifacts)?;
+    cache.files = repo.index_files().map_err(repo_error)?;
+    cache.artifacts = repo.index_artifacts().map_err(repo_error)?;
+    let (tracked, untracked) = stable_worktree_fingerprints(&repo, &cache.files, &cache.artifacts)?;
+    if before_files != cache.files
+        || before_artifacts != cache.artifacts
+        || !worktree_fingerprint_shapes_equal(
+            &before_tracked,
+            &before_untracked,
+            &tracked,
+            &untracked,
+        )
+    {
+        return Err(repository_stale_error(
+            "worktree changed while status was being collected",
+        ));
+    }
+    cache.tracked_fingerprints = tracked;
+    cache.untracked_fingerprints = untracked;
     cache.head_target = head_target;
     cache.index = index;
     cache.index_metadata_initialized = true;
@@ -1400,6 +1569,11 @@ fn refresh_incremental_status(
     }
     cache.status = Some(status.clone());
     let paths_examined = cache.tracked_fingerprints.len() + cache.untracked_fingerprints.len();
+    let persistent_snapshot_saved = match persist_status_snapshot(&repo, cache) {
+        Ok(saved) => saved,
+        Err(error) if error.code() == SdkErrorCode::Cancelled => return Err(error),
+        Err(_) => false,
+    };
     Ok(incremental_status_result(
         cache,
         status,
@@ -1411,6 +1585,9 @@ fn refresh_incremental_status(
             metadata_cache_misses: paths_examined,
             tree_cache_hit,
             status_cache_hit: false,
+            persistent_snapshot_hit: false,
+            persistent_snapshot_saved,
+            stability_retries: 0,
         },
     ))
 }
@@ -1423,9 +1600,12 @@ fn incremental_status_result(
 ) -> IncrementalStatusResult {
     telemetry.duration_us = elapsed_us(started);
     let head = cache.head_target.as_deref().unwrap_or("unborn");
+    let status_digest = serde_json::to_vec(&status)
+        .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
+        .unwrap_or_else(|_| "unavailable".to_string());
     IncrementalStatusResult {
         generation: cache.generation,
-        change_token: format!("{head}:{}", cache.generation),
+        change_token: format!("{head}:{}:{status_digest}", cache.generation),
         status,
         telemetry,
     }
@@ -1447,6 +1627,72 @@ fn legacy_status_value(status: RepoStatus, current_branch: Option<String>) -> Re
         object.insert("current_branch".to_string(), Value::String(current_branch));
     }
     Ok(value)
+}
+
+fn stable_worktree_fingerprints(
+    repo: &Repository,
+    files: &BTreeMap<String, CommitFileState>,
+    artifacts: &BTreeMap<String, CommitArtifactState>,
+) -> Result<(
+    BTreeMap<String, TrackedFingerprint>,
+    BTreeMap<String, FileFingerprint>,
+)> {
+    let first = worktree_fingerprints(repo, files, artifacts)?;
+    let second = worktree_fingerprints(repo, files, artifacts)?;
+    if !worktree_fingerprint_shapes_equal(&first.0, &first.1, &second.0, &second.1) {
+        return Err(repository_stale_error(
+            "worktree changed while path metadata was being sampled",
+        ));
+    }
+    Ok(second)
+}
+
+fn worktree_fingerprint_shapes_equal(
+    first_tracked: &BTreeMap<String, TrackedFingerprint>,
+    first_untracked: &BTreeMap<String, FileFingerprint>,
+    second_tracked: &BTreeMap<String, TrackedFingerprint>,
+    second_untracked: &BTreeMap<String, FileFingerprint>,
+) -> bool {
+    first_tracked.len() == second_tracked.len()
+        && first_tracked.iter().all(|(key, first)| {
+            second_tracked.get(key).is_some_and(|second| {
+                optional_fingerprint_shape_equal(&first.main, &second.main)
+                    && optional_fingerprint_shape_equal(&first.wal, &second.wal)
+                    && optional_fingerprint_shape_equal(&first.shm, &second.shm)
+                    && optional_fingerprint_shape_equal(&first.journal, &second.journal)
+            })
+        })
+        && first_untracked.len() == second_untracked.len()
+        && first_untracked.iter().all(|(key, first)| {
+            second_untracked
+                .get(key)
+                .is_some_and(|second| first.is_file == second.is_file)
+        })
+}
+
+fn optional_fingerprint_shape_equal(
+    first: &Option<FileFingerprint>,
+    second: &Option<FileFingerprint>,
+) -> bool {
+    match (first, second) {
+        (None, None) => true,
+        (Some(first), Some(second)) => first.is_file == second.is_file,
+        _ => false,
+    }
+}
+
+fn worktree_fingerprints(
+    repo: &Repository,
+    files: &BTreeMap<String, CommitFileState>,
+    artifacts: &BTreeMap<String, CommitArtifactState>,
+) -> Result<(
+    BTreeMap<String, TrackedFingerprint>,
+    BTreeMap<String, FileFingerprint>,
+)> {
+    Ok((
+        tracked_fingerprints(repo, files, artifacts)?,
+        visible_untracked_fingerprints(repo, files, artifacts)?,
+    ))
 }
 
 fn tracked_fingerprints(
@@ -1520,13 +1766,346 @@ fn system_time_ns(time: SystemTime) -> Option<u128> {
         .map(|value| value.as_nanos())
 }
 
+fn load_persistent_status_snapshot(
+    repo: &Repository,
+    cache: &mut IncrementalStatusCache,
+    head_target: &Option<String>,
+    index: &Index,
+) -> Result<bool> {
+    graft::repo::cancellation_checkpoint().map_err(repo_error)?;
+    let repository_metadata_fingerprint = repository_metadata_fingerprint(repo, index)?;
+    let ignore_source_fingerprint = ignore_source_fingerprint(repo)?;
+    let directory = status_snapshot_directory(repo);
+    let mut candidates = match fs::read_dir(&directory) {
+        Ok(entries) => entries
+            .filter_map(std::result::Result::ok)
+            .filter_map(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                (name.starts_with("classification-v1-") && name.ends_with(".json"))
+                    .then(|| entry.path())
+            })
+            .collect::<Vec<_>>(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Ok(false),
+    };
+    candidates.sort_by_key(|path| {
+        fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(UNIX_EPOCH)
+    });
+    for path in candidates.into_iter().rev().take(MAX_STATUS_SNAPSHOTS) {
+        graft::repo::cancellation_checkpoint().map_err(repo_error)?;
+        let Ok(metadata) = fs::metadata(&path) else {
+            continue;
+        };
+        if metadata.len() > STATUS_SNAPSHOT_MAX_BYTES {
+            continue;
+        }
+        let Ok(bytes) = fs::read(&path) else {
+            continue;
+        };
+        if !snapshot_filename_matches(&path, &bytes) {
+            continue;
+        }
+        let Ok(mut snapshot) = serde_json::from_slice::<PersistedStatusSnapshot>(&bytes) else {
+            continue;
+        };
+        if snapshot.schema_version != STATUS_SNAPSHOT_SCHEMA_VERSION
+            || snapshot.repository_format_version != graft::repo::REPOSITORY_FORMAT_VERSION
+            || snapshot.object_format != graft::repo::OBJECT_FORMAT
+            || snapshot.repository_metadata_fingerprint != repository_metadata_fingerprint
+            || snapshot.ignore_source_fingerprint != ignore_source_fingerprint
+            || &snapshot.head_target != head_target
+            || &snapshot.index != index
+        {
+            continue;
+        }
+        snapshot.status.worktree = repo.worktree().to_path_buf();
+        snapshot.status.graft_dir = repo.graft_dir().to_path_buf();
+        cache.initialized = true;
+        cache.index_metadata_initialized = true;
+        cache.head_target = snapshot.head_target;
+        cache.index = snapshot.index;
+        cache.files = snapshot.files;
+        cache.artifacts = snapshot.artifacts;
+        cache.tracked_fingerprints = snapshot.tracked_fingerprints;
+        cache.untracked_fingerprints = snapshot.untracked_fingerprints;
+        cache.status = Some(snapshot.status);
+        cache.generation = snapshot.generation;
+        cache.ignore_matcher = None;
+        cache.tracked_ignored_paths = None;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn persist_status_snapshot(repo: &Repository, cache: &IncrementalStatusCache) -> Result<bool> {
+    graft::repo::cancellation_checkpoint().map_err(repo_error)?;
+    let Some(status) = cache.status.as_ref() else {
+        return Ok(false);
+    };
+    let mut status = status.clone();
+    status.worktree = PathBuf::new();
+    status.graft_dir = PathBuf::new();
+    let snapshot = PersistedStatusSnapshot {
+        schema_version: STATUS_SNAPSHOT_SCHEMA_VERSION,
+        repository_format_version: graft::repo::REPOSITORY_FORMAT_VERSION,
+        object_format: graft::repo::OBJECT_FORMAT.to_string(),
+        repository_metadata_fingerprint: repository_metadata_fingerprint(repo, &cache.index)?,
+        ignore_source_fingerprint: ignore_source_fingerprint(repo)?,
+        head_target: cache.head_target.clone(),
+        index: cache.index.clone(),
+        files: cache.files.clone(),
+        artifacts: cache.artifacts.clone(),
+        tracked_fingerprints: cache.tracked_fingerprints.clone(),
+        untracked_fingerprints: cache.untracked_fingerprints.clone(),
+        status,
+        generation: cache.generation,
+    };
+    let bytes = serde_json::to_vec(&snapshot).map_err(status_encode_error)?;
+    if bytes.len() as u64 > STATUS_SNAPSHOT_MAX_BYTES {
+        return Ok(false);
+    }
+    graft::repo::cancellation_checkpoint().map_err(repo_error)?;
+    let directory = status_snapshot_directory(repo);
+    fs::create_dir_all(&directory).map_err(|error| repository_command_error(error.into()))?;
+    let digest = blake3::hash(&bytes).to_hex().to_string();
+    let final_path = directory.join(format!("classification-v1-{digest}.json"));
+    if final_path.exists() {
+        return Ok(true);
+    }
+    for attempt in 0..100 {
+        let tmp_path = directory.join(format!(
+            ".classification-v1-{}-{}-{attempt}.tmp",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos())
+        ));
+        let mut file = match OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&tmp_path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(repository_command_error(error.into())),
+        };
+        let write_result = (|| -> std::io::Result<()> {
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            Ok(())
+        })();
+        if let Err(error) = write_result {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(repository_command_error(error.into()));
+        }
+        if let Err(error) = graft::repo::cancellation_checkpoint() {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(repo_error(error));
+        }
+        match fs::rename(&tmp_path, &final_path) {
+            Ok(()) => {}
+            Err(_error) if final_path.exists() => {
+                let _ = fs::remove_file(&tmp_path);
+            }
+            Err(error) => {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(repository_command_error(error.into()));
+            }
+        }
+        let _ = fs::File::open(&directory).and_then(|directory| directory.sync_all());
+        prune_status_snapshots(&directory, &final_path);
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn status_snapshot_directory(repo: &Repository) -> PathBuf {
+    repo.graft_dir().join("cache").join("sdk-status")
+}
+
+fn snapshot_filename_matches(path: &Path, bytes: &[u8]) -> bool {
+    let expected = format!("classification-v1-{}.json", blake3::hash(bytes).to_hex());
+    path.file_name()
+        .is_some_and(|name| name == expected.as_str())
+}
+
+fn prune_status_snapshots(directory: &Path, keep: &Path) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    let mut snapshots = entries
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name().is_some_and(|name| {
+                let name = name.to_string_lossy();
+                name.starts_with("classification-v1-") && name.ends_with(".json")
+            })
+        })
+        .collect::<Vec<_>>();
+    snapshots.sort_by_key(|path| {
+        fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(UNIX_EPOCH)
+    });
+    let remove_count = snapshots.len().saturating_sub(MAX_STATUS_SNAPSHOTS);
+    for path in snapshots.into_iter().take(remove_count) {
+        if path != keep {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn repository_metadata_fingerprint(repo: &Repository, index: &Index) -> Result<String> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&STATUS_SNAPSHOT_SCHEMA_VERSION.to_le_bytes());
+    hasher.update(&graft::repo::REPOSITORY_FORMAT_VERSION.to_le_bytes());
+    hasher.update(graft::repo::OBJECT_FORMAT.as_bytes());
+    hash_serialized(&mut hasher, index)?;
+    hash_serialized(&mut hasher, &repo.config().map_err(repo_error)?)?;
+    hash_serialized(&mut hasher, &repo.head_target().map_err(repo_error)?)?;
+    hash_serialized(&mut hasher, &repo.current_branch().map_err(repo_error)?)?;
+    for name in ["HEAD", "MERGE_HEAD", "ORIG_HEAD", "config.toml"] {
+        hash_optional_file(&mut hasher, repo.graft_dir(), &repo.graft_dir().join(name))?;
+    }
+    hash_metadata_tree(
+        &mut hasher,
+        repo.graft_dir(),
+        &repo.graft_dir().join("refs"),
+    )?;
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn ignore_source_fingerprint(repo: &Repository) -> Result<String> {
+    let mut hasher = blake3::Hasher::new();
+    let mut matcher = repo.ignore_matcher().map_err(repo_error)?;
+    hash_ignore_sources_in_directory(repo, &mut matcher, repo.worktree(), &mut hasher)?;
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn hash_ignore_sources_in_directory(
+    repo: &Repository,
+    matcher: &mut graft::repo::RepoIgnoreMatcher,
+    directory: &Path,
+    hasher: &mut blake3::Hasher,
+) -> Result<()> {
+    graft::repo::cancellation_checkpoint().map_err(repo_error)?;
+    for name in [graft::repo::GIT_IGNORE_FILE, graft::repo::GRAFT_IGNORE_FILE] {
+        hash_optional_file(hasher, repo.worktree(), &directory.join(name))?;
+    }
+    let entries = fs::read_dir(directory)
+        .map_err(|error| repository_stale_io("scan ignore source directory", error))?;
+    let mut directories = Vec::new();
+    for entry in entries {
+        graft::repo::cancellation_checkpoint().map_err(repo_error)?;
+        let entry =
+            entry.map_err(|error| repository_stale_io("scan ignore source entry", error))?;
+        let path = entry.path();
+        if repo.is_internal_worktree_path(&path) {
+            continue;
+        }
+        let file_type = entry
+            .file_type()
+            .map_err(|error| repository_stale_io("inspect ignore source path", error))?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        let key = repo.file_key(&path).map_err(repo_error)?;
+        if !matcher.is_ignored(&key, true).map_err(repo_error)? {
+            directories.push(path);
+        }
+    }
+    directories.sort();
+    for directory in directories {
+        hash_ignore_sources_in_directory(repo, matcher, &directory, hasher)?;
+    }
+    Ok(())
+}
+
+fn hash_metadata_tree(hasher: &mut blake3::Hasher, base: &Path, directory: &Path) -> Result<()> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(repository_stale_io("read repository metadata", error)),
+    };
+    let mut paths = entries
+        .map(|entry| {
+            entry
+                .map(|entry| entry.path())
+                .map_err(|error| repository_stale_io("read repository metadata entry", error))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    paths.sort();
+    for path in paths {
+        graft::repo::cancellation_checkpoint().map_err(repo_error)?;
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| repository_stale_io("inspect repository metadata", error))?;
+        if metadata.is_dir() {
+            hash_metadata_tree(hasher, base, &path)?;
+        } else if metadata.is_file() {
+            hash_optional_file(hasher, base, &path)?;
+        }
+    }
+    Ok(())
+}
+
+fn hash_optional_file(hasher: &mut blake3::Hasher, base: &Path, path: &Path) -> Result<()> {
+    graft::repo::cancellation_checkpoint().map_err(repo_error)?;
+    let before = match fingerprint_path(path)? {
+        Some(fingerprint) if fingerprint.is_file => fingerprint,
+        Some(_) => {
+            return Err(repository_stale_error(
+                "metadata source changed path type while it was being read",
+            ));
+        }
+        None => {
+            hasher.update(b"absent\0");
+            hasher.update(relative_hash_path(base, path).as_bytes());
+            return Ok(());
+        }
+    };
+    let bytes =
+        fs::read(path).map_err(|error| repository_stale_io("read metadata source", error))?;
+    let after = fingerprint_path(path)?.ok_or_else(|| {
+        repository_stale_error("metadata source disappeared while it was being read")
+    })?;
+    if before != after {
+        return Err(repository_stale_error(
+            "metadata source changed while it was being read",
+        ));
+    }
+    hasher.update(b"file\0");
+    hasher.update(relative_hash_path(base, path).as_bytes());
+    hasher.update(b"\0");
+    hasher.update(&bytes);
+    Ok(())
+}
+
+fn relative_hash_path(base: &Path, path: &Path) -> String {
+    path.strip_prefix(base)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn hash_serialized(hasher: &mut blake3::Hasher, value: &impl Serialize) -> Result<()> {
+    let bytes = serde_json::to_vec(value).map_err(status_encode_error)?;
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(&bytes);
+    Ok(())
+}
+
 fn visible_untracked_fingerprints(
     repo: &Repository,
     files: &BTreeMap<String, CommitFileState>,
     artifacts: &BTreeMap<String, CommitArtifactState>,
 ) -> Result<BTreeMap<String, FileFingerprint>> {
     let mut visible = BTreeMap::new();
-    collect_visible_files(repo, repo.worktree(), &mut visible)?;
+    let mut matcher = repo.ignore_matcher().map_err(repo_error)?;
+    collect_visible_files(repo, &mut matcher, repo.worktree(), &mut visible)?;
     visible.retain(|key, _| {
         !files.contains_key(key) && !artifacts.contains_key(key) && !is_sqlite_sidecar_key(key)
     });
@@ -1535,32 +2114,58 @@ fn visible_untracked_fingerprints(
 
 fn collect_visible_files(
     repo: &Repository,
+    matcher: &mut graft::repo::RepoIgnoreMatcher,
     directory: &Path,
     visible: &mut BTreeMap<String, FileFingerprint>,
 ) -> Result<()> {
-    if !directory.is_dir() {
-        return Ok(());
-    }
-    for entry in fs::read_dir(directory).map_err(|error| repository_command_error(error.into()))? {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if is_worktree_race_io(&error) => {
+            return Err(repository_stale_io("read worktree directory", error));
+        }
+        Err(error) => return Err(repository_command_error(error.into())),
+    };
+    for entry in entries {
         graft::repo::cancellation_checkpoint().map_err(repo_error)?;
-        let entry = entry.map_err(|error| repository_command_error(error.into()))?;
+        let entry = entry.map_err(|error| {
+            if is_worktree_race_io(&error) {
+                repository_stale_io("read worktree directory entry", error)
+            } else {
+                repository_command_error(error.into())
+            }
+        })?;
         let path = entry.path();
         if repo.is_internal_worktree_path(&path) {
             continue;
         }
         let file_type = entry
             .file_type()
-            .map_err(|error| repository_command_error(error.into()))?;
-        if repo.is_ignored_worktree_path(&path).map_err(repo_error)? {
+            .map_err(|error| repository_stale_io("inspect worktree path type", error))?;
+        let key = repo.file_key(&path).map_err(repo_error)?;
+        if matcher
+            .is_ignored(&key, file_type.is_dir())
+            .map_err(repo_error)?
+        {
             continue;
         }
         if file_type.is_dir() {
-            collect_visible_files(repo, &path, visible)?;
+            collect_visible_files(repo, matcher, &path, visible)?;
         } else if file_type.is_file() {
-            let key = repo.file_key(&path).map_err(repo_error)?;
-            let fingerprint = fingerprint_path(&path)?
-                .expect("directory entry remains present while it is fingerprinted");
-            visible.insert(key, fingerprint);
+            match fingerprint_path(&path)? {
+                Some(fingerprint) if fingerprint.is_file => {
+                    visible.insert(key, fingerprint);
+                }
+                Some(_) => {
+                    return Err(repository_stale_error(
+                        "worktree path changed type while it was being inspected",
+                    ));
+                }
+                None => {
+                    return Err(repository_stale_error(
+                        "worktree path disappeared while it was being inspected",
+                    ));
+                }
+            }
         }
     }
     Ok(())
@@ -1574,12 +2179,16 @@ fn collect_ignored_files(
     ignored: &mut Vec<String>,
     paths_examined: &mut usize,
 ) -> Result<()> {
-    if !directory.is_dir() {
-        return Ok(());
-    }
-    for entry in fs::read_dir(directory).map_err(|error| repository_command_error(error.into()))? {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if is_worktree_race_io(&error) => {
+            return Err(repository_stale_io("read inventory directory", error));
+        }
+        Err(error) => return Err(repository_command_error(error.into())),
+    };
+    for entry in entries {
         graft::repo::cancellation_checkpoint().map_err(repo_error)?;
-        let entry = entry.map_err(|error| repository_command_error(error.into()))?;
+        let entry = entry.map_err(|error| repository_stale_io("read inventory entry", error))?;
         let path = entry.path();
         if repo.is_internal_worktree_path(&path) {
             continue;
@@ -1587,7 +2196,7 @@ fn collect_ignored_files(
         *paths_examined = (*paths_examined).saturating_add(1);
         let file_type = entry
             .file_type()
-            .map_err(|error| repository_command_error(error.into()))?;
+            .map_err(|error| repository_stale_io("inspect inventory path type", error))?;
         let key = repo.file_key(&path).map_err(repo_error)?;
         let ignored_here = inherited_ignore
             || matcher
@@ -1634,6 +2243,26 @@ fn is_sqlite_sidecar_key(key: &str) -> bool {
 
 fn elapsed_us(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
+fn safe_remote_projection(config: &RemoteConfig) -> (SafeRemoteKind, String) {
+    match config {
+        RemoteConfig::Memory => (SafeRemoteKind::Memory, "memory".to_string()),
+        RemoteConfig::Fs { root } => (SafeRemoteKind::Fs, format!("fs://{root}")),
+        RemoteConfig::S3Compatible { bucket, prefix, endpoint } => {
+            let mut url = prefix.as_ref().map_or_else(
+                || format!("s3://{bucket}"),
+                |prefix| format!("s3://{bucket}/{prefix}"),
+            );
+            if let Some(endpoint) = endpoint {
+                url.push_str("?endpoint=");
+                url.push_str(endpoint);
+            }
+            (SafeRemoteKind::S3Compatible, url)
+        }
+        // `token_env` and any in-memory bearer credential are intentionally excluded.
+        RemoteConfig::Http { url, .. } => (SafeRemoteKind::Http, url.clone()),
+    }
 }
 
 fn normalize_requested_path(path: &Path) -> Result<String> {
@@ -1754,16 +2383,50 @@ fn repository_command_error(error: ErrCtx) -> SdkError {
         return SdkError::new(SdkErrorCode::Cancelled, "operation cancelled");
     }
     let message = error.to_string();
+    let code = sdk_error_code_for_message(&message);
+    SdkError::new(code, message)
+}
+
+fn sdk_error_code_for_message(message: &str) -> SdkErrorCode {
     let lowercase = message.to_ascii_lowercase();
-    let code = if lowercase.contains("locked")
+    if lowercase.contains("locked")
         || lowercase.contains("database lock")
         || lowercase.contains("already held")
     {
         SdkErrorCode::RepositoryBusy
+    } else if lowercase.contains("no such file")
+        || lowercase.contains("not a directory")
+        || lowercase.contains("is a directory")
+        || lowercase.contains("not a regular file")
+        || lowercase.contains("os error 2")
+        || lowercase.contains("os error 20")
+        || lowercase.contains("os error 21")
+    {
+        SdkErrorCode::RepositoryStale
     } else {
         SdkErrorCode::RepositoryCommand
-    };
-    SdkError::new(code, message)
+    }
+}
+
+fn is_worktree_race_io(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound
+            | std::io::ErrorKind::NotADirectory
+            | std::io::ErrorKind::IsADirectory
+    )
+}
+
+fn repository_stale_io(context: &str, error: std::io::Error) -> SdkError {
+    if is_worktree_race_io(&error) {
+        repository_stale_error(format!("{context}: repository changed during operation"))
+    } else {
+        repository_command_error(error.into())
+    }
+}
+
+fn repository_stale_error(message: impl Into<String>) -> SdkError {
+    SdkError::new(SdkErrorCode::RepositoryStale, message)
 }
 
 fn credential_error(error: RemoteCredentialErr) -> SdkError {
@@ -1996,6 +2659,8 @@ mod tests {
         assert!(!RepositoryOperation::IsIgnoredPath.materializes_worktree());
         assert!(!RepositoryOperation::IsIgnoredPaths.materializes_worktree());
         assert!(!RepositoryOperation::Inventory.materializes_worktree());
+        assert!(!RepositoryOperation::RepositoryMetadata.materializes_worktree());
+        assert!(!RepositoryOperation::ListRemotes.materializes_worktree());
         assert!(!RepositoryOperation::RemoteConfigure.materializes_worktree());
         assert!(!RepositoryOperation::Push.materializes_worktree());
         assert!(!RepositoryOperation::Fetch.materializes_worktree());
@@ -2053,6 +2718,280 @@ mod tests {
         let hot = session.status_incremental().unwrap();
         assert!(hot.telemetry.status_cache_hit);
         assert_eq!(hot.generation, changed.generation);
+    }
+
+    #[test]
+    fn persistent_status_snapshot_survives_reopen_and_invalidates_safely() {
+        let directory = tempfile::tempdir().unwrap();
+        let note = directory.path().join("note.txt");
+        let session = RepositorySession::new(directory.path());
+        session.open().unwrap();
+        session.init().unwrap();
+        fs::write(&note, "one\n").unwrap();
+        session.add_all().unwrap();
+        session.commit("initial").unwrap();
+
+        let built = session.status_incremental().unwrap();
+        assert!(built.telemetry.persistent_snapshot_saved);
+        assert!(!built.telemetry.persistent_snapshot_hit);
+        let generation = built.generation;
+        session.close().unwrap();
+        session.open().unwrap();
+
+        let reopened = session.status_incremental().unwrap();
+        assert!(reopened.telemetry.persistent_snapshot_hit);
+        assert!(reopened.telemetry.status_cache_hit);
+        assert_eq!(reopened.generation, generation);
+        assert_eq!(reopened.change_token, built.change_token);
+        assert!(!reopened.status.dirty);
+
+        session.close().unwrap();
+        fs::write(directory.path().join(".gitignore"), "generated/\n").unwrap();
+        session.open().unwrap();
+        let ignore_changed = session.status_incremental().unwrap();
+        assert!(!ignore_changed.telemetry.persistent_snapshot_hit);
+        assert!(!ignore_changed.telemetry.status_cache_hit);
+        assert!(ignore_changed.status.dirty);
+        assert_ne!(ignore_changed.change_token, reopened.change_token);
+
+        session.close().unwrap();
+        fs::write(&note, "externally staged\n").unwrap();
+        let writer = Repository::open(directory.path()).unwrap();
+        writer.stage_artifact_path(&note).unwrap();
+        session.open().unwrap();
+        let index_changed = session.status_incremental().unwrap();
+        assert!(!index_changed.telemetry.persistent_snapshot_hit);
+        assert!(index_changed.status.has_staged_changes);
+
+        session.close().unwrap();
+        let external_commit = writer.commit("external writer").unwrap();
+        session.open().unwrap();
+        let head_changed = session.status_incremental().unwrap();
+        assert!(!head_changed.telemetry.persistent_snapshot_hit);
+        assert_eq!(
+            head_changed.status.head_target.as_deref(),
+            Some(external_commit.id.as_str())
+        );
+
+        session.close().unwrap();
+        let mut config = writer.config().unwrap();
+        config.track.user_roots.push("docs".to_string());
+        writer.write_config(&config).unwrap();
+        session.open().unwrap();
+        let config_changed = session.status_incremental().unwrap();
+        assert!(!config_changed.telemetry.persistent_snapshot_hit);
+
+        let cache_directory = directory.path().join(".graft/cache/sdk-status");
+        session.close().unwrap();
+        fs::write(
+            cache_directory.join(".classification-v1-killed-writer.tmp"),
+            b"truncated",
+        )
+        .unwrap();
+        session.open().unwrap();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let cancelled =
+            with_cancellation(&cancellation, || session.status_incremental()).unwrap_err();
+        assert_eq!(cancelled.code(), SdkErrorCode::Cancelled);
+        assert!(
+            session
+                .status_incremental()
+                .unwrap()
+                .telemetry
+                .persistent_snapshot_hit
+        );
+        let snapshot = fs::read_dir(cache_directory)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "json")
+            })
+            .unwrap();
+        let encoded = fs::read_to_string(snapshot).unwrap();
+        assert!(!encoded.contains(&directory.path().to_string_lossy().to_string()));
+    }
+
+    #[test]
+    fn persistent_status_snapshot_rejects_older_classification_schema() {
+        let directory = tempfile::tempdir().unwrap();
+        let session = RepositorySession::new(directory.path());
+        session.open().unwrap();
+        session.init().unwrap();
+        fs::write(directory.path().join("note.txt"), "one\n").unwrap();
+        session.add_all().unwrap();
+        session.commit("initial").unwrap();
+        assert!(
+            session
+                .status_incremental()
+                .unwrap()
+                .telemetry
+                .persistent_snapshot_saved
+        );
+        session.close().unwrap();
+
+        let cache_directory = directory.path().join(".graft/cache/sdk-status");
+        let snapshot_path = fs::read_dir(&cache_directory)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "json")
+            })
+            .unwrap();
+        let mut snapshot =
+            serde_json::from_slice::<PersistedStatusSnapshot>(&fs::read(&snapshot_path).unwrap())
+                .unwrap();
+        snapshot.schema_version = STATUS_SNAPSHOT_SCHEMA_VERSION - 1;
+        let bytes = serde_json::to_vec(&snapshot).unwrap();
+        for entry in fs::read_dir(&cache_directory)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+        {
+            if entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "json")
+            {
+                fs::remove_file(entry.path()).unwrap();
+            }
+        }
+        fs::write(
+            cache_directory.join(format!(
+                "classification-v1-{}.json",
+                blake3::hash(&bytes).to_hex()
+            )),
+            bytes,
+        )
+        .unwrap();
+
+        session.open().unwrap();
+        let rebuilt = session.status_incremental().unwrap();
+        assert!(!rebuilt.telemetry.persistent_snapshot_hit);
+        assert!(rebuilt.telemetry.persistent_snapshot_saved);
+    }
+
+    #[test]
+    fn metadata_and_remote_projection_do_not_scan_or_expose_credentials() {
+        let directory = tempfile::tempdir().unwrap();
+        let session = RepositorySession::new(directory.path());
+        session.open().unwrap();
+        session.init().unwrap();
+        fs::write(directory.path().join("note.txt"), "one\n").unwrap();
+        session.add_all().unwrap();
+        let committed = session.commit("initial").unwrap();
+        session
+            .configure_remote(&RemoteConfigureOptions {
+                name: "origin".to_string(),
+                url: "https://example.invalid/acme/repo".to_string(),
+                bearer_token: Some("never-persist-this-token".to_string()),
+                overwrite: false,
+                upstream_branch: None,
+            })
+            .unwrap();
+
+        let metadata = session.repository_metadata().unwrap();
+        assert_eq!(
+            metadata.current_head.as_deref(),
+            committed.pointer("/commit/id").and_then(Value::as_str)
+        );
+        assert_eq!(metadata.current_branch.as_deref(), Some("main"));
+        assert_eq!(metadata.telemetry.paths_examined, 0);
+        let remotes = session.list_remotes().unwrap();
+        assert_eq!(remotes.telemetry.paths_examined, 0);
+        assert_eq!(remotes.remotes.len(), 1);
+        assert_eq!(remotes.remotes[0].kind, SafeRemoteKind::Http);
+        assert_eq!(remotes.remotes[0].url, "https://example.invalid/acme/repo");
+        assert!(!serde_json::to_string(&remotes).unwrap().contains("token"));
+
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let error = with_cancellation(&cancellation, || session.repository_metadata()).unwrap_err();
+        assert_eq!(error.code(), SdkErrorCode::Cancelled);
+        assert_eq!(session.list_remotes().unwrap().telemetry.paths_examined, 0);
+    }
+
+    #[test]
+    fn concurrent_path_type_churn_never_poison_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let shape = directory.path().join("shape");
+        fs::write(&shape, "tracked\n").unwrap();
+        let session = Arc::new(RepositorySession::new(directory.path()));
+        session.open().unwrap();
+        session.init().unwrap();
+        session.add_all().unwrap();
+        session.commit("track shape").unwrap();
+        session.status_incremental().unwrap();
+
+        let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let churn_running = running.clone();
+        let churn_shape = shape.clone();
+        let churn = thread::spawn(move || {
+            let renamed = churn_shape.with_file_name("shape-renamed");
+            while churn_running.load(Ordering::Acquire) {
+                let _ = fs::remove_file(&churn_shape);
+                let _ = fs::create_dir(&churn_shape);
+                let _ = fs::write(churn_shape.join("nested.txt"), "nested\n");
+                let _ = fs::remove_file(churn_shape.join("nested.txt"));
+                let _ = fs::remove_dir(&churn_shape);
+                let _ = fs::write(&churn_shape, "replacement\n");
+                let _ = fs::rename(&churn_shape, &renamed);
+                let _ = fs::rename(&renamed, &churn_shape);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::symlink;
+                    let _ = fs::remove_file(&churn_shape);
+                    let _ = symlink("missing-shape-target", &churn_shape);
+                    let _ = fs::remove_file(&churn_shape);
+                }
+            }
+        });
+
+        for _ in 0..20 {
+            match session.status_incremental() {
+                Ok(_) => {}
+                Err(error) => assert_eq!(error.code(), SdkErrorCode::RepositoryStale, "{error}"),
+            }
+            match session.diff_paths(&DiffPathsOptions {
+                paths: vec![PathBuf::from("shape")],
+                rows: false,
+                root: None,
+                from: None,
+                to: None,
+                limit: 1,
+                after: None,
+            }) {
+                Ok(_) => {}
+                Err(error) => assert_eq!(error.code(), SdkErrorCode::RepositoryStale, "{error}"),
+            }
+            match session
+                .is_ignored_paths(&IgnoredPathsOptions { paths: vec![PathBuf::from("shape")] })
+            {
+                Ok(_) => {}
+                Err(error) => assert_eq!(error.code(), SdkErrorCode::RepositoryStale, "{error}"),
+            }
+            match session.inventory(&InventoryOptions {
+                kind: InventoryKind::Untracked,
+                limit: 10,
+                after: None,
+            }) {
+                Ok(_) => {}
+                Err(error) => assert_eq!(error.code(), SdkErrorCode::RepositoryStale, "{error}"),
+            }
+        }
+        running.store(false, Ordering::Release);
+        churn.join().unwrap();
+        if shape.is_dir() {
+            fs::remove_dir_all(&shape).unwrap();
+        } else {
+            let _ = fs::remove_file(&shape);
+        }
+        fs::write(&shape, "stable\n").unwrap();
+        assert!(session.status_incremental().is_ok());
+        assert!(session.repository_metadata().is_ok());
     }
 
     #[test]

@@ -298,10 +298,10 @@ pub(super) fn is_sqlite_database_file(path: &Path) -> Result<bool> {
 }
 
 pub(super) fn classify_artifact_path(path: &Path) -> Result<RepoTrackedPathKind> {
-    let mut file = fs::File::open(path)?;
-    let mut sample = vec![0; CONTENT_CLASS_SAMPLE_BYTES];
-    let len = file.read(&mut sample)?;
-    sample.truncate(len);
+    let file = fs::File::open(path)?;
+    let mut sample = Vec::with_capacity(CONTENT_CLASS_SAMPLE_BYTES + 3);
+    file.take((CONTENT_CLASS_SAMPLE_BYTES + 3) as u64)
+        .read_to_end(&mut sample)?;
     Ok(classify_artifact_bytes(&sample))
 }
 
@@ -366,12 +366,44 @@ pub(super) fn is_text_bytes(bytes: &[u8]) -> bool {
     if sample.is_empty() {
         return true;
     }
-    if sample.contains(&0) || std::str::from_utf8(sample).is_err() {
+    if sample.contains(&0) || !has_valid_utf8_sniff_prefix(bytes, sample) {
         return false;
     }
     sample
         .iter()
         .all(|byte| !byte.is_ascii_control() || matches!(*byte, b'\n' | b'\r' | b'\t'))
+}
+
+fn has_valid_utf8_sniff_prefix(bytes: &[u8], sample: &[u8]) -> bool {
+    match std::str::from_utf8(sample) {
+        Ok(_) => true,
+        Err(error) if error.error_len().is_none() && bytes.len() > sample.len() => {
+            let sequence_start = error.valid_up_to();
+            let Some(sequence_len) = sample
+                .get(sequence_start)
+                .copied()
+                .and_then(utf8_sequence_len)
+            else {
+                return false;
+            };
+            let Some(sequence_end) = sequence_start.checked_add(sequence_len) else {
+                return false;
+            };
+            bytes
+                .get(sequence_start..sequence_end)
+                .is_some_and(|sequence| std::str::from_utf8(sequence).is_ok())
+        }
+        Err(_) => false,
+    }
+}
+
+fn utf8_sequence_len(leading_byte: u8) -> Option<usize> {
+    match leading_byte {
+        0xc2..=0xdf => Some(2),
+        0xe0..=0xef => Some(3),
+        0xf0..=0xf4 => Some(4),
+        _ => None,
+    }
 }
 
 pub(super) fn is_sqlite_sidecar_file(path: &Path) -> bool {

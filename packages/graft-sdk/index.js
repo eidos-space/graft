@@ -66,6 +66,14 @@ class RepositorySession {
     return callJson(() => this.#native.statusIncremental(signal))
   }
 
+  async repositoryMetadata({ signal } = {}) {
+    return callJson(() => this.#native.repositoryMetadata(signal))
+  }
+
+  async listRemotes({ signal } = {}) {
+    return callJson(() => this.#native.listRemotes(signal))
+  }
+
   async addAll({ signal } = {}) {
     return callJson(() => this.#native.addAll(signal))
   }

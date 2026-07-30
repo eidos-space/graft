@@ -37,6 +37,8 @@ test("exposes ABI-stable SDK metadata and materialization contract", () => {
     "init",
     "status",
     "statusIncremental",
+    "repositoryMetadata",
+    "listRemotes",
     "addAll",
     "stagePaths",
     "untrackPaths",
@@ -85,6 +87,50 @@ test("repeated status and diff reuse one native session without a CLI", async ()
   })
 })
 
+test("classifies UTF-8 codepoints crossing the sniff boundary as text", async () => {
+  await withTemporaryDirectory("graft-sdk-utf8-boundary-", async (root) => {
+    const session = await RepositorySession.open(root)
+    await session.init()
+    const paths = []
+
+    for (const [width, character] of [
+      [2, "¢"],
+      [3, "中"],
+      [4, "😀"],
+    ]) {
+      for (let bytesBeforeBoundary = 1; bytesBeforeBoundary < width; bytesBeforeBoundary += 1) {
+        const relativePath = `utf8-${width}-${bytesBeforeBoundary}.txt`
+        paths.push(relativePath)
+        await fs.writeFile(
+          path.join(root, relativePath),
+          Buffer.concat([
+            Buffer.alloc(8192 - bytesBeforeBoundary, "a"),
+            Buffer.from(`${character}\n`),
+          ])
+        )
+      }
+    }
+
+    const untracked = await session.statusIncremental()
+    assert.deepEqual(
+      untracked.status.paths.map(({ path: relativePath, kind }) => [relativePath, kind]),
+      paths.map((relativePath) => [relativePath, "text_file"])
+    )
+
+    await session.stagePaths({ paths })
+    const committed = await session.commit("UTF-8 boundary")
+    const changed = await session.commitChangedPaths({
+      revision: committed.commit.id,
+      limit: 100,
+    })
+    assert.deepEqual(
+      changed.paths.map(({ path: relativePath, kind }) => [relativePath, kind]),
+      paths.map((relativePath) => [relativePath, "text_file"])
+    )
+    await session.close()
+  })
+})
+
 test("incremental status exposes a stable session generation", async () => {
   await withTemporaryDirectory("graft-sdk-generation-", async (root) => {
     const session = await RepositorySession.open(root)
@@ -106,6 +152,61 @@ test("incremental status exposes a stable session generation", async () => {
     assert.equal(changed.status.dirty, true)
     assert.ok(changed.generation > hot.generation)
     assert.equal(changed.telemetry.status_cache_hit, false)
+    assert.equal(typeof changed.telemetry.persistent_snapshot_saved, "boolean")
+    await session.close()
+
+    const reopened = await RepositorySession.open(root)
+    const persisted = await reopened.statusIncremental()
+    assert.equal(persisted.telemetry.persistent_snapshot_hit, true)
+    assert.equal(persisted.telemetry.status_cache_hit, true)
+    assert.equal(persisted.generation, changed.generation)
+    assert.equal(persisted.change_token, changed.change_token)
+    await reopened.close()
+  })
+})
+
+test("metadata and remotes avoid worktree classification and credentials", async () => {
+  await withTemporaryDirectory("graft-sdk-metadata-", async (root) => {
+    const session = await RepositorySession.open(root)
+    await session.init()
+    await fs.writeFile(path.join(root, "note.txt"), "one\n")
+    await session.addAll()
+    const committed = await session.commit("initial")
+    await session.configureRemote({
+      name: "origin",
+      url: "https://example.invalid/acme/space",
+      bearerToken: "in-memory-only",
+    })
+
+    const metadata = await session.repositoryMetadata()
+    assert.equal(metadata.current_head, committed.commit.id)
+    assert.equal(metadata.current_branch, "main")
+    assert.equal(metadata.telemetry.paths_examined, 0)
+    const remotes = await session.listRemotes()
+    assert.equal(remotes.telemetry.paths_examined, 0)
+    assert.deepEqual(remotes.remotes, [
+      {
+        name: "origin",
+        kind: "http",
+        url: "https://example.invalid/acme/space",
+      },
+    ])
+    assert.equal(JSON.stringify(remotes).includes("in-memory-only"), false)
+
+    const controller = new AbortController()
+    const inFlight = Array.from({ length: 24 }, () =>
+      session.diff({ rows: true })
+    )
+    const queuedMetadata = session.repositoryMetadata({
+      signal: controller.signal,
+    })
+    controller.abort()
+    await assert.rejects(
+      queuedMetadata,
+      (error) => error.name === "AbortError"
+    )
+    await Promise.all(inFlight)
+    assert.equal((await session.listRemotes()).telemetry.paths_examined, 0)
     await session.close()
   })
 })

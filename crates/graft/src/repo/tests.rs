@@ -1631,6 +1631,57 @@ fn stage_artifact_path_uses_configured_inline_text_threshold() {
 }
 
 #[test]
+fn stage_artifact_path_classifies_utf8_codepoints_across_sniff_boundary_as_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = Repository::init(tmp.path()).unwrap();
+
+    for (width, character) in [(2, "¢"), (3, "中"), (4, "😀")] {
+        for bytes_before_boundary in 1..width {
+            let name = format!("utf8-{width}-{bytes_before_boundary}.txt");
+            let path = tmp.path().join(&name);
+            let mut bytes = vec![b'a'; CONTENT_CLASS_SAMPLE_BYTES - bytes_before_boundary];
+            bytes.extend_from_slice(character.as_bytes());
+            bytes.push(b'\n');
+            fs::write(&path, bytes).unwrap();
+
+            assert_eq!(
+                classify_artifact_path(&path).unwrap(),
+                RepoTrackedPathKind::TextFile,
+                "{name} should be text during bounded worktree classification"
+            );
+
+            let state = repo
+                .stage_artifact_path(&path)
+                .unwrap()
+                .artifact
+                .expect("artifact staged");
+            assert_eq!(
+                artifact_tracked_path_kind(&state),
+                RepoTrackedPathKind::TextFile,
+                "{name} should remain text when its UTF-8 codepoint crosses the sniff boundary"
+            );
+        }
+    }
+}
+
+#[test]
+fn artifact_classification_rejects_invalid_utf8_at_sniff_boundary() {
+    let mut incomplete = vec![b'a'; CONTENT_CLASS_SAMPLE_BYTES - 1];
+    incomplete.push(0xe4);
+    assert_eq!(
+        classify_artifact_bytes(&incomplete),
+        RepoTrackedPathKind::BinaryFile
+    );
+
+    let mut invalid_continuation = vec![b'a'; CONTENT_CLASS_SAMPLE_BYTES - 1];
+    invalid_continuation.extend_from_slice(&[0xe4, 0xff, 0xad]);
+    assert_eq!(
+        classify_artifact_bytes(&invalid_continuation),
+        RepoTrackedPathKind::BinaryFile
+    );
+}
+
+#[test]
 fn stage_artifact_path_uses_kind_and_external_path_storage_policy() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = Repository::init(tmp.path()).unwrap();

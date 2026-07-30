@@ -128,6 +128,9 @@ export interface StatusTelemetry {
   metadata_cache_misses: number
   tree_cache_hit: boolean
   status_cache_hit: boolean
+  persistent_snapshot_hit: boolean
+  persistent_snapshot_saved: boolean
+  stability_retries: number
 }
 
 export interface IncrementalStatusResult {
@@ -135,6 +138,33 @@ export interface IncrementalStatusResult {
   change_token: string
   status: RepositoryStatus
   telemetry: StatusTelemetry
+}
+
+export interface RepositoryMetadataTelemetry {
+  duration_us: number
+  /** Metadata-only operations never examine worktree paths. */
+  paths_examined: 0
+}
+
+export interface RepositoryMetadataResult {
+  current_head: string | null
+  current_branch: string | null
+  upstream: { remote: string; branch: string } | null
+  repository_format_version: number
+  object_format: string
+  telemetry: RepositoryMetadataTelemetry
+}
+
+export interface SafeRemoteInfo {
+  name: string
+  kind: "memory" | "fs" | "s3_compatible" | "http"
+  /** Credential-free configured remote URL. HTTP token_env is intentionally omitted. */
+  url: string
+}
+
+export interface ListRemotesResult {
+  remotes: SafeRemoteInfo[]
+  telemetry: RepositoryMetadataTelemetry
 }
 
 export interface CommitPathChangeCounts {
@@ -335,6 +365,10 @@ export class RepositorySession {
   statusIncremental(
     options?: OperationOptions
   ): Promise<IncrementalStatusResult>
+  repositoryMetadata(
+    options?: OperationOptions
+  ): Promise<RepositoryMetadataResult>
+  listRemotes(options?: OperationOptions): Promise<ListRemotesResult>
   addAll(options?: OperationOptions): Promise<GraftJson>
   stagePaths(options: StagePathsOptions): Promise<BatchPathsResult>
   untrackPaths(options: UntrackPathsOptions): Promise<BatchPathsResult>

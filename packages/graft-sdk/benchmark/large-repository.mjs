@@ -174,16 +174,34 @@ async function runBenchmark(root) {
     longTimeoutMs
   )
   await restoreFixturePaths(root, ["journal.txt"])
-  const processColdStatus = await sampleChildOperations(
-    iterations,
-    "cold-status",
+  await fs.rm(path.join(root, ".graft", "cache", "sdk-status"), {
+    force: true,
+    recursive: true,
+  })
+  const coldBuildStatus = await runTimedChild(
+    "incremental-status",
     root,
     longTimeoutMs
+  )
+  assert.equal(coldBuildStatus.timedOut, false)
+  assert.equal(
+    coldBuildStatus.result.telemetry.persistent_snapshot_hit,
+    false
+  )
+  const warmReopenStatus = await sampleChildOperations(
+    iterations,
+    "incremental-status",
+    root,
+    longTimeoutMs
+  )
+  assert.equal(
+    warmReopenStatus.values.at(-1).telemetry.persistent_snapshot_hit,
+    true
   )
   const sessionColdStatus = await sample(iterations, async () => {
     const session = await RepositorySession.open(root)
     try {
-      return await session.status()
+      return await session.statusIncremental()
     } finally {
       await session.close()
     }
@@ -195,8 +213,9 @@ async function runBenchmark(root) {
   } else {
     await session.status()
   }
-  const hotStatus = await sample(iterations, () => session.status())
-  const cleanStatus = hotStatus.values.at(-1)
+  const hotStatus = await sample(iterations, () => session.statusIncremental())
+  const cleanIncrementalStatus = hotStatus.values.at(-1)
+  const cleanStatus = cleanIncrementalStatus.status
   assert.equal(cleanStatus.dirty, false)
   const historyOne = await timed(() => session.history({ limit: 1 }))
   const summarySamples =
@@ -257,7 +276,9 @@ async function runBenchmark(root) {
       iterations,
     },
     milliseconds: {
-      status_process_cold: summarize(processColdStatus.milliseconds),
+      status_cold_build: coldBuildStatus.result.operation_milliseconds,
+      status_warm_reopen: summarize(warmReopenStatus.milliseconds),
+      status_process_cold: summarize(warmReopenStatus.milliseconds),
       status_session_cold: summarize(sessionColdStatus.milliseconds),
       status_hot: summarize(hotStatus.milliseconds),
       history_legacy_limit_1: round(historyOne.milliseconds),
@@ -279,7 +300,10 @@ async function runBenchmark(root) {
         cancellation.result?.cancellation_session_reusable_ms ?? null,
     },
     bytes: {
-      status_response: jsonBytes(cleanStatus),
+      status_cold_build_response: coldBuildStatus.result.response_bytes,
+      status_warm_reopen_response:
+        warmReopenStatus.values.at(-1).response_bytes,
+      status_response: jsonBytes(cleanIncrementalStatus),
       history_legacy_limit_1_response: jsonBytes(historyOne.value),
       history_summaries_50_response: summarySamples
         ? jsonBytes(summarySamples.values.at(-1))
@@ -308,12 +332,15 @@ async function runBenchmark(root) {
     rss: {
       parent_peak_bytes: peakRssBytes(),
       process_cold_status_peak_bytes: Math.max(
-        ...processColdStatus.values.map((value) => value.peak_rss_bytes)
+        ...warmReopenStatus.values.map((value) => value.peak_rss_bytes)
       ),
       working_diff_peak_bytes: fullDiff.result?.peak_rss_bytes ?? null,
       cancellation_peak_bytes: cancellation.result?.peak_rss_bytes ?? null,
     },
     telemetry: {
+      status_cold_build: coldBuildStatus.result.telemetry,
+      status_warm_reopen: warmReopenStatus.values.at(-1).telemetry,
+      status_hot: cleanIncrementalStatus.telemetry,
       status: changedStatus.value.telemetry ?? null,
       diff: pathDiffSamples.values.at(-1).telemetry ?? null,
       history: summarySamples?.values.at(-1)?.telemetry ?? null,
@@ -354,11 +381,12 @@ async function restoreFixturePaths(root, paths) {
 async function runChildOperation(operation, root) {
   const session = await RepositorySession.open(root)
   try {
-    if (operation === "cold-status") {
-      const measured = await timed(() => session.status())
+    if (operation === "incremental-status") {
+      const measured = await timed(() => session.statusIncremental())
       writeChildResult({
         operation_milliseconds: round(measured.milliseconds),
         response_bytes: jsonBytes(measured.value),
+        telemetry: measured.value.telemetry,
         peak_rss_bytes: peakRssBytes(),
       })
       return

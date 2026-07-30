@@ -1102,6 +1102,7 @@ dependencies = [
 name = "graft-sdk"
 version = "0.3.0-rc.0"
 dependencies = [
+ "blake3",
  "graft",
  "graft-sqlite",
  "parking_lot",

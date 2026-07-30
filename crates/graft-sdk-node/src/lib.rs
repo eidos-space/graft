@@ -104,6 +104,8 @@ enum JsonOperation {
     Init,
     Status,
     StatusIncremental,
+    RepositoryMetadata,
+    ListRemotes,
     AddAll,
     StagePaths {
         options: CoreStagePathsOptions,
@@ -198,6 +200,16 @@ impl JsonTask {
             return serde_json::to_string(&value)
                 .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
         }
+        if matches!(self.operation, JsonOperation::RepositoryMetadata) {
+            let value = self.session.repository_metadata().map_err(napi_error)?;
+            return serde_json::to_string(&value)
+                .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
+        }
+        if matches!(self.operation, JsonOperation::ListRemotes) {
+            let value = self.session.list_remotes().map_err(napi_error)?;
+            return serde_json::to_string(&value)
+                .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
+        }
         if let JsonOperation::HistorySummaries { limit, after } = &self.operation {
             let value = self
                 .session
@@ -253,6 +265,9 @@ impl JsonTask {
             JsonOperation::Init => self.session.init(),
             JsonOperation::Status => self.session.status(),
             JsonOperation::StatusIncremental => unreachable!("handled before JSON value dispatch"),
+            JsonOperation::RepositoryMetadata | JsonOperation::ListRemotes => {
+                unreachable!("handled before JSON value dispatch")
+            }
             JsonOperation::AddAll => self.session.add_all(),
             JsonOperation::StagePaths { .. } => {
                 unreachable!("handled before JSON value dispatch")
@@ -400,6 +415,16 @@ impl NodeRepositorySession {
     #[napi]
     pub fn status_incremental(&self, signal: Option<AbortSignal>) -> AsyncTask<JsonTask> {
         json_task(self, JsonOperation::StatusIncremental, signal)
+    }
+
+    #[napi]
+    pub fn repository_metadata(&self, signal: Option<AbortSignal>) -> AsyncTask<JsonTask> {
+        json_task(self, JsonOperation::RepositoryMetadata, signal)
+    }
+
+    #[napi]
+    pub fn list_remotes(&self, signal: Option<AbortSignal>) -> AsyncTask<JsonTask> {
+        json_task(self, JsonOperation::ListRemotes, signal)
     }
 
     #[napi]
@@ -728,6 +753,8 @@ pub fn operation_materializes_worktree(operation: String) -> Result<bool> {
         "init" => RepositoryOperation::Init,
         "status" => RepositoryOperation::Status,
         "status_incremental" | "statusIncremental" => RepositoryOperation::StatusIncremental,
+        "repository_metadata" | "repositoryMetadata" => RepositoryOperation::RepositoryMetadata,
+        "list_remotes" | "listRemotes" => RepositoryOperation::ListRemotes,
         "add_all" | "addAll" => RepositoryOperation::AddAll,
         "stage_paths" | "stagePaths" => RepositoryOperation::StagePaths,
         "untrack_paths" | "untrackPaths" => RepositoryOperation::UntrackPaths,

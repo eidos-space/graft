@@ -7,16 +7,20 @@ directory, 305 other tracked files, `.gitignore`, and a nested `.graftignore`. T
 were committed only after the generated trees were tracked. The history has 51 commits and the
 working change is one row inserted into `project.eidos`.
 
-The benchmark source is `benchmark/large-repository.mjs`. A fresh process measures process-cold
-status, a new session in the retained benchmark process measures session-cold status, and a warmed
-resident session measures hot status. Request and response sizes are compact JSON byte lengths;
-RSS is the process high-water mark. The checked-in JSON contains the complete safe telemetry.
+The benchmark source is `benchmark/large-repository.mjs`. It removes only the rebuildable SDK
+classification cache, measures one cold build, then opens a new process/session for every warm
+reopen sample. A warmed resident session measures hot status. Request and response sizes are
+compact JSON byte lengths; RSS is the process high-water mark. The persisted-classification run is
+checked in as `persistent-classification-macos-arm64.json`.
 
 ## Results
 
 | Operation | Baseline | Final p50 | Final p95 | Budget | Result |
 | --- | ---: | ---: | ---: | ---: | --- |
 | Process-cold status | 8,655.9 ms | 2,505.8 ms | 4,343.9 ms | reported | — |
+| Cold persistent snapshot build | 12,690 ms real-repo baseline | 4,647.7 ms single sample | — | reported | — |
+| New-process snapshot status | 12,690 ms real-repo baseline | 340.4 ms | 362.6 ms | <1,000 ms | pass |
+| New-process open + first status | 12,690 ms real-repo baseline | 715.5 ms | 749.0 ms | <1,000 ms | pass |
 | Unchanged hot status | 8,273.7 ms | 103.4 ms | 113.5 ms | <250 ms | pass |
 | 1,000-path ignore batch | >30,000 ms with serialized single-path calls | 2.4 ms | 2.6 ms | <100 ms hot | pass |
 | First tracked-and-ignored page after status | 7,570.0 ms | 23.7 ms | single first sample | <1,000 ms | pass |
@@ -68,14 +72,17 @@ from 7,835 ms cold and 1,972–2,139 ms hot to 26.0 ms cold and 0.24–0.32 ms h
 took 0.55 ms. The 336 KiB `.eidos` file took 39.0 ms cold and 9.8–10.0 ms hot, with 7.4 KiB
 responses. These calls used one newly opened session and did not run status first.
 
-The metadata/generation status cache is currently resident to one open `RepositorySession`.
-Opening a new session must therefore classify and fingerprint every tracked path again; a global
-immutable-tree cache may reduce object decoding but does not retain worktree classifications. The
-reported 12.7 second first scan on the real tracked-and-ignored repository is consequently expected
-for the current release candidate, but it is not an unavoidable architectural baseline. Reusing it
-across open/restart requires a separate persisted classification snapshot keyed by HEAD, index, and
-ignore-source fingerprints, with safe invalidation for external writers. That follow-up is separate
-from the bounded diff path and does not delay this candidate.
+The classification cache now survives `RepositorySession` close/open and utility restart. Its
+content-addressed snapshot is keyed and validated by repository/schema format, HEAD, index,
+refs/config, relevant ignore-source contents, and current path metadata. The 46,665-path snapshot
+is 22,427,846 bytes; status responses remain 1,077–1,080 bytes. An atomic write uses a synced
+same-directory temporary file followed by rename, so a strong kill can leave only an ignored temp
+file. Corrupt, truncated, mismatched, or stale candidates trigger a full rebuild.
+
+On this fixture the cold build took 4.65 seconds. A fresh process then returned first status in
+297–363 ms (p95 363 ms), or 696–749 ms including open (p95 749 ms). Resident hot status remained
+99.0 ms p50 / 106.6 ms p95. `repositoryMetadata` measured 0.164/0.340 ms p50/p95 and
+`listRemotes` 0.061/0.157 ms; both reported `paths_examined: 0`. No budget was relaxed.
 
 For ignore-heavy traversal, the retained session now also caches the tracked index, compiled root
 and nested ignore matchers, and the complete tracked-and-ignored classification. Matcher evaluation

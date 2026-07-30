@@ -124,6 +124,8 @@ files in the Space. Changes confined to `.graft` are not counted.
 | `init` | Initialize `.graft` metadata | No |
 | `status` | Inspect worktree and index state | No |
 | `statusIncremental` | Inspect status with a stable generation/change token and safe cache telemetry | No |
+| `repositoryMetadata` | Read head, branch, upstream, and repository format without scanning the worktree | No |
+| `listRemotes` | Read a credential-free remote URL/config projection without scanning the worktree | No |
 | `addAll` | Read/import the current worktree into the index | No |
 | `stagePaths` | Stage up to 1,000 explicit paths in one serialized SDK call | No |
 | `untrackPaths` | Remove up to 1,000 explicit files from the index without touching the worktree | No |
@@ -170,7 +172,8 @@ parallel. External changes to ordinary worktree files are observed by subsequent
 
 If an Electron utility process crashes, the OS releases its storage lock. A replacement utility
 process creates a new session and calls `open()`; Graft reconstructs the runtime from durable
-repository state. No stale daemon registration or PID file is involved.
+repository state and may reuse the validated classification snapshot described below. No stale
+daemon registration or PID file is involved.
 
 Dropping the JavaScript native object releases its Rust `Arc`, but Eidos should always await
 `close()` during orderly Space shutdown so lifecycle errors are observable.
@@ -179,9 +182,40 @@ Dropping the JavaScript native object releases its Rust `Arc`, but Eidos should 
 
 `statusIncremental()` fingerprints tracked files and SQLite sidecars with metadata. When HEAD,
 index, visible-untracked inventory, and file metadata are unchanged, it reuses the prior status and
-does not hash file contents. `generation` advances only when the semantic status changes;
-`change_token` combines that session generation with HEAD. Tokens are stable within an open
-session and should invalidate host snapshots, not serve as durable repository object IDs.
+does not hash file contents. After a stable classification it atomically writes a content-addressed
+snapshot under `.graft/cache/sdk-status`. A new session or replacement utility process can load
+that snapshot, then revalidate repository format, HEAD, index, refs/config, the content of all
+relevant `.gitignore` / `.graftignore` sources, and current tracked/untracked metadata. Any mismatch,
+corrupt/truncated file, or orphan temporary file causes a full rebuild; partial snapshots are never
+used. The cache stores no bearer credential or absolute worktree path.
+
+`telemetry.persistent_snapshot_hit` is true only when the persisted classification survives all
+validation and supplies the returned status. `persistent_snapshot_saved` reports a successful
+durable update, and `stability_retries` reports bounded retries caused by concurrent path changes.
+`generation` advances only when semantic status changes; `change_token` combines HEAD, generation,
+and a semantic status digest, and remains stable across a validated reopen. A full fingerprint
+invalidation may rebuild the numeric generation, while the digest still guarantees a different
+token for different status. The token should invalidate host snapshots, not
+serve as a repository object ID. SDK releases also reject persisted snapshots from an older
+classification schema, so changing sniff semantics cannot reuse an obsolete path kind.
+
+Text/binary classification sniffs the first 8192 bytes and reads up to three lookahead bytes when a
+valid UTF-8 code point crosses that boundary. Invalid UTF-8 within the sample, a genuinely
+incomplete trailing code point, NUL, and disallowed control bytes remain binary. Commit objects are
+immutable, so this boundary behavior applies to newly staged snapshots and diffs; it does not
+rewrite the recorded kind of an existing checkpoint.
+
+History and remote UI code should not call status merely to obtain repository metadata:
+
+```js
+const { current_head, current_branch, upstream } =
+  await session.repositoryMetadata({ signal })
+const { remotes } = await session.listRemotes({ signal })
+```
+
+Both calls read only refs/config metadata, never classify or materialize worktree paths, and report
+`telemetry.paths_examined: 0`. Remote entries contain `name`, typed `kind`, and a configured `url`;
+HTTP `token_env` and in-memory bearer tokens are deliberately omitted.
 
 `historySummaries({ limit, after })` returns only commit id, parents, message, timestamp, table
 counts, and optional path counts. It never reads a commit tree or blob. Commits created before path
@@ -213,8 +247,9 @@ const diff = page.parent
 tree-backed commit payload; history lists should not use it.
 
 For working changes, pass `status.status.paths` to `diffPaths`. The API accepts normalized explicit
-file paths, sorts/deduplicates them, and pages them with `limit`/`after`; directories are rejected so
-a request cannot accidentally expand to an unbounded tree. The legacy `diff()` remains compatible,
+logical paths, sorts/deduplicates them, and pages them with `limit`/`after`. It never recursively
+expands a directory; a tracked file that concurrently becomes a directory is still treated as that
+one logical tracked path. The legacy `diff()` remains compatible,
 but an unfiltered working diff is now driven by the status change set instead of every tracked path.
 Explicit path requests resolve only the matching immutable tree entry and index entry, then read the
 one referenced blob. They do not hydrate or clone the full commit maps. Telemetry reports
@@ -261,6 +296,7 @@ stabilizes transport/lifecycle failures as `GraftSdkError` with codes such as:
 - `GRAFT_SDK_REPOSITORY_BUSY`
 - `GRAFT_SDK_CANCELLED` (normalized to `AbortError` by the JavaScript wrapper)
 - `GRAFT_SDK_INVALID_ARGUMENT`
+- `GRAFT_SDK_REPOSITORY_STALE` (retryable concurrent ref/index/path-shape change)
 - `GRAFT_SDK_REPOSITORY_COMMAND`
 
 Callers should branch on `error.code`, not parse messages.
@@ -311,12 +347,16 @@ repository lock correctly excludes a second writer/runtime.
 `bench:large` creates a repeatable 46,665-path history, including 46,318 paths that become ignored
 only after they were tracked, nested `.graftignore` rules, 51 commits, and one changed `.eidos`
 database. It reports cold/hot median and p95 latency, JSON request/response bytes, peak RSS,
-cancellation latency, and safe SDK telemetry. Set `GRAFT_SDK_LARGE_FIXTURE` to retain/reuse the
-fixture and `GRAFT_SDK_LARGE_ITERATIONS` to control repetitions.
+cancellation latency, and safe SDK telemetry. The status section explicitly removes only the
+rebuildable SDK cache, measures one cold snapshot build, then opens a fresh process for every warm
+reopen sample. Set `GRAFT_SDK_LARGE_FIXTURE` to retain/reuse the fixture and
+`GRAFT_SDK_LARGE_ITERATIONS` to control repetitions.
 
 The large-repository results and profiler comparison are checked in as
 [`benchmark/results/large-repository.md`](benchmark/results/large-repository.md), with the machine-
-readable final run in [`benchmark/results/large-macos-arm64.json`](benchmark/results/large-macos-arm64.json).
+readable rc5 run in [`benchmark/results/large-macos-arm64.json`](benchmark/results/large-macos-arm64.json)
+and the persisted-classification run in
+[`benchmark/results/persistent-classification-macos-arm64.json`](benchmark/results/persistent-classification-macos-arm64.json).
 
 The checked-in macOS arm64 baseline is
 [`benchmark/results/macos-arm64.json`](https://github.com/eidos-space/graft/blob/main/packages/graft-sdk/benchmark/results/macos-arm64.json). For 30 iterations on
