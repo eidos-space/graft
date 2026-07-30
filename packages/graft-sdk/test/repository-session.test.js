@@ -24,7 +24,7 @@ const {
 } = require("..")
 
 test("exposes ABI-stable SDK metadata and materialization contract", () => {
-  assert.equal(sdkVersion(), "0.3.1")
+  assert.equal(sdkVersion(), "0.3.2")
   for (const operation of [
     "restore",
     "restorePaths",
