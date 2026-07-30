@@ -709,6 +709,12 @@ impl<'a> WorkspaceCheckout<'a> {
             backups.restore();
             return Err(err);
         }
+        for key in workspace_sqlite_keys(plan, previous_files) {
+            // Checkout either materialized the selected snapshot or made the new volume binding
+            // authoritative. A marker retained for non-materializing commits must not make a path
+            // removed by this checkout appear as an untracked worktree file.
+            self.repo.clear_dirty_key(&key)?;
+        }
 
         backups.discard();
         Ok(())
@@ -2153,6 +2159,14 @@ pub(super) fn checkout_merge_outcome(
                 previous_artifacts,
                 remote,
             )?;
+        }
+        MergeOutcome::Merged { conflicted, .. } => {
+            for key in conflicted {
+                // The conflict index establishes the current worktree (ours) as the new
+                // comparison baseline. Drop markers retained by earlier non-materializing
+                // checkpoints; a subsequent write will mark the bound volume dirty again.
+                repo.clear_dirty_key(key)?;
+            }
         }
         _ => {}
     }

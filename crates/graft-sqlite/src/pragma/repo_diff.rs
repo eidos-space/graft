@@ -372,19 +372,17 @@ pub(crate) fn repo_status_for_file(
     });
     for (key, expected_state) in tracked {
         graft::repo::cancellation_checkpoint()?;
-        if key == current_key
-            || status
-                .unstaged_changes
-                .iter()
-                .any(|change| change.path == key)
-        {
-            continue;
-        }
-
-        if repo_key_uses_volume_binding(repo, &key)?
-            && let Some(state) = repo_file_state_for_key(runtime, repo, &key)?
-        {
-            if !repo_file_state_content_eq(runtime, &state, &expected_state)? {
+        let bound_state = if key == current_key {
+            Some(current_repo_file_state(runtime, file)?)
+        } else if repo_key_uses_volume_binding(repo, &key)? {
+            repo_file_state_for_key(runtime, repo, &key)?
+        } else {
+            None
+        };
+        if let Some(state) = bound_state {
+            let matches = repo_file_state_content_eq(runtime, &state, &expected_state)?;
+            status.unstaged_changes.retain(|change| change.path != key);
+            if !matches {
                 status
                     .unstaged_changes
                     .push(graft::repo::RepoWorktreeChange {
@@ -394,6 +392,14 @@ pub(crate) fn repo_status_for_file(
                         storage: RepoPathStorage::SqliteSnapshot,
                     });
             }
+            continue;
+        }
+
+        if status
+            .unstaged_changes
+            .iter()
+            .any(|change| change.path == key)
+        {
             continue;
         }
 
