@@ -23,7 +23,10 @@ class MemoryRepository implements GraftRepositoryBackend {
     return value === undefined ? null : { size: value.byteLength };
   }
 
-  get(path: string, range?: GraftByteRange): GraftObject | null {
+  get(
+    path: string,
+    range?: GraftByteRange,
+  ): GraftObject | null | Promise<GraftObject | null> {
     const value = this.objects.get(path);
     if (value === undefined) {
       return null;
@@ -143,6 +146,7 @@ describe("createGraftRemoteHandler", () => {
       capabilities: expect.arrayContaining([
         "range",
         "list",
+        "upload-bundle",
         "receive-pack",
         "receive-bundle",
         "cas",
@@ -303,6 +307,94 @@ describe("createGraftRemoteHandler", () => {
     expect(
       await (await remoteFetch(app, `/receive/repo/raw/objects/pack/${packId}.pack`)).text(),
     ).toBe("pack");
+  });
+
+  it("streams a ref snapshot and immutable objects in one upload-bundle request", async () => {
+    const app = createTestApp();
+    for (const [path, body] of [
+      ["refs/heads/main", "commit-1\n"],
+      ["objects/pack/one.idx", "index"],
+      ["objects/pack/one.pack", "pack-data"],
+      ["segments/one", "segment"],
+    ] as const) {
+      const operation = path.startsWith("refs/") ? "raw" : "raw-if-not-exists";
+      expect(
+        (
+          await remoteFetch(app, `/upload/repo/${operation}/${path}`, {
+            method: "PUT",
+            body,
+          })
+        ).status,
+      ).toBe(204);
+    }
+
+    const response = await remoteFetch(app, "/upload/repo/upload-bundle/refs/heads/main", {
+      method: "POST",
+    });
+    expect(response.status, await response.clone().text()).toBe(200);
+    expect(response.headers.get("content-type")).toBe("application/vnd.graft.upload-bundle");
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    const manifestBytes = Number(response.headers.get("x-graft-bundle-manifest-bytes"));
+    const manifest = JSON.parse(new TextDecoder().decode(bytes.subarray(0, manifestBytes))) as {
+      version: number;
+      reference: { path: string; value_hex: string };
+      objects: number;
+    };
+    expect(manifest).toEqual({
+      version: 1,
+      reference: { path: "refs/heads/main", value_hex: "636f6d6d69742d310a" },
+      objects: 3,
+    });
+    expect(decodeUploadBundleFrames(bytes.subarray(manifestBytes), manifest.objects)).toEqual([
+      ["objects/pack/one.idx", "index"],
+      ["objects/pack/one.pack", "pack-data"],
+      ["segments/one", "segment"],
+    ]);
+  });
+
+  it("prefetches upload-bundle objects with a bounded concurrency window", async () => {
+    class DelayedRepository extends MemoryRepository {
+      activeImmutableGets = 0;
+      maximumImmutableGets = 0;
+
+      override async get(path: string, range?: GraftByteRange): Promise<GraftObject | null> {
+        if (!path.startsWith("refs/")) {
+          this.activeImmutableGets += 1;
+          this.maximumImmutableGets = Math.max(
+            this.maximumImmutableGets,
+            this.activeImmutableGets,
+          );
+          await new Promise((resolve) => setTimeout(resolve, 5));
+          this.activeImmutableGets -= 1;
+        }
+        return await super.get(path, range);
+      }
+    }
+
+    const backend = new DelayedRepository();
+    backend.put("refs/heads/main", new TextEncoder().encode("commit-1\n"));
+    for (let index = 0; index < 12; index += 1) {
+      backend.put(
+        `objects/prefetch/${index.toString().padStart(2, "0")}`,
+        new Uint8Array([index]),
+      );
+    }
+    const app = createGraftRemoteHandler({ backend: () => backend });
+    const response = await remoteFetch(app, "/prefetch/repo/upload-bundle/refs/heads/main", {
+      method: "POST",
+    });
+    expect(response.status, await response.clone().text()).toBe(200);
+    await response.arrayBuffer();
+    expect(backend.maximumImmutableGets).toBe(8);
+  });
+
+  it("returns not found when upload-bundle cannot resolve the requested ref", async () => {
+    const response = await remoteFetch(
+      createTestApp(),
+      "/missing/repo/upload-bundle/refs/heads/main",
+      { method: "POST" },
+    );
+    expect(response.status).toBe(404);
   });
 
   it("does not publish a ref when a receive-pack body is truncated", async () => {
@@ -544,6 +636,24 @@ function joinBytes(parts: Uint8Array[]): Uint8Array<ArrayBuffer> {
     offset += part.length;
   }
   return bytes;
+}
+
+function decodeUploadBundleFrames(bytes: Uint8Array, count: number): Array<[string, string]> {
+  const frames: Array<[string, string]> = [];
+  let offset = 0;
+  for (let index = 0; index < count; index += 1) {
+    const view = new DataView(bytes.buffer, bytes.byteOffset + offset);
+    const pathBytes = view.getUint32(0);
+    const bodyBytes = Number(view.getBigUint64(4));
+    offset += 12;
+    const path = new TextDecoder().decode(bytes.subarray(offset, offset + pathBytes));
+    offset += pathBytes;
+    const body = new TextDecoder().decode(bytes.subarray(offset, offset + bodyBytes));
+    offset += bodyBytes;
+    frames.push([path, body]);
+  }
+  expect(offset).toBe(bytes.byteLength);
+  return frames;
 }
 
 function textHex(value: string): string {

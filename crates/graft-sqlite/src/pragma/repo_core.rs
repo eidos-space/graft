@@ -89,14 +89,15 @@ pub(super) fn run_repo_clone(
                 .remote_default_branch("origin")?
                 .unwrap_or(repo.default_branch()?),
         };
-        let fetch = repo.fetch("origin", &branch)?;
+        let clone_fetch = repo.fetch_for_clone("origin", &branch)?;
+        let fetch = &clone_fetch.fetch;
         repo.branch_create(&branch, Some(&format!("refs/remotes/origin/{branch}")))?;
         repo.set_branch_upstream(&branch, "origin", &branch)?;
         let plan = repo.plan_switch_branch(&branch)?;
         file.attach_repo(repo.clone())?;
         attached = true;
         let runtime = file.runtime().clone();
-        let remote = Arc::new(repo.remote_store("origin")?);
+        let remote = clone_fetch.remote();
         let plan = prepare_repo_checkout_plan(&runtime, &plan, Some(remote.clone()))?;
         let previous_files = BTreeMap::new();
         let previous_artifacts = BTreeMap::new();
@@ -119,8 +120,8 @@ pub(super) fn run_repo_clone(
             remote: remote_info,
             current_head,
             current_branch,
-            branch: fetch.branch,
-            head: fetch.head,
+            branch: fetch.branch.clone(),
+            head: fetch.head.clone(),
             commits: fetch.commits,
             graft_dir: graft_dir.clone(),
             paths,

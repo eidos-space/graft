@@ -105,7 +105,7 @@ impl Repository {
         remote: &crate::remote::Remote,
         id: &object::ObjectId,
         pack_cache: &mut RemoteObjectPackCache,
-    ) -> Result<Bytes> {
+    ) -> Result<Option<Bytes>> {
         let hit = pack_cache.indexes(remote)?.iter().find_map(|index| {
             index
                 .objects
@@ -114,10 +114,7 @@ impl Repository {
                 .map(|entry| (index.pack.clone(), entry.offset, entry.len))
         });
         let Some((pack, offset, len)) = hit else {
-            return Err(RepoErr::InvalidRemoteObject {
-                path: object::LooseObjectStore::relative_path(id),
-                message: "missing object".to_string(),
-            });
+            return Ok(None);
         };
         let end = offset
             .checked_add(len)
@@ -140,7 +137,7 @@ impl Repository {
                 message: format!("pack entry for object {id} extends past pack length"),
             });
         }
-        Ok(pack_bytes.slice(offset..end))
+        Ok(Some(pack_bytes.slice(offset..end)))
     }
 
     pub(super) fn fetch_commit_chain(
@@ -450,9 +447,14 @@ impl Repository {
         pack_cache: &mut RemoteObjectPackCache,
     ) -> Result<object::Object> {
         let path = object::LooseObjectStore::relative_path(id);
-        let bytes = match block_on_remote(remote.get_raw(&path))? {
+        let bytes = match self.fetch_packed_object_bytes(remote, id, pack_cache)? {
             Some(bytes) => bytes,
-            None => self.fetch_packed_object_bytes(remote, id, pack_cache)?,
+            None => block_on_remote(remote.get_raw(&path))?.ok_or_else(|| {
+                RepoErr::InvalidRemoteObject {
+                    path: path.clone(),
+                    message: "missing object".to_string(),
+                }
+            })?,
         };
         Ok(self.object_store().write_raw_validated(id, &bytes)?)
     }

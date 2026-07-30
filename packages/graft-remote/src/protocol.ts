@@ -10,6 +10,7 @@ export const GRAFT_REMOTE_CAPABILITIES = [
   "list",
   "list-cursor",
   "put-if-absent",
+  "upload-bundle",
   "receive-pack",
   "receive-bundle",
   "cas",
@@ -24,6 +25,7 @@ export const RECEIVE_PACK_HEADER_INDEX_BYTES = "x-graft-index-bytes";
 export const RECEIVE_PACK_HEADER_REPLACEMENT_HEX = "x-graft-ref-replacement-hex";
 export const RECEIVE_BUNDLE_HEADER_MANIFEST_BYTES = "x-graft-bundle-manifest-bytes";
 export const MAX_RECEIVE_BUNDLE_OBJECTS = 256;
+export const MAX_UPLOAD_BUNDLE_OBJECTS = 65_536;
 const REPOSITORY_SEGMENT = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,62}[A-Za-z0-9])?$/;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });

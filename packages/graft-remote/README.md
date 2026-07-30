@@ -116,6 +116,8 @@ Backend guarantees:
 - `list` returns at most `query.limit` paths, sorted by UTF-8 byte order, after
   `query.after`, and restricted to `query.prefix`.
 - Immutable request bodies remain streams when the adapter storage supports it.
+- `upload-bundle` lists immutable keys and streams each `get` body into one
+  clone response without buffering the repository in memory.
 - `options.contentLength` is the exact length of a framed immutable body, such
   as each object in a `receive-pack` or `receive-bundle` request.
 - Repository instances are isolated by `repository.id`.

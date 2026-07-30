@@ -1,7 +1,10 @@
 use std::{
     collections::{HashMap, HashSet},
-    env, fmt, future,
+    env, fmt, fs, future,
+    io::Write,
     ops::Range,
+    path::{Component, Path},
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -39,6 +42,9 @@ const RECEIVE_PACK_HEADER_PACK_BYTES: &str = "x-graft-pack-bytes";
 const RECEIVE_PACK_HEADER_INDEX_BYTES: &str = "x-graft-index-bytes";
 const RECEIVE_PACK_HEADER_REPLACEMENT_HEX: &str = "x-graft-ref-replacement-hex";
 const RECEIVE_BUNDLE_HEADER_MANIFEST_BYTES: &str = "x-graft-bundle-manifest-bytes";
+const MAX_UPLOAD_BUNDLE_MANIFEST_BYTES: usize = 64 * 1024;
+const MAX_UPLOAD_BUNDLE_OBJECTS: usize = 65_536;
+const MAX_UPLOAD_BUNDLE_PATH_BYTES: usize = 768;
 static HTTP_REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 enum RemotePath<'a> {
@@ -72,6 +78,9 @@ pub enum RemoteErr {
 
     #[error("HTTP remote transport error: {0}")]
     HttpTransport(reqwest::Error),
+
+    #[error("upload-bundle filesystem error: {0}")]
+    UploadBundleIo(#[from] std::io::Error),
 
     #[error("HTTP remote returned {status} for `{path}`: {message}")]
     HttpStatus {
@@ -470,6 +479,26 @@ struct ReceiveBundleManifestObject<'a> {
     allow_existing: bool,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UploadBundleManifest {
+    version: u8,
+    reference: UploadBundleReference,
+    objects: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UploadBundleReference {
+    path: String,
+    value_hex: String,
+}
+
+pub(crate) enum UploadBundleOutcome {
+    Downloaded,
+    Unsupported,
+}
+
 impl RemoteObjectPack {
     pub(crate) fn new(id: String, pack: Bytes, index: Bytes) -> Self {
         Self {
@@ -742,6 +771,17 @@ impl Remote {
                 .map(|entry| entry.path().to_string())
                 .collect()),
             RemoteBackend::Http(remote) => remote.list_raw(prefix).await,
+        }
+    }
+
+    pub(crate) async fn download_upload_bundle(
+        &self,
+        ref_path: &str,
+        root: &Path,
+    ) -> Result<UploadBundleOutcome> {
+        match &self.backend {
+            RemoteBackend::Http(remote) => remote.download_upload_bundle(ref_path, root).await,
+            RemoteBackend::ObjectStore(_) => Ok(UploadBundleOutcome::Unsupported),
         }
     }
 
@@ -1303,6 +1343,63 @@ impl HttpRemote {
         }
     }
 
+    async fn download_upload_bundle(
+        &self,
+        ref_path: &str,
+        root: &Path,
+    ) -> Result<UploadBundleOutcome> {
+        let response = self
+            .send(
+                self.request(
+                    reqwest::Method::POST,
+                    self.raw_url("upload-bundle", ref_path),
+                )
+                .header(reqwest::header::CONTENT_LENGTH, 0)
+                .timeout(Duration::from_secs(30 * 60)),
+                "upload_bundle",
+                Some(0),
+            )
+            .await?;
+        Self::check_protocol(&response, ref_path)?;
+        if matches!(response.status().as_u16(), 404 | 405) {
+            Self::drain_response(response).await?;
+            return Ok(UploadBundleOutcome::Unsupported);
+        }
+        let response = Self::check_response(response, ref_path).await?;
+        let manifest_bytes = upload_bundle_manifest_length(response.headers(), ref_path)?;
+        let mut body = HttpDownloadBody::new(response.bytes_stream());
+        let manifest = body.read_exact(manifest_bytes, ref_path).await?;
+        let manifest = decode_upload_bundle_manifest(&manifest, ref_path)?;
+        validate_upload_bundle_manifest(&manifest, ref_path)?;
+        fs::create_dir_all(root)?;
+
+        let mut previous_path: Option<String> = None;
+        for _ in 0..manifest.objects {
+            let header = body.read_exact(12, ref_path).await?;
+            let path_bytes = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
+            let object_bytes = u64::from_be_bytes(header[4..12].try_into().unwrap());
+            if !(1..=MAX_UPLOAD_BUNDLE_PATH_BYTES).contains(&path_bytes) {
+                return Err(upload_bundle_error(ref_path, "invalid object path length"));
+            }
+            let path = body.read_exact(path_bytes, ref_path).await?;
+            let path = decode_upload_bundle_path(&path, previous_path.as_deref(), ref_path)?;
+            let destination = root.join(&path);
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(destination)?;
+            body.copy_exact(object_bytes, &mut file, ref_path).await?;
+            file.flush()?;
+            previous_path = Some(path);
+        }
+        body.require_end(ref_path).await?;
+        write_upload_bundle_ref(root, &manifest.reference, ref_path)?;
+        Ok(UploadBundleOutcome::Downloaded)
+    }
+
     async fn put_raw(&self, path: &str, bytes: Bytes) -> Result<()> {
         let request_bytes = bytes.len() as u64;
         let response = self
@@ -1580,6 +1677,220 @@ impl HttpRemote {
     }
 }
 
+type DownloadStream =
+    Pin<Box<dyn Stream<Item = std::result::Result<Bytes, reqwest::Error>> + Send + 'static>>;
+
+struct HttpDownloadBody {
+    stream: DownloadStream,
+    buffered: Bytes,
+}
+
+impl HttpDownloadBody {
+    fn new(
+        stream: impl Stream<Item = std::result::Result<Bytes, reqwest::Error>> + Send + 'static,
+    ) -> Self {
+        Self {
+            stream: Box::pin(stream),
+            buffered: Bytes::new(),
+        }
+    }
+
+    async fn read_exact(&mut self, length: usize, path: &str) -> Result<Vec<u8>> {
+        let mut output = Vec::with_capacity(length);
+        while output.len() < length {
+            let chunk = self
+                .next_chunk()
+                .await?
+                .ok_or_else(|| upload_bundle_error(path, "upload-bundle response is truncated"))?;
+            let needed = length - output.len();
+            if chunk.len() <= needed {
+                output.extend_from_slice(&chunk);
+            } else {
+                output.extend_from_slice(&chunk[..needed]);
+                self.buffered = chunk.slice(needed..);
+            }
+        }
+        Ok(output)
+    }
+
+    async fn copy_exact(
+        &mut self,
+        mut remaining: u64,
+        file: &mut fs::File,
+        path: &str,
+    ) -> Result<()> {
+        while remaining != 0 {
+            let chunk = self
+                .next_chunk()
+                .await?
+                .ok_or_else(|| upload_bundle_error(path, "upload-bundle object is truncated"))?;
+            let take = usize::try_from(remaining.min(chunk.len() as u64)).unwrap();
+            file.write_all(&chunk[..take])?;
+            remaining -= take as u64;
+            if take != chunk.len() {
+                self.buffered = chunk.slice(take..);
+            }
+        }
+        Ok(())
+    }
+
+    async fn require_end(&mut self, path: &str) -> Result<()> {
+        if self.next_chunk().await?.is_some() {
+            return Err(upload_bundle_error(
+                path,
+                "upload-bundle response has trailing bytes",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn next_chunk(&mut self) -> Result<Option<Bytes>> {
+        if !self.buffered.is_empty() {
+            return Ok(Some(std::mem::take(&mut self.buffered)));
+        }
+        loop {
+            match self.stream.next().await {
+                Some(Ok(bytes)) if bytes.is_empty() => {}
+                Some(Ok(bytes)) => return Ok(Some(bytes)),
+                Some(Err(err)) => return Err(RemoteErr::HttpTransport(err)),
+                None => return Ok(None),
+            }
+        }
+    }
+}
+
+fn upload_bundle_manifest_length(
+    headers: &reqwest::header::HeaderMap,
+    path: &str,
+) -> Result<usize> {
+    let value = headers
+        .get(RECEIVE_BUNDLE_HEADER_MANIFEST_BYTES)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|length| (1..=MAX_UPLOAD_BUNDLE_MANIFEST_BYTES).contains(length));
+    value.ok_or_else(|| upload_bundle_error(path, "invalid upload-bundle manifest length"))
+}
+
+fn decode_upload_bundle_manifest(bytes: &[u8], path: &str) -> Result<UploadBundleManifest> {
+    serde_json::from_slice(bytes)
+        .map_err(|err| upload_bundle_error(path, format!("invalid upload-bundle manifest: {err}")))
+}
+
+fn validate_upload_bundle_manifest(manifest: &UploadBundleManifest, path: &str) -> Result<()> {
+    if manifest.version != 1 {
+        return Err(upload_bundle_error(
+            path,
+            "unsupported upload-bundle manifest version",
+        ));
+    }
+    if manifest.reference.path != path {
+        return Err(upload_bundle_error(
+            path,
+            "upload-bundle reference path does not match request",
+        ));
+    }
+    if manifest.objects > MAX_UPLOAD_BUNDLE_OBJECTS {
+        return Err(upload_bundle_error(
+            path,
+            "upload-bundle contains too many objects",
+        ));
+    }
+    validate_upload_bundle_path(path, true)
+        .map_err(|message| upload_bundle_error(path, message))?;
+    let _ = decode_lower_hex(&manifest.reference.value_hex, path)?;
+    Ok(())
+}
+
+fn decode_upload_bundle_path(
+    bytes: &[u8],
+    previous: Option<&str>,
+    request: &str,
+) -> Result<String> {
+    let path = std::str::from_utf8(bytes)
+        .map_err(|_| upload_bundle_error(request, "upload-bundle object path is not UTF-8"))?;
+    validate_upload_bundle_path(path, false)
+        .map_err(|message| upload_bundle_error(request, message))?;
+    if previous.is_some_and(|previous| previous.as_bytes() >= path.as_bytes()) {
+        return Err(upload_bundle_error(
+            request,
+            "upload-bundle object paths are not ordered",
+        ));
+    }
+    Ok(path.to_string())
+}
+
+fn validate_upload_bundle_path(
+    path: &str,
+    transactional: bool,
+) -> std::result::Result<(), &'static str> {
+    if path.is_empty() || path.len() > MAX_UPLOAD_BUNDLE_PATH_BYTES || path.contains('\\') {
+        return Err("upload-bundle contains an invalid path");
+    }
+    if path
+        .split('/')
+        .any(|segment| segment.is_empty() || matches!(segment, "." | ".."))
+        || path.chars().any(char::is_control)
+        || Path::new(path)
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err("upload-bundle contains an unsafe path");
+    }
+    let is_transactional = path == "HEAD" || path.starts_with("refs/");
+    if is_transactional != transactional || path == "locks" || path.starts_with("locks/") {
+        return Err("upload-bundle path has the wrong storage class");
+    }
+    Ok(())
+}
+
+fn write_upload_bundle_ref(
+    root: &Path,
+    reference: &UploadBundleReference,
+    request: &str,
+) -> Result<()> {
+    let bytes = decode_lower_hex(&reference.value_hex, request)?;
+    let destination = root.join(&reference.path);
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)?;
+    file.write_all(&bytes)?;
+    file.flush()?;
+    Ok(())
+}
+
+fn decode_lower_hex(value: &str, path: &str) -> Result<Vec<u8>> {
+    if value.len() > 32 * 1024
+        || !value.len().is_multiple_of(2)
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(upload_bundle_error(
+            path,
+            "upload-bundle reference is not lowercase hexadecimal",
+        ));
+    }
+    (0..value.len())
+        .step_by(2)
+        .map(|offset| u8::from_str_radix(&value[offset..offset + 2], 16))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|_| {
+            upload_bundle_error(path, "upload-bundle reference is not lowercase hexadecimal")
+        })
+}
+
+fn upload_bundle_error(path: &str, message: impl Into<String>) -> RemoteErr {
+    RemoteErr::HttpStatus {
+        status: 502,
+        path: path.to_string(),
+        message: message.into(),
+    }
+}
+
 fn safe_server_timings(headers: &reqwest::header::HeaderMap) -> Vec<(&'static str, f64)> {
     let mut timings = Vec::new();
     for value in headers.get_all("server-timing") {
@@ -1773,6 +2084,42 @@ mod tests {
         (format!("http://{address}/org/repo"), task)
     }
 
+    async fn serve_upload_bundle(
+        manifest: serde_json::Value,
+        objects: &[(&str, &[u8])],
+    ) -> (String, tokio::task::JoinHandle<Vec<u8>>) {
+        let manifest = serde_json::to_vec(&manifest).unwrap();
+        let body = encode_test_upload_bundle(&manifest, objects);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await;
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nGraft-Protocol: 1\r\n{RECEIVE_BUNDLE_HEADER_MANIFEST_BYTES}: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                manifest.len(),
+                body.len(),
+            );
+            stream.write_all(headers.as_bytes()).await.unwrap();
+            for chunk in body.chunks(3) {
+                stream.write_all(chunk).await.unwrap();
+            }
+            request
+        });
+        (format!("http://{address}/org/repo"), task)
+    }
+
+    fn encode_test_upload_bundle(manifest: &[u8], objects: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut body = manifest.to_vec();
+        for (path, bytes) in objects {
+            body.extend_from_slice(&(path.len() as u32).to_be_bytes());
+            body.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+            body.extend_from_slice(path.as_bytes());
+            body.extend_from_slice(bytes);
+        }
+        body
+    }
+
     async fn read_http_request(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
         let mut request = Vec::new();
         let mut request_bytes = None;
@@ -1813,6 +2160,100 @@ mod tests {
             .position(|window| window == b"\r\n\r\n")
             .unwrap();
         &request[header_end + 4..]
+    }
+
+    #[tokio::test]
+    async fn upload_bundle_downloads_one_stream_into_a_local_remote() {
+        let manifest = serde_json::json!({
+            "version": 1,
+            "reference": {
+                "path": "refs/heads/main",
+                "value_hex": hex_encode(b"commit-one\n"),
+            },
+            "objects": 2,
+        });
+        let (url, request) = serve_upload_bundle(
+            manifest,
+            &[
+                ("objects/pack/example.idx", b"index"),
+                ("objects/pack/example.pack", b"pack"),
+            ],
+        )
+        .await;
+        let remote = RemoteConfig::Http { url, token_env: None }.build().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+
+        assert!(matches!(
+            remote
+                .download_upload_bundle("refs/heads/main", destination.path())
+                .await
+                .unwrap(),
+            UploadBundleOutcome::Downloaded
+        ));
+        assert_eq!(
+            fs::read(destination.path().join("refs/heads/main")).unwrap(),
+            b"commit-one\n"
+        );
+        assert_eq!(
+            fs::read(destination.path().join("objects/pack/example.idx")).unwrap(),
+            b"index"
+        );
+        assert_eq!(
+            fs::read(destination.path().join("objects/pack/example.pack")).unwrap(),
+            b"pack"
+        );
+        assert!(
+            request
+                .await
+                .unwrap()
+                .starts_with(b"POST /org/repo/upload-bundle/refs/heads/main ")
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_bundle_rejects_paths_outside_the_destination() {
+        let manifest = serde_json::json!({
+            "version": 1,
+            "reference": {
+                "path": "refs/heads/main",
+                "value_hex": hex_encode(b"commit-one\n"),
+            },
+            "objects": 1,
+        });
+        let (url, request) = serve_upload_bundle(manifest, &[("../escaped", b"bad")]).await;
+        let remote = RemoteConfig::Http { url, token_env: None }.build().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let destination = parent.path().join("bundle");
+
+        assert!(matches!(
+            remote
+                .download_upload_bundle("refs/heads/main", &destination)
+                .await,
+            Err(RemoteErr::HttpStatus { status: 502, .. })
+        ));
+        assert!(!parent.path().join("escaped").exists());
+        request.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn upload_bundle_falls_back_when_the_remote_does_not_support_it() {
+        let (url, request) = serve_http_response("404 Not Found", &["1"]).await;
+        let remote = RemoteConfig::Http { url, token_env: None }.build().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+
+        assert!(matches!(
+            remote
+                .download_upload_bundle("refs/heads/main", destination.path())
+                .await
+                .unwrap(),
+            UploadBundleOutcome::Unsupported
+        ));
+        assert!(
+            request
+                .await
+                .unwrap()
+                .starts_with("POST /org/repo/upload-bundle/refs/heads/main ")
+        );
     }
 
     #[tokio::test]

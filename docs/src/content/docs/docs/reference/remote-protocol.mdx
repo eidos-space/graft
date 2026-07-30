@@ -90,6 +90,7 @@ issuance, tenancy, and ACL storage are service concerns outside this protocol.
     "range",
     "list",
     "put-if-absent",
+    "upload-bundle",
     "receive-pack",
     "receive-bundle",
     "cas",
@@ -138,6 +139,7 @@ All paths below are relative to `{base}`.
 | `PUT /raw/<key>`                 | Replace transactional metadata.                      | `204 No Content` |
 | `DELETE /raw/<key>`              | Delete transactional metadata.                       | `204 No Content` |
 | `PUT /raw-if-not-exists/<key>`   | Create an object only when absent.                   | `204 No Content` |
+| `POST /upload-bundle/<ref-key>`  | Stream a ref snapshot and its immutable storage.    | `200 OK`         |
 | `POST /receive-pack/<ref-key>`   | Publish one object pack and atomically update a ref. | `204 No Content` |
 | `POST /receive-bundle/<ref-key>` | Publish immutable objects, a pack, and a ref.        | `204 No Content` |
 | `POST /cas/<key>`                | Atomically compare and replace metadata.             | `204 No Content` |
@@ -157,6 +159,48 @@ objects but cannot expose an incomplete commit.
 
 Deleting an already absent key through `DELETE /raw` SHOULD succeed so the
 operation remains idempotent.
+
+## Upload Bundle
+
+`upload-bundle` is an optional version 1 capability for Git-style clone
+transport. A client selects a branch and sends one authenticated request:
+
+```http
+POST /upload-bundle/refs/heads/main
+Content-Length: 0
+```
+
+The service reads the requested ref, lists the repository's immutable keys,
+then reads the ref again. If it changed, the service returns `409`; the client
+may retry. A stable snapshot returns
+`Content-Type: application/vnd.graft.upload-bundle` and the
+`x-graft-bundle-manifest-bytes` header. The response starts with that many
+bytes of UTF-8 JSON:
+
+```json
+{
+  "version": 1,
+  "reference": {
+    "path": "refs/heads/main",
+    "value_hex": "<lowercase hexadecimal ref bytes>"
+  },
+  "objects": 3
+}
+```
+
+Exactly `objects` binary frames follow. Each frame is a 4-byte unsigned path
+length, an 8-byte unsigned object length, the UTF-8 path, then the object body.
+Integers use network byte order. Paths MUST be strictly ordered, unique,
+immutable repository keys. The body MUST end immediately after the final
+frame. The service streams each immutable backend object without buffering the
+whole bundle.
+
+Version 1 bundles all immutable keys because the protocol service treats their
+contents as opaque. The client validates every frame, creates a temporary local
+remote, and resolves the selected commit graph and checkout from that local
+snapshot. This gives clone one bulk data response; future protocol versions may
+add reachability negotiation. Clients MUST fall back to the version 1 raw/list
+operations when `upload-bundle` returns `404` or `405`.
 
 ## Receive Pack
 

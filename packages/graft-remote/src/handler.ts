@@ -1,10 +1,14 @@
 import {
   GRAFT_REMOTE_CAPABILITIES,
+  MAX_LIST_LIMIT,
   MAX_METADATA_BYTES,
+  MAX_UPLOAD_BUNDLE_OBJECTS,
   PROTOCOL_HEADER,
   PROTOCOL_VERSION,
+  RECEIVE_BUNDLE_HEADER_MANIFEST_BYTES,
   GraftProtocolError,
   bytewiseCompare,
+  bytesEqual,
   emptyResponse,
   encodeListCursor,
   errorResponse,
@@ -41,12 +45,14 @@ import type {
 const OPERATIONS = new Set<GraftRemoteOperation>([
   "raw",
   "raw-if-not-exists",
+  "upload-bundle",
   "receive-pack",
   "receive-bundle",
   "cas",
   "cad",
   "list",
 ]);
+const UPLOAD_BUNDLE_PREFETCH_OBJECTS = 8;
 
 export function createGraftRemoteHandler<AdapterContext = undefined, Principal = undefined>(
   options: GraftRemoteOptions<AdapterContext, Principal>,
@@ -144,6 +150,8 @@ async function handleRequest<AdapterContext, Principal>(
       return raw(input.request, backend, path);
     case "raw-if-not-exists":
       return putIfAbsent(input.request, backend, path);
+    case "upload-bundle":
+      return uploadBundle(backend, path);
     case "receive-pack":
       return receivePack(input.request, backend, path);
     case "receive-bundle":
@@ -207,6 +215,9 @@ function validateMethodAndAction(
     case "raw-if-not-exists":
       requireMethod(method, "PUT");
       return "write";
+    case "upload-bundle":
+      requireMethod(method, "POST");
+      return "read";
     case "receive-pack":
     case "receive-bundle":
       requireMethod(method, "POST");
@@ -308,6 +319,268 @@ async function putIfAbsent(
     throw new GraftProtocolError(412, "precondition_failed", "Object already exists");
   }
   return emptyResponse();
+}
+
+async function uploadBundle(
+  backend: GraftRepositoryBackend,
+  refPath: string,
+): Promise<Response> {
+  requireTransactionalPath(refPath);
+  const reference = await readMetadataObject(backend, refPath);
+  if (reference === null) throw objectNotFound();
+  const paths = await listImmutablePaths(backend);
+  const confirmed = await readMetadataObject(backend, refPath);
+  if (confirmed === null || !bytesEqual(reference, confirmed)) {
+    throw new GraftProtocolError(
+      409,
+      "snapshot_changed",
+      "Reference changed while preparing the upload bundle",
+    );
+  }
+
+  const manifest = new TextEncoder().encode(
+    JSON.stringify({
+      version: 1,
+      reference: { path: refPath, value_hex: encodeLowerHex(reference) },
+      objects: paths.length,
+    }),
+  );
+  const headers = protocolHeaders({
+    "Content-Type": "application/vnd.graft.upload-bundle",
+    [RECEIVE_BUNDLE_HEADER_MANIFEST_BYTES]: manifest.byteLength.toString(),
+  });
+  return new Response(new UploadBundleBody(backend, manifest, paths).stream, { headers });
+}
+
+async function listImmutablePaths(backend: GraftRepositoryBackend): Promise<string[]> {
+  const paths: string[] = [];
+  let after: string | undefined;
+  for (;;) {
+    const result = await backend.list({ prefix: "", after, limit: MAX_LIST_LIMIT });
+    if (result.paths.length > MAX_LIST_LIMIT) {
+      throw backendContractError("List backend returned more paths than requested");
+    }
+    for (const path of result.paths) {
+      validateObjectPath(path);
+      if (after !== undefined && bytewiseCompare(path, after) <= 0) {
+        throw backendContractError("List backend returned unsorted paths");
+      }
+      after = path;
+      if (isImmutablePath(path)) paths.push(path);
+      if (paths.length > MAX_UPLOAD_BUNDLE_OBJECTS) {
+        throw new GraftProtocolError(413, "upload_bundle_too_large", "Too many bundled objects");
+      }
+    }
+    if (!result.hasMore) return paths;
+    if (result.paths.length === 0) {
+      throw backendContractError("List backend cannot advance the upload-bundle cursor");
+    }
+  }
+}
+
+async function readMetadataObject(
+  backend: GraftRepositoryBackend,
+  path: string,
+): Promise<Uint8Array<ArrayBuffer> | null> {
+  const object = await backend.get(path);
+  if (object === null) return null;
+  validateMetadata(object);
+  if (object.size > MAX_METADATA_BYTES) {
+    throw backendContractError("Transactional backend object exceeds the metadata limit");
+  }
+  const bytes = await readObjectBody(object, MAX_METADATA_BYTES);
+  if (bytes.byteLength !== object.size) {
+    throw backendContractError("Backend object body does not match its declared size");
+  }
+  return bytes;
+}
+
+async function readObjectBody(
+  object: GraftObject,
+  limit: number,
+): Promise<Uint8Array<ArrayBuffer>> {
+  const reader = objectBodyStream(object).getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const result = await reader.read();
+      if (result.done) break;
+      total += result.value.byteLength;
+      if (total > limit) throw backendContractError("Backend object body exceeds its size limit");
+      chunks.push(result.value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(new ArrayBuffer(total));
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
+}
+
+function encodeLowerHex(bytes: Uint8Array): string {
+  let value = "";
+  for (const byte of bytes) value += byte.toString(16).padStart(2, "0");
+  return value;
+}
+
+function objectBodyStream(object: GraftObject): ReadableStream<Uint8Array> {
+  if (object.body instanceof ReadableStream) return object.body;
+  const bytes = object.body instanceof Uint8Array ? object.body : new Uint8Array(object.body);
+  return new ReadableStream({
+    start(controller) {
+      controller.enqueue(bytes);
+      controller.close();
+    },
+  });
+}
+
+class UploadBundleBody {
+  readonly stream: ReadableStream<Uint8Array>;
+  readonly #backend: GraftRepositoryBackend;
+  readonly #paths: string[];
+  readonly #pending: Uint8Array[];
+  readonly #prefetched = new Map<number, Promise<PrefetchedObject>>();
+  #index = 0;
+  #nextPrefetch = 0;
+  #reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  #remaining = 0;
+
+  constructor(backend: GraftRepositoryBackend, manifest: Uint8Array, paths: string[]) {
+    this.#backend = backend;
+    this.#paths = paths;
+    this.#pending = [manifest];
+    this.stream = new ReadableStream({
+      pull: async (controller) => {
+        try {
+          await this.pull(controller);
+        } catch (error) {
+          await this.cancel(error);
+          throw error;
+        }
+      },
+      cancel: async (reason) => await this.cancel(reason),
+    });
+  }
+
+  private async pull(controller: ReadableStreamDefaultController<Uint8Array>): Promise<void> {
+    for (;;) {
+      const pending = this.#pending.shift();
+      if (pending !== undefined) {
+        controller.enqueue(pending);
+        return;
+      }
+      if (this.#reader !== undefined) {
+        if (await this.pullObject(controller)) return;
+        continue;
+      }
+      if (this.#index === this.#paths.length) {
+        controller.close();
+        return;
+      }
+      await this.openObject();
+    }
+  }
+
+  private async openObject(): Promise<void> {
+    this.fillPrefetch();
+    const path = this.#paths[this.#index]!;
+    const prefetched = await this.#prefetched.get(this.#index)!;
+    this.#prefetched.delete(this.#index);
+    if (!prefetched.ok) throw prefetched.error;
+    const object = prefetched.object;
+    if (object === null) throw backendContractError("Bundled immutable object disappeared");
+    validateMetadata(object);
+    this.#remaining = object.size;
+    this.#reader = objectBodyStream(object).getReader();
+    this.#pending.push(uploadBundleFrameHeader(path, object.size));
+  }
+
+  private fillPrefetch(): void {
+    const end = Math.min(
+      this.#paths.length,
+      this.#index + UPLOAD_BUNDLE_PREFETCH_OBJECTS,
+    );
+    while (this.#nextPrefetch < end) {
+      const index = this.#nextPrefetch;
+      const path = this.#paths[index]!;
+      const object = Promise.resolve(this.#backend.get(path)).then(
+        (value): PrefetchedObject => ({ ok: true, object: value }),
+        (error: unknown): PrefetchedObject => ({ ok: false, error }),
+      );
+      this.#prefetched.set(index, object);
+      this.#nextPrefetch += 1;
+    }
+  }
+
+  private async pullObject(
+    controller: ReadableStreamDefaultController<Uint8Array>,
+  ): Promise<boolean> {
+    for (;;) {
+      const result = await this.#reader!.read();
+      if (result.done) {
+        this.#reader!.releaseLock();
+        this.#reader = undefined;
+        if (this.#remaining !== 0) throw backendContractError("Bundled object body is truncated");
+        this.#index += 1;
+        return false;
+      }
+      if (result.value.byteLength === 0) continue;
+      if (result.value.byteLength > this.#remaining) {
+        throw backendContractError("Bundled object body exceeds its declared size");
+      }
+      this.#remaining -= result.value.byteLength;
+      controller.enqueue(result.value);
+      return true;
+    }
+  }
+
+  private async cancel(reason: unknown): Promise<void> {
+    const reader = this.#reader;
+    this.#reader = undefined;
+    if (reader !== undefined) {
+      try {
+        await reader.cancel(reason);
+      } finally {
+        reader.releaseLock();
+      }
+    }
+
+    const prefetched = [...this.#prefetched.values()];
+    this.#prefetched.clear();
+    this.#nextPrefetch = this.#paths.length;
+    const objects = await Promise.all(prefetched);
+    await Promise.all(
+      objects.map(async (result) => {
+        if (!result.ok || result.object === null) return;
+        const body = result.object.body;
+        if (!(body instanceof ReadableStream) || body.locked) return;
+        try {
+          await body.cancel(reason);
+        } catch {
+          // A backend may have already canceled the prefetched body.
+        }
+      }),
+    );
+  }
+}
+
+type PrefetchedObject =
+  | { ok: true; object: GraftObject | null }
+  | { ok: false; error: unknown };
+
+function uploadBundleFrameHeader(path: string, size: number): Uint8Array<ArrayBuffer> {
+  const pathBytes = new TextEncoder().encode(path);
+  const header = new Uint8Array(new ArrayBuffer(12 + pathBytes.byteLength));
+  const view = new DataView(header.buffer);
+  view.setUint32(0, pathBytes.byteLength);
+  view.setBigUint64(4, BigInt(size));
+  header.set(pathBytes, 12);
+  return header;
 }
 
 async function receivePack(
