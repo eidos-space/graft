@@ -132,6 +132,15 @@ encoding 必须被拒绝。服务可以公布 key/body 限制，并在超限时�
 `application/octet-stream`。mutation 成功响应没有 body。
 成功的 `HEAD` 响应必须通过 `Content-Length` 返回对应完整 `GET` 的字节数。
 
+version 1 服务仍必须支持 `HEAD /raw/<key>`。为了兼容明确返回 `405 Method Not
+Allowed` 或 `501 Not Implemented` 的旧 gateway，client 可以用
+`GET /raw/<key>` 和 `Range: bytes=0-0` 重试存在性探测。`200` 或 `206` 表示对象
+存在，`404` 表示不存在；只有同时包含 `Content-Range: bytes */0` 时，`416` 才
+表示一个已存在的空对象。当 gateway 忽略 `Range` 时，client 必须释放成功响应且
+不得继续读取完整对象；鉴权失败、其他状态码和 transport error 不得触发该 fallback。
+fallback 响应本身仍必须包含有效的 `Graft-Protocol` header；初始 `405` 或 `501`
+可能由 protocol service 前的 gateway 生成，因此可以不包含该 header。
+
 服务必须为不可变对象支持 `raw-if-not-exists`，并应该拒绝不可变对象的无条件覆盖
 或删除。Graft 的发布顺序是：先发布不可变对象，pack 成功后发布 index，最后 CAS
 更新 ref。ref 更新失败可以留下不可达对象，但不会暴露不完整 commit。

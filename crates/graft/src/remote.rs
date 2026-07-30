@@ -155,6 +155,7 @@ pub struct RemoteCredentials {
     mode: RemoteCredentialMode,
     http_bearer_tokens: Arc<RwLock<HashMap<String, BearerToken>>>,
     http_client: Arc<RwLock<Option<reqwest::Client>>>,
+    http_probe_client: Arc<RwLock<Option<reqwest::Client>>>,
     http_upload_client: Arc<RwLock<Option<reqwest::Client>>>,
 }
 
@@ -170,6 +171,10 @@ impl fmt::Debug for RemoteCredentials {
             .field(
                 "http_client_initialized",
                 &self.http_client.read().is_some(),
+            )
+            .field(
+                "http_probe_client_initialized",
+                &self.http_probe_client.read().is_some(),
             )
             .field(
                 "http_upload_client_initialized",
@@ -192,6 +197,7 @@ impl RemoteCredentials {
             mode: RemoteCredentialMode::Explicit,
             http_bearer_tokens: Arc::default(),
             http_client: Arc::default(),
+            http_probe_client: Arc::default(),
             http_upload_client: Arc::default(),
         }
     }
@@ -205,6 +211,7 @@ impl RemoteCredentials {
             mode: RemoteCredentialMode::Environment,
             http_bearer_tokens: Arc::default(),
             http_client: Arc::default(),
+            http_probe_client: Arc::default(),
             http_upload_client: Arc::default(),
         }
     }
@@ -262,6 +269,7 @@ impl RemoteCredentials {
     /// HTTP/1.1 proxies leave otherwise idle pooled connections unusable.
     pub fn reset_http_clients(&self) {
         *self.http_client.write() = None;
+        *self.http_probe_client.write() = None;
         *self.http_upload_client.write() = None;
     }
 
@@ -297,13 +305,24 @@ impl RemoteCredentials {
         let mut client = self.http_upload_client.write();
         Ok(client.get_or_insert(candidate).clone())
     }
+
+    fn http_probe_client(&self) -> Result<reqwest::Client> {
+        if let Some(client) = self.http_probe_client.read().clone() {
+            return Ok(client);
+        }
+
+        let candidate = build_http_client()?;
+        let mut client = self.http_probe_client.write();
+        Ok(client.get_or_insert(candidate).clone())
+    }
 }
 
 fn build_http_client() -> std::result::Result<reqwest::Client, reqwest::Error> {
     reqwest::ClientBuilder::new()
         // HTTP/2 request-body multiplexing stalls behind common local proxies.
-        // Reuse dedicated read and mutation HTTP/1.1 pools across the entire
-        // repository session so proxies never mix PUT bodies into read streams.
+        // Reuse dedicated read, existence-probe, and mutation HTTP/1.1 pools
+        // across the entire repository session so proxies never mix request
+        // types with different response-body behavior on one connection.
         .http1_only()
         .hickory_dns(true)
         .connect_timeout(Duration::from_secs(5))
@@ -401,6 +420,7 @@ enum RemoteBackend {
 #[derive(Debug, Clone)]
 struct HttpRemote {
     client: reqwest::Client,
+    probe_client: reqwest::Client,
     upload_client: reqwest::Client,
     url: String,
     token: Option<BearerToken>,
@@ -569,6 +589,7 @@ impl Remote {
                         url,
                         token,
                         credentials.http_client()?,
+                        credentials.http_probe_client()?,
                         credentials.http_upload_client()?,
                     )),
                 });
@@ -1088,17 +1109,19 @@ impl HttpRemote {
 
     #[cfg(test)]
     fn with_client(url: String, token: Option<BearerToken>, client: reqwest::Client) -> Self {
-        Self::with_clients(url, token, client.clone(), client)
+        Self::with_clients(url, token, client.clone(), client.clone(), client)
     }
 
     fn with_clients(
         url: String,
         token: Option<BearerToken>,
         client: reqwest::Client,
+        probe_client: reqwest::Client,
         upload_client: reqwest::Client,
     ) -> Self {
         Self {
             client,
+            probe_client,
             upload_client,
             url: url.trim_end_matches('/').to_string(),
             token,
@@ -1128,6 +1151,10 @@ impl HttpRemote {
 
     fn upload_request(&self, method: reqwest::Method, url: String) -> reqwest::RequestBuilder {
         self.request_with(&self.upload_client, method, url)
+    }
+
+    fn probe_request(&self, method: reqwest::Method, url: String) -> reqwest::RequestBuilder {
+        self.request_with(&self.probe_client, method, url)
     }
 
     fn request_with(
@@ -1238,17 +1265,75 @@ impl HttpRemote {
     async fn has_raw(&self, path: &str) -> Result<bool> {
         let response = self
             .send(
-                self.request(reqwest::Method::HEAD, self.raw_url("raw", path)),
+                self.probe_request(reqwest::Method::HEAD, self.raw_url("raw", path)),
                 "head",
                 Some(0),
             )
             .await?;
-        if response.status().as_u16() == 404 {
-            Self::check_protocol(&response, path)?;
-            return Ok(false);
+        let status = response.status().as_u16();
+        match status {
+            404 => {
+                Self::check_protocol(&response, path)?;
+                drop(response);
+                Ok(false)
+            }
+            405 | 501 => {
+                drop(response);
+                self.has_raw_with_range(path).await
+            }
+            _ => {
+                Self::check_response(response, path).await?;
+                Ok(true)
+            }
         }
-        Self::check_response(response, path).await?;
-        Ok(true)
+    }
+
+    async fn has_raw_with_range(&self, path: &str) -> Result<bool> {
+        let response = self
+            .send(
+                self.probe_request(reqwest::Method::GET, self.raw_url("raw", path))
+                    .header(reqwest::header::RANGE, "bytes=0-0"),
+                "range_probe",
+                Some(0),
+            )
+            .await?;
+        Self::check_protocol(&response, path)?;
+        let status = response.status().as_u16();
+        match status {
+            200 | 206 => {
+                drop(response);
+                Ok(true)
+            }
+            404 => {
+                drop(response);
+                Ok(false)
+            }
+            416 if response
+                .headers()
+                .get(reqwest::header::CONTENT_RANGE)
+                .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"bytes */0")) =>
+            {
+                drop(response);
+                Ok(true)
+            }
+            200..=299 => {
+                drop(response);
+                Err(RemoteErr::HttpStatus {
+                    status,
+                    path: path.to_string(),
+                    message: "range existence probe returned an unexpected success status"
+                        .to_string(),
+                })
+            }
+            _ => {
+                Self::check_response(response, path).await?;
+                Err(RemoteErr::HttpStatus {
+                    status,
+                    path: path.to_string(),
+                    message: "range existence probe returned an unexpected response".to_string(),
+                })
+            }
+        }
     }
 
     async fn get_raw(&self, path: &str) -> Result<Option<Bytes>> {
@@ -2084,6 +2169,27 @@ mod tests {
         (format!("http://{address}/org/repo"), task)
     }
 
+    async fn serve_http_messages(
+        responses: &[&str],
+    ) -> (String, tokio::task::JoinHandle<Vec<Vec<u8>>>) {
+        let responses = responses
+            .iter()
+            .map(|response| response.as_bytes().to_vec())
+            .collect::<Vec<_>>();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let mut requests = Vec::with_capacity(responses.len());
+            for response in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                requests.push(read_http_request(&mut stream).await);
+                stream.write_all(&response).await.unwrap();
+            }
+            requests
+        });
+        (format!("http://{address}/org/repo"), task)
+    }
+
     async fn serve_upload_bundle(
         manifest: serde_json::Value,
         objects: &[(&str, &[u8])],
@@ -2560,7 +2666,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resetting_repository_credentials_starts_a_fresh_read_connection() {
+    async fn resetting_repository_credentials_starts_a_fresh_probe_connection() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -2627,13 +2733,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repository_credentials_separate_read_and_upload_connections() {
+    async fn repository_credentials_separate_read_probe_and_upload_connections() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut read_stream, _) = listener.accept().await.unwrap();
-            read_http_headers(&mut read_stream).await;
+            let read_request = read_http_request(&mut read_stream).await;
             read_stream
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nGraft-Protocol: 1\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await
+                .unwrap();
+
+            let (mut probe_stream, _) =
+                tokio::time::timeout(Duration::from_secs(1), listener.accept())
+                    .await
+                    .expect("probe reused the read connection")
+                    .unwrap();
+            let probe_request = read_http_request(&mut probe_stream).await;
+            probe_stream
                 .write_all(
                     b"HTTP/1.1 204 No Content\r\nGraft-Protocol: 1\r\nContent-Length: 0\r\n\r\n",
                 )
@@ -2643,15 +2762,16 @@ mod tests {
             let (mut upload_stream, _) =
                 tokio::time::timeout(Duration::from_secs(1), listener.accept())
                     .await
-                    .expect("upload reused the read connection")
+                    .expect("upload reused the read or probe connection")
                     .unwrap();
-            read_http_headers(&mut upload_stream).await;
+            let upload_request = read_http_request(&mut upload_stream).await;
             upload_stream
                 .write_all(
                     b"HTTP/1.1 204 No Content\r\nGraft-Protocol: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                 )
                 .await
                 .unwrap();
+            (read_request, probe_request, upload_request)
         });
         let remote = RemoteConfig::Http {
             url: format!("http://{address}/org/repo"),
@@ -2660,12 +2780,16 @@ mod tests {
         .build_with_credentials("origin", &RemoteCredentials::explicit())
         .unwrap();
 
+        assert!(remote.get_raw("refs/heads/main").await.unwrap().is_none());
         assert!(remote.has_segment(&SegmentId::random()).await.unwrap());
         remote
             .put_raw_if_not_exists("objects/one", Bytes::from_static(b"one"))
             .await
             .unwrap();
-        server.await.unwrap();
+        let (read_request, probe_request, upload_request) = server.await.unwrap();
+        assert!(String::from_utf8_lossy(&read_request).starts_with("GET "));
+        assert!(String::from_utf8_lossy(&probe_request).starts_with("HEAD "));
+        assert!(String::from_utf8_lossy(&upload_request).starts_with("PUT "));
     }
 
     async fn read_http_headers(stream: &mut tokio::net::TcpStream) {
@@ -2825,6 +2949,224 @@ mod tests {
         let remote = HttpRemote::new(url, None).unwrap();
         assert!(!remote.has_raw("objects/one").await.unwrap());
         request.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_remote_falls_back_to_range_get_when_head_is_not_supported() {
+        for (head_status, fallback_status) in [
+            ("405 Method Not Allowed", "206 Partial Content"),
+            ("501 Not Implemented", "200 OK"),
+        ] {
+            let (url, requests) = serve_http_exchanges(&[head_status, fallback_status]).await;
+            let remote = HttpRemote::new(url, None).unwrap();
+
+            assert!(remote.has_raw("segments/example").await.unwrap());
+
+            let requests = requests.await.unwrap();
+            let head = String::from_utf8_lossy(&requests[0]);
+            let fallback = String::from_utf8_lossy(&requests[1]);
+            assert!(head.starts_with("HEAD /org/repo/raw/segments/example "));
+            assert!(fallback.starts_with("GET /org/repo/raw/segments/example "));
+            assert!(
+                fallback
+                    .lines()
+                    .any(|line| line.eq_ignore_ascii_case("Range: bytes=0-0"))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn http_remote_head_probe_succeeds_without_fallback() {
+        let (url, request) = serve_http_response("200 OK", &["1"]).await;
+        let remote = HttpRemote::new(url, None).unwrap();
+
+        assert!(remote.has_raw("segments/example").await.unwrap());
+        assert!(
+            request
+                .await
+                .unwrap()
+                .starts_with("HEAD /org/repo/raw/segments/example ")
+        );
+    }
+
+    #[tokio::test]
+    async fn http_remote_head_probe_does_not_fallback_on_other_statuses() {
+        for (response_status, expected_status) in [
+            ("401 Unauthorized", 401),
+            ("403 Forbidden", 403),
+            ("500 Internal Server Error", 500),
+        ] {
+            let (url, request) = serve_http_response(response_status, &["1"]).await;
+            let remote = HttpRemote::new(url, None).unwrap();
+            let error = remote.has_raw("segments/example").await.unwrap_err();
+
+            assert!(
+                matches!(error, RemoteErr::HttpStatus { status, .. } if status == expected_status)
+            );
+            assert!(
+                request
+                    .await
+                    .unwrap()
+                    .starts_with("HEAD /org/repo/raw/segments/example ")
+            );
+        }
+
+        let (url, request) = serve_http_response("404 Not Found", &["1"]).await;
+        let remote = HttpRemote::new(url, None).unwrap();
+        assert!(!remote.has_raw("segments/example").await.unwrap());
+        request.await.unwrap();
+
+        let responses = [
+            "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 206 Partial Content\r\nGraft-Protocol: 1\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx",
+        ];
+        let (url, requests) = serve_http_messages(&responses).await;
+        let remote = HttpRemote::new(url, None).unwrap();
+        assert!(remote.has_raw("segments/example").await.unwrap());
+        assert_eq!(requests.await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn http_remote_range_probe_preserves_missing_and_error_statuses() {
+        let (url, requests) =
+            serve_http_exchanges(&["405 Method Not Allowed", "404 Not Found"]).await;
+        let remote = HttpRemote::new(url, None).unwrap();
+        assert!(!remote.has_raw("segments/example").await.unwrap());
+        assert_eq!(requests.await.unwrap().len(), 2);
+
+        for (fallback_status, expected_status) in [
+            ("204 No Content", 204),
+            ("401 Unauthorized", 401),
+            ("500 Internal Server Error", 500),
+        ] {
+            let (url, requests) =
+                serve_http_exchanges(&["405 Method Not Allowed", fallback_status]).await;
+            let remote = HttpRemote::new(url, None).unwrap();
+            let error = remote.has_raw("segments/example").await.unwrap_err();
+
+            assert!(
+                matches!(error, RemoteErr::HttpStatus { status, .. } if status == expected_status)
+            );
+            assert_eq!(requests.await.unwrap().len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn http_remote_head_transport_error_is_preserved_without_retry() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await;
+            drop(stream);
+            let no_retry = tokio::time::timeout(Duration::from_millis(250), listener.accept())
+                .await
+                .is_err();
+            (request, no_retry)
+        });
+        let remote = HttpRemote::new(format!("http://{address}/org/repo"), None).unwrap();
+
+        assert!(matches!(
+            remote.has_raw("segments/example").await,
+            Err(RemoteErr::HttpTransport(_))
+        ));
+        let (request, no_retry) = server.await.unwrap();
+        assert!(String::from_utf8_lossy(&request).starts_with("HEAD "));
+        assert!(no_retry, "HEAD transport error was retried");
+    }
+
+    #[tokio::test]
+    async fn http_remote_range_probe_transport_error_is_preserved() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut head_stream, _) = listener.accept().await.unwrap();
+            read_http_request(&mut head_stream).await;
+            head_stream
+                .write_all(
+                    b"HTTP/1.1 405 Method Not Allowed\r\nGraft-Protocol: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            drop(head_stream);
+
+            let (get_stream, _) = listener.accept().await.unwrap();
+            drop(get_stream);
+        });
+        let remote = HttpRemote::new(format!("http://{address}/org/repo"), None).unwrap();
+
+        assert!(matches!(
+            remote.has_raw("segments/example").await,
+            Err(RemoteErr::HttpTransport(_))
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_remote_range_probe_recognizes_an_empty_segment() {
+        let responses = [
+            "HTTP/1.1 405 Method Not Allowed\r\nGraft-Protocol: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 416 Range Not Satisfiable\r\nGraft-Protocol: 1\r\nContent-Range: bytes */0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        ];
+        let (url, requests) = serve_http_messages(&responses).await;
+        let remote = HttpRemote::new(url, None).unwrap();
+
+        assert!(remote.has_raw("segments/empty").await.unwrap());
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            String::from_utf8_lossy(&requests[1])
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("Range: bytes=0-0"))
+        );
+    }
+
+    #[tokio::test]
+    async fn http_remote_range_probe_does_not_read_a_full_segment() {
+        const LARGE_SEGMENT_BYTES: usize = 16 * 1024 * 1024;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut head_stream, _) = listener.accept().await.unwrap();
+            read_http_request(&mut head_stream).await;
+            head_stream
+                .write_all(
+                    b"HTTP/1.1 405 Method Not Allowed\r\nGraft-Protocol: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            drop(head_stream);
+
+            let (mut get_stream, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut get_stream).await;
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nGraft-Protocol: 1\r\nContent-Length: {LARGE_SEGMENT_BYTES}\r\n\r\n"
+            );
+            get_stream.write_all(headers.as_bytes()).await.unwrap();
+            get_stream.write_all(&[7]).await.unwrap();
+
+            let mut buffer = [0_u8; 1];
+            let released = matches!(
+                tokio::time::timeout(Duration::from_secs(2), get_stream.read(&mut buffer)).await,
+                Ok(Ok(0))
+            );
+            (request, released)
+        });
+        let remote = HttpRemote::new(format!("http://{address}/org/repo"), None).unwrap();
+
+        let exists = tokio::time::timeout(Duration::from_secs(1), remote.has_raw("segments/large"))
+            .await
+            .expect("range probe waited for the full segment")
+            .unwrap();
+        assert!(exists);
+
+        let (request, released) = server.await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&request)
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("Range: bytes=0-0"))
+        );
+        assert!(released, "range probe response body was not released");
     }
 
     #[tokio::test]
