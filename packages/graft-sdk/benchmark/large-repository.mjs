@@ -166,7 +166,14 @@ function mutateDatabase(databasePath) {
 }
 
 async function runBenchmark(root) {
-  await restoreFixtureDatabase(root)
+  await restoreFixturePaths(root, ["project.eidos", "journal.txt"])
+  await fs.writeFile(path.join(root, "journal.txt"), "history benchmark modified\n")
+  const noStatusTinyPathDiff = await runTimedChild(
+    "path-diff",
+    root,
+    longTimeoutMs
+  )
+  await restoreFixturePaths(root, ["journal.txt"])
   const processColdStatus = await sampleChildOperations(
     iterations,
     "cold-status",
@@ -261,6 +268,9 @@ async function runBenchmark(root) {
       ignore_batch_1000_hot: summarize(ignoreBatchSamples.milliseconds),
       tracked_ignored_inventory_first: round(inventoryFirst.milliseconds),
       tracked_ignored_inventory_hot: summarize(inventorySamples.milliseconds),
+      no_status_tiny_path_diff: summarize(
+        noStatusTinyPathDiff.result.milliseconds
+      ),
       changed_status: round(changedStatus.milliseconds),
       changed_path_diff: summarize(pathDiffSamples.milliseconds),
       working_diff: fullDiff.milliseconds,
@@ -279,6 +289,13 @@ async function runBenchmark(root) {
       tracked_ignored_inventory_response: jsonBytes(
         inventorySamples.values.at(-1)
       ),
+      no_status_tiny_path_diff_request: jsonBytes({
+        paths: ["journal.txt"],
+        rows: true,
+        limit: 100,
+      }),
+      no_status_tiny_path_diff_response:
+        noStatusTinyPathDiff.result.response_bytes,
       changed_status_response: jsonBytes(changedStatus.value),
       changed_path_diff_request: jsonBytes({
         paths: ["project.eidos"],
@@ -300,6 +317,7 @@ async function runBenchmark(root) {
       status: changedStatus.value.telemetry ?? null,
       diff: pathDiffSamples.values.at(-1).telemetry ?? null,
       history: summarySamples?.values.at(-1)?.telemetry ?? null,
+      no_status_tiny_path_diff: noStatusTinyPathDiff.result.telemetry,
       ignore_batch: ignoreBatchSamples.values.at(-1).telemetry,
       inventory: {
         first: inventoryFirst.value.telemetry,
@@ -318,13 +336,15 @@ async function runBenchmark(root) {
   }
 }
 
-async function restoreFixtureDatabase(root) {
+async function restoreFixturePaths(root, paths) {
   const session = await RepositorySession.open(root)
   try {
     if (typeof session.restorePaths === "function") {
-      await session.restorePaths({ source: "HEAD", paths: ["project.eidos"] })
+      await session.restorePaths({ source: "HEAD", paths })
     } else {
-      await session.restore({ source: "HEAD", path: "project.eidos" })
+      for (const targetPath of paths) {
+        await session.restore({ source: "HEAD", path: targetPath })
+      }
     }
   } finally {
     await session.close()
@@ -347,6 +367,19 @@ async function runChildOperation(operation, root) {
       const measured = await timed(() => session.diff({ rows: true }))
       writeChildResult({
         response_bytes: jsonBytes(measured.value),
+        peak_rss_bytes: peakRssBytes(),
+      })
+      return
+    }
+    if (operation === "path-diff") {
+      const samples = await sample(3, () =>
+        session.diffPaths({ paths: ["journal.txt"], rows: true, limit: 100 })
+      )
+      const last = samples.values.at(-1)
+      writeChildResult({
+        milliseconds: samples.milliseconds,
+        response_bytes: jsonBytes(last),
+        telemetry: last.telemetry,
         peak_rss_bytes: peakRssBytes(),
       })
       return

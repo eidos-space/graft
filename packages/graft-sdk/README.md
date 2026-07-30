@@ -152,7 +152,8 @@ application handles after the SDK promise settles; the Graft repository session 
 
 `addAll` reads SQLite files and their committed/WAL state but does not replace them. Eidos should
 still checkpoint its application databases before snapshotting when it needs a deterministic
-commit boundary.
+commit boundary. `commit` advances history from the staged canonical snapshot without writing that
+snapshot back to the worktree, so an open application SQLite handle keeps the same file identity.
 
 ## Lifecycle, writers, and recovery
 
@@ -215,6 +216,9 @@ For working changes, pass `status.status.paths` to `diffPaths`. The API accepts 
 file paths, sorts/deduplicates them, and pages them with `limit`/`after`; directories are rejected so
 a request cannot accidentally expand to an unbounded tree. The legacy `diff()` remains compatible,
 but an unfiltered working diff is now driven by the status change set instead of every tracked path.
+Explicit path requests resolve only the matching immutable tree entry and index entry, then read the
+one referenced blob. They do not hydrate or clone the full commit maps. Telemetry reports
+`path_filter_fast_path: true` and `full_tree_paths_hydrated: 0` for this bounded contract.
 
 `inventory({ kind })` supports `tracked`, `untracked`, `ignored`, and `tracked_ignored`. The last form
 is the migration diagnostic for repositories that added ignore rules after committing generated

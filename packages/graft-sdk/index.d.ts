@@ -218,6 +218,10 @@ export interface DiffTelemetry {
   requested_paths: number
   returned_paths: number
   changed_paths: number
+  /** True when explicit paths use path-local tree/index state instead of full map hydration. */
+  path_filter_fast_path: boolean
+  /** Always zero for the bounded path-local implementation. */
+  full_tree_paths_hydrated: number
 }
 
 export interface DiffPathsResult {

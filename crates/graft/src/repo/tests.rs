@@ -2178,6 +2178,29 @@ fn diff_path_filter_matches_directory_prefix() {
 }
 
 #[test]
+fn path_filtered_worktree_diff_does_not_hydrate_unrelated_tree_blobs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = Repository::init(tmp.path()).unwrap();
+    let target = tmp.path().join("target.txt");
+    let unrelated = tmp.path().join("unrelated.txt");
+    fs::write(&target, "target v1").unwrap();
+    fs::write(&unrelated, "unrelated").unwrap();
+    repo.stage_artifact_path(&target).unwrap();
+    repo.stage_artifact_path(&unrelated).unwrap();
+    let commit = repo.commit_staged("baseline").unwrap();
+    let unrelated_state = commit.artifacts.get("unrelated.txt").unwrap();
+    fs::remove_file(repo.object_store().path_for(unrelated_state.oid())).unwrap();
+
+    fs::write(&target, "target v2").unwrap();
+    let diff = repo
+        .diff_worktree_artifact(&target, Some("target.txt"))
+        .unwrap();
+    assert_eq!(diff.artifacts.len(), 1);
+    assert_eq!(diff.artifacts[0].path, "target.txt");
+    assert_eq!(diff.artifacts[0].change, RepoFileChange::Modified);
+}
+
+#[test]
 fn diff_text_content_reports_utf8_and_absent_states_without_mutation() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = Repository::init(tmp.path()).unwrap();

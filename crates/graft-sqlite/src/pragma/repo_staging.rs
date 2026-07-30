@@ -256,9 +256,9 @@ pub(super) fn repo_head_commit(repo: &Repository) -> Result<Option<CommitObject>
 pub(super) fn repo_head_and_branch(
     repo: &Repository,
 ) -> Result<(Option<String>, Option<String>), ErrCtx> {
-    let status = repo.status()?;
+    let head = repo.head_target()?;
     let branch = repo.current_branch()?;
-    Ok((status.head_target, branch))
+    Ok((head, branch))
 }
 
 pub(super) fn staged_entry_kind_storage_and_change(

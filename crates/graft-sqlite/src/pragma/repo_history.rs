@@ -22,9 +22,11 @@ pub(super) fn run_repo_commit(
         }
         Err(err) => return Err(err.into()),
     };
-    let materialized = materialize_commit_sqlite_files(runtime, &repo, &commit)?;
     let branch = repo.current_branch()?;
-    Ok(RepoCommitOutcome { commit, branch, materialized })
+    // Staging already captured the canonical SQLite snapshot in the index. Re-materializing that
+    // snapshot here would replace the worktree directory entry and detach application SQLite
+    // handles that were intentionally kept open across a non-materializing checkpoint.
+    Ok(RepoCommitOutcome { commit, branch, materialized: Vec::new() })
 }
 
 pub(super) fn materialize_commit_sqlite_files(

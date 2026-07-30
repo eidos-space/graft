@@ -314,6 +314,8 @@ pub struct DiffTelemetry {
     pub requested_paths: usize,
     pub returned_paths: usize,
     pub changed_paths: usize,
+    pub path_filter_fast_path: bool,
+    pub full_tree_paths_hydrated: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -786,6 +788,8 @@ impl RepositorySession {
                 requested_paths,
                 returned_paths: results.len(),
                 changed_paths,
+                path_filter_fast_path: true,
+                full_tree_paths_hydrated: 0,
             },
             paths: results,
             has_more,
@@ -2355,7 +2359,22 @@ mod tests {
         session.open().unwrap();
         session.init().unwrap();
         session.add_all().unwrap();
-        session.commit("initial").unwrap();
+        let committed = session.commit("initial").unwrap();
+        assert!(committed.get("materialized").is_none());
+        database
+            .execute("INSERT INTO items (name) VALUES ('two')", [])
+            .unwrap();
+        let observer = Connection::open(&database_path).unwrap();
+        assert_eq!(
+            observer
+                .query_row("SELECT COUNT(*) FROM items", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        drop(observer);
+        assert_eq!(session.status().unwrap()["dirty"], json!(true));
+        session.add_all().unwrap();
+        session.commit("second database snapshot").unwrap();
         assert_eq!(session.status().unwrap()["dirty"], json!(false));
         session
             .diff(&DiffOptions { rows: true, ..DiffOptions::default() })
@@ -2372,7 +2391,7 @@ mod tests {
             reopened
                 .query_row("SELECT COUNT(*) FROM items", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            1
+            2
         );
     }
 

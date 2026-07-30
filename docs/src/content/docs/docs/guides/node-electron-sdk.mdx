@@ -125,7 +125,17 @@ Handle errors by `error.code`, including `GRAFT_SDK_SESSION_CLOSED`,
 The incremental surface adds generation-cached `statusIncremental`, paged `historySummaries`, lazy
 bounded `commitChangedPaths`, and explicit-path `diffPaths`. For a normal commit, diff those paths
 with `from: page.parent, to: page.revision`; for a root commit use `root: page.revision`.
-`historySummaries` itself never reads trees or blobs.
+`historySummaries` itself never reads trees or blobs. An explicit-path diff reads only the matching
+tree/index entry and referenced blob; `path_filter_fast_path: true` and
+`full_tree_paths_hydrated: 0` in telemetry confirm that no full commit map was hydrated.
+
+Status metadata and generation caches live for the retained `RepositorySession`. A newly opened
+session still performs one complete classification/fingerprint pass, so keep one session resident
+for the Space lifetime. Persisted cold-start classification reuse is not part of this candidate.
+
+`stagePaths` captures a canonical SQLite snapshot and `commit` advances history from that index
+state. Neither operation replaces the worktree database, so application SQLite handles may remain
+open and retain the same file identity across an automatic checkpoint.
 
 Batch `stagePaths`, `untrackPaths`, and `restorePaths` plus shared ignore/inventory queries avoid
 host-side protocol copies. `tracked_ignored` inventory is diagnostic: adding an ignore rule never

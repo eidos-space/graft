@@ -256,6 +256,8 @@ test("incremental SDK pages history, diffs, ignore inventory, and batch mutation
     })
     assert.equal(firstDiffPage.paths.length, 1)
     assert.equal(firstDiffPage.has_more, true)
+    assert.equal(firstDiffPage.telemetry.path_filter_fast_path, true)
+    assert.equal(firstDiffPage.telemetry.full_tree_paths_hydrated, 0)
     const secondDiffPage = await session.diffPaths({
       paths: ["note.txt", "node_modules/pkg/index.js"],
       limit: 1,
@@ -488,6 +490,45 @@ test("keeps HTTP credentials in memory and redacts command errors", async () => 
     await session.close()
   })
 })
+
+test(
+  "commit preserves an open SQLite worktree file identity",
+  nodeSqliteTest,
+  async () => {
+    await withTemporaryDirectory("graft-sdk-commit-identity-", async (root) => {
+      const databasePath = path.join(root, "records.eidos")
+      createDatabase(databasePath, "records", [["before"]])
+      const applicationDatabase = new DatabaseSync(databasePath)
+      applicationDatabase.exec("PRAGMA journal_mode=WAL")
+      const before = await fs.stat(databasePath)
+
+      const session = await RepositorySession.open(root)
+      await session.init()
+      const afterInit = await fs.stat(databasePath)
+      await session.stagePaths({ paths: ["records.eidos"] })
+      const afterStage = await fs.stat(databasePath)
+      const committed = await session.commit("Enable Space versioning")
+      const afterCommit = await fs.stat(databasePath)
+
+      assert.equal(afterInit.dev, before.dev)
+      assert.equal(afterInit.ino, before.ino)
+      assert.equal(afterStage.dev, before.dev)
+      assert.equal(afterStage.ino, before.ino)
+      assert.equal(afterCommit.dev, before.dev)
+      assert.equal(afterCommit.ino, before.ino)
+      assert.deepEqual(committed.materialized ?? [], [])
+
+      applicationDatabase.exec(
+        "INSERT INTO records (name) VALUES ('after')"
+      )
+      assert.equal(readCount(databasePath, "records"), 2)
+      assert.equal((await session.status()).dirty, true)
+
+      applicationDatabase.close()
+      await session.close()
+    })
+  }
+)
 
 test(
   "keeps non-materializing calls safe with an app DB handle and restores after close",

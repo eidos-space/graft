@@ -16,18 +16,20 @@ RSS is the process high-water mark. The checked-in JSON contains the complete sa
 
 | Operation | Baseline | Final p50 | Final p95 | Budget | Result |
 | --- | ---: | ---: | ---: | ---: | --- |
-| Process-cold status | 8,655.9 ms | 2,482.6 ms | 2,538.3 ms | reported | — |
-| Unchanged hot status | 8,273.7 ms | 104.1 ms | 106.2 ms | <250 ms | pass |
-| 1,000-path ignore batch | >30,000 ms with serialized single-path calls | 2.3 ms | 2.6 ms | <100 ms hot | pass |
-| First tracked-and-ignored page after status | 7,570.0 ms | 24.4 ms | single first sample | <1,000 ms | pass |
-| Hot tracked-and-ignored page | 7,570.0 ms | 8.9 ms | 9.4 ms | <100 ms | pass |
-| One changed `.eidos` path diff | 11,261.0 ms | 658.9 ms | 666.4 ms | <1,000 ms | pass |
-| 50 history summaries | >60,000 ms for legacy default history | 0.73 ms | 6.06 ms | <500 ms | pass |
-| Abort rejection | >60,000 ms / blocked session | 290.1 ms | single cancellation sample | <500 ms | pass |
+| Process-cold status | 8,655.9 ms | 2,505.8 ms | 4,343.9 ms | reported | — |
+| Unchanged hot status | 8,273.7 ms | 103.4 ms | 113.5 ms | <250 ms | pass |
+| 1,000-path ignore batch | >30,000 ms with serialized single-path calls | 2.4 ms | 2.6 ms | <100 ms hot | pass |
+| First tracked-and-ignored page after status | 7,570.0 ms | 23.7 ms | single first sample | <1,000 ms | pass |
+| Hot tracked-and-ignored page | 7,570.0 ms | 8.3 ms | 9.3 ms | <100 ms | pass |
+| New-session tiny-path diff, no prior status | 7,835.3 ms first / 1,971.5 ms hot | 0.47 ms | 29.1 ms including first call | <1,000 ms | pass |
+| One changed `.eidos` path diff after status | 11,261.0 ms | 2.9 ms | 3.8 ms | <1,000 ms | pass |
+| 50 history summaries | >60,000 ms for legacy default history | 0.76 ms | 7.67 ms | <500 ms | pass |
+| Abort rejection | >60,000 ms / blocked session | 301.7 ms | single cancellation sample | <500 ms | pass |
 
 The history-summary response is 14,260 bytes (budget <1 MiB) and reads zero tree and zero blob
-objects. The explicit diff request is 50 bytes and its response is 857 bytes. Status responses are
-828 bytes when clean and 1,310 bytes after the database change. For comparison, legacy
+objects. The no-prior-status tiny-path request is 49 bytes and its response is 474 bytes; the
+`.eidos` request is 50 bytes and its response is 913 bytes. Status responses are 828 bytes when
+clean and 1,310 bytes after the database change. For comparison, legacy
 `history({limit: 1})` still returns 11,146,927 bytes; callers should migrate list views to
 `historySummaries` and hydrate a selected commit with `commitDetails`.
 
@@ -37,9 +39,9 @@ tracked-and-ignored inventory page is 851 bytes. Its first call after resident s
 Batch results distinguish a physical or index-derived directory and report whether it has tracked
 descendants, so an ignored directory containing indexed files is not incorrectly pruned.
 
-Peak RSS was 185.1 MiB for a process-cold status child, 204.9 MiB for the bounded legacy working
-diff child, 239.1 MiB for the cancellation child, and 356.2 MiB for the parent process that ran all
-seven-sample distributions. After cancellation, the next incremental status completed in 102.6 ms,
+Peak RSS was 198.7 MiB for a process-cold status child, 212.0 MiB for the bounded legacy working
+diff child, 251.8 MiB for the cancellation child, and 363.0 MiB for the parent process that ran all
+seven-sample distributions. After cancellation, the next incremental status completed in 104.9 ms,
 showing that the resident session remained usable. The tracked-and-ignored diagnostic counted
 46,358 paths and returned a bounded five-item page.
 
@@ -51,10 +53,29 @@ blob, and repeatedly cloning large `BTreeMap` subtrees. The baseline working dif
 unfiltered path loop effectively quadratic. A correctly ignored 10k-file control repository stayed
 at 2–3 ms, confirming that matcher semantics were not the bottleneck.
 
-The implementation therefore caches immutable hydrated commit trees, adds a metadata/generation
-status cache, and drives working diff from changed paths. History summaries walk commit objects
+The implementation therefore caches immutable commit trees, adds a metadata/generation status
+cache, and drives working diff from changed paths. For an explicit path, `diffPaths` now binary
+searches the requested tree/index entry and reads only the referenced blob. It does not hydrate or
+clone the complete 46,665-path maps. A second hidden full scan was removed from result rendering:
+reading the current revision and branch now resolves the HEAD reference directly instead of calling
+full `status`. Telemetry reports `path_filter_fast_path: true` and
+`full_tree_paths_hydrated: 0`. History summaries walk commit objects
 without tree/blob hydration, while cooperative cancellation checkpoints cover tree hydration,
 status, diff, history, stage, restore, inventory, and SQLite page loops. No budget was relaxed.
+
+The same fix was gated read-only on the real 46,665-path Eidos repository. `.DS_Store` improved
+from 7,835 ms cold and 1,972–2,139 ms hot to 26.0 ms cold and 0.24–0.32 ms hot. A 3 KiB README
+took 0.55 ms. The 336 KiB `.eidos` file took 39.0 ms cold and 9.8–10.0 ms hot, with 7.4 KiB
+responses. These calls used one newly opened session and did not run status first.
+
+The metadata/generation status cache is currently resident to one open `RepositorySession`.
+Opening a new session must therefore classify and fingerprint every tracked path again; a global
+immutable-tree cache may reduce object decoding but does not retain worktree classifications. The
+reported 12.7 second first scan on the real tracked-and-ignored repository is consequently expected
+for the current release candidate, but it is not an unavoidable architectural baseline. Reusing it
+across open/restart requires a separate persisted classification snapshot keyed by HEAD, index, and
+ignore-source fingerprints, with safe invalidation for external writers. That follow-up is separate
+from the bounded diff path and does not delay this candidate.
 
 For ignore-heavy traversal, the retained session now also caches the tracked index, compiled root
 and nested ignore matchers, and the complete tracked-and-ignored classification. Matcher evaluation

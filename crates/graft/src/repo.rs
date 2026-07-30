@@ -634,6 +634,12 @@ pub struct CommitFileState {
     pub snapshot: RepoSnapshot,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RepoTrackedPathState {
+    File(CommitFileState),
+    Artifact(CommitArtifactState),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CommitArtifactState {

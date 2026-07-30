@@ -25,7 +25,7 @@ pub(super) fn repo_diff_for_spec(
                         format!("path `{}` is not a regular file", physical_path.display()).into(),
                     )),
                     Ok(_) if is_sqlite_database_path(&physical_path)? => {
-                        let expected = repo.index_files()?.get(&key).cloned();
+                        let expected = repo.index_file(&physical_path)?;
                         repo_diff_physical_sqlite_file(
                             runtime,
                             repo,
@@ -73,8 +73,7 @@ pub(super) fn repo_diff_for_spec(
                         format!("path `{}` is not a regular file", physical_path.display()).into(),
                     )),
                     Ok(_) if is_sqlite_database_path(&physical_path)? => {
-                        let from_id = repo.resolve_revision(&rev)?;
-                        let expected = repo.read_commit(&from_id)?.files.get(&key).cloned();
+                        let expected = repo.file_from_revision(&rev, &physical_path)?;
                         repo_diff_physical_sqlite_file(
                             runtime,
                             repo,

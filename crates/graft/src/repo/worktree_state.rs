@@ -6,8 +6,11 @@ type CachedCommitTreeState = Arc<(
     BTreeMap<String, CommitFileState>,
     BTreeMap<String, CommitArtifactState>,
 )>;
+type CachedTreeObject = Arc<object::TreeObject>;
 
 static COMMIT_TREE_CACHE: OnceLock<Mutex<HashMap<(PathBuf, String), CachedCommitTreeState>>> =
+    OnceLock::new();
+static TREE_OBJECT_CACHE: OnceLock<Mutex<HashMap<(PathBuf, String), CachedTreeObject>>> =
     OnceLock::new();
 
 #[derive(Debug, Clone, Copy)]
@@ -111,30 +114,34 @@ impl Repository {
 
     pub fn head_file(&self, path: impl AsRef<Path>) -> Result<Option<CommitFileState>> {
         let key = self.file_key(path)?;
-        Ok(self
-            .head_target()?
-            .map(|commit| self.read_commit(&commit))
-            .transpose()?
-            .and_then(|commit| commit.files.get(&key).cloned()))
+        Ok(match self.head_path_state(&key)? {
+            Some(RepoTrackedPathState::File(state)) => Some(state),
+            Some(RepoTrackedPathState::Artifact(_)) | None => None,
+        })
     }
 
     pub fn head_artifact(&self, path: impl AsRef<Path>) -> Result<Option<CommitArtifactState>> {
         let key = self.file_key(path)?;
-        Ok(self
-            .head_target()?
-            .map(|commit| self.read_commit(&commit))
-            .transpose()?
-            .and_then(|commit| commit.artifacts.get(&key).cloned()))
+        Ok(match self.head_path_state(&key)? {
+            Some(RepoTrackedPathState::Artifact(state)) => Some(state),
+            Some(RepoTrackedPathState::File(_)) | None => None,
+        })
     }
 
     pub fn index_file(&self, path: impl AsRef<Path>) -> Result<Option<CommitFileState>> {
         let key = self.file_key(path)?;
-        Ok(self.index_files()?.remove(&key))
+        Ok(match self.index_path_state(&key)? {
+            Some(RepoTrackedPathState::File(state)) => Some(state),
+            Some(RepoTrackedPathState::Artifact(_)) | None => None,
+        })
     }
 
     pub fn index_artifact(&self, path: impl AsRef<Path>) -> Result<Option<CommitArtifactState>> {
         let key = self.file_key(path)?;
-        Ok(self.index_artifacts()?.remove(&key))
+        Ok(match self.index_path_state(&key)? {
+            Some(RepoTrackedPathState::Artifact(state)) => Some(state),
+            Some(RepoTrackedPathState::File(_)) | None => None,
+        })
     }
 
     pub fn index_has_entry(&self, path: impl AsRef<Path>) -> Result<bool> {
@@ -245,7 +252,10 @@ impl Repository {
     ) -> Result<Option<CommitFileState>> {
         let target = self.resolve_revision(rev)?;
         let key = self.file_key(path)?;
-        Ok(self.read_commit(&target)?.files.get(&key).cloned())
+        Ok(match self.commit_path_state(&target, &key)? {
+            Some(RepoTrackedPathState::File(state)) => Some(state),
+            Some(RepoTrackedPathState::Artifact(_)) | None => None,
+        })
     }
 
     pub fn artifact_from_revision(
@@ -255,7 +265,10 @@ impl Repository {
     ) -> Result<Option<CommitArtifactState>> {
         let target = self.resolve_revision(rev)?;
         let key = self.file_key(path)?;
-        Ok(self.read_commit(&target)?.artifacts.get(&key).cloned())
+        Ok(match self.commit_path_state(&target, &key)? {
+            Some(RepoTrackedPathState::Artifact(state)) => Some(state),
+            Some(RepoTrackedPathState::File(_)) | None => None,
+        })
     }
 
     pub fn materialize_artifact_state(
@@ -541,6 +554,150 @@ impl Repository {
         Ok(parents)
     }
 
+    pub(super) fn index_path_state(&self, key: &str) -> Result<Option<RepoTrackedPathState>> {
+        let key = normalize_repo_path_key(key)?;
+        let index = self.read_index()?;
+        if index.has_conflicts() {
+            return Err(RepoErr::UnresolvedConflicts);
+        }
+        if let Some(entry) = index.stage0_entries().find(|entry| entry.path == key) {
+            return Ok(if let Some(file) = &entry.file {
+                Some(RepoTrackedPathState::File(file.clone()))
+            } else {
+                entry
+                    .artifact
+                    .as_ref()
+                    .cloned()
+                    .map(RepoTrackedPathState::Artifact)
+            });
+        }
+        self.head_path_state(&key)
+    }
+
+    pub(super) fn head_path_state(&self, key: &str) -> Result<Option<RepoTrackedPathState>> {
+        let key = normalize_repo_path_key(key)?;
+        let Some(target) = self.head_target()? else {
+            return Ok(None);
+        };
+        self.commit_path_state(&target, &key)
+    }
+
+    pub(super) fn revision_states_for_filter(
+        &self,
+        revision: &str,
+        filter: &str,
+    ) -> Result<(
+        String,
+        BTreeMap<String, CommitFileState>,
+        BTreeMap<String, CommitArtifactState>,
+    )> {
+        let target = self.resolve_revision(revision)?;
+        let id = object::ObjectId::from_str(&target)?;
+        let commit = self
+            .read_commit_object(&id)?
+            .ok_or_else(|| RepoErr::CommitNotFound(target.clone()))?;
+        let tree = self.tree_object_from_object(&commit.tree)?;
+        let filter = normalize_repo_path(filter);
+        let mut files = BTreeMap::new();
+        let mut artifacts = BTreeMap::new();
+        for entry in tree
+            .entries
+            .iter()
+            .filter(|entry| repo_path_matches_filter(&entry.path, Some(&filter)))
+        {
+            cancellation_checkpoint()?;
+            match self.tree_entry_state(entry)? {
+                RepoTrackedPathState::File(state) => {
+                    files.insert(entry.path.clone(), state);
+                }
+                RepoTrackedPathState::Artifact(state) => {
+                    artifacts.insert(entry.path.clone(), state);
+                }
+            }
+        }
+        Ok((target, files, artifacts))
+    }
+
+    pub(super) fn commit_path_state(
+        &self,
+        target: &str,
+        key: &str,
+    ) -> Result<Option<RepoTrackedPathState>> {
+        let id = object::ObjectId::from_str(target)?;
+        let commit = self
+            .read_commit_object(&id)?
+            .ok_or_else(|| RepoErr::CommitNotFound(target.to_string()))?;
+        let tree = self.tree_object_from_object(&commit.tree)?;
+        let Some(entry) = tree
+            .entries
+            .binary_search_by(|entry| entry.path.as_str().cmp(key))
+            .ok()
+            .map(|index| &tree.entries[index])
+        else {
+            return Ok(None);
+        };
+        cancellation_checkpoint()?;
+        self.tree_entry_state(entry).map(Some)
+    }
+
+    fn tree_object_from_object(&self, id: &object::ObjectId) -> Result<CachedTreeObject> {
+        let cache_key = (self.graft_dir.clone(), id.to_string());
+        let cached = TREE_OBJECT_CACHE
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&cache_key)
+            .cloned();
+        if let Some(cached) = cached {
+            return Ok(cached);
+        }
+
+        let object = self.object_store().read(id)?;
+        let object::Object::Tree(tree) = object else {
+            return Err(RepoErr::Object(object::ObjectErr::InvalidObject {
+                kind: "tree",
+                message: format!("object {id} is not a tree"),
+            }));
+        };
+        let tree = Arc::new(tree);
+        let cache = TREE_OBJECT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut cache = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if cache.len() >= COMMIT_TREE_CACHE_MAX_ENTRIES && !cache.contains_key(&cache_key) {
+            cache.clear();
+        }
+        cache.insert(cache_key, tree.clone());
+        Ok(tree)
+    }
+
+    fn tree_entry_state(&self, entry: &object::TreeEntry) -> Result<RepoTrackedPathState> {
+        let object = self.object_store().read(&entry.oid)?;
+        match (entry.mode, object) {
+            (
+                object::TreeEntryMode::SqliteDatabase,
+                object::Object::Blob(object::BlobObject::SqliteSnapshot(blob)),
+            ) => Ok(RepoTrackedPathState::File(
+                file_state_from_sqlite_snapshot_blob(blob),
+            )),
+            (object::TreeEntryMode::Regular, object::Object::Blob(blob)) => Ok(
+                RepoTrackedPathState::Artifact(artifact_state_from_blob(entry.oid.clone(), blob)?),
+            ),
+            (object::TreeEntryMode::SqliteDatabase, _) => {
+                Err(RepoErr::Object(object::ObjectErr::InvalidObject {
+                    kind: "blob",
+                    message: format!("tree entry `{}` is not a sqlite snapshot", entry.path),
+                }))
+            }
+            (object::TreeEntryMode::Regular, _) => {
+                Err(RepoErr::Object(object::ObjectErr::InvalidObject {
+                    kind: "blob",
+                    message: format!("tree entry `{}` is not a blob", entry.path),
+                }))
+            }
+        }
+    }
+
     pub fn read_commit(&self, id: &str) -> Result<CommitObject> {
         let id = object::ObjectId::from_str(id)?;
         let commit = self
@@ -637,42 +794,17 @@ impl Repository {
             return Ok((cached.0.clone(), cached.1.clone()));
         }
 
-        let object = self.object_store().read(id)?;
-        let object::Object::Tree(tree) = object else {
-            return Err(RepoErr::Object(object::ObjectErr::InvalidObject {
-                kind: "tree",
-                message: format!("object {id} is not a tree"),
-            }));
-        };
-
+        let tree = self.tree_object_from_object(id)?;
         let mut files = BTreeMap::new();
         let mut artifacts = BTreeMap::new();
-        for entry in tree.entries {
+        for entry in &tree.entries {
             cancellation_checkpoint()?;
-            match entry.mode {
-                object::TreeEntryMode::SqliteDatabase => {
-                    let object = self.object_store().read(&entry.oid)?;
-                    let object::Object::Blob(object::BlobObject::SqliteSnapshot(blob)) = object
-                    else {
-                        return Err(RepoErr::Object(object::ObjectErr::InvalidObject {
-                            kind: "blob",
-                            message: format!(
-                                "tree entry `{}` is not a sqlite snapshot",
-                                entry.path
-                            ),
-                        }));
-                    };
-                    files.insert(entry.path, file_state_from_sqlite_snapshot_blob(blob));
+            match self.tree_entry_state(entry)? {
+                RepoTrackedPathState::File(state) => {
+                    files.insert(entry.path.clone(), state);
                 }
-                object::TreeEntryMode::Regular => {
-                    let object = self.object_store().read(&entry.oid)?;
-                    let object::Object::Blob(blob) = object else {
-                        return Err(RepoErr::Object(object::ObjectErr::InvalidObject {
-                            kind: "blob",
-                            message: format!("tree entry `{}` is not a blob", entry.path),
-                        }));
-                    };
-                    artifacts.insert(entry.path, artifact_state_from_blob(entry.oid, blob)?);
+                RepoTrackedPathState::Artifact(state) => {
+                    artifacts.insert(entry.path.clone(), state);
                 }
             }
         }
