@@ -1,6 +1,6 @@
 {
   "name": "@eidos.space/graft",
-  "version": "0.3.0-rc.0",
+  "version": "0.3.0",
   "description": "Long-lived in-process Graft repository sessions for Node.js and Electron.",
   "license": "MIT OR Apache-2.0",
   "repository": {
@@ -63,12 +63,5 @@
     "access": "public",
     "provenance": true,
     "registry": "https://registry.npmjs.org/"
-  },
-  "optionalDependencies": {
-    "@eidos.space/graft-darwin-arm64": "0.3.0-rc.0",
-    "@eidos.space/graft-darwin-x64": "0.3.0-rc.0",
-    "@eidos.space/graft-linux-arm64-gnu": "0.3.0-rc.0",
-    "@eidos.space/graft-linux-x64-gnu": "0.3.0-rc.0",
-    "@eidos.space/graft-win32-x64-msvc": "0.3.0-rc.0"
   }
 }

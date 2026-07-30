@@ -51,6 +51,11 @@ Keep these versions equal:
 - `crates/graft-sdk-node/Cargo.toml`
 - every `@eidos.space/graft-*` optional dependency in the root package
 
+The five optional dependencies are release-artifact metadata. Keep them out of the source root
+package so `pnpm install --frozen-lockfile` does not resolve an unpublished version; after the five
+native packages are assembled, `release:prepare` injects exact dependencies matching the root
+version and `release:verify` checks all six manifests before publication.
+
 The SDK version is independent from the CLI/SQLite version. Before tagging, merge the SDK pull
 request and wait for the full `Release Graft SDK` pull-request matrix. It builds every advertised
 binary and tests it on Node.js 20 and 24.
@@ -58,7 +63,7 @@ binary and tests it on Node.js 20 and 24.
 From a clean checkout of the merged `origin/main` commit:
 
 ```sh
-version=0.2.0
+version=0.3.0
 test "$(node -p "require('./packages/graft-sdk/package.json').version")" = "$version"
 git tag -a "graft-sdk-v${version}" -m "Graft SDK v${version}"
 git push origin "graft-sdk-v${version}"
@@ -102,6 +107,9 @@ workflow: sdk-release.yml
 environment: npm
 allowed action: npm publish
 ```
+
+All six SDK package names already exist. Stable SDK releases use only this OIDC trusted publisher;
+the workflow does not read or set `NPM_TOKEN`.
 
 The release job has only `contents: write` and `id-token: write`; subsequent publishes use
 short-lived npm OIDC credentials and automatic provenance. Configure the GitHub `npm` environment

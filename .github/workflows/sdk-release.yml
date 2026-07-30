@@ -303,8 +303,6 @@ jobs:
           (cd release-assets && sha256sum *.node > SHA256SUMS)
 
       - name: Publish platform packages then root package
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: pnpm --dir packages/graft-sdk release:publish
 
       - name: Create or update SDK GitHub release
@@ -320,13 +318,14 @@ jobs:
           files: release-assets/*
 
   verify-published:
-    name: Verify npm install on ${{ matrix.suffix }}
+    name: Verify npm install on ${{ matrix.settings.suffix }} / Node.js ${{ matrix.node }}
     needs: [metadata, publish]
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ matrix.settings.runner }}
     strategy:
       fail-fast: false
       matrix:
-        include:
+        node: [20, 24]
+        settings:
           - runner: macos-15
             suffix: darwin-arm64
           - runner: macos-15-intel
@@ -344,11 +343,11 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
-          node-version: 24
+          node-version: ${{ matrix.node }}
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
 
-      - name: Install and open a repository session
+      - name: Install and exercise incremental repository APIs
         env:
           SDK_VERSION: ${{ needs.metadata.outputs.version }}
         run: |
@@ -357,23 +356,50 @@ jobs:
           npm init -y >/dev/null
           npm install --ignore-scripts "@eidos.space/graft@${SDK_VERSION}"
           node - <<'NODE'
-          const fs = require('node:fs')
+          const fs = require('node:fs/promises')
           const os = require('node:os')
           const path = require('node:path')
           const { RepositorySession, sdkVersion } = require('@eidos.space/graft')
 
-          const root = fs.mkdtempSync(path.join(os.tmpdir(), 'graft-sdk-install-'))
-          RepositorySession.open(root)
-            .then(async (session) => {
+          async function main() {
+            const root = await fs.mkdtemp(path.join(os.tmpdir(), 'graft-sdk-install-'))
+            const session = await RepositorySession.open(root)
+            try {
               await session.init()
-              const status = await session.status()
-              if (status.dirty !== false || sdkVersion() !== process.env.SDK_VERSION) {
-                throw new Error('published SDK smoke returned unexpected metadata')
+              await fs.writeFile(path.join(root, 'note.txt'), 'one\n')
+              await session.stagePaths({ paths: ['note.txt'] })
+              const initial = await session.commit('initial')
+              await fs.writeFile(path.join(root, 'note.txt'), 'two\n')
+
+              const status = await session.statusIncremental()
+              const metadata = await session.repositoryMetadata()
+              const remotes = await session.listRemotes()
+              const history = await session.historySummaries({ limit: 1 })
+              const diff = await session.diffPaths({ paths: ['note.txt'], limit: 1 })
+              const content = await session.readPathContent({
+                revision: initial.commit.id,
+                path: 'note.txt',
+                maxBytes: 1024,
+              })
+              if (
+                status.status.dirty !== true ||
+                metadata.telemetry.paths_examined !== 0 ||
+                !Array.isArray(remotes.remotes) ||
+                history.commits.length !== 1 ||
+                diff.paths.length !== 1 ||
+                content.content.state !== 'utf8' ||
+                content.content.content !== 'one\n' ||
+                sdkVersion() !== process.env.SDK_VERSION
+              ) {
+                throw new Error('published SDK smoke returned unexpected incremental results')
               }
+            } finally {
               await session.close()
-            })
-            .catch((error) => {
-              console.error(error)
-              process.exitCode = 1
-            })
+            }
+          }
+
+          main().catch((error) => {
+            console.error(error)
+            process.exitCode = 1
+          })
           NODE
