@@ -2,6 +2,7 @@
 /mutants.out*
 /dist/
 /distx/
+/release-assets/
 /node_modules/
 packages/graft-sdk/native/*.node
 packages/graft-sdk/*.node

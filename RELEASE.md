@@ -1,13 +1,16 @@
 # Releasing Graft
 
-Graft has two independent release trains:
+Graft has three independent release trains:
 
 - [`.github/workflows/sqlite-extension-release.yml`](.github/workflows/sqlite-extension-release.yml)
   publishes the SQLite extension and `graft` CLI from annotated `vX.Y.Z` tags.
 - [`.github/workflows/sdk-release.yml`](.github/workflows/sdk-release.yml) validates pull requests
   and publishes `@eidos.space/graft` from annotated `graft-sdk-vX.Y.Z` tags.
+- [`.github/workflows/remote-release.yml`](.github/workflows/remote-release.yml) validates and
+  publishes the framework-neutral, Hono, and Cloudflare Remote packages from annotated
+  `graft-remote-vX.Y.Z` tags.
 
-Both release tag types must point to a commit already merged into `origin/main`. Never release from
+All release tag types must point to a commit already merged into `origin/main`. Never release from
 a side branch or a dirty checkout.
 
 ## Prepare the release commit
@@ -55,7 +58,7 @@ binary and tests it on Node.js 20 and 24.
 From a clean checkout of the merged `origin/main` commit:
 
 ```sh
-version=0.1.0
+version=0.2.0
 test "$(node -p "require('./packages/graft-sdk/package.json').version")" = "$version"
 git tag -a "graft-sdk-v${version}" -m "Graft SDK v${version}"
 git push origin "graft-sdk-v${version}"
@@ -124,3 +127,41 @@ receive `E403` because the immutable version already exists even though `npm vie
 The root package is always published last, after all platform packages are visible. If the root
 exists while a platform package is missing, publish that unchanged platform artifact immediately
 or deprecate the incomplete root version.
+
+## Prepare a Remote package release
+
+Keep these versions equal:
+
+- `packages/graft-remote/package.json`
+- `packages/graft-remote-hono/package.json`
+- `packages/graft-remote-cloudflare/package.json`
+
+The Remote release is independent from the CLI/SQLite and resident SDK versions. From a clean
+checkout of the merged `origin/main` commit:
+
+```sh
+version=0.1.0
+node scripts/remote-release.mjs validate "$version"
+git tag -a "graft-remote-v${version}" -m "Graft Remote v${version}"
+git push origin "graft-remote-v${version}"
+```
+
+The workflow builds and tests all three packages, creates deterministic tarballs, verifies their
+contents and SHA-256 checksums, publishes core before the Hono and Cloudflare adapters, and then
+tests public installs on Node.js 20/24 and in a Wrangler dry-run bundle. It also creates a GitHub
+release without replacing the repository's latest CLI/SQLite release.
+
+The first Remote release uses the same short-lived `NPM_TOKEN` bootstrap described above. After
+the package names exist, configure each package's npm trusted publisher with:
+
+```text
+organization: eidos-space
+repository: graft
+workflow: remote-release.yml
+environment: npm
+allowed action: npm publish
+```
+
+Then delete `NPM_TOKEN` from the GitHub `npm` environment. If a Remote release stops partway, do
+not move or recreate the tag. Re-run the unchanged workflow: it verifies the same release archives,
+skips versions already visible on npm, and publishes only missing packages.

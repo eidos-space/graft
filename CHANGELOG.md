@@ -1,5 +1,44 @@
 # Changelog
 
+## Graft 0.11.0 — 2026-07-30
+
+### Added
+
+- HTTP Remotes can now negotiate `receive-pack` and `receive-bundle` so an
+  incremental push publishes immutable objects and the ref update in two
+  protocol requests instead of checking and uploading every object separately.
+- `@eidos.space/graft-remote`, `@eidos.space/graft-remote-hono`, and
+  `@eidos.space/graft-remote-cloudflare` provide reusable protocol, routing,
+  and R2/Durable Object layers for compatible hosted Remotes.
+- Push tracing reports safe phase timings, request counts, transferred bytes,
+  correlation IDs, and `Server-Timing` data without exposing credentials,
+  repository URLs, row contents, or local paths.
+
+### Changed
+
+- `@eidos.space/graft` 0.2.0 uses the bundled push protocols from resident
+  repository sessions while preserving the public session API and fallback
+  compatibility with existing HTTP Remotes.
+- Snapshot and external-file objects are bundled deterministically, uploaded
+  with bounded streaming, and published through the existing compare-and-swap
+  ref boundary.
+
+### Performance
+
+- A one-row incremental SQLite push to the staging HTTP Remote now needs two
+  data-plane requests rather than six, with measured resident-session median
+  latency reduced from 5.23 seconds to 3.16 seconds.
+- Reusing one HTTP connection for ref discovery and bundle publication removes
+  duplicate DNS, TCP, TLS, and authentication setup within a push.
+
+### Compatibility
+
+- Clients automatically fall back to the public object-by-object protocol when
+  a Remote does not advertise bundled receive capabilities.
+- Non-fast-forward protection, force behavior, atomic ref publication, retry
+  after partial upload, clone/fetch/pull, and logical SQLite row diffs retain
+  their existing behavior.
+
 ## Graft 0.10.0 — 2026-07-29
 
 ### Added

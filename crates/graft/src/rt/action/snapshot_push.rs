@@ -63,7 +63,7 @@ impl PreparedSnapshotPush {
             let commit_path = format!(
                 "logs/{}/commits/{}",
                 upload.commit.log().serialize(),
-                crate::core::cbe::CBE64::from(upload.commit.lsn()).to_string(),
+                crate::core::cbe::CBE64::from(upload.commit.lsn()),
             );
             objects.push(crate::remote::RemoteBundleObject::new(
                 commit_path,

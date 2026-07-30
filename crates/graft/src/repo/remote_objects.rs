@@ -217,7 +217,7 @@ impl Repository {
             }
 
             let Some(bytes) = self.object_store().read_raw(&object_id)? else {
-                return Err(RepoErr::CommitNotFound(id.clone()));
+                return Err(RepoErr::CommitNotFound(id));
             };
             let object = object::Object::decode(&bytes)?;
             let actual = object::ObjectId::for_bytes(&bytes);
@@ -386,7 +386,7 @@ impl Repository {
         let index_path = format!("{DIR_OBJECTS_PACK}/{pack_id}.idx");
         let index = RemoteObjectPackIndex {
             version: REMOTE_OBJECT_PACK_VERSION,
-            pack: pack_path.clone(),
+            pack: pack_path,
             objects: entries,
         };
         let index_bytes =
