@@ -69,8 +69,8 @@ mod output_types;
 mod parse;
 mod repo_checkout;
 mod repo_conflicts;
-mod repo_core;
-mod repo_diff;
+pub(crate) mod repo_core;
+pub(crate) mod repo_diff;
 mod repo_history;
 mod repo_merge;
 mod repo_output;
@@ -84,7 +84,7 @@ mod repo_sync;
 mod row_diff;
 mod row_merge_output;
 mod spec;
-mod sqlite_worktree;
+pub(crate) mod sqlite_worktree;
 mod volume_output;
 
 use self::{

@@ -1,5 +1,51 @@
 # Changelog
 
+## Graft SDK 0.3.0 — 2026-07-30
+
+### Added
+
+- Added persistent, generation-based incremental status with safe cache telemetry and crash-safe
+  reuse across repository sessions and utility-process restarts.
+- Added lightweight `repositoryMetadata` and credential-free `listRemotes` APIs that inspect no
+  worktree paths.
+- Added paged `historySummaries`, lazy `commitChangedPaths`, explicit-path `diffPaths`, bounded
+  `isIgnoredPaths`/inventory queries, batch `stagePaths`/`restorePaths`, and index-only
+  `untrackPaths`.
+- Added cancellable `readPathContent({ revision, path, maxBytes })` for bounded, hash-validated
+  artifact reads without exposing repository object storage.
+
+### Changed
+
+- Working and historical explicit-path diffs now hydrate only requested tree entries and blobs;
+  history summary lists no longer load full trees or artifacts.
+- Long-running status, diff, history, stage, restore, inventory, tree, and SQLite page loops now
+  cooperate with `AbortSignal` without poisoning the retained session.
+- SDK publication now uses npm OIDC Trusted Publishing and validates public installs on Node.js 20
+  and 24 across all five advertised native targets.
+
+### Fixed
+
+- `commit` now advances from the staged canonical snapshot without replacing worktree SQLite files,
+  preserving open application handles and inode identity.
+- Concurrent file/directory, rename, unlink/recreate, and symlink changes now retry or return the
+  structured `GRAFT_SDK_REPOSITORY_STALE` error instead of leaking raw filesystem errors.
+- UTF-8 text classification now validates code points crossing the 8192-byte sniff boundary;
+  incompatible persisted classifications are rejected through a snapshot schema bump.
+
+### Performance
+
+- On the checked-in 46,665-path macOS arm64 fixture, a validated persisted reopen is approximately
+  291 ms, resident hot status approximately 101 ms, one-path diff approximately 19 ms, and 50-entry
+  history summary approximately 10 ms.
+
+### Compatibility
+
+- Existing APIs remain available. `restore`, `restorePaths`, `pull`, and `cloneRepository` are the
+  only operations that materialize worktree files; `commit`, stage, metadata, history, diff, and
+  ignore APIs are non-materializing.
+- Existing checkpoints are immutable. Corrected UTF-8 classification applies to newly staged
+  snapshots and future diffs.
+
 ## Graft 0.11.0 — 2026-07-30
 
 ### Added

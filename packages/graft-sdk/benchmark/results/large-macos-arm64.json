@@ -1,0 +1,182 @@
+{
+  "schema": "graft-sdk-large-repository-benchmark-v1",
+  "generated_at": "2026-07-30T00:02:55.773Z",
+  "fixture": {
+    "tracked_paths": 46665,
+    "ignored_node_modules_paths": 46318,
+    "nested_ignore": "apps/web/.graftignore",
+    "changed_path": "project.eidos",
+    "history_commits": 51
+  },
+  "environment": {
+    "platform": "darwin",
+    "arch": "arm64",
+    "node": "v24.11.1",
+    "iterations": 7,
+    "cpu": "Apple M2",
+    "memory_bytes": 25769803776,
+    "os": "macOS 15.7.3"
+  },
+  "milliseconds": {
+    "status_process_cold": {
+      "first": 4343.917,
+      "min": 2478.524,
+      "p50": 2505.809,
+      "p95": 4343.917,
+      "max": 4343.917,
+      "mean": 2763.789
+    },
+    "status_session_cold": {
+      "first": 1967.34,
+      "min": 1114.747,
+      "p50": 1170.36,
+      "p95": 1967.34,
+      "max": 1967.34,
+      "mean": 1271.461
+    },
+    "status_hot": {
+      "first": 113.511,
+      "min": 100.333,
+      "p50": 103.358,
+      "p95": 113.511,
+      "max": 113.511,
+      "mean": 106.294
+    },
+    "history_legacy_limit_1": 186.01,
+    "history_summaries_50": {
+      "first": 7.669,
+      "min": 0.701,
+      "p50": 0.757,
+      "p95": 7.669,
+      "max": 7.669,
+      "mean": 1.749
+    },
+    "ignore_batch_1000_first": 3.173,
+    "ignore_batch_1000_hot": {
+      "first": 2.577,
+      "min": 2.177,
+      "p50": 2.356,
+      "p95": 2.577,
+      "max": 2.577,
+      "mean": 2.355
+    },
+    "tracked_ignored_inventory_first": 23.665,
+    "tracked_ignored_inventory_hot": {
+      "first": 9.055,
+      "min": 7.188,
+      "p50": 8.337,
+      "p95": 9.277,
+      "max": 9.277,
+      "mean": 8.335
+    },
+    "no_status_tiny_path_diff": {
+      "first": 29.093,
+      "min": 0.365,
+      "p50": 0.465,
+      "p95": 29.093,
+      "max": 29.093,
+      "mean": 9.974
+    },
+    "changed_status": 761.303,
+    "changed_path_diff": {
+      "first": 3.779,
+      "min": 2.265,
+      "p50": 2.9,
+      "p95": 3.779,
+      "max": 3.779,
+      "mean": 2.941
+    },
+    "working_diff": 2904.791,
+    "cancellation_rejection": 301.739,
+    "cancellation_session_reusable": 104.856
+  },
+  "bytes": {
+    "status_response": 828,
+    "history_legacy_limit_1_response": 11146927,
+    "history_summaries_50_response": 14260,
+    "ignore_batch_1000_request": 38987,
+    "ignore_batch_1000_response": 137096,
+    "tracked_ignored_inventory_response": 851,
+    "no_status_tiny_path_diff_request": 49,
+    "no_status_tiny_path_diff_response": 474,
+    "changed_status_response": 1310,
+    "changed_path_diff_request": 50,
+    "changed_path_diff_response": 913,
+    "working_diff_response": 674
+  },
+  "rss": {
+    "parent_peak_bytes": 380567552,
+    "process_cold_status_peak_bytes": 208306176,
+    "working_diff_peak_bytes": 222347264,
+    "cancellation_peak_bytes": 264044544
+  },
+  "telemetry": {
+    "status": {
+      "duration_us": 761156,
+      "paths_examined": 46665,
+      "metadata_cache_hits": 0,
+      "metadata_cache_misses": 46665,
+      "tree_cache_hit": true,
+      "status_cache_hit": false
+    },
+    "diff": {
+      "duration_us": 2214,
+      "requested_paths": 1,
+      "returned_paths": 1,
+      "changed_paths": 1,
+      "path_filter_fast_path": true,
+      "full_tree_paths_hydrated": 0
+    },
+    "history": {
+      "duration_us": 651,
+      "commits_returned": 50,
+      "tree_objects_read": 0,
+      "blob_objects_read": 0
+    },
+    "no_status_tiny_path_diff": {
+      "duration_us": 300,
+      "requested_paths": 1,
+      "returned_paths": 1,
+      "changed_paths": 1,
+      "path_filter_fast_path": true,
+      "full_tree_paths_hydrated": 0
+    },
+    "ignore_batch": {
+      "duration_us": 1637,
+      "paths_examined": 1000,
+      "index_cache_hit": true,
+      "ignore_matcher_cache_hit": true
+    },
+    "inventory": {
+      "first": {
+        "duration_us": 21327,
+        "paths_examined": 46665,
+        "items_returned": 5,
+        "inventory_cache_hit": false,
+        "index_cache_hit": true,
+        "ignore_matcher_cache_hit": true
+      },
+      "hot": {
+        "duration_us": 7060,
+        "paths_examined": 0,
+        "items_returned": 5,
+        "inventory_cache_hit": true,
+        "index_cache_hit": true,
+        "ignore_matcher_cache_hit": true
+      },
+      "kind": "tracked_ignored",
+      "total_matching": 46358,
+      "has_more": true,
+      "migration": {
+        "ignored_rules_do_not_untrack": true,
+        "tracked_ignored_paths": 46358,
+        "recommendation": "Remove paths from the index explicitly after reviewing this page; adding an ignore rule never untracks existing paths."
+      }
+    }
+  },
+  "timeouts": {
+    "working_diff": false,
+    "cancellation": false,
+    "long_operation_timeout_ms": 60000
+  }
+}

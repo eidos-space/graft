@@ -35,7 +35,9 @@ pub(super) fn run_repo_add(
         )
     } else {
         let state = current_repo_file_state(runtime, file)?;
-        Ok(vec![repo.stage_file_state_path(&file.tag, state)?])
+        let entry = repo.stage_file_state_path(&file.tag, state)?;
+        preserve_repo_volume_binding(runtime, &repo, &entry)?;
+        Ok(vec![entry])
     }
 }
 
@@ -256,9 +258,9 @@ pub(super) fn repo_head_commit(repo: &Repository) -> Result<Option<CommitObject>
 pub(super) fn repo_head_and_branch(
     repo: &Repository,
 ) -> Result<(Option<String>, Option<String>), ErrCtx> {
-    let status = repo.status()?;
+    let head = repo.head_target()?;
     let branch = repo.current_branch()?;
-    Ok((status.head_target, branch))
+    Ok((head, branch))
 }
 
 pub(super) fn staged_entry_kind_storage_and_change(
@@ -464,6 +466,7 @@ pub(super) fn stage_repo_add_topology_removals(
             && (repo_key_is_under_directory(candidate, key)
                 || repo_key_is_under_directory(key, candidate))
     }) {
+        graft::repo::cancellation_checkpoint()?;
         let tracked_at_head = head.as_ref().is_some_and(|commit| {
             commit.files.contains_key(&conflict) || commit.artifacts.contains_key(&conflict)
         });
@@ -503,6 +506,7 @@ pub(super) fn stage_repo_add_changes(
     let mut prepared_entries = Vec::with_capacity(changes.len());
 
     for change in changes {
+        graft::repo::cancellation_checkpoint()?;
         match change.change {
             RepoWorktreeChangeKind::Modified | RepoWorktreeChangeKind::Untracked => {
                 let physical_path = repo.worktree().join(&change.path);
@@ -531,6 +535,9 @@ pub(super) fn stage_repo_add_changes(
     }
 
     repo.stage_index_entries(&prepared_entries)?;
+    for entry in &prepared_entries {
+        preserve_repo_volume_binding(runtime, repo, entry)?;
+    }
     Ok(entries)
 }
 
@@ -565,7 +572,30 @@ pub(super) fn stage_repo_add_file(
 ) -> Result<graft::repo::index::IndexEntry, ErrCtx> {
     let entry = prepare_repo_add_file(runtime, file, repo, current_key, key, physical_path)?;
     repo.stage_index_entries(std::slice::from_ref(&entry))?;
+    preserve_repo_volume_binding(runtime, repo, &entry)?;
     Ok(entry)
+}
+
+fn preserve_repo_volume_binding(
+    runtime: &Runtime,
+    repo: &Repository,
+    entry: &graft::repo::index::IndexEntry,
+) -> Result<(), ErrCtx> {
+    let bound_matches_entry = match (
+        entry.file.as_ref(),
+        repo_file_state_for_key(runtime, repo, &entry.path)?,
+    ) {
+        (Some(expected), Some(bound)) => repo_file_state_content_eq(runtime, &bound, expected)?,
+        _ => false,
+    };
+    if bound_matches_entry {
+        // A non-materializing checkpoint intentionally leaves the physical SQLite placeholder
+        // behind. Keep the volume binding authoritative so status compares the live volume to the
+        // staged or committed snapshot instead of misclassifying that placeholder as a change.
+        // A stale binding must not win when this stage imported a physical SQLite file.
+        repo.mark_dirty_key(entry.path.clone())?;
+    }
+    Ok(())
 }
 
 pub(super) fn prepare_repo_add_file(
@@ -610,6 +640,7 @@ pub(super) fn collect_repo_add_directory_files(
     out: &mut BTreeSet<String>,
 ) -> Result<(), ErrCtx> {
     for entry in std::fs::read_dir(dir)? {
+        graft::repo::cancellation_checkpoint()?;
         let entry = entry?;
         let path = entry.path();
         if repo.is_internal_worktree_path(&path) {

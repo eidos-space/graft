@@ -293,6 +293,7 @@ impl Repository {
         let changed_tables = tables.len();
         let changes =
             self.commit_changes(parents.first().map(String::as_str), &files, &artifacts)?;
+        let path_changes = Some(commit_path_change_counts(&changes));
         let object_store = self.object_store();
         let tree = self.write_tree_object(&object_store, &files, &artifacts)?;
         let commit_object = self.canonical_commit_object(
@@ -301,6 +302,7 @@ impl Repository {
             &message,
             timestamp_ms,
             tables.clone(),
+            path_changes,
         )?;
         let id = object_store.write(&object::Object::Commit(commit_object))?;
         let commit = CommitObject {
@@ -360,6 +362,147 @@ impl Repository {
         self.log_page(usize::MAX, None).map(|(commits, _)| commits)
     }
 
+    /// Returns a bounded history page without reading any commit tree or blob object.
+    pub fn history_summary_page(
+        &self,
+        limit: usize,
+        after: Option<&str>,
+    ) -> Result<RepoHistorySummaryPage> {
+        if limit == 0 {
+            return Ok(RepoHistorySummaryPage {
+                commits: Vec::new(),
+                has_more: self.head_target()?.is_some(),
+                next_cursor: None,
+            });
+        }
+        let mut commits = Vec::with_capacity(limit.min(256));
+        let mut frontier = self.head_target()?.into_iter().collect::<Vec<_>>();
+        let mut seen = BTreeSet::<String>::new();
+        let mut cache = BTreeMap::<String, RepoCommitSummary>::new();
+        let mut after_seen = after.is_none();
+
+        while let Some((idx, id)) =
+            self.next_summary_frontier_commit(&frontier, &seen, &mut cache)?
+        {
+            cancellation_checkpoint()?;
+            frontier.remove(idx);
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            let commit = cache
+                .remove(&id)
+                .unwrap_or_else(|| unreachable!("commit summary was cached"));
+            for parent in &commit.parents {
+                if !seen.contains(parent) {
+                    frontier.push(parent.clone());
+                }
+            }
+            if !after_seen {
+                if after == Some(commit.id.as_str()) {
+                    after_seen = true;
+                }
+                continue;
+            }
+            commits.push(commit);
+            if commits.len() > limit {
+                commits.truncate(limit);
+                let next_cursor = commits.last().map(|commit| commit.id.clone());
+                return Ok(RepoHistorySummaryPage { commits, has_more: true, next_cursor });
+            }
+        }
+
+        if !after_seen {
+            return Err(RepoErr::InvalidRevision(
+                after.unwrap_or_default().to_string(),
+            ));
+        }
+        let next_cursor = commits.last().map(|commit| commit.id.clone());
+        Ok(RepoHistorySummaryPage { commits, has_more: false, next_cursor })
+    }
+
+    /// Lazily hydrates one commit and returns a bounded page of paths changed from its first
+    /// parent. A root commit is compared with an empty tree.
+    pub fn commit_changed_paths_page(
+        &self,
+        revision: &str,
+        limit: usize,
+        after: Option<&str>,
+    ) -> Result<RepoCommitChangedPathsPage> {
+        cancellation_checkpoint()?;
+        let revision = self.resolve_revision(revision)?;
+        let commit = self.read_commit(&revision)?;
+        cancellation_checkpoint()?;
+
+        let parent = commit.parents.first().cloned();
+        let mut paths = commit.changes;
+        paths.sort_by(|left, right| left.path.cmp(&right.path));
+        let total_changed_paths = paths.len();
+        if let Some(after) = after {
+            paths.retain(|change| change.path.as_str() > after);
+        }
+        let has_more = paths.len() > limit;
+        paths.truncate(limit);
+        let next_cursor = paths.last().map(|change| change.path.clone());
+        cancellation_checkpoint()?;
+
+        Ok(RepoCommitChangedPathsPage {
+            revision,
+            parent,
+            paths,
+            total_changed_paths,
+            has_more,
+            next_cursor,
+        })
+    }
+
+    /// Reads only the canonical commit object. Use [`Self::read_commit`] for lazy details.
+    pub fn read_commit_summary(&self, id: &str) -> Result<RepoCommitSummary> {
+        let id = object::ObjectId::from_str(id)?;
+        let commit = self
+            .read_commit_object(&id)?
+            .ok_or_else(|| RepoErr::CommitNotFound(id.to_string()))?;
+        let path_counts_complete = commit.path_changes.is_some();
+        let changed_tables = commit.tables.len();
+        Ok(RepoCommitSummary {
+            id: id.to_string(),
+            parents: commit.parents.iter().map(ToString::to_string).collect(),
+            message: commit.message,
+            timestamp_ms: commit.committer.timestamp_ms,
+            path_changes: commit.path_changes,
+            path_counts_complete,
+            tables: commit.tables,
+            changed_tables,
+        })
+    }
+
+    fn next_summary_frontier_commit(
+        &self,
+        frontier: &[String],
+        seen: &BTreeSet<String>,
+        cache: &mut BTreeMap<String, RepoCommitSummary>,
+    ) -> Result<Option<(usize, String)>> {
+        let mut selected = None;
+        let mut selected_timestamp = 0;
+        for (idx, id) in frontier.iter().enumerate() {
+            cancellation_checkpoint()?;
+            if seen.contains(id) {
+                continue;
+            }
+            if !cache.contains_key(id) {
+                cache.insert(id.clone(), self.read_commit_summary(id)?);
+            }
+            let timestamp = cache
+                .get(id)
+                .map(|commit| commit.timestamp_ms)
+                .unwrap_or_default();
+            if selected.is_none() || timestamp > selected_timestamp {
+                selected = Some((idx, id.clone()));
+                selected_timestamp = timestamp;
+            }
+        }
+        Ok(selected)
+    }
+
     /// Walk repository history in display order and return one bounded page.
     ///
     /// `after` is an exact commit object id from a previous page. The walk
@@ -376,6 +519,7 @@ impl Repository {
         let mut after_seen = after.is_none();
 
         while let Some((idx, id)) = self.next_log_frontier_commit(&frontier, &seen, &mut cache)? {
+            cancellation_checkpoint()?;
             frontier.remove(idx);
             if !seen.insert(id.clone()) {
                 continue;
@@ -419,6 +563,7 @@ impl Repository {
         let mut selected_timestamp = 0;
 
         for (idx, id) in frontier.iter().enumerate() {
+            cancellation_checkpoint()?;
             if seen.contains(id) {
                 continue;
             }

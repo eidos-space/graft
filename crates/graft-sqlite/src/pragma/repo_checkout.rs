@@ -709,6 +709,12 @@ impl<'a> WorkspaceCheckout<'a> {
             backups.restore();
             return Err(err);
         }
+        for key in workspace_sqlite_keys(plan, previous_files) {
+            // Checkout either materialized the selected snapshot or made the new volume binding
+            // authoritative. A marker retained for non-materializing commits must not make a path
+            // removed by this checkout appear as an untracked worktree file.
+            self.repo.clear_dirty_key(&key)?;
+        }
 
         backups.discard();
         Ok(())
@@ -1080,10 +1086,12 @@ pub(super) fn restore_repo_keys(
 ) -> Result<JsonRestoreOutcome, ErrCtx> {
     if spec.staged {
         for key in &keys {
+            graft::repo::cancellation_checkpoint()?;
             restore_key_path_detail(repo, spec, key)?;
         }
         let mut restored = Vec::with_capacity(keys.len());
         for key in keys {
+            graft::repo::cancellation_checkpoint()?;
             restored.push(restore_repo_key(runtime, file, repo, spec, &key)?);
         }
         return json_restore_outcome(repo, spec, restored);
@@ -1103,6 +1111,7 @@ pub(super) fn restore_repo_keys(
             .then_with(|| left.key.cmp(&right.key))
     });
     for entry in deletions {
+        graft::repo::cancellation_checkpoint()?;
         apply_restored_repo_key(runtime, file, repo, &entry.key, entry.restored.as_ref())?;
     }
     let mut restorations = plan
@@ -1115,10 +1124,12 @@ pub(super) fn restore_repo_keys(
             .then_with(|| left.key.cmp(&right.key))
     });
     for entry in restorations {
+        graft::repo::cancellation_checkpoint()?;
         prepare_restore_repo_key_target(repo, &entry.key)?;
         apply_restored_repo_key(runtime, file, repo, &entry.key, entry.restored.as_ref())?;
     }
     for entry in &plan {
+        graft::repo::cancellation_checkpoint()?;
         update_restored_worktree_state_key(runtime, repo, &entry.key, entry.restored.as_ref())?;
     }
     json_restore_outcome(
@@ -2148,6 +2159,14 @@ pub(super) fn checkout_merge_outcome(
                 previous_artifacts,
                 remote,
             )?;
+        }
+        MergeOutcome::Merged { conflicted, .. } => {
+            for key in conflicted {
+                // The conflict index establishes the current worktree (ours) as the new
+                // comparison baseline. Drop markers retained by earlier non-materializing
+                // checkpoints; a subsequent write will mark the bound volume dirty again.
+                repo.clear_dirty_key(key)?;
+            }
         }
         _ => {}
     }

@@ -26,6 +26,7 @@ flowchart LR
     J --> N["Node-API async task"]
     N --> S["Rust RepositorySession"]
     S --> M["Per-session mutex"]
+    S --> P["Validated classification snapshot"]
     M --> C["Retained RepositoryCommandService"]
     C --> R["Graft Repository + RepoRuntimeRegistry"]
     R --> O["Official Graft remote implementations"]
@@ -76,18 +77,32 @@ Graft. The native finalizer drops the last `Arc`, but explicit `close` is the su
 shutdown path.
 
 A utility-process crash releases the OS-backed storage lock. A new session reopens from durable
-state; there is no daemon lease, socket, stdin stream, or PID registry to recover.
+state; there is no daemon lease, socket, stdin stream, or PID registry to recover. Stable status
+classification is cached in immutable, content-addressed files under `.graft/cache/sdk-status`.
+Writes use a same-directory temporary file, file sync, atomic rename, and directory sync. A crash
+before rename leaves only an ignored temporary file.
+
+The snapshot CAS includes SDK schema/repository format, object format, HEAD/index, refs/config, and
+content fingerprints for relevant nested ignore sources. Loading also rechecks every tracked and
+visible-untracked metadata fingerprint before returning cached status. Any mismatch or corrupt
+file fully invalidates the snapshot. Absolute worktree paths are stripped before serialization;
+remote bearer credentials are never part of repository config or the snapshot.
 
 ## Worktree and application database handles
 
-Only `restore`, `pull`, and `cloneRepository` can replace tracked physical worktree files. Eidos
-must close affected application SQLite handles before these calls and reopen them afterward.
+Only `restore`, `restorePaths`, `pull`, and `cloneRepository` can replace tracked physical
+worktree files. Eidos must close affected application SQLite handles before these calls and reopen
+them afterward.
 `init` writes `.graft`, while `fetch`, `push`, and remote configuration change only repository or
 remote state.
 
-`status`, `diff`, and history are non-materializing and are supported while an application
+`status`, `repositoryMetadata`, `listRemotes`, `diff`, and history are non-materializing and are supported while an application
 `DatabaseSync` handle is open. `addAll` also does not replace a worktree file, but consumers should
 checkpoint application WAL state first when creating a deterministic snapshot.
+
+`repositoryMetadata` and `listRemotes` read refs/config only. Their telemetry has
+`paths_examined = 0`; remote projections omit `token_env` and in-memory credentials. History and
+remote authorization callers therefore do not need status as a metadata transport.
 
 ## Credential policy
 
@@ -109,14 +124,22 @@ legacy direct-repository entry points.
 
 ## Cancellation and conflicts
 
-The binding uses Node-API async work with an optional `AbortSignal`. Node can cancel a queued task,
-but cannot safely preempt a blocking Graft command already executing. The contract is therefore
-“cancel before start”; started operations complete normally. Repository mutations never expose a
-partially interrupted SDK result.
+The binding uses Node-API async work with an optional `AbortSignal`. Node cancels queued tasks; an
+abort after start also flips a shared cooperative token. Repository status, diff, history, stage,
+restore, inventory, tree hydration, and SQLite page loops check that token and return a dedicated
+cancelled error, which the JavaScript wrapper normalizes to `AbortError`. The retained runtime stays
+valid for the next call. Multi-path mutations may complete a prefix, but each index write and
+individual worktree replacement remains valid and observable through the next status.
 
 Graft's existing JSON command outcomes remain the source of truth for merge/pull/restore conflicts.
-The binding adds stable lifecycle, invalid-argument, repository-busy, repository-command, and
-invalid-response error codes without translating repository protocol semantics.
+During worktree traversal, file/directory/rename/unlink/symlink races are sampled twice and retried
+under the serialized session. A path that cannot stabilize returns
+`GRAFT_SDK_REPOSITORY_STALE`, a retryable structured error; raw `ENOENT`, `ENOTDIR`, and `EISDIR`
+do not cross the SDK boundary or poison the next call.
+
+The binding adds stable lifecycle, invalid-argument, repository-busy, repository-stale,
+repository-command, and invalid-response error codes without translating repository protocol
+semantics.
 
 ## Packaging boundary
 

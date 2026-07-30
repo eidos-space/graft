@@ -25,8 +25,12 @@ const { RepositorySession } = require("@eidos.space/graft")
 const session = await RepositorySession.open(spaceRoot)
 try {
   await session.init()
-  const status = await session.status()
-  const changes = await session.diff({ rows: true })
+  const status = await session.statusIncremental()
+  const changes = await session.diffPaths({
+    paths: status.status.paths.map(({ path }) => path),
+    rows: true,
+    limit: 100,
+  })
 } finally {
   await session.close()
 }
@@ -49,9 +53,10 @@ binary package；首版覆盖 macOS arm64/x64、Linux glibc arm64/x64 和 Window
 
 | 操作 | 会替换、新建或删除 tracked worktree 文件 |
 | --- | --- |
-| `init`、`status`、`addAll`、`commit`、`diff`、`history` | 否 |
+| `init`、`status`、`statusIncremental`、`repositoryMetadata`、`listRemotes`、`addAll`、`stagePaths`、`untrackPaths`、`commit` | 否 |
+| `diff`、`diffPaths`、`readPathContent`、`history`、`historySummaries`、`commitDetails`、`commitChangedPaths`、`isIgnoredPath`、`isIgnoredPaths`、`inventory` | 否 |
 | `configureRemote`、`push`、`fetch` | 否 |
-| `restore`、`pull`、`cloneRepository` | **是** |
+| `restore`、`restorePaths`、`pull`、`cloneRepository` | **是** |
 
 materializing 操作前先阻止新的应用写入、排空 transaction，并关闭受影响的 SQLite
 handle；SDK promise 结束后重新打开并验证。Graft repository session 本身可以继续常驻。
@@ -86,14 +91,44 @@ SDK 不读取 `GRAFT_REMOTE_TOKEN`，不把 token 写入 repository config 或 U
 `reopen()` 从持久状态重新构建 runtime。utility process 崩溃后由操作系统释放 storage lock；
 替代进程直接打开新 session，不需要 daemon lease 或 PID 文件。
 
-异步方法接受 `AbortSignal`。取消只终止尚未开始的队列任务；native repository command
-一旦开始就正常完成，避免暴露部分执行的 mutation。
+异步方法接受 `AbortSignal`。队列中和尚在执行的长循环都会协作检查取消信号；取消后
+同一 session 仍可继续使用。批量 mutation 可能完成前缀，重试前应重新读取 status。
 
 调用方应按 `error.code` 分支，例如 `GRAFT_SDK_SESSION_CLOSED`、
 `GRAFT_SDK_SESSION_CLOSING`、`GRAFT_SDK_REPOSITORY_BUSY` 与
 `GRAFT_SDK_REPOSITORY_COMMAND`。
 
-首个公开 API 覆盖 `init`、`open`、`status`、`addAll`、`commit`、`diff`、`history`、
-`restore`、`configureRemote`、`push`、`fetch`、`pull` 与 `cloneRepository`。参数和返回类型
-见 package [README](https://github.com/eidos-space/graft) 和
-TypeScript declaration。
+历史列表应使用不读取 tree/blob 的 `historySummaries`。展开 checkpoint 时，再调用最多
+100 条一页的 `commitChangedPaths`；普通 commit 用返回的 `parent` 和 `revision` 作为
+`diffPaths` 的 `from`/`to`，root commit 使用 `root: revision`。显式路径 diff 只读取匹配的
+tree/index entry 与对应 blob；telemetry 中的 `path_filter_fast_path: true` 与
+`full_tree_paths_hydrated: 0` 表示没有加载完整 commit map。
+
+渲染文本 diff 时，对 parent 与 commit 分别调用一次
+`readPathContent({ revision, path, maxBytes })`，再由宿主比较返回的 UTF-8 字符串。Graft 会解析并
+校验 inline blob 与 large-file pointer，不暴露 object path。结果有界，并明确返回 `absent`、
+`utf8`、`too_large`、`missing_payload` 或 `invalid_utf8`；该操作不会 materialize worktree。
+
+稳定的 `statusIncremental` 会把 content-addressed classification snapshot 原子写入
+`.graft/cache/sdk-status`。新 session 复用前会重新验证 SDK/repository schema、HEAD、index、
+refs/config、嵌套 ignore source 内容以及 tracked/untracked metadata；任一不匹配或 snapshot
+损坏都会触发完整重建。可通过 `persistent_snapshot_hit` 和 `persistent_snapshot_saved`
+telemetry 区分 warm reopen 与 cold build。
+
+History 与 Remote UI 只需 head/branch/remote 信息时，应调用 `repositoryMetadata()` 与
+`listRemotes()`，不要先调用 status。两者 `paths_examined=0`，且 Remote 结果不会包含
+`token_env` 或内存 bearer token。
+
+`stagePaths` 会把 canonical SQLite snapshot 写入 index，`commit` 只从该 index state 推进
+历史；两者都不会替换工作区数据库。因此自动 checkpoint 前后可保持应用 SQLite handle
+打开，并保留相同的文件 identity。
+
+后来添加 ignore 不会自动取消已追踪文件。先用 `inventory({ kind: "tracked_ignored" })`
+诊断并审核，再调用 `untrackPaths({ paths, expectedHead })`。该操作只移除 index entry，
+拒绝目录，不会删除或替换工作区文件；被 ignore 的文件也不会被后续 `addAll` 重新加入。
+参数和返回类型见 package [README](https://github.com/eidos-space/graft) 和 TypeScript declaration。
+
+Explorer 应通过 `isIgnoredPaths` 一次查询最多 1,000 个 entry，不要逐项跨 utility process
+调用。目录结果包含 `has_tracked_descendants`；ignored 目录仍有 tracked descendant 时不可
+剪枝。常驻 session 会缓存 index、嵌套 ignore matcher 与 `tracked_ignored` inventory，并在
+ignore 文件或 SDK index 变化后失效。

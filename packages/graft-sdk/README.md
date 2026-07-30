@@ -39,7 +39,7 @@ repositories have independent locks and can run concurrently.
 pnpm add @eidos.space/graft
 ```
 
-The root package selects one optional native package for the current host. Release `0.1.x`
+The root package selects one optional native package for the current host. The release workflow
 publishes and tests Node-API 8 binaries for macOS arm64/x64, Linux glibc arm64/x64, and Windows
 x64. Linux musl and other platform/CPU combinations fail explicitly instead of compiling during
 install or downloading an unverified binary.
@@ -79,8 +79,12 @@ const { RepositorySession } = require("@eidos.space/graft")
 
 const session = await RepositorySession.open(spaceRoot)
 try {
-  const status = await session.status()
-  const diff = await session.diff({ rows: true })
+  const status = await session.statusIncremental()
+  const diff = await session.diffPaths({
+    paths: status.status.paths.map(({ path }) => path),
+    rows: true,
+    limit: 100,
+  })
 } finally {
   await session.close()
 }
@@ -119,11 +123,25 @@ files in the Space. Changes confined to `.graft` are not counted.
 | `open`, `close`, `reopen` | Manage the retained repository runtime | No |
 | `init` | Initialize `.graft` metadata | No |
 | `status` | Inspect worktree and index state | No |
+| `statusIncremental` | Inspect status with a stable generation/change token and safe cache telemetry | No |
+| `repositoryMetadata` | Read head, branch, upstream, and repository format without scanning the worktree | No |
+| `listRemotes` | Read a credential-free remote URL/config projection without scanning the worktree | No |
 | `addAll` | Read/import the current worktree into the index | No |
+| `stagePaths` | Stage up to 1,000 explicit paths in one serialized SDK call | No |
+| `untrackPaths` | Remove up to 1,000 explicit files from the index without touching the worktree | No |
 | `commit` | Advance repository history | No |
 | `diff` | Compare worktree, index, or revisions | No |
+| `diffPaths` | Diff a page of explicit changed file paths (up to 100) | No |
+| `readPathContent` | Read bounded artifact content at one immutable revision | No |
 | `history` | Read commit history and status | No |
+| `historySummaries` | Read up to 500 lightweight commit summaries without trees/blobs | No |
+| `commitDetails` | Lazily hydrate one full commit | No |
+| `commitChangedPaths` | Lazily page one commit's first-parent changed paths (up to 100) | No |
+| `isIgnoredPath` | Apply nested `.gitignore` / `.graftignore` semantics | No |
+| `isIgnoredPaths` | Apply shared ignore/index caches to up to 1,000 file or directory paths | No |
+| `inventory` | Page tracked, untracked, ignored, or tracked-and-ignored paths | No |
 | `restore` | Replace selected paths from a revision | **Yes** |
+| `restorePaths` | Restore up to 1,000 explicit paths in one serialized SDK call | **Yes** |
 | `configureRemote` | Persist remote URL/upstream metadata | No |
 | `push` | Send objects/refs to a remote | No |
 | `fetch` | Receive objects/refs into `.graft` | No |
@@ -131,13 +149,14 @@ files in the Space. Changes confined to `.graft` are not counted.
 | `cloneRepository` | Populate a new worktree from a remote | **Yes** |
 
 `operationMaterializesWorktree(name)` exposes this contract to the Eidos gate. Before `restore`,
-`pull`, or `cloneRepository`, Eidos must checkpoint and close application SQLite handles for paths
-that can be replaced. Reopen those application handles after the SDK promise settles. The Graft
-repository session itself stays open during the operation.
+`restorePaths`, `pull`, or `cloneRepository`, Eidos must checkpoint and close application SQLite
+handles for paths that can be replaced. `stagePaths` never materializes the worktree. Reopen
+application handles after the SDK promise settles; the Graft repository session itself stays open.
 
 `addAll` reads SQLite files and their committed/WAL state but does not replace them. Eidos should
 still checkpoint its application databases before snapshotting when it needs a deterministic
-commit boundary.
+commit boundary. `commit` advances history from the staged canonical snapshot without writing that
+snapshot back to the worktree, so an open application SQLite handle keeps the same file identity.
 
 ## Lifecycle, writers, and recovery
 
@@ -154,17 +173,155 @@ parallel. External changes to ordinary worktree files are observed by subsequent
 
 If an Electron utility process crashes, the OS releases its storage lock. A replacement utility
 process creates a new session and calls `open()`; Graft reconstructs the runtime from durable
-repository state. No stale daemon registration or PID file is involved.
+repository state and may reuse the validated classification snapshot described below. No stale
+daemon registration or PID file is involved.
 
 Dropping the JavaScript native object releases its Rust `Arc`, but Eidos should always await
 `close()` during orderly Space shutdown so lifecycle errors are observable.
 
+## Incremental status, history, diff, and inventory
+
+`statusIncremental()` fingerprints tracked files and SQLite sidecars with metadata. When HEAD,
+index, visible-untracked inventory, and file metadata are unchanged, it reuses the prior status and
+does not hash file contents. After a stable classification it atomically writes a content-addressed
+snapshot under `.graft/cache/sdk-status`. A new session or replacement utility process can load
+that snapshot, then revalidate repository format, HEAD, index, refs/config, the content of all
+relevant `.gitignore` / `.graftignore` sources, and current tracked/untracked metadata. Any mismatch,
+corrupt/truncated file, or orphan temporary file causes a full rebuild; partial snapshots are never
+used. The cache stores no bearer credential or absolute worktree path.
+
+`telemetry.persistent_snapshot_hit` is true only when the persisted classification survives all
+validation and supplies the returned status. `persistent_snapshot_saved` reports a successful
+durable update, and `stability_retries` reports bounded retries caused by concurrent path changes.
+`generation` advances only when semantic status changes; `change_token` combines HEAD, generation,
+and a semantic status digest, and remains stable across a validated reopen. A full fingerprint
+invalidation may rebuild the numeric generation, while the digest still guarantees a different
+token for different status. The token should invalidate host snapshots, not
+serve as a repository object ID. SDK releases also reject persisted snapshots from an older
+classification schema, so changing sniff semantics cannot reuse an obsolete path kind.
+
+Text/binary classification sniffs the first 8192 bytes and reads up to three lookahead bytes when a
+valid UTF-8 code point crosses that boundary. Invalid UTF-8 within the sample, a genuinely
+incomplete trailing code point, NUL, and disallowed control bytes remain binary. Commit objects are
+immutable, so this boundary behavior applies to newly staged snapshots and diffs; it does not
+rewrite the recorded kind of an existing checkpoint.
+
+History and remote UI code should not call status merely to obtain repository metadata:
+
+```js
+const { current_head, current_branch, upstream } =
+  await session.repositoryMetadata({ signal })
+const { remotes } = await session.listRemotes({ signal })
+```
+
+Both calls read only refs/config metadata, never classify or materialize worktree paths, and report
+`telemetry.paths_examined: 0`. Remote entries contain `name`, typed `kind`, and a configured `url`;
+HTTP `token_env` and in-memory bearer tokens are deliberately omitted.
+
+`historySummaries({ limit, after })` returns only commit id, parents, message, timestamp, table
+counts, and optional path counts. It never reads a commit tree or blob. Commits created before path
+counts were added return `path_changes: null` and `path_counts_complete: false`. The `next_cursor`
+is the last returned commit id.
+
+When a user opens a commit, `commitChangedPaths({ revision, limit, after })` lazily reads that one
+commit and returns a bounded, path-sorted first-parent change inventory. It reads commit trees but
+no file blobs. A root commit has `parent: null` and compares against an empty tree. Merge commits
+compare against their first parent, matching the summary counts. Page size is at most 100.
+
+Use the returned paths to request only the historical diffs the UI will render:
+
+```js
+const page = await session.commitChangedPaths({ revision, limit: 100 })
+const paths = page.paths.map(({ path }) => path)
+const diff = page.parent
+  ? await session.diffPaths({
+      paths,
+      from: page.parent,
+      to: page.revision,
+      rows: true,
+      limit: 100,
+    })
+  : await session.diffPaths({ paths, root: page.revision, rows: true, limit: 100 })
+```
+
+For a text-file path, read each revision independently and pass the UTF-8 strings to the host's
+renderer without exposing `.graft` object paths:
+
+```js
+const after = await session.readPathContent({
+  revision: page.revision,
+  path: "notes/plan.md",
+  maxBytes: 1024 * 1024,
+})
+const before = page.parent
+  ? await session.readPathContent({
+      revision: page.parent,
+      path: "notes/plan.md",
+      maxBytes: 1024 * 1024,
+    })
+  : { content: { state: "absent" } }
+```
+
+`readPathContent` accepts one immutable `revision`, one normalized repository-relative `path`, and
+a required `maxBytes` between 1 and 8,388,608. The result is
+`{ revision, path, kind, storage, content }`; `revision` is the resolved commit id, and `kind` /
+`storage` are `null` when the path is absent. `content` is one of:
+
+- `{ state: "absent" }`
+- `{ state: "utf8", content, size, content_hash }`
+- `{ state: "too_large" | "missing_payload" | "invalid_utf8", size, content_hash }`
+
+The call reads only the selected immutable tree entry and payload, is cancellable, and never
+materializes or changes the worktree. Graft resolves inline FileBlob and large-file pointers,
+validates their declared kind, size, and content hash, and never returns object paths or
+credentials. SQLite paths, invalid revisions, malformed objects, and unsafe limits are rejected
+with a structured SDK error. A binary artifact can return `invalid_utf8`; callers should render
+text only when `kind === "text_file"` and `content.state === "utf8"`.
+
+`commitDetails(id)` remains available for compatible callers that deliberately need the full
+tree-backed commit payload; history lists should not use it.
+
+For working changes, pass `status.status.paths` to `diffPaths`. The API accepts normalized explicit
+logical paths, sorts/deduplicates them, and pages them with `limit`/`after`. It never recursively
+expands a directory; a tracked file that concurrently becomes a directory is still treated as that
+one logical tracked path. The legacy `diff()` remains compatible,
+but an unfiltered working diff is now driven by the status change set instead of every tracked path.
+Explicit path requests resolve only the matching immutable tree entry and index entry, then read the
+one referenced blob. They do not hydrate or clone the full commit maps. Telemetry reports
+`path_filter_fast_path: true` and `full_tree_paths_hydrated: 0` for this bounded contract.
+
+`inventory({ kind })` supports `tracked`, `untracked`, `ignored`, and `tracked_ignored`. The last form
+is the migration diagnostic for repositories that added ignore rules after committing generated
+trees. Ignore rules never untrack an existing path. Review the bounded pages, then pass approved
+explicit files to `untrackPaths({ paths, expectedHead })`. It rejects directories, non-normalized
+paths, more than 1,000 inputs, and a stale `expectedHead`. Each returned item has its own structured
+repository result. The operation removes only index entries: physical files are never deleted or
+replaced, `materializes_worktree` is `false`, and files covered by ignore rules remain ignored by
+later `addAll` calls. The SDK never performs this migration implicitly.
+
+Explorer-style callers should send up to 1,000 visible entries in one
+`isIgnoredPaths({ paths, signal })` call instead of serializing one native task per entry. Each
+result includes `is_directory` and `has_tracked_descendants`. An ignored directory with tracked
+descendants must remain traversable so the host can expose and migrate those tracked files; an
+ignored directory without tracked descendants may be pruned. The batch preserves request order.
+
+The retained session caches the tracked index, compiled nested ignore rules, and the complete
+`tracked_ignored` classification. Ignore-source metadata invalidates the matcher and inventory when
+a loaded `.gitignore` or `.graftignore` changes. `inventory.telemetry` reports separate inventory,
+index, and matcher cache hits; a hot cached page examines zero tracked paths.
+
+Telemetry contains only durations, counts, and cache/object-read facts. It never contains bearer
+tokens or absolute user paths.
+
 ## Cancellation, conflicts, and errors
 
-Every asynchronous method accepts `{ signal }`. Aborting cancels work that is still queued in the
-Node/libuv async-work queue. Once a Graft operation has started, it is not preempted: its result or
-error wins, avoiding partially interrupted repository mutations. Closing likewise waits for the
-in-flight operation instead of canceling it.
+Every asynchronous method accepts `{ signal }`. Aborting still cancels queued Node/libuv work and
+also flips a cooperative token for work already running. Status, diff, history, changed-path
+hydration, batch ignore queries, stage, untrack, restore, inventory, tree hydration, and SQLite page
+loops check that token. Cancellation rejects with an `AbortError`; the retained session remains
+open and usable. A cancelled multi-path mutation can leave a completed prefix, but every individual
+index write or worktree replacement remains valid. Call status before retrying. `close()` keeps its
+existing contract: it waits for the in-flight operation and does not implicitly cancel it.
 
 Repository conflicts and command results retain Graft's existing JSON schema. The binding
 stabilizes transport/lifecycle failures as `GraftSdkError` with codes such as:
@@ -172,7 +329,9 @@ stabilizes transport/lifecycle failures as `GraftSdkError` with codes such as:
 - `GRAFT_SDK_SESSION_CLOSED`
 - `GRAFT_SDK_SESSION_CLOSING`
 - `GRAFT_SDK_REPOSITORY_BUSY`
+- `GRAFT_SDK_CANCELLED` (normalized to `AbortError` by the JavaScript wrapper)
 - `GRAFT_SDK_INVALID_ARGUMENT`
+- `GRAFT_SDK_REPOSITORY_STALE` (retryable concurrent ref/index/path-shape change)
 - `GRAFT_SDK_REPOSITORY_COMMAND`
 
 Callers should branch on `error.code`, not parse messages.
@@ -207,6 +366,7 @@ Build the release CLI and addon, then run:
 ```sh
 cargo build --release -p graft-tool
 pnpm --dir packages/graft-sdk bench
+pnpm --dir packages/graft-sdk bench:large
 ```
 
 `GRAFT_SDK_BENCH_ITERATIONS` controls repetition (default 30), and `GRAFT_CLI_PATH` may select a
@@ -218,6 +378,20 @@ specific CLI binary. The benchmark reports first/min/p50/p95/max/mean for:
 
 The benchmark deliberately closes the retained SDK session before each CLI sample because the
 repository lock correctly excludes a second writer/runtime.
+
+`bench:large` creates a repeatable 46,665-path history, including 46,318 paths that become ignored
+only after they were tracked, nested `.graftignore` rules, 51 commits, and one changed `.eidos`
+database. It reports cold/hot median and p95 latency, JSON request/response bytes, peak RSS,
+cancellation latency, and safe SDK telemetry. The status section explicitly removes only the
+rebuildable SDK cache, measures one cold snapshot build, then opens a fresh process for every warm
+reopen sample. Set `GRAFT_SDK_LARGE_FIXTURE` to retain/reuse the fixture and
+`GRAFT_SDK_LARGE_ITERATIONS` to control repetitions.
+
+The large-repository results and profiler comparison are checked in as
+[`benchmark/results/large-repository.md`](benchmark/results/large-repository.md), with the machine-
+readable rc5 run in [`benchmark/results/large-macos-arm64.json`](benchmark/results/large-macos-arm64.json)
+and the persisted-classification run in
+[`benchmark/results/persistent-classification-macos-arm64.json`](benchmark/results/persistent-classification-macos-arm64.json).
 
 The checked-in macOS arm64 baseline is
 [`benchmark/results/macos-arm64.json`](https://github.com/eidos-space/graft/blob/main/packages/graft-sdk/benchmark/results/macos-arm64.json). For 30 iterations on
@@ -232,7 +406,9 @@ An annotated `graft-sdk-vX.Y.Z` tag on a commit already merged into `main` start
 `.github/workflows/sdk-release.yml`. The workflow builds every advertised target, tests each
 binary on Node.js 20 and 24, assembles and verifies all optional packages, publishes platform
 packages before the root package, creates a GitHub SDK release with checksums, then installs the
-public root package on every supported platform and opens a repository session. After each npm
+public root package on every supported platform under Node.js 20 and 24 and exercises
+`statusIncremental`, metadata, remotes, history summaries, and explicit-path diff. Publishing uses
+npm OIDC Trusted Publishing; the SDK workflow does not read a persistent npm token. After each npm
 publish, the job allows up to ten minutes for the immutable version to become visible through the
 registry read path before it advances to the next package.
 

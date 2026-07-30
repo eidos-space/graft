@@ -7,13 +7,19 @@ use std::{path::Path, sync::Arc};
 
 use graft::{
     remote::{RemoteConfig, RemoteCredentialErr, RemoteCredentials},
-    repo::Repository,
+    repo::{
+        CommitFileState, CommitObject, RepoCommitChangedPathsPage, RepoHistorySummaryPage,
+        RepoStatus, Repository,
+    },
     setup::setup_graft_temporary,
 };
 
 use crate::{
     file::vol_file::VolFile,
-    pragma::GraftCommand,
+    pragma::{
+        GraftCommand, repo_core::repo_for_file, repo_diff::repo_status_for_file,
+        sqlite_worktree::physical_sqlite_file_matches_state,
+    },
     vfs::{ErrCtx, RepoRuntimeRegistry},
 };
 
@@ -98,6 +104,57 @@ impl RepositoryCommandService {
         self.credentials.reset_http_clients();
         let runtime = self.file.runtime().clone();
         command.command.eval(&runtime, &mut self.file)
+    }
+
+    /// Returns the repository retained by this service, discovering it after `init` when needed.
+    pub fn repository(&mut self) -> Result<Repository, ErrCtx> {
+        repo_for_file(&mut self.file)
+    }
+
+    /// Computes the repository status while retaining the service runtime.
+    pub fn status(&mut self) -> Result<RepoStatus, ErrCtx> {
+        let runtime = self.file.runtime().clone();
+        let repo = repo_for_file(&mut self.file)?;
+        repo_status_for_file(&runtime, &self.file, &repo)
+    }
+
+    /// Lists commit metadata without hydrating any commit trees or blobs.
+    pub fn history_summaries(
+        &mut self,
+        limit: usize,
+        after: Option<&str>,
+    ) -> Result<RepoHistorySummaryPage, ErrCtx> {
+        self.repository()?
+            .history_summary_page(limit, after)
+            .map_err(Into::into)
+    }
+
+    /// Hydrates the full details for one commit on demand.
+    pub fn commit_details(&mut self, revision: &str) -> Result<CommitObject, ErrCtx> {
+        let repo = self.repository()?;
+        let id = repo.resolve_revision(revision)?;
+        repo.read_commit(&id).map_err(Into::into)
+    }
+
+    /// Lazily hydrates one commit's first-parent path changes and returns a bounded page.
+    pub fn commit_changed_paths(
+        &mut self,
+        revision: &str,
+        limit: usize,
+        after: Option<&str>,
+    ) -> Result<RepoCommitChangedPathsPage, ErrCtx> {
+        self.repository()?
+            .commit_changed_paths_page(revision, limit, after)
+            .map_err(Into::into)
+    }
+
+    /// Compares a physical SQLite worktree file with its tracked snapshot.
+    pub fn physical_sqlite_matches(
+        &self,
+        path: &Path,
+        expected: &CommitFileState,
+    ) -> Result<bool, ErrCtx> {
+        physical_sqlite_file_matches_state(self.file.runtime(), path, expected)
     }
 
     /// Injects or rotates an HTTP bearer token without writing it to repository config.

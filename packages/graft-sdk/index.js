@@ -62,8 +62,30 @@ class RepositorySession {
     return callJson(() => this.#native.status(signal))
   }
 
+  async statusIncremental({ signal } = {}) {
+    return callJson(() => this.#native.statusIncremental(signal))
+  }
+
+  async repositoryMetadata({ signal } = {}) {
+    return callJson(() => this.#native.repositoryMetadata(signal))
+  }
+
+  async listRemotes({ signal } = {}) {
+    return callJson(() => this.#native.listRemotes(signal))
+  }
+
   async addAll({ signal } = {}) {
     return callJson(() => this.#native.addAll(signal))
+  }
+
+  async stagePaths(options) {
+    const { signal, ...stageOptions } = options
+    return callJson(() => this.#native.stagePaths(stageOptions, signal))
+  }
+
+  async untrackPaths(options) {
+    const { signal, ...untrackOptions } = options
+    return callJson(() => this.#native.untrackPaths(untrackOptions, signal))
   }
 
   async commit(message, { signal } = {}) {
@@ -75,14 +97,57 @@ class RepositorySession {
     return callJson(() => this.#native.diff(diffOptions, signal))
   }
 
+  async diffPaths(options) {
+    const { signal, ...diffOptions } = options
+    return callJson(() => this.#native.diffPaths(diffOptions, signal))
+  }
+
+  async readPathContent(options) {
+    const { signal, ...readOptions } = options
+    return callJson(() => this.#native.readPathContent(readOptions, signal))
+  }
+
   async history(options = {}) {
     const { limit = 50, after, signal } = options
     return callJson(() => this.#native.history(limit, after, signal))
   }
 
+  async historySummaries(options = {}) {
+    const { limit = 50, after, signal } = options
+    return callJson(() => this.#native.historySummaries(limit, after, signal))
+  }
+
+  async commitDetails(revision, { signal } = {}) {
+    return callJson(() => this.#native.commitDetails(revision, signal))
+  }
+
+  async commitChangedPaths(options) {
+    const { signal, ...pathOptions } = options
+    return callJson(() => this.#native.commitChangedPaths(pathOptions, signal))
+  }
+
+  async isIgnoredPath(path, { signal } = {}) {
+    return callJson(() => this.#native.isIgnoredPath(path, signal))
+  }
+
+  async isIgnoredPaths(options) {
+    const { signal, ...pathOptions } = options
+    return callJson(() => this.#native.isIgnoredPaths(pathOptions, signal))
+  }
+
+  async inventory(options = {}) {
+    const { kind = "tracked_ignored", limit = 100, after, signal } = options
+    return callJson(() => this.#native.inventory({ kind, limit, after }, signal))
+  }
+
   async restore(options) {
     const { signal, ...restoreOptions } = options
     return callJson(() => this.#native.restore(restoreOptions, signal))
+  }
+
+  async restorePaths(options) {
+    const { signal, ...restoreOptions } = options
+    return callJson(() => this.#native.restorePaths(restoreOptions, signal))
   }
 
   async configureRemote(options) {
@@ -157,6 +222,11 @@ function normalizeError(error) {
   const match = message.match(/^\[(GRAFT_SDK_[A-Z_]+)\]\s*(.*)$/s)
   if (!match) {
     return new GraftSdkError(message, "GRAFT_SDK_NATIVE", error)
+  }
+  if (match[1] === "GRAFT_SDK_CANCELLED") {
+    const cancelled = new Error(match[2], { cause: error })
+    cancelled.name = "AbortError"
+    return cancelled
   }
   return new GraftSdkError(match[2], match[1], error)
 }

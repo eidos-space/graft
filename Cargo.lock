@@ -1100,8 +1100,9 @@ dependencies = [
 
 [[package]]
 name = "graft-sdk"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
+ "blake3",
  "graft",
  "graft-sqlite",
  "parking_lot",
@@ -1114,7 +1115,7 @@ dependencies = [
 
 [[package]]
 name = "graft-sdk-node"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "graft-sdk",
  "napi",

@@ -1,0 +1,89 @@
+{
+  "schema": "graft-sdk-persistent-classification-benchmark-v1",
+  "generated_at": "2026-07-30T05:06:35.234Z",
+  "fixture": {
+    "tracked_paths": 46665,
+    "tracked_ignored_paths": 46358,
+    "ignored_node_modules_paths": 46318,
+    "nested_ignore": "apps/web/.graftignore",
+    "history_commits": 51
+  },
+  "environment": {
+    "platform": "darwin",
+    "arch": "arm64",
+    "node": "v24.18.1",
+    "cpu": "Apple M2",
+    "memory_bytes": 25769803776,
+    "iterations": 7
+  },
+  "milliseconds": {
+    "status_cold_build": 4647.74,
+    "status_warm_reopen": {
+      "p50": 340.4,
+      "p95": 362.598,
+      "min": 297.392,
+      "max": 362.598
+    },
+    "open_plus_first_status_warm_reopen": {
+      "p50": 715.507,
+      "p95": 748.953,
+      "min": 695.669,
+      "max": 748.953
+    },
+    "status_resident_hot": {
+      "p50": 98.99,
+      "p95": 106.565,
+      "min": 97.495,
+      "max": 106.565
+    },
+    "repository_metadata": {
+      "p50": 0.164,
+      "p95": 0.34
+    },
+    "list_remotes": {
+      "p50": 0.061,
+      "p95": 0.157
+    },
+    "history_summaries_50": {
+      "p50": 0.738,
+      "p95": 7.648
+    },
+    "single_changed_path_diff": {
+      "p50": 1.913,
+      "p95": 3.238
+    },
+    "cancellation_rejection": 52.126,
+    "post_cancel_status": 99.256
+  },
+  "bytes": {
+    "persistent_snapshot": 22427846,
+    "status_cold_build_response": 1080,
+    "status_warm_reopen_response": 1077,
+    "repository_metadata_response": 229,
+    "list_remotes_response": 64,
+    "history_summaries_50_response": 14260,
+    "single_changed_path_diff_response": 913
+  },
+  "rss": {
+    "warm_reopen_process_peak_bytes": 196329472,
+    "parent_peak_bytes": 451100672
+  },
+  "telemetry": {
+    "cold_build": {
+      "paths_examined": 46665,
+      "persistent_snapshot_hit": false,
+      "persistent_snapshot_saved": true,
+      "status_cache_hit": false,
+      "stability_retries": 0
+    },
+    "warm_reopen": {
+      "paths_examined": 46665,
+      "metadata_cache_hits": 46665,
+      "persistent_snapshot_hit": true,
+      "status_cache_hit": true,
+      "stability_retries": 0
+    },
+    "metadata_paths_examined": 0,
+    "remotes_paths_examined": 0
+  }
+}

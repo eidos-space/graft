@@ -17,6 +17,20 @@ impl Repository {
     }
 
     pub fn diff_revisions(&self, from: &str, to: &str, path: Option<&str>) -> Result<RepoDiff> {
+        if let Some(path) = path {
+            let (from_id, from_files, from_artifacts) =
+                self.revision_states_for_filter(from, path)?;
+            let (to_id, to_files, to_artifacts) = self.revision_states_for_filter(to, path)?;
+            return Ok(diff_repo_maps(
+                from_id,
+                to_id,
+                &from_files,
+                &to_files,
+                &from_artifacts,
+                &to_artifacts,
+                Some(path),
+            ));
+        }
         let from_id = self.resolve_revision(from)?;
         let to_id = self.resolve_revision(to)?;
         let from_commit = self.read_commit(&from_id)?;
@@ -34,6 +48,18 @@ impl Repository {
     }
 
     pub fn diff_root(&self, to: &str, path: Option<&str>) -> Result<RepoDiff> {
+        if let Some(path) = path {
+            let (to_id, to_files, to_artifacts) = self.revision_states_for_filter(to, path)?;
+            return Ok(diff_repo_maps(
+                "root",
+                to_id,
+                &BTreeMap::new(),
+                &to_files,
+                &BTreeMap::new(),
+                &to_artifacts,
+                Some(path),
+            ));
+        }
         let to_id = self.resolve_revision(to)?;
         let to_commit = self.read_commit(&to_id)?;
         Ok(diff_repo_maps(
@@ -64,6 +90,67 @@ impl Repository {
             return Err(RepoErr::PathNotTextArtifact(artifact.path.clone()));
         }
         self.diff_artifact_content(artifact, max_bytes)
+    }
+
+    pub fn read_path_content(
+        &self,
+        revision: &str,
+        path: &str,
+        max_bytes: ByteUnit,
+    ) -> Result<RepoPathContent> {
+        if max_bytes == ByteUnit::ZERO {
+            return Err(RepoErr::InvalidTextDiffContentLimit);
+        }
+        let revision = self.resolve_revision(revision)?;
+        let path = normalize_repo_path_key(path)?;
+        cancellation_checkpoint()?;
+        let Some(state) = self.commit_path_state(&revision, &path)? else {
+            return Ok(RepoPathContent {
+                revision,
+                path,
+                kind: None,
+                storage: None,
+                content: RepoPathContentState::Absent,
+            });
+        };
+        let RepoTrackedPathState::Artifact(state) = state else {
+            return Err(RepoErr::PathNotArtifact(path));
+        };
+        let kind = state.kind();
+        let storage = artifact_tracked_path_storage(&state);
+        let size = state.size();
+        let content_hash = state.content_hash().clone();
+        let content = if size > max_bytes.as_u64() {
+            RepoPathContentState::TooLarge { size, content_hash }
+        } else {
+            let bytes = match self.artifact_bytes(&state) {
+                Ok(bytes) => bytes,
+                Err(RepoErr::Io(err))
+                    if state.is_large() && err.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    return Ok(RepoPathContent {
+                        revision,
+                        path,
+                        kind: Some(kind),
+                        storage: Some(storage),
+                        content: RepoPathContentState::MissingPayload { size, content_hash },
+                    });
+                }
+                Err(err) => return Err(err),
+            };
+            cancellation_checkpoint()?;
+            match String::from_utf8(bytes) {
+                Ok(content) => RepoPathContentState::Utf8 { content, size, content_hash },
+                Err(_) => RepoPathContentState::InvalidUtf8 { size, content_hash },
+            }
+        };
+        Ok(RepoPathContent {
+            revision,
+            path,
+            kind: Some(kind),
+            storage: Some(storage),
+            content,
+        })
     }
 
     pub fn diff_artifact_content(
@@ -150,17 +237,13 @@ impl Repository {
         filter: Option<&str>,
     ) -> Result<RepoDiff> {
         let key = self.file_key(path)?;
-        let mut worktree_files = self.index_files()?;
-        worktree_files.insert(key.clone(), state);
-        let mut worktree_artifacts = self.index_artifacts()?;
-        worktree_artifacts.remove(&key);
-        Ok(diff_repo_maps(
+        let expected = self.index_path_state(&key)?;
+        Ok(diff_repo_path_states(
             "index",
             "worktree",
-            &self.index_files()?,
-            &worktree_files,
-            &self.index_artifacts()?,
-            &worktree_artifacts,
+            &key,
+            expected,
+            Some(RepoTrackedPathState::File(state)),
             filter,
         ))
     }
@@ -170,16 +253,10 @@ impl Repository {
         path: impl AsRef<Path>,
         filter: Option<&str>,
     ) -> Result<RepoDiff> {
-        let mut worktree_files = self.index_files()?;
-        worktree_files.remove(&self.file_key(path)?);
-        Ok(diff_repo_maps(
-            "index",
-            "worktree",
-            &self.index_files()?,
-            &worktree_files,
-            &self.index_artifacts()?,
-            &self.index_artifacts()?,
-            filter,
+        let key = self.file_key(path)?;
+        let expected = self.index_path_state(&key)?;
+        Ok(diff_repo_path_states(
+            "index", "worktree", &key, expected, None, filter,
         ))
     }
 
@@ -190,19 +267,13 @@ impl Repository {
     ) -> Result<RepoDiff> {
         let key = self.file_key(path)?;
         let artifact = self.write_artifact_state_from_path(&key, &self.worktree.join(&key))?;
-        let index_files = self.index_files()?;
-        let mut worktree_files = index_files.clone();
-        worktree_files.remove(&key);
-        let index_artifacts = self.index_artifacts()?;
-        let mut worktree_artifacts = index_artifacts.clone();
-        worktree_artifacts.insert(key, artifact);
-        Ok(diff_repo_maps(
+        let expected = self.index_path_state(&key)?;
+        Ok(diff_repo_path_states(
             "index",
             "worktree",
-            &index_files,
-            &worktree_files,
-            &index_artifacts,
-            &worktree_artifacts,
+            &key,
+            expected,
+            Some(RepoTrackedPathState::Artifact(artifact)),
             filter,
         ))
     }
@@ -213,18 +284,9 @@ impl Repository {
         filter: Option<&str>,
     ) -> Result<RepoDiff> {
         let key = self.file_key(path)?;
-        let index_files = self.index_files()?;
-        let index_artifacts = self.index_artifacts()?;
-        let mut worktree_artifacts = index_artifacts.clone();
-        worktree_artifacts.remove(&key);
-        Ok(diff_repo_maps(
-            "index",
-            "worktree",
-            &index_files,
-            &index_files,
-            &index_artifacts,
-            &worktree_artifacts,
-            filter,
+        let expected = self.index_path_state(&key)?;
+        Ok(diff_repo_path_states(
+            "index", "worktree", &key, expected, None, filter,
         ))
     }
 
@@ -236,21 +298,14 @@ impl Repository {
         filter: Option<&str>,
     ) -> Result<RepoDiff> {
         let from_id = self.resolve_revision(rev)?;
-        let from_commit = self.read_commit(&from_id)?;
-        let from_files = from_commit.files;
-        let from_artifacts = from_commit.artifacts;
-        let mut worktree_files = from_files.clone();
         let key = self.file_key(path)?;
-        worktree_files.insert(key.clone(), state);
-        let mut worktree_artifacts = from_artifacts.clone();
-        worktree_artifacts.remove(&key);
-        Ok(diff_repo_maps(
+        let expected = self.commit_path_state(&from_id, &key)?;
+        Ok(diff_repo_path_states(
             from_id,
             "worktree",
-            &from_files,
-            &worktree_files,
-            &from_artifacts,
-            &worktree_artifacts,
+            &key,
+            expected,
+            Some(RepoTrackedPathState::File(state)),
             filter,
         ))
     }
@@ -262,19 +317,10 @@ impl Repository {
         filter: Option<&str>,
     ) -> Result<RepoDiff> {
         let from_id = self.resolve_revision(rev)?;
-        let from_commit = self.read_commit(&from_id)?;
-        let from_files = from_commit.files;
-        let from_artifacts = from_commit.artifacts;
-        let mut worktree_files = from_files.clone();
-        worktree_files.remove(&self.file_key(path)?);
-        Ok(diff_repo_maps(
-            from_id,
-            "worktree",
-            &from_files,
-            &worktree_files,
-            &from_artifacts,
-            &from_artifacts,
-            filter,
+        let key = self.file_key(path)?;
+        let expected = self.commit_path_state(&from_id, &key)?;
+        Ok(diff_repo_path_states(
+            from_id, "worktree", &key, expected, None, filter,
         ))
     }
 
@@ -285,22 +331,15 @@ impl Repository {
         filter: Option<&str>,
     ) -> Result<RepoDiff> {
         let from_id = self.resolve_revision(rev)?;
-        let from_commit = self.read_commit(&from_id)?;
-        let from_files = from_commit.files;
-        let from_artifacts = from_commit.artifacts;
         let key = self.file_key(path)?;
         let artifact = self.write_artifact_state_from_path(&key, &self.worktree.join(&key))?;
-        let mut worktree_files = from_files.clone();
-        worktree_files.remove(&key);
-        let mut worktree_artifacts = from_artifacts.clone();
-        worktree_artifacts.insert(key, artifact);
-        Ok(diff_repo_maps(
+        let expected = self.commit_path_state(&from_id, &key)?;
+        Ok(diff_repo_path_states(
             from_id,
             "worktree",
-            &from_files,
-            &worktree_files,
-            &from_artifacts,
-            &worktree_artifacts,
+            &key,
+            expected,
+            Some(RepoTrackedPathState::Artifact(artifact)),
             filter,
         ))
     }
@@ -312,19 +351,10 @@ impl Repository {
         filter: Option<&str>,
     ) -> Result<RepoDiff> {
         let from_id = self.resolve_revision(rev)?;
-        let from_commit = self.read_commit(&from_id)?;
-        let from_files = from_commit.files;
-        let from_artifacts = from_commit.artifacts;
-        let mut worktree_artifacts = from_artifacts.clone();
-        worktree_artifacts.remove(&self.file_key(path)?);
-        Ok(diff_repo_maps(
-            from_id,
-            "worktree",
-            &from_files,
-            &from_files,
-            &from_artifacts,
-            &worktree_artifacts,
-            filter,
+        let key = self.file_key(path)?;
+        let expected = self.commit_path_state(&from_id, &key)?;
+        Ok(diff_repo_path_states(
+            from_id, "worktree", &key, expected, None, filter,
         ))
     }
 
@@ -512,6 +542,47 @@ impl Repository {
     }
 }
 
+fn diff_repo_path_states(
+    from: impl Into<String>,
+    to: impl Into<String>,
+    key: &str,
+    before: Option<RepoTrackedPathState>,
+    after: Option<RepoTrackedPathState>,
+    filter: Option<&str>,
+) -> RepoDiff {
+    let mut from_files = BTreeMap::new();
+    let mut to_files = BTreeMap::new();
+    let mut from_artifacts = BTreeMap::new();
+    let mut to_artifacts = BTreeMap::new();
+    match before {
+        Some(RepoTrackedPathState::File(state)) => {
+            from_files.insert(key.to_string(), state);
+        }
+        Some(RepoTrackedPathState::Artifact(state)) => {
+            from_artifacts.insert(key.to_string(), state);
+        }
+        None => {}
+    }
+    match after {
+        Some(RepoTrackedPathState::File(state)) => {
+            to_files.insert(key.to_string(), state);
+        }
+        Some(RepoTrackedPathState::Artifact(state)) => {
+            to_artifacts.insert(key.to_string(), state);
+        }
+        None => {}
+    }
+    diff_repo_maps(
+        from,
+        to,
+        &from_files,
+        &to_files,
+        &from_artifacts,
+        &to_artifacts,
+        filter,
+    )
+}
+
 impl Repository {
     pub(super) fn write_tree_object(
         &self,
@@ -549,6 +620,7 @@ impl Repository {
         message: &str,
         timestamp_ms: u64,
         tables: Vec<CommitTableSummary>,
+        path_changes: Option<CommitPathChangeCounts>,
     ) -> Result<object::CommitObject> {
         let parents = parents
             .iter()
@@ -563,6 +635,7 @@ impl Repository {
             committer: signature,
             repo_format_version: REPOSITORY_FORMAT_VERSION,
             tables,
+            path_changes,
             message: message.to_string(),
         })
     }

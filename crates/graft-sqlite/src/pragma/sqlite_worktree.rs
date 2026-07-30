@@ -91,6 +91,7 @@ impl PhysicalSqliteReader {
 
         let stored = runtime.snapshot_reader(expected.snapshot.to_snapshot());
         for page_number in 1..=self.page_count().to_u32() {
+            graft::repo::cancellation_checkpoint()?;
             let pageidx = PageIdx::try_from(page_number).map_err(|err| {
                 ErrCtx::PragmaErr(format!("invalid SQLite page index {page_number}: {err}").into())
             })?;
@@ -236,7 +237,7 @@ impl VolumeRead for PhysicalSqliteReader {
     }
 }
 
-pub(super) fn physical_sqlite_file_matches_state(
+pub(crate) fn physical_sqlite_file_matches_state(
     runtime: &Runtime,
     path: &Path,
     expected: &CommitFileState,
@@ -436,6 +437,7 @@ fn import_sqlite_reader_state(
     let mut target = None;
 
     for page_number in 1..=physical.page_count().to_u32() {
+        graft::repo::cancellation_checkpoint()?;
         let pageidx = PageIdx::try_from(page_number).map_err(|err| {
             ErrCtx::PragmaErr(
                 format!("invalid SQLite page index in `{}`: {err}", path.display()).into(),

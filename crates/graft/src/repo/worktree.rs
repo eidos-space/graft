@@ -1,8 +1,10 @@
 use std::{
     borrow::Cow,
+    collections::BTreeMap,
     fs,
     io::Read,
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use ignore::{
@@ -19,36 +21,112 @@ use super::{
 pub(super) struct IgnoreRules {
     worktree: PathBuf,
     root: Gitignore,
+    root_sources: DirectoryIgnoreFingerprint,
 }
 
-impl IgnoreRules {
-    pub(super) fn load(worktree: &Path) -> Result<Self> {
-        Ok(Self {
-            worktree: worktree.to_path_buf(),
-            root: Self::load_directory(worktree)?,
-        })
-    }
+/// Reusable nested `.gitignore` / `.graftignore` matcher for bounded SDK scans.
+#[derive(Debug, Clone)]
+pub struct RepoIgnoreMatcher {
+    worktree: PathBuf,
+    root: Gitignore,
+    directory_rules: BTreeMap<PathBuf, Gitignore>,
+    rule_sources: BTreeMap<PathBuf, DirectoryIgnoreFingerprint>,
+}
 
-    pub(super) fn is_ignored(&self, key: &str, is_dir: bool) -> Result<bool> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IgnoreFileFingerprint {
+    len: u64,
+    modified_ns: Option<u128>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanoseconds: i64,
+}
+
+type DirectoryIgnoreFingerprint = [Option<IgnoreFileFingerprint>; 2];
+
+impl RepoIgnoreMatcher {
+    pub fn is_ignored(&mut self, key: &str, is_dir: bool) -> Result<bool> {
+        let key = normalize_repo_path_key(key)?;
         if key.is_empty() {
             return Ok(false);
         }
-
-        let mut matchers = vec![self.root.clone()];
+        let mut rule_directories = Vec::new();
         let mut path = self.worktree.clone();
-        let mut components = Path::new(key).components().peekable();
+        let mut components = Path::new(&key).components().peekable();
         while let Some(component) = components.next() {
             path.push(component);
             let has_descendants = components.peek().is_some();
             let component_is_dir = has_descendants || is_dir;
-            if Self::matches(&matchers, &path, component_is_dir) {
+            if self.matches(&rule_directories, &path, component_is_dir) {
                 return Ok(true);
             }
             if has_descendants {
-                matchers.push(Self::load_directory(&path)?);
+                if !self.directory_rules.contains_key(&path) {
+                    let (rules, sources) = IgnoreRules::load_directory(&path)?;
+                    self.directory_rules.insert(path.clone(), rules);
+                    self.rule_sources.insert(path.clone(), sources);
+                }
+                rule_directories.push(path.clone());
             }
         }
         Ok(false)
+    }
+
+    /// Returns false when an ignore source loaded by this matcher changed on disk.
+    pub fn rules_unchanged(&self) -> Result<bool> {
+        for (directory, expected) in &self.rule_sources {
+            super::cancellation_checkpoint()?;
+            if &IgnoreRules::source_fingerprint(directory)? != expected {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn matches(&self, rule_directories: &[PathBuf], path: &Path, is_dir: bool) -> bool {
+        for directory in rule_directories.iter().rev() {
+            let matcher = self
+                .directory_rules
+                .get(directory)
+                .expect("visited ignore directory has loaded rules");
+            match matcher.matched(path, is_dir) {
+                Match::Ignore(_) => return true,
+                Match::Whitelist(_) => return false,
+                Match::None => {}
+            }
+        }
+        matches!(self.root.matched(path, is_dir), Match::Ignore(_))
+    }
+}
+
+impl IgnoreRules {
+    pub(super) fn load(worktree: &Path) -> Result<Self> {
+        let (root, root_sources) = Self::load_directory(worktree)?;
+        Ok(Self {
+            worktree: worktree.to_path_buf(),
+            root,
+            root_sources,
+        })
+    }
+
+    pub(super) fn is_ignored(&self, key: &str, is_dir: bool) -> Result<bool> {
+        self.matcher().is_ignored(key, is_dir)
+    }
+
+    pub(super) fn matcher(&self) -> RepoIgnoreMatcher {
+        let mut rule_sources = BTreeMap::new();
+        rule_sources.insert(self.worktree.clone(), self.root_sources.clone());
+        RepoIgnoreMatcher {
+            worktree: self.worktree.clone(),
+            root: self.root.clone(),
+            directory_rules: BTreeMap::new(),
+            rule_sources,
+        }
     }
 
     pub(super) fn root(&self) -> Gitignore {
@@ -56,7 +134,7 @@ impl IgnoreRules {
     }
 
     pub(super) fn rules_for_directory(&self, directory: &Path) -> Result<Gitignore> {
-        Self::load_directory(directory)
+        Self::load_directory(directory).map(|(rules, _)| rules)
     }
 
     pub(super) fn matches(matchers: &[Gitignore], path: &Path, is_dir: bool) -> bool {
@@ -70,23 +148,61 @@ impl IgnoreRules {
         false
     }
 
-    fn load_directory(directory: &Path) -> Result<Gitignore> {
+    fn load_directory(directory: &Path) -> Result<(Gitignore, DirectoryIgnoreFingerprint)> {
         let mut builder = GitignoreBuilder::new(directory);
-        for file_name in [GIT_IGNORE_FILE, GRAFT_IGNORE_FILE] {
+        let sources = Self::source_fingerprint(directory)?;
+        for (file_name, source) in [GIT_IGNORE_FILE, GRAFT_IGNORE_FILE]
+            .into_iter()
+            .zip(sources.iter())
+        {
+            if source.is_none() {
+                continue;
+            }
             let path = directory.join(file_name);
-            match fs::symlink_metadata(&path) {
-                Ok(metadata) if metadata.is_file() => {
-                    if let Some(err) = builder.add(path) {
-                        return Err(err.into());
-                    }
-                }
-                Ok(_) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => return Err(err.into()),
+            if let Some(err) = builder.add(path) {
+                return Err(err.into());
             }
         }
-        Ok(builder.build()?)
+        Ok((builder.build()?, sources))
     }
+
+    fn source_fingerprint(directory: &Path) -> Result<DirectoryIgnoreFingerprint> {
+        let mut sources = [None, None];
+        for (index, file_name) in [GIT_IGNORE_FILE, GRAFT_IGNORE_FILE].into_iter().enumerate() {
+            let path = directory.join(file_name);
+            sources[index] = match fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.is_file() => Some(ignore_file_fingerprint(&metadata)),
+                Ok(_) => None,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            };
+        }
+        Ok(sources)
+    }
+}
+
+fn ignore_file_fingerprint(metadata: &fs::Metadata) -> IgnoreFileFingerprint {
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+
+    IgnoreFileFingerprint {
+        len: metadata.len(),
+        modified_ns: metadata.modified().ok().and_then(system_time_ns),
+        #[cfg(unix)]
+        device: metadata.dev(),
+        #[cfg(unix)]
+        inode: metadata.ino(),
+        #[cfg(unix)]
+        changed_seconds: metadata.ctime(),
+        #[cfg(unix)]
+        changed_nanoseconds: metadata.ctime_nsec(),
+    }
+}
+
+fn system_time_ns(time: SystemTime) -> Option<u128> {
+    time.duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|value| value.as_nanos())
 }
 
 pub(super) fn wildcard_match(pattern: &str, text: &str) -> bool {
@@ -182,10 +298,10 @@ pub(super) fn is_sqlite_database_file(path: &Path) -> Result<bool> {
 }
 
 pub(super) fn classify_artifact_path(path: &Path) -> Result<RepoTrackedPathKind> {
-    let mut file = fs::File::open(path)?;
-    let mut sample = vec![0; CONTENT_CLASS_SAMPLE_BYTES];
-    let len = file.read(&mut sample)?;
-    sample.truncate(len);
+    let file = fs::File::open(path)?;
+    let mut sample = Vec::with_capacity(CONTENT_CLASS_SAMPLE_BYTES + 3);
+    file.take((CONTENT_CLASS_SAMPLE_BYTES + 3) as u64)
+        .read_to_end(&mut sample)?;
     Ok(classify_artifact_bytes(&sample))
 }
 
@@ -250,12 +366,44 @@ pub(super) fn is_text_bytes(bytes: &[u8]) -> bool {
     if sample.is_empty() {
         return true;
     }
-    if sample.contains(&0) || std::str::from_utf8(sample).is_err() {
+    if sample.contains(&0) || !has_valid_utf8_sniff_prefix(bytes, sample) {
         return false;
     }
     sample
         .iter()
         .all(|byte| !byte.is_ascii_control() || matches!(*byte, b'\n' | b'\r' | b'\t'))
+}
+
+fn has_valid_utf8_sniff_prefix(bytes: &[u8], sample: &[u8]) -> bool {
+    match std::str::from_utf8(sample) {
+        Ok(_) => true,
+        Err(error) if error.error_len().is_none() && bytes.len() > sample.len() => {
+            let sequence_start = error.valid_up_to();
+            let Some(sequence_len) = sample
+                .get(sequence_start)
+                .copied()
+                .and_then(utf8_sequence_len)
+            else {
+                return false;
+            };
+            let Some(sequence_end) = sequence_start.checked_add(sequence_len) else {
+                return false;
+            };
+            bytes
+                .get(sequence_start..sequence_end)
+                .is_some_and(|sequence| std::str::from_utf8(sequence).is_ok())
+        }
+        Err(_) => false,
+    }
+}
+
+fn utf8_sequence_len(leading_byte: u8) -> Option<usize> {
+    match leading_byte {
+        0xc2..=0xdf => Some(2),
+        0xe0..=0xef => Some(3),
+        0xf0..=0xf4 => Some(4),
+        _ => None,
+    }
 }
 
 pub(super) fn is_sqlite_sidecar_file(path: &Path) -> bool {

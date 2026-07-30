@@ -25,8 +25,12 @@ const { RepositorySession } = require("@eidos.space/graft")
 const session = await RepositorySession.open(spaceRoot)
 try {
   await session.init()
-  const status = await session.status()
-  const changes = await session.diff({ rows: true })
+  const status = await session.statusIncremental()
+  const changes = await session.diffPaths({
+    paths: status.status.paths.map(({ path }) => path),
+    rows: true,
+    limit: 100,
+  })
 } finally {
   await session.close()
 }
@@ -65,9 +69,10 @@ install-time compiler or binary downloader.
 
 | Operation | Replaces, creates, or removes tracked worktree files |
 | --- | --- |
-| `init`, `status`, `addAll`, `commit`, `diff`, `history` | No |
+| `init`, `status`, `statusIncremental`, `repositoryMetadata`, `listRemotes`, `addAll`, `stagePaths`, `untrackPaths`, `commit` | No |
+| `diff`, `diffPaths`, `readPathContent`, `history`, `historySummaries`, `commitDetails`, `commitChangedPaths`, `isIgnoredPath`, `isIgnoredPaths`, `inventory` | No |
 | `configureRemote`, `push`, `fetch` | No |
-| `restore`, `pull`, `cloneRepository` | **Yes** |
+| `restore`, `restorePaths`, `pull`, `cloneRepository` | **Yes** |
 
 Before a materializing operation, stop new application writes, drain transactions, and close the
 affected SQLite handles. Reopen and validate those handles after the SDK promise settles. The Graft
@@ -106,9 +111,10 @@ and is idempotent. `reopen()` reconstructs the runtime from durable state. If a 
 crashes, the OS releases the storage lock; a replacement process opens a fresh session without a
 daemon lease or PID recovery file.
 
-Async methods accept an `AbortSignal`. Cancellation stops work that is still queued. Once a native
-repository command starts, it completes normally to avoid exposing a partially interrupted
-mutation.
+Async methods accept an `AbortSignal`. Cancellation stops queued work and cooperatively interrupts
+long-running repository loops after start. It rejects with `AbortError`; the same retained session
+remains usable. A cancelled multi-path stage, untrack, or restore can complete a prefix, so read
+status before retrying. `close()` still waits and never implicitly cancels an operation.
 
 Handle errors by `error.code`, including `GRAFT_SDK_SESSION_CLOSED`,
 `GRAFT_SDK_SESSION_CLOSING`, `GRAFT_SDK_REPOSITORY_BUSY`, and
@@ -116,7 +122,41 @@ Handle errors by `error.code`, including `GRAFT_SDK_SESSION_CLOSED`,
 
 ## API
 
-The first stable surface covers `init`, `open`, `status`, `addAll`, `commit`, `diff`, `history`,
-`restore`, `configureRemote`, `push`, `fetch`, `pull`, and `cloneRepository`. See the package
+The incremental surface adds generation-cached `statusIncremental`, paged `historySummaries`, lazy
+bounded `commitChangedPaths`, and explicit-path `diffPaths`. For a normal commit, diff those paths
+with `from: page.parent, to: page.revision`; for a root commit use `root: page.revision`.
+`historySummaries` itself never reads trees or blobs. An explicit-path diff reads only the matching
+tree/index entry and referenced blob; `path_filter_fast_path: true` and
+`full_tree_paths_hydrated: 0` in telemetry confirm that no full commit map was hydrated.
+
+For text rendering, call `readPathContent({ revision, path, maxBytes })` once for the parent and
+once for the commit, then diff the returned UTF-8 strings in the host. Graft resolves and validates
+inline blobs and large-file pointers without exposing object paths. The bounded result reports
+`absent`, `utf8`, `too_large`, `missing_payload`, or `invalid_utf8`; the operation never
+materializes the worktree.
+
+After a stable `statusIncremental`, Graft atomically persists a content-addressed classification
+snapshot under `.graft/cache/sdk-status`. A new session revalidates its SDK/repository schema,
+HEAD, index, refs/config, nested ignore-source contents, and tracked/untracked metadata before reuse.
+Any mismatch or corrupt snapshot triggers a full rebuild. Use `persistent_snapshot_hit` and
+`persistent_snapshot_saved` telemetry to distinguish a validated warm reopen from a cold build.
+
+History and Remote UI should call `repositoryMetadata()` and `listRemotes()` instead of status.
+Both inspect zero worktree paths; Remote results omit `token_env` and in-memory bearer credentials.
+
+`stagePaths` captures a canonical SQLite snapshot and `commit` advances history from that index
+state. Neither operation replaces the worktree database, so application SQLite handles may remain
+open and retain the same file identity across an automatic checkpoint.
+
+Batch `stagePaths`, `untrackPaths`, and `restorePaths` plus shared ignore/inventory queries avoid
+host-side protocol copies. `tracked_ignored` inventory is diagnostic: adding an ignore rule never
+untracks an already committed path. After review, call
+`untrackPaths({ paths, expectedHead })`; it removes only index entries, rejects directories, never
+deletes physical files, and ignored files are not re-added by `addAll`. See the package
 [README](https://github.com/eidos-space/graft) and TypeScript
 declarations for options and result types.
+
+Explorer traversal should batch at most 1,000 entries with `isIgnoredPaths`. For directories, use
+`has_tracked_descendants`: do not prune an ignored directory while it still contains indexed files.
+The retained session caches the tracked-and-ignored inventory and invalidates it when a loaded
+ignore file or the SDK-managed index changes.

@@ -1,19 +1,19 @@
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt::{self, Display},
     fs,
     path::{Path, PathBuf},
     str::FromStr,
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(unix)]
-use std::{
-    collections::HashMap,
-    os::unix::fs::MetadataExt,
-    sync::{Mutex, OnceLock},
-};
+use std::os::unix::fs::MetadataExt;
 
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream};
@@ -42,7 +42,7 @@ pub use config::{
     CONFIG_KEY_TRACK_USER_ROOTS, CONFIG_KEY_WORKTREE_MATERIALIZE_SQLITE, FileConfig, MergeConfig,
     RepoConfig, RepoConfigEntry, TrackConfig, WorktreeConfig,
 };
-pub use object::CommitTableSummary;
+pub use object::{CommitPathChangeCounts, CommitTableSummary};
 
 use config::{
     config_entries, config_entry, config_generated_columns_table, config_internal_resolver_subject,
@@ -57,7 +57,7 @@ use worktree::{
     normalize_repo_path, normalize_repo_path_key,
 };
 
-pub use worktree::validate_repo_path_identity;
+pub use worktree::{RepoIgnoreMatcher, validate_repo_path_identity};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -83,6 +83,65 @@ const DEFAULT_LARGE_FILE_THRESHOLD: ByteUnit = ByteUnit::MB;
 #[cfg(unix)]
 const ARTIFACT_STAT_CACHE_MAX_ENTRIES: usize = 100_000;
 
+thread_local! {
+    static ACTIVE_CANCELLATION: RefCell<Option<CancellationToken>> = const { RefCell::new(None) };
+}
+
+/// A cheap cooperative cancellation flag for repository operations.
+///
+/// Callers install a token with [`with_cancellation`]. Repository loops use
+/// [`cancellation_checkpoint`] and return [`RepoErr::Cancelled`] without poisoning the
+/// repository session or retained runtime.
+#[derive(Debug, Clone, Default)]
+pub struct CancellationToken {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl CancellationToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+}
+
+struct CancellationScope(Option<CancellationToken>);
+
+impl Drop for CancellationScope {
+    fn drop(&mut self) {
+        ACTIVE_CANCELLATION.with(|active| {
+            active.replace(self.0.take());
+        });
+    }
+}
+
+/// Runs an operation with cooperative cancellation enabled on the current worker thread.
+pub fn with_cancellation<T>(token: &CancellationToken, operation: impl FnOnce() -> T) -> T {
+    let previous = ACTIVE_CANCELLATION.with(|active| active.replace(Some(token.clone())));
+    let _scope = CancellationScope(previous);
+    operation()
+}
+
+/// Returns [`RepoErr::Cancelled`] when the current operation's token was cancelled.
+pub fn cancellation_checkpoint() -> Result<()> {
+    let cancelled = ACTIVE_CANCELLATION.with(|active| {
+        active
+            .borrow()
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+    });
+    if cancelled {
+        return Err(RepoErr::Cancelled);
+    }
+    Ok(())
+}
+
 const CONFIG_FILE: &str = "config.toml";
 const HEAD_FILE: &str = "HEAD";
 const MERGE_HEAD_FILE: &str = "MERGE_HEAD";
@@ -107,6 +166,9 @@ const REMOTE_OBJECT_PACK_MAGIC: &[u8] = b"graft-object-pack-v1\n";
 
 #[derive(Debug, Error)]
 pub enum RepoErr {
+    #[error("operation cancelled")]
+    Cancelled,
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -214,6 +276,9 @@ pub enum RepoErr {
 
     #[error("path `{0}` is not a text artifact")]
     PathNotTextArtifact(String),
+
+    #[error("path `{0}` is not an artifact")]
+    PathNotArtifact(String),
 
     #[error("text diff content limit must be greater than zero")]
     InvalidTextDiffContentLimit,
@@ -523,6 +588,41 @@ pub struct CommitObject {
     pub changed_tables: usize,
 }
 
+/// Lightweight commit metadata that never hydrates the commit tree or blob payloads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoCommitSummary {
+    pub id: String,
+    pub parents: Vec<String>,
+    pub message: String,
+    pub timestamp_ms: u64,
+    /// Present for commits written by versions that persist path counts in the commit object.
+    pub path_changes: Option<CommitPathChangeCounts>,
+    pub path_counts_complete: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tables: Vec<CommitTableSummary>,
+    pub changed_tables: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoHistorySummaryPage {
+    pub commits: Vec<RepoCommitSummary>,
+    pub has_more: bool,
+    pub next_cursor: Option<String>,
+}
+
+/// One bounded page of paths changed from a commit's first parent to the commit.
+///
+/// Root commits compare against an empty tree and therefore have no `parent`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoCommitChangedPathsPage {
+    pub revision: String,
+    pub parent: Option<String>,
+    pub paths: Vec<CommitPathChange>,
+    pub total_changed_paths: usize,
+    pub has_more: bool,
+    pub next_cursor: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitPathChange {
     pub path: String,
@@ -535,6 +635,12 @@ pub struct CommitPathChange {
 pub struct CommitFileState {
     pub volume: VolumeId,
     pub snapshot: RepoSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RepoTrackedPathState {
+    File(CommitFileState),
+    Artifact(CommitArtifactState),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -757,6 +863,38 @@ pub struct RepoTextContentDiff {
     pub storage: RepoPathStorage,
     pub before: RepoTextContentState,
     pub after: RepoTextContentState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoPathContent {
+    pub revision: String,
+    pub path: String,
+    pub kind: Option<RepoTrackedPathKind>,
+    pub storage: Option<RepoPathStorage>,
+    pub content: RepoPathContentState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum RepoPathContentState {
+    Absent,
+    Utf8 {
+        content: String,
+        size: u64,
+        content_hash: object::ObjectId,
+    },
+    TooLarge {
+        size: u64,
+        content_hash: object::ObjectId,
+    },
+    MissingPayload {
+        size: u64,
+        content_hash: object::ObjectId,
+    },
+    InvalidUtf8 {
+        size: u64,
+        content_hash: object::ObjectId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2425,6 +2563,18 @@ fn commit_path_changes(
             storage: path.storage,
         })
         .collect()
+}
+
+fn commit_path_change_counts(changes: &[CommitPathChange]) -> CommitPathChangeCounts {
+    let mut counts = CommitPathChangeCounts { added: 0, modified: 0, deleted: 0 };
+    for change in changes {
+        match change.change {
+            RepoFileChange::Added => counts.added += 1,
+            RepoFileChange::Modified => counts.modified += 1,
+            RepoFileChange::Deleted => counts.deleted += 1,
+        }
+    }
+    counts
 }
 
 fn repo_path_matches_filter(key: &str, path: Option<&str>) -> bool {

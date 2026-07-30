@@ -24,23 +24,118 @@ const {
 } = require("..")
 
 test("exposes ABI-stable SDK metadata and materialization contract", () => {
-  assert.equal(sdkVersion(), "0.2.0")
-  for (const operation of ["restore", "pull", "cloneRepository"]) {
+  assert.equal(sdkVersion(), "0.3.0")
+  for (const operation of [
+    "restore",
+    "restorePaths",
+    "pull",
+    "cloneRepository",
+  ]) {
     assert.equal(operationMaterializesWorktree(operation), true)
   }
   for (const operation of [
     "init",
     "status",
+    "statusIncremental",
+    "repositoryMetadata",
+    "listRemotes",
     "addAll",
+    "stagePaths",
+    "untrackPaths",
     "commit",
     "diff",
+    "diffPaths",
+    "readPathContent",
     "history",
+    "historySummaries",
+    "commitDetails",
+    "commitChangedPaths",
+    "isIgnoredPath",
+    "isIgnoredPaths",
+    "inventory",
     "configureRemote",
     "push",
     "fetch",
   ]) {
     assert.equal(operationMaterializesWorktree(operation), false)
   }
+})
+
+test("reads bounded revision path content without materializing", async () => {
+  await withTemporaryDirectory("graft-sdk-path-content-", async (root) => {
+    const session = await RepositorySession.open(root)
+    await session.init()
+    await fs.writeFile(path.join(root, "note.txt"), "one\n")
+    await session.addAll()
+    const baseline = await session.commit("baseline text")
+
+    const baselineContent = await session.readPathContent({
+      path: "note.txt",
+      revision: baseline.commit.id,
+      maxBytes: 1024,
+    })
+    assert.equal(baselineContent.revision, baseline.commit.id)
+    assert.equal(baselineContent.path, "note.txt")
+    assert.equal(baselineContent.kind, "text_file")
+    assert.equal(baselineContent.content.state, "utf8")
+    assert.equal(baselineContent.content.content, "one\n")
+    assert.equal(baselineContent.content.size, 4)
+    const absent = await session.readPathContent({
+      path: "missing.txt",
+      revision: baseline.commit.id,
+      maxBytes: 1024,
+    })
+    assert.equal(absent.kind, null)
+    assert.equal(absent.storage, null)
+    assert.deepEqual(absent.content, { state: "absent" })
+
+    await fs.writeFile(path.join(root, "note.txt"), "two\n")
+    await session.stagePaths({ paths: ["note.txt"] })
+    const updated = await session.commit("updated text")
+    const before = await session.readPathContent({
+      path: "note.txt",
+      revision: baseline.commit.id,
+      maxBytes: 1024,
+    })
+    const after = await session.readPathContent({
+      path: "note.txt",
+      revision: updated.commit.id,
+      maxBytes: 1024,
+    })
+    assert.equal(before.content.state, "utf8")
+    assert.equal(before.content.content, "one\n")
+    assert.equal(after.content.state, "utf8")
+    assert.equal(after.content.content, "two\n")
+
+    const bounded = await session.readPathContent({
+      path: "note.txt",
+      revision: updated.commit.id,
+      maxBytes: 3,
+    })
+    assert.equal(bounded.content.state, "too_large")
+    await assert.rejects(
+      session.readPathContent({
+        path: "note.txt",
+        revision: updated.commit.id,
+        maxBytes: 8 * 1024 * 1024 + 1,
+      }),
+      /between 1 and 8388608/
+    )
+
+    const controller = new AbortController()
+    const running = Array.from({ length: 24 }, () => session.diff({ rows: true }))
+    const queued = session.readPathContent({
+      path: "note.txt",
+      revision: updated.commit.id,
+      maxBytes: 1024,
+      signal: controller.signal,
+    })
+    controller.abort()
+    await assert.rejects(queued, (error) => error.name === "AbortError")
+    await Promise.all(running)
+    assert.equal((await session.repositoryMetadata()).current_head, updated.commit.id)
+    await session.close()
+  })
 })
 
 test("repeated status and diff reuse one native session without a CLI", async () => {
@@ -67,6 +162,355 @@ test("repeated status and diff reuse one native session without a CLI", async ()
     } finally {
       restoreEnvironment("GRAFT_CLI_PATH", previousCliPath)
     }
+  })
+})
+
+test("classifies UTF-8 codepoints crossing the sniff boundary as text", async () => {
+  await withTemporaryDirectory("graft-sdk-utf8-boundary-", async (root) => {
+    const session = await RepositorySession.open(root)
+    await session.init()
+    const paths = []
+
+    for (const [width, character] of [
+      [2, "¢"],
+      [3, "中"],
+      [4, "😀"],
+    ]) {
+      for (let bytesBeforeBoundary = 1; bytesBeforeBoundary < width; bytesBeforeBoundary += 1) {
+        const relativePath = `utf8-${width}-${bytesBeforeBoundary}.txt`
+        paths.push(relativePath)
+        await fs.writeFile(
+          path.join(root, relativePath),
+          Buffer.concat([
+            Buffer.alloc(8192 - bytesBeforeBoundary, "a"),
+            Buffer.from(`${character}\n`),
+          ])
+        )
+      }
+    }
+
+    const untracked = await session.statusIncremental()
+    assert.deepEqual(
+      untracked.status.paths.map(({ path: relativePath, kind }) => [relativePath, kind]),
+      paths.map((relativePath) => [relativePath, "text_file"])
+    )
+
+    await session.stagePaths({ paths })
+    const committed = await session.commit("UTF-8 boundary")
+    const changed = await session.commitChangedPaths({
+      revision: committed.commit.id,
+      limit: 100,
+    })
+    assert.deepEqual(
+      changed.paths.map(({ path: relativePath, kind }) => [relativePath, kind]),
+      paths.map((relativePath) => [relativePath, "text_file"])
+    )
+    await session.close()
+  })
+})
+
+test("incremental status exposes a stable session generation", async () => {
+  await withTemporaryDirectory("graft-sdk-generation-", async (root) => {
+    const session = await RepositorySession.open(root)
+    await session.init()
+    const note = path.join(root, "note.txt")
+    await fs.writeFile(note, "one\n")
+    await session.addAll()
+    await session.commit("baseline")
+
+    const first = await session.statusIncremental()
+    const hot = await session.statusIncremental()
+    assert.equal(first.status.dirty, false)
+    assert.equal(hot.generation, first.generation)
+    assert.equal(hot.change_token, first.change_token)
+    assert.equal(hot.telemetry.status_cache_hit, true)
+
+    await fs.writeFile(note, "two\n")
+    const changed = await session.statusIncremental()
+    assert.equal(changed.status.dirty, true)
+    assert.ok(changed.generation > hot.generation)
+    assert.equal(changed.telemetry.status_cache_hit, false)
+    assert.equal(typeof changed.telemetry.persistent_snapshot_saved, "boolean")
+    await session.close()
+
+    const reopened = await RepositorySession.open(root)
+    const persisted = await reopened.statusIncremental()
+    assert.equal(persisted.telemetry.persistent_snapshot_hit, true)
+    assert.equal(persisted.telemetry.status_cache_hit, true)
+    assert.equal(persisted.generation, changed.generation)
+    assert.equal(persisted.change_token, changed.change_token)
+    await reopened.close()
+  })
+})
+
+test("metadata and remotes avoid worktree classification and credentials", async () => {
+  await withTemporaryDirectory("graft-sdk-metadata-", async (root) => {
+    const session = await RepositorySession.open(root)
+    await session.init()
+    await fs.writeFile(path.join(root, "note.txt"), "one\n")
+    await session.addAll()
+    const committed = await session.commit("initial")
+    await session.configureRemote({
+      name: "origin",
+      url: "https://example.invalid/acme/space",
+      bearerToken: "in-memory-only",
+    })
+
+    const metadata = await session.repositoryMetadata()
+    assert.equal(metadata.current_head, committed.commit.id)
+    assert.equal(metadata.current_branch, "main")
+    assert.equal(metadata.telemetry.paths_examined, 0)
+    const remotes = await session.listRemotes()
+    assert.equal(remotes.telemetry.paths_examined, 0)
+    assert.deepEqual(remotes.remotes, [
+      {
+        name: "origin",
+        kind: "http",
+        url: "https://example.invalid/acme/space",
+      },
+    ])
+    assert.equal(JSON.stringify(remotes).includes("in-memory-only"), false)
+
+    const controller = new AbortController()
+    const inFlight = Array.from({ length: 24 }, () =>
+      session.diff({ rows: true })
+    )
+    const queuedMetadata = session.repositoryMetadata({
+      signal: controller.signal,
+    })
+    controller.abort()
+    await assert.rejects(
+      queuedMetadata,
+      (error) => error.name === "AbortError"
+    )
+    await Promise.all(inFlight)
+    assert.equal((await session.listRemotes()).telemetry.paths_examined, 0)
+    await session.close()
+  })
+})
+
+test("incremental SDK pages history, diffs, ignore inventory, and batch mutations", async () => {
+  await withTemporaryDirectory("graft-sdk-incremental-", async (root) => {
+    const session = await RepositorySession.open(root)
+    await session.init()
+    await fs.mkdir(path.join(root, "node_modules", "pkg"), { recursive: true })
+    await fs.writeFile(path.join(root, "node_modules", "pkg", "index.js"), "one\n")
+    await fs.writeFile(path.join(root, "note.txt"), "one\n")
+    await session.addAll()
+    const baselineCommit = await session.commit("baseline")
+
+    await fs.writeFile(path.join(root, ".gitignore"), "node_modules/\n")
+    await session.addAll()
+    const ignoredCommit = await session.commit("ignore dependencies")
+    const history = await session.historySummaries({ limit: 1 })
+    assert.equal(history.commits.length, 1)
+    assert.equal(history.commits[0].id, ignoredCommit.commit.id)
+    assert.equal(history.commits[0].path_counts_complete, true)
+    assert.equal(history.telemetry.tree_objects_read, 0)
+    assert.equal(history.telemetry.blob_objects_read, 0)
+    assert.equal((await session.commitDetails(history.commits[0].id)).id, history.commits[0].id)
+
+    const rootFirstPage = await session.commitChangedPaths({
+      revision: baselineCommit.commit.id,
+      limit: 1,
+    })
+    assert.equal(rootFirstPage.parent, null)
+    assert.equal(rootFirstPage.total_changed_paths, 2)
+    assert.equal(rootFirstPage.paths.length, 1)
+    assert.equal(rootFirstPage.has_more, true)
+    assert.equal(rootFirstPage.telemetry.blob_objects_read, 0)
+    const rootSecondPage = await session.commitChangedPaths({
+      revision: baselineCommit.commit.id,
+      limit: 1,
+      after: rootFirstPage.next_cursor,
+    })
+    assert.equal(rootSecondPage.paths.length, 1)
+    assert.equal(rootSecondPage.has_more, false)
+    const rootPaths = [...rootFirstPage.paths, ...rootSecondPage.paths].map(
+      ({ path: changedPath }) => changedPath
+    )
+    const rootDiff = await session.diffPaths({
+      paths: rootPaths,
+      root: baselineCommit.commit.id,
+      limit: 100,
+    })
+    assert.equal(rootDiff.paths.length, 2)
+
+    const commitPaths = await session.commitChangedPaths({
+      revision: ignoredCommit.commit.id,
+      limit: 100,
+    })
+    assert.equal(commitPaths.parent, baselineCommit.commit.id)
+    assert.deepEqual(
+      commitPaths.paths.map(({ path: changedPath }) => changedPath),
+      [".gitignore"]
+    )
+    const commitDiff = await session.diffPaths({
+      paths: commitPaths.paths.map(({ path: changedPath }) => changedPath),
+      from: commitPaths.parent,
+      to: commitPaths.revision,
+      limit: 100,
+    })
+    assert.equal(commitDiff.paths.length, 1)
+    await assert.rejects(
+      session.commitChangedPaths({
+        revision: ignoredCommit.commit.id,
+        limit: 101,
+      }),
+      /between 1 and 100/
+    )
+    const historyAbort = new AbortController()
+    const historyRunning = Array.from({ length: 24 }, () => session.diff({ rows: true }))
+    const queuedHistory = session.commitChangedPaths({
+      revision: ignoredCommit.commit.id,
+      signal: historyAbort.signal,
+    })
+    historyAbort.abort()
+    await assert.rejects(
+      queuedHistory,
+      (error) => error.name === "AbortError"
+    )
+    await Promise.all(historyRunning)
+    assert.equal(
+      (await session.commitChangedPaths({ revision: ignoredCommit.commit.id })).paths.length,
+      1
+    )
+
+    const ignored = await session.isIgnoredPath("node_modules/pkg/index.js")
+    assert.equal(ignored.is_ignored, true)
+    assert.equal(ignored.is_tracked, true)
+    assert.equal(ignored.is_directory, false)
+    const ignoredBatch = await session.isIgnoredPaths({
+      paths: ["node_modules", "node_modules/pkg/index.js", "note.txt"],
+    })
+    assert.equal(ignoredBatch.paths.length, 3)
+    assert.equal(ignoredBatch.paths[0].is_ignored, true)
+    assert.equal(ignoredBatch.paths[0].is_directory, true)
+    assert.equal(ignoredBatch.paths[0].has_tracked_descendants, true)
+    assert.equal(ignoredBatch.paths[0].is_tracked, false)
+    assert.equal(ignoredBatch.paths[1].is_ignored, true)
+    assert.equal(ignoredBatch.paths[1].is_tracked, true)
+    assert.equal(ignoredBatch.paths[2].is_ignored, false)
+    await assert.rejects(
+      session.isIgnoredPaths({
+        paths: Array.from({ length: 1001 }, (_, index) => `query-${index}`),
+      }),
+      /exceeds 1000/
+    )
+    const ignoreAbort = new AbortController()
+    const ignoreRunning = Array.from({ length: 24 }, () => session.diff({ rows: true }))
+    const queuedIgnore = session.isIgnoredPaths({
+      paths: ["node_modules"],
+      signal: ignoreAbort.signal,
+    })
+    ignoreAbort.abort()
+    await assert.rejects(
+      queuedIgnore,
+      (error) => error.name === "AbortError"
+    )
+    await Promise.all(ignoreRunning)
+    assert.equal((await session.isIgnoredPaths({ paths: ["node_modules"] })).paths.length, 1)
+    const inventory = await session.inventory({
+      kind: "tracked_ignored",
+      limit: 10,
+    })
+    assert.deepEqual(
+      inventory.items.map((item) => item.path),
+      ["node_modules/pkg/index.js"]
+    )
+    assert.equal(inventory.migration.ignored_rules_do_not_untrack, true)
+    assert.equal(inventory.telemetry.inventory_cache_hit, false)
+    const hotInventory = await session.inventory({
+      kind: "tracked_ignored",
+      limit: 10,
+    })
+    assert.equal(hotInventory.telemetry.inventory_cache_hit, true)
+    assert.equal(hotInventory.telemetry.paths_examined, 0)
+
+    await fs.writeFile(path.join(root, "note.txt"), "two\n")
+    await fs.writeFile(path.join(root, "node_modules", "pkg", "index.js"), "two\n")
+    const firstDiffPage = await session.diffPaths({
+      paths: ["note.txt", "node_modules/pkg/index.js"],
+      limit: 1,
+    })
+    assert.equal(firstDiffPage.paths.length, 1)
+    assert.equal(firstDiffPage.has_more, true)
+    assert.equal(firstDiffPage.telemetry.path_filter_fast_path, true)
+    assert.equal(firstDiffPage.telemetry.full_tree_paths_hydrated, 0)
+    const secondDiffPage = await session.diffPaths({
+      paths: ["note.txt", "node_modules/pkg/index.js"],
+      limit: 1,
+      after: firstDiffPage.next_cursor,
+    })
+    assert.equal(secondDiffPage.paths.length, 1)
+    assert.equal(secondDiffPage.has_more, false)
+
+    const expectedHead = (await session.status()).current_head
+    const staged = await session.stagePaths({
+      paths: ["note.txt", "node_modules/pkg/index.js"],
+      expectedHead,
+    })
+    assert.equal(staged.paths.length, 2)
+    assert.equal(staged.materializes_worktree, false)
+    const restored = await session.restorePaths({
+      source: "HEAD",
+      expectedHead,
+      paths: ["note.txt", "node_modules/pkg/index.js"],
+    })
+    assert.equal(restored.paths.length, 2)
+    assert.equal(restored.materializes_worktree, true)
+    assert.equal(await fs.readFile(path.join(root, "note.txt"), "utf8"), "one\n")
+
+    await assert.rejects(
+      session.untrackPaths({ paths: ["node_modules"], expectedHead }),
+      /directory/
+    )
+    await assert.rejects(
+      session.untrackPaths({ paths: Array.from({ length: 1001 }, (_, index) => `p-${index}`) }),
+      /exceeds 1000/
+    )
+    await assert.rejects(
+      session.untrackPaths({ paths: ["node_modules/pkg/index.js"], expectedHead: "deadbeef" }),
+      /HEAD changed/
+    )
+    const untrackAbort = new AbortController()
+    const untrackRunning = Array.from({ length: 24 }, () => session.diff({ rows: true }))
+    const queuedUntrack = session.untrackPaths({
+      paths: ["node_modules/pkg/index.js"],
+      expectedHead,
+      signal: untrackAbort.signal,
+    })
+    untrackAbort.abort()
+    await assert.rejects(
+      queuedUntrack,
+      (error) => error.name === "AbortError"
+    )
+    await Promise.all(untrackRunning)
+    const untracked = await session.untrackPaths({
+      paths: ["node_modules/pkg/index.js"],
+      expectedHead,
+    })
+    assert.equal(untracked.paths.length, 1)
+    assert.equal(untracked.paths[0].path, "node_modules/pkg/index.js")
+    assert.equal(untracked.materializes_worktree, false)
+    assert.equal(
+      await fs.readFile(path.join(root, "node_modules", "pkg", "index.js"), "utf8"),
+      "one\n"
+    )
+    await session.addAll()
+    const ignoredAfterUntrack = await session.isIgnoredPath("node_modules/pkg/index.js")
+    assert.equal(ignoredAfterUntrack.is_ignored, true)
+    assert.equal(ignoredAfterUntrack.is_tracked, false)
+    assert.deepEqual(
+      (
+        await session.inventory({
+          kind: "tracked_ignored",
+          limit: 10,
+        })
+      ).items,
+      []
+    )
+    await session.close()
   })
 })
 
@@ -227,6 +671,45 @@ test("keeps HTTP credentials in memory and redacts command errors", async () => 
 })
 
 test(
+  "commit preserves an open SQLite worktree file identity",
+  nodeSqliteTest,
+  async () => {
+    await withTemporaryDirectory("graft-sdk-commit-identity-", async (root) => {
+      const databasePath = path.join(root, "records.eidos")
+      createDatabase(databasePath, "records", [["before"]])
+      const applicationDatabase = new DatabaseSync(databasePath)
+      applicationDatabase.exec("PRAGMA journal_mode=WAL")
+      const before = await fs.stat(databasePath)
+
+      const session = await RepositorySession.open(root)
+      await session.init()
+      const afterInit = await fs.stat(databasePath)
+      await session.stagePaths({ paths: ["records.eidos"] })
+      const afterStage = await fs.stat(databasePath)
+      const committed = await session.commit("Enable Space versioning")
+      const afterCommit = await fs.stat(databasePath)
+
+      assert.equal(afterInit.dev, before.dev)
+      assert.equal(afterInit.ino, before.ino)
+      assert.equal(afterStage.dev, before.dev)
+      assert.equal(afterStage.ino, before.ino)
+      assert.equal(afterCommit.dev, before.dev)
+      assert.equal(afterCommit.ino, before.ino)
+      assert.deepEqual(committed.materialized ?? [], [])
+
+      applicationDatabase.exec(
+        "INSERT INTO records (name) VALUES ('after')"
+      )
+      assert.equal(readCount(databasePath, "records"), 2)
+      assert.equal((await session.status()).dirty, true)
+
+      applicationDatabase.close()
+      await session.close()
+    })
+  }
+)
+
+test(
   "keeps non-materializing calls safe with an app DB handle and restores after close",
   nodeSqliteTest,
   async () => {
@@ -266,7 +749,7 @@ test(
   }
 )
 
-test("AbortSignal cancels queued work without interrupting an in-flight command", async () => {
+test("AbortSignal cancels queued work and leaves the session usable", async () => {
   await withTemporaryDirectory("graft-sdk-abort-", async (root) => {
     const session = await RepositorySession.open(root)
     await session.init()

@@ -13,6 +13,30 @@ export interface DiffOptions extends OperationOptions {
   path?: string
 }
 
+export interface DiffPathsOptions extends OperationOptions {
+  paths: string[]
+  rows?: boolean
+  /** Compare an empty tree to this root commit. Mutually exclusive with from/to. */
+  root?: string
+  /** Compare this revision to `to`, or to the worktree when `to` is omitted. */
+  from?: string
+  /** Historical comparison target. Requires `from`. */
+  to?: string
+  /** Maximum explicit paths returned per page. Range: 1–100. */
+  limit?: number
+  /** Last path from the preceding page. */
+  after?: string
+}
+
+export interface ReadPathContentOptions extends OperationOptions {
+  /** Commit id, ref, or other supported immutable revision expression. */
+  revision: string
+  /** One normalized repository-relative artifact path. */
+  path: string
+  /** UTF-8 content limit in bytes. Range: 1–8,388,608. */
+  maxBytes: number
+}
+
 export interface HistoryOptions extends OperationOptions {
   limit?: number
   after?: string
@@ -23,6 +47,26 @@ export interface RestoreOptions extends OperationOptions {
   expectedHead?: string
   requireClean?: boolean
   path: string
+}
+
+export interface StagePathsOptions extends OperationOptions {
+  paths: string[]
+  expectedHead?: string
+  force?: boolean
+}
+
+export interface UntrackPathsOptions extends OperationOptions {
+  /** One to 1,000 normalized explicit file paths. Directories are rejected. */
+  paths: string[]
+  /** Compare-and-swap guard; the operation fails if HEAD differs. */
+  expectedHead?: string
+}
+
+export interface RestorePathsOptions extends OperationOptions {
+  source?: string
+  expectedHead?: string
+  requireClean?: boolean
+  paths: string[]
 }
 
 export interface RemoteConfigureOptions extends OperationOptions {
@@ -45,6 +89,300 @@ export interface CloneOptions extends OperationOptions {
 }
 
 export type GraftJson = Record<string, unknown> | unknown[]
+
+export type RepositoryPathKind =
+  | "sqlite_database"
+  | "text_file"
+  | "binary_file"
+
+export type RepositoryPathStorage =
+  | "sqlite_snapshot"
+  | "inline"
+  | "external"
+
+export interface RepositoryStatusCounts {
+  unstaged: number
+  staged: number
+  conflicted: number
+}
+
+export interface RepositoryStatusPath {
+  path: string
+  kind: RepositoryPathKind
+  storage: RepositoryPathStorage
+  code: string
+  conflicted: boolean
+  index_status: string
+  worktree_status: string
+  unstaged_change?: "modified" | "deleted" | "untracked"
+  staged_change?: "added" | "modified" | "deleted"
+  [key: string]: unknown
+}
+
+export interface RepositoryStatus {
+  worktree: string
+  graft_dir: string
+  repository_format_version: number
+  head_target: string | null
+  merge_head: string | null
+  orig_head: string | null
+  dirty: boolean
+  has_unstaged_changes: boolean
+  has_staged_changes: boolean
+  has_conflicts: boolean
+  work_in_progress: boolean
+  counts: RepositoryStatusCounts
+  paths: RepositoryStatusPath[]
+  unstaged: string[]
+  staged: string[]
+  conflicted: string[]
+  [key: string]: unknown
+}
+
+export interface StatusResult extends RepositoryStatus {
+  current_head?: string
+  current_branch?: string
+}
+
+export interface StatusTelemetry {
+  duration_us: number
+  paths_examined: number
+  metadata_cache_hits: number
+  metadata_cache_misses: number
+  tree_cache_hit: boolean
+  status_cache_hit: boolean
+  persistent_snapshot_hit: boolean
+  persistent_snapshot_saved: boolean
+  stability_retries: number
+}
+
+export interface IncrementalStatusResult {
+  generation: number
+  change_token: string
+  status: RepositoryStatus
+  telemetry: StatusTelemetry
+}
+
+export interface RepositoryMetadataTelemetry {
+  duration_us: number
+  /** Metadata-only operations never examine worktree paths. */
+  paths_examined: 0
+}
+
+export interface RepositoryMetadataResult {
+  current_head: string | null
+  current_branch: string | null
+  upstream: { remote: string; branch: string } | null
+  repository_format_version: number
+  object_format: string
+  telemetry: RepositoryMetadataTelemetry
+}
+
+export interface SafeRemoteInfo {
+  name: string
+  kind: "memory" | "fs" | "s3_compatible" | "http"
+  /** Credential-free configured remote URL. HTTP token_env is intentionally omitted. */
+  url: string
+}
+
+export interface ListRemotesResult {
+  remotes: SafeRemoteInfo[]
+  telemetry: RepositoryMetadataTelemetry
+}
+
+export interface CommitPathChangeCounts {
+  added: number
+  modified: number
+  deleted: number
+}
+
+export interface CommitTableSummary {
+  name: string
+  inserts: number
+  deletes: number
+  updates: number
+}
+
+export interface CommitSummary {
+  id: string
+  parents: string[]
+  message: string
+  timestamp_ms: number
+  path_changes: CommitPathChangeCounts | null
+  path_counts_complete: boolean
+  tables: CommitTableSummary[]
+  changed_tables: number
+}
+
+export interface HistoryTelemetry {
+  duration_us: number
+  commits_returned: number
+  tree_objects_read: 0
+  blob_objects_read: 0
+}
+
+export interface HistorySummariesResult {
+  commits: CommitSummary[]
+  has_more: boolean
+  next_cursor: string | null
+  telemetry: HistoryTelemetry
+}
+
+export interface CommitChangedPathsOptions extends OperationOptions {
+  revision: string
+  /** Maximum changed paths returned per page. Range: 1–100. */
+  limit?: number
+  /** Last path from the preceding page. */
+  after?: string
+}
+
+export interface CommitPathChange {
+  path: string
+  change: "added" | "modified" | "deleted"
+  kind: RepositoryPathKind
+  storage: RepositoryPathStorage
+}
+
+export interface CommitChangedPathsResult {
+  /** Resolved commit id. */
+  revision: string
+  /** First parent id, or null when this is a root commit. */
+  parent: string | null
+  paths: CommitPathChange[]
+  total_changed_paths: number
+  has_more: boolean
+  next_cursor: string | null
+  telemetry: {
+    duration_us: number
+    paths_examined: number
+    items_returned: number
+    tree_objects_read: number
+    blob_objects_read: 0
+  }
+}
+
+export interface PathDiffResult {
+  path: string
+  diff: GraftJson
+}
+
+export interface DiffTelemetry {
+  duration_us: number
+  requested_paths: number
+  returned_paths: number
+  changed_paths: number
+  /** True when explicit paths use path-local tree/index state instead of full map hydration. */
+  path_filter_fast_path: boolean
+  /** Always zero for the bounded path-local implementation. */
+  full_tree_paths_hydrated: number
+}
+
+export interface DiffPathsResult {
+  paths: PathDiffResult[]
+  has_more: boolean
+  next_cursor: string | null
+  telemetry: DiffTelemetry
+}
+
+export type PathContentState =
+  | { state: "absent" }
+  | {
+      state: "utf8"
+      content: string
+      size: number
+      content_hash: string
+    }
+  | {
+      state: "too_large" | "missing_payload" | "invalid_utf8"
+      size: number
+      content_hash: string
+    }
+
+export interface ReadPathContentResult {
+  /** Fully resolved commit id. */
+  revision: string
+  path: string
+  kind: RepositoryPathKind | null
+  storage: RepositoryPathStorage | null
+  content: PathContentState
+}
+
+export interface BatchPathResult {
+  path: string
+  result: GraftJson
+}
+
+export interface BatchPathsResult {
+  paths: BatchPathResult[]
+  materializes_worktree: boolean
+}
+
+export type InventoryKind =
+  | "tracked"
+  | "untracked"
+  | "ignored"
+  | "tracked_ignored"
+
+export interface InventoryOptions extends OperationOptions {
+  kind?: InventoryKind
+  /** Maximum paths returned per page. Range: 1–1000. */
+  limit?: number
+  after?: string
+}
+
+export interface InventoryItem {
+  path: string
+  tracked: boolean
+  ignored: boolean
+}
+
+export interface IgnoreMigrationDiagnostic {
+  ignored_rules_do_not_untrack: true
+  tracked_ignored_paths: number
+  recommendation: string
+}
+
+export interface InventoryResult {
+  kind: InventoryKind
+  items: InventoryItem[]
+  total_matching: number
+  has_more: boolean
+  next_cursor: string | null
+  migration: IgnoreMigrationDiagnostic | null
+  telemetry: {
+    duration_us: number
+    paths_examined: number
+    items_returned: number
+    inventory_cache_hit: boolean
+    index_cache_hit: boolean
+    ignore_matcher_cache_hit: boolean
+  }
+}
+
+export interface IgnoredPathResult {
+  path: string
+  is_ignored: boolean
+  is_tracked: boolean
+  /** True for a physical directory or a path with tracked descendants. */
+  is_directory: boolean
+  /** True when the index contains one or more files below this directory path. */
+  has_tracked_descendants: boolean
+}
+
+export interface IgnoredPathsOptions extends OperationOptions {
+  /** One to 1,000 normalized repository-relative file or directory paths. */
+  paths: string[]
+}
+
+export interface IgnoredPathsResult {
+  paths: IgnoredPathResult[]
+  telemetry: {
+    duration_us: number
+    paths_examined: number
+    index_cache_hit: boolean
+    ignore_matcher_cache_hit: boolean
+  }
+}
 
 export class GraftSdkError extends Error {
   readonly code: string
@@ -69,12 +407,38 @@ export class RepositorySession {
   clearHttpBearerToken(remoteName: string): void
 
   init(options?: OperationOptions): Promise<GraftJson>
-  status(options?: OperationOptions): Promise<GraftJson>
+  status(options?: OperationOptions): Promise<StatusResult>
+  statusIncremental(
+    options?: OperationOptions
+  ): Promise<IncrementalStatusResult>
+  repositoryMetadata(
+    options?: OperationOptions
+  ): Promise<RepositoryMetadataResult>
+  listRemotes(options?: OperationOptions): Promise<ListRemotesResult>
   addAll(options?: OperationOptions): Promise<GraftJson>
+  stagePaths(options: StagePathsOptions): Promise<BatchPathsResult>
+  untrackPaths(options: UntrackPathsOptions): Promise<BatchPathsResult>
   commit(message: string, options?: OperationOptions): Promise<GraftJson>
   diff(options?: DiffOptions): Promise<GraftJson>
+  diffPaths(options: DiffPathsOptions): Promise<DiffPathsResult>
+  readPathContent(options: ReadPathContentOptions): Promise<ReadPathContentResult>
   history(options?: HistoryOptions): Promise<GraftJson>
+  historySummaries(options?: HistoryOptions): Promise<HistorySummariesResult>
+  commitDetails(
+    revision: string,
+    options?: OperationOptions
+  ): Promise<GraftJson>
+  commitChangedPaths(
+    options: CommitChangedPathsOptions
+  ): Promise<CommitChangedPathsResult>
+  isIgnoredPath(
+    path: string,
+    options?: OperationOptions
+  ): Promise<IgnoredPathResult>
+  isIgnoredPaths(options: IgnoredPathsOptions): Promise<IgnoredPathsResult>
+  inventory(options?: InventoryOptions): Promise<InventoryResult>
   restore(options: RestoreOptions): Promise<GraftJson>
+  restorePaths(options: RestorePathsOptions): Promise<BatchPathsResult>
   configureRemote(options: RemoteConfigureOptions): Promise<GraftJson>
   push(options?: RemoteOperationOptions): Promise<GraftJson>
   fetch(options?: RemoteOperationOptions): Promise<GraftJson>

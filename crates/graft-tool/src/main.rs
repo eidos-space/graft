@@ -3742,7 +3742,7 @@ mod tests {
     }
 
     #[test]
-    fn sql_command_materializes_subdir_database_on_commit() {
+    fn sql_command_commit_preserves_subdir_database_without_materializing() {
         let _guard = CWD_LOCK.lock().unwrap();
         let original_dir = std::env::current_dir().unwrap();
         let temp_dir = tempfile::tempdir().unwrap();
@@ -3763,7 +3763,7 @@ mod tests {
             let output =
                 run_repository_command(Some(db), None, "json_commit", Some("initial docs"))?
                     .unwrap();
-            assert!(output.contains("\"materialized\""), "{output}");
+            assert!(!output.contains("\"materialized\""), "{output}");
 
             let materialized = temp_dir.path().join("sub-app/main.sqlite");
             assert!(materialized.exists());
