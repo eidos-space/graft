@@ -28,6 +28,15 @@ export interface DiffPathsOptions extends OperationOptions {
   after?: string
 }
 
+export interface ReadPathContentOptions extends OperationOptions {
+  /** Commit id, ref, or other supported immutable revision expression. */
+  revision: string
+  /** One normalized repository-relative artifact path. */
+  path: string
+  /** UTF-8 content limit in bytes. Range: 1–8,388,608. */
+  maxBytes: number
+}
+
 export interface HistoryOptions extends OperationOptions {
   limit?: number
   after?: string
@@ -81,6 +90,16 @@ export interface CloneOptions extends OperationOptions {
 
 export type GraftJson = Record<string, unknown> | unknown[]
 
+export type RepositoryPathKind =
+  | "sqlite_database"
+  | "text_file"
+  | "binary_file"
+
+export type RepositoryPathStorage =
+  | "sqlite_snapshot"
+  | "inline"
+  | "external"
+
 export interface RepositoryStatusCounts {
   unstaged: number
   staged: number
@@ -89,10 +108,14 @@ export interface RepositoryStatusCounts {
 
 export interface RepositoryStatusPath {
   path: string
+  kind: RepositoryPathKind
+  storage: RepositoryPathStorage
   code: string
   conflicted: boolean
   index_status: string
   worktree_status: string
+  unstaged_change?: "modified" | "deleted" | "untracked"
+  staged_change?: "added" | "modified" | "deleted"
   [key: string]: unknown
 }
 
@@ -216,8 +239,8 @@ export interface CommitChangedPathsOptions extends OperationOptions {
 export interface CommitPathChange {
   path: string
   change: "added" | "modified" | "deleted"
-  kind: "sqlite_database" | "text_file" | "binary_file"
-  storage: "sqlite_snapshot" | "inline" | "external"
+  kind: RepositoryPathKind
+  storage: RepositoryPathStorage
 }
 
 export interface CommitChangedPathsResult {
@@ -259,6 +282,29 @@ export interface DiffPathsResult {
   has_more: boolean
   next_cursor: string | null
   telemetry: DiffTelemetry
+}
+
+export type PathContentState =
+  | { state: "absent" }
+  | {
+      state: "utf8"
+      content: string
+      size: number
+      content_hash: string
+    }
+  | {
+      state: "too_large" | "missing_payload" | "invalid_utf8"
+      size: number
+      content_hash: string
+    }
+
+export interface ReadPathContentResult {
+  /** Fully resolved commit id. */
+  revision: string
+  path: string
+  kind: RepositoryPathKind | null
+  storage: RepositoryPathStorage | null
+  content: PathContentState
 }
 
 export interface BatchPathResult {
@@ -375,6 +421,7 @@ export class RepositorySession {
   commit(message: string, options?: OperationOptions): Promise<GraftJson>
   diff(options?: DiffOptions): Promise<GraftJson>
   diffPaths(options: DiffPathsOptions): Promise<DiffPathsResult>
+  readPathContent(options: ReadPathContentOptions): Promise<ReadPathContentResult>
   history(options?: HistoryOptions): Promise<GraftJson>
   historySummaries(options?: HistoryOptions): Promise<HistorySummariesResult>
   commitDetails(

@@ -25,8 +25,12 @@ const { RepositorySession } = require("@eidos.space/graft")
 const session = await RepositorySession.open(spaceRoot)
 try {
   await session.init()
-  const status = await session.status()
-  const changes = await session.diff({ rows: true })
+  const status = await session.statusIncremental()
+  const changes = await session.diffPaths({
+    paths: status.status.paths.map(({ path }) => path),
+    rows: true,
+    limit: 100,
+  })
 } finally {
   await session.close()
 }
@@ -49,8 +53,8 @@ binary package；首版覆盖 macOS arm64/x64、Linux glibc arm64/x64 和 Window
 
 | 操作 | 会替换、新建或删除 tracked worktree 文件 |
 | --- | --- |
-| `init`、`status`、`statusIncremental`、`addAll`、`stagePaths`、`untrackPaths`、`commit` | 否 |
-| `diff`、`diffPaths`、`history`、`historySummaries`、`commitDetails`、`commitChangedPaths`、`isIgnoredPaths`、`inventory` | 否 |
+| `init`、`status`、`statusIncremental`、`repositoryMetadata`、`listRemotes`、`addAll`、`stagePaths`、`untrackPaths`、`commit` | 否 |
+| `diff`、`diffPaths`、`readPathContent`、`history`、`historySummaries`、`commitDetails`、`commitChangedPaths`、`isIgnoredPath`、`isIgnoredPaths`、`inventory` | 否 |
 | `configureRemote`、`push`、`fetch` | 否 |
 | `restore`、`restorePaths`、`pull`、`cloneRepository` | **是** |
 
@@ -100,9 +104,20 @@ SDK 不读取 `GRAFT_REMOTE_TOKEN`，不把 token 写入 repository config 或 U
 tree/index entry 与对应 blob；telemetry 中的 `path_filter_fast_path: true` 与
 `full_tree_paths_hydrated: 0` 表示没有加载完整 commit map。
 
-status metadata/generation cache 绑定常驻 `RepositorySession`。新开 session 仍需执行一次
-完整分类和 fingerprint，因此 Space 生命周期内应复用同一个 session；本候选版本尚不包含
-跨 session/进程持久化的冷启动分类缓存。
+渲染文本 diff 时，对 parent 与 commit 分别调用一次
+`readPathContent({ revision, path, maxBytes })`，再由宿主比较返回的 UTF-8 字符串。Graft 会解析并
+校验 inline blob 与 large-file pointer，不暴露 object path。结果有界，并明确返回 `absent`、
+`utf8`、`too_large`、`missing_payload` 或 `invalid_utf8`；该操作不会 materialize worktree。
+
+稳定的 `statusIncremental` 会把 content-addressed classification snapshot 原子写入
+`.graft/cache/sdk-status`。新 session 复用前会重新验证 SDK/repository schema、HEAD、index、
+refs/config、嵌套 ignore source 内容以及 tracked/untracked metadata；任一不匹配或 snapshot
+损坏都会触发完整重建。可通过 `persistent_snapshot_hit` 和 `persistent_snapshot_saved`
+telemetry 区分 warm reopen 与 cold build。
+
+History 与 Remote UI 只需 head/branch/remote 信息时，应调用 `repositoryMetadata()` 与
+`listRemotes()`，不要先调用 status。两者 `paths_examined=0`，且 Remote 结果不会包含
+`token_env` 或内存 bearer token。
 
 `stagePaths` 会把 canonical SQLite snapshot 写入 index，`commit` 只从该 index state 推进
 历史；两者都不会替换工作区数据库。因此自动 checkpoint 前后可保持应用 SQLite handle

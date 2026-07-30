@@ -13,9 +13,12 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-use graft::remote::{RemoteConfig, RemoteCredentialErr, RemoteCredentials};
-pub use graft::repo::CancellationToken;
+pub use graft::repo::{CancellationToken, RepoPathContent, RepoPathContentState};
 use graft::repo::{CommitArtifactState, CommitFileState, RepoStatus, Repository, index::Index};
+use graft::{
+    core::byte_unit::ByteUnit,
+    remote::{RemoteConfig, RemoteCredentialErr, RemoteCredentials},
+};
 use graft_sqlite::{
     repo_service::{RepositoryCommand, RepositoryCommandService},
     vfs::ErrCtx,
@@ -33,6 +36,7 @@ const MAX_HISTORY_SUMMARY_PAGE_SIZE: usize = 500;
 const MAX_COMMIT_CHANGED_PATH_PAGE_SIZE: usize = 100;
 const MAX_DIFF_PATH_PAGE_SIZE: usize = 100;
 const MAX_DIFF_PATH_REQUEST_SIZE: usize = 10_000;
+pub const MAX_PATH_CONTENT_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_BATCH_MUTATION_PATHS: usize = 1_000;
 const MAX_INVENTORY_PAGE_SIZE: usize = 1_000;
 const MAX_IGNORE_QUERY_PATHS: usize = 1_000;
@@ -304,6 +308,7 @@ pub enum RepositoryOperation {
     Commit,
     Diff,
     DiffPaths,
+    ReadPathContent,
     History,
     HistorySummaries,
     CommitDetails,
@@ -351,6 +356,13 @@ pub struct DiffPathsOptions {
     pub to: Option<String>,
     pub limit: usize,
     pub after: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReadPathContentOptions {
+    pub path: PathBuf,
+    pub revision: String,
+    pub max_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -909,6 +921,27 @@ impl RepositorySession {
             paths: results,
             has_more,
             next_cursor,
+        })
+    }
+
+    /// Reads bounded UTF-8 artifact content for one explicit path at an immutable revision.
+    pub fn read_path_content(&self, options: &ReadPathContentOptions) -> Result<RepoPathContent> {
+        if options.max_bytes == 0 || options.max_bytes > MAX_PATH_CONTENT_BYTES {
+            return Err(invalid_argument(format!(
+                "path content max_bytes must be between 1 and {MAX_PATH_CONTENT_BYTES}"
+            )));
+        }
+        let path = normalize_requested_path(&options.path)?;
+        validate_revision(&options.revision)?;
+
+        self.with_service(|service| {
+            graft::repo::cancellation_checkpoint().map_err(repo_error)?;
+            let repo = service.repository().map_err(repository_command_error)?;
+            let content = repo
+                .read_path_content(&options.revision, &path, ByteUnit::new(options.max_bytes))
+                .map_err(repo_error)?;
+            graft::repo::cancellation_checkpoint().map_err(repo_error)?;
+            Ok(content)
         })
     }
 
@@ -2648,6 +2681,7 @@ mod tests {
         assert!(!RepositoryOperation::StatusIncremental.materializes_worktree());
         assert!(!RepositoryOperation::Diff.materializes_worktree());
         assert!(!RepositoryOperation::DiffPaths.materializes_worktree());
+        assert!(!RepositoryOperation::ReadPathContent.materializes_worktree());
         assert!(!RepositoryOperation::AddAll.materializes_worktree());
         assert!(!RepositoryOperation::StagePaths.materializes_worktree());
         assert!(!RepositoryOperation::UntrackPaths.materializes_worktree());
@@ -2912,6 +2946,107 @@ mod tests {
         let error = with_cancellation(&cancellation, || session.repository_metadata()).unwrap_err();
         assert_eq!(error.code(), SdkErrorCode::Cancelled);
         assert_eq!(session.list_remotes().unwrap().telemetry.paths_examined, 0);
+    }
+
+    #[test]
+    fn revision_path_content_is_bounded_cancellable_and_non_materializing() {
+        let directory = tempfile::tempdir().unwrap();
+        let note = directory.path().join("note.txt");
+        let session = RepositorySession::new(directory.path());
+        session.open().unwrap();
+        session.init().unwrap();
+
+        fs::write(&note, "one\n").unwrap();
+        session.add_all().unwrap();
+        let root = session.commit("root text").unwrap();
+        let root_id = root["commit"]["id"].as_str().unwrap().to_string();
+        let root_content = session
+            .read_path_content(&ReadPathContentOptions {
+                path: PathBuf::from("note.txt"),
+                revision: root_id.clone(),
+                max_bytes: 1024,
+            })
+            .unwrap();
+        assert_eq!(root_content.revision, root_id);
+        assert_eq!(root_content.path, "note.txt");
+        assert_eq!(
+            root_content.kind,
+            Some(graft::repo::RepoTrackedPathKind::TextFile)
+        );
+        assert!(matches!(
+            root_content.content,
+            RepoPathContentState::Utf8 { ref content, size: 4, .. } if content == "one\n"
+        ));
+        let absent = session
+            .read_path_content(&ReadPathContentOptions {
+                path: PathBuf::from("missing.txt"),
+                revision: root_id.clone(),
+                max_bytes: 1024,
+            })
+            .unwrap();
+        assert_eq!(absent.kind, None);
+        assert!(matches!(absent.content, RepoPathContentState::Absent));
+
+        fs::write(&note, "two\n").unwrap();
+        session.add_all().unwrap();
+        let updated = session.commit("update text").unwrap();
+        let updated_id = updated["commit"]["id"].as_str().unwrap().to_string();
+        let before = session
+            .read_path_content(&ReadPathContentOptions {
+                path: PathBuf::from("note.txt"),
+                revision: root_id.clone(),
+                max_bytes: 1024,
+            })
+            .unwrap();
+        let after = session
+            .read_path_content(&ReadPathContentOptions {
+                path: PathBuf::from("note.txt"),
+                revision: updated_id.clone(),
+                max_bytes: 1024,
+            })
+            .unwrap();
+        assert!(matches!(
+            before.content,
+            RepoPathContentState::Utf8 { ref content, .. } if content == "one\n"
+        ));
+        assert!(matches!(
+            after.content,
+            RepoPathContentState::Utf8 { ref content, .. } if content == "two\n"
+        ));
+
+        let bounded = session
+            .read_path_content(&ReadPathContentOptions {
+                path: PathBuf::from("note.txt"),
+                revision: updated_id.clone(),
+                max_bytes: 3,
+            })
+            .unwrap();
+        assert!(matches!(
+            bounded.content,
+            RepoPathContentState::TooLarge { size: 4, .. }
+        ));
+
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let error = with_cancellation(&cancelled, || {
+            session.read_path_content(&ReadPathContentOptions {
+                path: PathBuf::from("note.txt"),
+                revision: root_id.clone(),
+                max_bytes: 1024,
+            })
+        })
+        .unwrap_err();
+        assert_eq!(error.code(), SdkErrorCode::Cancelled);
+        assert!(session.repository_metadata().is_ok());
+
+        let error = session
+            .read_path_content(&ReadPathContentOptions {
+                path: PathBuf::from("note.txt"),
+                revision: updated_id,
+                max_bytes: MAX_PATH_CONTENT_BYTES + 1,
+            })
+            .unwrap_err();
+        assert_eq!(error.code(), SdkErrorCode::InvalidArgument);
     }
 
     #[test]

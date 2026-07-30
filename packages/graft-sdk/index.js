@@ -102,6 +102,11 @@ class RepositorySession {
     return callJson(() => this.#native.diffPaths(diffOptions, signal))
   }
 
+  async readPathContent(options) {
+    const { signal, ...readOptions } = options
+    return callJson(() => this.#native.readPathContent(readOptions, signal))
+  }
+
   async history(options = {}) {
     const { limit = 50, after, signal } = options
     return callJson(() => this.#native.history(limit, after, signal))

@@ -2278,6 +2278,21 @@ fn diff_text_content_reports_utf8_and_absent_states_without_mutation() {
         content.after,
         RepoTextContentState::Utf8 { content, size: 8, .. } if content == "# Hello\n"
     ));
+    let read = repo
+        .read_path_content(&second.id, "note.md", ByteUnit::new(128))
+        .unwrap();
+    assert_eq!(read.revision, second.id);
+    assert_eq!(read.kind, Some(RepoTrackedPathKind::TextFile));
+    assert!(matches!(
+        read.content,
+        RepoPathContentState::Utf8 { content, size: 8, .. } if content == "# Hello\n"
+    ));
+    let absent = repo
+        .read_path_content(&second.id, "missing.md", ByteUnit::new(128))
+        .unwrap();
+    assert_eq!(absent.kind, None);
+    assert_eq!(absent.storage, None);
+    assert_eq!(absent.content, RepoPathContentState::Absent);
     let after_status = repo.status().unwrap();
     assert_eq!(after_status.head_target, before_status.head_target);
     assert_eq!(after_status.staged, before_status.staged);
@@ -2330,6 +2345,13 @@ fn diff_text_content_bounds_and_reports_missing_external_payloads() {
         bounded.after,
         RepoTextContentState::TooLarge { size: 17, .. }
     ));
+    let bounded_read = repo
+        .read_path_content(&first.id, "note.md", ByteUnit::new(4))
+        .unwrap();
+    assert!(matches!(
+        bounded_read.content,
+        RepoPathContentState::TooLarge { size: 17, .. }
+    ));
 
     let before = diff.artifacts[0].from.as_ref().unwrap();
     fs::remove_file(repo.large_file_content_path(before.content_hash())).unwrap();
@@ -2341,6 +2363,13 @@ fn diff_text_content_bounds_and_reports_missing_external_payloads() {
         RepoTextContentState::MissingPayload { .. }
     ));
     assert!(matches!(missing.after, RepoTextContentState::Utf8 { .. }));
+    let missing_read = repo
+        .read_path_content(&first.id, "note.md", ByteUnit::new(128))
+        .unwrap();
+    assert!(matches!(
+        missing_read.content,
+        RepoPathContentState::MissingPayload { .. }
+    ));
 }
 
 #[test]
@@ -2370,6 +2399,33 @@ fn diff_text_content_reports_invalid_full_utf8() {
         content.after,
         RepoTextContentState::InvalidUtf8 { size: 8193, .. }
     ));
+    let read = repo
+        .read_path_content(&second.id, "note.md", ByteUnit::new(16 * 1024))
+        .unwrap();
+    assert!(matches!(
+        read.content,
+        RepoPathContentState::InvalidUtf8 { size: 8193, .. }
+    ));
+}
+
+#[test]
+fn read_path_content_rejects_inline_blob_metadata_mismatch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = Repository::init(tmp.path()).unwrap();
+    let note = tmp.path().join("note.md");
+    fs::write(&note, "hello").unwrap();
+    repo.stage_artifact_path(&note).unwrap();
+    let commit = repo.commit_staged("note").unwrap();
+    let state = commit.artifacts.get("note.md").unwrap();
+    let object_path = repo.object_store().path_for(state.oid());
+    let encoded = fs::read_to_string(&object_path).unwrap();
+    assert!(encoded.contains("aGVsbG8="));
+    fs::write(&object_path, encoded.replace("aGVsbG8=", "d29ybGQ=")).unwrap();
+
+    let error = repo
+        .read_path_content(&commit.id, "note.md", ByteUnit::new(128))
+        .unwrap_err();
+    assert!(matches!(error, RepoErr::Object(_)));
 }
 
 #[test]

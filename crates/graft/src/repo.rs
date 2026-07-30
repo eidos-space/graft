@@ -277,6 +277,9 @@ pub enum RepoErr {
     #[error("path `{0}` is not a text artifact")]
     PathNotTextArtifact(String),
 
+    #[error("path `{0}` is not an artifact")]
+    PathNotArtifact(String),
+
     #[error("text diff content limit must be greater than zero")]
     InvalidTextDiffContentLimit,
 
@@ -860,6 +863,38 @@ pub struct RepoTextContentDiff {
     pub storage: RepoPathStorage,
     pub before: RepoTextContentState,
     pub after: RepoTextContentState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoPathContent {
+    pub revision: String,
+    pub path: String,
+    pub kind: Option<RepoTrackedPathKind>,
+    pub storage: Option<RepoPathStorage>,
+    pub content: RepoPathContentState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum RepoPathContentState {
+    Absent,
+    Utf8 {
+        content: String,
+        size: u64,
+        content_hash: object::ObjectId,
+    },
+    TooLarge {
+        size: u64,
+        content_hash: object::ObjectId,
+    },
+    MissingPayload {
+        size: u64,
+        content_hash: object::ObjectId,
+    },
+    InvalidUtf8 {
+        size: u64,
+        content_hash: object::ObjectId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

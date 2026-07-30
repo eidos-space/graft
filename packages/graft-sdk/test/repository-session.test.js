@@ -24,7 +24,7 @@ const {
 } = require("..")
 
 test("exposes ABI-stable SDK metadata and materialization contract", () => {
-  assert.equal(sdkVersion(), "0.3.0-rc.0")
+  assert.equal(sdkVersion(), "0.3.0")
   for (const operation of [
     "restore",
     "restorePaths",
@@ -45,6 +45,7 @@ test("exposes ABI-stable SDK metadata and materialization contract", () => {
     "commit",
     "diff",
     "diffPaths",
+    "readPathContent",
     "history",
     "historySummaries",
     "commitDetails",
@@ -58,6 +59,83 @@ test("exposes ABI-stable SDK metadata and materialization contract", () => {
   ]) {
     assert.equal(operationMaterializesWorktree(operation), false)
   }
+})
+
+test("reads bounded revision path content without materializing", async () => {
+  await withTemporaryDirectory("graft-sdk-path-content-", async (root) => {
+    const session = await RepositorySession.open(root)
+    await session.init()
+    await fs.writeFile(path.join(root, "note.txt"), "one\n")
+    await session.addAll()
+    const baseline = await session.commit("baseline text")
+
+    const baselineContent = await session.readPathContent({
+      path: "note.txt",
+      revision: baseline.commit.id,
+      maxBytes: 1024,
+    })
+    assert.equal(baselineContent.revision, baseline.commit.id)
+    assert.equal(baselineContent.path, "note.txt")
+    assert.equal(baselineContent.kind, "text_file")
+    assert.equal(baselineContent.content.state, "utf8")
+    assert.equal(baselineContent.content.content, "one\n")
+    assert.equal(baselineContent.content.size, 4)
+    const absent = await session.readPathContent({
+      path: "missing.txt",
+      revision: baseline.commit.id,
+      maxBytes: 1024,
+    })
+    assert.equal(absent.kind, null)
+    assert.equal(absent.storage, null)
+    assert.deepEqual(absent.content, { state: "absent" })
+
+    await fs.writeFile(path.join(root, "note.txt"), "two\n")
+    await session.stagePaths({ paths: ["note.txt"] })
+    const updated = await session.commit("updated text")
+    const before = await session.readPathContent({
+      path: "note.txt",
+      revision: baseline.commit.id,
+      maxBytes: 1024,
+    })
+    const after = await session.readPathContent({
+      path: "note.txt",
+      revision: updated.commit.id,
+      maxBytes: 1024,
+    })
+    assert.equal(before.content.state, "utf8")
+    assert.equal(before.content.content, "one\n")
+    assert.equal(after.content.state, "utf8")
+    assert.equal(after.content.content, "two\n")
+
+    const bounded = await session.readPathContent({
+      path: "note.txt",
+      revision: updated.commit.id,
+      maxBytes: 3,
+    })
+    assert.equal(bounded.content.state, "too_large")
+    await assert.rejects(
+      session.readPathContent({
+        path: "note.txt",
+        revision: updated.commit.id,
+        maxBytes: 8 * 1024 * 1024 + 1,
+      }),
+      /between 1 and 8388608/
+    )
+
+    const controller = new AbortController()
+    const running = Array.from({ length: 24 }, () => session.diff({ rows: true }))
+    const queued = session.readPathContent({
+      path: "note.txt",
+      revision: updated.commit.id,
+      maxBytes: 1024,
+      signal: controller.signal,
+    })
+    controller.abort()
+    await assert.rejects(queued, (error) => error.name === "AbortError")
+    await Promise.all(running)
+    assert.equal((await session.repositoryMetadata()).current_head, updated.commit.id)
+    await session.close()
+  })
 })
 
 test("repeated status and diff reuse one native session without a CLI", async () => {

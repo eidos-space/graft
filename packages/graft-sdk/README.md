@@ -132,6 +132,7 @@ files in the Space. Changes confined to `.graft` are not counted.
 | `commit` | Advance repository history | No |
 | `diff` | Compare worktree, index, or revisions | No |
 | `diffPaths` | Diff a page of explicit changed file paths (up to 100) | No |
+| `readPathContent` | Read bounded artifact content at one immutable revision | No |
 | `history` | Read commit history and status | No |
 | `historySummaries` | Read up to 500 lightweight commit summaries without trees/blobs | No |
 | `commitDetails` | Lazily hydrate one full commit | No |
@@ -242,6 +243,40 @@ const diff = page.parent
     })
   : await session.diffPaths({ paths, root: page.revision, rows: true, limit: 100 })
 ```
+
+For a text-file path, read each revision independently and pass the UTF-8 strings to the host's
+renderer without exposing `.graft` object paths:
+
+```js
+const after = await session.readPathContent({
+  revision: page.revision,
+  path: "notes/plan.md",
+  maxBytes: 1024 * 1024,
+})
+const before = page.parent
+  ? await session.readPathContent({
+      revision: page.parent,
+      path: "notes/plan.md",
+      maxBytes: 1024 * 1024,
+    })
+  : { content: { state: "absent" } }
+```
+
+`readPathContent` accepts one immutable `revision`, one normalized repository-relative `path`, and
+a required `maxBytes` between 1 and 8,388,608. The result is
+`{ revision, path, kind, storage, content }`; `revision` is the resolved commit id, and `kind` /
+`storage` are `null` when the path is absent. `content` is one of:
+
+- `{ state: "absent" }`
+- `{ state: "utf8", content, size, content_hash }`
+- `{ state: "too_large" | "missing_payload" | "invalid_utf8", size, content_hash }`
+
+The call reads only the selected immutable tree entry and payload, is cancellable, and never
+materializes or changes the worktree. Graft resolves inline FileBlob and large-file pointers,
+validates their declared kind, size, and content hash, and never returns object paths or
+credentials. SQLite paths, invalid revisions, malformed objects, and unsafe limits are rejected
+with a structured SDK error. A binary artifact can return `invalid_utf8`; callers should render
+text only when `kind === "text_file"` and `content.state === "utf8"`.
 
 `commitDetails(id)` remains available for compatible callers that deliberately need the full
 tree-backed commit payload; history lists should not use it.
@@ -371,7 +406,9 @@ An annotated `graft-sdk-vX.Y.Z` tag on a commit already merged into `main` start
 `.github/workflows/sdk-release.yml`. The workflow builds every advertised target, tests each
 binary on Node.js 20 and 24, assembles and verifies all optional packages, publishes platform
 packages before the root package, creates a GitHub SDK release with checksums, then installs the
-public root package on every supported platform and opens a repository session. After each npm
+public root package on every supported platform under Node.js 20 and 24 and exercises
+`statusIncremental`, metadata, remotes, history summaries, and explicit-path diff. Publishing uses
+npm OIDC Trusted Publishing; the SDK workflow does not read a persistent npm token. After each npm
 publish, the job allows up to ten minutes for the immutable version to become visible through the
 registry read path before it advances to the next package.
 

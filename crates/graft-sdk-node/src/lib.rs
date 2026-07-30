@@ -4,9 +4,10 @@ use graft_sdk::{
     CancellationToken, CommitChangedPathsOptions as CoreCommitChangedPathsOptions,
     DiffOptions as CoreDiffOptions, DiffPathsOptions as CoreDiffPathsOptions,
     IgnoredPathsOptions as CoreIgnoredPathsOptions, InventoryKind,
-    InventoryOptions as CoreInventoryOptions, RemoteConfigureOptions as CoreRemoteConfigureOptions,
-    RepositoryOperation, RepositorySession as CoreRepositorySession,
-    RestoreOptions as CoreRestoreOptions, RestorePathsOptions as CoreRestorePathsOptions, SdkError,
+    InventoryOptions as CoreInventoryOptions, ReadPathContentOptions as CoreReadPathContentOptions,
+    RemoteConfigureOptions as CoreRemoteConfigureOptions, RepositoryOperation,
+    RepositorySession as CoreRepositorySession, RestoreOptions as CoreRestoreOptions,
+    RestorePathsOptions as CoreRestorePathsOptions, SdkError,
     StagePathsOptions as CoreStagePathsOptions, UntrackPathsOptions as CoreUntrackPathsOptions,
 };
 use napi::{
@@ -34,6 +35,13 @@ pub struct DiffPathsOptions {
     pub to: Option<String>,
     pub limit: Option<u32>,
     pub after: Option<String>,
+}
+
+#[napi(object)]
+pub struct ReadPathContentOptions {
+    pub path: String,
+    pub revision: String,
+    pub max_bytes: u32,
 }
 
 #[napi(object)]
@@ -121,6 +129,9 @@ enum JsonOperation {
     },
     DiffPaths {
         options: CoreDiffPathsOptions,
+    },
+    ReadPathContent {
+        options: CoreReadPathContentOptions,
     },
     History {
         limit: usize,
@@ -223,6 +234,14 @@ impl JsonTask {
             return serde_json::to_string(&value)
                 .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
         }
+        if let JsonOperation::ReadPathContent { options } = &self.operation {
+            let value = self
+                .session
+                .read_path_content(options)
+                .map_err(napi_error)?;
+            return serde_json::to_string(&value)
+                .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
+        }
         if let JsonOperation::CommitChangedPaths { options } = &self.operation {
             let value = self
                 .session
@@ -278,6 +297,9 @@ impl JsonTask {
             JsonOperation::Commit { message } => self.session.commit(message),
             JsonOperation::Diff { options } => self.session.diff(options),
             JsonOperation::DiffPaths { .. } => {
+                unreachable!("handled before JSON value dispatch")
+            }
+            JsonOperation::ReadPathContent { .. } => {
                 unreachable!("handled before JSON value dispatch")
             }
             JsonOperation::History { limit, after } => {
@@ -508,6 +530,25 @@ impl NodeRepositorySession {
                     to: options.to,
                     limit: options.limit.unwrap_or(100) as usize,
                     after: options.after,
+                },
+            },
+            signal,
+        )
+    }
+
+    #[napi]
+    pub fn read_path_content(
+        &self,
+        options: ReadPathContentOptions,
+        signal: Option<AbortSignal>,
+    ) -> AsyncTask<JsonTask> {
+        json_task(
+            self,
+            JsonOperation::ReadPathContent {
+                options: CoreReadPathContentOptions {
+                    path: PathBuf::from(options.path),
+                    revision: options.revision,
+                    max_bytes: u64::from(options.max_bytes),
                 },
             },
             signal,
@@ -761,6 +802,7 @@ pub fn operation_materializes_worktree(operation: String) -> Result<bool> {
         "commit" => RepositoryOperation::Commit,
         "diff" => RepositoryOperation::Diff,
         "diff_paths" | "diffPaths" => RepositoryOperation::DiffPaths,
+        "read_path_content" | "readPathContent" => RepositoryOperation::ReadPathContent,
         "history" => RepositoryOperation::History,
         "history_summaries" | "historySummaries" => RepositoryOperation::HistorySummaries,
         "commit_details" | "commitDetails" => RepositoryOperation::CommitDetails,

@@ -92,6 +92,67 @@ impl Repository {
         self.diff_artifact_content(artifact, max_bytes)
     }
 
+    pub fn read_path_content(
+        &self,
+        revision: &str,
+        path: &str,
+        max_bytes: ByteUnit,
+    ) -> Result<RepoPathContent> {
+        if max_bytes == ByteUnit::ZERO {
+            return Err(RepoErr::InvalidTextDiffContentLimit);
+        }
+        let revision = self.resolve_revision(revision)?;
+        let path = normalize_repo_path_key(path)?;
+        cancellation_checkpoint()?;
+        let Some(state) = self.commit_path_state(&revision, &path)? else {
+            return Ok(RepoPathContent {
+                revision,
+                path,
+                kind: None,
+                storage: None,
+                content: RepoPathContentState::Absent,
+            });
+        };
+        let RepoTrackedPathState::Artifact(state) = state else {
+            return Err(RepoErr::PathNotArtifact(path));
+        };
+        let kind = state.kind();
+        let storage = artifact_tracked_path_storage(&state);
+        let size = state.size();
+        let content_hash = state.content_hash().clone();
+        let content = if size > max_bytes.as_u64() {
+            RepoPathContentState::TooLarge { size, content_hash }
+        } else {
+            let bytes = match self.artifact_bytes(&state) {
+                Ok(bytes) => bytes,
+                Err(RepoErr::Io(err))
+                    if state.is_large() && err.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    return Ok(RepoPathContent {
+                        revision,
+                        path,
+                        kind: Some(kind),
+                        storage: Some(storage),
+                        content: RepoPathContentState::MissingPayload { size, content_hash },
+                    });
+                }
+                Err(err) => return Err(err),
+            };
+            cancellation_checkpoint()?;
+            match String::from_utf8(bytes) {
+                Ok(content) => RepoPathContentState::Utf8 { content, size, content_hash },
+                Err(_) => RepoPathContentState::InvalidUtf8 { size, content_hash },
+            }
+        };
+        Ok(RepoPathContent {
+            revision,
+            path,
+            kind: Some(kind),
+            storage: Some(storage),
+            content,
+        })
+    }
+
     pub fn diff_artifact_content(
         &self,
         artifact: &RepoArtifactDiff,

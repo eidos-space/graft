@@ -69,8 +69,8 @@ install-time compiler or binary downloader.
 
 | Operation | Replaces, creates, or removes tracked worktree files |
 | --- | --- |
-| `init`, `status`, `statusIncremental`, `addAll`, `stagePaths`, `untrackPaths`, `commit` | No |
-| `diff`, `diffPaths`, `history`, `historySummaries`, `commitDetails`, `commitChangedPaths`, `isIgnoredPaths`, `inventory` | No |
+| `init`, `status`, `statusIncremental`, `repositoryMetadata`, `listRemotes`, `addAll`, `stagePaths`, `untrackPaths`, `commit` | No |
+| `diff`, `diffPaths`, `readPathContent`, `history`, `historySummaries`, `commitDetails`, `commitChangedPaths`, `isIgnoredPath`, `isIgnoredPaths`, `inventory` | No |
 | `configureRemote`, `push`, `fetch` | No |
 | `restore`, `restorePaths`, `pull`, `cloneRepository` | **Yes** |
 
@@ -129,9 +129,20 @@ with `from: page.parent, to: page.revision`; for a root commit use `root: page.r
 tree/index entry and referenced blob; `path_filter_fast_path: true` and
 `full_tree_paths_hydrated: 0` in telemetry confirm that no full commit map was hydrated.
 
-Status metadata and generation caches live for the retained `RepositorySession`. A newly opened
-session still performs one complete classification/fingerprint pass, so keep one session resident
-for the Space lifetime. Persisted cold-start classification reuse is not part of this candidate.
+For text rendering, call `readPathContent({ revision, path, maxBytes })` once for the parent and
+once for the commit, then diff the returned UTF-8 strings in the host. Graft resolves and validates
+inline blobs and large-file pointers without exposing object paths. The bounded result reports
+`absent`, `utf8`, `too_large`, `missing_payload`, or `invalid_utf8`; the operation never
+materializes the worktree.
+
+After a stable `statusIncremental`, Graft atomically persists a content-addressed classification
+snapshot under `.graft/cache/sdk-status`. A new session revalidates its SDK/repository schema,
+HEAD, index, refs/config, nested ignore-source contents, and tracked/untracked metadata before reuse.
+Any mismatch or corrupt snapshot triggers a full rebuild. Use `persistent_snapshot_hit` and
+`persistent_snapshot_saved` telemetry to distinguish a validated warm reopen from a cold build.
+
+History and Remote UI should call `repositoryMetadata()` and `listRemotes()` instead of status.
+Both inspect zero worktree paths; Remote results omit `token_env` and in-memory bearer credentials.
 
 `stagePaths` captures a canonical SQLite snapshot and `commit` advances history from that index
 state. Neither operation replaces the worktree database, so application SQLite handles may remain

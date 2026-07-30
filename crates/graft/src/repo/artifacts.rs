@@ -83,6 +83,7 @@ impl Repository {
         match state {
             CommitArtifactState::File { oid, .. } => {
                 let object = self.object_store().read(oid)?;
+                validate_artifact_object_matches_state(state, &object)?;
                 let object::Object::Blob(object::BlobObject::File(blob)) = object else {
                     return Err(RepoErr::Object(object::ObjectErr::InvalidObject {
                         kind: "blob",
@@ -91,7 +92,9 @@ impl Repository {
                 };
                 Ok(blob.bytes)
             }
-            CommitArtifactState::LargeFile { content_hash, size, .. } => {
+            CommitArtifactState::LargeFile { oid, content_hash, size, .. } => {
+                let object = self.object_store().read(oid)?;
+                validate_artifact_object_matches_state(state, &object)?;
                 self.read_large_file_content(content_hash, *size)
             }
         }
