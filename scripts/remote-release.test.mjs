@@ -60,7 +60,7 @@ test("validates the checked-in Remote package release contract", async () => {
     );
     metadataByName.set(metadata.name, metadata);
   }
-  validatePackageMetadata(metadataByName, "0.1.0");
+  validatePackageMetadata(metadataByName, "0.2.0");
 });
 
 test("rejects a dependency that could escape the release version", () => {
