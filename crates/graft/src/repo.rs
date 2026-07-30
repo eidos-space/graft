@@ -67,7 +67,7 @@ use crate::{
         LogId, VolumeId, byte_unit::ByteUnit, commit_hash::CommitHash, lsn::LSN, lsn::LSNRangeExt,
         page_count::PageCount,
     },
-    remote::{RemoteConfig, RemoteCredentials, RemoteErr},
+    remote::{Remote, RemoteConfig, RemoteCredentials, RemoteErr, UploadBundleOutcome},
     snapshot::Snapshot,
 };
 
@@ -419,6 +419,18 @@ pub struct FetchOutcome {
     pub branch: String,
     pub head: String,
     pub commits: usize,
+}
+
+pub struct CloneFetch {
+    pub fetch: FetchOutcome,
+    remote: Arc<Remote>,
+    _bundle: Option<tempfile::TempDir>,
+}
+
+impl CloneFetch {
+    pub fn remote(&self) -> Arc<Remote> {
+        self.remote.clone()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

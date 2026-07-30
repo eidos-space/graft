@@ -22,6 +22,27 @@ async function responseText(response: Response): Promise<string> {
   return new TextDecoder().decode(await response.arrayBuffer());
 }
 
+function decodeUploadBundle(bytes: Uint8Array, manifestBytes: number): Array<[string, string]> {
+  const manifest = JSON.parse(new TextDecoder().decode(bytes.subarray(0, manifestBytes))) as {
+    objects: number;
+  };
+  const objects: Array<[string, string]> = [];
+  let offset = manifestBytes;
+  for (let index = 0; index < manifest.objects; index += 1) {
+    const view = new DataView(bytes.buffer, bytes.byteOffset + offset);
+    const pathBytes = view.getUint32(0);
+    const bodyBytes = Number(view.getBigUint64(4));
+    offset += 12;
+    const path = new TextDecoder().decode(bytes.subarray(offset, offset + pathBytes));
+    offset += pathBytes;
+    const body = new TextDecoder().decode(bytes.subarray(offset, offset + bodyBytes));
+    offset += bodyBytes;
+    objects.push([path, body]);
+  }
+  expect(offset).toBe(bytes.byteLength);
+  return objects;
+}
+
 describe("graft remote protocol", () => {
   it("requires authentication and protocol negotiation", async () => {
     const unauthorized = await SELF.fetch(`${ORIGIN}/auth/repo`, {
@@ -91,6 +112,33 @@ describe("graft remote protocol", () => {
     });
     expect(head.status).toBe(200);
     expect(head.headers.get("content-length")).toBe("6");
+  });
+
+  it("streams an upload bundle across transactional storage and R2", async () => {
+    await remoteFetch("/upload/repo/raw/refs/heads/main", {
+      method: "PUT",
+      body: "commit-one\n",
+    });
+    await remoteFetch("/upload/repo/raw-if-not-exists/objects/pack/one.idx", {
+      method: "PUT",
+      body: "index",
+    });
+    await remoteFetch("/upload/repo/raw-if-not-exists/objects/pack/one.pack", {
+      method: "PUT",
+      body: "pack",
+    });
+
+    const response = await remoteFetch("/upload/repo/upload-bundle/refs/heads/main", {
+      method: "POST",
+    });
+    expect(response.status).toBe(200);
+    const manifestBytes = Number(response.headers.get("x-graft-bundle-manifest-bytes"));
+    expect(manifestBytes).toBeGreaterThan(0);
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    expect(decodeUploadBundle(bytes, manifestBytes)).toEqual([
+      ["objects/pack/one.idx", "index"],
+      ["objects/pack/one.pack", "pack"],
+    ]);
   });
 
   it("performs atomic ref compare-and-swap and compare-and-delete", async () => {

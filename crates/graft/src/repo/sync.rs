@@ -5,6 +5,50 @@ impl Repository {
         validate_remote_name(remote)?;
         validate_ref_name(branch)?;
         let remote_store = self.remote_store(remote)?;
+        self.fetch_with_store(remote, branch, &remote_store)
+    }
+
+    pub fn fetch_for_clone(&self, remote: &str, branch: &str) -> Result<CloneFetch> {
+        validate_remote_name(remote)?;
+        validate_ref_name(branch)?;
+        let network_remote = self.remote_store(remote)?;
+        let head_path = format!("refs/heads/{branch}");
+        let bundle = tempfile::tempdir()?;
+        let outcome =
+            block_on_remote(network_remote.download_upload_bundle(&head_path, bundle.path()))?;
+        match outcome {
+            UploadBundleOutcome::Downloaded => {
+                let root = bundle.path().to_string_lossy().into_owned();
+                let remote_store = RemoteConfig::Fs { root }.build()?;
+                let fetch = self.fetch_with_store(remote, branch, &remote_store)?;
+                Ok(CloneFetch {
+                    fetch,
+                    remote: Arc::new(remote_store),
+                    _bundle: Some(bundle),
+                })
+            }
+            UploadBundleOutcome::Unsupported => {
+                let fetch = self.fetch_with_store(remote, branch, &network_remote)?;
+                // Do not carry a pooled HTTP/1 connection from large pack downloads into
+                // checkout. Some proxies leave that connection readable but unusable for
+                // the first storage-commit request. A new pool preserves the legacy fallback.
+                self.remote_credentials.reset_http_clients();
+                let checkout_remote = self.remote_store(remote)?;
+                Ok(CloneFetch {
+                    fetch,
+                    remote: Arc::new(checkout_remote),
+                    _bundle: None,
+                })
+            }
+        }
+    }
+
+    fn fetch_with_store(
+        &self,
+        remote: &str,
+        branch: &str,
+        remote_store: &Remote,
+    ) -> Result<FetchOutcome> {
         let head_path = format!("refs/heads/{branch}");
         let Some(head) = block_on_remote(remote_store.get_raw(&head_path))? else {
             return Err(RepoErr::RemoteBranchNotFound {
@@ -13,7 +57,7 @@ impl Repository {
             });
         };
         let head = parse_remote_ref(&head_path, head)?;
-        let commits = self.fetch_commit_chain(&remote_store, &head)?;
+        let commits = self.fetch_commit_chain(remote_store, &head)?;
         self.set_remote_tracking_ref(remote, branch, &head)?;
         Ok(FetchOutcome {
             remote: remote.to_string(),

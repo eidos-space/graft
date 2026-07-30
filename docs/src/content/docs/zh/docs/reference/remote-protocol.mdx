@@ -76,6 +76,7 @@ ACL 存储不属于本协议。
     "range",
     "list",
     "put-if-absent",
+    "upload-bundle",
     "receive-pack",
     "receive-bundle",
     "cas",
@@ -120,6 +121,7 @@ encoding 必须被拒绝。服务可以公布 key/body 限制，并在超限时�
 | `PUT /raw/<key>`                 | 替换事务元数据。                      | `204 No Content` |
 | `DELETE /raw/<key>`              | 删除事务元数据。                      | `204 No Content` |
 | `PUT /raw-if-not-exists/<key>`   | 仅当对象不存在时创建。                | `204 No Content` |
+| `POST /upload-bundle/<ref-key>`  | 流式返回 ref 快照及其不可变存储。    | `200 OK`         |
 | `POST /receive-pack/<ref-key>`   | 发布一个 object pack 并原子更新 ref。 | `204 No Content` |
 | `POST /receive-bundle/<ref-key>` | 发布不可变对象、pack 并原子更新 ref。 | `204 No Content` |
 | `POST /cas/<key>`                | 原子 compare-and-swap。               | `204 No Content` |
@@ -135,6 +137,43 @@ encoding 必须被拒绝。服务可以公布 key/body 限制，并在超限时�
 更新 ref。ref 更新失败可以留下不可达对象，但不会暴露不完整 commit。
 
 对已不存在 key 的 `DELETE /raw` 应该仍成功，以保持幂等。
+
+## Upload Bundle
+
+`upload-bundle` 是 version 1 的可选 capability，用于 Git 风格的 clone 传输。client
+选定 branch 后只发送一个已认证请求：
+
+```http
+POST /upload-bundle/refs/heads/main
+Content-Length: 0
+```
+
+服务先读取请求的 ref，列举 repository 的不可变 key，再读取一次 ref。如果 ref
+已经变化则返回 `409`，client 可以重试。快照稳定时返回
+`Content-Type: application/vnd.graft.upload-bundle` 和
+`x-graft-bundle-manifest-bytes` header。响应开头是该 header 指定长度的 UTF-8 JSON：
+
+```json
+{
+  "version": 1,
+  "reference": {
+    "path": "refs/heads/main",
+    "value_hex": "<ref 字节的小写十六进制>"
+  },
+  "objects": 3
+}
+```
+
+之后必须紧跟 `objects` 个二进制 frame。每个 frame 依次包含 4 字节无符号 path
+长度、8 字节无符号对象长度、UTF-8 path 和对象 body；整数使用网络字节序。path
+必须严格有序、唯一，并且属于不可变 repository key。最后一个 frame 后不得有多余
+字节。服务直接转发每个 backend 对象流，无需把整个 bundle 缓存在内存中。
+
+version 1 会打包全部不可变 key，因为协议服务把对象内容视为 opaque。client 校验
+所有 frame，建立临时本地 remote，再从该本地快照解析选定 commit graph 并完成
+checkout。因此 clone 的数据主体只有一个 bulk response；后续协议版本可以增加
+reachability negotiation。`upload-bundle` 返回 `404` 或 `405` 时，client 必须回退
+到 version 1 的 raw/list 操作。
 
 ## Receive Pack
 
