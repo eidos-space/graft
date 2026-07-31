@@ -132,6 +132,15 @@ pub struct JsonRepoRowDiffFile {
     pub tables: Vec<JsonTableChanges>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub opaque_changes: Vec<JsonOpaqueChange>,
+    pub telemetry: JsonRowDiffTelemetry,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct JsonRowDiffTelemetry {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_table: Option<String>,
+    pub tables_considered: usize,
+    pub tables_scanned: usize,
 }
 
 /// Table entry in show output (for `graft_json_show`)

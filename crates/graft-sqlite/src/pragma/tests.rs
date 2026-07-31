@@ -587,6 +587,7 @@ fn parse_repo_diff_arg_supports_row_mode() {
             kind: None,
             target: RepoDiffTarget::Worktree { path: None },
             content: None,
+            table: None,
         }
     );
     assert_eq!(
@@ -596,6 +597,7 @@ fn parse_repo_diff_arg_supports_row_mode() {
             kind: None,
             target: RepoDiffTarget::Staged { path: Some("app.db".to_string()) },
             content: None,
+            table: None,
         }
     );
     assert_eq!(
@@ -605,6 +607,7 @@ fn parse_repo_diff_arg_supports_row_mode() {
             kind: Some(RepoTrackedPathKind::SqliteDatabase),
             target: RepoDiffTarget::Staged { path: None },
             content: None,
+            table: None,
         }
     );
     assert_eq!(
@@ -618,6 +621,7 @@ fn parse_repo_diff_arg_supports_row_mode() {
                 path: Some("app.db".to_string()),
             },
             content: None,
+            table: None,
         }
     );
     assert_eq!(
@@ -630,11 +634,45 @@ fn parse_repo_diff_arg_supports_row_mode() {
                 path: Some("--rows".to_string()),
             },
             content: None,
+            table: None,
         }
     );
     assert!(parse_repo_diff_arg(Some("--rows --rows")).is_err());
     assert!(parse_repo_diff_arg(Some("--kind nope")).is_err());
     assert!(parse_repo_diff_arg(Some("--kind db --kind text_file")).is_err());
+}
+
+#[test]
+fn parse_repo_diff_arg_supports_one_table_row_mode() {
+    assert_eq!(
+        parse_repo_diff_arg(Some(
+            r#"--rows --table "project \"docs\"" HEAD~1 HEAD -- app.db"#,
+        ))
+        .unwrap(),
+        RepoDiffSpec {
+            mode: DiffMode::Rows,
+            kind: None,
+            target: RepoDiffTarget::Revisions {
+                from: "HEAD~1".to_string(),
+                to: "HEAD".to_string(),
+                path: Some("app.db".to_string()),
+            },
+            content: None,
+            table: Some(r#"project "docs""#.to_string()),
+        }
+    );
+
+    for invalid in [
+        "--table docs -- app.db",
+        "--rows --table docs",
+        "--rows --table docs --table other -- app.db",
+        "--rows --table -- app.db",
+    ] {
+        assert!(
+            parse_repo_diff_arg(Some(invalid)).is_err(),
+            "accepted {invalid}"
+        );
+    }
 }
 
 #[test]
@@ -732,6 +770,7 @@ fn parse_repo_diff_arg_requires_bounded_single_path_content_mode() {
             content: Some(RepoTextContentSpec {
                 max_bytes: graft::repo::DEFAULT_TEXT_DIFF_CONTENT_LIMIT,
             }),
+            table: None,
         }
     );
     assert_eq!(
@@ -746,6 +785,7 @@ fn parse_repo_diff_arg_requires_bounded_single_path_content_mode() {
             content: Some(RepoTextContentSpec {
                 max_bytes: graft::repo::DEFAULT_TEXT_DIFF_CONTENT_LIMIT,
             }),
+            table: None,
         }
     );
     assert_eq!(
@@ -782,6 +822,7 @@ fn parse_repo_diff_arg_supports_explicit_root_comparisons() {
             kind: None,
             target: RepoDiffTarget::Root { to: "HEAD".to_string(), path: None },
             content: None,
+            table: None,
         }
     );
     assert_eq!(
@@ -797,6 +838,7 @@ fn parse_repo_diff_arg_supports_explicit_root_comparisons() {
                 path: Some("notes/first  draft.md".to_string()),
             },
             content: Some(RepoTextContentSpec { max_bytes: ByteUnit::new(4096) }),
+            table: None,
         }
     );
     for invalid in [

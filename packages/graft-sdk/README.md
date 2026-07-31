@@ -83,6 +83,8 @@ try {
   const diff = await session.diffPaths({
     paths: status.status.paths.map(({ path }) => path),
     rows: true,
+    // Optional: scan just the table the user opened.
+    table: "customers",
     limit: 100,
   })
 } finally {

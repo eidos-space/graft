@@ -11,6 +11,8 @@ export interface DiffOptions extends OperationOptions {
   from?: string
   to?: string
   path?: string
+  /** Return row details only for this table. Requires rows and one explicit path. */
+  table?: string
 }
 
 export interface DiffPathsOptions extends OperationOptions {
@@ -22,6 +24,8 @@ export interface DiffPathsOptions extends OperationOptions {
   from?: string
   /** Historical comparison target. Requires `from`. */
   to?: string
+  /** Return row details only for this table. Requires rows. */
+  table?: string
   /** Maximum explicit paths returned per page. Range: 1–100. */
   limit?: number
   /** Last path from the preceding page. */
@@ -273,6 +277,12 @@ export interface DiffTelemetry {
   changed_paths: number
   /** True when explicit paths use path-local tree/index state instead of full map hydration. */
   path_filter_fast_path: boolean
+  /** True when row details were limited to the requested table. */
+  table_filter_fast_path: boolean
+  /** Requested table for row details, or null for an all-table diff. */
+  requested_table: string | null
+  /** Number of SQLite tables whose rows were scanned across the returned paths. */
+  tables_scanned: number
   /** Always zero for the bounded path-local implementation. */
   full_tree_paths_hydrated: number
 }

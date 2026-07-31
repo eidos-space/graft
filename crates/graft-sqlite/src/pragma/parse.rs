@@ -429,6 +429,7 @@ pub(super) fn parse_repo_diff_arg(arg: Option<&str>) -> Result<RepoDiffSpec, Pra
             kind: None,
             target: RepoDiffTarget::Worktree { path: None },
             content: None,
+            table: None,
         });
     };
     reject_ambiguous_posix_path_escape(arg)?;
@@ -437,6 +438,7 @@ pub(super) fn parse_repo_diff_arg(arg: Option<&str>) -> Result<RepoDiffSpec, Pra
     let mut kind = None;
     let mut include_content = false;
     let mut max_content_bytes = None;
+    let mut table = None;
     let mut root = None;
     let mut parts = Vec::new();
     let mut in_path = false;
@@ -461,6 +463,21 @@ pub(super) fn parse_repo_diff_arg(arg: Option<&str>) -> Result<RepoDiffSpec, Pra
                 return Err(pragma_fail("diff --kind requires a value"));
             };
             kind = Some(parse_repo_tracked_path_kind_arg(value)?);
+            index += 2;
+        } else if !in_path && part == "--table" {
+            if table.is_some() {
+                return Err(pragma_fail("diff accepts --table only once"));
+            }
+            let Some(value) = raw_parts.get(index + 1) else {
+                return Err(pragma_fail("diff --table requires a value"));
+            };
+            if value.is_empty() {
+                return Err(pragma_fail("diff --table requires a non-empty value"));
+            }
+            if value.len() > 1_024 {
+                return Err(pragma_fail("diff --table exceeds 1,024 bytes"));
+            }
+            table = Some(value.clone());
             index += 2;
         } else if !in_path && part == "--content" {
             if include_content {
@@ -546,6 +563,22 @@ pub(super) fn parse_repo_diff_arg(arg: Option<&str>) -> Result<RepoDiffSpec, Pra
     if max_content_bytes.is_some() && !include_content {
         return Err(pragma_fail("diff --max-content-bytes requires --content"));
     }
+    if table.is_some() && mode != DiffMode::Rows {
+        return Err(pragma_fail("diff --table requires --rows"));
+    }
+    if table.is_some()
+        && !matches!(
+            &target,
+            RepoDiffTarget::Worktree { path: Some(path) }
+                | RepoDiffTarget::Staged { path: Some(path) }
+                | RepoDiffTarget::RevisionToWorktree { path: Some(path), .. }
+                | RepoDiffTarget::Revisions { path: Some(path), .. }
+                | RepoDiffTarget::Root { path: Some(path), .. }
+                if !path.is_empty()
+        )
+    {
+        return Err(pragma_fail("diff --table requires one explicit path"));
+    }
     let content = if include_content {
         if mode != DiffMode::Default {
             return Err(pragma_fail("diff --content cannot be combined with --rows"));
@@ -572,7 +605,7 @@ pub(super) fn parse_repo_diff_arg(arg: Option<&str>) -> Result<RepoDiffSpec, Pra
     } else {
         None
     };
-    Ok(RepoDiffSpec { mode, kind, target, content })
+    Ok(RepoDiffSpec { mode, kind, target, content, table })
 }
 
 pub(super) fn parse_volume_diff_arg(arg: &str) -> Result<(LSN, LSN, DiffMode), PragmaErr> {

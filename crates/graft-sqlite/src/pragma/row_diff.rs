@@ -194,6 +194,7 @@ pub(super) fn json_repo_row_diff(
     runtime: &Runtime,
     repo: &Repository,
     diff: &RepoDiff,
+    table: Option<&str>,
 ) -> Result<crate::json::JsonRepoRowDiffResult, ErrCtx> {
     let paths = diff
         .paths
@@ -212,7 +213,7 @@ pub(super) fn json_repo_row_diff(
             let change = repo_file_change_label(file.change).to_string();
             let kind = repo_tracked_path_kind_json_label(file.kind).to_string();
             let storage = repo_path_storage_json_label(file.storage).to_string();
-            match repo_file_row_diff(runtime, repo, file) {
+            match repo_file_row_diff(runtime, repo, file, table) {
                 Ok(Some(row_diff)) => Ok(crate::json::JsonRepoRowDiffFile {
                     path: file.path.clone(),
                     change,
@@ -225,6 +226,11 @@ pub(super) fn json_repo_row_diff(
                     message: None,
                     tables: json_table_changes(&row_diff.table_changes),
                     opaque_changes: json_opaque_changes(&row_diff.opaque_changes),
+                    telemetry: crate::json::JsonRowDiffTelemetry {
+                        requested_table: row_diff.telemetry.requested_table,
+                        tables_considered: row_diff.telemetry.tables_considered,
+                        tables_scanned: row_diff.telemetry.tables_scanned,
+                    },
                 }),
                 Ok(None) => Ok(crate::json::JsonRepoRowDiffFile {
                     path: file.path.clone(),
@@ -240,6 +246,7 @@ pub(super) fn json_repo_row_diff(
                     )),
                     tables: Vec::new(),
                     opaque_changes: Vec::new(),
+                    telemetry: crate::json::JsonRowDiffTelemetry::default(),
                 }),
                 Err(err) => Ok(crate::json::JsonRepoRowDiffFile {
                     path: file.path.clone(),
@@ -255,6 +262,7 @@ pub(super) fn json_repo_row_diff(
                     )),
                     tables: Vec::new(),
                     opaque_changes: Vec::new(),
+                    telemetry: crate::json::JsonRowDiffTelemetry::default(),
                 }),
             }
         })

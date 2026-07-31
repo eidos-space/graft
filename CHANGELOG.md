@@ -1,5 +1,28 @@
 # Changelog
 
+## Graft SDK 0.3.3 — 2026-07-31
+
+### Added
+
+- Added an optional table filter to explicit-path SQLite row diffs, including safe telemetry that
+  identifies the requested table and how many tables were scanned.
+- Added logical row diffs for SQLite files introduced by an initial checkpoint or added/deleted
+  between checkpoints.
+
+### Changed
+
+- Table-detail requests now scan only the selected SQLite table instead of every table in the
+  database while preserving file and table summary metadata.
+- Large Remote pushes now use phase-specific transfer timeouts, reconcile ambiguous publication
+  outcomes, and expose stable SDK error codes for safe retry handling.
+
+### Fixed
+
+- Push retries no longer restart already completed immutable object uploads when the final
+  publication response times out.
+- Row-detail consumers can request one changed table without paying the cost of unrelated large
+  tables in the same Eidos File.
+
 ## Graft SDK 0.3.0 — 2026-07-30
 
 ### Added

@@ -442,6 +442,14 @@ pub struct RowLevelDiff {
     pub schema_changes: Vec<SchemaChange>,
     pub table_changes: Vec<TableChanges>,
     pub opaque_changes: Vec<OpaqueChange>,
+    pub telemetry: RowLevelDiffTelemetry,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RowLevelDiffTelemetry {
+    pub requested_table: Option<String>,
+    pub tables_considered: usize,
+    pub tables_scanned: usize,
 }
 
 impl RowLevelDiff {
@@ -660,11 +668,20 @@ pub fn row_level_diff_snapshots(
     from_snapshot: &Snapshot,
     to_snapshot: &Snapshot,
 ) -> Result<RowLevelDiff, graft::err::GraftErr> {
+    row_level_diff_snapshots_for_table(runtime, from_snapshot, to_snapshot, None)
+}
+
+pub fn row_level_diff_snapshots_for_table(
+    runtime: &Runtime,
+    from_snapshot: &Snapshot,
+    to_snapshot: &Snapshot,
+    table: Option<&str>,
+) -> Result<RowLevelDiff, graft::err::GraftErr> {
     let from_reader = runtime.snapshot_reader(from_snapshot.clone());
     let to_reader = runtime.snapshot_reader(to_snapshot.clone());
     let from_lsn = from_snapshot.head().map_or(LSN::FIRST, |(_, lsn)| lsn);
     let to_lsn = to_snapshot.head().map_or(LSN::FIRST, |(_, lsn)| lsn);
-    row_level_diff_readers(&from_reader, &to_reader, from_lsn, to_lsn)
+    row_level_diff_readers_for_table(&from_reader, &to_reader, from_lsn, to_lsn, table)
 }
 
 pub fn row_level_diff_readers(
@@ -673,7 +690,17 @@ pub fn row_level_diff_readers(
     from_lsn: LSN,
     to_lsn: LSN,
 ) -> Result<RowLevelDiff, graft::err::GraftErr> {
-    row_level_diff_from_readers(from_reader, to_reader, from_lsn, to_lsn)
+    row_level_diff_readers_for_table(from_reader, to_reader, from_lsn, to_lsn, None)
+}
+
+pub fn row_level_diff_readers_for_table(
+    from_reader: &dyn VolumeRead,
+    to_reader: &dyn VolumeRead,
+    from_lsn: LSN,
+    to_lsn: LSN,
+    table: Option<&str>,
+) -> Result<RowLevelDiff, graft::err::GraftErr> {
+    row_level_diff_from_readers(from_reader, to_reader, from_lsn, to_lsn, table)
 }
 
 fn row_level_diff_checked_out(
@@ -693,7 +720,7 @@ fn row_level_diff_checked_out(
         graft::err::LogicalErr::Other(format!("Failed to create reader for {to_vid}: {e:?}"))
     })?;
 
-    row_level_diff_from_readers(&from_reader, &to_reader, from_lsn, to_lsn)
+    row_level_diff_from_readers(&from_reader, &to_reader, from_lsn, to_lsn, None)
 }
 
 pub(crate) struct MaterializedSnapshot {
@@ -823,6 +850,7 @@ fn row_level_diff_from_readers(
     to_reader: &dyn VolumeRead,
     from_lsn: LSN,
     to_lsn: LSN,
+    table_filter: Option<&str>,
 ) -> Result<RowLevelDiff, graft::err::GraftErr> {
     let native_page_size = PAGESIZE.as_u32();
     let needs_materialized_schema = sqlite_page_size(from_reader)? != native_page_size
@@ -858,16 +886,40 @@ fn row_level_diff_from_readers(
     };
 
     // Compare schema and tables
-    let schema_changes = diff_schema_entries(&from_master, &to_master);
+    let mut schema_changes = diff_schema_entries(&from_master, &to_master);
+    if let Some(table) = table_filter {
+        schema_changes.retain(|change| {
+            change.name == table
+                || from_master
+                    .iter()
+                    .chain(to_master.iter())
+                    .any(|entry| entry.name == change.name && entry.table_name == table)
+        });
+    }
     let mut table_changes = Vec::new();
     let mut limitations = diff_parser_limitations(&from_scanner, &to_scanner);
 
     // Collect all table names
-    let ignored_table_infos = ignored_row_diff_table_infos(&from_master, &to_master);
+    let mut ignored_table_infos = ignored_row_diff_table_infos(&from_master, &to_master);
+    if let Some(table) = table_filter {
+        ignored_table_infos.retain(|name, info| {
+            name == table || info.owner.as_deref().is_some_and(|owner| owner == table)
+        });
+    }
     limitations.extend(ignored_table_infos.values().map(|table| {
         RowLevelDiffLimitation::new(table.reason.limitation_kind(), Some(table.name.clone()))
     }));
-    limitations.extend(generated_column_limitations(&from_master, &to_master));
+    limitations.extend(
+        generated_column_limitations(&from_master, &to_master)
+            .into_iter()
+            .filter(|limitation| {
+                table_filter.is_none()
+                    || limitation
+                        .subject
+                        .as_deref()
+                        .is_some_and(|subject| table_filter.is_some_and(|table| subject == table))
+            }),
+    );
     dedupe_limitations(&mut limitations);
     let ignored_tables: HashSet<String> = ignored_table_infos.keys().cloned().collect();
     let opaque_changes = diff_opaque_tables(
@@ -880,7 +932,13 @@ fn row_level_diff_from_readers(
     let index_btree_changes = if needs_materialized_schema {
         Vec::new()
     } else {
-        diff_index_btrees(from_reader, to_reader, &from_master, &to_master)
+        diff_index_btrees(
+            from_reader,
+            to_reader,
+            &from_master,
+            &to_master,
+            table_filter,
+        )
     };
     limitations.extend(index_btree_changes.iter().map(|change| {
         RowLevelDiffLimitation::new(change.reason.limitation_kind(), Some(change.name.clone()))
@@ -892,18 +950,25 @@ fn row_level_diff_from_readers(
         .collect();
     let mut all_tables: HashSet<String> = HashSet::new();
     for entry in &from_master {
-        if is_diffable_table(entry, &ignored_tables) {
+        if is_diffable_table(entry, &ignored_tables)
+            && table_filter.is_none_or(|table| entry.name == table)
+        {
             all_tables.insert(entry.name.clone());
         }
     }
     for entry in &to_master {
-        if is_diffable_table(entry, &ignored_tables) {
+        if is_diffable_table(entry, &ignored_tables)
+            && table_filter.is_none_or(|table| entry.name == table)
+        {
             all_tables.insert(entry.name.clone());
         }
     }
+    let tables_considered = all_tables.len();
+    let mut tables_scanned = 0;
 
     // Compare each table
     for table_name in all_tables {
+        tables_scanned += 1;
         let from_entry = from_master.iter().find(|e| e.name == table_name);
         let to_entry = to_master.iter().find(|e| e.name == table_name);
 
@@ -994,6 +1059,11 @@ fn row_level_diff_from_readers(
         schema_changes,
         table_changes,
         opaque_changes,
+        telemetry: RowLevelDiffTelemetry {
+            requested_table: table_filter.map(str::to_owned),
+            tables_considered,
+            tables_scanned,
+        },
     })
 }
 
@@ -1556,11 +1626,12 @@ fn diff_index_btrees(
     to_reader: &dyn VolumeRead,
     from_master: &[MasterEntry],
     to_master: &[MasterEntry],
+    table_filter: Option<&str>,
 ) -> Vec<OpaqueChange> {
     let mut changes = Vec::new();
     let mut names = HashSet::new();
     for entry in from_master.iter().chain(to_master.iter()) {
-        if is_index_btree(entry) {
+        if is_index_btree(entry) && table_filter.is_none_or(|table| entry.table_name == table) {
             names.insert(entry.name.clone());
         }
     }
@@ -1947,6 +2018,7 @@ mod tests {
                 ],
             }],
             opaque_changes: vec![],
+            telemetry: RowLevelDiffTelemetry::default(),
         };
 
         let sql = diff.to_sql();
@@ -1976,6 +2048,7 @@ mod tests {
                 }],
             }],
             opaque_changes: vec![],
+            telemetry: RowLevelDiffTelemetry::default(),
         };
 
         let sql = diff.to_sql();
@@ -2003,6 +2076,7 @@ mod tests {
                 }],
             }],
             opaque_changes: vec![],
+            telemetry: RowLevelDiffTelemetry::default(),
         };
 
         let sql = diff.to_sql();
@@ -2021,6 +2095,7 @@ mod tests {
             schema_changes: vec![],
             table_changes: vec![],
             opaque_changes: vec![],
+            telemetry: RowLevelDiffTelemetry::default(),
         };
 
         let sql = diff.to_sql();

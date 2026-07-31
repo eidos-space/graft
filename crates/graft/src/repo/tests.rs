@@ -781,6 +781,25 @@ fn cancellation_scope_returns_cancelled_without_poisoning_repository() {
 }
 
 #[test]
+fn remote_wait_is_cancelled_without_a_wall_clock_request_timeout() {
+    let token = CancellationToken::new();
+    let canceller = token.clone();
+    let task = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        canceller.cancel();
+    });
+    let started = std::time::Instant::now();
+
+    let result = with_cancellation(&token, || {
+        block_on_remote(std::future::pending::<std::result::Result<(), RemoteErr>>())
+    });
+
+    task.join().unwrap();
+    assert!(matches!(result, Err(RepoErr::Cancelled)));
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[test]
 fn status_scans_worktree_files_as_untracked() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = Repository::init(tmp.path()).unwrap();
@@ -3679,6 +3698,56 @@ fn push_and_fetch_roundtrip_large_artifact_payloads() {
         .materialize_artifact_key("assets/model.bin", &cloned_state)
         .unwrap();
     assert_eq!(fs::read(materialized).unwrap(), bytes);
+}
+
+#[test]
+fn incremental_push_does_not_prepare_unchanged_large_artifact_payloads() {
+    let remote_dir = tempfile::tempdir().unwrap();
+    let remote = RemoteConfig::Fs {
+        root: remote_dir.path().to_string_lossy().into_owned(),
+    };
+
+    let source_dir = tempfile::tempdir().unwrap();
+    let source = Repository::init(source_dir.path()).unwrap();
+    source.remote_add("origin", remote).unwrap();
+
+    let asset = source_dir.path().join("assets/model.bin");
+    fs::create_dir_all(asset.parent().unwrap()).unwrap();
+    fs::write(&asset, vec![7_u8; 2 * 1024 * 1024]).unwrap();
+    source
+        .stage_artifact_path_with_inline_text_threshold(&asset, 4)
+        .unwrap();
+    let initial = source.commit_staged("track model").unwrap();
+    source.push("origin", "main").unwrap();
+
+    let note = source_dir.path().join("checkpoint.txt");
+    fs::write(&note, b"small checkpoint").unwrap();
+    source.stage_artifact_path(&note).unwrap();
+    let checkpoint = source.commit_staged("small checkpoint").unwrap();
+    let remote_store = source.remote_store("origin").unwrap();
+    let prepared = source
+        .push_commit_chain(&remote_store, &checkpoint.id, Some(&initial.id))
+        .unwrap();
+
+    assert_eq!(prepared.commits, 1);
+    assert!(
+        prepared.bundle_objects.is_empty(),
+        "the unchanged 2 MiB payload must not be prepared for the incremental push"
+    );
+
+    source.push("origin", "main").unwrap();
+
+    let second_asset = source_dir.path().join("assets/new-model.bin");
+    fs::write(&second_asset, vec![9_u8; 1024 * 1024]).unwrap();
+    source
+        .stage_artifact_path_with_inline_text_threshold(&second_asset, 4)
+        .unwrap();
+    let with_new_payload = source.commit_staged("add another model").unwrap();
+    let prepared = source
+        .push_commit_chain(&remote_store, &with_new_payload.id, Some(&checkpoint.id))
+        .unwrap();
+
+    assert_eq!(prepared.bundle_objects.len(), 1);
 }
 
 #[test]
