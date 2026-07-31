@@ -9325,12 +9325,28 @@ fn test_repo_diff_matrix_on_physical_database_path() {
             r#"
             CREATE TABLE repo_diff (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
             INSERT INTO repo_diff (name) VALUES ('Alice');
+            CREATE TABLE unrelated (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO unrelated (value) VALUES ('unchanged');
             "#,
         )
         .unwrap();
     pragma_query_string(&sqlite, "graft_add");
     let commit = pragma_arg_string(&sqlite, "graft_commit", "initial row");
     assert!(commit.contains("initial row"));
+
+    let root_row_diff: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_diff",
+        "--rows --table repo_diff --root HEAD -- app.db",
+    ))
+    .expect("root table diff should compare the database with an empty SQLite snapshot");
+    assert_eq!(root_row_diff["files"][0]["row_diff_available"], true);
+    assert_eq!(root_row_diff["files"][0]["tables"][0]["name"], "repo_diff");
+    assert_eq!(
+        root_row_diff["files"][0]["tables"][0]["changes"][0]["op"],
+        "insert"
+    );
+    assert_eq!(root_row_diff["files"][0]["telemetry"]["tables_scanned"], 1);
 
     sqlite
         .execute("INSERT INTO repo_diff (name) VALUES ('Bob')", [])
@@ -9379,6 +9395,30 @@ fn test_repo_diff_matrix_on_physical_database_path() {
     assert_eq!(json_worktree_row_diff["from"], "index");
     assert_eq!(json_worktree_row_diff["to"], "worktree");
     assert_repo_row_diff_json(&json_worktree_row_diff);
+
+    let filtered_row_diff: Value = serde_json::from_str(&pragma_arg_string(
+        &sqlite,
+        "graft_json_diff",
+        "--rows --table repo_diff -- app.db",
+    ))
+    .expect("graft_json_diff --table should return a table-local row diff");
+    assert_eq!(
+        filtered_row_diff["files"][0]["tables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|table| table["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["repo_diff"]
+    );
+    assert_eq!(
+        filtered_row_diff["files"][0]["telemetry"],
+        serde_json::json!({
+            "requested_table": "repo_diff",
+            "tables_considered": 1,
+            "tables_scanned": 1
+        })
+    );
 
     pragma_query_string(&sqlite, "graft_add");
 

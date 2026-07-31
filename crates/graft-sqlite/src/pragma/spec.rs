@@ -46,6 +46,7 @@ pub(crate) struct RepoDiffSpec {
     pub(super) kind: Option<RepoTrackedPathKind>,
     pub(super) target: RepoDiffTarget,
     pub(super) content: Option<RepoTextContentSpec>,
+    pub(super) table: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

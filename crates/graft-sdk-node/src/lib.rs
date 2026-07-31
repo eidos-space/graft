@@ -24,6 +24,7 @@ pub struct DiffOptions {
     pub from: Option<String>,
     pub to: Option<String>,
     pub path: Option<String>,
+    pub table: Option<String>,
 }
 
 #[napi(object)]
@@ -33,6 +34,7 @@ pub struct DiffPathsOptions {
     pub root: Option<String>,
     pub from: Option<String>,
     pub to: Option<String>,
+    pub table: Option<String>,
     pub limit: Option<u32>,
     pub after: Option<String>,
 }
@@ -509,6 +511,7 @@ impl NodeRepositorySession {
             from: options.from,
             to: options.to,
             path: options.path.map(PathBuf::from),
+            table: options.table,
         });
         json_task(self, JsonOperation::Diff { options }, signal)
     }
@@ -528,6 +531,7 @@ impl NodeRepositorySession {
                     root: options.root,
                     from: options.from,
                     to: options.to,
+                    table: options.table,
                     limit: options.limit.unwrap_or(100) as usize,
                     after: options.after,
                 },

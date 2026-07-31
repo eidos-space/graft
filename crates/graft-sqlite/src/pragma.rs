@@ -2331,11 +2331,17 @@ impl GraftCommand {
                     return pragma_err!("diff --content is only available through graft_json_diff");
                 }
                 let mode = spec.mode;
+                let table = spec.table.clone();
                 let repo = repo_for_file(file)?;
                 let diff = repo_diff_for_spec(&runtime, file, &repo, spec)?;
                 match mode {
                     DiffMode::Default => Ok(Some(format_repo_diff(&diff)?)),
-                    DiffMode::Rows => Ok(Some(format_repo_row_diff(&runtime, &repo, &diff)?)),
+                    DiffMode::Rows => Ok(Some(format_repo_row_diff(
+                        &runtime,
+                        &repo,
+                        &diff,
+                        table.as_deref(),
+                    )?)),
                 }
             }
 
@@ -2438,6 +2444,7 @@ impl GraftCommand {
                 }
                 let mode = spec.mode;
                 let kind = spec.kind.map(repo_tracked_path_kind_json_label);
+                let table = spec.table.clone();
                 let repo = repo_for_file(file)?;
                 let content_request = match (&spec.content, &spec.target) {
                     (
@@ -2467,7 +2474,7 @@ impl GraftCommand {
                         })?))
                     }
                     DiffMode::Rows => {
-                        let rows = json_repo_row_diff(&runtime, &repo, &diff)?;
+                        let rows = json_repo_row_diff(&runtime, &repo, &diff, table.as_deref())?;
                         Ok(Some(to_json(&JsonRepoDiffOutcome {
                             current_head,
                             current_branch,

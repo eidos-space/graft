@@ -133,6 +133,7 @@ pub(super) fn format_repo_row_diff(
     runtime: &Runtime,
     repo: &Repository,
     diff: &RepoDiff,
+    table: Option<&str>,
 ) -> Result<String, ErrCtx> {
     let mut f = String::new();
     writeln!(
@@ -149,7 +150,7 @@ pub(super) fn format_repo_row_diff(
     for file in &diff.files {
         let change = repo_file_change_label(file.change);
         writeln!(&mut f, "{change}: {}", file.path)?;
-        let Some(row_diff) = repo_file_row_diff(runtime, repo, file)? else {
+        let Some(row_diff) = repo_file_row_diff(runtime, repo, file, table)? else {
             writeln!(
                 &mut f,
                 "  Row diff unavailable for {} database snapshots.",
@@ -182,45 +183,101 @@ pub(super) fn repo_file_row_diff(
     runtime: &Runtime,
     repo: &Repository,
     file: &graft::repo::RepoFileDiff,
+    table: Option<&str>,
 ) -> Result<Option<crate::row_level_diff::RowLevelDiff>, ErrCtx> {
-    let Some(from) = &file.from else {
-        return Ok(None);
-    };
     let resolver = RepoSnapshotResolver::local_then_remote(
         runtime,
         repo_default_remote_store(repo),
         RepoSnapshotPurpose::Diff,
         SnapshotHashPolicy::AllowHydratedMismatch,
     );
-    resolver.resolve_snapshot(&from.snapshot)?;
     if file.worktree.is_some() {
         let physical_path = repo.worktree().join(&file.path);
         let physical = PhysicalSqliteReader::open(&physical_path)?;
+        let Some(from) = &file.from else {
+            let empty = empty_sqlite_reader()?;
+            return crate::row_level_diff::row_level_diff_readers_for_table(
+                &empty,
+                &physical,
+                LSN::FIRST,
+                LSN::FIRST.saturating_next(),
+                table,
+            )
+            .map(Some)
+            .map_err(|err| {
+                ErrCtx::PragmaErr(format!("Row diff error for `{}`: {err:?}", file.path).into())
+            });
+        };
+        resolver.resolve_snapshot(&from.snapshot)?;
         let from_snapshot = from.snapshot.to_snapshot();
         let from_lsn = from_snapshot.head().map_or(LSN::FIRST, |(_, lsn)| lsn);
         let from_reader = runtime.snapshot_reader(from_snapshot);
-        return crate::row_level_diff::row_level_diff_readers(
+        return crate::row_level_diff::row_level_diff_readers_for_table(
             &from_reader,
             &physical,
             from_lsn,
             from_lsn.saturating_next(),
+            table,
         )
         .map(Some)
         .map_err(|err| {
             ErrCtx::PragmaErr(format!("Row diff error for `{}`: {err:?}", file.path).into())
         });
     }
-    let Some(to) = &file.to else {
-        return Ok(None);
+    let row_diff = match (&file.from, &file.to) {
+        (Some(from), Some(to)) => {
+            resolver.resolve_snapshot(&from.snapshot)?;
+            resolver.resolve_snapshot(&to.snapshot)?;
+            crate::row_level_diff::row_level_diff_snapshots_for_table(
+                runtime,
+                &from.snapshot.to_snapshot(),
+                &to.snapshot.to_snapshot(),
+                table,
+            )
+        }
+        (None, Some(to)) => {
+            resolver.resolve_snapshot(&to.snapshot)?;
+            let empty = empty_sqlite_reader()?;
+            let to_snapshot = to.snapshot.to_snapshot();
+            let to_lsn = to_snapshot.head().map_or(LSN::FIRST, |(_, lsn)| lsn);
+            let to_reader = runtime.snapshot_reader(to_snapshot);
+            crate::row_level_diff::row_level_diff_readers_for_table(
+                &empty,
+                &to_reader,
+                LSN::FIRST,
+                to_lsn,
+                table,
+            )
+        }
+        (Some(from), None) => {
+            resolver.resolve_snapshot(&from.snapshot)?;
+            let empty = empty_sqlite_reader()?;
+            let from_snapshot = from.snapshot.to_snapshot();
+            let from_lsn = from_snapshot.head().map_or(LSN::FIRST, |(_, lsn)| lsn);
+            let from_reader = runtime.snapshot_reader(from_snapshot);
+            crate::row_level_diff::row_level_diff_readers_for_table(
+                &from_reader,
+                &empty,
+                from_lsn,
+                from_lsn.saturating_next(),
+                table,
+            )
+        }
+        (None, None) => return Ok(None),
     };
-    resolver.resolve_snapshot(&to.snapshot)?;
-    crate::row_level_diff::row_level_diff_snapshots(
-        runtime,
-        &from.snapshot.to_snapshot(),
-        &to.snapshot.to_snapshot(),
-    )
-    .map(Some)
-    .map_err(|err| ErrCtx::PragmaErr(format!("Row diff error for `{}`: {err:?}", file.path).into()))
+    row_diff.map(Some).map_err(|err| {
+        ErrCtx::PragmaErr(format!("Row diff error for `{}`: {err:?}", file.path).into())
+    })
+}
+
+fn empty_sqlite_reader() -> Result<PhysicalSqliteReader, ErrCtx> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("empty.sqlite");
+    let connection = rusqlite::Connection::open(&path)?;
+    connection.pragma_update(None, "page_size", PAGESIZE.as_u32())?;
+    connection.execute_batch("VACUUM")?;
+    drop(connection);
+    PhysicalSqliteReader::open(&path)
 }
 
 pub(super) fn repo_default_remote_store(repo: &Repository) -> Option<Arc<Remote>> {

@@ -351,6 +351,7 @@ pub struct DiffOptions {
     pub from: Option<String>,
     pub to: Option<String>,
     pub path: Option<PathBuf>,
+    pub table: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -360,6 +361,7 @@ pub struct DiffPathsOptions {
     pub root: Option<String>,
     pub from: Option<String>,
     pub to: Option<String>,
+    pub table: Option<String>,
     pub limit: usize,
     pub after: Option<String>,
 }
@@ -384,6 +386,9 @@ pub struct DiffTelemetry {
     pub returned_paths: usize,
     pub changed_paths: usize,
     pub path_filter_fast_path: bool,
+    pub table_filter_fast_path: bool,
+    pub requested_table: Option<String>,
+    pub tables_scanned: usize,
     pub full_tree_paths_hydrated: usize,
 }
 
@@ -879,6 +884,8 @@ impl RepositorySession {
             root: options.root.clone(),
             from: options.from.clone(),
             to: options.to.clone(),
+            path: options.paths.first().cloned(),
+            table: options.table.clone(),
             ..DiffOptions::default()
         })?;
 
@@ -906,6 +913,7 @@ impl RepositorySession {
                 from: options.from.clone(),
                 to: options.to.clone(),
                 path: Some(PathBuf::from(&path)),
+                table: options.table.clone(),
                 ..DiffOptions::default()
             })?;
             results.push(PathDiffResult { path, diff });
@@ -914,6 +922,10 @@ impl RepositorySession {
             .iter()
             .filter(|entry| value_changed_path_count(&entry.diff) > 0)
             .count();
+        let tables_scanned = results
+            .iter()
+            .map(|entry| value_row_diff_tables_scanned(&entry.diff))
+            .sum();
         let next_cursor = results.last().map(|entry| entry.path.clone());
         Ok(DiffPathsResult {
             telemetry: DiffTelemetry {
@@ -922,6 +934,9 @@ impl RepositorySession {
                 returned_paths: results.len(),
                 changed_paths,
                 path_filter_fast_path: true,
+                table_filter_fast_path: options.table.is_some(),
+                requested_table: options.table.clone(),
+                tables_scanned,
                 full_tree_paths_hydrated: 0,
             },
             paths: results,
@@ -2390,6 +2405,21 @@ fn value_changed_path_count(value: &Value) -> usize {
         .map_or(0, Vec::len)
 }
 
+fn value_row_diff_tables_scanned(value: &Value) -> usize {
+    value
+        .get("files")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|file| {
+            file.get("telemetry")
+                .and_then(|telemetry| telemetry.get("tables_scanned"))
+                .and_then(Value::as_u64)
+        })
+        .map(|count| count as usize)
+        .sum()
+}
+
 fn repo_error(error: graft::repo::RepoErr) -> SdkError {
     repository_command_error(error.into())
 }
@@ -2532,10 +2562,26 @@ fn diff_argument(options: &DiffOptions) -> Result<Option<String>> {
     if options.from.is_none() && options.to.is_some() {
         return Err(invalid_argument("diff `to` requires a `from` revision"));
     }
+    if options.table.is_some() && !options.rows {
+        return Err(invalid_argument("diff `table` requires row details"));
+    }
+    if options.table.is_some() && options.path.is_none() {
+        return Err(invalid_argument("diff `table` requires one explicit path"));
+    }
 
     let mut parts = Vec::new();
     if options.rows {
         parts.push("--rows".to_string());
+    }
+    if let Some(table) = &options.table {
+        if table.is_empty() {
+            return Err(invalid_argument("diff table must not be empty"));
+        }
+        if table.len() > 1_024 {
+            return Err(invalid_argument("diff table exceeds 1,024 bytes"));
+        }
+        parts.push("--table".to_string());
+        parts.push(quote_pragma_value(table)?);
     }
     if options.staged {
         parts.push("--staged".to_string());
@@ -2558,6 +2604,14 @@ fn diff_argument(options: &DiffOptions) -> Result<Option<String>> {
         parts.push(quote_pragma_path(path)?);
     }
     Ok((!parts.is_empty()).then(|| parts.join(" ")))
+}
+
+fn quote_pragma_value(value: &str) -> Result<String> {
+    if value.contains('\0') {
+        return Err(invalid_argument("diff value must not contain NUL"));
+    }
+    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+    Ok(format!("\"{escaped}\""))
 }
 
 fn remote_branch_argument(remote: Option<&str>, branch: Option<&str>) -> Result<Option<String>> {
@@ -3163,6 +3217,7 @@ mod tests {
                 root: None,
                 from: None,
                 to: None,
+                table: None,
                 limit: 1,
                 after: None,
             }) {

@@ -165,6 +165,66 @@ test("repeated status and diff reuse one native session without a CLI", async ()
   })
 })
 
+test(
+  "table-scoped row diff scans and returns only the requested table",
+  nodeSqliteTest,
+  async () => {
+    await withTemporaryDirectory("graft-sdk-table-diff-", async (root) => {
+      const databasePath = path.join(root, "space.eidos")
+      const database = new DatabaseSync(databasePath)
+      database.exec(`
+        CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+        CREATE TABLE unrelated (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO customers (name) VALUES ('Ada');
+        INSERT INTO unrelated (value) VALUES ('unchanged');
+      `)
+      database.close()
+
+      const session = await RepositorySession.open(root)
+      await session.init()
+      await session.addAll()
+      const baseline = await session.commit("baseline")
+
+      const changed = new DatabaseSync(databasePath)
+      changed.exec("INSERT INTO customers (name) VALUES ('Grace')")
+      changed.close()
+      await session.addAll()
+      const updated = await session.commit("update customers")
+
+      const result = await session.diffPaths({
+        paths: ["space.eidos"],
+        rows: true,
+        table: "customers",
+        from: baseline.commit.id,
+        to: updated.commit.id,
+        limit: 1,
+      })
+      assert.deepEqual(
+        result.paths[0].diff.files[0].tables.map(({ name }) => name),
+        ["customers"]
+      )
+      assert.deepEqual(result.paths[0].diff.files[0].telemetry, {
+        requested_table: "customers",
+        tables_considered: 1,
+        tables_scanned: 1,
+      })
+      assert.equal(result.telemetry.table_filter_fast_path, true)
+      assert.equal(result.telemetry.requested_table, "customers")
+      assert.equal(result.telemetry.tables_scanned, 1)
+
+      await assert.rejects(
+        session.diffPaths({
+          paths: ["space.eidos"],
+          table: "customers",
+          limit: 1,
+        }),
+        /requires row details/
+      )
+      await session.close()
+    })
+  }
+)
+
 test("classifies UTF-8 codepoints crossing the sniff boundary as text", async () => {
   await withTemporaryDirectory("graft-sdk-utf8-boundary-", async (root) => {
     const session = await RepositorySession.open(root)
