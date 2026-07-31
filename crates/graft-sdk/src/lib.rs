@@ -67,6 +67,9 @@ pub enum SdkErrorCode {
     InvalidArgument,
     InvalidResponse,
     RepositoryStale,
+    RemoteTransportTimeout,
+    RemotePublicationUnconfirmed,
+    RemotePublicationOutcomeUnknown,
     RepositoryCommand,
 }
 
@@ -82,6 +85,9 @@ impl SdkErrorCode {
             Self::InvalidArgument => "GRAFT_SDK_INVALID_ARGUMENT",
             Self::InvalidResponse => "GRAFT_SDK_INVALID_RESPONSE",
             Self::RepositoryStale => "GRAFT_SDK_REPOSITORY_STALE",
+            Self::RemoteTransportTimeout => "GRAFT_SDK_REMOTE_TRANSPORT_TIMEOUT",
+            Self::RemotePublicationUnconfirmed => "GRAFT_SDK_REMOTE_PUBLICATION_UNCONFIRMED",
+            Self::RemotePublicationOutcomeUnknown => "GRAFT_SDK_REMOTE_PUBLICATION_OUTCOME_UNKNOWN",
             Self::RepositoryCommand => "GRAFT_SDK_REPOSITORY_COMMAND",
         }
     }
@@ -1429,7 +1435,7 @@ impl RepositorySession {
 
     fn command_error(&self, error: ErrCtx) -> SdkError {
         let message = self.credentials.redact(&error.to_string());
-        let code = sdk_error_code_for_message(&message);
+        let code = sdk_error_code_for_error(&error, &message);
         SdkError::new(code, message)
     }
 
@@ -2416,8 +2422,30 @@ fn repository_command_error(error: ErrCtx) -> SdkError {
         return SdkError::new(SdkErrorCode::Cancelled, "operation cancelled");
     }
     let message = error.to_string();
-    let code = sdk_error_code_for_message(&message);
+    let code = sdk_error_code_for_error(&error, &message);
     SdkError::new(code, message)
+}
+
+fn sdk_error_code_for_error(error: &ErrCtx, message: &str) -> SdkErrorCode {
+    use graft::{
+        remote::{HttpTransportErrorKind, RemoteErr},
+        repo::RepoErr,
+    };
+
+    match error {
+        ErrCtx::Repo(RepoErr::Remote(RemoteErr::PublicationUnconfirmed { .. })) => {
+            SdkErrorCode::RemotePublicationUnconfirmed
+        }
+        ErrCtx::Repo(RepoErr::Remote(RemoteErr::PublicationOutcomeUnknown { .. })) => {
+            SdkErrorCode::RemotePublicationOutcomeUnknown
+        }
+        ErrCtx::Repo(RepoErr::Remote(remote_error))
+            if remote_error.http_transport_kind() == Some(HttpTransportErrorKind::Timeout) =>
+        {
+            SdkErrorCode::RemoteTransportTimeout
+        }
+        _ => sdk_error_code_for_message(message),
+    }
 }
 
 fn sdk_error_code_for_message(message: &str) -> SdkErrorCode {
@@ -2698,6 +2726,45 @@ mod tests {
         assert!(!RepositoryOperation::RemoteConfigure.materializes_worktree());
         assert!(!RepositoryOperation::Push.materializes_worktree());
         assert!(!RepositoryOperation::Fetch.materializes_worktree());
+    }
+
+    #[test]
+    fn publication_outcomes_have_stable_sdk_error_codes() {
+        let transport_error = || graft::remote::RemoteErr::HttpStatus {
+            status: 503,
+            path: "refs/heads/main".to_string(),
+            message: "test transport stand-in".to_string(),
+        };
+        let unconfirmed = repository_command_error(ErrCtx::Repo(graft::repo::RepoErr::Remote(
+            graft::remote::RemoteErr::PublicationUnconfirmed {
+                path: "refs/heads/main".to_string(),
+                source: Box::new(transport_error()),
+            },
+        )));
+        assert_eq!(
+            unconfirmed.code(),
+            SdkErrorCode::RemotePublicationUnconfirmed
+        );
+        assert_eq!(
+            unconfirmed.code().as_str(),
+            "GRAFT_SDK_REMOTE_PUBLICATION_UNCONFIRMED"
+        );
+
+        let unknown = repository_command_error(ErrCtx::Repo(graft::repo::RepoErr::Remote(
+            graft::remote::RemoteErr::PublicationOutcomeUnknown {
+                path: "refs/heads/main".to_string(),
+                publication_error: Box::new(transport_error()),
+                reconciliation_error: Box::new(transport_error()),
+            },
+        )));
+        assert_eq!(
+            unknown.code(),
+            SdkErrorCode::RemotePublicationOutcomeUnknown
+        );
+        assert_eq!(
+            unknown.code().as_str(),
+            "GRAFT_SDK_REMOTE_PUBLICATION_OUTCOME_UNKNOWN"
+        );
     }
 
     #[test]

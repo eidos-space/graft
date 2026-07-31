@@ -45,6 +45,7 @@ const RECEIVE_BUNDLE_HEADER_MANIFEST_BYTES: &str = "x-graft-bundle-manifest-byte
 const MAX_UPLOAD_BUNDLE_MANIFEST_BYTES: usize = 64 * 1024;
 const MAX_UPLOAD_BUNDLE_OBJECTS: usize = 65_536;
 const MAX_UPLOAD_BUNDLE_PATH_BYTES: usize = 768;
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 static HTTP_REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 enum RemotePath<'a> {
@@ -76,8 +77,30 @@ pub enum RemoteErr {
     #[error("HTTP client setup error: {0}")]
     SetupHttp(#[from] reqwest::Error),
 
-    #[error("HTTP remote transport error: {0}")]
-    HttpTransport(reqwest::Error),
+    #[error("HTTP remote `{operation}` transport failed ({kind})")]
+    HttpTransport {
+        operation: &'static str,
+        kind: HttpTransportErrorKind,
+        #[source]
+        source: reqwest::Error,
+    },
+
+    #[error(
+        "remote publication for `{path}` was not confirmed; remote still has the expected ref and retry is safe"
+    )]
+    PublicationUnconfirmed {
+        path: String,
+        #[source]
+        source: Box<RemoteErr>,
+    },
+
+    #[error("remote publication outcome for `{path}` could not be confirmed")]
+    PublicationOutcomeUnknown {
+        path: String,
+        #[source]
+        publication_error: Box<RemoteErr>,
+        reconciliation_error: Box<RemoteErr>,
+    },
 
     #[error("upload-bundle filesystem error: {0}")]
     UploadBundleIo(#[from] std::io::Error),
@@ -106,6 +129,27 @@ pub enum RemoteErr {
 
     #[error("remote object `{path}` changed during compare-and-swap")]
     CompareAndSwap { path: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpTransportErrorKind {
+    Timeout,
+    Connect,
+    Request,
+    Body,
+    Other,
+}
+
+impl fmt::Display for HttpTransportErrorKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Timeout => "timeout",
+            Self::Connect => "connect",
+            Self::Request => "request",
+            Self::Body => "body",
+            Self::Other => "other",
+        })
+    }
 }
 
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
@@ -326,7 +370,13 @@ fn build_http_client() -> std::result::Result<reqwest::Client, reqwest::Error> {
         .http1_only()
         .hickory_dns(true)
         .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(30))
+        // Do not put a wall-clock deadline on the shared client. Reads attach
+        // their own bounded request timeout, while mutation uploads remain
+        // progress/cancellation driven like Git smart HTTP. A fixed total
+        // timeout incorrectly rejects healthy large pushes.
+        .tcp_keepalive(Duration::from_secs(30))
+        .tcp_keepalive_interval(Duration::from_secs(30))
+        .tcp_keepalive_retries(5)
         .build()
 }
 
@@ -339,6 +389,47 @@ fn valid_credential_remote_name(remote_name: &str) -> bool {
 }
 
 impl RemoteErr {
+    fn http_transport(operation: &'static str, source: reqwest::Error) -> Self {
+        let kind = if source.is_timeout() {
+            HttpTransportErrorKind::Timeout
+        } else if source.is_connect() {
+            HttpTransportErrorKind::Connect
+        } else if source.is_request() {
+            HttpTransportErrorKind::Request
+        } else if source.is_body() {
+            HttpTransportErrorKind::Body
+        } else {
+            HttpTransportErrorKind::Other
+        };
+        Self::HttpTransport { operation, kind, source }
+    }
+
+    pub fn http_transport_kind(&self) -> Option<HttpTransportErrorKind> {
+        match self {
+            Self::HttpTransport { kind, .. } => Some(*kind),
+            Self::PublicationUnconfirmed { source, .. } => source.http_transport_kind(),
+            Self::PublicationOutcomeUnknown { publication_error, .. } => {
+                publication_error.http_transport_kind()
+            }
+            _ => None,
+        }
+    }
+
+    pub fn publication_unconfirmed(&self) -> bool {
+        matches!(self, Self::PublicationUnconfirmed { .. })
+    }
+
+    pub fn publication_outcome_unknown(&self) -> bool {
+        matches!(self, Self::PublicationOutcomeUnknown { .. })
+    }
+
+    fn may_have_published(&self) -> bool {
+        matches!(
+            self,
+            Self::HttpTransport { .. } | Self::CompareAndSwap { .. }
+        )
+    }
+
     fn objectstore_err_kind(&self) -> Option<opendal::ErrorKind> {
         if let RemoteErr::ObjectStore(err) = self {
             Some(err.kind())
@@ -422,6 +513,7 @@ struct HttpRemote {
     client: reqwest::Client,
     probe_client: reqwest::Client,
     upload_client: reqwest::Client,
+    request_timeout: Duration,
     url: String,
     token: Option<BearerToken>,
 }
@@ -731,13 +823,17 @@ impl Remote {
     #[tracing::instrument(level = "trace", err(level = "debug"), skip(self))]
     pub async fn has_segment(&self, sid: &SegmentId) -> Result<bool> {
         let path = RemotePath::Segment(sid).build();
+        self.has_raw(&path).await
+    }
+
+    pub(crate) async fn has_raw(&self, path: &str) -> Result<bool> {
         match &self.backend {
-            RemoteBackend::ObjectStore(store) => match store.stat(&path).await {
+            RemoteBackend::ObjectStore(store) => match store.stat(path).await {
                 Ok(_) => Ok(true),
                 Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
                 Err(err) => Err(err.into()),
             },
-            RemoteBackend::Http(remote) => remote.has_raw(&path).await,
+            RemoteBackend::Http(remote) => remote.has_raw(path).await,
         }
     }
 
@@ -908,18 +1004,33 @@ impl Remote {
         if let (RemoteBackend::Http(remote), Some(pack)) = (&self.backend, pack.as_ref()) {
             match remote
                 .receive_pack(pack, ref_path, expected, replacement.clone())
-                .await?
+                .await
             {
-                HttpReceivePackResult::Published => return Ok(()),
-                HttpReceivePackResult::Unsupported | HttpReceivePackResult::RetryIndividually => {}
+                Ok(HttpReceivePackResult::Published) => return Ok(()),
+                Ok(
+                    HttpReceivePackResult::Unsupported | HttpReceivePackResult::RetryIndividually,
+                ) => {}
+                Err(err) => {
+                    return self
+                        .reconcile_publication_error(err, ref_path, expected, &replacement)
+                        .await;
+                }
             }
         }
 
         if let Some(pack) = pack.as_ref() {
             self.put_pack_objects(pack).await?;
         }
-        self.compare_and_swap_raw(ref_path, expected, replacement)
+        match self
+            .compare_and_swap_raw(ref_path, expected, replacement.clone())
             .await
+        {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                self.reconcile_publication_error(err, ref_path, expected, &replacement)
+                    .await
+            }
+        }
     }
 
     pub(crate) async fn publish_object_bundle_and_ref(
@@ -940,16 +1051,51 @@ impl Remote {
         if let (RemoteBackend::Http(remote), Some(pack)) = (&self.backend, pack.as_ref()) {
             match remote
                 .receive_bundle(&objects, pack, ref_path, expected, replacement.clone())
-                .await?
+                .await
             {
-                HttpReceivePackResult::Published => return Ok(()),
-                HttpReceivePackResult::Unsupported | HttpReceivePackResult::RetryIndividually => {}
+                Ok(HttpReceivePackResult::Published) => return Ok(()),
+                Ok(
+                    HttpReceivePackResult::Unsupported | HttpReceivePackResult::RetryIndividually,
+                ) => {}
+                Err(err) => {
+                    return self
+                        .reconcile_publication_error(err, ref_path, expected, &replacement)
+                        .await;
+                }
             }
         }
 
         self.put_bundle_objects(&objects).await?;
         self.publish_object_pack_and_ref(pack, ref_path, expected, replacement)
             .await
+    }
+
+    async fn reconcile_publication_error(
+        &self,
+        error: RemoteErr,
+        ref_path: &str,
+        expected: Option<&[u8]>,
+        replacement: &Bytes,
+    ) -> Result<()> {
+        if !error.may_have_published() {
+            return Err(error);
+        }
+
+        match self.get_raw(ref_path).await {
+            Ok(current) if current.as_ref() == Some(replacement) => Ok(()),
+            Ok(current) if current.as_ref().map(Bytes::as_ref) == expected => {
+                Err(RemoteErr::PublicationUnconfirmed {
+                    path: ref_path.to_string(),
+                    source: Box::new(error),
+                })
+            }
+            Ok(_) => Err(RemoteErr::CompareAndSwap { path: ref_path.to_string() }),
+            Err(reconciliation_error) => Err(RemoteErr::PublicationOutcomeUnknown {
+                path: ref_path.to_string(),
+                publication_error: Box::new(error),
+                reconciliation_error: Box::new(reconciliation_error),
+            }),
+        }
     }
 
     async fn put_bundle_objects(&self, objects: &[RemoteBundleObject]) -> Result<()> {
@@ -1119,10 +1265,29 @@ impl HttpRemote {
         probe_client: reqwest::Client,
         upload_client: reqwest::Client,
     ) -> Self {
+        Self::with_clients_and_request_timeout(
+            url,
+            token,
+            client,
+            probe_client,
+            upload_client,
+            HTTP_REQUEST_TIMEOUT,
+        )
+    }
+
+    fn with_clients_and_request_timeout(
+        url: String,
+        token: Option<BearerToken>,
+        client: reqwest::Client,
+        probe_client: reqwest::Client,
+        upload_client: reqwest::Client,
+        request_timeout: Duration,
+    ) -> Self {
         Self {
             client,
             probe_client,
             upload_client,
+            request_timeout,
             url: url.trim_end_matches('/').to_string(),
             token,
         }
@@ -1147,6 +1312,11 @@ impl HttpRemote {
 
     fn request(&self, method: reqwest::Method, url: String) -> reqwest::RequestBuilder {
         self.request_with(&self.client, method, url)
+            .timeout(self.request_timeout)
+    }
+
+    fn publication_request(&self, method: reqwest::Method, url: String) -> reqwest::RequestBuilder {
+        self.request_with(&self.client, method, url)
     }
 
     fn upload_request(&self, method: reqwest::Method, url: String) -> reqwest::RequestBuilder {
@@ -1155,6 +1325,7 @@ impl HttpRemote {
 
     fn probe_request(&self, method: reqwest::Method, url: String) -> reqwest::RequestBuilder {
         self.request_with(&self.probe_client, method, url)
+            .timeout(self.request_timeout)
     }
 
     fn request_with(
@@ -1215,7 +1386,7 @@ impl HttpRemote {
                     response_bytes: None,
                     server_timings: &[],
                 });
-                Err(RemoteErr::HttpTransport(err))
+                Err(RemoteErr::http_transport(operation, err))
             }
         }
     }
@@ -1246,8 +1417,8 @@ impl HttpRemote {
     }
 
     async fn check_response(response: reqwest::Response, path: &str) -> Result<reqwest::Response> {
-        Self::check_protocol(&response, path)?;
         if response.status().is_success() {
+            Self::check_protocol(&response, path)?;
             return Ok(response);
         }
         let status = response.status().as_u16();
@@ -1273,9 +1444,13 @@ impl HttpRemote {
         let status = response.status().as_u16();
         match status {
             404 => {
-                Self::check_protocol(&response, path)?;
-                drop(response);
-                Ok(false)
+                if Self::check_protocol(&response, path).is_ok() {
+                    drop(response);
+                    Ok(false)
+                } else {
+                    Self::check_response(response, path).await?;
+                    unreachable!("an HTTP 404 cannot pass response validation")
+                }
             }
             405 | 501 => {
                 drop(response);
@@ -1297,26 +1472,33 @@ impl HttpRemote {
                 Some(0),
             )
             .await?;
-        Self::check_protocol(&response, path)?;
         let status = response.status().as_u16();
         match status {
             200 | 206 => {
+                Self::check_protocol(&response, path)?;
                 drop(response);
                 Ok(true)
             }
             404 => {
-                drop(response);
-                Ok(false)
+                if Self::check_protocol(&response, path).is_ok() {
+                    drop(response);
+                    Ok(false)
+                } else {
+                    Self::check_response(response, path).await?;
+                    unreachable!("an HTTP 404 cannot pass response validation")
+                }
             }
             416 if response
                 .headers()
                 .get(reqwest::header::CONTENT_RANGE)
                 .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"bytes */0")) =>
             {
+                Self::check_protocol(&response, path)?;
                 drop(response);
                 Ok(true)
             }
             200..=299 => {
+                Self::check_protocol(&response, path)?;
                 drop(response);
                 Err(RemoteErr::HttpStatus {
                     status,
@@ -1345,20 +1527,23 @@ impl HttpRemote {
             )
             .await?;
         if response.status().as_u16() == 404 {
-            Self::check_protocol(&response, path)?;
-            Self::drain_response(response).await?;
-            return Ok(None);
+            if Self::check_protocol(&response, path).is_ok() {
+                Self::drain_response(response).await?;
+                return Ok(None);
+            }
+            Self::check_response(response, path).await?;
+            unreachable!("an HTTP 404 cannot pass response validation")
         }
         let response = Self::check_response(response, path).await?;
-        Ok(Some(
-            response.bytes().await.map_err(RemoteErr::HttpTransport)?,
-        ))
+        Ok(Some(response.bytes().await.map_err(|err| {
+            RemoteErr::http_transport("get_body", err)
+        })?))
     }
 
     async fn drain_response(response: reqwest::Response) -> Result<()> {
         let mut body = response.bytes_stream();
         while let Some(chunk) = body.next().await {
-            chunk.map_err(RemoteErr::HttpTransport)?;
+            chunk.map_err(|err| RemoteErr::http_transport("drain_body", err))?;
         }
         Ok(())
     }
@@ -1384,7 +1569,10 @@ impl HttpRemote {
             )
             .await?;
         let response = Self::check_response(response, path).await?;
-        response.bytes().await.map_err(RemoteErr::HttpTransport)
+        response
+            .bytes()
+            .await
+            .map_err(|err| RemoteErr::http_transport("range_get_body", err))
     }
 
     async fn list_raw(&self, prefix: &str) -> Result<Vec<String>> {
@@ -1404,7 +1592,10 @@ impl HttpRemote {
                 )
                 .await?;
             let response = Self::check_response(response, prefix).await?;
-            let bytes = response.bytes().await.map_err(RemoteErr::HttpTransport)?;
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(|err| RemoteErr::http_transport("list_body", err))?;
             let page: HttpListResponse =
                 serde_json::from_slice(&bytes).map_err(|err| RemoteErr::HttpStatus {
                     status: 502,
@@ -1445,8 +1636,9 @@ impl HttpRemote {
                 Some(0),
             )
             .await?;
-        Self::check_protocol(&response, ref_path)?;
-        if matches!(response.status().as_u16(), 404 | 405) {
+        if matches!(response.status().as_u16(), 404 | 405)
+            && Self::check_protocol(&response, ref_path).is_ok()
+        {
             Self::drain_response(response).await?;
             return Ok(UploadBundleOutcome::Unsupported);
         }
@@ -1595,8 +1787,9 @@ impl HttpRemote {
                 Some(content_length as u64),
             )
             .await?;
-        Self::check_protocol(&response, ref_path)?;
-        if matches!(response.status().as_u16(), 404 | 405) {
+        if matches!(response.status().as_u16(), 404 | 405)
+            && Self::check_protocol(&response, ref_path).is_ok()
+        {
             Self::drain_response(response).await?;
             return Ok(HttpReceivePackResult::Unsupported);
         }
@@ -1669,7 +1862,7 @@ impl HttpRemote {
                 // A receive-bundle is the only mutation after the ref read in the fast path.
                 // Reuse that connection like Git smart HTTP; legacy PUTs and fallbacks retain
                 // the isolated upload pool because mixed proxy traffic previously stalled.
-                self.request(
+                self.publication_request(
                     reqwest::Method::POST,
                     self.raw_url("receive-bundle", ref_path),
                 )
@@ -1692,13 +1885,20 @@ impl HttpRemote {
                 Some(content_length as u64),
             )
             .await?;
-        Self::check_protocol(&response, ref_path)?;
         match response.status().as_u16() {
-            404 | 405 => {
+            413 => {
+                // An edge proxy can reject the aggregate body before it reaches
+                // Graft, so this response is not expected to carry Graft-Protocol.
+                // Retry through immutable per-object writes, then publish the pack
+                // and ref with the normal receive-pack/CAS path.
+                Self::drain_response(response).await?;
+                return Ok(HttpReceivePackResult::RetryIndividually);
+            }
+            404 | 405 if Self::check_protocol(&response, ref_path).is_ok() => {
                 Self::drain_response(response).await?;
                 return Ok(HttpReceivePackResult::Unsupported);
             }
-            412 => {
+            412 if Self::check_protocol(&response, ref_path).is_ok() => {
                 Self::drain_response(response).await?;
                 return Ok(HttpReceivePackResult::RetryIndividually);
             }
@@ -1837,7 +2037,9 @@ impl HttpDownloadBody {
             match self.stream.next().await {
                 Some(Ok(bytes)) if bytes.is_empty() => {}
                 Some(Ok(bytes)) => return Ok(Some(bytes)),
-                Some(Err(err)) => return Err(RemoteErr::HttpTransport(err)),
+                Some(Err(err)) => {
+                    return Err(RemoteErr::http_transport("upload_bundle_body", err));
+                }
                 None => return Ok(None),
             }
         }
@@ -2190,6 +2392,45 @@ mod tests {
         (format!("http://{address}/org/repo"), task)
     }
 
+    async fn serve_lost_publication_response(
+        reconciled_ref: Option<&[u8]>,
+    ) -> (String, tokio::task::JoinHandle<Vec<Vec<u8>>>) {
+        let reconciled_ref = reconciled_ref.map(ToOwned::to_owned);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut publication_stream, _) = listener.accept().await.unwrap();
+            let publication = read_http_request(&mut publication_stream).await;
+            drop(publication_stream);
+
+            let (mut reconciliation_stream, _) = listener.accept().await.unwrap();
+            let reconciliation = read_http_request(&mut reconciliation_stream).await;
+            match reconciled_ref {
+                Some(value) => {
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\nGraft-Protocol: 1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        value.len()
+                    );
+                    reconciliation_stream
+                        .write_all(headers.as_bytes())
+                        .await
+                        .unwrap();
+                    reconciliation_stream.write_all(&value).await.unwrap();
+                }
+                None => {
+                    reconciliation_stream
+                        .write_all(
+                            b"HTTP/1.1 404 Not Found\r\nGraft-Protocol: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+            vec![publication, reconciliation]
+        });
+        (format!("http://{address}/org/repo"), task)
+    }
+
     async fn serve_upload_bundle(
         manifest: serde_json::Value,
         objects: &[(&str, &[u8])],
@@ -2441,6 +2682,131 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn receive_pack_reconciles_a_lost_success_response_from_the_remote_ref() {
+        let (url, requests) = serve_lost_publication_response(Some(b"new\n")).await;
+        let remote = RemoteConfig::Http { url, token_env: None }.build().unwrap();
+
+        remote
+            .publish_object_pack_and_ref(
+                Some(RemoteObjectPack::new(
+                    "9".repeat(64),
+                    Bytes::from_static(b"pack"),
+                    Bytes::from_static(b"idx"),
+                )),
+                "refs/heads/main",
+                Some(b"old\n"),
+                "new\n",
+            )
+            .await
+            .unwrap();
+
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            String::from_utf8_lossy(&requests[0])
+                .starts_with("POST /org/repo/receive-pack/refs/heads/main ")
+        );
+        assert!(
+            String::from_utf8_lossy(&requests[1]).starts_with("GET /org/repo/raw/refs/heads/main ")
+        );
+    }
+
+    #[tokio::test]
+    async fn receive_pack_treats_an_identical_concurrent_publication_as_success() {
+        let responses = [
+            "HTTP/1.1 409 Conflict\r\nGraft-Protocol: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nGraft-Protocol: 1\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnew\n",
+        ];
+        let (url, requests) = serve_http_messages(&responses).await;
+        let remote = RemoteConfig::Http { url, token_env: None }.build().unwrap();
+
+        remote
+            .publish_object_pack_and_ref(
+                Some(RemoteObjectPack::new(
+                    "7".repeat(64),
+                    Bytes::from_static(b"pack"),
+                    Bytes::from_static(b"idx"),
+                )),
+                "refs/heads/main",
+                Some(b"old\n"),
+                "new\n",
+            )
+            .await
+            .unwrap();
+
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            String::from_utf8_lossy(&requests[1]).starts_with("GET /org/repo/raw/refs/heads/main ")
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_cas_reconciles_a_lost_success_response_from_the_remote_ref() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for status in ["404 Not Found", "204 No Content", "204 No Content"] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                requests.push(read_http_request(&mut stream).await);
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nGraft-Protocol: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+
+            let (mut cas_stream, _) = listener.accept().await.unwrap();
+            requests.push(read_http_request(&mut cas_stream).await);
+            drop(cas_stream);
+
+            let (mut reconciliation_stream, _) = listener.accept().await.unwrap();
+            requests.push(read_http_request(&mut reconciliation_stream).await);
+            reconciliation_stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nGraft-Protocol: 1\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnew\n",
+                )
+                .await
+                .unwrap();
+            requests
+        });
+        let remote = RemoteConfig::Http {
+            url: format!("http://{address}/org/repo"),
+            token_env: None,
+        }
+        .build()
+        .unwrap();
+
+        remote
+            .publish_object_pack_and_ref(
+                Some(RemoteObjectPack::new(
+                    "8".repeat(64),
+                    Bytes::from_static(b"pack"),
+                    Bytes::from_static(b"idx"),
+                )),
+                "refs/heads/main",
+                Some(b"old\n"),
+                "new\n",
+            )
+            .await
+            .unwrap();
+
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 5);
+        assert!(
+            String::from_utf8_lossy(&requests[0])
+                .starts_with("POST /org/repo/receive-pack/refs/heads/main ")
+        );
+        assert!(
+            String::from_utf8_lossy(&requests[3])
+                .starts_with("POST /org/repo/cas/refs/heads/main ")
+        );
+        assert!(
+            String::from_utf8_lossy(&requests[4]).starts_with("GET /org/repo/raw/refs/heads/main ")
+        );
+    }
+
+    #[tokio::test]
     async fn receive_bundle_publishes_extra_objects_pack_index_and_ref_in_one_request() {
         let (url, requests) = serve_http_exchanges(&["204 No Content"]).await;
         let remote = RemoteConfig::Http { url, token_env: None }.build().unwrap();
@@ -2492,6 +2858,288 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn receive_bundle_is_not_bounded_by_the_read_request_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 204 No Content\r\nGraft-Protocol: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            request
+        });
+        let client = build_http_client().unwrap();
+        let remote = Remote {
+            backend: RemoteBackend::Http(HttpRemote::with_clients_and_request_timeout(
+                format!("http://{address}/org/repo"),
+                None,
+                client.clone(),
+                client.clone(),
+                client,
+                Duration::from_millis(25),
+            )),
+        };
+        let payload = Bytes::from(vec![7_u8; 2 * 1024 * 1024]);
+
+        remote
+            .publish_object_bundle_and_ref(
+                vec![
+                    RemoteBundleObject::new("segments/slow".to_string(), [payload.clone()], true)
+                        .unwrap(),
+                ],
+                Some(RemoteObjectPack::new(
+                    "f".repeat(64),
+                    Bytes::from_static(b"pack"),
+                    Bytes::from_static(b"idx"),
+                )),
+                "refs/heads/main",
+                None,
+                "new\n",
+            )
+            .await
+            .unwrap();
+
+        let request = server.await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&request)
+                .starts_with("POST /org/repo/receive-bundle/refs/heads/main ")
+        );
+        assert_eq!(
+            http_request_body(&request).len(),
+            payload.len()
+                + b"packidx".len()
+                + serde_json::to_vec(&serde_json::json!({
+                    "version": 1,
+                    "objects": [{
+                        "path": "segments/slow",
+                        "bytes": payload.len(),
+                        "allow_existing": true,
+                    }],
+                }))
+                .unwrap()
+                .len()
+        );
+    }
+
+    #[tokio::test]
+    async fn receive_bundle_reconciles_a_lost_success_response_from_the_remote_ref() {
+        let (url, requests) = serve_lost_publication_response(Some(b"new\n")).await;
+        let remote = RemoteConfig::Http { url, token_env: None }.build().unwrap();
+
+        remote
+            .publish_object_bundle_and_ref(
+                vec![
+                    RemoteBundleObject::new(
+                        "segments/example".to_string(),
+                        [Bytes::from_static(b"segment")],
+                        true,
+                    )
+                    .unwrap(),
+                ],
+                Some(RemoteObjectPack::new(
+                    "1".repeat(64),
+                    Bytes::from_static(b"pack"),
+                    Bytes::from_static(b"idx"),
+                )),
+                "refs/heads/main",
+                Some(b"old\n"),
+                "new\n",
+            )
+            .await
+            .unwrap();
+
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            String::from_utf8_lossy(&requests[0])
+                .starts_with("POST /org/repo/receive-bundle/refs/heads/main ")
+        );
+        assert!(
+            String::from_utf8_lossy(&requests[1]).starts_with("GET /org/repo/raw/refs/heads/main ")
+        );
+    }
+
+    #[tokio::test]
+    async fn receive_bundle_reconciles_a_timed_out_response_from_the_remote_ref() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut publication_stream, _) = listener.accept().await.unwrap();
+            let publication = read_http_request(&mut publication_stream).await;
+
+            let (mut reconciliation_stream, _) = listener.accept().await.unwrap();
+            let reconciliation = read_http_request(&mut reconciliation_stream).await;
+            reconciliation_stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nGraft-Protocol: 1\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnew\n",
+                )
+                .await
+                .unwrap();
+            drop(publication_stream);
+            vec![publication, reconciliation]
+        });
+        let timed_publication_client = reqwest::ClientBuilder::new()
+            .http1_only()
+            .connect_timeout(Duration::from_secs(1))
+            .timeout(Duration::from_millis(25))
+            .build()
+            .unwrap();
+        let fallback_client = build_http_client().unwrap();
+        let remote = Remote {
+            backend: RemoteBackend::Http(HttpRemote::with_clients_and_request_timeout(
+                format!("http://{address}/org/repo"),
+                None,
+                timed_publication_client,
+                fallback_client.clone(),
+                fallback_client,
+                Duration::from_secs(1),
+            )),
+        };
+
+        remote
+            .publish_object_bundle_and_ref(
+                vec![
+                    RemoteBundleObject::new(
+                        "segments/example".to_string(),
+                        [Bytes::from_static(b"segment")],
+                        true,
+                    )
+                    .unwrap(),
+                ],
+                Some(RemoteObjectPack::new(
+                    "5".repeat(64),
+                    Bytes::from_static(b"pack"),
+                    Bytes::from_static(b"idx"),
+                )),
+                "refs/heads/main",
+                Some(b"old\n"),
+                "new\n",
+            )
+            .await
+            .unwrap();
+
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            String::from_utf8_lossy(&requests[1]).starts_with("GET /org/repo/raw/refs/heads/main ")
+        );
+    }
+
+    #[tokio::test]
+    async fn receive_bundle_reports_retryable_unconfirmed_when_remote_ref_is_unchanged() {
+        let (url, requests) = serve_lost_publication_response(Some(b"old\n")).await;
+        let remote = RemoteConfig::Http { url, token_env: None }.build().unwrap();
+
+        let error = remote
+            .publish_object_bundle_and_ref(
+                vec![
+                    RemoteBundleObject::new(
+                        "segments/example".to_string(),
+                        [Bytes::from_static(b"segment")],
+                        true,
+                    )
+                    .unwrap(),
+                ],
+                Some(RemoteObjectPack::new(
+                    "2".repeat(64),
+                    Bytes::from_static(b"pack"),
+                    Bytes::from_static(b"idx"),
+                )),
+                "refs/heads/main",
+                Some(b"old\n"),
+                "new\n",
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.publication_unconfirmed(), "{error:?}");
+        assert_eq!(requests.await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn receive_bundle_reports_conflict_when_reconciliation_finds_another_ref() {
+        let (url, requests) = serve_lost_publication_response(Some(b"other\n")).await;
+        let remote = RemoteConfig::Http { url, token_env: None }.build().unwrap();
+
+        let error = remote
+            .publish_object_bundle_and_ref(
+                vec![
+                    RemoteBundleObject::new(
+                        "segments/example".to_string(),
+                        [Bytes::from_static(b"segment")],
+                        true,
+                    )
+                    .unwrap(),
+                ],
+                Some(RemoteObjectPack::new(
+                    "3".repeat(64),
+                    Bytes::from_static(b"pack"),
+                    Bytes::from_static(b"idx"),
+                )),
+                "refs/heads/main",
+                Some(b"old\n"),
+                "new\n",
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, RemoteErr::CompareAndSwap { .. }),
+            "{error:?}"
+        );
+        assert_eq!(requests.await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn receive_bundle_preserves_unknown_outcome_when_reconciliation_also_fails() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                read_http_request(&mut stream).await;
+                drop(stream);
+            }
+        });
+        let remote = RemoteConfig::Http {
+            url: format!("http://{address}/org/repo"),
+            token_env: None,
+        }
+        .build()
+        .unwrap();
+
+        let error = remote
+            .publish_object_bundle_and_ref(
+                vec![
+                    RemoteBundleObject::new(
+                        "segments/example".to_string(),
+                        [Bytes::from_static(b"segment")],
+                        true,
+                    )
+                    .unwrap(),
+                ],
+                Some(RemoteObjectPack::new(
+                    "4".repeat(64),
+                    Bytes::from_static(b"pack"),
+                    Bytes::from_static(b"idx"),
+                )),
+                "refs/heads/main",
+                Some(b"old\n"),
+                "new\n",
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.publication_outcome_unknown(), "{error:?}");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn receive_bundle_falls_back_to_objects_then_receive_pack() {
         let (url, requests) =
             serve_http_exchanges(&["404 Not Found", "204 No Content", "204 No Content"]).await;
@@ -2533,6 +3181,220 @@ mod tests {
         assert!(request_lines[0].starts_with("POST /org/repo/receive-bundle/"));
         assert!(request_lines[1].starts_with("PUT /org/repo/raw-if-not-exists/segments/example"));
         assert!(request_lines[2].starts_with("POST /org/repo/receive-pack/"));
+    }
+
+    #[tokio::test]
+    async fn receive_bundle_fallback_accepts_an_allow_existing_put_race() {
+        let responses = [
+            "HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 412 Precondition Failed\r\nGraft-Protocol: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 204 No Content\r\nGraft-Protocol: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        ];
+        let (url, requests) = serve_http_messages(&responses).await;
+        let remote = RemoteConfig::Http { url, token_env: None }.build().unwrap();
+
+        remote
+            .publish_object_bundle_and_ref(
+                vec![
+                    RemoteBundleObject::new(
+                        "segments/example".to_string(),
+                        [Bytes::from_static(b"segment")],
+                        true,
+                    )
+                    .unwrap(),
+                ],
+                Some(RemoteObjectPack::new(
+                    "e".repeat(64),
+                    Bytes::from_static(b"pack"),
+                    Bytes::from_static(b"idx"),
+                )),
+                "refs/heads/main",
+                None,
+                "new\n",
+            )
+            .await
+            .unwrap();
+
+        let request_lines = requests
+            .await
+            .unwrap()
+            .iter()
+            .map(|request| {
+                String::from_utf8_lossy(request)
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        assert!(request_lines[0].starts_with("POST /org/repo/receive-bundle/"));
+        assert!(request_lines[1].starts_with("PUT /org/repo/raw-if-not-exists/segments/example"));
+        assert!(request_lines[2].starts_with("POST /org/repo/receive-pack/"));
+    }
+
+    #[tokio::test]
+    async fn receive_bundle_preserves_edge_statuses_without_protocol_headers() {
+        for (response_status, expected_status) in [
+            ("401 Unauthorized", 401),
+            ("403 Forbidden", 403),
+            ("502 Bad Gateway", 502),
+        ] {
+            let response = format!(
+                "HTTP/1.1 {response_status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let (url, requests) = serve_http_messages(&[&response]).await;
+            let remote = RemoteConfig::Http { url, token_env: None }.build().unwrap();
+
+            let error = remote
+                .publish_object_bundle_and_ref(
+                    vec![
+                        RemoteBundleObject::new(
+                            "segments/example".to_string(),
+                            [Bytes::from_static(b"segment")],
+                            true,
+                        )
+                        .unwrap(),
+                    ],
+                    Some(RemoteObjectPack::new(
+                        "f".repeat(64),
+                        Bytes::from_static(b"pack"),
+                        Bytes::from_static(b"idx"),
+                    )),
+                    "refs/heads/main",
+                    None,
+                    "new\n",
+                )
+                .await
+                .unwrap_err();
+
+            assert!(
+                matches!(error, RemoteErr::HttpStatus { status, .. } if status == expected_status),
+                "{error:?}"
+            );
+            assert_eq!(requests.await.unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn receive_bundle_preserves_payload_too_large_for_an_individual_object() {
+        let responses = [
+            "HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        ];
+        let (url, requests) = serve_http_messages(&responses).await;
+        let remote = RemoteConfig::Http { url, token_env: None }.build().unwrap();
+
+        let error = remote
+            .publish_object_bundle_and_ref(
+                vec![
+                    RemoteBundleObject::new(
+                        "segments/example".to_string(),
+                        [Bytes::from_static(b"segment")],
+                        true,
+                    )
+                    .unwrap(),
+                ],
+                Some(RemoteObjectPack::new(
+                    "1".repeat(64),
+                    Bytes::from_static(b"pack"),
+                    Bytes::from_static(b"idx"),
+                )),
+                "refs/heads/main",
+                None,
+                "new\n",
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, RemoteErr::HttpStatus { status: 413, .. }),
+            "{error:?}"
+        );
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            String::from_utf8_lossy(&requests[1])
+                .starts_with("PUT /org/repo/raw-if-not-exists/segments/example")
+        );
+    }
+
+    #[tokio::test]
+    async fn receive_bundle_fallback_reconciles_a_lost_receive_pack_response() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+
+            let (mut bundle_stream, _) = listener.accept().await.unwrap();
+            requests.push(read_http_request(&mut bundle_stream).await);
+            bundle_stream
+                .write_all(
+                    b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+
+            let (mut object_stream, _) = listener.accept().await.unwrap();
+            requests.push(read_http_request(&mut object_stream).await);
+            object_stream
+                .write_all(
+                    b"HTTP/1.1 204 No Content\r\nGraft-Protocol: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+
+            let (mut publication_stream, _) = listener.accept().await.unwrap();
+            requests.push(read_http_request(&mut publication_stream).await);
+            drop(publication_stream);
+
+            let (mut reconciliation_stream, _) = listener.accept().await.unwrap();
+            requests.push(read_http_request(&mut reconciliation_stream).await);
+            reconciliation_stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nGraft-Protocol: 1\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnew\n",
+                )
+                .await
+                .unwrap();
+            requests
+        });
+        let remote = RemoteConfig::Http {
+            url: format!("http://{address}/org/repo"),
+            token_env: None,
+        }
+        .build()
+        .unwrap();
+
+        remote
+            .publish_object_bundle_and_ref(
+                vec![
+                    RemoteBundleObject::new(
+                        "segments/example".to_string(),
+                        [Bytes::from_static(b"segment")],
+                        true,
+                    )
+                    .unwrap(),
+                ],
+                Some(RemoteObjectPack::new(
+                    "2".repeat(64),
+                    Bytes::from_static(b"pack"),
+                    Bytes::from_static(b"idx"),
+                )),
+                "refs/heads/main",
+                Some(b"old\n"),
+                "new\n",
+            )
+            .await
+            .unwrap();
+
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 4);
+        assert!(
+            String::from_utf8_lossy(&requests[2])
+                .starts_with("POST /org/repo/receive-pack/refs/heads/main ")
+        );
+        assert!(
+            String::from_utf8_lossy(&requests[3]).starts_with("GET /org/repo/raw/refs/heads/main ")
+        );
     }
 
     #[tokio::test]
@@ -2941,7 +3803,7 @@ mod tests {
         let remote = HttpRemote::new(url, None).unwrap();
         assert!(matches!(
             remote.has_raw("objects/one").await,
-            Err(RemoteErr::HttpProtocolMismatch { received: None, .. })
+            Err(RemoteErr::HttpStatus { status: 404, .. })
         ));
         request.await.unwrap();
 
@@ -3068,7 +3930,7 @@ mod tests {
 
         assert!(matches!(
             remote.has_raw("segments/example").await,
-            Err(RemoteErr::HttpTransport(_))
+            Err(RemoteErr::HttpTransport { .. })
         ));
         let (request, no_retry) = server.await.unwrap();
         assert!(String::from_utf8_lossy(&request).starts_with("HEAD "));
@@ -3097,7 +3959,7 @@ mod tests {
 
         assert!(matches!(
             remote.has_raw("segments/example").await,
-            Err(RemoteErr::HttpTransport(_))
+            Err(RemoteErr::HttpTransport { .. })
         ));
         server.await.unwrap();
     }

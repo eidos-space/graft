@@ -185,10 +185,9 @@ impl Repository {
         stop_at: Option<&str>,
     ) -> Result<PreparedObjectPush> {
         let negotiation_trace = crate::trace::PushTraceSpan::new("object_negotiation");
-        let remote_objects = if stop_at.is_some() {
-            BTreeSet::new()
-        } else {
-            self.remote_object_ids(remote)?
+        let remote_objects = match stop_at {
+            Some(stop_at) => self.advertised_remote_object_ids(stop_at)?,
+            None => self.remote_object_ids(remote)?,
         };
         negotiation_trace.finish(&[("remote_objects", remote_objects.len() as u64)]);
         let discovery_trace = crate::trace::PushTraceSpan::new("object_discovery_and_hash");
@@ -247,19 +246,71 @@ impl Repository {
         let count = commits.len();
         let object_count = objects.len() as u64;
         let external_count = external_payloads.len() as u64;
-        let external_bytes = external_payloads.values().copied().sum();
         discovery_trace.finish(&[
             ("commits", count as u64),
             ("objects", object_count),
             ("external_payloads", external_count),
         ]);
+        let payload_negotiation_trace =
+            crate::trace::PushTraceSpan::new("external_payload_negotiation");
+        let external_payloads =
+            self.missing_remote_large_file_payloads(remote, external_payloads)?;
+        let missing_external_count = external_payloads.len() as u64;
+        let missing_external_bytes = external_payloads.values().copied().sum();
+        payload_negotiation_trace.finish(&[
+            ("candidates", external_count),
+            ("existing", external_count - missing_external_count),
+            ("missing", missing_external_count),
+        ]);
         let large_file_trace = crate::trace::PushTraceSpan::new("large_file_prepare");
         let bundle_objects = self.prepare_large_file_contents(external_payloads)?;
-        large_file_trace.finish(&[("objects", external_count), ("bytes", external_bytes)]);
+        large_file_trace.finish(&[
+            ("objects", missing_external_count),
+            ("bytes", missing_external_bytes),
+        ]);
         let pack_trace = crate::trace::PushTraceSpan::new("object_pack_build");
         let pack = self.prepare_object_pack(objects)?;
         pack_trace.finish(&[("objects", object_count)]);
         Ok(PreparedObjectPush { commits: count, pack, bundle_objects })
+    }
+
+    fn advertised_remote_object_ids(&self, stop_at: &str) -> Result<BTreeSet<object::ObjectId>> {
+        let stop_at = object::ObjectId::from_str(stop_at)?;
+        if self.object_store().read_raw(&stop_at)?.is_none() {
+            return Ok(BTreeSet::new());
+        }
+
+        let mut objects = BTreeMap::new();
+        let mut external_payloads = BTreeMap::new();
+        self.collect_object_graph_for_pack(
+            &stop_at,
+            &BTreeSet::new(),
+            &mut objects,
+            &mut external_payloads,
+        )?;
+        Ok(objects.into_keys().collect())
+    }
+
+    fn missing_remote_large_file_payloads(
+        &self,
+        remote: &crate::remote::Remote,
+        external_payloads: BTreeMap<object::ObjectId, u64>,
+    ) -> Result<BTreeMap<object::ObjectId, u64>> {
+        let missing = block_on_remote(async {
+            stream::iter(external_payloads)
+                .map(|(id, size)| async move {
+                    let path = large_file_content_relative_path(&id);
+                    let exists = remote.has_raw(&path).await?;
+                    Ok::<_, RemoteErr>((id, size, exists))
+                })
+                .buffer_unordered(REMOTE_EXTERNAL_PAYLOAD_PROBE_CONCURRENCY)
+                .try_filter_map(
+                    |(id, size, exists)| async move { Ok((!exists).then_some((id, size))) },
+                )
+                .try_collect::<Vec<_>>()
+                .await
+        })?;
+        Ok(missing.into_iter().collect())
     }
 
     pub(super) fn commit_ancestors_inclusive(&self, head: &str) -> Result<BTreeSet<String>> {

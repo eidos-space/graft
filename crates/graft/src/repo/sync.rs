@@ -388,9 +388,8 @@ impl Repository {
             remote_head_raw.as_deref(),
             format!("{head}\n"),
         ));
-        publication_trace.finish(&[]);
         match publication {
-            Ok(()) => {}
+            Ok(()) => publication_trace.finish(&[]),
             Err(RepoErr::Remote(RemoteErr::CompareAndSwap { .. } | RemoteErr::LockBusy { .. })) => {
                 return Err(RepoErr::RemoteRefChanged {
                     remote: remote.to_string(),

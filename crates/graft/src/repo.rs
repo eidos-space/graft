@@ -9,7 +9,7 @@ use std::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(unix)]
@@ -142,6 +142,10 @@ pub fn cancellation_checkpoint() -> Result<()> {
     Ok(())
 }
 
+fn active_cancellation_token() -> Option<CancellationToken> {
+    ACTIVE_CANCELLATION.with(|active| active.borrow().clone())
+}
+
 const CONFIG_FILE: &str = "config.toml";
 const HEAD_FILE: &str = "HEAD";
 const MERGE_HEAD_FILE: &str = "MERGE_HEAD";
@@ -161,6 +165,7 @@ const DIR_LOGS_HEAD: &str = "logs/HEAD";
 const SQLITE_DATABASE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
 const CONTENT_CLASS_SAMPLE_BYTES: usize = 8192;
 const REMOTE_REF_READ_CONCURRENCY: usize = 5;
+const REMOTE_EXTERNAL_PAYLOAD_PROBE_CONCURRENCY: usize = 5;
 const REMOTE_OBJECT_PACK_VERSION: u32 = 1;
 const REMOTE_OBJECT_PACK_MAGIC: &[u8] = b"graft-object-pack-v1\n";
 
@@ -2194,11 +2199,23 @@ fn block_on_remote<T>(
                     .build()?,
             );
         }
-        Ok(runtime
-            .as_ref()
-            .expect("runtime initialized")
-            .block_on(future)?)
+        let runtime = runtime.as_ref().expect("runtime initialized");
+        if let Some(cancellation) = active_cancellation_token() {
+            return runtime.block_on(async {
+                tokio::select! {
+                    result = future => Ok(result?),
+                    () = wait_for_cancellation(cancellation) => Err(RepoErr::Cancelled),
+                }
+            });
+        }
+        Ok(runtime.block_on(future)?)
     })
+}
+
+async fn wait_for_cancellation(cancellation: CancellationToken) {
+    while !cancellation.is_cancelled() {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
 
 fn parse_remote_ref(path: &str, bytes: bytes::Bytes) -> Result<String> {
