@@ -275,10 +275,12 @@ const diff = page.parent
 New UI code should use `diffSqlitePaths({ mode: "summary" })` when a database path is expanded,
 then `mode: "rows"` only after a table is opened. `rowLimit` is independent of the path `limit`;
 `rowAfter` is opaque and must be passed back unchanged. Rowid tables use a leaf-at-a-time streaming
-merge and stop after the requested page plus one lookahead change. `WITHOUT ROWID` tables and
-non-native SQLite page sizes use a `materialized_compat` path; their response remains bounded but
-snapshot materialization can still be proportional to database size. The file and aggregate
-telemetry report `rows_scanned`, `rows_returned`, `truncated`, and `response_scope`.
+merge and stop after the requested page plus one lookahead change. Native-page-size `STRICT
+WITHOUT ROWID` tables with ascending `TEXT` or `INTEGER` primary keys and BINARY collation
+use the same bounded model in primary-key order. Other `WITHOUT ROWID` layouts and non-native
+SQLite page sizes use a `materialized_compat` path; their response remains bounded but snapshot
+materialization can still be proportional to database size. The file and aggregate telemetry
+report `rows_scanned`, `rows_returned`, `truncated`, and `response_scope`.
 Row cursors are stable for immutable revision comparisons. If the worktree changes while a caller
 is paging its live diff, restart from the first page after observing a new status `change_token`.
 

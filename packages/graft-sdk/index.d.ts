@@ -366,7 +366,12 @@ export interface BoundedSqliteDiffFile {
     rows_scanned: number
     rows_returned: number
     truncated: boolean
-    response_scope: "streaming_rowid" | "materialized_compat" | "unavailable"
+    response_scope:
+      | "streaming_rowid"
+      | "streaming_primary_key"
+      | "streaming_btree"
+      | "materialized_compat"
+      | "unavailable"
   }
 }
 

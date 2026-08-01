@@ -15,19 +15,22 @@
   one page plus a lookahead row instead of materializing every changed row.
 - Empty-to-populated summary comparisons count leaf cells without decoding row payloads, keeping
   million-row history expansion responses small enough for Electron IPC and renderer consumption.
+- Native-page-size Eidos `STRICT WITHOUT ROWID` tables now stream in primary-key order instead of
+  copying both SQLite snapshots and materializing complete tables before applying the row limit.
 
 ### Performance
 
-- On the checked 410,636,288-byte, one-million-row fixture, the table summary completed in about
-  1.65 seconds with a 1,231-byte response and no decoded rows; the first 100-row page completed in
-  about 1.97 seconds with a 44,354-byte response after scanning 101 changed rows.
+- On the checked 437,227,520-byte Eidos fixture, the all-table summary completed in about 1.8
+  seconds with a 1,405-byte response; the first 100-row page for the million-row table completed in
+  about 1.1 seconds with a 55,927-byte response after scanning 101 changed rows.
 
 ### Compatibility
 
 - `diffPaths({ rows: true })` retains its existing full-row behavior. New large-diff consumers
   should use `diffSqlitePaths` summary-first paging.
-- `WITHOUT ROWID` tables and non-native SQLite page sizes return bounded payloads through the
-  reported `materialized_compat` path, whose snapshot memory can still scale with database size.
+- Custom-collation or descending `WITHOUT ROWID` primary keys and non-native SQLite page sizes
+  return bounded payloads through the reported `materialized_compat` path, whose snapshot memory
+  can still scale with database size.
 
 ## Graft SDK 0.3.3 — 2026-07-31
 
