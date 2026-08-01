@@ -1,6 +1,11 @@
 use graft::volume_writer::VolumeWriter;
 use rusqlite::{Connection, ErrorCode, OpenFlags, backup::Backup};
 use std::time::{Duration, Instant};
+#[cfg(target_os = "macos")]
+use std::{
+    ffi::{CString, c_char, c_int},
+    os::unix::ffi::OsStrExt,
+};
 use tempfile::TempDir;
 
 use super::*;
@@ -12,6 +17,7 @@ use super::*;
 pub(super) struct PhysicalSqliteReader {
     input: Mutex<File>,
     path: PathBuf,
+    snapshot_path: PathBuf,
     snapshot: graft::snapshot::Snapshot,
     _snapshot_dir: Option<TempDir>,
 }
@@ -71,6 +77,7 @@ impl PhysicalSqliteReader {
         Ok(Self {
             input: Mutex::new(input),
             path: path.to_path_buf(),
+            snapshot_path: snapshot_path.to_path_buf(),
             snapshot,
             _snapshot_dir: snapshot_dir,
         })
@@ -78,6 +85,122 @@ impl PhysicalSqliteReader {
 
     pub(super) fn worktree_state(&self) -> RepoWorktreeFileState {
         RepoWorktreeFileState { page_count: self.page_count() }
+    }
+
+    /// Finds tables that own pages changed from `expected` to this stable worktree snapshot.
+    ///
+    /// `dbstat` gives us `SQLite`'s page ownership without decoding every row. Returning `None`
+    /// deliberately falls back to the full logical scan whenever a changed page cannot be mapped,
+    /// preserving exact diff semantics for unusual freelist or extension layouts.
+    pub(super) fn changed_table_candidates(
+        &self,
+        expected: &dyn VolumeRead,
+    ) -> Result<Option<BTreeSet<String>>, ErrCtx> {
+        let max_page_count = self
+            .page_count()
+            .to_u32()
+            .max(expected.page_count().to_u32());
+        let mut changed_pages = BTreeSet::new();
+        for page_number in 1..=max_page_count {
+            if page_number.is_multiple_of(1_024) {
+                graft::repo::cancellation_checkpoint()?;
+            }
+            let pageidx = PageIdx::try_from(page_number).map_err(|error| {
+                ErrCtx::PragmaErr(
+                    format!("invalid SQLite page index {page_number}: {error}").into(),
+                )
+            })?;
+            if self.read_page(pageidx)? != expected.read_page(pageidx)? {
+                changed_pages.insert(page_number);
+            }
+        }
+        self.table_candidates_for_changed_pages(&changed_pages)
+    }
+
+    /// Reuses the physical worktree as a fast staged-snapshot reader only when every byte still
+    /// matches the staged state. While validating that invariant, collect pages changed from the
+    /// previous commit so checkpoint summaries can avoid scanning unrelated large tables.
+    pub(super) fn staged_table_candidates(
+        &self,
+        staged: &dyn VolumeRead,
+        previous: &dyn VolumeRead,
+    ) -> Result<Option<BTreeSet<String>>, ErrCtx> {
+        if self.page_count() != staged.page_count() {
+            return Ok(None);
+        }
+
+        let max_page_count = self
+            .page_count()
+            .to_u32()
+            .max(previous.page_count().to_u32());
+        let mut changed_pages = BTreeSet::new();
+        for page_number in 1..=max_page_count {
+            if page_number.is_multiple_of(1_024) {
+                graft::repo::cancellation_checkpoint()?;
+            }
+            let pageidx = PageIdx::try_from(page_number).map_err(|error| {
+                ErrCtx::PragmaErr(
+                    format!("invalid SQLite page index {page_number}: {error}").into(),
+                )
+            })?;
+            let physical_page = self.read_page(pageidx)?;
+            if page_number <= self.page_count().to_u32()
+                && physical_page != staged.read_page(pageidx)?
+            {
+                return Ok(None);
+            }
+            if physical_page != previous.read_page(pageidx)? {
+                changed_pages.insert(page_number);
+            }
+        }
+        self.table_candidates_for_changed_pages(&changed_pages)
+    }
+
+    fn table_candidates_for_changed_pages(
+        &self,
+        changed_pages: &BTreeSet<u32>,
+    ) -> Result<Option<BTreeSet<String>>, ErrCtx> {
+        if changed_pages.is_empty() {
+            return Ok(Some(BTreeSet::new()));
+        }
+
+        let connection = Connection::open_with_flags(
+            &self.snapshot_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        let mut statement = match connection.prepare(
+            "SELECT d.pageno, COALESCE(m.tbl_name, d.name) \
+             FROM dbstat AS d \
+             LEFT JOIN sqlite_schema AS m ON m.name = d.name",
+        ) {
+            Ok(statement) => statement,
+            Err(_) => return Ok(None),
+        };
+        let mut mapped_pages = BTreeSet::new();
+        let mut tables = BTreeSet::new();
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (page_number, table_name) = row?;
+            if !changed_pages.contains(&page_number) {
+                continue;
+            }
+            mapped_pages.insert(page_number);
+            if !table_name.starts_with("sqlite_") {
+                tables.insert(table_name);
+            }
+        }
+
+        // Page 1 always carries SQLite's change counter and schema cookie. Schema changes are
+        // compared separately, so it is the only unmapped page that is safe to ignore here.
+        if changed_pages
+            .iter()
+            .any(|page_number| *page_number != 1 && !mapped_pages.contains(page_number))
+        {
+            return Ok(None);
+        }
+        Ok(Some(tables))
     }
 
     pub(super) fn matches_state(
@@ -152,6 +275,11 @@ fn backup_sqlite_source(path: &Path, snapshot_path: &Path) -> Result<(), ErrCtx>
     const BACKUP_RETRY_DELAY: Duration = Duration::from_millis(10);
     const PAGES_PER_STEP: i32 = 256;
 
+    #[cfg(target_os = "macos")]
+    if clone_rollback_journal_snapshot(path, snapshot_path, BACKUP_TIMEOUT)? {
+        return Ok(());
+    }
+
     let source = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -197,6 +325,58 @@ fn backup_sqlite_source(path: &Path, snapshot_path: &Path) -> Result<(), ErrCtx>
         destination.query_row("PRAGMA journal_mode=DELETE", [], |_| Ok(()))?;
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn clone_rollback_journal_snapshot(
+    path: &Path,
+    snapshot_path: &Path,
+    timeout: Duration,
+) -> Result<bool, ErrCtx> {
+    let source = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    source.busy_timeout(timeout)?;
+    let journal_mode: String = source.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+    if !journal_mode.eq_ignore_ascii_case("delete") {
+        return Ok(false);
+    }
+
+    // A read transaction holds SQLite's shared lock while APFS creates the clone. Writers may
+    // continue preparing a transaction, but cannot publish an in-place rollback-journal commit
+    // until the clone has captured one coherent database image.
+    source.execute_batch("BEGIN")?;
+    source.query_row("SELECT count(*) FROM sqlite_schema", [], |_| Ok(()))?;
+    let clone_result = clone_file(path, snapshot_path);
+    source.execute_batch("ROLLBACK")?;
+    match clone_result {
+        Ok(()) => Ok(true),
+        Err(_) => {
+            let _ = std::fs::remove_file(snapshot_path);
+            Ok(false)
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn clone_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    unsafe extern "C" {
+        fn clonefile(source: *const c_char, destination: *const c_char, flags: c_int) -> c_int;
+    }
+
+    let source = CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let destination = CString::new(destination.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    // SAFETY: both pointers come from live NUL-terminated `CString`s and flags=0 is the documented
+    // clonefile mode. The destination does not exist inside our private temporary directory.
+    let result = unsafe { clonefile(source.as_ptr(), destination.as_ptr(), 0) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 impl VolumeRead for PhysicalSqliteReader {
@@ -615,6 +795,46 @@ mod tests {
         let latest = runtime.volume_log(&updated.volume).unwrap().remove(0);
         assert!(latest.changed_pages > 0);
         assert!(latest.changed_pages < updated.snapshot.page_count.to_u32() as usize);
+    }
+
+    #[test]
+    fn staged_candidates_require_an_exact_worktree_match() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("app.sqlite");
+        let connection = create_database(&path, "delete");
+        let runtime = test_runtime();
+        let initial = import_physical_sqlite_file_state(&runtime, &path, None).unwrap();
+
+        connection
+            .execute(
+                "UPDATE records SET payload = ?1 WHERE id = 32",
+                [vec![0xA5_u8; 3_000]],
+            )
+            .unwrap();
+        let updated = import_physical_sqlite_file_state(&runtime, &path, Some(&initial)).unwrap();
+        let previous_reader = runtime.snapshot_reader(initial.snapshot.to_snapshot());
+        let staged_reader = runtime.snapshot_reader(updated.snapshot.to_snapshot());
+        let physical = PhysicalSqliteReader::open(&path).unwrap();
+        assert_eq!(
+            physical
+                .staged_table_candidates(&staged_reader, &previous_reader)
+                .unwrap(),
+            Some(BTreeSet::from(["records".to_string()]))
+        );
+
+        connection
+            .execute(
+                "UPDATE records SET payload = ?1 WHERE id = 48",
+                [vec![0x5A_u8; 3_000]],
+            )
+            .unwrap();
+        let changed_after_stage = PhysicalSqliteReader::open(&path).unwrap();
+        assert_eq!(
+            changed_after_stage
+                .staged_table_candidates(&staged_reader, &previous_reader)
+                .unwrap(),
+            None
+        );
     }
 
     #[test]

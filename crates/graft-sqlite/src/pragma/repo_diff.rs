@@ -580,7 +580,7 @@ pub(super) fn staged_commit_table_summary(
     let diff = repo.diff_staged(None)?;
     let mut by_name = BTreeMap::<String, CommitTableSummary>::new();
     for file in &diff.files {
-        let summaries = repo_file_table_summary(runtime, file)?;
+        let summaries = repo_file_table_summary(runtime, repo, file)?;
         for summary in summaries {
             merge_table_summary(&mut by_name, summary);
         }
@@ -590,6 +590,7 @@ pub(super) fn staged_commit_table_summary(
 
 pub(super) fn repo_file_table_summary(
     runtime: &Runtime,
+    repo: &Repository,
     file: &graft::repo::RepoFileDiff,
 ) -> Result<Vec<CommitTableSummary>, ErrCtx> {
     match (&file.from, &file.to) {
@@ -610,18 +611,33 @@ pub(super) fn repo_file_table_summary(
                     SnapshotSummaryMode::Deleted,
                 );
             }
-            let diff = crate::row_level_diff::row_level_diff_snapshots(
-                runtime,
-                &from_snapshot,
-                &to_snapshot,
+            if let Some(summaries) =
+                staged_worktree_table_summary(runtime, repo, file, &from_snapshot, &to_snapshot)?
+            {
+                return Ok(summaries);
+            }
+            let from_reader = runtime.snapshot_reader(from_snapshot.clone());
+            let to_reader = runtime.snapshot_reader(to_snapshot.clone());
+            let from_lsn = from_snapshot.head().map_or(LSN::FIRST, |(_, lsn)| lsn);
+            let to_lsn = to_snapshot.head().map_or(LSN::FIRST, |(_, lsn)| lsn);
+            let diff = crate::row_level_diff::bounded_row_level_diff_readers(
+                &from_reader,
+                &to_reader,
+                from_lsn,
+                to_lsn,
+                &crate::row_level_diff::BoundedRowDiffMode::Summary,
             )
-            .map_err(|e| ErrCtx::PragmaErr(format!("Diff error: {e:?}").into()))?;
+            .map_err(|error| ErrCtx::PragmaErr(format!("Diff error: {error:?}").into()))?;
             Ok(diff
-                .table_changes
-                .iter()
-                .filter_map(|table| {
-                    let (inserts, deletes, updates) = count_changes_json(&table.changes);
-                    table_summary(table.table_name.clone(), inserts, deletes, updates)
+                .summaries
+                .into_iter()
+                .filter_map(|summary| {
+                    table_summary(
+                        summary.table_name,
+                        summary.inserts,
+                        summary.deletes,
+                        summary.updates,
+                    )
                 })
                 .collect())
         }
@@ -637,6 +653,55 @@ pub(super) fn repo_file_table_summary(
         ),
         (None, None) => Ok(Vec::new()),
     }
+}
+
+fn staged_worktree_table_summary(
+    runtime: &Runtime,
+    repo: &Repository,
+    file: &graft::repo::RepoFileDiff,
+    from_snapshot: &graft::snapshot::Snapshot,
+    to_snapshot: &graft::snapshot::Snapshot,
+) -> Result<Option<Vec<CommitTableSummary>>, ErrCtx> {
+    let physical_path = repo.worktree().join(&file.path);
+    let metadata = match std::fs::symlink_metadata(&physical_path) {
+        Ok(metadata) if metadata.file_type().is_file() => metadata,
+        Ok(_) => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.len() < 100 || !is_sqlite_database_path(&physical_path)? {
+        return Ok(None);
+    }
+
+    let physical = PhysicalSqliteReader::open(&physical_path)?;
+    let from_reader = runtime.snapshot_reader(from_snapshot.clone());
+    let to_reader = runtime.snapshot_reader(to_snapshot.clone());
+    let Some(tables) = physical.staged_table_candidates(&to_reader, &from_reader)? else {
+        return Ok(None);
+    };
+    let from_lsn = from_snapshot.head().map_or(LSN::FIRST, |(_, lsn)| lsn);
+    let to_lsn = to_snapshot.head().map_or(LSN::FIRST, |(_, lsn)| lsn);
+    let diff = crate::row_level_diff::bounded_row_level_diff_readers_for_summary_tables(
+        &from_reader,
+        &to_reader,
+        from_lsn,
+        to_lsn,
+        &tables,
+    )
+    .map_err(|error| ErrCtx::PragmaErr(format!("Diff error: {error:?}").into()))?;
+    Ok(Some(
+        diff.summaries
+            .into_iter()
+            .filter_map(|summary| {
+                table_summary(
+                    summary.table_name,
+                    summary.inserts,
+                    summary.deletes,
+                    summary.updates,
+                )
+            })
+            .collect(),
+    ))
 }
 
 #[derive(Debug, Clone, Copy)]

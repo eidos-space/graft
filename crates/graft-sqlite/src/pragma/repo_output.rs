@@ -290,13 +290,26 @@ pub(super) fn repo_file_bounded_row_diff(
             let snapshot = from.snapshot.to_snapshot();
             let from_lsn = snapshot.head().map_or(LSN::FIRST, |(_, lsn)| lsn);
             let from_reader = runtime.snapshot_reader(snapshot);
-            crate::row_level_diff::bounded_row_level_diff_readers(
-                &from_reader,
-                &physical,
-                from_lsn,
-                from_lsn.saturating_next(),
-                mode,
-            )
+            let summary_tables = matches!(mode, crate::row_level_diff::BoundedRowDiffMode::Summary)
+                .then(|| physical.changed_table_candidates(&from_reader))
+                .transpose()?;
+            if let Some(Some(tables)) = summary_tables {
+                crate::row_level_diff::bounded_row_level_diff_readers_for_summary_tables(
+                    &from_reader,
+                    &physical,
+                    from_lsn,
+                    from_lsn.saturating_next(),
+                    &tables,
+                )
+            } else {
+                crate::row_level_diff::bounded_row_level_diff_readers(
+                    &from_reader,
+                    &physical,
+                    from_lsn,
+                    from_lsn.saturating_next(),
+                    mode,
+                )
+            }
         } else {
             let empty = empty_sqlite_reader()?;
             crate::row_level_diff::bounded_row_level_diff_readers(

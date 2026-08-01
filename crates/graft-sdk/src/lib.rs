@@ -3481,6 +3481,151 @@ mod tests {
     }
 
     #[test]
+    fn worktree_sqlite_diff_skips_large_tables_after_nullable_column_append() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("space.eidos");
+        let mut database = rusqlite::Connection::open(&database_path).unwrap();
+        database
+            .execute_batch(
+                "CREATE TABLE archive (
+                    id TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                 ) STRICT, WITHOUT ROWID;
+                 CREATE TABLE notes (
+                    id TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                 ) STRICT, WITHOUT ROWID;",
+            )
+            .unwrap();
+        let transaction = database.transaction().unwrap();
+        for index in 0..20_000 {
+            transaction
+                .execute(
+                    "INSERT INTO archive (id, value) VALUES (?1, ?2)",
+                    [format!("archive-{index:05}"), format!("value-{index}")],
+                )
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+        database
+            .execute(
+                "INSERT INTO notes (id, value) VALUES ('note-0', 'baseline')",
+                [],
+            )
+            .unwrap();
+        drop(database);
+
+        let session = RepositorySession::new(directory.path());
+        session.open().unwrap();
+        session.init().unwrap();
+        session.add_all().unwrap();
+        session.commit("large baseline").unwrap();
+
+        let database = rusqlite::Connection::open(&database_path).unwrap();
+        database
+            .execute_batch(
+                "ALTER TABLE notes ADD COLUMN detail TEXT;
+                 INSERT INTO notes (id, value) VALUES ('note-1', 'one');
+                 INSERT INTO notes (id, value, detail) VALUES ('note-2', 'two', 'new field');",
+            )
+            .unwrap();
+        drop(database);
+
+        let options = |response| SqliteDiffPathsOptions {
+            paths: vec![PathBuf::from("space.eidos")],
+            root: None,
+            from: None,
+            to: None,
+            response,
+            limit: 1,
+            after: None,
+        };
+        let summary = session
+            .diff_sqlite_paths(&options(SqliteDiffResponse::Summary))
+            .unwrap();
+        let file = &summary.paths[0].diff["files"][0];
+        assert_eq!(file["summaries"].as_array().unwrap().len(), 1);
+        assert_eq!(file["summaries"][0]["name"], "notes");
+        assert_eq!(file["summaries"][0]["inserts"], 2);
+        assert_eq!(summary.telemetry.tables_scanned, 1);
+        assert_eq!(summary.telemetry.response_scope, "streaming_primary_key");
+
+        let rows = session
+            .diff_sqlite_paths(&options(SqliteDiffResponse::Rows {
+                table: "notes".to_string(),
+                limit: 100,
+                after: None,
+            }))
+            .unwrap();
+        assert_eq!(rows.telemetry.tables_scanned, 1);
+        assert_eq!(rows.telemetry.rows_returned, 2);
+        assert_eq!(rows.telemetry.response_scope, "streaming_primary_key");
+        assert_eq!(
+            rows.paths[0].diff["files"][0]["tables"][0]["changes"][1]["values"][2],
+            "new field"
+        );
+
+        session
+            .stage_paths(&StagePathsOptions {
+                paths: vec![PathBuf::from("space.eidos")],
+                expected_head: None,
+                force: false,
+            })
+            .unwrap();
+        session.commit("small table change").unwrap();
+        let history = session.history_summaries(1, None).unwrap();
+        assert_eq!(history.commits[0].changed_tables, 1);
+        assert_eq!(history.commits[0].tables[0].name, "notes");
+        assert_eq!(history.commits[0].tables[0].inserts, 2);
+
+        let database = rusqlite::Connection::open(&database_path).unwrap();
+        database
+            .execute_batch(
+                "DELETE FROM archive WHERE id = 'archive-00001';
+                 UPDATE archive SET value = 'changed' WHERE id = 'archive-10000';
+                 INSERT INTO archive (id, value) VALUES ('archive-99999', 'new');",
+            )
+            .unwrap();
+        drop(database);
+
+        let summary = session
+            .diff_sqlite_paths(&options(SqliteDiffResponse::Summary))
+            .unwrap();
+        let file = &summary.paths[0].diff["files"][0];
+        assert_eq!(file["summaries"].as_array().unwrap().len(), 1);
+        assert_eq!(file["summaries"][0]["name"], "archive");
+        assert_eq!(file["summaries"][0]["inserts"], 1);
+        assert_eq!(file["summaries"][0]["deletes"], 1);
+        assert_eq!(file["summaries"][0]["updates"], 1);
+        assert!(summary.telemetry.rows_scanned < 2_000);
+
+        let rows = session
+            .diff_sqlite_paths(&options(SqliteDiffResponse::Rows {
+                table: "archive".to_string(),
+                limit: 100,
+                after: None,
+            }))
+            .unwrap();
+        assert_eq!(rows.telemetry.rows_returned, 3);
+        assert!(rows.telemetry.rows_scanned < 2_000);
+
+        session
+            .stage_paths(&StagePathsOptions {
+                paths: vec![PathBuf::from("space.eidos")],
+                expected_head: None,
+                force: false,
+            })
+            .unwrap();
+        session.commit("large table sparse change").unwrap();
+        let history = session.history_summaries(1, None).unwrap();
+        assert_eq!(history.commits[0].changed_tables, 1);
+        assert_eq!(history.commits[0].tables[0].name, "archive");
+        assert_eq!(history.commits[0].tables[0].inserts, 1);
+        assert_eq!(history.commits[0].tables[0].deletes, 1);
+        assert_eq!(history.commits[0].tables[0].updates, 1);
+    }
+
+    #[test]
     fn concurrent_path_type_churn_never_poison_session() {
         let directory = tempfile::tempdir().unwrap();
         let shape = directory.path().join("shape");
