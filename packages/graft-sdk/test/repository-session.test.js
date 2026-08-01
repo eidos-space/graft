@@ -1108,7 +1108,15 @@ async function withTemporaryDirectory(prefix, operation) {
   try {
     await operation(directory)
   } finally {
-    await fs.rm(directory, { force: true, recursive: true })
+    // Native storage handles can take a moment to close on Windows. Let
+    // Node retry the transient EBUSY/ENOTEMPTY/EPERM cleanup failures instead
+    // of making an otherwise successful SDK contract test flaky.
+    await fs.rm(directory, {
+      force: true,
+      maxRetries: 10,
+      recursive: true,
+      retryDelay: 100,
+    })
   }
 }
 
