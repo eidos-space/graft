@@ -106,6 +106,52 @@ pub struct JsonRepoRowDiffResult {
     pub files: Vec<JsonRepoRowDiffFile>,
 }
 
+/// Memory-bounded `SQLite` repository diff result.
+#[derive(Debug, Clone, Serialize)]
+pub struct JsonRepoBoundedDiffResult {
+    pub from: String,
+    pub to: String,
+    pub paths: Vec<JsonRepoPathDiff>,
+    pub files: Vec<JsonRepoBoundedDiffFile>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct JsonRepoBoundedDiffFile {
+    pub path: String,
+    pub change: String,
+    pub kind: String,
+    pub storage: String,
+    pub row_diff_available: bool,
+    pub mode: String,
+    pub logical_status: String,
+    pub capabilities: Vec<String>,
+    pub limitations: Vec<JsonDiffLimitation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub summaries: Vec<JsonTableSummary>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tables: Vec<JsonTableChanges>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub opaque_changes: Vec<JsonOpaqueChange>,
+    pub has_more: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    pub telemetry: JsonBoundedRowDiffTelemetry,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct JsonBoundedRowDiffTelemetry {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_table: Option<String>,
+    pub tables_considered: usize,
+    pub tables_scanned: usize,
+    pub rows_scanned: usize,
+    pub rows_returned: usize,
+    pub truncated: bool,
+    pub response_scope: String,
+}
+
 /// Path-level repository diff summary shared by default and row diff surfaces.
 #[derive(Debug, Clone, Serialize)]
 pub struct JsonRepoPathDiff {

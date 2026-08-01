@@ -32,6 +32,33 @@ export interface DiffPathsOptions extends OperationOptions {
   after?: string
 }
 
+interface SqliteDiffPathsBase extends OperationOptions {
+  paths: string[]
+  root?: string
+  from?: string
+  to?: string
+  /** Maximum explicit paths returned per page. Range: 1–100. */
+  limit?: number
+  /** Last path from the preceding path page. */
+  after?: string
+}
+
+export type SqliteDiffPathsOptions =
+  | (SqliteDiffPathsBase & {
+      mode: "summary"
+      table?: never
+      rowLimit?: never
+      rowAfter?: never
+    })
+  | (SqliteDiffPathsBase & {
+      mode: "rows"
+      table: string
+      /** Maximum row changes returned. Range: 1–1,000. Defaults to 100. */
+      rowLimit?: number
+      /** Opaque cursor returned by the preceding row page. */
+      rowAfter?: string
+    })
+
 export interface ReadPathContentOptions extends OperationOptions {
   /** Commit id, ref, or other supported immutable revision expression. */
   revision: string
@@ -294,6 +321,87 @@ export interface DiffPathsResult {
   telemetry: DiffTelemetry
 }
 
+export interface SqliteTableSummary {
+  name: string
+  inserts: number
+  deletes: number
+  updates: number
+}
+
+export interface SqliteRowChange {
+  op: "insert" | "delete" | "update"
+  rowid?: number
+  key?: Record<string, unknown>
+  values: unknown[]
+  old_values?: unknown[]
+}
+
+export interface SqliteRowChangeTable {
+  name: string
+  columns?: string[]
+  primary_key_columns?: string[]
+  changes: SqliteRowChange[]
+}
+
+export interface BoundedSqliteDiffFile {
+  path: string
+  change: "added" | "modified" | "deleted"
+  kind: RepositoryPathKind
+  storage: RepositoryPathStorage
+  row_diff_available: boolean
+  mode: "summary" | "rows"
+  logical_status: string
+  capabilities: string[]
+  limitations: Array<{ kind: string; subject?: string }>
+  message?: string
+  summaries?: SqliteTableSummary[]
+  tables?: SqliteRowChangeTable[]
+  opaque_changes?: unknown[]
+  has_more: boolean
+  next_cursor?: string
+  telemetry: {
+    requested_table?: string
+    tables_considered: number
+    tables_scanned: number
+    rows_scanned: number
+    rows_returned: number
+    truncated: boolean
+    response_scope: "streaming_rowid" | "materialized_compat" | "unavailable"
+  }
+}
+
+export interface BoundedSqliteRepositoryDiff {
+  current_head?: string
+  current_branch?: string
+  from: string
+  to: string
+  paths: Array<{
+    path: string
+    change: "added" | "modified" | "deleted"
+    kind: RepositoryPathKind
+    storage: RepositoryPathStorage
+  }>
+  files: BoundedSqliteDiffFile[]
+}
+
+export interface SqliteDiffPathsResult {
+  paths: Array<{ path: string; diff: BoundedSqliteRepositoryDiff }>
+  has_more: boolean
+  next_cursor: string | null
+  telemetry: {
+    duration_us: number
+    requested_paths: number
+    returned_paths: number
+    changed_paths: number
+    response_scope: string
+    requested_table: string | null
+    tables_scanned: number
+    rows_scanned: number
+    rows_returned: number
+    truncated: boolean
+  }
+}
+
 export type PathContentState =
   | { state: "absent" }
   | {
@@ -431,6 +539,7 @@ export class RepositorySession {
   commit(message: string, options?: OperationOptions): Promise<GraftJson>
   diff(options?: DiffOptions): Promise<GraftJson>
   diffPaths(options: DiffPathsOptions): Promise<DiffPathsResult>
+  diffSqlitePaths(options: SqliteDiffPathsOptions): Promise<SqliteDiffPathsResult>
   readPathContent(options: ReadPathContentOptions): Promise<ReadPathContentResult>
   history(options?: HistoryOptions): Promise<GraftJson>
   historySummaries(options?: HistoryOptions): Promise<HistorySummariesResult>

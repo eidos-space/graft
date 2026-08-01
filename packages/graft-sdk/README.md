@@ -87,6 +87,30 @@ try {
     table: "customers",
     limit: 100,
   })
+
+  // For large SQLite changes, first load table counts with no row payloads.
+  const summary = await session.diffSqlitePaths({
+    paths: ["space.eidos"],
+    mode: "summary",
+    limit: 1,
+  })
+  const firstRows = await session.diffSqlitePaths({
+    paths: ["space.eidos"],
+    mode: "rows",
+    table: "customers",
+    rowLimit: 100,
+    limit: 1,
+  })
+  const nextRows = firstRows.paths[0].diff.files[0].next_cursor
+    ? await session.diffSqlitePaths({
+        paths: ["space.eidos"],
+        mode: "rows",
+        table: "customers",
+        rowLimit: 100,
+        rowAfter: firstRows.paths[0].diff.files[0].next_cursor,
+        limit: 1,
+      })
+    : undefined
 } finally {
   await session.close()
 }
@@ -134,6 +158,7 @@ files in the Space. Changes confined to `.graft` are not counted.
 | `commit` | Advance repository history | No |
 | `diff` | Compare worktree, index, or revisions | No |
 | `diffPaths` | Diff a page of explicit changed file paths (up to 100) | No |
+| `diffSqlitePaths` | Read SQLite table summaries or one bounded row page for explicit paths | No |
 | `readPathContent` | Read bounded artifact content at one immutable revision | No |
 | `history` | Read commit history and status | No |
 | `historySummaries` | Read up to 500 lightweight commit summaries without trees/blobs | No |
@@ -245,6 +270,29 @@ const diff = page.parent
     })
   : await session.diffPaths({ paths, root: page.revision, rows: true, limit: 100 })
 ```
+
+`diffPaths({ rows: true })` remains the compatibility surface and can return every changed row.
+New UI code should use `diffSqlitePaths({ mode: "summary" })` when a database path is expanded,
+then `mode: "rows"` only after a table is opened. `rowLimit` is independent of the path `limit`;
+`rowAfter` is opaque and must be passed back unchanged. Rowid tables use a leaf-at-a-time streaming
+merge and stop after the requested page plus one lookahead change. `WITHOUT ROWID` tables and
+non-native SQLite page sizes use a `materialized_compat` path; their response remains bounded but
+snapshot materialization can still be proportional to database size. The file and aggregate
+telemetry report `rows_scanned`, `rows_returned`, `truncated`, and `response_scope`.
+Row cursors are stable for immutable revision comparisons. If the worktree changes while a caller
+is paging its live diff, restart from the first page after observing a new status `change_token`.
+
+The focused regression benchmark is configurable so CI can stay small while release validation
+can exercise a hundreds-of-megabytes database:
+
+```bash
+pnpm --dir packages/graft-sdk bench:sqlite-diff
+GRAFT_SQLITE_DIFF_ROWS=1000000 GRAFT_SQLITE_DIFF_PAYLOAD_BYTES=384 \
+  pnpm --dir packages/graft-sdk bench:sqlite-diff
+```
+
+Set `GRAFT_SQLITE_DIFF_LEGACY=1` only on deliberately small fixtures when comparing the legacy
+unbounded response; its purpose is to demonstrate the payload growth that this API avoids.
 
 For a text-file path, read each revision independently and pass the UTF-8 strings to the host's
 renderer without exposing `.graft` object paths:

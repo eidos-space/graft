@@ -6,7 +6,7 @@
 //! - Traversing B-tree to read table data
 //! - Serializing/deserializing records
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use graft::core::PageIdx;
 use graft::volume_reader::VolumeRead;
@@ -167,6 +167,35 @@ pub struct TableScanner<'a> {
     header: DatabaseHeader,
 }
 
+/// Incremental, rowid-ordered reader for a `SQLite` table B-tree.
+///
+/// Only one leaf page is decoded at a time. This is the primitive used by the
+/// bounded repository diff API so a large table does not have to become a
+/// `HashMap<i64, Record>` before callers can inspect its first changes.
+pub struct TableRowStream<'a> {
+    scanner: TableScanner<'a>,
+    leaf_pages: Vec<u32>,
+    next_leaf_page: usize,
+    buffered_rows: VecDeque<(i64, Record)>,
+}
+
+impl TableRowStream<'_> {
+    pub fn next_row(&mut self) -> Result<Option<(i64, Record)>, ParseError> {
+        loop {
+            if let Some(row) = self.buffered_rows.pop_front() {
+                return Ok(Some(row));
+            }
+            let Some(page_num) = self.leaf_pages.get(self.next_leaf_page).copied() else {
+                return Ok(None);
+            };
+            self.next_leaf_page += 1;
+            let mut rows = self.scanner.read_rows_from_leaf_page(page_num)?;
+            rows.sort_by_key(|(rowid, _)| *rowid);
+            self.buffered_rows = rows.into();
+        }
+    }
+}
+
 impl<'a> TableScanner<'a> {
     pub fn new(reader: &'a dyn VolumeRead) -> Result<Self, ParseError> {
         let header_page = reader
@@ -276,6 +305,32 @@ impl<'a> TableScanner<'a> {
         Ok(pages)
     }
 
+    /// Consume the scanner and return a rowid-ordered, leaf-at-a-time stream.
+    pub fn into_row_stream(self, root_page: u32) -> Result<TableRowStream<'a>, ParseError> {
+        let mut leaf_pages = Vec::new();
+        self.collect_table_leaf_pages_ordered(root_page, &mut leaf_pages)?;
+        Ok(TableRowStream {
+            scanner: self,
+            leaf_pages,
+            next_leaf_page: 0,
+            buffered_rows: VecDeque::new(),
+        })
+    }
+
+    /// Count rows from leaf headers without decoding row payloads.
+    pub fn count_table_rows(&self, root_page: u32) -> Result<usize, ParseError> {
+        let mut leaf_pages = Vec::new();
+        self.collect_table_leaf_pages_ordered(root_page, &mut leaf_pages)?;
+        let mut rows = 0_usize;
+        for page_num in leaf_pages {
+            let (_, _, header) = self.read_table_page(page_num)?;
+            rows = rows
+                .checked_add(usize::from(header.num_cells))
+                .ok_or(ParseError::InvalidCell)?;
+        }
+        Ok(rows)
+    }
+
     /// Read rows from a known subset of table leaf pages.
     pub fn read_rows_from_leaf_pages(
         &self,
@@ -295,6 +350,19 @@ impl<'a> TableScanner<'a> {
             rows.insert(cell.rowid, Record::parse(&cell.payload)?);
         }
         Ok(rows)
+    }
+
+    fn read_rows_from_leaf_page(&self, page_num: u32) -> Result<Vec<(i64, Record)>, ParseError> {
+        let (full_page, header_offset, header) = self.read_table_page(page_num)?;
+        if header.page_type != 13 {
+            return Err(ParseError::InvalidPage);
+        }
+        let mut cells = Vec::new();
+        self.read_leaf_cells(full_page.as_ref(), header_offset, &header, &mut cells)?;
+        cells
+            .into_iter()
+            .map(|cell| Ok((cell.rowid, Record::parse(&cell.payload)?)))
+            .collect()
     }
 
     /// Return true when a leaf may depend on overflow pages not represented by its own bytes.
@@ -363,6 +431,39 @@ impl<'a> TableScanner<'a> {
                     let cell = Self::parse_table_interior_cell(&page_bytes[cell_offset..])?
                         .ok_or(ParseError::InvalidCell)?;
                     self.collect_table_leaf_pages(cell.left_child, pages)?;
+                }
+            }
+            _ => return Err(ParseError::InvalidPage),
+        }
+        Ok(())
+    }
+
+    fn collect_table_leaf_pages_ordered(
+        &self,
+        page_num: u32,
+        pages: &mut Vec<u32>,
+    ) -> Result<(), ParseError> {
+        let (full_page, header_offset, header) = self.read_table_page(page_num)?;
+        let page_bytes = full_page.as_ref();
+        match header.page_type {
+            13 => pages.push(page_num),
+            5 => {
+                for cell_index in 0..header.num_cells {
+                    let ptr_offset =
+                        header_offset + header.header_size() + usize::from(cell_index) * 2;
+                    if ptr_offset + 2 > page_bytes.len() {
+                        return Err(ParseError::InvalidCell);
+                    }
+                    let cell_offset = usize::from(u16::from_be_bytes([
+                        page_bytes[ptr_offset],
+                        page_bytes[ptr_offset + 1],
+                    ]));
+                    let cell = Self::parse_table_interior_cell(&page_bytes[cell_offset..])?
+                        .ok_or(ParseError::InvalidCell)?;
+                    self.collect_table_leaf_pages_ordered(cell.left_child, pages)?;
+                }
+                if let Some(right_child) = header.right_child_ptr {
+                    self.collect_table_leaf_pages_ordered(right_child, pages)?;
                 }
             }
             _ => return Err(ParseError::InvalidPage),

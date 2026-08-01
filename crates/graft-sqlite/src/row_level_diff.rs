@@ -3,14 +3,14 @@
 //! Parses `SQLite` B-tree directly to compare row data between versions
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     fs::File,
     io::Write,
 };
 
 use crate::sqlite_parse::{
     ColumnInfo, GeneratedColumnKind, KeyConstraintKind, MasterEntry, ParseError, Record,
-    TableScanner, Value, read_all_rows,
+    TableRowStream, TableScanner, Value, read_all_rows,
 };
 use graft::core::{PageIdx, VolumeId, lsn::LSN, page::PAGESIZE};
 use graft::rt::runtime::Runtime;
@@ -452,6 +452,67 @@ pub struct RowLevelDiffTelemetry {
     pub tables_scanned: usize,
 }
 
+/// Summary for one table without row payloads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundedTableSummary {
+    pub table_name: String,
+    pub inserts: usize,
+    pub deletes: usize,
+    pub updates: usize,
+}
+
+/// Requested response shape for the bounded `SQLite` diff surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoundedRowDiffMode {
+    Summary,
+    Rows {
+        table: String,
+        limit: usize,
+        offset: usize,
+    },
+}
+
+/// Memory-bounded logical diff used by SDK consumers.
+#[derive(Debug)]
+pub struct BoundedRowLevelDiff {
+    pub from_lsn: LSN,
+    pub to_lsn: LSN,
+    pub analysis: RowLevelDiffAnalysis,
+    pub schema_changes: Vec<SchemaChange>,
+    pub summaries: Vec<BoundedTableSummary>,
+    pub table_changes: Vec<TableChanges>,
+    pub opaque_changes: Vec<OpaqueChange>,
+    pub telemetry: BoundedRowDiffTelemetry,
+    pub has_more: bool,
+    pub next_offset: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BoundedRowDiffTelemetry {
+    pub requested_table: Option<String>,
+    pub tables_considered: usize,
+    pub tables_scanned: usize,
+    pub rows_scanned: usize,
+    pub rows_returned: usize,
+    pub truncated: bool,
+    pub response_scope: &'static str,
+}
+
+impl BoundedRowLevelDiff {
+    pub fn logical_status(&self) -> LogicalDiffStatus {
+        if !self.schema_changes.is_empty()
+            || !self.summaries.is_empty()
+            || !self.table_changes.is_empty()
+        {
+            LogicalDiffStatus::LogicalChanges
+        } else if !self.opaque_changes.is_empty() {
+            LogicalDiffStatus::UnsupportedLogicalSurface
+        } else {
+            LogicalDiffStatus::FileChangedNoSupportedLogicalChanges
+        }
+    }
+}
+
 impl RowLevelDiff {
     pub fn logical_status(&self) -> LogicalDiffStatus {
         if !self.schema_changes.is_empty() || !self.table_changes.is_empty() {
@@ -701,6 +762,533 @@ pub fn row_level_diff_readers_for_table(
     table: Option<&str>,
 ) -> Result<RowLevelDiff, graft::err::GraftErr> {
     row_level_diff_from_readers(from_reader, to_reader, from_lsn, to_lsn, table)
+}
+
+/// Compute either an all-table summary or one bounded page of row details.
+///
+/// Ordinary rowid tables are merged in rowid order one leaf page at a time.
+/// The compatibility path for non-native page sizes and `WITHOUT ROWID`
+/// tables may materialize snapshots, but the returned row payload remains
+/// bounded by the requested page size.
+pub fn bounded_row_level_diff_readers(
+    from_reader: &dyn VolumeRead,
+    to_reader: &dyn VolumeRead,
+    from_lsn: LSN,
+    to_lsn: LSN,
+    mode: &BoundedRowDiffMode,
+) -> Result<BoundedRowLevelDiff, graft::err::GraftErr> {
+    bounded_row_diff_from_readers(from_reader, to_reader, from_lsn, to_lsn, mode)
+}
+
+fn bounded_row_diff_from_readers(
+    from_reader: &dyn VolumeRead,
+    to_reader: &dyn VolumeRead,
+    from_lsn: LSN,
+    to_lsn: LSN,
+    mode: &BoundedRowDiffMode,
+) -> Result<BoundedRowLevelDiff, graft::err::GraftErr> {
+    let native_page_size = PAGESIZE.as_u32();
+    let needs_materialized_schema = sqlite_page_size(from_reader)? != native_page_size
+        || sqlite_page_size(to_reader)? != native_page_size;
+    let from_scanner = TableScanner::new(from_reader).map_err(|error| {
+        graft::err::LogicalErr::Other(format!("Failed to parse source B-tree: {error:?}"))
+    })?;
+    let to_scanner = TableScanner::new(to_reader).map_err(|error| {
+        graft::err::LogicalErr::Other(format!("Failed to parse target B-tree: {error:?}"))
+    })?;
+    let mut materialized = needs_materialized_schema
+        .then(|| MaterializedPair::new(from_reader, to_reader))
+        .transpose()?;
+    let (from_master, to_master) =
+        bounded_master_tables(&from_scanner, &to_scanner, materialized.as_ref())?;
+    let requested_table = match mode {
+        BoundedRowDiffMode::Summary => None,
+        BoundedRowDiffMode::Rows { table, .. } => Some(table.as_str()),
+    };
+    let mut schema_changes = diff_schema_entries(&from_master, &to_master);
+    if let Some(table) = requested_table {
+        schema_changes.retain(|change| change.name == table);
+    }
+    let ignored_table_infos = ignored_row_diff_table_infos(&from_master, &to_master);
+    let ignored_tables: HashSet<String> = ignored_table_infos.keys().cloned().collect();
+    let mut limitations = diff_parser_limitations(&from_scanner, &to_scanner);
+    limitations.extend(ignored_table_infos.values().map(|table| {
+        RowLevelDiffLimitation::new(table.reason.limitation_kind(), Some(table.name.clone()))
+    }));
+    limitations.extend(generated_column_limitations(&from_master, &to_master));
+    dedupe_limitations(&mut limitations);
+    let opaque_changes = diff_opaque_tables_bounded(
+        from_reader,
+        to_reader,
+        &from_master,
+        &to_master,
+        &ignored_table_infos,
+        requested_table,
+    );
+
+    let mut table_names = BTreeSet::new();
+    for entry in from_master.iter().chain(&to_master) {
+        if is_diffable_table(entry, &ignored_tables)
+            && requested_table.is_none_or(|table| entry.name == table)
+        {
+            table_names.insert(entry.name.clone());
+        }
+    }
+    let tables_considered = table_names.len();
+    let mut summaries = Vec::new();
+    let mut table_changes = Vec::new();
+    let mut rows_scanned = 0_usize;
+    let mut has_more = false;
+    let mut next_offset = None;
+    let mut used_materialized_compat = false;
+
+    for table_name in table_names {
+        bounded_cancellation_checkpoint()?;
+        let from_entry = from_master.iter().find(|entry| entry.name == table_name);
+        let to_entry = to_master.iter().find(|entry| entry.name == table_name);
+        let entry = to_entry
+            .or(from_entry)
+            .expect("bounded table exists in one side");
+        let column_infos = entry.parse_columns();
+        let columns = column_infos
+            .iter()
+            .map(|column| column.name.clone())
+            .collect();
+        let rowid_alias = rowid_alias_column(&column_infos);
+        let generated_columns = generated_columns(&column_infos);
+        let needs_sqlite_rows = needs_materialized_schema
+            || from_entry.is_some_and(is_without_rowid_table)
+            || to_entry.is_some_and(is_without_rowid_table);
+        let page = if needs_sqlite_rows {
+            used_materialized_compat = true;
+            if materialized.is_none() {
+                materialized = Some(MaterializedPair::new(from_reader, to_reader)?);
+            }
+            bounded_materialized_table(
+                materialized
+                    .as_ref()
+                    .expect("materialized pair initialized"),
+                from_entry,
+                to_entry,
+                mode,
+            )?
+        } else {
+            bounded_rowid_table(from_reader, to_reader, from_entry, to_entry, mode)?
+        };
+        rows_scanned = rows_scanned.saturating_add(page.rows_scanned);
+        if matches!(mode, BoundedRowDiffMode::Summary)
+            && page.inserts + page.deletes + page.updates > 0
+        {
+            summaries.push(BoundedTableSummary {
+                table_name: table_name.clone(),
+                inserts: page.inserts,
+                deletes: page.deletes,
+                updates: page.updates,
+            });
+        }
+        if !page.changes.is_empty() {
+            table_changes.push(TableChanges {
+                table_name,
+                columns,
+                rowid_alias,
+                generated_columns,
+                semantic_key_columns: Vec::new(),
+                primary_key_columns: page.primary_key_columns,
+                changes: page.changes,
+            });
+        }
+        has_more |= page.has_more;
+        next_offset = page.next_offset.or(next_offset);
+    }
+    let rows_returned = table_changes.iter().map(|table| table.changes.len()).sum();
+    Ok(BoundedRowLevelDiff {
+        from_lsn,
+        to_lsn,
+        analysis: RowLevelDiffAnalysis {
+            limitations,
+            ..RowLevelDiffAnalysis::default()
+        },
+        schema_changes,
+        summaries,
+        table_changes,
+        opaque_changes,
+        telemetry: BoundedRowDiffTelemetry {
+            requested_table: requested_table.map(str::to_owned),
+            tables_considered,
+            tables_scanned: tables_considered,
+            rows_scanned,
+            rows_returned,
+            truncated: has_more,
+            response_scope: if used_materialized_compat {
+                "materialized_compat"
+            } else {
+                "streaming_rowid"
+            },
+        },
+        has_more,
+        next_offset,
+    })
+}
+
+fn bounded_master_tables(
+    from_scanner: &TableScanner<'_>,
+    to_scanner: &TableScanner<'_>,
+    materialized: Option<&MaterializedPair>,
+) -> Result<(Vec<MasterEntry>, Vec<MasterEntry>), graft::err::GraftErr> {
+    if let Some(pair) = materialized {
+        return Ok((
+            read_master_table_sqlite(&pair.from.connection, "source")?,
+            read_master_table_sqlite(&pair.to.connection, "target")?,
+        ));
+    }
+    Ok((
+        from_scanner.read_master_table().map_err(|error| {
+            graft::err::LogicalErr::Other(format!("Failed to read source schema: {error:?}"))
+        })?,
+        to_scanner.read_master_table().map_err(|error| {
+            graft::err::LogicalErr::Other(format!("Failed to read target schema: {error:?}"))
+        })?,
+    ))
+}
+
+fn diff_opaque_tables_bounded(
+    from_reader: &dyn VolumeRead,
+    to_reader: &dyn VolumeRead,
+    from_master: &[MasterEntry],
+    to_master: &[MasterEntry],
+    ignored_tables: &BTreeMap<String, IgnoredTable>,
+    table_filter: Option<&str>,
+) -> Vec<OpaqueChange> {
+    let mut changes = Vec::new();
+    for (name, info) in ignored_tables {
+        if table_filter.is_some_and(|table| name != table && info.owner.as_deref() != Some(table)) {
+            continue;
+        }
+        let from_entry = from_master.iter().find(|entry| entry.name == *name);
+        let to_entry = to_master.iter().find(|entry| entry.name == *name);
+        let change = match (from_entry, to_entry) {
+            (None, None) => None,
+            (None, Some(_)) => Some(OpaqueChangeKind::Added),
+            (Some(_), None) => Some(OpaqueChangeKind::Deleted),
+            (Some(from), Some(to))
+                if from.entry_type != to.entry_type
+                    || from.table_name != to.table_name
+                    || from.sql != to.sql =>
+            {
+                Some(OpaqueChangeKind::Modified)
+            }
+            (Some(from), Some(to)) if from.root_page == 0 || to.root_page == 0 => None,
+            (Some(from), Some(to)) => {
+                let changed = (|| {
+                    let from_scanner = TableScanner::new(from_reader).map_err(|error| {
+                        graft::err::LogicalErr::Other(format!(
+                            "Failed to scan opaque source table: {error}"
+                        ))
+                    })?;
+                    let to_scanner = TableScanner::new(to_reader).map_err(|error| {
+                        graft::err::LogicalErr::Other(format!(
+                            "Failed to scan opaque target table: {error}"
+                        ))
+                    })?;
+                    changed_table_leaf_pages(
+                        from_reader,
+                        to_reader,
+                        &from_scanner,
+                        &to_scanner,
+                        from,
+                        to,
+                    )
+                })();
+                match changed {
+                    Ok(Some(pages)) => (!pages.is_empty()).then_some(OpaqueChangeKind::Modified),
+                    Ok(None) | Err(_) => Some(OpaqueChangeKind::Modified),
+                }
+            }
+        };
+        if let Some(change) = change {
+            changes.push(OpaqueChange {
+                name: info.name.clone(),
+                change,
+                reason: info.reason,
+                owner: info.owner.clone(),
+            });
+        }
+    }
+    changes
+}
+
+struct BoundedTablePage {
+    inserts: usize,
+    deletes: usize,
+    updates: usize,
+    rows_scanned: usize,
+    primary_key_columns: Vec<String>,
+    changes: Vec<RowChange>,
+    has_more: bool,
+    next_offset: Option<usize>,
+}
+
+fn bounded_rowid_table(
+    from_reader: &dyn VolumeRead,
+    to_reader: &dyn VolumeRead,
+    from_entry: Option<&MasterEntry>,
+    to_entry: Option<&MasterEntry>,
+    mode: &BoundedRowDiffMode,
+) -> Result<BoundedTablePage, graft::err::GraftErr> {
+    let from_count = from_entry
+        .map(|entry| TableScanner::new(from_reader)?.count_table_rows(entry.root_page))
+        .transpose()
+        .map_err(|error| {
+            graft::err::LogicalErr::Other(format!("Failed to count source rows: {error}"))
+        })?
+        .unwrap_or(0);
+    let to_count = to_entry
+        .map(|entry| TableScanner::new(to_reader)?.count_table_rows(entry.root_page))
+        .transpose()
+        .map_err(|error| {
+            graft::err::LogicalErr::Other(format!("Failed to count target rows: {error}"))
+        })?
+        .unwrap_or(0);
+    if matches!(mode, BoundedRowDiffMode::Summary) && (from_count == 0 || to_count == 0) {
+        return Ok(BoundedTablePage {
+            inserts: to_count,
+            deletes: from_count,
+            updates: 0,
+            rows_scanned: 0,
+            primary_key_columns: Vec::new(),
+            changes: Vec::new(),
+            has_more: false,
+            next_offset: None,
+        });
+    }
+    let mut from_stream = from_entry
+        .map(|entry| TableScanner::new(from_reader)?.into_row_stream(entry.root_page))
+        .transpose()
+        .map_err(|error| {
+            graft::err::LogicalErr::Other(format!("Failed to stream source rows: {error}"))
+        })?;
+    let mut to_stream = to_entry
+        .map(|entry| TableScanner::new(to_reader)?.into_row_stream(entry.root_page))
+        .transpose()
+        .map_err(|error| {
+            graft::err::LogicalErr::Other(format!("Failed to stream target rows: {error}"))
+        })?;
+    let mut from_row = next_bounded_row(&mut from_stream)?;
+    let mut to_row = next_bounded_row(&mut to_stream)?;
+    let mut page = BoundedTablePage {
+        inserts: 0,
+        deletes: 0,
+        updates: 0,
+        rows_scanned: 0,
+        primary_key_columns: Vec::new(),
+        changes: Vec::new(),
+        has_more: false,
+        next_offset: None,
+    };
+    let (offset, limit) = match mode {
+        BoundedRowDiffMode::Summary => (usize::MAX, 0),
+        BoundedRowDiffMode::Rows { offset, limit, .. } => (*offset, *limit),
+    };
+    let mut change_index = 0_usize;
+    while from_row.is_some() || to_row.is_some() {
+        if page.rows_scanned.is_multiple_of(1_024) {
+            bounded_cancellation_checkpoint()?;
+        }
+        let change = match (from_row.take(), to_row.take()) {
+            (Some((from_rowid, old_row)), Some((to_rowid, new_row))) if from_rowid == to_rowid => {
+                page.rows_scanned = page.rows_scanned.saturating_add(2);
+                from_row = next_bounded_row(&mut from_stream)?;
+                to_row = next_bounded_row(&mut to_stream)?;
+                (old_row != new_row).then_some(RowChange::Update {
+                    rowid: from_rowid,
+                    old_row,
+                    new_row,
+                })
+            }
+            (Some((from_rowid, old_row)), Some((to_rowid, new_row))) if from_rowid < to_rowid => {
+                page.rows_scanned = page.rows_scanned.saturating_add(1);
+                from_row = next_bounded_row(&mut from_stream)?;
+                to_row = Some((to_rowid, new_row));
+                Some(RowChange::Delete { rowid: from_rowid, row: old_row })
+            }
+            (Some((from_rowid, old_row)), Some((to_rowid, new_row))) => {
+                page.rows_scanned = page.rows_scanned.saturating_add(1);
+                from_row = Some((from_rowid, old_row));
+                to_row = next_bounded_row(&mut to_stream)?;
+                Some(RowChange::Insert { rowid: to_rowid, row: new_row })
+            }
+            (Some((rowid, row)), None) => {
+                page.rows_scanned = page.rows_scanned.saturating_add(1);
+                from_row = next_bounded_row(&mut from_stream)?;
+                Some(RowChange::Delete { rowid, row })
+            }
+            (None, Some((rowid, row))) => {
+                page.rows_scanned = page.rows_scanned.saturating_add(1);
+                to_row = next_bounded_row(&mut to_stream)?;
+                Some(RowChange::Insert { rowid, row })
+            }
+            (None, None) => None,
+        };
+        let Some(change) = change else { continue };
+        match &change {
+            RowChange::Insert { .. } => page.inserts += 1,
+            RowChange::Delete { .. } => page.deletes += 1,
+            RowChange::Update { .. } => page.updates += 1,
+            _ => unreachable!("rowid stream only produces rowid changes"),
+        }
+        if !matches!(mode, BoundedRowDiffMode::Summary) && change_index >= offset {
+            if page.changes.len() == limit {
+                page.has_more = true;
+                page.next_offset = Some(offset.saturating_add(limit));
+                break;
+            }
+            page.changes.push(change);
+        }
+        change_index = change_index.saturating_add(1);
+    }
+    Ok(page)
+}
+
+fn next_bounded_row(
+    stream: &mut Option<TableRowStream<'_>>,
+) -> Result<Option<(i64, Record)>, graft::err::GraftErr> {
+    stream
+        .as_mut()
+        .map(|stream| stream.next_row())
+        .transpose()
+        .map(Option::flatten)
+        .map_err(|error| {
+            graft::err::LogicalErr::Other(format!("Failed to stream SQLite table rows: {error}"))
+                .into()
+        })
+}
+
+fn bounded_cancellation_checkpoint() -> Result<(), graft::err::GraftErr> {
+    graft::repo::cancellation_checkpoint().map_err(|error| {
+        graft::err::LogicalErr::Other(format!("bounded SQLite diff cancelled: {error}")).into()
+    })
+}
+
+fn bounded_materialized_table(
+    pair: &MaterializedPair,
+    from_entry: Option<&MasterEntry>,
+    to_entry: Option<&MasterEntry>,
+    mode: &BoundedRowDiffMode,
+) -> Result<BoundedTablePage, graft::err::GraftErr> {
+    if matches!(mode, BoundedRowDiffMode::Summary) {
+        let from_count = materialized_table_count(&pair.from.connection, from_entry, "source")?;
+        let to_count = materialized_table_count(&pair.to.connection, to_entry, "target")?;
+        if from_count == 0 || to_count == 0 {
+            return Ok(BoundedTablePage {
+                inserts: to_count,
+                deletes: from_count,
+                updates: 0,
+                rows_scanned: 0,
+                primary_key_columns: Vec::new(),
+                changes: Vec::new(),
+                has_more: false,
+                next_offset: None,
+            });
+        }
+    }
+    let from_rows = from_entry
+        .map(|entry| read_sqlite_table_rows(&pair.from.connection, entry, "source"))
+        .transpose()?;
+    let to_rows = to_entry
+        .map(|entry| read_sqlite_table_rows(&pair.to.connection, entry, "target"))
+        .transpose()?;
+    let primary_key_columns = to_rows
+        .as_ref()
+        .or(from_rows.as_ref())
+        .map(|rows| rows.primary_key_columns.clone())
+        .unwrap_or_default();
+    let mut from_rows = from_rows.map(|rows| rows.rows).unwrap_or_default();
+    let mut to_rows = to_rows.map(|rows| rows.rows).unwrap_or_default();
+    let mut identities = BTreeSet::new();
+    identities.extend(from_rows.keys().cloned());
+    identities.extend(to_rows.keys().cloned());
+    let (offset, limit) = match mode {
+        BoundedRowDiffMode::Summary => (usize::MAX, 0),
+        BoundedRowDiffMode::Rows { offset, limit, .. } => (*offset, *limit),
+    };
+    let mut inserts = 0_usize;
+    let mut deletes = 0_usize;
+    let mut updates = 0_usize;
+    let mut rows_scanned = 0_usize;
+    let mut change_index = 0_usize;
+    let mut changes = Vec::with_capacity(limit);
+    let mut has_more = false;
+    for identity in identities {
+        if rows_scanned.is_multiple_of(1_024) {
+            bounded_cancellation_checkpoint()?;
+        }
+        let old_row = from_rows.remove(&identity);
+        let new_row = to_rows.remove(&identity);
+        rows_scanned += usize::from(old_row.is_some()) + usize::from(new_row.is_some());
+        let change = match (old_row, new_row, identity) {
+            (Some(old_row), Some(new_row), RowIdentity::Rowid(rowid)) if old_row != new_row => {
+                Some(RowChange::Update { rowid, old_row, new_row })
+            }
+            (Some(old_row), Some(new_row), RowIdentity::PrimaryKey(key)) if old_row != new_row => {
+                Some(RowChange::PrimaryKeyUpdate { key, old_row, new_row })
+            }
+            (Some(row), None, RowIdentity::Rowid(rowid)) => Some(RowChange::Delete { rowid, row }),
+            (Some(row), None, RowIdentity::PrimaryKey(key)) => {
+                Some(RowChange::PrimaryKeyDelete { key, row })
+            }
+            (None, Some(row), RowIdentity::Rowid(rowid)) => Some(RowChange::Insert { rowid, row }),
+            (None, Some(row), RowIdentity::PrimaryKey(key)) => {
+                Some(RowChange::PrimaryKeyInsert { key, row })
+            }
+            _ => None,
+        };
+        let Some(change) = change else { continue };
+        match &change {
+            RowChange::Insert { .. } | RowChange::PrimaryKeyInsert { .. } => inserts += 1,
+            RowChange::Delete { .. } | RowChange::PrimaryKeyDelete { .. } => deletes += 1,
+            RowChange::Update { .. } | RowChange::PrimaryKeyUpdate { .. } => updates += 1,
+        }
+        if !matches!(mode, BoundedRowDiffMode::Summary) && change_index >= offset {
+            if changes.len() == limit {
+                has_more = true;
+                break;
+            }
+            changes.push(change);
+        }
+        change_index = change_index.saturating_add(1);
+    }
+    Ok(BoundedTablePage {
+        inserts,
+        deletes,
+        updates,
+        rows_scanned,
+        primary_key_columns,
+        changes,
+        has_more,
+        next_offset: has_more.then_some(offset.saturating_add(limit)),
+    })
+}
+
+fn materialized_table_count(
+    connection: &Connection,
+    entry: Option<&MasterEntry>,
+    side: &str,
+) -> Result<usize, graft::err::GraftErr> {
+    let Some(entry) = entry else { return Ok(0) };
+    let count = connection
+        .query_row(
+            &format!("SELECT count(*) FROM {}", quote_identifier(&entry.name)),
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| sqlite_snapshot_err(side, "count table rows in", error))?;
+    usize::try_from(count).map_err(|_| {
+        graft::err::LogicalErr::Other(format!(
+            "Invalid row count for {side} table '{}'",
+            entry.name
+        ))
+        .into()
+    })
 }
 
 fn row_level_diff_checked_out(
