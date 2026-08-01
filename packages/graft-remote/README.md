@@ -39,6 +39,10 @@ interface User {
 }
 
 const handleRemote = createGraftRemoteHandler<RuntimeContext, User>({
+  limits: {
+    maxRequestBytes: 64 * 1024 * 1024,
+    multipartPartBytes: 16 * 1024 * 1024,
+  },
   async authenticate({ request }) {
     return await authenticateRequest(request);
   },
@@ -106,6 +110,7 @@ interface GraftRepositoryBackend {
     expected: Uint8Array<ArrayBuffer> | undefined,
   ): MaybePromise<boolean>;
   list(query: GraftListQuery): MaybePromise<GraftListResult>;
+  multipart?: GraftMultipartBackend;
 }
 ```
 
@@ -120,6 +125,10 @@ Backend guarantees:
   clone response without buffering the repository in memory.
 - `options.contentLength` is the exact length of a framed immutable body, such
   as each object in a `receive-pack` or `receive-bundle` request.
+- `multipart` optionally stores one logical immutable object through resumable
+  parts. The protocol engine advertises it as `multipart-object`, validates
+  every part against `limits.multipartPartBytes`, and keeps the final object at
+  the original repository path.
 - Repository instances are isolated by `repository.id`.
 
 ## Authentication and authorization

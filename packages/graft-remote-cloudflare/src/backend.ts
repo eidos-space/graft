@@ -4,6 +4,8 @@ import {
   type GraftByteRange,
   type GraftListQuery,
   type GraftListResult,
+  type GraftMultipartBackend,
+  type GraftMultipartUpload,
   type GraftObject,
   type GraftObjectMetadata,
   type GraftRepositoryBackend,
@@ -13,10 +15,22 @@ import {
 
 import type { RepositoryDurableObject } from "./repository";
 
+const R2_MIN_MULTIPART_PART_BYTES = 5 * 1024 * 1024;
+const R2_MAX_MULTIPART_PART_BYTES = 5 * 1024 * 1024 * 1024;
+const R2_MAX_MULTIPART_PARTS = 10_000;
+
 export class CloudflareRepositoryBackend implements GraftRepositoryBackend {
   readonly #objects: R2Bucket;
   readonly #repositoryId: string;
   readonly #metadata: DurableObjectStub<RepositoryDurableObject>;
+  readonly multipart: GraftMultipartBackend = {
+    start: async (path, totalBytes, partBytes) =>
+      await this.startMultipart(path, totalBytes, partBytes),
+    uploadPart: async (path, uploadId, partNumber, value, contentLength) =>
+      await this.uploadMultipartPart(path, uploadId, partNumber, value, contentLength),
+    complete: async (path, uploadId) => await this.completeMultipart(path, uploadId),
+    abort: async (path, uploadId) => await this.abortMultipart(path, uploadId),
+  };
 
   constructor(storage: CloudflareRepositoryStorage, repositoryId: string) {
     this.#objects = storage.objects;
@@ -128,6 +142,152 @@ export class CloudflareRepositoryBackend implements GraftRepositoryBackend {
     return `repositories/${this.#repositoryId}/objects/${path}`;
   }
 
+  private async startMultipart(
+    path: string,
+    totalBytes: number,
+    partBytes: number,
+  ): Promise<GraftMultipartUpload | null> {
+    validateR2MultipartShape(totalBytes, partBytes);
+    const key = this.r2Key(path);
+    if ((await this.#objects.head(key)) !== null) return null;
+
+    const existing = await this.#metadata.getMultipartUpload(path);
+    if (existing !== null) {
+      if (existing.totalBytes === totalBytes && existing.partBytes === partBytes) {
+        return publicMultipartUpload(existing);
+      }
+      await this.discardMultipart(path, existing.uploadId, key);
+    }
+
+    const upload = await this.#objects.createMultipartUpload(key, {
+      httpMetadata: { contentType: "application/octet-stream" },
+    });
+    let retained = false;
+    try {
+      retained = await this.#metadata.createMultipartUpload(
+        path,
+        upload.uploadId,
+        totalBytes,
+        partBytes,
+      );
+      if (retained) {
+        return {
+          uploadId: upload.uploadId,
+          totalBytes,
+          partBytes,
+          uploadedParts: [],
+        };
+      }
+    } finally {
+      if (!retained) {
+        try {
+          await upload.abort();
+        } catch {
+          // Another request won the durable session. R2 also expires abandoned uploads.
+        }
+      }
+    }
+
+    const winner = await this.#metadata.getMultipartUpload(path);
+    if (
+      winner === null ||
+      winner.totalBytes !== totalBytes ||
+      winner.partBytes !== partBytes
+    ) {
+      throw new Error("Multipart upload session changed while it was created");
+    }
+    return publicMultipartUpload(winner);
+  }
+
+  private async uploadMultipartPart(
+    path: string,
+    uploadId: string,
+    partNumber: number,
+    value: ReadableStream<Uint8Array>,
+    contentLength: number,
+  ): Promise<void> {
+    const state = await this.requireMultipart(path, uploadId);
+    const partCount = Math.ceil(state.totalBytes / state.partBytes);
+    const expectedBytes =
+      partNumber === partCount
+        ? state.totalBytes - state.partBytes * (partCount - 1)
+        : state.partBytes;
+    if (partNumber < 1 || partNumber > partCount || contentLength !== expectedBytes) {
+      throw new RangeError("Multipart part does not match the upload session");
+    }
+
+    const fixed = fixedR2Body(value, contentLength);
+    try {
+      const uploaded = await this.#objects
+        .resumeMultipartUpload(this.r2Key(path), uploadId)
+        .uploadPart(partNumber, fixed.body);
+      await fixed.finish(true);
+      await this.#metadata.recordMultipartPart(
+        path,
+        uploadId,
+        uploaded.partNumber,
+        uploaded.etag,
+        contentLength,
+      );
+    } catch (error) {
+      await fixed.cancel();
+      await fixed.finish(false);
+      throw error;
+    }
+  }
+
+  private async completeMultipart(path: string, uploadId: string): Promise<boolean> {
+    const key = this.r2Key(path);
+    if ((await this.#objects.head(key)) !== null) {
+      await this.discardMultipart(path, uploadId, key);
+      return false;
+    }
+    const state = await this.requireMultipart(path, uploadId);
+    const partCount = Math.ceil(state.totalBytes / state.partBytes);
+    if (
+      state.uploadedParts.length !== partCount ||
+      state.uploadedParts.some((part, index) => part.partNumber !== index + 1)
+    ) {
+      throw new RangeError("Multipart upload is incomplete");
+    }
+    const object = await this.#objects
+      .resumeMultipartUpload(key, uploadId)
+      .complete(
+        state.uploadedParts.map((part) => ({
+          partNumber: part.partNumber,
+          etag: part.etag,
+        })),
+      );
+    if (object.size !== state.totalBytes) {
+      throw new Error("Completed multipart object has an unexpected size");
+    }
+    await this.#metadata.deleteMultipartUpload(path, uploadId);
+    return true;
+  }
+
+  private async abortMultipart(path: string, uploadId: string): Promise<void> {
+    const state = await this.#metadata.getMultipartUpload(path);
+    if (state === null || state.uploadId !== uploadId) return;
+    await this.discardMultipart(path, uploadId, this.r2Key(path));
+  }
+
+  private async requireMultipart(path: string, uploadId: string) {
+    const state = await this.#metadata.getMultipartUpload(path);
+    if (state === null || state.uploadId !== uploadId) {
+      throw new RangeError("Multipart upload session does not exist");
+    }
+    return state;
+  }
+
+  private async discardMultipart(path: string, uploadId: string, key: string): Promise<void> {
+    try {
+      await this.#objects.resumeMultipartUpload(key, uploadId).abort();
+    } catch {
+      // The upload may already be complete or expired. The durable session is stale either way.
+    }
+    await this.#metadata.deleteMultipartUpload(path, uploadId);
+  }
+
   private async putImmutable(
     path: string,
     value: GraftWriteBody,
@@ -147,6 +307,33 @@ export class CloudflareRepositoryBackend implements GraftRepositoryBackend {
       await fixed.finish(false);
       throw error;
     }
+  }
+}
+
+function publicMultipartUpload(
+  state: Awaited<ReturnType<RepositoryDurableObject["getMultipartUpload"]>> & {},
+): GraftMultipartUpload {
+  return {
+    uploadId: state.uploadId,
+    totalBytes: state.totalBytes,
+    partBytes: state.partBytes,
+    uploadedParts: state.uploadedParts.map((part) => ({
+      partNumber: part.partNumber,
+      bytes: part.bytes,
+    })),
+  };
+}
+
+function validateR2MultipartShape(totalBytes: number, partBytes: number): void {
+  if (
+    !Number.isSafeInteger(totalBytes) ||
+    totalBytes < 1 ||
+    !Number.isSafeInteger(partBytes) ||
+    partBytes < R2_MIN_MULTIPART_PART_BYTES ||
+    partBytes > R2_MAX_MULTIPART_PART_BYTES ||
+    Math.ceil(totalBytes / partBytes) > R2_MAX_MULTIPART_PARTS
+  ) {
+    throw new RangeError("Object is outside the supported R2 multipart limits");
   }
 }
 

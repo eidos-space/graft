@@ -40,6 +40,35 @@ export interface GraftListResult {
   hasMore: boolean;
 }
 
+export interface GraftMultipartPart {
+  partNumber: number;
+  bytes: number;
+}
+
+export interface GraftMultipartUpload {
+  uploadId: string;
+  totalBytes: number;
+  partBytes: number;
+  uploadedParts: GraftMultipartPart[];
+}
+
+export interface GraftMultipartBackend {
+  start(
+    path: string,
+    totalBytes: number,
+    partBytes: number,
+  ): MaybePromise<GraftMultipartUpload | null>;
+  uploadPart(
+    path: string,
+    uploadId: string,
+    partNumber: number,
+    value: ReadableStream<Uint8Array>,
+    contentLength: number,
+  ): MaybePromise<void>;
+  complete(path: string, uploadId: string): MaybePromise<boolean>;
+  abort(path: string, uploadId: string): MaybePromise<void>;
+}
+
 export interface GraftRepositoryBackend {
   head(path: string): MaybePromise<GraftObjectMetadata | null>;
   get(path: string, range?: GraftByteRange): MaybePromise<GraftObject | null>;
@@ -61,6 +90,7 @@ export interface GraftRepositoryBackend {
     expected: Uint8Array<ArrayBuffer> | undefined,
   ): MaybePromise<boolean>;
   list(query: GraftListQuery): MaybePromise<GraftListResult>;
+  multipart?: GraftMultipartBackend;
 }
 
 export type GraftRemoteAction = "discover" | "read" | "write";
@@ -72,6 +102,10 @@ export type GraftRemoteOperation =
   | "upload-bundle"
   | "receive-pack"
   | "receive-bundle"
+  | "multipart-start"
+  | "multipart-part"
+  | "multipart-complete"
+  | "multipart-abort"
   | "cas"
   | "cad"
   | "list";
@@ -110,6 +144,10 @@ export interface GraftRemoteOptions<AdapterContext = undefined, Principal = unde
     request: GraftHandlerRequest<AdapterContext>,
   ): MaybePromise<string>;
   onError?(error: unknown, request: GraftHandlerRequest<AdapterContext>): MaybePromise<void>;
+  limits?: {
+    maxRequestBytes?: number;
+    multipartPartBytes?: number;
+  };
 }
 
 export type GraftRemoteHandler<AdapterContext> = (
