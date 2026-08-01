@@ -588,6 +588,7 @@ fn parse_repo_diff_arg_supports_row_mode() {
             target: RepoDiffTarget::Worktree { path: None },
             content: None,
             table: None,
+            row_page: None,
         }
     );
     assert_eq!(
@@ -598,6 +599,7 @@ fn parse_repo_diff_arg_supports_row_mode() {
             target: RepoDiffTarget::Staged { path: Some("app.db".to_string()) },
             content: None,
             table: None,
+            row_page: None,
         }
     );
     assert_eq!(
@@ -608,6 +610,7 @@ fn parse_repo_diff_arg_supports_row_mode() {
             target: RepoDiffTarget::Staged { path: None },
             content: None,
             table: None,
+            row_page: None,
         }
     );
     assert_eq!(
@@ -622,6 +625,7 @@ fn parse_repo_diff_arg_supports_row_mode() {
             },
             content: None,
             table: None,
+            row_page: None,
         }
     );
     assert_eq!(
@@ -635,6 +639,7 @@ fn parse_repo_diff_arg_supports_row_mode() {
             },
             content: None,
             table: None,
+            row_page: None,
         }
     );
     assert!(parse_repo_diff_arg(Some("--rows --rows")).is_err());
@@ -659,6 +664,7 @@ fn parse_repo_diff_arg_supports_one_table_row_mode() {
             },
             content: None,
             table: Some(r#"project "docs""#.to_string()),
+            row_page: None,
         }
     );
 
@@ -667,6 +673,42 @@ fn parse_repo_diff_arg_supports_one_table_row_mode() {
         "--rows --table docs",
         "--rows --table docs --table other -- app.db",
         "--rows --table -- app.db",
+    ] {
+        assert!(
+            parse_repo_diff_arg(Some(invalid)).is_err(),
+            "accepted {invalid}"
+        );
+    }
+}
+
+#[test]
+fn parse_repo_diff_arg_supports_bounded_sqlite_modes() {
+    let summary = parse_repo_diff_arg(Some("--sqlite-summary HEAD -- app.eidos")).unwrap();
+    assert_eq!(summary.mode, DiffMode::SqliteSummary);
+    assert_eq!(summary.table, None);
+    assert_eq!(summary.row_page, None);
+
+    let rows = parse_repo_diff_arg(Some(
+        r#"--rows --table records --row-limit 25 --row-after "graft-row-v1:25" HEAD -- app.eidos"#,
+    ))
+    .unwrap();
+    assert_eq!(rows.mode, DiffMode::Rows);
+    assert_eq!(rows.table.as_deref(), Some("records"));
+    assert_eq!(
+        rows.row_page,
+        Some(RepoRowPageSpec {
+            limit: 25,
+            after: Some("graft-row-v1:25".to_string()),
+        })
+    );
+
+    for invalid in [
+        "--sqlite-summary",
+        "--sqlite-summary --table records -- app.eidos",
+        "--rows --row-limit 25 -- app.eidos",
+        "--rows --table records --row-limit 0 -- app.eidos",
+        "--rows --table records --row-limit 1001 -- app.eidos",
+        "--rows --table records --row-after graft-row-v1:25 -- app.eidos",
     ] {
         assert!(
             parse_repo_diff_arg(Some(invalid)).is_err(),
@@ -771,6 +813,7 @@ fn parse_repo_diff_arg_requires_bounded_single_path_content_mode() {
                 max_bytes: graft::repo::DEFAULT_TEXT_DIFF_CONTENT_LIMIT,
             }),
             table: None,
+            row_page: None,
         }
     );
     assert_eq!(
@@ -786,6 +829,7 @@ fn parse_repo_diff_arg_requires_bounded_single_path_content_mode() {
                 max_bytes: graft::repo::DEFAULT_TEXT_DIFF_CONTENT_LIMIT,
             }),
             table: None,
+            row_page: None,
         }
     );
     assert_eq!(
@@ -823,6 +867,7 @@ fn parse_repo_diff_arg_supports_explicit_root_comparisons() {
             target: RepoDiffTarget::Root { to: "HEAD".to_string(), path: None },
             content: None,
             table: None,
+            row_page: None,
         }
     );
     assert_eq!(
@@ -839,6 +884,7 @@ fn parse_repo_diff_arg_supports_explicit_root_comparisons() {
             },
             content: Some(RepoTextContentSpec { max_bytes: ByteUnit::new(4096) }),
             table: None,
+            row_page: None,
         }
     );
     for invalid in [

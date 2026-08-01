@@ -102,6 +102,11 @@ class RepositorySession {
     return callJson(() => this.#native.diffPaths(diffOptions, signal))
   }
 
+  async diffSqlitePaths(options) {
+    const { signal, ...diffOptions } = options
+    return callJson(() => this.#native.diffSqlitePaths(diffOptions, signal))
+  }
+
   async readPathContent(options) {
     const { signal, ...readOptions } = options
     return callJson(() => this.#native.readPathContent(readOptions, signal))

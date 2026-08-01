@@ -8,6 +8,7 @@ use graft_sdk::{
     RemoteConfigureOptions as CoreRemoteConfigureOptions, RepositoryOperation,
     RepositorySession as CoreRepositorySession, RestoreOptions as CoreRestoreOptions,
     RestorePathsOptions as CoreRestorePathsOptions, SdkError,
+    SqliteDiffPathsOptions as CoreSqliteDiffPathsOptions, SqliteDiffResponse,
     StagePathsOptions as CoreStagePathsOptions, UntrackPathsOptions as CoreUntrackPathsOptions,
 };
 use napi::{
@@ -35,6 +36,20 @@ pub struct DiffPathsOptions {
     pub from: Option<String>,
     pub to: Option<String>,
     pub table: Option<String>,
+    pub limit: Option<u32>,
+    pub after: Option<String>,
+}
+
+#[napi(object)]
+pub struct SqliteDiffPathsOptions {
+    pub paths: Vec<String>,
+    pub mode: String,
+    pub root: Option<String>,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub table: Option<String>,
+    pub row_limit: Option<u32>,
+    pub row_after: Option<String>,
     pub limit: Option<u32>,
     pub after: Option<String>,
 }
@@ -131,6 +146,9 @@ enum JsonOperation {
     },
     DiffPaths {
         options: CoreDiffPathsOptions,
+    },
+    SqliteDiffPaths {
+        options: CoreSqliteDiffPathsOptions,
     },
     ReadPathContent {
         options: CoreReadPathContentOptions,
@@ -236,6 +254,14 @@ impl JsonTask {
             return serde_json::to_string(&value)
                 .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
         }
+        if let JsonOperation::SqliteDiffPaths { options } = &self.operation {
+            let value = self
+                .session
+                .diff_sqlite_paths(options)
+                .map_err(napi_error)?;
+            return serde_json::to_string(&value)
+                .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
+        }
         if let JsonOperation::ReadPathContent { options } = &self.operation {
             let value = self
                 .session
@@ -298,7 +324,7 @@ impl JsonTask {
             }
             JsonOperation::Commit { message } => self.session.commit(message),
             JsonOperation::Diff { options } => self.session.diff(options),
-            JsonOperation::DiffPaths { .. } => {
+            JsonOperation::DiffPaths { .. } | JsonOperation::SqliteDiffPaths { .. } => {
                 unreachable!("handled before JSON value dispatch")
             }
             JsonOperation::ReadPathContent { .. } => {
@@ -532,6 +558,42 @@ impl NodeRepositorySession {
                     from: options.from,
                     to: options.to,
                     table: options.table,
+                    limit: options.limit.unwrap_or(100) as usize,
+                    after: options.after,
+                },
+            },
+            signal,
+        )
+    }
+
+    #[napi]
+    pub fn diff_sqlite_paths(
+        &self,
+        options: SqliteDiffPathsOptions,
+        signal: Option<AbortSignal>,
+    ) -> AsyncTask<JsonTask> {
+        let response = match options.mode.as_str() {
+            "summary" => SqliteDiffResponse::Summary,
+            "rows" => SqliteDiffResponse::Rows {
+                table: options.table.unwrap_or_default(),
+                limit: options.row_limit.unwrap_or(100) as usize,
+                after: options.row_after,
+            },
+            _ => SqliteDiffResponse::Rows {
+                table: String::new(),
+                limit: 0,
+                after: None,
+            },
+        };
+        json_task(
+            self,
+            JsonOperation::SqliteDiffPaths {
+                options: CoreSqliteDiffPathsOptions {
+                    paths: options.paths.into_iter().map(PathBuf::from).collect(),
+                    root: options.root,
+                    from: options.from,
+                    to: options.to,
+                    response,
                     limit: options.limit.unwrap_or(100) as usize,
                     after: options.after,
                 },
@@ -806,6 +868,7 @@ pub fn operation_materializes_worktree(operation: String) -> Result<bool> {
         "commit" => RepositoryOperation::Commit,
         "diff" => RepositoryOperation::Diff,
         "diff_paths" | "diffPaths" => RepositoryOperation::DiffPaths,
+        "diff_sqlite_paths" | "diffSqlitePaths" => RepositoryOperation::DiffPaths,
         "read_path_content" | "readPathContent" => RepositoryOperation::ReadPathContent,
         "history" => RepositoryOperation::History,
         "history_summaries" | "historySummaries" => RepositoryOperation::HistorySummaries,

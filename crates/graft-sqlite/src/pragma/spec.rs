@@ -7,6 +7,14 @@ pub enum DiffMode {
     Default,
     /// Row-level: detailed comparison of each row
     Rows,
+    /// `SQLite` table summaries without row payloads.
+    SqliteSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RepoRowPageSpec {
+    pub(super) limit: usize,
+    pub(super) after: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +55,7 @@ pub(crate) struct RepoDiffSpec {
     pub(super) target: RepoDiffTarget,
     pub(super) content: Option<RepoTextContentSpec>,
     pub(super) table: Option<String>,
+    pub(super) row_page: Option<RepoRowPageSpec>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

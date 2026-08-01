@@ -6,7 +6,7 @@
 //! - Traversing B-tree to read table data
 //! - Serializing/deserializing records
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use graft::core::PageIdx;
 use graft::volume_reader::VolumeRead;
@@ -167,6 +167,78 @@ pub struct TableScanner<'a> {
     header: DatabaseHeader,
 }
 
+/// Incremental, rowid-ordered reader for a `SQLite` table B-tree.
+///
+/// Only one leaf page is decoded at a time. This is the primitive used by the
+/// bounded repository diff API so a large table does not have to become a
+/// `HashMap<i64, Record>` before callers can inspect its first changes.
+pub struct TableRowStream<'a> {
+    scanner: TableScanner<'a>,
+    leaf_pages: Vec<u32>,
+    next_leaf_page: usize,
+    buffered_rows: VecDeque<(i64, Record)>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum IndexStreamItem {
+    LeafPage(u32),
+    InteriorCell { page_num: u32, cell_offset: usize },
+}
+
+/// Incremental, primary-key-ordered reader for an index B-tree.
+///
+/// `WITHOUT ROWID` tables store complete rows in index leaf and interior cells. The traversal
+/// plan retains only page/cell locations; at most one leaf page of decoded records is buffered.
+pub struct IndexRowStream<'a> {
+    scanner: TableScanner<'a>,
+    items: VecDeque<IndexStreamItem>,
+    buffered_records: VecDeque<Record>,
+}
+
+impl TableRowStream<'_> {
+    pub fn next_row(&mut self) -> Result<Option<(i64, Record)>, ParseError> {
+        loop {
+            if let Some(row) = self.buffered_rows.pop_front() {
+                return Ok(Some(row));
+            }
+            let Some(page_num) = self.leaf_pages.get(self.next_leaf_page).copied() else {
+                return Ok(None);
+            };
+            self.next_leaf_page += 1;
+            let mut rows = self.scanner.read_rows_from_leaf_page(page_num)?;
+            rows.sort_by_key(|(rowid, _)| *rowid);
+            self.buffered_rows = rows.into();
+        }
+    }
+}
+
+impl IndexRowStream<'_> {
+    pub fn next_record(&mut self) -> Result<Option<Record>, ParseError> {
+        loop {
+            if let Some(record) = self.buffered_records.pop_front() {
+                return Ok(Some(record));
+            }
+            let Some(item) = self.items.pop_front() else {
+                return Ok(None);
+            };
+            match item {
+                IndexStreamItem::LeafPage(page_num) => {
+                    self.buffered_records = self
+                        .scanner
+                        .read_index_records_from_leaf_page(page_num)?
+                        .into();
+                }
+                IndexStreamItem::InteriorCell { page_num, cell_offset } => {
+                    return self
+                        .scanner
+                        .read_index_record_from_cell(page_num, cell_offset, true)
+                        .map(Some);
+                }
+            }
+        }
+    }
+}
+
 impl<'a> TableScanner<'a> {
     pub fn new(reader: &'a dyn VolumeRead) -> Result<Self, ParseError> {
         let header_page = reader
@@ -276,6 +348,102 @@ impl<'a> TableScanner<'a> {
         Ok(pages)
     }
 
+    /// Consume the scanner and return a rowid-ordered, leaf-at-a-time stream.
+    pub fn into_row_stream(self, root_page: u32) -> Result<TableRowStream<'a>, ParseError> {
+        let mut leaf_pages = Vec::new();
+        self.collect_table_leaf_pages_ordered(root_page, &mut leaf_pages)?;
+        Ok(TableRowStream {
+            scanner: self,
+            leaf_pages,
+            next_leaf_page: 0,
+            buffered_rows: VecDeque::new(),
+        })
+    }
+
+    /// Consume the scanner and return an index-key-ordered stream.
+    pub fn into_index_row_stream(self, root_page: u32) -> Result<IndexRowStream<'a>, ParseError> {
+        let mut items = VecDeque::new();
+        self.collect_index_stream_items(root_page, &mut items)?;
+        Ok(IndexRowStream {
+            scanner: self,
+            items,
+            buffered_records: VecDeque::new(),
+        })
+    }
+
+    /// Count every record in an index B-tree from page headers without decoding row payloads.
+    pub fn count_index_rows(&self, root_page: u32) -> Result<usize, ParseError> {
+        let mut items = VecDeque::new();
+        self.collect_index_stream_items(root_page, &mut items)?;
+        let mut rows = 0_usize;
+        for item in items {
+            rows = rows
+                .checked_add(match item {
+                    IndexStreamItem::LeafPage(page_num) => {
+                        let (_, _, header) = self.read_table_page(page_num)?;
+                        usize::from(header.num_cells)
+                    }
+                    IndexStreamItem::InteriorCell { .. } => 1,
+                })
+                .ok_or(ParseError::InvalidCell)?;
+        }
+        Ok(rows)
+    }
+
+    fn collect_index_stream_items(
+        &self,
+        page_num: u32,
+        items: &mut VecDeque<IndexStreamItem>,
+    ) -> Result<(), ParseError> {
+        let (full_page, header_offset, header) = self.read_table_page(page_num)?;
+        let page_bytes = full_page.as_ref();
+        match header.page_type {
+            10 => items.push_back(IndexStreamItem::LeafPage(page_num)),
+            2 => {
+                for cell_index in 0..header.num_cells {
+                    let ptr_offset =
+                        header_offset + header.header_size() + usize::from(cell_index) * 2;
+                    if ptr_offset + 2 > page_bytes.len() {
+                        return Err(ParseError::InvalidCell);
+                    }
+                    let cell_offset = usize::from(u16::from_be_bytes([
+                        page_bytes[ptr_offset],
+                        page_bytes[ptr_offset + 1],
+                    ]));
+                    if cell_offset + 4 > page_bytes.len() {
+                        return Err(ParseError::InvalidCell);
+                    }
+                    let left_child = u32::from_be_bytes([
+                        page_bytes[cell_offset],
+                        page_bytes[cell_offset + 1],
+                        page_bytes[cell_offset + 2],
+                        page_bytes[cell_offset + 3],
+                    ]);
+                    self.collect_index_stream_items(left_child, items)?;
+                    items.push_back(IndexStreamItem::InteriorCell { page_num, cell_offset });
+                }
+                let right_child = header.right_child_ptr.ok_or(ParseError::InvalidPage)?;
+                self.collect_index_stream_items(right_child, items)?;
+            }
+            _ => return Err(ParseError::InvalidPage),
+        }
+        Ok(())
+    }
+
+    /// Count rows from leaf headers without decoding row payloads.
+    pub fn count_table_rows(&self, root_page: u32) -> Result<usize, ParseError> {
+        let mut leaf_pages = Vec::new();
+        self.collect_table_leaf_pages_ordered(root_page, &mut leaf_pages)?;
+        let mut rows = 0_usize;
+        for page_num in leaf_pages {
+            let (_, _, header) = self.read_table_page(page_num)?;
+            rows = rows
+                .checked_add(usize::from(header.num_cells))
+                .ok_or(ParseError::InvalidCell)?;
+        }
+        Ok(rows)
+    }
+
     /// Read rows from a known subset of table leaf pages.
     pub fn read_rows_from_leaf_pages(
         &self,
@@ -295,6 +463,102 @@ impl<'a> TableScanner<'a> {
             rows.insert(cell.rowid, Record::parse(&cell.payload)?);
         }
         Ok(rows)
+    }
+
+    fn read_rows_from_leaf_page(&self, page_num: u32) -> Result<Vec<(i64, Record)>, ParseError> {
+        let (full_page, header_offset, header) = self.read_table_page(page_num)?;
+        if header.page_type != 13 {
+            return Err(ParseError::InvalidPage);
+        }
+        let mut cells = Vec::new();
+        self.read_leaf_cells(full_page.as_ref(), header_offset, &header, &mut cells)?;
+        cells
+            .into_iter()
+            .map(|cell| Ok((cell.rowid, Record::parse(&cell.payload)?)))
+            .collect()
+    }
+
+    fn read_index_records_from_leaf_page(&self, page_num: u32) -> Result<Vec<Record>, ParseError> {
+        let (full_page, header_offset, header) = self.read_table_page(page_num)?;
+        if header.page_type != 10 {
+            return Err(ParseError::InvalidPage);
+        }
+        let page_bytes = full_page.as_ref();
+        let mut records = Vec::with_capacity(usize::from(header.num_cells));
+        for cell_index in 0..header.num_cells {
+            let ptr_offset = header_offset + header.header_size() + usize::from(cell_index) * 2;
+            if ptr_offset + 2 > page_bytes.len() {
+                return Err(ParseError::InvalidCell);
+            }
+            let cell_offset = usize::from(u16::from_be_bytes([
+                page_bytes[ptr_offset],
+                page_bytes[ptr_offset + 1],
+            ]));
+            records.push(self.read_index_record_from_bytes(page_bytes, cell_offset, false)?);
+        }
+        Ok(records)
+    }
+
+    fn read_index_record_from_cell(
+        &self,
+        page_num: u32,
+        cell_offset: usize,
+        interior: bool,
+    ) -> Result<Record, ParseError> {
+        let (full_page, _, _) = self.read_table_page(page_num)?;
+        self.read_index_record_from_bytes(full_page.as_ref(), cell_offset, interior)
+    }
+
+    fn read_index_record_from_bytes(
+        &self,
+        page_bytes: &[u8],
+        cell_offset: usize,
+        interior: bool,
+    ) -> Result<Record, ParseError> {
+        let usable_end = self.usable_size().min(page_bytes.len());
+        if cell_offset >= usable_end {
+            return Err(ParseError::InvalidCell);
+        }
+        let data = &page_bytes[cell_offset..usable_end];
+        let payload_prefix = if interior { 4 } else { 0 };
+        if data.len() <= payload_prefix {
+            return Err(ParseError::InvalidCell);
+        }
+        let (payload_size, payload_size_bytes) = read_varint(&data[payload_prefix..]);
+        if payload_size < 0 || payload_size_bytes == 0 {
+            return Err(ParseError::InvalidCell);
+        }
+        let payload_size = usize::try_from(payload_size).map_err(|_| ParseError::InvalidCell)?;
+        let payload_start = payload_prefix + payload_size_bytes;
+        let local_payload_size = self.local_index_payload_size(payload_size);
+        let local_payload_end = payload_start
+            .checked_add(local_payload_size)
+            .ok_or(ParseError::InvalidCell)?;
+        if local_payload_end > data.len() {
+            return Err(ParseError::InvalidCell);
+        }
+        let mut payload = Vec::with_capacity(payload_size);
+        payload.extend_from_slice(&data[payload_start..local_payload_end]);
+        if payload.len() < payload_size {
+            let overflow_pointer_end = local_payload_end
+                .checked_add(4)
+                .ok_or(ParseError::InvalidCell)?;
+            if overflow_pointer_end > data.len() {
+                return Err(ParseError::InvalidCell);
+            }
+            let first_overflow_page = u32::from_be_bytes([
+                data[local_payload_end],
+                data[local_payload_end + 1],
+                data[local_payload_end + 2],
+                data[local_payload_end + 3],
+            ]);
+            self.read_overflow_payload(
+                first_overflow_page,
+                payload_size - payload.len(),
+                &mut payload,
+            )?;
+        }
+        Record::parse(&payload)
     }
 
     /// Return true when a leaf may depend on overflow pages not represented by its own bytes.
@@ -363,6 +627,39 @@ impl<'a> TableScanner<'a> {
                     let cell = Self::parse_table_interior_cell(&page_bytes[cell_offset..])?
                         .ok_or(ParseError::InvalidCell)?;
                     self.collect_table_leaf_pages(cell.left_child, pages)?;
+                }
+            }
+            _ => return Err(ParseError::InvalidPage),
+        }
+        Ok(())
+    }
+
+    fn collect_table_leaf_pages_ordered(
+        &self,
+        page_num: u32,
+        pages: &mut Vec<u32>,
+    ) -> Result<(), ParseError> {
+        let (full_page, header_offset, header) = self.read_table_page(page_num)?;
+        let page_bytes = full_page.as_ref();
+        match header.page_type {
+            13 => pages.push(page_num),
+            5 => {
+                for cell_index in 0..header.num_cells {
+                    let ptr_offset =
+                        header_offset + header.header_size() + usize::from(cell_index) * 2;
+                    if ptr_offset + 2 > page_bytes.len() {
+                        return Err(ParseError::InvalidCell);
+                    }
+                    let cell_offset = usize::from(u16::from_be_bytes([
+                        page_bytes[ptr_offset],
+                        page_bytes[ptr_offset + 1],
+                    ]));
+                    let cell = Self::parse_table_interior_cell(&page_bytes[cell_offset..])?
+                        .ok_or(ParseError::InvalidCell)?;
+                    self.collect_table_leaf_pages_ordered(cell.left_child, pages)?;
+                }
+                if let Some(right_child) = header.right_child_ptr {
+                    self.collect_table_leaf_pages_ordered(right_child, pages)?;
                 }
             }
             _ => return Err(ParseError::InvalidPage),
@@ -592,6 +889,25 @@ impl<'a> TableScanner<'a> {
             return 0;
         }
 
+        let mut local_payload_size =
+            min_local + ((payload_size - min_local) % overflow_payload_size);
+        if local_payload_size > max_local {
+            local_payload_size = min_local;
+        }
+        local_payload_size
+    }
+
+    fn local_index_payload_size(&self, payload_size: usize) -> usize {
+        let usable_size = self.usable_size();
+        let min_local = ((usable_size.saturating_sub(12) * 32) / 255).saturating_sub(23);
+        let max_local = ((usable_size.saturating_sub(12) * 64) / 255).saturating_sub(23);
+        if payload_size <= max_local {
+            return payload_size;
+        }
+        let overflow_payload_size = usable_size.saturating_sub(4);
+        if overflow_payload_size == 0 {
+            return 0;
+        }
         let mut local_payload_size =
             min_local + ((payload_size - min_local) % overflow_payload_size);
         if local_payload_size > max_local {

@@ -2320,6 +2320,9 @@ impl GraftCommand {
                         // Row-level detailed diff
                         row_diff_impl(&runtime, file, from, to)
                     }
+                    DiffMode::SqliteSummary => {
+                        pragma_err!("SQLite summary mode is only available for repository diffs")
+                    }
                 }
             }
 
@@ -2342,6 +2345,9 @@ impl GraftCommand {
                         &diff,
                         table.as_deref(),
                     )?)),
+                    DiffMode::SqliteSummary => {
+                        pragma_err!("diff --sqlite-summary requires JSON output")
+                    }
                 }
             }
 
@@ -2435,6 +2441,9 @@ impl GraftCommand {
                             ErrCtx::PragmaErr(format!("JSON error: {e}").into())
                         })?))
                     }
+                    DiffMode::SqliteSummary => {
+                        pragma_err!("SQLite summary mode is only available for repository diffs")
+                    }
                 }
             }
 
@@ -2445,6 +2454,7 @@ impl GraftCommand {
                 let mode = spec.mode;
                 let kind = spec.kind.map(repo_tracked_path_kind_json_label);
                 let table = spec.table.clone();
+                let row_page = spec.row_page.clone();
                 let repo = repo_for_file(file)?;
                 let content_request = match (&spec.content, &spec.target) {
                     (
@@ -2474,12 +2484,42 @@ impl GraftCommand {
                         })?))
                     }
                     DiffMode::Rows => {
-                        let rows = json_repo_row_diff(&runtime, &repo, &diff, table.as_deref())?;
+                        let rows = if let Some(page) = row_page {
+                            let table = table.as_ref().expect("paged rows require one table");
+                            let offset = bounded_row_offset(page.after.as_deref(), table)?;
+                            let mode = crate::row_level_diff::BoundedRowDiffMode::Rows {
+                                table: table.clone(),
+                                limit: page.limit,
+                                offset,
+                            };
+                            json_repo_bounded_diff(&runtime, &repo, &diff, &mode)?
+                        } else {
+                            let rows =
+                                json_repo_row_diff(&runtime, &repo, &diff, table.as_deref())?;
+                            return Ok(Some(to_json(&JsonRepoDiffOutcome {
+                                current_head,
+                                current_branch,
+                                kind,
+                                diff: rows,
+                                content: None,
+                            })?));
+                        };
                         Ok(Some(to_json(&JsonRepoDiffOutcome {
                             current_head,
                             current_branch,
                             kind,
                             diff: rows,
+                            content: None,
+                        })?))
+                    }
+                    DiffMode::SqliteSummary => {
+                        let mode = crate::row_level_diff::BoundedRowDiffMode::Summary;
+                        let summary = json_repo_bounded_diff(&runtime, &repo, &diff, &mode)?;
+                        Ok(Some(to_json(&JsonRepoDiffOutcome {
+                            current_head,
+                            current_branch,
+                            kind,
+                            diff: summary,
                             content: None,
                         })?))
                     }

@@ -12,8 +12,8 @@ use super::{
     JsonTagsMode, LargeFileFetchSpec, LargeFilePruneSpec, LargeFileStatusSpec, LsFilesSpec,
     RepoAddSpec, RepoAuditSpec, RepoCheckoutSpec, RepoCloneSpec, RepoDiffSpec, RepoDiffTarget,
     RepoExportSpec, RepoInitSpec, RepoRemoveSpec, RepoResolveRowSpec, RepoResolveSpec,
-    RepoRestoreSpec, RepoTextContentSpec, ResolveSide, StatusSpec, StorageGcSpec, parse_or_fail,
-    pragma_fail,
+    RepoRestoreSpec, RepoRowPageSpec, RepoTextContentSpec, ResolveSide, StatusSpec, StorageGcSpec,
+    parse_or_fail, pragma_fail,
 };
 
 pub(super) fn parse_remote_add(arg: &str) -> Result<(String, RemoteConfig), PragmaErr> {
@@ -430,6 +430,7 @@ pub(super) fn parse_repo_diff_arg(arg: Option<&str>) -> Result<RepoDiffSpec, Pra
             target: RepoDiffTarget::Worktree { path: None },
             content: None,
             table: None,
+            row_page: None,
         });
     };
     reject_ambiguous_posix_path_escape(arg)?;
@@ -439,6 +440,8 @@ pub(super) fn parse_repo_diff_arg(arg: Option<&str>) -> Result<RepoDiffSpec, Pra
     let mut include_content = false;
     let mut max_content_bytes = None;
     let mut table = None;
+    let mut row_limit = None;
+    let mut row_after = None;
     let mut root = None;
     let mut parts = Vec::new();
     let mut in_path = false;
@@ -454,6 +457,12 @@ pub(super) fn parse_repo_diff_arg(arg: Option<&str>) -> Result<RepoDiffSpec, Pra
                 return Err(pragma_fail("`--rows` may only be specified once"));
             }
             mode = DiffMode::Rows;
+            index += 1;
+        } else if !in_path && part == "--sqlite-summary" {
+            if mode != DiffMode::Default {
+                return Err(pragma_fail("diff accepts only one SQLite response mode"));
+            }
+            mode = DiffMode::SqliteSummary;
             index += 1;
         } else if !in_path && part == "--kind" {
             if kind.is_some() {
@@ -478,6 +487,32 @@ pub(super) fn parse_repo_diff_arg(arg: Option<&str>) -> Result<RepoDiffSpec, Pra
                 return Err(pragma_fail("diff --table exceeds 1,024 bytes"));
             }
             table = Some(value.clone());
+            index += 2;
+        } else if !in_path && part == "--row-limit" {
+            if row_limit.is_some() {
+                return Err(pragma_fail("diff accepts --row-limit only once"));
+            }
+            let Some(value) = raw_parts.get(index + 1) else {
+                return Err(pragma_fail("diff --row-limit requires a value"));
+            };
+            let value = value.parse::<usize>().map_err(|_| {
+                pragma_fail("diff --row-limit must be an integer between 1 and 1,000")
+            })?;
+            if !(1..=1_000).contains(&value) {
+                return Err(pragma_fail(
+                    "diff --row-limit must be an integer between 1 and 1,000",
+                ));
+            }
+            row_limit = Some(value);
+            index += 2;
+        } else if !in_path && part == "--row-after" {
+            if row_after.is_some() {
+                return Err(pragma_fail("diff accepts --row-after only once"));
+            }
+            let Some(value) = raw_parts.get(index + 1) else {
+                return Err(pragma_fail("diff --row-after requires a value"));
+            };
+            row_after = Some(value.clone());
             index += 2;
         } else if !in_path && part == "--content" {
             if include_content {
@@ -566,6 +601,12 @@ pub(super) fn parse_repo_diff_arg(arg: Option<&str>) -> Result<RepoDiffSpec, Pra
     if table.is_some() && mode != DiffMode::Rows {
         return Err(pragma_fail("diff --table requires --rows"));
     }
+    if row_limit.is_some() && (mode != DiffMode::Rows || table.is_none()) {
+        return Err(pragma_fail("diff --row-limit requires --rows and --table"));
+    }
+    if row_after.is_some() && row_limit.is_none() {
+        return Err(pragma_fail("diff --row-after requires --row-limit"));
+    }
     if table.is_some()
         && !matches!(
             &target,
@@ -605,7 +646,30 @@ pub(super) fn parse_repo_diff_arg(arg: Option<&str>) -> Result<RepoDiffSpec, Pra
     } else {
         None
     };
-    Ok(RepoDiffSpec { mode, kind, target, content, table })
+    if mode == DiffMode::SqliteSummary
+        && !matches!(
+            &target,
+            RepoDiffTarget::Worktree { path: Some(path) }
+                | RepoDiffTarget::Staged { path: Some(path) }
+                | RepoDiffTarget::RevisionToWorktree { path: Some(path), .. }
+                | RepoDiffTarget::Revisions { path: Some(path), .. }
+                | RepoDiffTarget::Root { path: Some(path), .. }
+                if !path.is_empty()
+        )
+    {
+        return Err(pragma_fail(
+            "diff --sqlite-summary requires one explicit path",
+        ));
+    }
+    let row_page = row_limit.map(|limit| RepoRowPageSpec { limit, after: row_after });
+    Ok(RepoDiffSpec {
+        mode,
+        kind,
+        target,
+        content,
+        table,
+        row_page,
+    })
 }
 
 pub(super) fn parse_volume_diff_arg(arg: &str) -> Result<(LSN, LSN, DiffMode), PragmaErr> {

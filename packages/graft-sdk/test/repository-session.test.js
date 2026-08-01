@@ -24,7 +24,7 @@ const {
 } = require("..")
 
 test("exposes ABI-stable SDK metadata and materialization contract", () => {
-  assert.equal(sdkVersion(), "0.3.3")
+  assert.equal(sdkVersion(), "0.3.4")
   for (const operation of [
     "restore",
     "restorePaths",
@@ -220,6 +220,224 @@ test(
         }),
         /requires row details/
       )
+      await session.close()
+    })
+  }
+)
+
+test(
+  "returns SQLite summaries and stable bounded row pages without full payloads",
+  nodeSqliteTest,
+  async () => {
+    await withTemporaryDirectory("graft-sdk-bounded-row-diff-", async (root) => {
+      const databasePath = path.join(root, "space.eidos")
+      const database = new DatabaseSync(databasePath)
+      database.exec("CREATE TABLE records (id INTEGER PRIMARY KEY, value TEXT NOT NULL)")
+      database.close()
+
+      const session = await RepositorySession.open(root)
+      await session.init()
+      await session.addAll()
+      const baseline = await session.commit("empty records")
+
+      const changed = new DatabaseSync(databasePath)
+      const insert = changed.prepare("INSERT INTO records (value) VALUES (?)")
+      changed.exec("BEGIN")
+      for (let index = 0; index < 5_000; index += 1) {
+        insert.run(`value-${index}`)
+      }
+      changed.exec("COMMIT")
+      changed.close()
+      await session.addAll()
+      const updated = await session.commit("insert records")
+
+      const summary = await session.diffSqlitePaths({
+        paths: ["space.eidos"],
+        mode: "summary",
+        from: baseline.commit.id,
+        to: updated.commit.id,
+        limit: 1,
+      })
+      assert.deepEqual(summary.paths[0].diff.files[0].summaries, [
+        { name: "records", inserts: 5_000, deletes: 0, updates: 0 },
+      ])
+      assert.equal(summary.paths[0].diff.files[0].tables, undefined)
+      assert.equal(summary.telemetry.rows_returned, 0)
+      assert.equal(summary.telemetry.response_scope, "streaming_rowid")
+
+      const first = await session.diffSqlitePaths({
+        paths: ["space.eidos"],
+        mode: "rows",
+        table: "records",
+        rowLimit: 2,
+        from: baseline.commit.id,
+        to: updated.commit.id,
+        limit: 1,
+      })
+      const firstFile = first.paths[0].diff.files[0]
+      assert.deepEqual(
+        firstFile.tables[0].changes.map(({ rowid }) => rowid),
+        [1, 2]
+      )
+      assert.equal(firstFile.has_more, true)
+      assert.match(firstFile.next_cursor, /^graft-row-v1:/)
+      assert.equal(first.telemetry.rows_returned, 2)
+      assert.equal(first.telemetry.truncated, true)
+
+      const second = await session.diffSqlitePaths({
+        paths: ["space.eidos"],
+        mode: "rows",
+        table: "records",
+        rowLimit: 2,
+        rowAfter: firstFile.next_cursor,
+        from: baseline.commit.id,
+        to: updated.commit.id,
+        limit: 1,
+      })
+      assert.deepEqual(
+        second.paths[0].diff.files[0].tables[0].changes.map(({ rowid }) => rowid),
+        [3, 4]
+      )
+
+      await assert.rejects(
+        session.diffSqlitePaths({
+          paths: ["space.eidos"],
+          mode: "rows",
+          table: "records",
+          rowLimit: 2,
+          rowAfter: "not-a-cursor",
+          from: baseline.commit.id,
+          to: updated.commit.id,
+          limit: 1,
+        }),
+        /invalid or incompatible row diff cursor/
+      )
+      await session.close()
+    })
+  }
+)
+
+test(
+  "streams Eidos-style STRICT WITHOUT ROWID changes in primary-key order",
+  nodeSqliteTest,
+  async () => {
+    await withTemporaryDirectory("graft-sdk-without-rowid-diff-", async (root) => {
+      const databasePath = path.join(root, "space.eidos")
+      const database = new DatabaseSync(databasePath)
+      database.exec(`
+        PRAGMA journal_mode=DELETE;
+        CREATE TABLE records (
+          id TEXT PRIMARY KEY COLLATE BINARY,
+          value TEXT NOT NULL COLLATE NOCASE,
+          score INTEGER NOT NULL
+        ) STRICT, WITHOUT ROWID;
+        CREATE TABLE eidos__meta (
+          singleton INTEGER PRIMARY KEY,
+          revision INTEGER NOT NULL
+        ) STRICT, WITHOUT ROWID;
+        INSERT INTO eidos__meta VALUES (1, 1);
+      `)
+      database.close()
+
+      const session = await RepositorySession.open(root)
+      await session.init()
+      await session.addAll()
+      const empty = await session.commit("empty records")
+
+      const populated = new DatabaseSync(databasePath)
+      const insert = populated.prepare(
+        "INSERT INTO records (id, value, score) VALUES (?, ?, ?)"
+      )
+      populated.exec("BEGIN")
+      for (let index = 0; index < 5_000; index += 1) {
+        const id = index.toString().padStart(8, "0")
+        insert.run(id, `value-${id}`, index)
+      }
+      populated.exec("COMMIT")
+      populated.close()
+      await session.addAll()
+      const baseline = await session.commit("populate records")
+
+      const initialSummary = await session.diffSqlitePaths({
+        paths: ["space.eidos"],
+        mode: "summary",
+        from: empty.commit.id,
+        to: baseline.commit.id,
+        limit: 1,
+      })
+      assert.deepEqual(initialSummary.paths[0].diff.files[0].summaries, [
+        { name: "records", inserts: 5_000, deletes: 0, updates: 0 },
+      ])
+      // The inserted table is counted from B-tree headers; only the unchanged singleton metadata
+      // row is decoded on both sides.
+      assert.ok(initialSummary.telemetry.rows_scanned <= 2)
+      assert.equal(
+        initialSummary.telemetry.response_scope,
+        "streaming_primary_key"
+      )
+
+      const changed = new DatabaseSync(databasePath)
+      changed.exec(`
+        DELETE FROM records WHERE id = '00000001';
+        INSERT INTO records VALUES ('00005000', 'inserted', 5000);
+      `)
+      changed
+        .prepare("UPDATE records SET value = ? WHERE id = '00000002'")
+        .run("updated".repeat(600))
+      changed.close()
+      await session.addAll()
+      const updated = await session.commit("mutate records")
+
+      const summary = await session.diffSqlitePaths({
+        paths: ["space.eidos"],
+        mode: "summary",
+        from: baseline.commit.id,
+        to: updated.commit.id,
+        limit: 1,
+      })
+      assert.deepEqual(summary.paths[0].diff.files[0].summaries, [
+        { name: "records", inserts: 1, deletes: 1, updates: 1 },
+      ])
+      assert.equal(summary.telemetry.response_scope, "streaming_primary_key")
+
+      const first = await session.diffSqlitePaths({
+        paths: ["space.eidos"],
+        mode: "rows",
+        table: "records",
+        rowLimit: 2,
+        from: baseline.commit.id,
+        to: updated.commit.id,
+        limit: 1,
+      })
+      const firstFile = first.paths[0].diff.files[0]
+      assert.deepEqual(
+        firstFile.tables[0].changes.map(({ op, key }) => [op, key.id]),
+        [
+          ["delete", "00000001"],
+          ["update", "00000002"],
+        ]
+      )
+      assert.equal(firstFile.has_more, true)
+      assert.equal(first.telemetry.response_scope, "streaming_primary_key")
+
+      const second = await session.diffSqlitePaths({
+        paths: ["space.eidos"],
+        mode: "rows",
+        table: "records",
+        rowLimit: 2,
+        rowAfter: firstFile.next_cursor,
+        from: baseline.commit.id,
+        to: updated.commit.id,
+        limit: 1,
+      })
+      assert.deepEqual(
+        second.paths[0].diff.files[0].tables[0].changes.map(({ op, key }) => [
+          op,
+          key.id,
+        ]),
+        [["insert", "00005000"]]
+      )
+      assert.equal(second.paths[0].diff.files[0].has_more, false)
       await session.close()
     })
   }

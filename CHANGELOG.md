@@ -1,5 +1,37 @@
 # Changelog
 
+## Graft SDK 0.3.4 — 2026-08-01
+
+### Added
+
+- Added `diffSqlitePaths`, a bounded SQLite diff surface with a payload-free table summary mode
+  and an independently paged row-detail mode for one explicitly selected table.
+- Added opaque row cursors, cooperative cancellation, and aggregate/file telemetry for rows
+  scanned, rows returned, truncation, and the active streaming or compatibility path.
+
+### Changed
+
+- Rowid tables now merge changes in stable rowid order one SQLite leaf page at a time and stop after
+  one page plus a lookahead row instead of materializing every changed row.
+- Empty-to-populated summary comparisons count leaf cells without decoding row payloads, keeping
+  million-row history expansion responses small enough for Electron IPC and renderer consumption.
+- Native-page-size Eidos `STRICT WITHOUT ROWID` tables now stream in primary-key order instead of
+  copying both SQLite snapshots and materializing complete tables before applying the row limit.
+
+### Performance
+
+- On the checked 437,227,520-byte Eidos fixture, the all-table summary completed in about 1.8
+  seconds with a 1,405-byte response; the first 100-row page for the million-row table completed in
+  about 1.1 seconds with a 55,927-byte response after scanning 101 changed rows.
+
+### Compatibility
+
+- `diffPaths({ rows: true })` retains its existing full-row behavior. New large-diff consumers
+  should use `diffSqlitePaths` summary-first paging.
+- Custom-collation or descending `WITHOUT ROWID` primary keys and non-native SQLite page sizes
+  return bounded payloads through the reported `materialized_compat` path, whose snapshot memory
+  can still scale with database size.
+
 ## Graft SDK 0.3.3 — 2026-07-31
 
 ### Added

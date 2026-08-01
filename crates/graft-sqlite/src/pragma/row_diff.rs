@@ -276,6 +276,171 @@ pub(super) fn json_repo_row_diff(
     })
 }
 
+const ROW_CURSOR_PREFIX: &str = "graft-row-v1:";
+
+pub(super) fn bounded_row_offset(after: Option<&str>, table: &str) -> Result<usize, ErrCtx> {
+    let Some(after) = after else { return Ok(0) };
+    let value = after
+        .strip_prefix(ROW_CURSOR_PREFIX)
+        .ok_or_else(|| ErrCtx::PragmaErr("invalid or incompatible row diff cursor".into()))?;
+    let (cursor_table, value) = value
+        .split_once(':')
+        .ok_or_else(|| ErrCtx::PragmaErr("invalid or incompatible row diff cursor".into()))?;
+    if cursor_table != encode_cursor_table(table) {
+        return Err(ErrCtx::PragmaErr(
+            "row diff cursor does not match the requested table".into(),
+        ));
+    }
+    value
+        .parse::<usize>()
+        .map_err(|_| ErrCtx::PragmaErr("invalid or incompatible row diff cursor".into()))
+}
+
+fn bounded_row_cursor(table: &str, offset: usize) -> String {
+    format!("{ROW_CURSOR_PREFIX}{}:{offset}", encode_cursor_table(table))
+}
+
+fn encode_cursor_table(table: &str) -> String {
+    table
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+pub(super) fn json_repo_bounded_diff(
+    runtime: &Runtime,
+    repo: &Repository,
+    diff: &RepoDiff,
+    mode: &crate::row_level_diff::BoundedRowDiffMode,
+) -> Result<crate::json::JsonRepoBoundedDiffResult, ErrCtx> {
+    let paths = diff
+        .paths
+        .iter()
+        .map(|path| crate::json::JsonRepoPathDiff {
+            path: path.path.clone(),
+            change: repo_file_change_label(path.change).to_string(),
+            kind: repo_tracked_path_kind_json_label(path.kind).to_string(),
+            storage: repo_path_storage_json_label(path.storage).to_string(),
+        })
+        .collect();
+    let response_mode = match mode {
+        crate::row_level_diff::BoundedRowDiffMode::Summary => "summary",
+        crate::row_level_diff::BoundedRowDiffMode::Rows { .. } => "rows",
+    };
+    let files = diff
+        .files
+        .iter()
+        .map(|file| {
+            let change = repo_file_change_label(file.change).to_string();
+            let kind = repo_tracked_path_kind_json_label(file.kind).to_string();
+            let storage = repo_path_storage_json_label(file.storage).to_string();
+            match repo_file_bounded_row_diff(runtime, repo, file, mode) {
+                Ok(Some(row_diff)) => Ok(crate::json::JsonRepoBoundedDiffFile {
+                    path: file.path.clone(),
+                    change,
+                    kind,
+                    storage,
+                    row_diff_available: true,
+                    mode: response_mode.to_string(),
+                    logical_status: row_diff.logical_status().as_str().to_string(),
+                    capabilities: row_diff
+                        .analysis
+                        .capabilities
+                        .iter()
+                        .map(|capability| capability.as_str().to_string())
+                        .collect(),
+                    limitations: json_limitations(&row_diff.analysis.limitations),
+                    message: None,
+                    summaries: row_diff
+                        .summaries
+                        .into_iter()
+                        .map(|summary| crate::json::JsonTableSummary {
+                            name: summary.table_name,
+                            inserts: summary.inserts,
+                            deletes: summary.deletes,
+                            updates: summary.updates,
+                        })
+                        .collect(),
+                    tables: json_table_changes(&row_diff.table_changes),
+                    opaque_changes: json_opaque_changes(&row_diff.opaque_changes),
+                    has_more: row_diff.has_more,
+                    next_cursor: row_diff.next_offset.map(|offset| {
+                        let table = row_diff
+                            .telemetry
+                            .requested_table
+                            .as_deref()
+                            .expect("row pagination always has a requested table");
+                        bounded_row_cursor(table, offset)
+                    }),
+                    telemetry: crate::json::JsonBoundedRowDiffTelemetry {
+                        requested_table: row_diff.telemetry.requested_table,
+                        tables_considered: row_diff.telemetry.tables_considered,
+                        tables_scanned: row_diff.telemetry.tables_scanned,
+                        rows_scanned: row_diff.telemetry.rows_scanned,
+                        rows_returned: row_diff.telemetry.rows_returned,
+                        truncated: row_diff.telemetry.truncated,
+                        response_scope: row_diff.telemetry.response_scope.to_string(),
+                    },
+                }),
+                Ok(None) => Ok(unavailable_bounded_file(
+                    file,
+                    &change,
+                    kind,
+                    storage,
+                    response_mode,
+                    "row diff unavailable for these database snapshots".to_string(),
+                )),
+                Err(error) => Ok(unavailable_bounded_file(
+                    file,
+                    &change,
+                    kind,
+                    storage,
+                    response_mode,
+                    format!("bounded row diff unavailable: {error}"),
+                )),
+            }
+        })
+        .collect::<Result<Vec<_>, ErrCtx>>()?;
+    Ok(crate::json::JsonRepoBoundedDiffResult {
+        from: diff.from.clone(),
+        to: diff.to.clone(),
+        paths,
+        files,
+    })
+}
+
+fn unavailable_bounded_file(
+    file: &graft::repo::RepoFileDiff,
+    change: &str,
+    kind: String,
+    storage: String,
+    mode: &str,
+    message: String,
+) -> crate::json::JsonRepoBoundedDiffFile {
+    crate::json::JsonRepoBoundedDiffFile {
+        path: file.path.clone(),
+        change: change.to_string(),
+        kind,
+        storage,
+        row_diff_available: false,
+        mode: mode.to_string(),
+        logical_status: "row_diff_unavailable".to_string(),
+        capabilities: Vec::new(),
+        limitations: Vec::new(),
+        message: Some(message),
+        summaries: Vec::new(),
+        tables: Vec::new(),
+        opaque_changes: Vec::new(),
+        has_more: false,
+        next_cursor: None,
+        telemetry: crate::json::JsonBoundedRowDiffTelemetry {
+            response_scope: "unavailable".to_string(),
+            ..crate::json::JsonBoundedRowDiffTelemetry::default()
+        },
+    }
+}
+
 pub(super) fn json_table_changes(
     changes: &[crate::row_level_diff::TableChanges],
 ) -> Vec<crate::json::JsonTableChanges> {

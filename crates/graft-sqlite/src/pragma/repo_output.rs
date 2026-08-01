@@ -270,6 +270,98 @@ pub(super) fn repo_file_row_diff(
     })
 }
 
+pub(super) fn repo_file_bounded_row_diff(
+    runtime: &Runtime,
+    repo: &Repository,
+    file: &graft::repo::RepoFileDiff,
+    mode: &crate::row_level_diff::BoundedRowDiffMode,
+) -> Result<Option<crate::row_level_diff::BoundedRowLevelDiff>, ErrCtx> {
+    let resolver = RepoSnapshotResolver::local_then_remote(
+        runtime,
+        repo_default_remote_store(repo),
+        RepoSnapshotPurpose::Diff,
+        SnapshotHashPolicy::AllowHydratedMismatch,
+    );
+    let result = if file.worktree.is_some() {
+        let physical_path = repo.worktree().join(&file.path);
+        let physical = PhysicalSqliteReader::open(&physical_path)?;
+        if let Some(from) = &file.from {
+            resolver.resolve_snapshot(&from.snapshot)?;
+            let snapshot = from.snapshot.to_snapshot();
+            let from_lsn = snapshot.head().map_or(LSN::FIRST, |(_, lsn)| lsn);
+            let from_reader = runtime.snapshot_reader(snapshot);
+            crate::row_level_diff::bounded_row_level_diff_readers(
+                &from_reader,
+                &physical,
+                from_lsn,
+                from_lsn.saturating_next(),
+                mode,
+            )
+        } else {
+            let empty = empty_sqlite_reader()?;
+            crate::row_level_diff::bounded_row_level_diff_readers(
+                &empty,
+                &physical,
+                LSN::FIRST,
+                LSN::FIRST.saturating_next(),
+                mode,
+            )
+        }
+    } else {
+        match (&file.from, &file.to) {
+            (Some(from), Some(to)) => {
+                resolver.resolve_snapshot(&from.snapshot)?;
+                resolver.resolve_snapshot(&to.snapshot)?;
+                let from_snapshot = from.snapshot.to_snapshot();
+                let to_snapshot = to.snapshot.to_snapshot();
+                let from_lsn = from_snapshot.head().map_or(LSN::FIRST, |(_, lsn)| lsn);
+                let to_lsn = to_snapshot.head().map_or(LSN::FIRST, |(_, lsn)| lsn);
+                let from_reader = runtime.snapshot_reader(from_snapshot);
+                let to_reader = runtime.snapshot_reader(to_snapshot);
+                crate::row_level_diff::bounded_row_level_diff_readers(
+                    &from_reader,
+                    &to_reader,
+                    from_lsn,
+                    to_lsn,
+                    mode,
+                )
+            }
+            (None, Some(to)) => {
+                resolver.resolve_snapshot(&to.snapshot)?;
+                let empty = empty_sqlite_reader()?;
+                let snapshot = to.snapshot.to_snapshot();
+                let to_lsn = snapshot.head().map_or(LSN::FIRST, |(_, lsn)| lsn);
+                let reader = runtime.snapshot_reader(snapshot);
+                crate::row_level_diff::bounded_row_level_diff_readers(
+                    &empty,
+                    &reader,
+                    LSN::FIRST,
+                    to_lsn,
+                    mode,
+                )
+            }
+            (Some(from), None) => {
+                resolver.resolve_snapshot(&from.snapshot)?;
+                let empty = empty_sqlite_reader()?;
+                let snapshot = from.snapshot.to_snapshot();
+                let from_lsn = snapshot.head().map_or(LSN::FIRST, |(_, lsn)| lsn);
+                let reader = runtime.snapshot_reader(snapshot);
+                crate::row_level_diff::bounded_row_level_diff_readers(
+                    &reader,
+                    &empty,
+                    from_lsn,
+                    from_lsn.saturating_next(),
+                    mode,
+                )
+            }
+            (None, None) => return Ok(None),
+        }
+    };
+    result.map(Some).map_err(|error| {
+        ErrCtx::PragmaErr(format!("Bounded row diff error for `{}`: {error:?}", file.path).into())
+    })
+}
+
 fn empty_sqlite_reader() -> Result<PhysicalSqliteReader, ErrCtx> {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("empty.sqlite");

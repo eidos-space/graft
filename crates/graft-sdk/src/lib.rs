@@ -367,6 +367,27 @@ pub struct DiffPathsOptions {
 }
 
 #[derive(Debug, Clone)]
+pub enum SqliteDiffResponse {
+    Summary,
+    Rows {
+        table: String,
+        limit: usize,
+        after: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct SqliteDiffPathsOptions {
+    pub paths: Vec<PathBuf>,
+    pub root: Option<String>,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub response: SqliteDiffResponse,
+    pub limit: usize,
+    pub after: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct ReadPathContentOptions {
     pub path: PathBuf,
     pub revision: String,
@@ -398,6 +419,28 @@ pub struct DiffPathsResult {
     pub has_more: bool,
     pub next_cursor: Option<String>,
     pub telemetry: DiffTelemetry,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SqliteDiffTelemetry {
+    pub duration_us: u64,
+    pub requested_paths: usize,
+    pub returned_paths: usize,
+    pub changed_paths: usize,
+    pub response_scope: String,
+    pub requested_table: Option<String>,
+    pub tables_scanned: usize,
+    pub rows_scanned: usize,
+    pub rows_returned: usize,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SqliteDiffPathsResult {
+    pub paths: Vec<PathDiffResult>,
+    pub has_more: bool,
+    pub next_cursor: Option<String>,
+    pub telemetry: SqliteDiffTelemetry,
 }
 
 #[derive(Debug, Clone)]
@@ -938,6 +981,62 @@ impl RepositorySession {
                 requested_table: options.table.clone(),
                 tables_scanned,
                 full_tree_paths_hydrated: 0,
+            },
+            paths: results,
+            has_more,
+            next_cursor,
+        })
+    }
+
+    /// Computes a SQLite-aware summary or one bounded row page for explicit paths.
+    pub fn diff_sqlite_paths(
+        &self,
+        options: &SqliteDiffPathsOptions,
+    ) -> Result<SqliteDiffPathsResult> {
+        validate_diff_path_page(&options.paths, options.limit)?;
+        let started = Instant::now();
+        let mut paths = options
+            .paths
+            .iter()
+            .map(|path| normalize_requested_path(path))
+            .collect::<Result<Vec<_>>>()?;
+        paths.sort();
+        paths.dedup();
+        if let Some(after) = &options.after {
+            paths.retain(|path| path > after);
+        }
+        let requested_paths = paths.len();
+        let has_more = paths.len() > options.limit;
+        paths.truncate(options.limit);
+        let mut results = Vec::with_capacity(paths.len());
+        for path in paths {
+            graft::repo::cancellation_checkpoint().map_err(repo_error)?;
+            let argument = sqlite_diff_argument(options, Path::new(&path))?;
+            let diff = self.execute_json("json_diff", Some(&argument))?;
+            results.push(PathDiffResult { path, diff });
+        }
+        let changed_paths = results
+            .iter()
+            .filter(|entry| value_changed_path_count(&entry.diff) > 0)
+            .count();
+        let telemetry = bounded_diff_telemetry(&results);
+        let requested_table = match &options.response {
+            SqliteDiffResponse::Summary => None,
+            SqliteDiffResponse::Rows { table, .. } => Some(table.clone()),
+        };
+        let next_cursor = results.last().map(|entry| entry.path.clone());
+        Ok(SqliteDiffPathsResult {
+            telemetry: SqliteDiffTelemetry {
+                duration_us: elapsed_us(started),
+                requested_paths,
+                returned_paths: results.len(),
+                changed_paths,
+                response_scope: telemetry.response_scope,
+                requested_table,
+                tables_scanned: telemetry.tables_scanned,
+                rows_scanned: telemetry.rows_scanned,
+                rows_returned: telemetry.rows_returned,
+                truncated: telemetry.truncated,
             },
             paths: results,
             has_more,
@@ -2420,6 +2519,72 @@ fn value_row_diff_tables_scanned(value: &Value) -> usize {
         .sum()
 }
 
+#[derive(Default)]
+struct BoundedDiffTelemetryAggregate {
+    response_scope: String,
+    tables_scanned: usize,
+    rows_scanned: usize,
+    rows_returned: usize,
+    truncated: bool,
+}
+
+fn bounded_diff_telemetry(results: &[PathDiffResult]) -> BoundedDiffTelemetryAggregate {
+    let mut aggregate = BoundedDiffTelemetryAggregate::default();
+    for file in results
+        .iter()
+        .filter_map(|entry| entry.diff.get("files").and_then(Value::as_array))
+        .flatten()
+    {
+        let Some(telemetry) = file.get("telemetry") else {
+            continue;
+        };
+        aggregate.tables_scanned += telemetry
+            .get("tables_scanned")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize;
+        aggregate.rows_scanned += telemetry
+            .get("rows_scanned")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize;
+        aggregate.rows_returned += telemetry
+            .get("rows_returned")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize;
+        aggregate.truncated |= telemetry
+            .get("truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if aggregate.response_scope.is_empty() {
+            aggregate.response_scope = telemetry
+                .get("response_scope")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+        }
+    }
+    if aggregate.response_scope.is_empty() {
+        aggregate.response_scope = "unavailable".to_string();
+    }
+    aggregate
+}
+
+fn validate_diff_path_page(paths: &[PathBuf], limit: usize) -> Result<()> {
+    if paths.is_empty() {
+        return Err(invalid_argument("diff paths must not be empty"));
+    }
+    if paths.len() > MAX_DIFF_PATH_REQUEST_SIZE {
+        return Err(invalid_argument(format!(
+            "diff paths request exceeds {MAX_DIFF_PATH_REQUEST_SIZE} paths"
+        )));
+    }
+    if limit == 0 || limit > MAX_DIFF_PATH_PAGE_SIZE {
+        return Err(invalid_argument(format!(
+            "diff path limit must be between 1 and {MAX_DIFF_PATH_PAGE_SIZE}"
+        )));
+    }
+    Ok(())
+}
+
 fn repo_error(error: graft::repo::RepoErr) -> SdkError {
     repository_command_error(error.into())
 }
@@ -2480,7 +2645,9 @@ fn sdk_error_code_for_error(error: &ErrCtx, message: &str) -> SdkErrorCode {
 
 fn sdk_error_code_for_message(message: &str) -> SdkErrorCode {
     let lowercase = message.to_ascii_lowercase();
-    if lowercase.contains("locked")
+    if lowercase.contains("cancelled") || lowercase.contains("canceled") {
+        SdkErrorCode::Cancelled
+    } else if lowercase.contains("locked")
         || lowercase.contains("database lock")
         || lowercase.contains("already held")
     {
@@ -2604,6 +2771,63 @@ fn diff_argument(options: &DiffOptions) -> Result<Option<String>> {
         parts.push(quote_pragma_path(path)?);
     }
     Ok((!parts.is_empty()).then(|| parts.join(" ")))
+}
+
+fn sqlite_diff_argument(options: &SqliteDiffPathsOptions, path: &Path) -> Result<String> {
+    if options.root.is_some() && (options.from.is_some() || options.to.is_some()) {
+        return Err(invalid_argument(
+            "root diff cannot be combined with from/to revisions",
+        ));
+    }
+    if options.from.is_none() && options.to.is_some() {
+        return Err(invalid_argument("diff `to` requires a `from` revision"));
+    }
+    let mut parts = Vec::new();
+    match &options.response {
+        SqliteDiffResponse::Summary => parts.push("--sqlite-summary".to_string()),
+        SqliteDiffResponse::Rows { table, limit, after } => {
+            if table.is_empty() || table.len() > 1_024 {
+                return Err(invalid_argument(
+                    "SQLite row diff table must contain between 1 and 1,024 bytes",
+                ));
+            }
+            if *limit == 0 || *limit > 1_000 {
+                return Err(invalid_argument(
+                    "SQLite row diff limit must be between 1 and 1,000",
+                ));
+            }
+            parts.extend([
+                "--rows".to_string(),
+                "--table".to_string(),
+                quote_pragma_value(table)?,
+                "--row-limit".to_string(),
+                limit.to_string(),
+            ]);
+            if let Some(after) = after {
+                if after.is_empty() || after.len() > 1_024 {
+                    return Err(invalid_argument("SQLite row cursor is invalid"));
+                }
+                parts.push("--row-after".to_string());
+                parts.push(quote_pragma_value(after)?);
+            }
+        }
+    }
+    if let Some(root) = &options.root {
+        validate_revision(root)?;
+        parts.push("--root".to_string());
+        parts.push(root.clone());
+    }
+    if let Some(from) = &options.from {
+        validate_revision(from)?;
+        parts.push(from.clone());
+        if let Some(to) = &options.to {
+            validate_revision(to)?;
+            parts.push(to.clone());
+        }
+    }
+    parts.push("--".to_string());
+    parts.push(quote_pragma_path(path)?);
+    Ok(parts.join(" "))
 }
 
 fn quote_pragma_value(value: &str) -> Result<String> {
@@ -3168,6 +3392,92 @@ mod tests {
             })
             .unwrap_err();
         assert_eq!(error.code(), SdkErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn sqlite_diff_summary_and_rows_are_independently_bounded() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("space.eidos");
+        let database = rusqlite::Connection::open(&database_path).unwrap();
+        database
+            .execute_batch("CREATE TABLE records (id INTEGER PRIMARY KEY, value TEXT NOT NULL);")
+            .unwrap();
+        drop(database);
+
+        let session = RepositorySession::new(directory.path());
+        session.open().unwrap();
+        session.init().unwrap();
+        session.add_all().unwrap();
+        let baseline = session.commit("empty records").unwrap();
+        let baseline = baseline["commit"]["id"].as_str().unwrap().to_string();
+
+        let mut database = rusqlite::Connection::open(&database_path).unwrap();
+        let transaction = database.transaction().unwrap();
+        for index in 0..1_000 {
+            transaction
+                .execute(
+                    "INSERT INTO records (value) VALUES (?1)",
+                    [format!("value-{index}")],
+                )
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+        drop(database);
+        session.add_all().unwrap();
+        let updated = session.commit("insert records").unwrap();
+        let updated = updated["commit"]["id"].as_str().unwrap().to_string();
+        let base_options = |response| SqliteDiffPathsOptions {
+            paths: vec![PathBuf::from("space.eidos")],
+            root: None,
+            from: Some(baseline.clone()),
+            to: Some(updated.clone()),
+            response,
+            limit: 1,
+            after: None,
+        };
+
+        let summary = session
+            .diff_sqlite_paths(&base_options(SqliteDiffResponse::Summary))
+            .unwrap();
+        assert_eq!(summary.telemetry.rows_returned, 0);
+        assert_eq!(summary.telemetry.response_scope, "streaming_rowid");
+        assert_eq!(
+            summary.paths[0].diff["files"][0]["summaries"][0]["inserts"],
+            1_000
+        );
+
+        let first = session
+            .diff_sqlite_paths(&base_options(SqliteDiffResponse::Rows {
+                table: "records".to_string(),
+                limit: 2,
+                after: None,
+            }))
+            .unwrap();
+        assert_eq!(first.telemetry.rows_returned, 2);
+        assert!(first.telemetry.truncated);
+        let file = &first.paths[0].diff["files"][0];
+        assert_eq!(file["tables"][0]["changes"].as_array().unwrap().len(), 2);
+        let cursor = file["next_cursor"].as_str().unwrap().to_string();
+
+        let second = session
+            .diff_sqlite_paths(&base_options(SqliteDiffResponse::Rows {
+                table: "records".to_string(),
+                limit: 2,
+                after: Some(cursor),
+            }))
+            .unwrap();
+        assert_eq!(
+            second.paths[0].diff["files"][0]["tables"][0]["changes"][0]["rowid"],
+            3
+        );
+
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let error = with_cancellation(&cancelled, || {
+            session.diff_sqlite_paths(&base_options(SqliteDiffResponse::Summary))
+        })
+        .unwrap_err();
+        assert_eq!(error.code(), SdkErrorCode::Cancelled);
     }
 
     #[test]
