@@ -18,7 +18,7 @@ use tempfile::TempDir;
 use super::*;
 
 const PAGE_HASH_CACHE_MAGIC: &[u8; 16] = b"graft-page-index";
-const PAGE_HASH_CACHE_VERSION: u32 = 2;
+const PAGE_HASH_CACHE_VERSION: u32 = 3;
 const PAGE_HASH_BYTES: usize = 32;
 const PAGE_HASH_CHUNK_PAGES: usize = 64;
 const PAGE_HASH_CHUNK_BYTES: usize = PAGE_HASH_CHUNK_PAGES * PAGESIZE.as_usize();
@@ -28,8 +28,11 @@ const PAGE_SCAN_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 const MIN_PAGE_HASH_CACHE_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_PAGE_HASH_CACHE_ENTRIES: usize = 4;
 const MAX_WORKTREE_DIFF_PROBES: usize = 16;
-const WORKTREE_DIFF_PROBE_VERSION: u32 = 1;
+const WORKTREE_DIFF_PROBE_VERSION: u32 = 2;
 const MAX_PERSISTED_DIFF_PROBE_BYTES: u64 = 64 * 1024;
+const SQLITE_FILE_CHANGE_COUNTER_OFFSET: usize = 24;
+const SQLITE_VERSION_VALID_FOR_OFFSET: usize = 92;
+const SQLITE_VOLATILE_HEADER_FIELD_BYTES: usize = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct WorktreeFileFingerprint {
@@ -149,14 +152,14 @@ impl SqlitePageHashCache {
 
     fn path_for_state(&self, state: &CommitFileState) -> Result<PathBuf, ErrCtx> {
         let state_hash = sqlite_page_index_state_hash(state)?;
-        Ok(self.directory.join(format!("pages-v2-{state_hash}.bin")))
+        Ok(self.directory.join(format!("pages-v3-{state_hash}.bin")))
     }
 
     fn probe_path_for_state(&self, state: &CommitFileState) -> Result<PathBuf, ErrCtx> {
         let state_hash = sqlite_page_index_state_hash(state)?;
         Ok(self
             .directory
-            .join(format!("worktree-probe-v1-{state_hash}.json")))
+            .join(format!("worktree-probe-v2-{state_hash}.json")))
     }
 
     fn load_probe(
@@ -220,7 +223,7 @@ impl SqlitePageHashCache {
         })?;
         let final_path = self.probe_path_for_state(state)?;
         let temp_path = self.directory.join(format!(
-            ".worktree-probe-v1-{}-{}.tmp",
+            ".worktree-probe-v2-{}-{}.tmp",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -320,7 +323,7 @@ impl SqlitePageHashCache {
         std::fs::create_dir_all(&self.directory)?;
         let final_path = self.path_for_state(state)?;
         let temp_path = self.directory.join(format!(
-            ".pages-v2-{}-{}.tmp",
+            ".pages-v3-{}-{}.tmp",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -412,11 +415,11 @@ fn prune_page_hash_cache(directory: &Path, keep: &Path) {
             if let Some(state_hash) = path
                 .file_name()
                 .and_then(|name| name.to_str())
-                .and_then(|name| name.strip_prefix("pages-v2-"))
+                .and_then(|name| name.strip_prefix("pages-v3-"))
                 .and_then(|name| name.strip_suffix(".bin"))
             {
                 let _ = std::fs::remove_file(
-                    directory.join(format!("worktree-probe-v1-{state_hash}.json")),
+                    directory.join(format!("worktree-probe-v2-{state_hash}.json")),
                 );
             }
             let _ = std::fs::remove_file(path);
@@ -426,6 +429,41 @@ fn prune_page_hash_cache(directory: &Path, keep: &Path) {
 
 fn page_hash_chunk_count(page_count: usize) -> usize {
     page_count.div_ceil(PAGE_HASH_CHUNK_PAGES)
+}
+
+/// Hashes SQLite pages using the same content semantics as the Graft VFS.
+///
+/// SQLite's online backup rewrites the file change counter and version-valid-for number on page
+/// 1. They are cache invalidation hints rather than database content, and the Graft VFS already
+/// ignores writes that only touch these fields. Excluding them here keeps page indexes portable
+/// between raw rollback-journal snapshots and online-backup snapshots.
+fn sqlite_page_chunk_hash(first_page: u32, bytes: &[u8]) -> blake3::Hash {
+    if first_page != 1 {
+        return blake3::hash(bytes);
+    }
+
+    let change_counter_end = SQLITE_FILE_CHANGE_COUNTER_OFFSET + SQLITE_VOLATILE_HEADER_FIELD_BYTES;
+    let version_valid_for_end =
+        SQLITE_VERSION_VALID_FOR_OFFSET + SQLITE_VOLATILE_HEADER_FIELD_BYTES;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&bytes[..SQLITE_FILE_CHANGE_COUNTER_OFFSET]);
+    hasher.update(&bytes[change_counter_end..SQLITE_VERSION_VALID_FOR_OFFSET]);
+    hasher.update(&bytes[version_valid_for_end..]);
+    hasher.finalize()
+}
+
+fn sqlite_page_bytes_equal(page_number: u32, left: &[u8], right: &[u8]) -> bool {
+    if page_number != 1 {
+        return left == right;
+    }
+
+    let change_counter_end = SQLITE_FILE_CHANGE_COUNTER_OFFSET + SQLITE_VOLATILE_HEADER_FIELD_BYTES;
+    let version_valid_for_end =
+        SQLITE_VERSION_VALID_FOR_OFFSET + SQLITE_VOLATILE_HEADER_FIELD_BYTES;
+    left[..SQLITE_FILE_CHANGE_COUNTER_OFFSET] == right[..SQLITE_FILE_CHANGE_COUNTER_OFFSET]
+        && left[change_counter_end..SQLITE_VERSION_VALID_FOR_OFFSET]
+            == right[change_counter_end..SQLITE_VERSION_VALID_FOR_OFFSET]
+        && left[version_valid_for_end..] == right[version_valid_for_end..]
 }
 
 /// A stable page reader for a physical `SQLite` worktree file.
@@ -630,7 +668,11 @@ impl PhysicalSqliteReader {
                     format!("invalid SQLite page index {page_number}: {error}").into(),
                 )
             })?;
-            if self.read_page(pageidx)? != expected.read_page(pageidx)? {
+            if !sqlite_page_bytes_equal(
+                page_number,
+                self.read_page(pageidx)?.as_ref(),
+                expected.read_page(pageidx)?.as_ref(),
+            ) {
                 changed_pages.insert(page_number);
             }
         }
@@ -686,11 +728,19 @@ impl PhysicalSqliteReader {
             })?;
             let physical_page = self.read_page(pageidx)?;
             if page_number <= self.page_count().to_u32()
-                && physical_page != staged.read_page(pageidx)?
+                && !sqlite_page_bytes_equal(
+                    page_number,
+                    physical_page.as_ref(),
+                    staged.read_page(pageidx)?.as_ref(),
+                )
             {
                 return Ok(None);
             }
-            if physical_page != previous.read_page(pageidx)? {
+            if !sqlite_page_bytes_equal(
+                page_number,
+                physical_page.as_ref(),
+                previous.read_page(pageidx)?.as_ref(),
+            ) {
                 changed_pages.insert(page_number);
             }
         }
@@ -759,7 +809,11 @@ impl PhysicalSqliteReader {
             let pageidx = PageIdx::try_from(page_number).map_err(|err| {
                 ErrCtx::PragmaErr(format!("invalid SQLite page index {page_number}: {err}").into())
             })?;
-            if self.read_page(pageidx)? != stored.read_page(pageidx)? {
+            if !sqlite_page_bytes_equal(
+                page_number,
+                self.read_page(pageidx)?.as_ref(),
+                stored.read_page(pageidx)?.as_ref(),
+            ) {
                 return Ok(false);
             }
         }
@@ -836,7 +890,7 @@ impl PhysicalSqliteReader {
         let mut changed_pages = BTreeSet::new();
         self.visit_page_chunks(|first_page, chunk_bytes| {
             let chunk_index = (first_page - 1) as usize / PAGE_HASH_CHUNK_PAGES;
-            let current_hash = blake3::hash(chunk_bytes);
+            let current_hash = sqlite_page_chunk_hash(first_page, chunk_bytes);
             if cached_hashes
                 .get(chunk_index)
                 .is_some_and(|expected_hash| expected_hash == current_hash.as_bytes())
@@ -854,7 +908,11 @@ impl PhysicalSqliteReader {
                     )
                 })?;
                 let unchanged = expected.page_count().contains(pageidx)
-                    && expected.read_page(pageidx)?.as_ref() == page_bytes;
+                    && sqlite_page_bytes_equal(
+                        page_number,
+                        expected.read_page(pageidx)?.as_ref(),
+                        page_bytes,
+                    );
                 if !unchanged {
                     changed_pages.insert(page_number);
                 }
@@ -1355,7 +1413,7 @@ fn import_sqlite_reader_state(
     let mut current_hashes = Vec::with_capacity(page_hash_chunk_count(page_count));
 
     physical.visit_page_chunks(|first_page, chunk_bytes| {
-        let current_hash = *blake3::hash(chunk_bytes).as_bytes();
+        let current_hash = *sqlite_page_chunk_hash(first_page, chunk_bytes).as_bytes();
         current_hashes.push(current_hash);
         let chunk_index = (first_page - 1) as usize / PAGE_HASH_CHUNK_PAGES;
         if cached_hashes
@@ -1374,9 +1432,11 @@ fn import_sqlite_reader_state(
                 )
             })?;
             let unchanged = match &base_reader {
-                Some(reader) if reader.page_count().contains(pageidx) => {
-                    reader.read_page(pageidx)?.as_ref() == page_bytes
-                }
+                Some(reader) if reader.page_count().contains(pageidx) => sqlite_page_bytes_equal(
+                    page_number,
+                    reader.read_page(pageidx)?.as_ref(),
+                    page_bytes,
+                ),
                 _ => false,
             };
             if unchanged {
@@ -1552,6 +1612,30 @@ mod tests {
     ) -> Result<(CommitFileState, PreparedSqliteStage), ErrCtx> {
         let cache = SqlitePageHashCache::new(repo, key);
         prepare_physical_sqlite_file_state_with_cache(runtime, path, base, Some(&cache))
+    }
+
+    #[test]
+    fn page_index_ignores_only_sqlite_volatile_header_counters() {
+        let original = vec![0_u8; PAGESIZE.as_usize()];
+        let mut counters_changed = original.clone();
+        counters_changed[SQLITE_FILE_CHANGE_COUNTER_OFFSET..SQLITE_FILE_CHANGE_COUNTER_OFFSET + 4]
+            .copy_from_slice(&17_u32.to_be_bytes());
+        counters_changed[SQLITE_VERSION_VALID_FOR_OFFSET..SQLITE_VERSION_VALID_FOR_OFFSET + 4]
+            .copy_from_slice(&23_u32.to_be_bytes());
+
+        assert!(sqlite_page_bytes_equal(1, &original, &counters_changed));
+        assert_eq!(
+            sqlite_page_chunk_hash(1, &original),
+            sqlite_page_chunk_hash(1, &counters_changed)
+        );
+
+        let mut content_changed = counters_changed;
+        content_changed[40] = 1;
+        assert!(!sqlite_page_bytes_equal(1, &original, &content_changed));
+        assert_ne!(
+            sqlite_page_chunk_hash(1, &original),
+            sqlite_page_chunk_hash(1, &content_changed)
+        );
     }
 
     #[test]

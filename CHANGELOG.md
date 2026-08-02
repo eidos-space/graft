@@ -19,6 +19,8 @@
   avoiding a second read of the live application database.
 - Status refresh preserves proven local classification across Remote projection changes and
   refreshes ahead/behind metadata independently.
+- SQLite page indexes use the same content semantics as the Graft VFS across raw and online-backup
+  snapshots, ignoring only SQLite's volatile page-1 counters and invalidating older cache schemas.
 
 ### Performance
 
