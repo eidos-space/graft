@@ -79,9 +79,14 @@ ACL 存储不属于本协议。
     "upload-bundle",
     "receive-pack",
     "receive-bundle",
+    "multipart-object",
     "cas",
     "cad"
-  ]
+  ],
+  "limits": {
+    "max_request_bytes": 67108864,
+    "multipart_part_bytes": 16777216
+  }
 }
 ```
 
@@ -124,6 +129,10 @@ encoding 必须被拒绝。服务可以公布 key/body 限制，并在超限时�
 | `POST /upload-bundle/<ref-key>`  | 流式返回 ref 快照及其不可变存储。    | `200 OK`         |
 | `POST /receive-pack/<ref-key>`   | 发布一个 object pack 并原子更新 ref。 | `204 No Content` |
 | `POST /receive-bundle/<ref-key>` | 发布不可变对象、pack 并原子更新 ref。 | `204 No Content` |
+| `POST /multipart-start/<key>`    | 开始或恢复不可变对象的分片上传。    | `200 OK`         |
+| `PUT /multipart-part/<key>`      | 上传一个编号分片。                  | `204 No Content` |
+| `POST /multipart-complete/<key>` | 将全部分片组装到原不可变 key。      | `204 No Content` |
+| `DELETE /multipart-abort/<key>`  | 终止未完成的分片上传。              | `204 No Content` |
 | `POST /cas/<key>`                | 原子 compare-and-swap。               | `204 No Content` |
 | `POST /cad/<key>`                | 原子 compare-and-delete。             | `204 No Content` |
 | `GET /list?prefix=<prefix>`      | 递归列举 key。                        | `200 OK`         |
@@ -244,6 +253,52 @@ manifest、全部对象、pack 和 index 的长度之和。服务必须按 manif
 `allow_existing: true` 把已有对象视为幂等成功；`false` 则返回 `412`，让 client
 通过独立的 version 1 路径读取并校验冲突后再重试发布。`receive-bundle` 返回 `404`
 或 `405` 时，client 必须回退到逐个不可变对象写入，再调用 `receive-pack` 或 `/cas`。
+
+## 不可变对象分片上传
+
+`multipart-object` 是 version 1 的可选 capability，用于超过 HTTP 网关 request body
+限制的不可变对象。它只改变传输方式：完成后的对象仍位于原 key，并保持相同的逻辑
+content ID。
+
+公布该 capability 时，descriptor 必须包含 `limits.multipart_part_bytes`；服务也应该
+公布 `limits.max_request_bytes`，让 client 在请求不可能到达应用时直接跳过聚合的
+`receive-bundle` 或 `receive-pack`。开始或恢复上传：
+
+```http
+POST /multipart-start/segments/<segment-id>
+Content-Length: 0
+x-graft-object-bytes: <总字节数>
+```
+
+响应返回持久 upload session 与已经完成的 part：
+
+```json
+{
+  "upload_id": "opaque-upload-id",
+  "total_bytes": 111249535,
+  "part_bytes": 16777216,
+  "uploaded_parts": [{ "part_number": 1, "bytes": 16777216 }]
+}
+```
+
+part 从 1 开始编号。除最后一个 part 外，其余 part 必须等于 descriptor 公布的大小；
+最后一个 part 携带余数：
+
+```http
+PUT /multipart-part/segments/<segment-id>
+Content-Length: <part 字节数>
+x-graft-upload-id: <opaque-upload-id>
+x-graft-part-number: <正十进制编号>
+```
+
+同一 session 重传相同编号会替换该 part，因此响应丢失后可以安全重试。对相同 key 和
+长度再次调用 `multipart-start`，必须返回同一 session 和已完成 part 列表。全部 part
+存在后，使用空 body 和 `x-graft-upload-id` 调用 `POST /multipart-complete/<key>`，
+把完整对象暴露在原不可变 key；`DELETE /multipart-abort/<key>` 释放未完成 session。
+
+目标已存在时，start/complete 返回 `412`，client 沿用 `raw-if-not-exists` 的 collision
+策略。multipart complete 不发布 ref；所有不可变对象完成后，client 仍需执行
+`receive-pack` 或 CAS。
 
 ## Compare 操作
 

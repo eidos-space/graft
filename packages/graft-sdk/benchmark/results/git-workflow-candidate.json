@@ -1,0 +1,454 @@
+{
+  "schema_version": 2,
+  "label": "next",
+  "graft_version": "graft-tool 0.11.0",
+  "provenance": {
+    "run_id": "18c7e773140911c8-a324",
+    "report_kind": "paired_candidate",
+    "harness_label": "next",
+    "build_profile": "release",
+    "os": "macos",
+    "arch": "aarch64",
+    "runner_image": null,
+    "pair_order": [
+      "baseline_first",
+      "candidate_first",
+      "baseline_first",
+      "candidate_first"
+    ]
+  },
+  "parameters": {
+    "profile": "ci",
+    "sqlite_rows": 20000,
+    "updated_rows": 2000,
+    "row_payload_bytes": 256,
+    "text_file_count": 64,
+    "text_file_bytes": 4096,
+    "binary_file_count": 2,
+    "binary_file_bytes": 2097152
+  },
+  "sample_count": 4,
+  "warmup_count": 1,
+  "metrics": [
+    {
+      "name": "speed.repo_init",
+      "display_name": "Repository init",
+      "group": "speed",
+      "unit": "milliseconds",
+      "lower_is_better": true,
+      "median": 4.1942710000000005,
+      "median_absolute_deviation": 0.061228999999999534,
+      "samples": [
+        4.222917,
+        4.288082999999999,
+        4.047292,
+        4.165625
+      ]
+    },
+    {
+      "name": "speed.stage_initial",
+      "display_name": "Stage initial dataset",
+      "group": "speed",
+      "unit": "milliseconds",
+      "lower_is_better": true,
+      "median": 977.7455415,
+      "median_absolute_deviation": 37.54999950000001,
+      "samples": [
+        944.661167,
+        935.729917,
+        2907.912958,
+        1010.829916
+      ]
+    },
+    {
+      "name": "speed.commit_initial",
+      "display_name": "Commit initial dataset",
+      "group": "speed",
+      "unit": "milliseconds",
+      "lower_is_better": true,
+      "median": 482.13347899999997,
+      "median_absolute_deviation": 4.83156249999999,
+      "samples": [
+        478.248792,
+        486.01816599999995,
+        476.35504099999997,
+        547.7310829999999
+      ]
+    },
+    {
+      "name": "speed.stage_incremental",
+      "display_name": "Stage 10% row update",
+      "group": "speed",
+      "unit": "milliseconds",
+      "lower_is_better": true,
+      "median": 525.3829165,
+      "median_absolute_deviation": 15.681291500000043,
+      "samples": [
+        503.651667,
+        515.751583,
+        577.669625,
+        535.0142500000001
+      ]
+    },
+    {
+      "name": "speed.commit_incremental",
+      "display_name": "Commit incremental update",
+      "group": "speed",
+      "unit": "milliseconds",
+      "lower_is_better": true,
+      "median": 541.4718545,
+      "median_absolute_deviation": 17.324250000000063,
+      "samples": [
+        551.037292,
+        531.9064169999999,
+        508.49750000000006,
+        566.554917
+      ]
+    },
+    {
+      "name": "speed.row_diff",
+      "display_name": "Row diff between commits",
+      "group": "speed",
+      "unit": "milliseconds",
+      "lower_is_better": true,
+      "median": 613.2396665,
+      "median_absolute_deviation": 45.51516700000002,
+      "samples": [
+        671.445333,
+        556.883791,
+        578.565208,
+        647.914125
+      ]
+    },
+    {
+      "name": "speed.checkout_parent",
+      "display_name": "Checkout parent revision",
+      "group": "speed",
+      "unit": "milliseconds",
+      "lower_is_better": true,
+      "median": 544.2087710000001,
+      "median_absolute_deviation": 9.482124999999996,
+      "samples": [
+        526.5662920000001,
+        569.0277080000001,
+        542.8870000000001,
+        545.530542
+      ]
+    },
+    {
+      "name": "speed.push_fs_remote",
+      "display_name": "Push to filesystem remote",
+      "group": "speed",
+      "unit": "milliseconds",
+      "lower_is_better": true,
+      "median": 657.2866245,
+      "median_absolute_deviation": 23.889478999999994,
+      "samples": [
+        640.324333,
+        626.469958,
+        740.2082909999999,
+        674.248916
+      ]
+    },
+    {
+      "name": "storage.worktree_bytes",
+      "display_name": "Worktree dataset",
+      "group": "storage",
+      "unit": "bytes",
+      "lower_is_better": true,
+      "median": 10330112.0,
+      "median_absolute_deviation": 0.0,
+      "samples": [
+        10330112.0,
+        10330112.0,
+        10330112.0,
+        10330112.0
+      ]
+    },
+    {
+      "name": "storage.sqlite_bytes",
+      "display_name": "Materialized SQLite database",
+      "group": "storage",
+      "unit": "bytes",
+      "lower_is_better": true,
+      "median": 5873664.0,
+      "median_absolute_deviation": 0.0,
+      "samples": [
+        5873664.0,
+        5873664.0,
+        5873664.0,
+        5873664.0
+      ]
+    },
+    {
+      "name": "storage.graft_initial_bytes",
+      "display_name": ".graft after initial commit",
+      "group": "storage",
+      "unit": "bytes",
+      "lower_is_better": true,
+      "median": 10129093.0,
+      "median_absolute_deviation": 0.0,
+      "samples": [
+        10129093.0,
+        10129093.0,
+        10129093.0,
+        10129093.0
+      ]
+    },
+    {
+      "name": "storage.graft_incremental_bytes",
+      "display_name": ".graft after incremental commit",
+      "group": "storage",
+      "unit": "bytes",
+      "lower_is_better": true,
+      "median": 17799518.0,
+      "median_absolute_deviation": 0.0,
+      "samples": [
+        17799518.0,
+        17799518.0,
+        17799518.0,
+        17799518.0
+      ]
+    },
+    {
+      "name": "storage.incremental_growth_bytes",
+      "display_name": "Incremental history growth",
+      "group": "storage",
+      "unit": "bytes",
+      "lower_is_better": true,
+      "median": 7670425.0,
+      "median_absolute_deviation": 0.0,
+      "samples": [
+        7670425.0,
+        7670425.0,
+        7670425.0,
+        7670425.0
+      ]
+    },
+    {
+      "name": "storage.initial_amplification",
+      "display_name": "Initial storage amplification",
+      "group": "storage",
+      "unit": "ratio",
+      "lower_is_better": true,
+      "median": 0.9805404820393041,
+      "median_absolute_deviation": 0.0,
+      "samples": [
+        0.9805404820393041,
+        0.9805404820393041,
+        0.9805404820393041,
+        0.9805404820393041
+      ]
+    },
+    {
+      "name": "storage.incremental_amplification",
+      "display_name": "Two-commit storage amplification",
+      "group": "storage",
+      "unit": "ratio",
+      "lower_is_better": true,
+      "median": 1.7230711535363799,
+      "median_absolute_deviation": 0.0,
+      "samples": [
+        1.7230711535363799,
+        1.7230711535363799,
+        1.7230711535363799,
+        1.7230711535363799
+      ]
+    },
+    {
+      "name": "storage.fjall_incremental_bytes",
+      "display_name": "SQLite snapshot store",
+      "group": "storage",
+      "unit": "bytes",
+      "lower_is_better": true,
+      "median": 11132128.0,
+      "median_absolute_deviation": 0.0,
+      "samples": [
+        11132128.0,
+        11132128.0,
+        11132128.0,
+        11132128.0
+      ]
+    },
+    {
+      "name": "storage.objects_incremental_bytes",
+      "display_name": "Repository objects",
+      "group": "storage",
+      "unit": "bytes",
+      "lower_is_better": true,
+      "median": 375129.0,
+      "median_absolute_deviation": 0.0,
+      "samples": [
+        375129.0,
+        375129.0,
+        375129.0,
+        375129.0
+      ]
+    },
+    {
+      "name": "storage.payloads_incremental_bytes",
+      "display_name": "External file payloads",
+      "group": "storage",
+      "unit": "bytes",
+      "lower_is_better": true,
+      "median": 6291456.0,
+      "median_absolute_deviation": 0.0,
+      "samples": [
+        6291456.0,
+        6291456.0,
+        6291456.0,
+        6291456.0
+      ]
+    },
+    {
+      "name": "storage.metadata_incremental_bytes",
+      "display_name": "Refs, index, and metadata",
+      "group": "storage",
+      "unit": "bytes",
+      "lower_is_better": true,
+      "median": 805.0,
+      "median_absolute_deviation": 0.0,
+      "samples": [
+        805.0,
+        805.0,
+        805.0,
+        805.0
+      ]
+    },
+    {
+      "name": "storage.graft_file_count",
+      "display_name": ".graft file count",
+      "group": "storage",
+      "unit": "count",
+      "lower_is_better": true,
+      "median": 103.0,
+      "median_absolute_deviation": 0.0,
+      "samples": [
+        103.0,
+        103.0,
+        103.0,
+        103.0
+      ]
+    },
+    {
+      "name": "storage.objects_file_count",
+      "display_name": "Repository object file count",
+      "group": "storage",
+      "unit": "count",
+      "lower_is_better": true,
+      "median": 74.0,
+      "median_absolute_deviation": 0.0,
+      "samples": [
+        74.0,
+        74.0,
+        74.0,
+        74.0
+      ]
+    },
+    {
+      "name": "storage.remote_bytes",
+      "display_name": "Filesystem remote after push",
+      "group": "storage",
+      "unit": "bytes",
+      "lower_is_better": true,
+      "median": 17267763.5,
+      "median_absolute_deviation": 0.5,
+      "samples": [
+        17267764.0,
+        17267765.0,
+        17267763.0,
+        17267763.0
+      ]
+    },
+    {
+      "name": "storage.remote_segments_bytes",
+      "display_name": "Remote segments",
+      "group": "storage",
+      "unit": "bytes",
+      "lower_is_better": true,
+      "median": 10592591.0,
+      "median_absolute_deviation": 0.0,
+      "samples": [
+        10592591.0,
+        10592591.0,
+        10592591.0,
+        10592591.0
+      ]
+    },
+    {
+      "name": "storage.remote_commits_bytes",
+      "display_name": "Remote storage commits",
+      "group": "storage",
+      "unit": "bytes",
+      "lower_is_better": true,
+      "median": 920.0,
+      "median_absolute_deviation": 0.0,
+      "samples": [
+        920.0,
+        920.0,
+        920.0,
+        920.0
+      ]
+    },
+    {
+      "name": "storage.remote_objects_bytes",
+      "display_name": "Remote repository objects",
+      "group": "storage",
+      "unit": "bytes",
+      "lower_is_better": true,
+      "median": 382710.5,
+      "median_absolute_deviation": 0.5,
+      "samples": [
+        382711.0,
+        382712.0,
+        382710.0,
+        382710.0
+      ]
+    },
+    {
+      "name": "storage.remote_payloads_bytes",
+      "display_name": "Remote external payloads",
+      "group": "storage",
+      "unit": "bytes",
+      "lower_is_better": true,
+      "median": 6291456.0,
+      "median_absolute_deviation": 0.0,
+      "samples": [
+        6291456.0,
+        6291456.0,
+        6291456.0,
+        6291456.0
+      ]
+    },
+    {
+      "name": "storage.remote_metadata_bytes",
+      "display_name": "Remote refs and metadata",
+      "group": "storage",
+      "unit": "bytes",
+      "lower_is_better": true,
+      "median": 86.0,
+      "median_absolute_deviation": 0.0,
+      "samples": [
+        86.0,
+        86.0,
+        86.0,
+        86.0
+      ]
+    },
+    {
+      "name": "storage.remote_file_count",
+      "display_name": "Remote file count",
+      "group": "storage",
+      "unit": "count",
+      "lower_is_better": true,
+      "median": 11.0,
+      "median_absolute_deviation": 0.0,
+      "samples": [
+        11.0,
+        11.0,
+        11.0,
+        11.0
+      ]
+    }
+  ]
+}

@@ -621,7 +621,19 @@ pub(super) fn prepare_repo_add_file(
             .get(key)
             .cloned()
             .or(repo.head_file(physical_path)?);
-        let state = import_physical_sqlite_file_state(runtime, physical_path, base.as_ref())?;
+        let (state, prepared) = prepare_cached_physical_sqlite_file_state(
+            runtime,
+            repo,
+            key,
+            physical_path,
+            base.as_ref(),
+        )?;
+        tracing::debug!(
+            key,
+            page_hash_cache_hit = prepared.page_hash_cache_hit(),
+            "prepared repository SQLite stage"
+        );
+        file.cache_prepared_sqlite_stage(key.to_string(), prepared);
         repo.prepare_file_state_path(repo.worktree().join(key), state)
             .map_err(Into::into)
     } else if let Some(state) = repo_file_state_for_key(runtime, repo, key)? {

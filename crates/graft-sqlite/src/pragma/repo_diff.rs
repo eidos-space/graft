@@ -7,6 +7,8 @@ pub(super) fn repo_diff_for_spec(
     spec: RepoDiffSpec,
 ) -> Result<RepoDiff, ErrCtx> {
     let kind = spec.kind;
+    let bounded_table_rows =
+        spec.mode == DiffMode::Rows && spec.table.is_some() && spec.row_page.is_some();
     let mut diff = match spec.target {
         RepoDiffTarget::Worktree { path } => {
             let path = repo_diff_path(repo, path.as_deref())?;
@@ -26,14 +28,24 @@ pub(super) fn repo_diff_for_spec(
                     )),
                     Ok(_) if is_sqlite_database_path(&physical_path)? => {
                         let expected = repo.index_file(&physical_path)?;
-                        repo_diff_physical_sqlite_file(
-                            runtime,
-                            repo,
-                            &physical_path,
-                            &key,
-                            expected,
-                            None,
-                        )
+                        if bounded_table_rows {
+                            repo_diff_physical_sqlite_file_for_bounded_rows(
+                                repo,
+                                &physical_path,
+                                &key,
+                                expected,
+                                None,
+                            )
+                        } else {
+                            repo_diff_physical_sqlite_file(
+                                runtime,
+                                repo,
+                                &physical_path,
+                                &key,
+                                expected,
+                                None,
+                            )
+                        }
                     }
                     Ok(_) => Ok(repo.diff_worktree_artifact(&physical_path, Some(&key))?),
                     Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -74,14 +86,24 @@ pub(super) fn repo_diff_for_spec(
                     )),
                     Ok(_) if is_sqlite_database_path(&physical_path)? => {
                         let expected = repo.file_from_revision(&rev, &physical_path)?;
-                        repo_diff_physical_sqlite_file(
-                            runtime,
-                            repo,
-                            &physical_path,
-                            &key,
-                            expected,
-                            Some(&rev),
-                        )
+                        if bounded_table_rows {
+                            repo_diff_physical_sqlite_file_for_bounded_rows(
+                                repo,
+                                &physical_path,
+                                &key,
+                                expected,
+                                Some(&rev),
+                            )
+                        } else {
+                            repo_diff_physical_sqlite_file(
+                                runtime,
+                                repo,
+                                &physical_path,
+                                &key,
+                                expected,
+                                Some(&rev),
+                            )
+                        }
                     }
                     Ok(_) => Ok(repo.diff_revision_to_worktree_artifact(
                         &rev,
@@ -453,19 +475,24 @@ pub(super) fn repo_diff_physical_sqlite_file(
     expected: Option<CommitFileState>,
     rev: Option<&str>,
 ) -> Result<RepoDiff, ErrCtx> {
-    let physical = PhysicalSqliteReader::open(physical_path)?;
-    let matches = expected
-        .as_ref()
-        .map(|expected| physical.matches_state(runtime, expected))
-        .transpose()?
-        .unwrap_or(false);
+    let (matches, worktree_state) = super::sqlite_worktree::with_consistent_physical_sqlite_reader(
+        physical_path,
+        |physical| {
+            let matches = expected
+                .as_ref()
+                .map(|expected| physical.matches_cached_state(runtime, repo, key, expected))
+                .transpose()?
+                .unwrap_or(false);
+            Ok((matches, physical.worktree_state()))
+        },
+    )?;
     let state = if matches {
         expected.expect("matching physical file has an expected state")
     } else {
         CommitFileState {
             volume: VolumeId::EMPTY,
             snapshot: RepoSnapshot {
-                page_count: physical.page_count(),
+                page_count: worktree_state.page_count,
                 ranges: Vec::new(),
             },
         }
@@ -482,8 +509,47 @@ pub(super) fn repo_diff_physical_sqlite_file(
             .find(|file| file.path == key)
             .expect("changed physical SQLite file should produce a diff entry");
         file.to = None;
-        file.worktree = Some(physical.worktree_state());
+        file.worktree = Some(worktree_state);
     }
+    Ok(diff)
+}
+
+/// Builds a worktree diff shell for a table-scoped bounded row request.
+///
+/// The subsequent row diff compares only the requested table, so probing every page merely to
+/// rediscover that the physical file changed would defeat the table fast path. Summary/status
+/// requests continue to use the authoritative whole-file probe above.
+fn repo_diff_physical_sqlite_file_for_bounded_rows(
+    repo: &Repository,
+    physical_path: &Path,
+    key: &str,
+    expected: Option<CommitFileState>,
+    rev: Option<&str>,
+) -> Result<RepoDiff, ErrCtx> {
+    let worktree_state = super::sqlite_worktree::with_consistent_physical_sqlite_reader(
+        physical_path,
+        |physical| Ok(physical.worktree_state()),
+    )?;
+    let state = CommitFileState {
+        volume: VolumeId::EMPTY,
+        snapshot: RepoSnapshot {
+            page_count: worktree_state.page_count,
+            ranges: Vec::new(),
+        },
+    };
+    let mut diff = if let Some(rev) = rev {
+        repo.diff_revision_to_worktree_file(rev, physical_path, state, Some(key))?
+    } else {
+        repo.diff_worktree_file(physical_path, state, Some(key))?
+    };
+    let file = diff
+        .files
+        .iter_mut()
+        .find(|file| file.path == key)
+        .expect("bounded physical SQLite request should produce a diff entry");
+    file.from = expected;
+    file.to = None;
+    file.worktree = Some(worktree_state);
     Ok(diff)
 }
 
@@ -577,10 +643,26 @@ pub(super) fn staged_commit_table_summary(
     runtime: &Runtime,
     repo: &Repository,
 ) -> Result<Vec<CommitTableSummary>, ErrCtx> {
+    staged_commit_table_summary_with_prepared(runtime, repo, None)
+}
+
+pub(super) fn staged_commit_table_summary_for_file(
+    runtime: &Runtime,
+    file: &VolFile,
+    repo: &Repository,
+) -> Result<Vec<CommitTableSummary>, ErrCtx> {
+    staged_commit_table_summary_with_prepared(runtime, repo, Some(file))
+}
+
+fn staged_commit_table_summary_with_prepared(
+    runtime: &Runtime,
+    repo: &Repository,
+    prepared_file: Option<&VolFile>,
+) -> Result<Vec<CommitTableSummary>, ErrCtx> {
     let diff = repo.diff_staged(None)?;
     let mut by_name = BTreeMap::<String, CommitTableSummary>::new();
     for file in &diff.files {
-        let summaries = repo_file_table_summary(runtime, file)?;
+        let summaries = repo_file_table_summary_with_prepared(runtime, repo, file, prepared_file)?;
         for summary in summaries {
             merge_table_summary(&mut by_name, summary);
         }
@@ -588,9 +670,11 @@ pub(super) fn staged_commit_table_summary(
     Ok(by_name.into_values().collect())
 }
 
-pub(super) fn repo_file_table_summary(
+fn repo_file_table_summary_with_prepared(
     runtime: &Runtime,
+    repo: &Repository,
     file: &graft::repo::RepoFileDiff,
+    prepared_file: Option<&VolFile>,
 ) -> Result<Vec<CommitTableSummary>, ErrCtx> {
     match (&file.from, &file.to) {
         (Some(from), Some(to)) => {
@@ -610,18 +694,38 @@ pub(super) fn repo_file_table_summary(
                     SnapshotSummaryMode::Deleted,
                 );
             }
-            let diff = crate::row_level_diff::row_level_diff_snapshots(
+            if let Some(summaries) = staged_worktree_table_summary(
                 runtime,
+                repo,
+                file,
                 &from_snapshot,
                 &to_snapshot,
+                prepared_file,
+            )? {
+                return Ok(summaries);
+            }
+            let from_reader = runtime.snapshot_reader(from_snapshot.clone());
+            let to_reader = runtime.snapshot_reader(to_snapshot.clone());
+            let from_lsn = from_snapshot.head().map_or(LSN::FIRST, |(_, lsn)| lsn);
+            let to_lsn = to_snapshot.head().map_or(LSN::FIRST, |(_, lsn)| lsn);
+            let diff = crate::row_level_diff::bounded_row_level_diff_readers(
+                &from_reader,
+                &to_reader,
+                from_lsn,
+                to_lsn,
+                &crate::row_level_diff::BoundedRowDiffMode::Summary,
             )
-            .map_err(|e| ErrCtx::PragmaErr(format!("Diff error: {e:?}").into()))?;
+            .map_err(|error| ErrCtx::PragmaErr(format!("Diff error: {error:?}").into()))?;
             Ok(diff
-                .table_changes
-                .iter()
-                .filter_map(|table| {
-                    let (inserts, deletes, updates) = count_changes_json(&table.changes);
-                    table_summary(table.table_name.clone(), inserts, deletes, updates)
+                .summaries
+                .into_iter()
+                .filter_map(|summary| {
+                    table_summary(
+                        summary.table_name,
+                        summary.inserts,
+                        summary.deletes,
+                        summary.updates,
+                    )
                 })
                 .collect())
         }
@@ -637,6 +741,91 @@ pub(super) fn repo_file_table_summary(
         ),
         (None, None) => Ok(Vec::new()),
     }
+}
+
+fn staged_worktree_table_summary(
+    runtime: &Runtime,
+    repo: &Repository,
+    file: &graft::repo::RepoFileDiff,
+    from_snapshot: &graft::snapshot::Snapshot,
+    to_snapshot: &graft::snapshot::Snapshot,
+    prepared_file: Option<&VolFile>,
+) -> Result<Option<Vec<CommitTableSummary>>, ErrCtx> {
+    let prepared =
+        prepared_file.and_then(|prepared_file| prepared_file.prepared_sqlite_stage(&file.path));
+    let tables = match (&file.from, &file.to, prepared.as_ref()) {
+        (Some(from), Some(to), Some(prepared)) if prepared.matches(from, to) => {
+            prepared.table_candidates()?
+        }
+        _ => {
+            let physical_path = repo.worktree().join(&file.path);
+            let metadata = match std::fs::symlink_metadata(&physical_path) {
+                Ok(metadata) if metadata.file_type().is_file() => metadata,
+                Ok(_) => return Ok(None),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
+            if metadata.len() < 100 || !is_sqlite_database_path(&physical_path)? {
+                return Ok(None);
+            }
+
+            let physical = PhysicalSqliteReader::open(&physical_path)?;
+            let from_reader = runtime.snapshot_reader(from_snapshot.clone());
+            let to_reader = runtime.snapshot_reader(to_snapshot.clone());
+            physical.staged_table_candidates(&to_reader, &from_reader)?
+        }
+    };
+    let Some(tables) = tables else {
+        return Ok(None);
+    };
+    let from_reader = runtime.snapshot_reader(from_snapshot.clone());
+    let to_reader = runtime.snapshot_reader(to_snapshot.clone());
+    let from_lsn = from_snapshot.head().map_or(LSN::FIRST, |(_, lsn)| lsn);
+    let to_lsn = to_snapshot.head().map_or(LSN::FIRST, |(_, lsn)| lsn);
+    if let Some(summaries) = crate::row_level_diff::rowid_table_summaries_for_tables(
+        &from_reader,
+        &to_reader,
+        from_lsn,
+        to_lsn,
+        &tables,
+    )
+    .map_err(|error| ErrCtx::PragmaErr(format!("Diff error: {error:?}").into()))?
+    {
+        return Ok(Some(
+            summaries
+                .into_iter()
+                .filter_map(|summary| {
+                    table_summary(
+                        summary.table_name,
+                        summary.inserts,
+                        summary.deletes,
+                        summary.updates,
+                    )
+                })
+                .collect(),
+        ));
+    }
+    let diff = crate::row_level_diff::bounded_row_level_diff_readers_for_summary_tables(
+        &from_reader,
+        &to_reader,
+        from_lsn,
+        to_lsn,
+        &tables,
+    )
+    .map_err(|error| ErrCtx::PragmaErr(format!("Diff error: {error:?}").into()))?;
+    Ok(Some(
+        diff.summaries
+            .into_iter()
+            .filter_map(|summary| {
+                table_summary(
+                    summary.table_name,
+                    summary.inserts,
+                    summary.deletes,
+                    summary.updates,
+                )
+            })
+            .collect(),
+    ))
 }
 
 #[derive(Debug, Clone, Copy)]

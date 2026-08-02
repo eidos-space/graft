@@ -1,19 +1,561 @@
 use graft::volume_writer::VolumeWriter;
 use rusqlite::{Connection, ErrorCode, OpenFlags, backup::Backup};
-use std::time::{Duration, Instant};
+use std::collections::VecDeque;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+#[cfg(target_os = "macos")]
+use std::{
+    ffi::{CString, c_char, c_int},
+    os::unix::ffi::OsStrExt,
+};
+use std::{
+    fs::OpenOptions,
+    io::{BufReader, BufWriter},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 use tempfile::TempDir;
 
 use super::*;
+
+const PAGE_HASH_CACHE_MAGIC: &[u8; 16] = b"graft-page-index";
+const PAGE_HASH_CACHE_VERSION: u32 = 3;
+const PAGE_HASH_BYTES: usize = 32;
+const PAGE_HASH_CHUNK_PAGES: usize = 64;
+const PAGE_HASH_CHUNK_BYTES: usize = PAGE_HASH_CHUNK_PAGES * PAGESIZE.as_usize();
+const PAGE_HASH_CACHE_HEADER_BYTES: usize = PAGE_HASH_CACHE_MAGIC.len() + 12;
+const PAGE_HASH_CACHE_CHECKSUM_BYTES: usize = 32;
+const PAGE_SCAN_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+const MIN_PAGE_HASH_CACHE_FILE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_PAGE_HASH_CACHE_ENTRIES: usize = 4;
+const MAX_WORKTREE_DIFF_PROBES: usize = 16;
+const WORKTREE_DIFF_PROBE_VERSION: u32 = 2;
+const MAX_PERSISTED_DIFF_PROBE_BYTES: u64 = 64 * 1024;
+const SQLITE_FILE_CHANGE_COUNTER_OFFSET: usize = 24;
+const SQLITE_VERSION_VALID_FOR_OFFSET: usize = 92;
+const SQLITE_VOLATILE_HEADER_FIELD_BYTES: usize = 4;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct WorktreeFileFingerprint {
+    len: u64,
+    modified_nanos: Option<u128>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    ctime_seconds: i64,
+    #[cfg(unix)]
+    ctime_nanos: i64,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct WorktreeDiffProbeIdentity {
+    path: PathBuf,
+    expected_index: PathBuf,
+    fingerprint: WorktreeFileFingerprint,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct WorktreeDiffProbe {
+    matches: bool,
+    table_candidates: Option<BTreeSet<String>>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedWorktreeDiffProbePayload {
+    version: u32,
+    fingerprint: WorktreeFileFingerprint,
+    probe: WorktreeDiffProbe,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedWorktreeDiffProbe {
+    payload: PersistedWorktreeDiffProbePayload,
+    checksum: String,
+}
+
+static WORKTREE_DIFF_PROBES: OnceLock<
+    Mutex<VecDeque<(WorktreeDiffProbeIdentity, WorktreeDiffProbe)>>,
+> = OnceLock::new();
+
+fn worktree_diff_probe_identity(
+    path: &Path,
+    cache: &SqlitePageHashCache,
+    expected: &CommitFileState,
+) -> Result<WorktreeDiffProbeIdentity, ErrCtx> {
+    let metadata = std::fs::metadata(path)?;
+    Ok(WorktreeDiffProbeIdentity {
+        path: path.to_path_buf(),
+        expected_index: cache.path_for_state(expected)?,
+        fingerprint: WorktreeFileFingerprint {
+            len: metadata.len(),
+            modified_nanos: metadata.modified().ok().and_then(system_time_nanos),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+            #[cfg(unix)]
+            ctime_seconds: metadata.ctime(),
+            #[cfg(unix)]
+            ctime_nanos: metadata.ctime_nsec(),
+        },
+    })
+}
+
+fn system_time_nanos(time: SystemTime) -> Option<u128> {
+    time.duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|value| value.as_nanos())
+}
+
+fn load_worktree_diff_probe(identity: &WorktreeDiffProbeIdentity) -> Option<WorktreeDiffProbe> {
+    WORKTREE_DIFF_PROBES
+        .get_or_init(|| Mutex::new(VecDeque::new()))
+        .lock()
+        .iter()
+        .rev()
+        .find(|(candidate, _)| candidate == identity)
+        .map(|(_, probe)| probe.clone())
+}
+
+fn store_worktree_diff_probe(identity: WorktreeDiffProbeIdentity, probe: WorktreeDiffProbe) {
+    let mut probes = WORKTREE_DIFF_PROBES
+        .get_or_init(|| Mutex::new(VecDeque::new()))
+        .lock();
+    probes.retain(|(candidate, _)| candidate != &identity);
+    probes.push_back((identity, probe));
+    while probes.len() > MAX_WORKTREE_DIFF_PROBES {
+        probes.pop_front();
+    }
+}
+
+/// A content-addressed page index for one repository `SQLite` path.
+///
+/// The file name binds the index to an exact `CommitFileState`. The body is checksummed before any
+/// page hashes are trusted, so a missing, stale, truncated, or corrupted cache only disables the
+/// optimization and falls back to the authoritative page comparison.
+struct SqlitePageHashCache {
+    directory: PathBuf,
+}
+
+impl SqlitePageHashCache {
+    fn new(repo: &Repository, key: &str) -> Self {
+        let key_hash = blake3::hash(key.as_bytes()).to_hex();
+        Self {
+            directory: repo
+                .graft_dir()
+                .join("cache")
+                .join("sqlite-pages")
+                .join(key_hash.as_str()),
+        }
+    }
+
+    fn path_for_state(&self, state: &CommitFileState) -> Result<PathBuf, ErrCtx> {
+        let state_hash = sqlite_page_index_state_hash(state)?;
+        Ok(self.directory.join(format!("pages-v3-{state_hash}.bin")))
+    }
+
+    fn probe_path_for_state(&self, state: &CommitFileState) -> Result<PathBuf, ErrCtx> {
+        let state_hash = sqlite_page_index_state_hash(state)?;
+        Ok(self
+            .directory
+            .join(format!("worktree-probe-v2-{state_hash}.json")))
+    }
+
+    fn load_probe(
+        &self,
+        state: &CommitFileState,
+        fingerprint: &WorktreeFileFingerprint,
+    ) -> Result<Option<WorktreeDiffProbe>, ErrCtx> {
+        let path = self.probe_path_for_state(state)?;
+        let metadata = match std::fs::metadata(&path) {
+            Ok(metadata) if metadata.len() <= MAX_PERSISTED_DIFF_PROBE_BYTES => metadata,
+            Ok(_) => return Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        debug_assert!(metadata.len() <= MAX_PERSISTED_DIFF_PROBE_BYTES);
+        let persisted: PersistedWorktreeDiffProbe = serde_json::from_slice(&std::fs::read(path)?)
+            .map_err(|error| {
+            ErrCtx::PragmaErr(
+                format!("failed to decode persisted SQLite worktree probe: {error}").into(),
+            )
+        })?;
+        let payload_bytes = serde_json::to_vec(&persisted.payload).map_err(|error| {
+            ErrCtx::PragmaErr(
+                format!("failed to verify persisted SQLite worktree probe: {error}").into(),
+            )
+        })?;
+        if persisted.payload.version != WORKTREE_DIFF_PROBE_VERSION
+            || &persisted.payload.fingerprint != fingerprint
+            || blake3::hash(&payload_bytes).to_hex().as_str() != persisted.checksum
+        {
+            return Ok(None);
+        }
+        Ok(Some(persisted.payload.probe))
+    }
+
+    fn store_probe(
+        &self,
+        state: &CommitFileState,
+        fingerprint: &WorktreeFileFingerprint,
+        probe: &WorktreeDiffProbe,
+    ) -> Result<(), ErrCtx> {
+        std::fs::create_dir_all(&self.directory)?;
+        let payload = PersistedWorktreeDiffProbePayload {
+            version: WORKTREE_DIFF_PROBE_VERSION,
+            fingerprint: fingerprint.clone(),
+            probe: probe.clone(),
+        };
+        let payload_bytes = serde_json::to_vec(&payload).map_err(|error| {
+            ErrCtx::PragmaErr(
+                format!("failed to encode persisted SQLite worktree probe: {error}").into(),
+            )
+        })?;
+        let persisted = PersistedWorktreeDiffProbe {
+            payload,
+            checksum: blake3::hash(&payload_bytes).to_hex().to_string(),
+        };
+        let bytes = serde_json::to_vec(&persisted).map_err(|error| {
+            ErrCtx::PragmaErr(
+                format!("failed to encode persisted SQLite worktree probe: {error}").into(),
+            )
+        })?;
+        let final_path = self.probe_path_for_state(state)?;
+        let temp_path = self.directory.join(format!(
+            ".worktree-probe-v2-{}-{}.tmp",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos())
+        ));
+        let file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp_path)?;
+        let mut writer = BufWriter::new(file);
+        writer.write_all(&bytes)?;
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
+        drop(writer);
+        if let Err(error) = std::fs::rename(&temp_path, &final_path) {
+            let _ = std::fs::remove_file(&temp_path);
+            if !final_path.exists() {
+                return Err(error.into());
+            }
+        }
+        Ok(())
+    }
+
+    fn load(&self, state: &CommitFileState) -> Result<Option<Vec<[u8; PAGE_HASH_BYTES]>>, ErrCtx> {
+        let path = self.path_for_state(state)?;
+        let expected_page_count = state.snapshot.page_count.to_u32() as usize;
+        let expected_hash_count = page_hash_chunk_count(expected_page_count);
+        let expected_len = PAGE_HASH_CACHE_HEADER_BYTES
+            .checked_add(
+                expected_hash_count
+                    .checked_mul(PAGE_HASH_BYTES)
+                    .ok_or_else(page_hash_cache_size_error)?,
+            )
+            .and_then(|value| value.checked_add(PAGE_HASH_CACHE_CHECKSUM_BYTES))
+            .ok_or_else(page_hash_cache_size_error)?;
+        let metadata = match std::fs::metadata(&path) {
+            Ok(metadata) if metadata.len() == expected_len as u64 => metadata,
+            Ok(_) => return Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        debug_assert_eq!(metadata.len(), expected_len as u64);
+        let bytes = std::fs::read(path)?;
+        if bytes.len() != expected_len
+            || &bytes[..PAGE_HASH_CACHE_MAGIC.len()] != PAGE_HASH_CACHE_MAGIC
+        {
+            return Ok(None);
+        }
+        let version_offset = PAGE_HASH_CACHE_MAGIC.len();
+        let version = u32::from_le_bytes(
+            bytes[version_offset..version_offset + 4]
+                .try_into()
+                .expect("page-index version has a fixed width"),
+        );
+        let page_count = u32::from_le_bytes(
+            bytes[version_offset + 4..version_offset + 8]
+                .try_into()
+                .expect("page-index count has a fixed width"),
+        );
+        let chunk_pages = u32::from_le_bytes(
+            bytes[version_offset + 8..PAGE_HASH_CACHE_HEADER_BYTES]
+                .try_into()
+                .expect("page-index chunk size has a fixed width"),
+        );
+        if version != PAGE_HASH_CACHE_VERSION
+            || page_count as usize != expected_page_count
+            || chunk_pages as usize != PAGE_HASH_CHUNK_PAGES
+        {
+            return Ok(None);
+        }
+        let checksum_offset = bytes.len() - PAGE_HASH_CACHE_CHECKSUM_BYTES;
+        let actual_checksum = blake3::hash(&bytes[..checksum_offset]);
+        if actual_checksum.as_bytes() != &bytes[checksum_offset..] {
+            return Ok(None);
+        }
+        let mut hashes = Vec::with_capacity(expected_hash_count);
+        for hash in
+            bytes[PAGE_HASH_CACHE_HEADER_BYTES..checksum_offset].chunks_exact(PAGE_HASH_BYTES)
+        {
+            hashes.push(
+                hash.try_into()
+                    .expect("validated page-index hashes have a fixed width"),
+            );
+        }
+        Ok(Some(hashes))
+    }
+
+    fn store(
+        &self,
+        state: &CommitFileState,
+        hashes: &[[u8; PAGE_HASH_BYTES]],
+    ) -> Result<(), ErrCtx> {
+        let page_count = state.snapshot.page_count.to_u32() as usize;
+        if hashes.len() != page_hash_chunk_count(page_count) {
+            return Err(page_hash_cache_size_error());
+        }
+        std::fs::create_dir_all(&self.directory)?;
+        let final_path = self.path_for_state(state)?;
+        let temp_path = self.directory.join(format!(
+            ".pages-v3-{}-{}.tmp",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos())
+        ));
+        let file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp_path)?;
+        let mut writer = BufWriter::new(file);
+        let mut checksum = blake3::Hasher::new();
+        write_page_hash_cache_bytes(&mut writer, &mut checksum, PAGE_HASH_CACHE_MAGIC)?;
+        write_page_hash_cache_bytes(
+            &mut writer,
+            &mut checksum,
+            &PAGE_HASH_CACHE_VERSION.to_le_bytes(),
+        )?;
+        write_page_hash_cache_bytes(
+            &mut writer,
+            &mut checksum,
+            &(page_count as u32).to_le_bytes(),
+        )?;
+        write_page_hash_cache_bytes(
+            &mut writer,
+            &mut checksum,
+            &(PAGE_HASH_CHUNK_PAGES as u32).to_le_bytes(),
+        )?;
+        for hash in hashes {
+            write_page_hash_cache_bytes(&mut writer, &mut checksum, hash)?;
+        }
+        writer.write_all(checksum.finalize().as_bytes())?;
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
+        drop(writer);
+        if let Err(error) = std::fs::rename(&temp_path, &final_path) {
+            let _ = std::fs::remove_file(&temp_path);
+            if !final_path.exists() {
+                return Err(error.into());
+            }
+        }
+        prune_page_hash_cache(&self.directory, &final_path);
+        Ok(())
+    }
+}
+
+fn sqlite_page_index_state_hash(state: &CommitFileState) -> Result<blake3::Hash, ErrCtx> {
+    let encoded = serde_json::to_vec(state).map_err(|error| {
+        ErrCtx::PragmaErr(format!("failed to encode SQLite page-index state: {error}").into())
+    })?;
+    Ok(blake3::hash(&encoded))
+}
+
+fn page_hash_cache_size_error() -> ErrCtx {
+    ErrCtx::PragmaErr("SQLite page-index size exceeds supported limits".into())
+}
+
+fn write_page_hash_cache_bytes(
+    writer: &mut BufWriter<File>,
+    checksum: &mut blake3::Hasher,
+    bytes: &[u8],
+) -> Result<(), ErrCtx> {
+    writer.write_all(bytes)?;
+    checksum.update(bytes);
+    Ok(())
+}
+
+fn prune_page_hash_cache(directory: &Path, keep: &Path) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    let mut indexes = entries
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name().is_some_and(|name| {
+                let name = name.to_string_lossy();
+                name.starts_with("pages-v") && name.ends_with(".bin")
+            })
+        })
+        .collect::<Vec<_>>();
+    indexes.sort_by_key(|path| {
+        std::fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(UNIX_EPOCH)
+    });
+    let remove_count = indexes.len().saturating_sub(MAX_PAGE_HASH_CACHE_ENTRIES);
+    for path in indexes.into_iter().take(remove_count) {
+        if path != keep {
+            if let Some(state_hash) = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix("pages-v3-"))
+                .and_then(|name| name.strip_suffix(".bin"))
+            {
+                let _ = std::fs::remove_file(
+                    directory.join(format!("worktree-probe-v2-{state_hash}.json")),
+                );
+            }
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+fn page_hash_chunk_count(page_count: usize) -> usize {
+    page_count.div_ceil(PAGE_HASH_CHUNK_PAGES)
+}
+
+/// Hashes SQLite pages using the same content semantics as the Graft VFS.
+///
+/// SQLite's online backup rewrites the file change counter and version-valid-for number on page
+/// 1. They are cache invalidation hints rather than database content, and the Graft VFS already
+/// ignores writes that only touch these fields. Excluding them here keeps page indexes portable
+/// between raw rollback-journal snapshots and online-backup snapshots.
+fn sqlite_page_chunk_hash(first_page: u32, bytes: &[u8]) -> blake3::Hash {
+    if first_page != 1 {
+        return blake3::hash(bytes);
+    }
+
+    let change_counter_end = SQLITE_FILE_CHANGE_COUNTER_OFFSET + SQLITE_VOLATILE_HEADER_FIELD_BYTES;
+    let version_valid_for_end =
+        SQLITE_VERSION_VALID_FOR_OFFSET + SQLITE_VOLATILE_HEADER_FIELD_BYTES;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&bytes[..SQLITE_FILE_CHANGE_COUNTER_OFFSET]);
+    hasher.update(&bytes[change_counter_end..SQLITE_VERSION_VALID_FOR_OFFSET]);
+    hasher.update(&bytes[version_valid_for_end..]);
+    hasher.finalize()
+}
+
+fn sqlite_page_bytes_equal(page_number: u32, left: &[u8], right: &[u8]) -> bool {
+    if page_number != 1 {
+        return left == right;
+    }
+
+    let change_counter_end = SQLITE_FILE_CHANGE_COUNTER_OFFSET + SQLITE_VOLATILE_HEADER_FIELD_BYTES;
+    let version_valid_for_end =
+        SQLITE_VERSION_VALID_FOR_OFFSET + SQLITE_VOLATILE_HEADER_FIELD_BYTES;
+    left[..SQLITE_FILE_CHANGE_COUNTER_OFFSET] == right[..SQLITE_FILE_CHANGE_COUNTER_OFFSET]
+        && left[change_counter_end..SQLITE_VERSION_VALID_FOR_OFFSET]
+            == right[change_counter_end..SQLITE_VERSION_VALID_FOR_OFFSET]
+        && left[version_valid_for_end..] == right[version_valid_for_end..]
+}
 
 /// A stable page reader for a physical `SQLite` worktree file.
 ///
 /// This module is the data-plane boundary between repository operations and `SQLite`. Repository
 /// commands must not read physical `SQLite` pages or manipulate Graft volumes directly.
-pub(super) struct PhysicalSqliteReader {
+pub(crate) struct PhysicalSqliteReader {
     input: Mutex<File>,
     path: PathBuf,
+    snapshot_path: PathBuf,
     snapshot: graft::snapshot::Snapshot,
     _snapshot_dir: Option<TempDir>,
+}
+
+struct LockedPhysicalSqliteReader {
+    physical: PhysicalSqliteReader,
+    _guard: Connection,
+}
+
+impl LockedPhysicalSqliteReader {
+    /// Reads the live rollback-journal database under one `SQLite` shared lock.
+    ///
+    /// This path is only used after an exact page-index hit, so the bounded sequential scan and
+    /// table mapping finish quickly. Cache misses retain the cloned snapshot path and never hold a
+    /// worktree lock during their authoritative full comparison.
+    fn open(path: &Path) -> Result<Option<Self>, ErrCtx> {
+        validate_sqlite_source(path)?;
+        let source = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        source.busy_timeout(Duration::from_secs(5))?;
+        let journal_mode: String =
+            source.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+        if !journal_mode.eq_ignore_ascii_case("delete") {
+            return Ok(None);
+        }
+        source.execute_batch("BEGIN")?;
+        source.query_row("SELECT count(*) FROM sqlite_schema", [], |_| Ok(()))?;
+        let physical = PhysicalSqliteReader::open_snapshot(path, path, None)?;
+        Ok(Some(Self { physical, _guard: source }))
+    }
+}
+
+/// Runs a bounded read against a consistent physical `SQLite` image.
+///
+/// Rollback-journal databases can be read directly under a shared transaction, which avoids
+/// copying an entire large worktree merely to inspect one table. WAL databases retain the online
+/// backup fallback because their committed image may span the database and WAL sidecar.
+pub(super) fn with_consistent_physical_sqlite_reader<T>(
+    path: &Path,
+    read: impl FnOnce(&PhysicalSqliteReader) -> Result<T, ErrCtx>,
+) -> Result<T, ErrCtx> {
+    if let Some(locked) = LockedPhysicalSqliteReader::open(path)? {
+        return read(&locked.physical);
+    }
+    let snapshot = PhysicalSqliteReader::open(path)?;
+    read(&snapshot)
+}
+
+/// The stable `SQLite` image and page-set produced by one staging operation.
+///
+/// Keeping this alive until commit mirrors Git's index semantics: the staged snapshot, not the
+/// possibly newer worktree, is the source of truth for the commit. The captured changed-page set
+/// also avoids repeating the full physical/staged/previous comparison during summary generation.
+pub(crate) struct PreparedSqliteStage {
+    physical: Option<PhysicalSqliteReader>,
+    prepared_table_candidates: Option<Option<BTreeSet<String>>>,
+    previous: Option<CommitFileState>,
+    staged: CommitFileState,
+    changed_pages: BTreeSet<u32>,
+    page_hash_cache_hit: bool,
+}
+
+impl PreparedSqliteStage {
+    pub(crate) fn matches(&self, previous: &CommitFileState, staged: &CommitFileState) -> bool {
+        self.previous.as_ref() == Some(previous) && &self.staged == staged
+    }
+
+    pub(crate) fn table_candidates(&self) -> Result<Option<BTreeSet<String>>, ErrCtx> {
+        if let Some(candidates) = &self.prepared_table_candidates {
+            return Ok(candidates.clone());
+        }
+        self.physical
+            .as_ref()
+            .expect("deferred table candidates retain their stable SQLite snapshot")
+            .table_candidates_for_changed_pages(&self.changed_pages)
+    }
+
+    pub(crate) fn page_hash_cache_hit(&self) -> bool {
+        self.page_hash_cache_hit
+    }
 }
 
 impl PhysicalSqliteReader {
@@ -71,6 +613,7 @@ impl PhysicalSqliteReader {
         Ok(Self {
             input: Mutex::new(input),
             path: path.to_path_buf(),
+            snapshot_path: snapshot_path.to_path_buf(),
             snapshot,
             _snapshot_dir: snapshot_dir,
         })
@@ -78,6 +621,177 @@ impl PhysicalSqliteReader {
 
     pub(super) fn worktree_state(&self) -> RepoWorktreeFileState {
         RepoWorktreeFileState { page_count: self.page_count() }
+    }
+
+    fn visit_page_chunks(
+        &self,
+        mut visitor: impl FnMut(u32, &[u8]) -> Result<(), ErrCtx>,
+    ) -> Result<(), ErrCtx> {
+        let mut input = self.input.lock();
+        input.seek(SeekFrom::Start(0))?;
+        let mut reader = BufReader::with_capacity(PAGE_SCAN_BUFFER_BYTES, &mut *input);
+        let mut chunk = vec![0_u8; PAGE_HASH_CHUNK_BYTES];
+        let mut first_page = 1_u32;
+        let page_count = self.page_count().to_u32();
+        while first_page <= page_count {
+            graft::repo::cancellation_checkpoint()?;
+            let pages_remaining = (page_count - first_page + 1) as usize;
+            let chunk_pages = pages_remaining.min(PAGE_HASH_CHUNK_PAGES);
+            let chunk_bytes = chunk_pages * PAGESIZE.as_usize();
+            reader.read_exact(&mut chunk[..chunk_bytes])?;
+            visitor(first_page, &chunk[..chunk_bytes])?;
+            first_page += chunk_pages as u32;
+        }
+        Ok(())
+    }
+
+    /// Finds tables that own pages changed from `expected` to this stable worktree snapshot.
+    ///
+    /// `dbstat` gives us `SQLite`'s page ownership without decoding every row. Returning `None`
+    /// deliberately falls back to the full logical scan whenever a changed page cannot be mapped,
+    /// preserving exact diff semantics for unusual freelist or extension layouts.
+    pub(super) fn changed_table_candidates(
+        &self,
+        expected: &dyn VolumeRead,
+    ) -> Result<Option<BTreeSet<String>>, ErrCtx> {
+        let max_page_count = self
+            .page_count()
+            .to_u32()
+            .max(expected.page_count().to_u32());
+        let mut changed_pages = BTreeSet::new();
+        for page_number in 1..=max_page_count {
+            if page_number.is_multiple_of(1_024) {
+                graft::repo::cancellation_checkpoint()?;
+            }
+            let pageidx = PageIdx::try_from(page_number).map_err(|error| {
+                ErrCtx::PragmaErr(
+                    format!("invalid SQLite page index {page_number}: {error}").into(),
+                )
+            })?;
+            if !sqlite_page_bytes_equal(
+                page_number,
+                self.read_page(pageidx)?.as_ref(),
+                expected.read_page(pageidx)?.as_ref(),
+            ) {
+                changed_pages.insert(page_number);
+            }
+        }
+        self.table_candidates_for_changed_pages(&changed_pages)
+    }
+
+    /// Finds changed table candidates using the committed page index when it is available.
+    ///
+    /// This mirrors Git's index/stat fast path: hash the worktree sequentially in coarse chunks,
+    /// then compare individual pages only inside chunks whose content hash changed. Falling back
+    /// to the authoritative page-by-page comparison preserves correctness when the index is
+    /// missing or unreadable.
+    pub(super) fn cached_changed_table_candidates(
+        &self,
+        runtime: &Runtime,
+        repo: &Repository,
+        key: &str,
+        expected_state: &CommitFileState,
+        expected: &dyn VolumeRead,
+    ) -> Result<Option<BTreeSet<String>>, ErrCtx> {
+        let probe = self.cached_diff_probe(runtime, repo, key, expected_state, expected)?;
+        if !probe.matches && probe.table_candidates.is_none() {
+            return self.changed_table_candidates(expected);
+        }
+        Ok(probe.table_candidates)
+    }
+
+    /// Reuses the physical worktree as a fast staged-snapshot reader only when every byte still
+    /// matches the staged state. While validating that invariant, collect pages changed from the
+    /// previous commit so checkpoint summaries can avoid scanning unrelated large tables.
+    pub(super) fn staged_table_candidates(
+        &self,
+        staged: &dyn VolumeRead,
+        previous: &dyn VolumeRead,
+    ) -> Result<Option<BTreeSet<String>>, ErrCtx> {
+        if self.page_count() != staged.page_count() {
+            return Ok(None);
+        }
+
+        let max_page_count = self
+            .page_count()
+            .to_u32()
+            .max(previous.page_count().to_u32());
+        let mut changed_pages = BTreeSet::new();
+        for page_number in 1..=max_page_count {
+            if page_number.is_multiple_of(1_024) {
+                graft::repo::cancellation_checkpoint()?;
+            }
+            let pageidx = PageIdx::try_from(page_number).map_err(|error| {
+                ErrCtx::PragmaErr(
+                    format!("invalid SQLite page index {page_number}: {error}").into(),
+                )
+            })?;
+            let physical_page = self.read_page(pageidx)?;
+            if page_number <= self.page_count().to_u32()
+                && !sqlite_page_bytes_equal(
+                    page_number,
+                    physical_page.as_ref(),
+                    staged.read_page(pageidx)?.as_ref(),
+                )
+            {
+                return Ok(None);
+            }
+            if !sqlite_page_bytes_equal(
+                page_number,
+                physical_page.as_ref(),
+                previous.read_page(pageidx)?.as_ref(),
+            ) {
+                changed_pages.insert(page_number);
+            }
+        }
+        self.table_candidates_for_changed_pages(&changed_pages)
+    }
+
+    fn table_candidates_for_changed_pages(
+        &self,
+        changed_pages: &BTreeSet<u32>,
+    ) -> Result<Option<BTreeSet<String>>, ErrCtx> {
+        if changed_pages.is_empty() {
+            return Ok(Some(BTreeSet::new()));
+        }
+
+        let connection = Connection::open_with_flags(
+            &self.snapshot_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        let mut statement = match connection.prepare(
+            "SELECT d.pageno, COALESCE(m.tbl_name, d.name) \
+             FROM dbstat AS d \
+             LEFT JOIN sqlite_schema AS m ON m.name = d.name",
+        ) {
+            Ok(statement) => statement,
+            Err(_) => return Ok(None),
+        };
+        let mut mapped_pages = BTreeSet::new();
+        let mut tables = BTreeSet::new();
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (page_number, table_name) = row?;
+            if !changed_pages.contains(&page_number) {
+                continue;
+            }
+            mapped_pages.insert(page_number);
+            if !table_name.starts_with("sqlite_") {
+                tables.insert(table_name);
+            }
+        }
+
+        // Page 1 always carries SQLite's change counter and schema cookie. Schema changes are
+        // compared separately, so it is the only unmapped page that is safe to ignore here.
+        if changed_pages
+            .iter()
+            .any(|page_number| *page_number != 1 && !mapped_pages.contains(page_number))
+        {
+            return Ok(None);
+        }
+        Ok(Some(tables))
     }
 
     pub(super) fn matches_state(
@@ -95,11 +809,128 @@ impl PhysicalSqliteReader {
             let pageidx = PageIdx::try_from(page_number).map_err(|err| {
                 ErrCtx::PragmaErr(format!("invalid SQLite page index {page_number}: {err}").into())
             })?;
-            if self.read_page(pageidx)? != stored.read_page(pageidx)? {
+            if !sqlite_page_bytes_equal(
+                page_number,
+                self.read_page(pageidx)?.as_ref(),
+                stored.read_page(pageidx)?.as_ref(),
+            ) {
                 return Ok(false);
             }
         }
         Ok(true)
+    }
+
+    /// Verifies the worktree against an exact committed state using its persisted page index.
+    ///
+    /// A cache hit turns the comparison into one sequential physical read and avoids both a
+    /// worktree clone and random reads from the immutable Graft snapshot. The page hashes are
+    /// content-addressed by `expected`; any cache miss or validation failure uses the authoritative
+    /// page comparison.
+    pub(super) fn matches_cached_state(
+        &self,
+        runtime: &Runtime,
+        repo: &Repository,
+        key: &str,
+        expected: &CommitFileState,
+    ) -> Result<bool, ErrCtx> {
+        let expected_reader = runtime.snapshot_reader(expected.snapshot.to_snapshot());
+        self.cached_diff_probe(runtime, repo, key, expected, &expected_reader)
+            .map(|probe| probe.matches)
+    }
+
+    fn cached_diff_probe(
+        &self,
+        runtime: &Runtime,
+        repo: &Repository,
+        key: &str,
+        expected_state: &CommitFileState,
+        expected: &dyn VolumeRead,
+    ) -> Result<WorktreeDiffProbe, ErrCtx> {
+        if self.snapshot_path != self.path {
+            return Ok(WorktreeDiffProbe {
+                matches: self.matches_state(runtime, expected_state)?,
+                table_candidates: None,
+            });
+        }
+        let cache = SqlitePageHashCache::new(repo, key);
+        let identity = worktree_diff_probe_identity(&self.path, &cache, expected_state)?;
+        if let Some(probe) = load_worktree_diff_probe(&identity) {
+            return Ok(probe);
+        }
+        match cache.load_probe(expected_state, &identity.fingerprint) {
+            Ok(Some(probe)) => {
+                store_worktree_diff_probe(identity, probe.clone());
+                return Ok(probe);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::debug!(
+                    ?error,
+                    "ignoring unreadable persisted SQLite worktree probe"
+                );
+            }
+        }
+        let cached_hashes = match cache.load(expected_state) {
+            Ok(Some(hashes)) => hashes,
+            Ok(None) => {
+                return Ok(WorktreeDiffProbe {
+                    matches: self.matches_state(runtime, expected_state)?,
+                    table_candidates: None,
+                });
+            }
+            Err(error) => {
+                tracing::debug!(?error, "ignoring unreadable SQLite page-index cache");
+                return Ok(WorktreeDiffProbe {
+                    matches: self.matches_state(runtime, expected_state)?,
+                    table_candidates: None,
+                });
+            }
+        };
+
+        let mut changed_pages = BTreeSet::new();
+        self.visit_page_chunks(|first_page, chunk_bytes| {
+            let chunk_index = (first_page - 1) as usize / PAGE_HASH_CHUNK_PAGES;
+            let current_hash = sqlite_page_chunk_hash(first_page, chunk_bytes);
+            if cached_hashes
+                .get(chunk_index)
+                .is_some_and(|expected_hash| expected_hash == current_hash.as_bytes())
+            {
+                return Ok(());
+            }
+
+            for (page_offset, page_bytes) in
+                chunk_bytes.chunks_exact(PAGESIZE.as_usize()).enumerate()
+            {
+                let page_number = first_page + page_offset as u32;
+                let pageidx = PageIdx::try_from(page_number).map_err(|error| {
+                    ErrCtx::PragmaErr(
+                        format!("invalid SQLite page index {page_number}: {error}").into(),
+                    )
+                })?;
+                let unchanged = expected.page_count().contains(pageidx)
+                    && sqlite_page_bytes_equal(
+                        page_number,
+                        expected.read_page(pageidx)?.as_ref(),
+                        page_bytes,
+                    );
+                if !unchanged {
+                    changed_pages.insert(page_number);
+                }
+            }
+            Ok(())
+        })?;
+        for page_number in (self.page_count().to_u32() + 1)..=expected.page_count().to_u32() {
+            changed_pages.insert(page_number);
+        }
+        let probe = WorktreeDiffProbe {
+            matches: changed_pages.is_empty(),
+            table_candidates: self.table_candidates_for_changed_pages(&changed_pages)?,
+        };
+        if let Err(error) = cache.store_probe(expected_state, &identity.fingerprint, &probe) {
+            tracing::debug!(?error, "failed to persist SQLite worktree probe");
+        }
+        store_worktree_diff_probe(identity, probe.clone());
+        Ok(probe)
     }
 }
 
@@ -152,6 +983,11 @@ fn backup_sqlite_source(path: &Path, snapshot_path: &Path) -> Result<(), ErrCtx>
     const BACKUP_RETRY_DELAY: Duration = Duration::from_millis(10);
     const PAGES_PER_STEP: i32 = 256;
 
+    #[cfg(target_os = "macos")]
+    if clone_rollback_journal_snapshot(path, snapshot_path, BACKUP_TIMEOUT)? {
+        return Ok(());
+    }
+
     let source = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -197,6 +1033,58 @@ fn backup_sqlite_source(path: &Path, snapshot_path: &Path) -> Result<(), ErrCtx>
         destination.query_row("PRAGMA journal_mode=DELETE", [], |_| Ok(()))?;
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn clone_rollback_journal_snapshot(
+    path: &Path,
+    snapshot_path: &Path,
+    timeout: Duration,
+) -> Result<bool, ErrCtx> {
+    let source = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    source.busy_timeout(timeout)?;
+    let journal_mode: String = source.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+    if !journal_mode.eq_ignore_ascii_case("delete") {
+        return Ok(false);
+    }
+
+    // A read transaction holds SQLite's shared lock while APFS creates the clone. Writers may
+    // continue preparing a transaction, but cannot publish an in-place rollback-journal commit
+    // until the clone has captured one coherent database image.
+    source.execute_batch("BEGIN")?;
+    source.query_row("SELECT count(*) FROM sqlite_schema", [], |_| Ok(()))?;
+    let clone_result = clone_file(path, snapshot_path);
+    source.execute_batch("ROLLBACK")?;
+    match clone_result {
+        Ok(()) => Ok(true),
+        Err(_) => {
+            let _ = std::fs::remove_file(snapshot_path);
+            Ok(false)
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn clone_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    unsafe extern "C" {
+        fn clonefile(source: *const c_char, destination: *const c_char, flags: c_int) -> c_int;
+    }
+
+    let source = CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let destination = CString::new(destination.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    // SAFETY: both pointers come from live NUL-terminated `CString`s and flags=0 is the documented
+    // clonefile mode. The destination does not exist inside our private temporary directory.
+    let result = unsafe { clonefile(source.as_ptr(), destination.as_ptr(), 0) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 impl VolumeRead for PhysicalSqliteReader {
@@ -416,7 +1304,88 @@ pub(super) fn import_physical_sqlite_file_state(
     base: Option<&CommitFileState>,
 ) -> Result<CommitFileState, ErrCtx> {
     let physical = PhysicalSqliteReader::open(path)?;
-    import_sqlite_reader_state(runtime, path, base, physical)
+    import_sqlite_reader_state(runtime, path, base, &physical, None, None)
+        .map(|(state, _, _)| state)
+}
+
+#[cfg(test)]
+pub(super) fn prepare_physical_sqlite_file_state(
+    runtime: &Runtime,
+    path: &Path,
+    base: Option<&CommitFileState>,
+) -> Result<(CommitFileState, PreparedSqliteStage), ErrCtx> {
+    prepare_physical_sqlite_file_state_with_cache(runtime, path, base, None)
+}
+
+pub(super) fn prepare_cached_physical_sqlite_file_state(
+    runtime: &Runtime,
+    repo: &Repository,
+    key: &str,
+    path: &Path,
+    base: Option<&CommitFileState>,
+) -> Result<(CommitFileState, PreparedSqliteStage), ErrCtx> {
+    if std::fs::metadata(path)?.len() < MIN_PAGE_HASH_CACHE_FILE_BYTES {
+        return prepare_physical_sqlite_file_state_with_cache(runtime, path, base, None);
+    }
+    let cache = SqlitePageHashCache::new(repo, key);
+    prepare_physical_sqlite_file_state_with_cache(runtime, path, base, Some(&cache))
+}
+
+fn prepare_physical_sqlite_file_state_with_cache(
+    runtime: &Runtime,
+    path: &Path,
+    base: Option<&CommitFileState>,
+    cache: Option<&SqlitePageHashCache>,
+) -> Result<(CommitFileState, PreparedSqliteStage), ErrCtx> {
+    let cached_hashes = match (base, cache) {
+        (Some(base), Some(cache)) => match cache.load(base) {
+            Ok(hashes) => hashes,
+            Err(error) => {
+                tracing::debug!(?error, "ignoring unreadable SQLite page-index cache");
+                None
+            }
+        },
+        _ => None,
+    };
+    if cached_hashes.is_some()
+        && let Some(locked) = LockedPhysicalSqliteReader::open(path)?
+    {
+        let (state, changed_pages, page_hash_cache_hit) = import_sqlite_reader_state(
+            runtime,
+            path,
+            base,
+            &locked.physical,
+            cache,
+            cached_hashes,
+        )?;
+        let prepared_table_candidates = Some(
+            locked
+                .physical
+                .table_candidates_for_changed_pages(&changed_pages)?,
+        );
+        let prepared = PreparedSqliteStage {
+            physical: None,
+            prepared_table_candidates,
+            previous: base.cloned(),
+            staged: state.clone(),
+            changed_pages,
+            page_hash_cache_hit,
+        };
+        return Ok((state, prepared));
+    }
+
+    let physical = PhysicalSqliteReader::open(path)?;
+    let (state, changed_pages, page_hash_cache_hit) =
+        import_sqlite_reader_state(runtime, path, base, &physical, cache, cached_hashes)?;
+    let prepared = PreparedSqliteStage {
+        physical: Some(physical),
+        prepared_table_candidates: None,
+        previous: base.cloned(),
+        staged: state.clone(),
+        changed_pages,
+        page_hash_cache_hit,
+    };
+    Ok((state, prepared))
 }
 
 pub(super) fn import_stable_sqlite_file_state(
@@ -424,51 +1393,99 @@ pub(super) fn import_stable_sqlite_file_state(
     path: &Path,
 ) -> Result<CommitFileState, ErrCtx> {
     let physical = PhysicalSqliteReader::open_stable(path)?;
-    import_sqlite_reader_state(runtime, path, None, physical)
+    import_sqlite_reader_state(runtime, path, None, &physical, None, None)
+        .map(|(state, _, _)| state)
 }
 
 fn import_sqlite_reader_state(
     runtime: &Runtime,
     path: &Path,
     base: Option<&CommitFileState>,
-    physical: PhysicalSqliteReader,
-) -> Result<CommitFileState, ErrCtx> {
+    physical: &PhysicalSqliteReader,
+    cache: Option<&SqlitePageHashCache>,
+    cached_hashes: Option<Vec<[u8; PAGE_HASH_BYTES]>>,
+) -> Result<(CommitFileState, BTreeSet<u32>, bool), ErrCtx> {
+    let page_hash_cache_hit = cached_hashes.is_some();
     let base_reader = base.map(|state| runtime.snapshot_reader(state.snapshot.to_snapshot()));
     let mut target = None;
+    let mut changed_pages = BTreeSet::new();
+    let page_count = physical.page_count().to_u32() as usize;
+    let mut current_hashes = Vec::with_capacity(page_hash_chunk_count(page_count));
 
-    for page_number in 1..=physical.page_count().to_u32() {
-        graft::repo::cancellation_checkpoint()?;
-        let pageidx = PageIdx::try_from(page_number).map_err(|err| {
-            ErrCtx::PragmaErr(
-                format!("invalid SQLite page index in `{}`: {err}", path.display()).into(),
-            )
-        })?;
-        let page = physical.read_page(pageidx)?;
-        let unchanged = match &base_reader {
-            Some(reader) if reader.page_count().contains(pageidx) => {
-                reader.read_page(pageidx)? == page
-            }
-            _ => false,
-        };
-        if unchanged {
-            continue;
+    physical.visit_page_chunks(|first_page, chunk_bytes| {
+        let current_hash = *sqlite_page_chunk_hash(first_page, chunk_bytes).as_bytes();
+        current_hashes.push(current_hash);
+        let chunk_index = (first_page - 1) as usize / PAGE_HASH_CHUNK_PAGES;
+        if cached_hashes
+            .as_ref()
+            .and_then(|hashes| hashes.get(chunk_index))
+            .is_some_and(|expected| expected == &current_hash)
+        {
+            return Ok(());
         }
 
-        let target = ensure_import_target(runtime, base, &mut target)?;
-        target.writer.write_page(pageidx, page)?;
-    }
+        for (page_offset, page_bytes) in chunk_bytes.chunks_exact(PAGESIZE.as_usize()).enumerate() {
+            let page_number = first_page + page_offset as u32;
+            let pageidx = PageIdx::try_from(page_number).map_err(|error| {
+                ErrCtx::PragmaErr(
+                    format!("invalid SQLite page index in `{}`: {error}", path.display()).into(),
+                )
+            })?;
+            let unchanged = match &base_reader {
+                Some(reader) if reader.page_count().contains(pageidx) => sqlite_page_bytes_equal(
+                    page_number,
+                    reader.read_page(pageidx)?.as_ref(),
+                    page_bytes,
+                ),
+                _ => false,
+            };
+            if unchanged {
+                continue;
+            }
+            changed_pages.insert(page_number);
+            let target = ensure_import_target(runtime, base, &mut target)?;
+            let page = Page::try_from(page_bytes).map_err(|error| {
+                ErrCtx::PragmaErr(
+                    format!("invalid SQLite page in `{}`: {error}", path.display()).into(),
+                )
+            })?;
+            target.writer.write_page(pageidx, page)?;
+        }
+        Ok(())
+    })?;
 
     if base.is_none_or(|state| state.snapshot.page_count != physical.page_count()) {
+        if let Some(base) = base {
+            for page_number in
+                (physical.page_count().to_u32() + 1)..=base.snapshot.page_count.to_u32()
+            {
+                changed_pages.insert(page_number);
+            }
+        }
         let target = ensure_import_target(runtime, base, &mut target)?;
         target.writer.soft_truncate(physical.page_count())?;
     }
 
-    let Some(target) = target else {
-        return Ok(base
+    let state = match target {
+        Some(target) => target.commit(runtime)?,
+        None => base
             .cloned()
-            .expect("an unchanged import must have a base snapshot"));
+            .expect("an unchanged import must have a base snapshot"),
     };
-    target.commit(runtime)
+    if let Some(cache) = cache
+        && let Err(error) = cache.store(&state, &current_hashes)
+    {
+        tracing::debug!(?error, "failed to persist SQLite page-index cache");
+    }
+    tracing::debug!(
+        path = %path.display(),
+        page_count,
+        chunks_hashed = current_hashes.len(),
+        changed_pages = changed_pages.len(),
+        page_hash_cache_hit,
+        "prepared physical SQLite state"
+    );
+    Ok((state, changed_pages, page_hash_cache_hit))
 }
 
 struct ImportTarget {
@@ -586,6 +1603,41 @@ mod tests {
         connection
     }
 
+    fn prepare_with_forced_page_cache(
+        runtime: &Runtime,
+        repo: &Repository,
+        key: &str,
+        path: &Path,
+        base: Option<&CommitFileState>,
+    ) -> Result<(CommitFileState, PreparedSqliteStage), ErrCtx> {
+        let cache = SqlitePageHashCache::new(repo, key);
+        prepare_physical_sqlite_file_state_with_cache(runtime, path, base, Some(&cache))
+    }
+
+    #[test]
+    fn page_index_ignores_only_sqlite_volatile_header_counters() {
+        let original = vec![0_u8; PAGESIZE.as_usize()];
+        let mut counters_changed = original.clone();
+        counters_changed[SQLITE_FILE_CHANGE_COUNTER_OFFSET..SQLITE_FILE_CHANGE_COUNTER_OFFSET + 4]
+            .copy_from_slice(&17_u32.to_be_bytes());
+        counters_changed[SQLITE_VERSION_VALID_FOR_OFFSET..SQLITE_VERSION_VALID_FOR_OFFSET + 4]
+            .copy_from_slice(&23_u32.to_be_bytes());
+
+        assert!(sqlite_page_bytes_equal(1, &original, &counters_changed));
+        assert_eq!(
+            sqlite_page_chunk_hash(1, &original),
+            sqlite_page_chunk_hash(1, &counters_changed)
+        );
+
+        let mut content_changed = counters_changed;
+        content_changed[40] = 1;
+        assert!(!sqlite_page_bytes_equal(1, &original, &content_changed));
+        assert_ne!(
+            sqlite_page_chunk_hash(1, &original),
+            sqlite_page_chunk_hash(1, &content_changed)
+        );
+    }
+
     #[test]
     fn unchanged_import_reuses_snapshot_and_changed_import_is_incremental() {
         let temp = tempfile::tempdir().unwrap();
@@ -615,6 +1667,300 @@ mod tests {
         let latest = runtime.volume_log(&updated.volume).unwrap().remove(0);
         assert!(latest.changed_pages > 0);
         assert!(latest.changed_pages < updated.snapshot.page_count.to_u32() as usize);
+    }
+
+    #[test]
+    fn staged_candidates_require_an_exact_worktree_match() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("app.sqlite");
+        let connection = create_database(&path, "delete");
+        let runtime = test_runtime();
+        let initial = import_physical_sqlite_file_state(&runtime, &path, None).unwrap();
+
+        connection
+            .execute(
+                "UPDATE records SET payload = ?1 WHERE id = 32",
+                [vec![0xA5_u8; 3_000]],
+            )
+            .unwrap();
+        let updated = import_physical_sqlite_file_state(&runtime, &path, Some(&initial)).unwrap();
+        let previous_reader = runtime.snapshot_reader(initial.snapshot.to_snapshot());
+        let staged_reader = runtime.snapshot_reader(updated.snapshot.to_snapshot());
+        let physical = PhysicalSqliteReader::open(&path).unwrap();
+        assert_eq!(
+            physical
+                .staged_table_candidates(&staged_reader, &previous_reader)
+                .unwrap(),
+            Some(BTreeSet::from(["records".to_string()]))
+        );
+
+        connection
+            .execute(
+                "UPDATE records SET payload = ?1 WHERE id = 48",
+                [vec![0x5A_u8; 3_000]],
+            )
+            .unwrap();
+        let changed_after_stage = PhysicalSqliteReader::open(&path).unwrap();
+        assert_eq!(
+            changed_after_stage
+                .staged_table_candidates(&staged_reader, &previous_reader)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn prepared_stage_keeps_candidates_after_worktree_moves_on() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("app.sqlite");
+        let connection = create_database(&path, "delete");
+        let runtime = test_runtime();
+        let initial = import_physical_sqlite_file_state(&runtime, &path, None).unwrap();
+
+        connection
+            .execute(
+                "UPDATE records SET payload = ?1 WHERE id = 32",
+                [vec![0xA5_u8; 3_000]],
+            )
+            .unwrap();
+        let (staged, prepared) =
+            prepare_physical_sqlite_file_state(&runtime, &path, Some(&initial)).unwrap();
+
+        connection
+            .execute(
+                "UPDATE records SET payload = ?1 WHERE id = 48",
+                [vec![0x5A_u8; 3_000]],
+            )
+            .unwrap();
+
+        assert!(prepared.matches(&initial, &staged));
+        assert_eq!(
+            prepared.table_candidates().unwrap(),
+            Some(BTreeSet::from(["records".to_string()]))
+        );
+    }
+
+    #[test]
+    fn cached_stage_reuses_persisted_page_hashes_for_the_exact_base() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+        let path = temp.path().join("app.sqlite");
+        let connection = create_database(&path, "delete");
+        let runtime = test_runtime();
+        let initial = import_physical_sqlite_file_state(&runtime, &path, None).unwrap();
+
+        connection
+            .execute(
+                "UPDATE records SET payload = ?1 WHERE id = 32",
+                [vec![0xA5_u8; 3_000]],
+            )
+            .unwrap();
+        let (first, first_prepared) =
+            prepare_with_forced_page_cache(&runtime, &repo, "app.sqlite", &path, Some(&initial))
+                .unwrap();
+        assert!(!first_prepared.page_hash_cache_hit());
+
+        connection
+            .execute(
+                "UPDATE records SET payload = ?1 WHERE id = 48",
+                [vec![0x5A_u8; 3_000]],
+            )
+            .unwrap();
+        let (second, second_prepared) =
+            prepare_with_forced_page_cache(&runtime, &repo, "app.sqlite", &path, Some(&first))
+                .unwrap();
+        assert!(second_prepared.page_hash_cache_hit());
+        assert!(second_prepared.physical.is_none());
+        assert!(second_prepared.prepared_table_candidates.is_some());
+        assert_ne!(second.snapshot, first.snapshot);
+
+        let unchanged =
+            prepare_with_forced_page_cache(&runtime, &repo, "app.sqlite", &path, Some(&second))
+                .unwrap();
+        assert!(unchanged.1.page_hash_cache_hit());
+        assert_eq!(unchanged.0, second);
+        connection
+            .execute(
+                "UPDATE records SET payload = ?1 WHERE id = 1",
+                [vec![0xC3_u8; 3_000]],
+            )
+            .expect("the indexed read lock must be released before stage returns");
+    }
+
+    #[test]
+    fn small_database_skips_the_persistent_page_hash_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+        let path = temp.path().join("small.sqlite");
+        let connection = create_database(&path, "delete");
+        assert!(std::fs::metadata(&path).unwrap().len() < MIN_PAGE_HASH_CACHE_FILE_BYTES);
+        let runtime = test_runtime();
+        let initial = import_physical_sqlite_file_state(&runtime, &path, None).unwrap();
+
+        connection
+            .execute(
+                "UPDATE records SET payload = ?1 WHERE id = 32",
+                [vec![0xA5_u8; 3_000]],
+            )
+            .unwrap();
+        let (_, prepared) = prepare_cached_physical_sqlite_file_state(
+            &runtime,
+            &repo,
+            "small.sqlite",
+            &path,
+            Some(&initial),
+        )
+        .unwrap();
+
+        assert!(!prepared.page_hash_cache_hit());
+        assert!(!repo.graft_dir().join("cache").join("sqlite-pages").exists());
+    }
+
+    #[test]
+    fn cached_changed_table_candidates_reuses_the_committed_page_index() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+        let path = temp.path().join("app.sqlite");
+        let connection = create_database(&path, "delete");
+        let runtime = test_runtime();
+        let initial = import_physical_sqlite_file_state(&runtime, &path, None).unwrap();
+
+        connection
+            .execute(
+                "UPDATE records SET payload = ?1 WHERE id = 32",
+                [vec![0xA5_u8; 3_000]],
+            )
+            .unwrap();
+        let (committed, _) =
+            prepare_with_forced_page_cache(&runtime, &repo, "app.sqlite", &path, Some(&initial))
+                .unwrap();
+
+        let matches_committed = with_consistent_physical_sqlite_reader(&path, |physical| {
+            physical.matches_cached_state(&runtime, &repo, "app.sqlite", &committed)
+        })
+        .unwrap();
+        assert!(matches_committed);
+
+        connection
+            .execute(
+                "UPDATE records SET payload = ?1 WHERE id = 48",
+                [vec![0x5A_u8; 3_000]],
+            )
+            .unwrap();
+        let expected = runtime.snapshot_reader(committed.snapshot.to_snapshot());
+        let candidates = with_consistent_physical_sqlite_reader(&path, |physical| {
+            physical.cached_changed_table_candidates(
+                &runtime,
+                &repo,
+                "app.sqlite",
+                &committed,
+                &expected,
+            )
+        })
+        .unwrap();
+
+        assert_eq!(candidates, Some(BTreeSet::from(["records".to_string()])));
+        let cache = SqlitePageHashCache::new(&repo, "app.sqlite");
+        assert!(cache.probe_path_for_state(&committed).unwrap().is_file());
+        WORKTREE_DIFF_PROBES
+            .get_or_init(|| Mutex::new(VecDeque::new()))
+            .lock()
+            .clear();
+        let matches_changed = with_consistent_physical_sqlite_reader(&path, |physical| {
+            physical.matches_cached_state(&runtime, &repo, "app.sqlite", &committed)
+        })
+        .unwrap();
+        assert!(!matches_changed);
+    }
+
+    #[test]
+    fn bounded_consistent_reader_uses_the_live_rollback_journal_image() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("app.sqlite");
+        let connection = create_database(&path, "delete");
+
+        let read_live_image =
+            with_consistent_physical_sqlite_reader(
+                &path,
+                |reader| Ok(reader.snapshot_path == path),
+            )
+            .unwrap();
+
+        assert!(read_live_image);
+        connection
+            .execute(
+                "UPDATE records SET payload = ?1 WHERE id = 1",
+                [vec![0xC3_u8; 3_000]],
+            )
+            .expect("the bounded read lock must be released after the callback");
+    }
+
+    #[test]
+    fn corrupted_page_hash_cache_falls_back_to_authoritative_comparison() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+        let path = temp.path().join("app.sqlite");
+        let connection = create_database(&path, "delete");
+        let runtime = test_runtime();
+        let initial = import_physical_sqlite_file_state(&runtime, &path, None).unwrap();
+
+        connection
+            .execute(
+                "UPDATE records SET payload = ?1 WHERE id = 32",
+                [vec![0xA5_u8; 3_000]],
+            )
+            .unwrap();
+        let (first, _) =
+            prepare_with_forced_page_cache(&runtime, &repo, "app.sqlite", &path, Some(&initial))
+                .unwrap();
+        let cache = SqlitePageHashCache::new(&repo, "app.sqlite");
+        std::fs::write(cache.path_for_state(&first).unwrap(), b"corrupted").unwrap();
+
+        connection
+            .execute(
+                "UPDATE records SET payload = ?1 WHERE id = 48",
+                [vec![0x5A_u8; 3_000]],
+            )
+            .unwrap();
+        let (second, prepared) =
+            prepare_with_forced_page_cache(&runtime, &repo, "app.sqlite", &path, Some(&first))
+                .unwrap();
+        assert!(!prepared.page_hash_cache_hit());
+        assert_ne!(second.snapshot, first.snapshot);
+    }
+
+    #[test]
+    fn cached_wal_stage_retains_the_online_backup_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+        let path = temp.path().join("app.sqlite");
+        let connection = create_database(&path, "wal");
+        let runtime = test_runtime();
+        let initial = import_physical_sqlite_file_state(&runtime, &path, None).unwrap();
+
+        connection
+            .execute(
+                "UPDATE records SET payload = ?1 WHERE id = 32",
+                [vec![0xA5_u8; 3_000]],
+            )
+            .unwrap();
+        let (first, _) =
+            prepare_with_forced_page_cache(&runtime, &repo, "app.sqlite", &path, Some(&initial))
+                .unwrap();
+        connection
+            .execute(
+                "UPDATE records SET payload = ?1 WHERE id = 48",
+                [vec![0x5A_u8; 3_000]],
+            )
+            .unwrap();
+        let (second, prepared) =
+            prepare_with_forced_page_cache(&runtime, &repo, "app.sqlite", &path, Some(&first))
+                .unwrap();
+
+        assert!(prepared.page_hash_cache_hit());
+        assert!(prepared.physical.is_some());
+        assert!(prepared.prepared_table_candidates.is_none());
+        assert_ne!(second.snapshot, first.snapshot);
     }
 
     #[test]

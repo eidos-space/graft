@@ -7,6 +7,7 @@ import {
   createGraftRemoteHandler,
   type GraftByteRange,
   type GraftListQuery,
+  type GraftMultipartBackend,
   type GraftObject,
   type GraftObjectMetadata,
   type GraftRepositoryBackend,
@@ -17,6 +18,66 @@ const ORIGIN = "https://remote.example";
 
 class MemoryRepository implements GraftRepositoryBackend {
   readonly objects = new Map<string, Uint8Array<ArrayBuffer>>();
+  readonly uploads = new Map<
+    string,
+    {
+      uploadId: string;
+      totalBytes: number;
+      partBytes: number;
+      parts: Map<number, Uint8Array<ArrayBuffer>>;
+    }
+  >();
+  readonly multipart: GraftMultipartBackend = {
+    start: (path, totalBytes, partBytes) => {
+      if (this.objects.has(path)) return null;
+      const existing = this.uploads.get(path);
+      if (existing !== undefined) {
+        return {
+          uploadId: existing.uploadId,
+          totalBytes: existing.totalBytes,
+          partBytes: existing.partBytes,
+          uploadedParts: [...existing.parts]
+            .sort(([left], [right]) => left - right)
+            .map(([partNumber, bytes]) => ({ partNumber, bytes: bytes.byteLength })),
+        };
+      }
+      const upload = {
+        uploadId: crypto.randomUUID(),
+        totalBytes,
+        partBytes,
+        parts: new Map<number, Uint8Array<ArrayBuffer>>(),
+      };
+      this.uploads.set(path, upload);
+      return { uploadId: upload.uploadId, totalBytes, partBytes, uploadedParts: [] };
+    },
+    uploadPart: async (path, uploadId, partNumber, value) => {
+      const upload = this.uploads.get(path);
+      if (upload === undefined || upload.uploadId !== uploadId) {
+        throw new RangeError("unknown multipart upload");
+      }
+      upload.parts.set(partNumber, await bodyBytes(value));
+    },
+    complete: (path, uploadId) => {
+      if (this.objects.has(path)) return false;
+      const upload = this.uploads.get(path);
+      if (upload === undefined || upload.uploadId !== uploadId) {
+        throw new RangeError("unknown multipart upload");
+      }
+      const value = new Uint8Array(upload.totalBytes);
+      let offset = 0;
+      for (const [, part] of [...upload.parts].sort(([left], [right]) => left - right)) {
+        value.set(part, offset);
+        offset += part.byteLength;
+      }
+      if (offset !== value.byteLength) throw new RangeError("incomplete multipart upload");
+      this.objects.set(path, value);
+      this.uploads.delete(path);
+      return true;
+    },
+    abort: (path, uploadId) => {
+      if (this.uploads.get(path)?.uploadId === uploadId) this.uploads.delete(path);
+    },
+  };
 
   head(path: string): GraftObjectMetadata | null {
     const value = this.objects.get(path);
@@ -90,7 +151,7 @@ class MemoryRepository implements GraftRepositoryBackend {
   }
 }
 
-function createTestApp() {
+function createTestApp(limits?: { maxRequestBytes?: number; multipartPartBytes?: number }) {
   const repositories = new Map<string, MemoryRepository>();
   return createGraftRemoteHandler({
     authenticate({ request }) {
@@ -108,6 +169,7 @@ function createTestApp() {
       }
       return backend;
     },
+    limits,
   });
 }
 
@@ -152,6 +214,86 @@ describe("createGraftRemoteHandler", () => {
         "cas",
       ]),
     });
+  });
+
+  it("resumes multipart immutable uploads and advertises request limits", async () => {
+    const app = createTestApp({ maxRequestBytes: 8, multipartPartBytes: 5 });
+    const descriptor = await remoteFetch(app, "/acme/archive");
+    expect(await descriptor.json()).toMatchObject({
+      capabilities: expect.arrayContaining(["multipart-object"]),
+      limits: { max_request_bytes: 8, multipart_part_bytes: 5 },
+    });
+
+    const start = await remoteFetch(app, "/acme/archive/multipart-start/segments/large", {
+      method: "POST",
+      headers: { "x-graft-object-bytes": "11", "Content-Length": "0" },
+    });
+    expect(start.status).toBe(200);
+    const session = (await start.json()) as { upload_id: string };
+
+    expect(
+      (
+        await remoteFetch(app, "/acme/archive/multipart-part/segments/large", {
+          method: "PUT",
+          headers: {
+            "x-graft-upload-id": session.upload_id,
+            "x-graft-part-number": "1",
+            "Content-Length": "5",
+          },
+          body: "abcde",
+        })
+      ).status,
+    ).toBe(204);
+
+    const resumed = await remoteFetch(app, "/acme/archive/multipart-start/segments/large", {
+      method: "POST",
+      headers: { "x-graft-object-bytes": "11", "Content-Length": "0" },
+    });
+    expect(await resumed.json()).toMatchObject({
+      upload_id: session.upload_id,
+      uploaded_parts: [{ part_number: 1, bytes: 5 }],
+    });
+
+    for (const [partNumber, body] of [
+      [2, "fghij"],
+      [3, "k"],
+    ] as const) {
+      const part = await remoteFetch(app, "/acme/archive/multipart-part/segments/large", {
+        method: "PUT",
+        headers: {
+          "x-graft-upload-id": session.upload_id,
+          "x-graft-part-number": partNumber.toString(),
+          "Content-Length": body.length.toString(),
+        },
+        body,
+      });
+      expect(part.status).toBe(204);
+    }
+
+    const complete = await remoteFetch(app, "/acme/archive/multipart-complete/segments/large", {
+      method: "POST",
+      headers: { "x-graft-upload-id": session.upload_id, "Content-Length": "0" },
+    });
+    expect(complete.status).toBe(204);
+    expect(
+      await (await remoteFetch(app, "/acme/archive/raw/segments/large")).text(),
+    ).toBe("abcdefghijk");
+    expect(
+      (
+        await remoteFetch(app, "/acme/archive/multipart-start/segments/large", {
+          method: "POST",
+          headers: { "x-graft-object-bytes": "11", "Content-Length": "0" },
+        })
+      ).status,
+    ).toBe(412);
+
+    const tooLarge = await remoteFetch(app, "/acme/archive/raw-if-not-exists/segments/direct", {
+      method: "PUT",
+      headers: { "Content-Length": "9" },
+      body: "123456789",
+    });
+    expect(tooLarge.status).toBe(413);
+    expect(await tooLarge.json()).toMatchObject({ title: "request_too_large" });
   });
 
   it("separates authentication, authorization, repository mapping, and storage", async () => {

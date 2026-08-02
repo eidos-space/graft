@@ -1,0 +1,74 @@
+{
+  "schema": "graft-sdk-real-eidos-benchmark-v1",
+  "generated_at": "2026-08-02T05:31:04.466Z",
+  "sdk": {
+    "module": "npm:@eidos.space/graft@0.3.4",
+    "version": "0.3.4"
+  },
+  "source": {
+    "path": "fixture:Untitled.eidos",
+    "bytes": 460689408
+  },
+  "environment": {
+    "platform": "darwin",
+    "arch": "arm64",
+    "node": "v26.0.0",
+    "cpu": "Apple M2",
+    "memory_bytes": 25769803776
+  },
+  "fixture_copy": {
+    "milliseconds": 1294.364,
+    "response_bytes": 0
+  },
+  "peak_rss_bytes": 4170727424,
+  "operations": {
+    "session_open": {
+      "milliseconds": 463.845,
+      "response_bytes": 2
+    },
+    "init": {
+      "milliseconds": 445.34,
+      "response_bytes": 308
+    },
+    "stage_initial": {
+      "milliseconds": 6366.419,
+      "response_bytes": 149
+    },
+    "commit_initial": {
+      "milliseconds": 3661.209,
+      "response_bytes": 452
+    },
+    "status_dirty": {
+      "milliseconds": 5395.603,
+      "response_bytes": 1525
+    },
+    "working_summary": {
+      "milliseconds": 18836.532,
+      "response_bytes": 1154
+    },
+    "working_meta_rows": {
+      "milliseconds": 10063.069,
+      "response_bytes": 1614
+    },
+    "stage_meta_change": {
+      "milliseconds": 6052.94,
+      "response_bytes": 311
+    },
+    "commit_meta_change": {
+      "milliseconds": 21298.491,
+      "response_bytes": 517
+    },
+    "status_after_commit": {
+      "milliseconds": 7451.076,
+      "response_bytes": 1203
+    },
+    "historical_summary": {
+      "milliseconds": 12528.875,
+      "response_bytes": 1269
+    },
+    "history_summaries_50": {
+      "milliseconds": 0.389,
+      "response_bytes": 1340
+    }
+  }
+}

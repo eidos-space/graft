@@ -53,6 +53,7 @@ pub enum CommitHashParseErr {
     Copy,
     PartialEq,
     Eq,
+    Hash,
     Default,
     TryFromBytes,
     IntoBytes,
@@ -67,7 +68,7 @@ pub enum CommitHashPrefix {
 }
 
 #[derive(
-    Clone, PartialEq, Eq, Default, TryFromBytes, IntoBytes, Immutable, KnownLayout, Unaligned,
+    Clone, PartialEq, Eq, Hash, Default, TryFromBytes, IntoBytes, Immutable, KnownLayout, Unaligned,
 )]
 #[repr(C)]
 pub struct CommitHash {

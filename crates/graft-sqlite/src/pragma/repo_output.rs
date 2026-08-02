@@ -282,80 +282,118 @@ pub(super) fn repo_file_bounded_row_diff(
         RepoSnapshotPurpose::Diff,
         SnapshotHashPolicy::AllowHydratedMismatch,
     );
-    let result = if file.worktree.is_some() {
+    if file.worktree.is_some() {
         let physical_path = repo.worktree().join(&file.path);
-        let physical = PhysicalSqliteReader::open(&physical_path)?;
-        if let Some(from) = &file.from {
+        let result = super::sqlite_worktree::with_consistent_physical_sqlite_reader(
+            &physical_path,
+            |physical| {
+                if let Some(from) = &file.from {
+                    resolver.resolve_snapshot(&from.snapshot)?;
+                    let snapshot = from.snapshot.to_snapshot();
+                    let from_lsn = snapshot.head().map_or(LSN::FIRST, |(_, lsn)| lsn);
+                    let from_reader = runtime.snapshot_reader(snapshot);
+                    let summary_tables =
+                        matches!(mode, crate::row_level_diff::BoundedRowDiffMode::Summary)
+                            .then(|| {
+                                physical.cached_changed_table_candidates(
+                                    runtime,
+                                    repo,
+                                    &file.path,
+                                    from,
+                                    &from_reader,
+                                )
+                            })
+                            .transpose()?;
+                    let rows = if let Some(Some(tables)) = summary_tables {
+                        crate::row_level_diff::bounded_row_level_diff_readers_for_summary_tables(
+                            &from_reader,
+                            physical,
+                            from_lsn,
+                            from_lsn.saturating_next(),
+                            &tables,
+                        )
+                    } else {
+                        crate::row_level_diff::bounded_row_level_diff_readers(
+                            &from_reader,
+                            physical,
+                            from_lsn,
+                            from_lsn.saturating_next(),
+                            mode,
+                        )
+                    };
+                    rows.map(Some).map_err(|error| {
+                        ErrCtx::PragmaErr(
+                            format!("Bounded row diff error for `{}`: {error:?}", file.path).into(),
+                        )
+                    })
+                } else {
+                    let empty = empty_sqlite_reader()?;
+                    crate::row_level_diff::bounded_row_level_diff_readers(
+                        &empty,
+                        physical,
+                        LSN::FIRST,
+                        LSN::FIRST.saturating_next(),
+                        mode,
+                    )
+                    .map(Some)
+                    .map_err(|error| {
+                        ErrCtx::PragmaErr(
+                            format!("Bounded row diff error for `{}`: {error:?}", file.path).into(),
+                        )
+                    })
+                }
+            },
+        );
+        return result;
+    }
+
+    let result = match (&file.from, &file.to) {
+        (Some(from), Some(to)) => {
             resolver.resolve_snapshot(&from.snapshot)?;
-            let snapshot = from.snapshot.to_snapshot();
-            let from_lsn = snapshot.head().map_or(LSN::FIRST, |(_, lsn)| lsn);
-            let from_reader = runtime.snapshot_reader(snapshot);
+            resolver.resolve_snapshot(&to.snapshot)?;
+            let from_snapshot = from.snapshot.to_snapshot();
+            let to_snapshot = to.snapshot.to_snapshot();
+            let from_lsn = from_snapshot.head().map_or(LSN::FIRST, |(_, lsn)| lsn);
+            let to_lsn = to_snapshot.head().map_or(LSN::FIRST, |(_, lsn)| lsn);
+            let from_reader = runtime.snapshot_reader(from_snapshot);
+            let to_reader = runtime.snapshot_reader(to_snapshot);
             crate::row_level_diff::bounded_row_level_diff_readers(
                 &from_reader,
-                &physical,
+                &to_reader,
+                from_lsn,
+                to_lsn,
+                mode,
+            )
+        }
+        (None, Some(to)) => {
+            resolver.resolve_snapshot(&to.snapshot)?;
+            let empty = empty_sqlite_reader()?;
+            let snapshot = to.snapshot.to_snapshot();
+            let to_lsn = snapshot.head().map_or(LSN::FIRST, |(_, lsn)| lsn);
+            let reader = runtime.snapshot_reader(snapshot);
+            crate::row_level_diff::bounded_row_level_diff_readers(
+                &empty,
+                &reader,
+                LSN::FIRST,
+                to_lsn,
+                mode,
+            )
+        }
+        (Some(from), None) => {
+            resolver.resolve_snapshot(&from.snapshot)?;
+            let empty = empty_sqlite_reader()?;
+            let snapshot = from.snapshot.to_snapshot();
+            let from_lsn = snapshot.head().map_or(LSN::FIRST, |(_, lsn)| lsn);
+            let reader = runtime.snapshot_reader(snapshot);
+            crate::row_level_diff::bounded_row_level_diff_readers(
+                &reader,
+                &empty,
                 from_lsn,
                 from_lsn.saturating_next(),
                 mode,
             )
-        } else {
-            let empty = empty_sqlite_reader()?;
-            crate::row_level_diff::bounded_row_level_diff_readers(
-                &empty,
-                &physical,
-                LSN::FIRST,
-                LSN::FIRST.saturating_next(),
-                mode,
-            )
         }
-    } else {
-        match (&file.from, &file.to) {
-            (Some(from), Some(to)) => {
-                resolver.resolve_snapshot(&from.snapshot)?;
-                resolver.resolve_snapshot(&to.snapshot)?;
-                let from_snapshot = from.snapshot.to_snapshot();
-                let to_snapshot = to.snapshot.to_snapshot();
-                let from_lsn = from_snapshot.head().map_or(LSN::FIRST, |(_, lsn)| lsn);
-                let to_lsn = to_snapshot.head().map_or(LSN::FIRST, |(_, lsn)| lsn);
-                let from_reader = runtime.snapshot_reader(from_snapshot);
-                let to_reader = runtime.snapshot_reader(to_snapshot);
-                crate::row_level_diff::bounded_row_level_diff_readers(
-                    &from_reader,
-                    &to_reader,
-                    from_lsn,
-                    to_lsn,
-                    mode,
-                )
-            }
-            (None, Some(to)) => {
-                resolver.resolve_snapshot(&to.snapshot)?;
-                let empty = empty_sqlite_reader()?;
-                let snapshot = to.snapshot.to_snapshot();
-                let to_lsn = snapshot.head().map_or(LSN::FIRST, |(_, lsn)| lsn);
-                let reader = runtime.snapshot_reader(snapshot);
-                crate::row_level_diff::bounded_row_level_diff_readers(
-                    &empty,
-                    &reader,
-                    LSN::FIRST,
-                    to_lsn,
-                    mode,
-                )
-            }
-            (Some(from), None) => {
-                resolver.resolve_snapshot(&from.snapshot)?;
-                let empty = empty_sqlite_reader()?;
-                let snapshot = from.snapshot.to_snapshot();
-                let from_lsn = snapshot.head().map_or(LSN::FIRST, |(_, lsn)| lsn);
-                let reader = runtime.snapshot_reader(snapshot);
-                crate::row_level_diff::bounded_row_level_diff_readers(
-                    &reader,
-                    &empty,
-                    from_lsn,
-                    from_lsn.saturating_next(),
-                    mode,
-                )
-            }
-            (None, None) => return Ok(None),
-        }
+        (None, None) => return Ok(None),
     };
     result.map(Some).map_err(|error| {
         ErrCtx::PragmaErr(format!("Bounded row diff error for `{}`: {error:?}", file.path).into())

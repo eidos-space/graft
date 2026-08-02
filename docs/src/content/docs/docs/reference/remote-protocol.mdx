@@ -93,9 +93,14 @@ issuance, tenancy, and ACL storage are service concerns outside this protocol.
     "upload-bundle",
     "receive-pack",
     "receive-bundle",
+    "multipart-object",
     "cas",
     "cad"
-  ]
+  ],
+  "limits": {
+    "max_request_bytes": 67108864,
+    "multipart_part_bytes": 16777216
+  }
 }
 ```
 
@@ -142,6 +147,10 @@ All paths below are relative to `{base}`.
 | `POST /upload-bundle/<ref-key>`  | Stream a ref snapshot and its immutable storage.    | `200 OK`         |
 | `POST /receive-pack/<ref-key>`   | Publish one object pack and atomically update a ref. | `204 No Content` |
 | `POST /receive-bundle/<ref-key>` | Publish immutable objects, a pack, and a ref.        | `204 No Content` |
+| `POST /multipart-start/<key>`    | Start or resume a multipart immutable upload.        | `200 OK`         |
+| `PUT /multipart-part/<key>`      | Upload one numbered part.                            | `204 No Content` |
+| `POST /multipart-complete/<key>` | Assemble all uploaded parts at the immutable key.    | `204 No Content` |
+| `DELETE /multipart-abort/<key>`  | Abort an incomplete multipart upload.                | `204 No Content` |
 | `POST /cas/<key>`                | Atomically compare and replace metadata.             | `204 No Content` |
 | `POST /cad/<key>`                | Atomically compare and delete metadata.              | `204 No Content` |
 | `GET /list?prefix=<prefix>`      | Recursively list matching keys.                      | `200 OK`         |
@@ -284,6 +293,58 @@ truncated, or trailing body MUST NOT update the ref.
 verify the collision before retrying publication. Clients MUST fall back to
 individual immutable writes followed by `receive-pack` or `/cas` when
 `receive-bundle` returns `404` or `405`.
+
+## Multipart Immutable Objects
+
+`multipart-object` is an optional version 1 capability for immutable objects
+that exceed an HTTP gateway's request-body limit. It changes only the transfer:
+the completed object remains at the original key and retains the same logical
+content identifier.
+
+The descriptor MUST include `limits.multipart_part_bytes` when this capability
+is advertised. A service SHOULD also publish `limits.max_request_bytes` so a
+client can skip an aggregate `receive-bundle` or `receive-pack` request that
+cannot reach the application. A client starts or resumes an upload with:
+
+```http
+POST /multipart-start/segments/<segment-id>
+Content-Length: 0
+x-graft-object-bytes: <total decimal bytes>
+```
+
+The response identifies the durable session and the parts already stored:
+
+```json
+{
+  "upload_id": "opaque-upload-id",
+  "total_bytes": 111249535,
+  "part_bytes": 16777216,
+  "uploaded_parts": [{ "part_number": 1, "bytes": 16777216 }]
+}
+```
+
+Clients MUST send all missing parts in ascending order. Part numbers start at
+one. Every non-final part has exactly the advertised part size; the final part
+contains the remainder.
+
+```http
+PUT /multipart-part/segments/<segment-id>
+Content-Length: <part bytes>
+x-graft-upload-id: <opaque-upload-id>
+x-graft-part-number: <positive decimal number>
+```
+
+Re-uploading a part number replaces that part in the same session, which makes
+a lost response safe to retry. Repeating `multipart-start` for the same key and
+length returns the same session and completed-part list. After all parts are
+present, `POST /multipart-complete/<key>` with `x-graft-upload-id` and an empty
+body atomically exposes the complete immutable object. `DELETE
+/multipart-abort/<key>` with the same header releases an incomplete session.
+
+The start and complete operations return `412` when the immutable target
+already exists. Clients apply the same collision policy used by
+`raw-if-not-exists`. Multipart completion never publishes a ref; the client
+still performs `receive-pack` or CAS only after all immutable objects exist.
 
 ## Compare Operations
 

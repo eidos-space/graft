@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::Debug,
     ops::RangeInclusive,
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use crate::{
@@ -114,9 +114,25 @@ impl Keyspaces {
     }
 }
 
+fn hydrated_snapshot_key(snapshot: &Snapshot) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"graft-hydrated-snapshot-v1\0");
+    hasher.update(&snapshot.page_count.to_u32().to_le_bytes());
+    for range in snapshot.iter() {
+        hasher.update(range.log.serialize().as_bytes());
+        hasher.update(&range.lsns.start().to_u64().to_le_bytes());
+        hasher.update(&range.lsns.end().to_u64().to_le_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
 pub struct FjallStorage {
     db: fjall::Database,
     ks: Keyspaces,
+    /// Derived snapshot-presence proofs live outside Fjall's keyspaces so checking or recording
+    /// one never enlarges the database's write set. This is deliberately analogous to Git's
+    /// replaceable commit-graph/index helpers: deleting the directory only loses acceleration.
+    hydration_cache_dir: PathBuf,
 
     /// Must be held while performing read+write transactions.
     /// Read-only and write-only transactions don't need to hold the lock as
@@ -134,26 +150,33 @@ impl Debug for FjallStorage {
 
 impl FjallStorage {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, FjallStorageErr> {
-        let builder = Database::builder(path);
+        let path = path.as_ref().to_path_buf();
+        let builder = Database::builder(&path);
         #[cfg(target_arch = "wasm32")]
         let builder = builder.worker_threads_unchecked(0);
-        Self::open_from_builder(builder)
+        Self::open_from_builder(builder, path.join("cache/hydrated-snapshots-v1"))
     }
 
     pub fn open_temporary() -> Result<Self, FjallStorageErr> {
         let path = tempfile::tempdir()?.keep();
-        let builder = Database::builder(path).temporary(true);
+        let builder = Database::builder(&path).temporary(true);
         #[cfg(target_arch = "wasm32")]
         let builder = builder.worker_threads_unchecked(0);
-        Self::open_from_builder(builder)
+        Self::open_from_builder(builder, path.join("cache/hydrated-snapshots-v1"))
     }
 
     fn open_from_builder(
         builder: fjall::DatabaseBuilder<Database>,
+        hydration_cache_dir: PathBuf,
     ) -> Result<Self, FjallStorageErr> {
         let db = builder.open()?;
         let ks = Keyspaces::open(&db)?;
-        Ok(Self { db, ks, lock: Default::default() })
+        Ok(Self {
+            db,
+            ks,
+            hydration_cache_dir,
+            lock: Default::default(),
+        })
     }
 
     pub(crate) fn read(&self) -> ReadGuard<'_> {
@@ -169,6 +192,46 @@ impl FjallStorage {
     /// will block.
     pub(crate) fn read_write(&self) -> ReadWriteGuard<'_> {
         ReadWriteGuard::open(self)
+    }
+
+    pub(crate) fn snapshot_hydration_cached(
+        &self,
+        snapshot: &Snapshot,
+    ) -> Result<bool, FjallStorageErr> {
+        Ok(self
+            .hydration_cache_dir
+            .join(hydrated_snapshot_key(snapshot))
+            .is_file())
+    }
+
+    pub(crate) fn mark_snapshot_hydrated(
+        &self,
+        snapshot: &Snapshot,
+    ) -> Result<(), FjallStorageErr> {
+        std::fs::create_dir_all(&self.hydration_cache_dir)?;
+        let final_path = self
+            .hydration_cache_dir
+            .join(hydrated_snapshot_key(snapshot));
+        if final_path.is_file() {
+            return Ok(());
+        }
+        let temp_path = self.hydration_cache_dir.join(format!(
+            ".hydrated-{}-{}.tmp",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::write(&temp_path, b"hydrated\n")?;
+        match std::fs::rename(&temp_path, &final_path) {
+            Ok(()) => Ok(()),
+            Err(_error) if final_path.is_file() => {
+                let _ = std::fs::remove_file(temp_path);
+                Ok(())
+            }
+            Err(error) => {
+                let _ = std::fs::remove_file(temp_path);
+                Err(error.into())
+            }
+        }
     }
 
     pub fn write_page(
@@ -382,6 +445,14 @@ impl FjallStorage {
             return Ok(outcome);
         }
 
+        // Hydration markers are derived indexes. Clear them before deleting
+        // pages so a later Runtime never trusts a marker invalidated by GC.
+        match std::fs::remove_dir_all(&self.hydration_cache_dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+
         let mut batch = self.db.batch();
         for vid in candidate_volumes {
             batch.remove_typed(&self.ks.volumes, vid);
@@ -408,7 +479,6 @@ impl FjallStorage {
         self.ks.checkpoints.major_compact()?;
         self.ks.page_versions.major_compact()?;
         self.ks.pages.major_compact()?;
-
         Ok(outcome)
     }
 }
@@ -900,6 +970,17 @@ impl<'a> ReadWriteGuard<'a> {
             return Err(LogicalErr::VolumeConcurrentWrite(vid.clone()).into());
         }
 
+        // Record local completeness in the replaceable side cache after the commit becomes
+        // durable. Unlike the former Fjall keyspace this does not enlarge every storage write
+        // transaction, while the next diff/commit can still avoid proving pages Graft just wrote.
+        let base_is_fully_hydrated = self
+            .read
+            .storage
+            .snapshot_hydration_cached(&snapshot)
+            .unwrap_or(false);
+        let commit_is_fully_hydrated =
+            page_count.to_usize() == pages.len() || base_is_fully_hydrated;
+
         let volume = self.read.volume(vid)?;
 
         // the commit_lsn is the next lsn for the volume's local Log
@@ -944,7 +1025,13 @@ impl<'a> ReadWriteGuard<'a> {
         // since we are holding a read_write lock, we know that no other thread
         // is concurrently committing to the volume, so we know this snapshot
         // will reflect the commit we just executed
-        self.read.storage.read().snapshot(&volume.vid)
+        let snapshot = self.read.storage.read().snapshot(&volume.vid)?;
+        if commit_is_fully_hydrated
+            && let Err(error) = self.read.storage.mark_snapshot_hydrated(&snapshot)
+        {
+            tracing::debug!(?error, "failed to record local snapshot hydration proof");
+        }
+        Ok(snapshot)
     }
 
     /// Verify we are ready to make a remote commit and update the volume

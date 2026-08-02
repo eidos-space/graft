@@ -390,6 +390,122 @@ impl<'a> TableScanner<'a> {
         Ok(rows)
     }
 
+    /// Return every page that belongs to an index B-tree.
+    ///
+    /// `WITHOUT ROWID` tables use this layout for their primary storage. Keeping page identity
+    /// lets callers skip byte-identical subtrees and decode only pages that can contain changed
+    /// rows.
+    pub fn index_btree_pages(&self, root_page: u32) -> Result<Vec<u32>, ParseError> {
+        let mut pages = Vec::new();
+        self.collect_index_btree_pages(root_page, &mut pages)?;
+        Ok(pages)
+    }
+
+    /// Decode all records stored directly on one index B-tree page.
+    ///
+    /// Interior index cells contain complete records as well as child pointers, so they must be
+    /// included alongside leaf cells when a changed page is inspected.
+    pub fn read_index_records_from_page(&self, page_num: u32) -> Result<Vec<Record>, ParseError> {
+        let (full_page, header_offset, header) = self.read_table_page(page_num)?;
+        if !matches!(header.page_type, 2 | 10) {
+            return Err(ParseError::InvalidPage);
+        }
+        let page_bytes = full_page.as_ref();
+        let interior = header.page_type == 2;
+        let mut records = Vec::with_capacity(usize::from(header.num_cells));
+        for cell_index in 0..header.num_cells {
+            let ptr_offset = header_offset + header.header_size() + usize::from(cell_index) * 2;
+            if ptr_offset + 2 > page_bytes.len() {
+                return Err(ParseError::InvalidCell);
+            }
+            let cell_offset = usize::from(u16::from_be_bytes([
+                page_bytes[ptr_offset],
+                page_bytes[ptr_offset + 1],
+            ]));
+            records.push(self.read_index_record_from_bytes(page_bytes, cell_offset, interior)?);
+        }
+        Ok(records)
+    }
+
+    /// Return true when an index page references overflow payload pages.
+    ///
+    /// The owning B-tree page can remain byte-identical while an overflow page changes. Callers
+    /// therefore conservatively decode such pages instead of treating equal page bytes as proof
+    /// that every contained row is unchanged.
+    pub fn index_page_has_overflow(&self, page_num: u32) -> Result<bool, ParseError> {
+        let (full_page, header_offset, header) = self.read_table_page(page_num)?;
+        if !matches!(header.page_type, 2 | 10) {
+            return Err(ParseError::InvalidPage);
+        }
+        let page_bytes = full_page.as_ref();
+        let payload_prefix = if header.page_type == 2 { 4 } else { 0 };
+        let usable_end = self.usable_size().min(page_bytes.len());
+        for cell_index in 0..header.num_cells {
+            let ptr_offset = header_offset + header.header_size() + usize::from(cell_index) * 2;
+            if ptr_offset + 2 > page_bytes.len() {
+                return Err(ParseError::InvalidCell);
+            }
+            let cell_offset = usize::from(u16::from_be_bytes([
+                page_bytes[ptr_offset],
+                page_bytes[ptr_offset + 1],
+            ]));
+            let payload_offset = cell_offset
+                .checked_add(payload_prefix)
+                .ok_or(ParseError::InvalidCell)?;
+            if payload_offset >= usable_end {
+                return Err(ParseError::InvalidCell);
+            }
+            let (payload_size, bytes_read) = read_varint(&page_bytes[payload_offset..usable_end]);
+            if payload_size < 0 || bytes_read == 0 {
+                return Err(ParseError::InvalidCell);
+            }
+            let payload_size =
+                usize::try_from(payload_size).map_err(|_| ParseError::InvalidCell)?;
+            if self.local_index_payload_size(payload_size) < payload_size {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn collect_index_btree_pages(
+        &self,
+        page_num: u32,
+        pages: &mut Vec<u32>,
+    ) -> Result<(), ParseError> {
+        let (full_page, header_offset, header) = self.read_table_page(page_num)?;
+        pages.push(page_num);
+        if header.page_type == 10 {
+            return Ok(());
+        }
+        if header.page_type != 2 {
+            return Err(ParseError::InvalidPage);
+        }
+        let page_bytes = full_page.as_ref();
+        for cell_index in 0..header.num_cells {
+            let ptr_offset = header_offset + header.header_size() + usize::from(cell_index) * 2;
+            if ptr_offset + 2 > page_bytes.len() {
+                return Err(ParseError::InvalidCell);
+            }
+            let cell_offset = usize::from(u16::from_be_bytes([
+                page_bytes[ptr_offset],
+                page_bytes[ptr_offset + 1],
+            ]));
+            if cell_offset + 4 > page_bytes.len() {
+                return Err(ParseError::InvalidCell);
+            }
+            let left_child = u32::from_be_bytes([
+                page_bytes[cell_offset],
+                page_bytes[cell_offset + 1],
+                page_bytes[cell_offset + 2],
+                page_bytes[cell_offset + 3],
+            ]);
+            self.collect_index_btree_pages(left_child, pages)?;
+        }
+        let right_child = header.right_child_ptr.ok_or(ParseError::InvalidPage)?;
+        self.collect_index_btree_pages(right_child, pages)
+    }
+
     fn collect_index_stream_items(
         &self,
         page_num: u32,

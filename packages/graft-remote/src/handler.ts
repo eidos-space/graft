@@ -3,6 +3,9 @@ import {
   MAX_LIST_LIMIT,
   MAX_METADATA_BYTES,
   MAX_UPLOAD_BUNDLE_OBJECTS,
+  MULTIPART_HEADER_OBJECT_BYTES,
+  MULTIPART_HEADER_PART_NUMBER,
+  MULTIPART_HEADER_UPLOAD_ID,
   PROTOCOL_HEADER,
   PROTOCOL_VERSION,
   RECEIVE_BUNDLE_HEADER_MANIFEST_BYTES,
@@ -48,18 +51,30 @@ const OPERATIONS = new Set<GraftRemoteOperation>([
   "upload-bundle",
   "receive-pack",
   "receive-bundle",
+  "multipart-start",
+  "multipart-part",
+  "multipart-complete",
+  "multipart-abort",
   "cas",
   "cad",
   "list",
 ]);
 const UPLOAD_BUNDLE_PREFETCH_OBJECTS = 8;
+const DEFAULT_MULTIPART_PART_BYTES = 16 * 1024 * 1024;
+const MAX_MULTIPART_PARTS = 10_000;
+
+interface NormalizedRemoteLimits {
+  maxRequestBytes?: number;
+  multipartPartBytes: number;
+}
 
 export function createGraftRemoteHandler<AdapterContext = undefined, Principal = undefined>(
   options: GraftRemoteOptions<AdapterContext, Principal>,
 ): GraftRemoteHandler<AdapterContext> {
+  const limits = normalizeRemoteLimits(options.limits);
   return async (request): Promise<Response> => {
     try {
-      return await handleRequest(request, options);
+      return await handleRequest(request, options, limits);
     } catch (error) {
       if (options.onError !== undefined) {
         try {
@@ -83,6 +98,7 @@ export function createGraftRemoteHandler<AdapterContext = undefined, Principal =
 async function handleRequest<AdapterContext, Principal>(
   input: GraftHandlerRequest<AdapterContext>,
   options: GraftRemoteOptions<AdapterContext, Principal>,
+  limits: NormalizedRemoteLimits,
 ): Promise<Response> {
   const principal = await options.authenticate?.(input);
   if (input.request.headers.get(PROTOCOL_HEADER) !== PROTOCOL_VERSION) {
@@ -132,11 +148,21 @@ async function handleRequest<AdapterContext, Principal>(
 
   if (operation === "descriptor") {
     rejectUnexpectedQuery(url);
+    const capabilities: string[] = [...GRAFT_REMOTE_CAPABILITIES];
+    if (backend.multipart !== undefined) capabilities.push("multipart-object");
     return jsonResponse({
       protocol: "graft-remote",
       version: 1,
       repository: repository.id,
-      capabilities: [...GRAFT_REMOTE_CAPABILITIES],
+      capabilities,
+      limits: {
+        ...(limits.maxRequestBytes === undefined
+          ? {}
+          : { max_request_bytes: limits.maxRequestBytes }),
+        ...(backend.multipart === undefined
+          ? {}
+          : { multipart_part_bytes: limits.multipartPartBytes }),
+      },
     });
   }
   if (operation === "list") {
@@ -145,6 +171,7 @@ async function handleRequest<AdapterContext, Principal>(
 
   rejectUnexpectedQuery(url);
   const path = objectPath!;
+  enforceRequestLimit(input.request.headers, limits.maxRequestBytes);
   switch (operation) {
     case "raw":
       return raw(input.request, backend, path);
@@ -156,6 +183,14 @@ async function handleRequest<AdapterContext, Principal>(
       return receivePack(input.request, backend, path);
     case "receive-bundle":
       return receiveBundle(input.request, backend, path);
+    case "multipart-start":
+      return startMultipartUpload(input.request, backend, path, limits.multipartPartBytes);
+    case "multipart-part":
+      return uploadMultipartPart(input.request, backend, path, limits.multipartPartBytes);
+    case "multipart-complete":
+      return completeMultipartUpload(input.request, backend, path);
+    case "multipart-abort":
+      return abortMultipartUpload(input.request, backend, path);
     case "cas":
       return compareAndSwap(input.request, backend, path);
     case "cad":
@@ -222,11 +257,108 @@ function validateMethodAndAction(
     case "receive-bundle":
       requireMethod(method, "POST");
       return "write";
+    case "multipart-start":
+    case "multipart-complete":
+      requireMethod(method, "POST");
+      return "write";
+    case "multipart-part":
+      requireMethod(method, "PUT");
+      return "write";
+    case "multipart-abort":
+      requireMethod(method, "DELETE");
+      return "write";
     case "cas":
     case "cad":
       requireMethod(method, "POST");
       return "write";
   }
+}
+
+async function startMultipartUpload(
+  request: Request,
+  backend: GraftRepositoryBackend,
+  path: string,
+  partBytes: number,
+): Promise<Response> {
+  requireImmutablePath(path);
+  const multipart = requireMultipartBackend(backend);
+  requireEmptyBody(request);
+  const totalBytes = parsePositiveIntegerHeader(request.headers, MULTIPART_HEADER_OBJECT_BYTES);
+  const parts = Math.ceil(totalBytes / partBytes);
+  if (parts > MAX_MULTIPART_PARTS) {
+    throw new GraftProtocolError(
+      413,
+      "multipart_object_too_large",
+      `Multipart object requires more than ${MAX_MULTIPART_PARTS} parts`,
+    );
+  }
+  const upload = await multipart.start(path, totalBytes, partBytes);
+  if (upload === null) {
+    throw new GraftProtocolError(412, "precondition_failed", "Object already exists");
+  }
+  validateMultipartUpload(upload, totalBytes, partBytes);
+  return jsonResponse({
+    upload_id: upload.uploadId,
+    total_bytes: upload.totalBytes,
+    part_bytes: upload.partBytes,
+    uploaded_parts: upload.uploadedParts.map((part) => ({
+      part_number: part.partNumber,
+      bytes: part.bytes,
+    })),
+  });
+}
+
+async function uploadMultipartPart(
+  request: Request,
+  backend: GraftRepositoryBackend,
+  path: string,
+  partBytes: number,
+): Promise<Response> {
+  requireImmutablePath(path);
+  const multipart = requireMultipartBackend(backend);
+  const uploadId = parseUploadId(request.headers);
+  const partNumber = parsePositiveIntegerHeader(request.headers, MULTIPART_HEADER_PART_NUMBER);
+  if (partNumber > MAX_MULTIPART_PARTS) {
+    throw new GraftProtocolError(400, "invalid_multipart_part", "Multipart part number is too large");
+  }
+  const contentLength = parseContentLengthHeader(request.headers);
+  if (contentLength < 1 || contentLength > partBytes) {
+    throw new GraftProtocolError(
+      400,
+      "invalid_multipart_part",
+      "Multipart part Content-Length is outside the advertised part size",
+    );
+  }
+  if (request.body === null) {
+    throw new GraftProtocolError(400, "invalid_multipart_part", "Multipart part body is missing");
+  }
+  await multipart.uploadPart(path, uploadId, partNumber, request.body, contentLength);
+  return emptyResponse();
+}
+
+async function completeMultipartUpload(
+  request: Request,
+  backend: GraftRepositoryBackend,
+  path: string,
+): Promise<Response> {
+  requireImmutablePath(path);
+  requireEmptyBody(request);
+  const created = await requireMultipartBackend(backend).complete(path, parseUploadId(request.headers));
+  if (!created) {
+    throw new GraftProtocolError(412, "precondition_failed", "Object already exists");
+  }
+  return emptyResponse();
+}
+
+async function abortMultipartUpload(
+  request: Request,
+  backend: GraftRepositoryBackend,
+  path: string,
+): Promise<Response> {
+  requireImmutablePath(path);
+  requireEmptyBody(request);
+  await requireMultipartBackend(backend).abort(path, parseUploadId(request.headers));
+  return emptyResponse();
 }
 
 async function raw(
@@ -917,6 +1049,159 @@ async function listObjects(backend: GraftRepositoryBackend, url: URL): Promise<R
     });
   }
   return jsonResponse({ paths: result.paths });
+}
+
+function normalizeRemoteLimits(
+  limits: GraftRemoteOptions<never, never>["limits"],
+): NormalizedRemoteLimits {
+  const maxRequestBytes = limits?.maxRequestBytes;
+  const multipartPartBytes = limits?.multipartPartBytes ?? DEFAULT_MULTIPART_PART_BYTES;
+  if (
+    maxRequestBytes !== undefined &&
+    (!Number.isSafeInteger(maxRequestBytes) || maxRequestBytes < 1)
+  ) {
+    throw new TypeError("maxRequestBytes must be a positive safe integer");
+  }
+  if (!Number.isSafeInteger(multipartPartBytes) || multipartPartBytes < 1) {
+    throw new TypeError("multipartPartBytes must be a positive safe integer");
+  }
+  if (maxRequestBytes !== undefined && multipartPartBytes > maxRequestBytes) {
+    throw new TypeError("multipartPartBytes cannot exceed maxRequestBytes");
+  }
+  return {
+    ...(maxRequestBytes === undefined ? {} : { maxRequestBytes }),
+    multipartPartBytes,
+  };
+}
+
+function enforceRequestLimit(headers: Headers, maxRequestBytes: number | undefined): void {
+  if (maxRequestBytes === undefined) return;
+  const value = headers.get("content-length");
+  if (value === null) return;
+  if (!/^(?:0|[1-9]\d*)$/.test(value) || !Number.isSafeInteger(Number(value))) {
+    throw new GraftProtocolError(
+      400,
+      "invalid_content_length",
+      "Content-Length must be a non-negative safe integer",
+    );
+  }
+  if (Number(value) > maxRequestBytes) {
+    throw new GraftProtocolError(
+      413,
+      "request_too_large",
+      "Request exceeds the remote service request limit",
+    );
+  }
+}
+
+function requireMultipartBackend(
+  backend: GraftRepositoryBackend,
+): NonNullable<GraftRepositoryBackend["multipart"]> {
+  if (backend.multipart === undefined) {
+    throw new GraftProtocolError(
+      404,
+      "operation_not_found",
+      "Multipart object upload is not supported",
+    );
+  }
+  return backend.multipart;
+}
+
+function requireImmutablePath(path: string): void {
+  if (!isImmutablePath(path)) {
+    throw new GraftProtocolError(
+      400,
+      "invalid_immutable_path",
+      "Multipart upload is only defined for immutable objects",
+    );
+  }
+}
+
+function requireEmptyBody(request: Request): void {
+  const value = request.headers.get("content-length");
+  if (value !== null && value !== "0") {
+    throw new GraftProtocolError(400, "unexpected_body", "Request body must be empty");
+  }
+}
+
+function parsePositiveIntegerHeader(headers: Headers, name: string): number {
+  const value = headers.get(name);
+  if (value === null || !/^[1-9]\d*$/.test(value)) {
+    throw new GraftProtocolError(400, "invalid_multipart_upload", `${name} must be positive`);
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) {
+    throw new GraftProtocolError(413, "multipart_object_too_large", `${name} is too large`);
+  }
+  return parsed;
+}
+
+function parseContentLengthHeader(headers: Headers): number {
+  const value = headers.get("content-length");
+  if (value === null || !/^(?:0|[1-9]\d*)$/.test(value)) {
+    throw new GraftProtocolError(
+      400,
+      "invalid_multipart_part",
+      "Multipart part requires Content-Length",
+    );
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) {
+    throw new GraftProtocolError(413, "multipart_part_too_large", "Multipart part is too large");
+  }
+  return parsed;
+}
+
+function parseUploadId(headers: Headers): string {
+  const value = headers.get(MULTIPART_HEADER_UPLOAD_ID);
+  if (
+    value === null ||
+    value.length < 1 ||
+    value.length > 1_024 ||
+    /[\u0000-\u001f\u007f]/.test(value)
+  ) {
+    throw new GraftProtocolError(
+      400,
+      "invalid_multipart_upload",
+      `${MULTIPART_HEADER_UPLOAD_ID} is invalid`,
+    );
+  }
+  return value;
+}
+
+function validateMultipartUpload(
+  upload: NonNullable<
+    Awaited<ReturnType<NonNullable<GraftRepositoryBackend["multipart"]>["start"]>>
+  >,
+  totalBytes: number,
+  partBytes: number,
+): void {
+  if (
+    upload.uploadId.length < 1 ||
+    upload.uploadId.length > 1_024 ||
+    /[\u0000-\u001f\u007f]/.test(upload.uploadId) ||
+    upload.totalBytes !== totalBytes ||
+    upload.partBytes !== partBytes
+  ) {
+    throw backendContractError("Multipart backend returned an invalid upload session");
+  }
+  const partCount = Math.ceil(totalBytes / partBytes);
+  let previous = 0;
+  for (const part of upload.uploadedParts) {
+    if (
+      !Number.isSafeInteger(part.partNumber) ||
+      part.partNumber <= previous ||
+      part.partNumber > partCount
+    ) {
+      throw backendContractError("Multipart backend returned invalid uploaded parts");
+    }
+    const expectedBytes =
+      part.partNumber === partCount ? totalBytes - partBytes * (partCount - 1) : partBytes;
+    if (part.bytes !== expectedBytes) {
+      throw backendContractError("Multipart backend returned an invalid uploaded part size");
+    }
+    previous = part.partNumber;
+  }
 }
 
 function objectHeaders(metadata: GraftObjectMetadata): Headers {

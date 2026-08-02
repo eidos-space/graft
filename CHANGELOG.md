@@ -1,5 +1,57 @@
 # Changelog
 
+## Graft SDK 0.3.5 — 2026-08-02
+
+### Added
+
+- Added checksummed, content-addressed SQLite page indexes and worktree probes for large database
+  files, with conservative fallback when fingerprints are racy or cache data is unavailable.
+- Added stable physical SQLite readers, prepared stage state, and snapshot hydration proofs that
+  stay outside the authoritative repository database write set.
+- Added reproducible ordinary-file, Git-like, synthetic SQLite, and real Eidos benchmark suites
+  with checked-in baseline/candidate raw results and a full performance report.
+
+### Changed
+
+- Checkpoint summaries now choose a changed-page-aware rowid algorithm or a bounded primary-key
+  algorithm based on SQLite table layout instead of applying one scan strategy to every table.
+- Staging retains the exact canonical SQLite snapshot and changed-table candidates for commit,
+  avoiding a second read of the live application database.
+- Status refresh preserves proven local classification across Remote projection changes and
+  refreshes ahead/behind metadata independently.
+- SQLite page indexes use the same content semantics as the Graft VFS across raw and online-backup
+  snapshots, ignoring only SQLite's volatile page-1 counters and invalidating older cache schemas.
+
+### Performance
+
+- On the checked 460,689,408-byte Eidos fixture, dirty status fell from 5.40 seconds to 19.7 ms,
+  selected metadata rows from 10.06 seconds to 1.69 ms, and a metadata-only checkpoint commit from
+  21.30 seconds to 1.69 ms; peak RSS fell from 3.88 GiB to 672.7 MiB.
+- A paired 5.6 MiB Git-like repository workload remained within benchmark noise for ordinary
+  stage, commit, row diff, checkout, and filesystem Remote push, with unchanged storage bytes.
+
+### Compatibility
+
+- SQLite files smaller than 16 MiB bypass the persistent page index because an authoritative scan
+  is cheaper at that scale. Derived caches are optional and may be deleted without affecting
+  repository correctness.
+- `stagePaths` remains API-compatible but still performs per-path core work; large explicit path
+  batches remain a documented performance limit.
+
+## Graft Remote 0.2.1 — 2026-08-02
+
+### Added
+
+- Added resumable multipart upload negotiation for large immutable Remote objects and Cloudflare
+  R2 multipart storage support.
+- Added retry-safe part upload, completion reconciliation, protocol tests, and fallback for Remotes
+  that do not advertise multipart capabilities.
+
+### Changed
+
+- Large segment publication can resume completed parts instead of restarting the entire object
+  after a timeout or interrupted request.
+
 ## Graft SDK 0.3.4 — 2026-08-01
 
 ### Added

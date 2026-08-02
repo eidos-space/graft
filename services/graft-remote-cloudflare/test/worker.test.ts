@@ -114,6 +114,54 @@ describe("graft remote protocol", () => {
     expect(head.headers.get("content-length")).toBe("6");
   });
 
+  it("resumes R2 multipart uploads without changing the immutable object path", async () => {
+    const totalBytes = 6 * 1024 * 1024;
+    const start = await remoteFetch("/multipart/repo/multipart-start/segments/large", {
+      method: "POST",
+      headers: {
+        "content-length": "0",
+        "x-graft-object-bytes": totalBytes.toString(),
+      },
+    });
+    expect(start.status).toBe(200);
+    const session = (await start.json()) as { upload_id: string };
+    const part = await remoteFetch("/multipart/repo/multipart-part/segments/large", {
+      method: "PUT",
+      headers: {
+        "content-length": totalBytes.toString(),
+        "x-graft-upload-id": session.upload_id,
+        "x-graft-part-number": "1",
+      },
+      body: new Uint8Array(totalBytes).fill(7),
+    });
+    expect(part.status).toBe(204);
+
+    const resumed = await remoteFetch("/multipart/repo/multipart-start/segments/large", {
+      method: "POST",
+      headers: {
+        "content-length": "0",
+        "x-graft-object-bytes": totalBytes.toString(),
+      },
+    });
+    expect(await resumed.json()).toMatchObject({
+      upload_id: session.upload_id,
+      uploaded_parts: [{ part_number: 1, bytes: totalBytes }],
+    });
+    const completed = await remoteFetch(
+      "/multipart/repo/multipart-complete/segments/large",
+      {
+        method: "POST",
+        headers: {
+          "content-length": "0",
+          "x-graft-upload-id": session.upload_id,
+        },
+      },
+    );
+    expect(completed.status).toBe(204);
+    const head = await remoteFetch("/multipart/repo/raw/segments/large", { method: "HEAD" });
+    expect(head.headers.get("content-length")).toBe(totalBytes.toString());
+  });
+
   it("streams an upload bundle across transactional storage and R2", async () => {
     await remoteFetch("/upload/repo/raw/refs/heads/main", {
       method: "PUT",

@@ -1,6 +1,6 @@
 {
   "name": "@eidos.space/graft",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "description": "Long-lived in-process Graft repository sessions for Node.js and Electron.",
   "license": "MIT OR Apache-2.0",
   "repository": {
@@ -39,6 +39,8 @@
     "test": "node --test test/*.test.js",
     "bench": "node benchmark/cli-vs-sdk.mjs",
     "bench:large": "node benchmark/large-repository.mjs",
+    "bench:matrix": "node benchmark/performance-matrix.mjs",
+    "bench:real-eidos": "node benchmark/real-eidos.mjs",
     "bench:sqlite-diff": "node benchmark/sqlite-diff.mjs",
     "bench:push": "node benchmark/push.mjs",
     "release:create-packages": "napi create-npm-dirs --npm-dir npm",

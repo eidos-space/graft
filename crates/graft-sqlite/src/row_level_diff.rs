@@ -778,7 +778,92 @@ pub fn bounded_row_level_diff_readers(
     to_lsn: LSN,
     mode: &BoundedRowDiffMode,
 ) -> Result<BoundedRowLevelDiff, graft::err::GraftErr> {
-    bounded_row_diff_from_readers(from_reader, to_reader, from_lsn, to_lsn, mode)
+    bounded_row_diff_from_readers(from_reader, to_reader, from_lsn, to_lsn, mode, None)
+}
+
+/// Computes a summary after a worktree page comparison has already narrowed the candidate tables.
+/// Schema changes are still included even when their table no longer owns a page in the worktree.
+pub fn bounded_row_level_diff_readers_for_summary_tables(
+    from_reader: &dyn VolumeRead,
+    to_reader: &dyn VolumeRead,
+    from_lsn: LSN,
+    to_lsn: LSN,
+    tables: &BTreeSet<String>,
+) -> Result<BoundedRowLevelDiff, graft::err::GraftErr> {
+    bounded_row_diff_from_readers(
+        from_reader,
+        to_reader,
+        from_lsn,
+        to_lsn,
+        &BoundedRowDiffMode::Summary,
+        Some(tables),
+    )
+}
+
+/// Uses the existing page-aware rowid diff when every candidate table has an ordinary rowid
+/// layout. For these tables it is faster to decode only rows on changed B-tree pages than to merge
+/// the complete rowid stream. `WITHOUT ROWID` and schema-changing tables return `None` so callers
+/// retain the bounded primary-key path that avoids materializing large Eidos tables.
+pub fn rowid_table_summaries_for_tables(
+    from_reader: &dyn VolumeRead,
+    to_reader: &dyn VolumeRead,
+    from_lsn: LSN,
+    to_lsn: LSN,
+    tables: &BTreeSet<String>,
+) -> Result<Option<Vec<BoundedTableSummary>>, graft::err::GraftErr> {
+    if sqlite_page_size(from_reader)? != PAGESIZE.as_u32()
+        || sqlite_page_size(to_reader)? != PAGESIZE.as_u32()
+    {
+        return Ok(None);
+    }
+    let from_scanner = TableScanner::new(from_reader).map_err(|error| {
+        graft::err::LogicalErr::Other(format!("Failed to parse source B-tree: {error:?}"))
+    })?;
+    let to_scanner = TableScanner::new(to_reader).map_err(|error| {
+        graft::err::LogicalErr::Other(format!("Failed to parse target B-tree: {error:?}"))
+    })?;
+    let from_master = from_scanner.read_master_table().map_err(|error| {
+        graft::err::LogicalErr::Other(format!("Failed to read source schema: {error:?}"))
+    })?;
+    let to_master = to_scanner.read_master_table().map_err(|error| {
+        graft::err::LogicalErr::Other(format!("Failed to read target schema: {error:?}"))
+    })?;
+    for table in tables {
+        let from_entry = from_master.iter().find(|entry| entry.name == *table);
+        let to_entry = to_master.iter().find(|entry| entry.name == *table);
+        let stable_rowid_layout = match (from_entry, to_entry) {
+            (Some(from), Some(to)) => {
+                !is_without_rowid_table(from) && !is_without_rowid_table(to) && from.sql == to.sql
+            }
+            _ => false,
+        };
+        if !stable_rowid_layout {
+            return Ok(None);
+        }
+    }
+
+    let mut summaries = Vec::new();
+    for table in tables {
+        let diff = row_level_diff_readers_for_table(
+            from_reader,
+            to_reader,
+            from_lsn,
+            to_lsn,
+            Some(table),
+        )?;
+        for changes in diff.table_changes {
+            let (inserts, deletes, updates) = count_changes(&changes.changes);
+            if inserts + deletes + updates > 0 {
+                summaries.push(BoundedTableSummary {
+                    table_name: changes.table_name,
+                    inserts,
+                    deletes,
+                    updates,
+                });
+            }
+        }
+    }
+    Ok(Some(summaries))
 }
 
 fn bounded_row_diff_from_readers(
@@ -787,6 +872,7 @@ fn bounded_row_diff_from_readers(
     from_lsn: LSN,
     to_lsn: LSN,
     mode: &BoundedRowDiffMode,
+    summary_tables: Option<&BTreeSet<String>>,
 ) -> Result<BoundedRowLevelDiff, graft::err::GraftErr> {
     let native_page_size = PAGESIZE.as_u32();
     let needs_materialized_schema = sqlite_page_size(from_reader)? != native_page_size
@@ -831,6 +917,12 @@ fn bounded_row_diff_from_readers(
     for entry in from_master.iter().chain(&to_master) {
         if is_diffable_table(entry, &ignored_tables)
             && requested_table.is_none_or(|table| entry.name == table)
+            && summary_tables.is_none_or(|tables| {
+                tables.contains(&entry.name)
+                    || schema_changes
+                        .iter()
+                        .any(|change| change.name == entry.name)
+            })
         {
             table_names.insert(entry.name.clone());
         }
@@ -863,7 +955,7 @@ fn bounded_row_diff_from_readers(
             || to_entry.is_some_and(is_without_rowid_table);
         let direct_primary_key = !needs_materialized_schema
             && without_rowid
-            && compatible_without_rowid_layout(from_entry, to_entry).is_some();
+            && compatible_without_rowid_layouts(from_entry, to_entry).is_some();
         let needs_sqlite_rows = needs_materialized_schema || (without_rowid && !direct_primary_key);
         let page = if needs_sqlite_rows {
             used_materialized_compat = true;
@@ -1118,20 +1210,28 @@ impl WithoutRowidLayout {
         })
     }
 
-    fn decode(&self, physical: Record) -> Result<(RowIdentity, Record), graft::err::GraftErr> {
-        if physical.values.len() != self.physical_to_declared.len() {
+    fn decode(
+        &self,
+        physical: Record,
+        output_columns: &[String],
+    ) -> Result<(RowIdentity, Record), graft::err::GraftErr> {
+        // SQLite does not rewrite existing records after `ALTER TABLE ADD COLUMN`, so records in
+        // the newer B-tree may legitimately omit trailing nullable columns from the newer schema.
+        if physical.values.len() > self.physical_to_declared.len() {
             return Err(graft::err::LogicalErr::Other(format!(
-                "WITHOUT ROWID record contains {} values, expected {}",
+                "WITHOUT ROWID record contains {} values, expected at most {}",
                 physical.values.len(),
                 self.physical_to_declared.len()
             ))
             .into());
         }
         let mut values = vec![Value::Null; self.columns.len()];
-        for (physical_index, declared_index) in
-            self.physical_to_declared.iter().copied().enumerate()
+        for (physical_value, declared_index) in physical
+            .values
+            .into_iter()
+            .zip(self.physical_to_declared.iter().copied())
         {
-            values[declared_index] = physical.values[physical_index].clone();
+            values[declared_index] = physical_value;
         }
         let key = self
             .primary_key_columns
@@ -1148,8 +1248,28 @@ impl WithoutRowidLayout {
                 }
             })
             .collect();
-        Ok((RowIdentity::PrimaryKey(key), Record { values }))
+        let output_values = output_columns
+            .iter()
+            .map(|column| {
+                self.columns
+                    .iter()
+                    .position(|candidate| candidate == column)
+                    .map_or(Value::Null, |index| values[index].clone())
+            })
+            .collect();
+        Ok((
+            RowIdentity::PrimaryKey(key),
+            Record { values: output_values },
+        ))
     }
+}
+
+#[derive(Debug, Clone)]
+struct WithoutRowidPairLayout {
+    from: Option<WithoutRowidLayout>,
+    to: Option<WithoutRowidLayout>,
+    output_columns: Vec<String>,
+    primary_key_columns: Vec<String>,
 }
 
 fn supports_direct_primary_key_order(entry: &MasterEntry, primary_key_columns: &[String]) -> bool {
@@ -1194,10 +1314,10 @@ fn ordering_fragment_is_supported(fragment: &str) -> bool {
     })
 }
 
-fn compatible_without_rowid_layout(
+fn compatible_without_rowid_layouts(
     from_entry: Option<&MasterEntry>,
     to_entry: Option<&MasterEntry>,
-) -> Option<WithoutRowidLayout> {
+) -> Option<WithoutRowidPairLayout> {
     let from = match from_entry {
         Some(entry) => Some(WithoutRowidLayout::from_entry(entry)?),
         None => None,
@@ -1206,17 +1326,60 @@ fn compatible_without_rowid_layout(
         Some(entry) => Some(WithoutRowidLayout::from_entry(entry)?),
         None => None,
     };
-    match (from, to) {
-        (Some(from), Some(to))
-            if from.columns == to.columns
-                && from.primary_key_columns == to.primary_key_columns
-                && from.physical_to_declared == to.physical_to_declared =>
-        {
-            Some(to)
-        }
-        (Some(layout), None) | (None, Some(layout)) => Some(layout),
-        _ => None,
+    let primary_key_columns = to
+        .as_ref()
+        .or(from.as_ref())
+        .map(|layout| layout.primary_key_columns.clone())?;
+    if from.as_ref().zip(to.as_ref()).is_some_and(|(from, to)| {
+        from.primary_key_columns != to.primary_key_columns
+            || !supports_nullable_appended_transition(from_entry, to_entry, from, to)
+    }) {
+        return None;
     }
+    let output_columns = to
+        .as_ref()
+        .or(from.as_ref())
+        .map(|layout| layout.columns.clone())?;
+    Some(WithoutRowidPairLayout {
+        from,
+        to,
+        output_columns,
+        primary_key_columns,
+    })
+}
+
+fn supports_nullable_appended_transition(
+    from_entry: Option<&MasterEntry>,
+    to_entry: Option<&MasterEntry>,
+    from: &WithoutRowidLayout,
+    to: &WithoutRowidLayout,
+) -> bool {
+    if from.columns == to.columns {
+        return true;
+    }
+    let (shorter, longer, longer_entry) = if from.columns.len() < to.columns.len() {
+        (from, to, to_entry)
+    } else {
+        (to, from, from_entry)
+    };
+    if !longer.columns.starts_with(&shorter.columns) {
+        return false;
+    }
+    let Some(longer_entry) = longer_entry else {
+        return false;
+    };
+    let definitions = parse_create_table_column_definitions(&longer_entry.sql);
+    longer.columns[shorter.columns.len()..]
+        .iter()
+        .all(|column| {
+            definitions
+                .iter()
+                .find(|definition| definition.name == *column)
+                .is_some_and(|definition| {
+                    let sql = definition.sql.to_ascii_uppercase();
+                    !sql.contains("NOT NULL") && !sql.contains("DEFAULT")
+                })
+        })
 }
 
 fn bounded_without_rowid_table(
@@ -1226,7 +1389,7 @@ fn bounded_without_rowid_table(
     to_entry: Option<&MasterEntry>,
     mode: &BoundedRowDiffMode,
 ) -> Result<BoundedTablePage, graft::err::GraftErr> {
-    let layout = compatible_without_rowid_layout(from_entry, to_entry).ok_or_else(|| {
+    let layouts = compatible_without_rowid_layouts(from_entry, to_entry).ok_or_else(|| {
         graft::err::LogicalErr::Other("unsupported WITHOUT ROWID primary-key layout".into())
     })?;
     let from_count = from_entry
@@ -1247,17 +1410,32 @@ fn bounded_without_rowid_table(
             ))
         })?
         .unwrap_or(0);
-    if matches!(mode, BoundedRowDiffMode::Summary) && (from_count == 0 || to_count == 0) {
+    if matches!(mode, BoundedRowDiffMode::Summary)
+        && (from_entry.is_none() || to_entry.is_none() || from_count == 0 || to_count == 0)
+    {
         return Ok(BoundedTablePage {
             inserts: to_count,
             deletes: from_count,
             updates: 0,
             rows_scanned: 0,
-            primary_key_columns: layout.primary_key_columns,
+            primary_key_columns: layouts.primary_key_columns,
             changes: Vec::new(),
             has_more: false,
             next_offset: None,
         });
+    }
+    if from_count > 0
+        && to_count > 0
+        && let (Some(from_entry), Some(to_entry)) = (from_entry, to_entry)
+    {
+        return bounded_without_rowid_changed_pages(
+            from_reader,
+            to_reader,
+            from_entry,
+            to_entry,
+            &layouts,
+            mode,
+        );
     }
     let mut from_stream = from_entry
         .map(|entry| TableScanner::new(from_reader)?.into_index_row_stream(entry.root_page))
@@ -1275,14 +1453,19 @@ fn bounded_without_rowid_table(
                 "Failed to stream target WITHOUT ROWID rows: {error}"
             ))
         })?;
-    let mut from_row = next_bounded_primary_key_row(&mut from_stream, &layout)?;
-    let mut to_row = next_bounded_primary_key_row(&mut to_stream, &layout)?;
+    let mut from_row = next_bounded_primary_key_row(
+        &mut from_stream,
+        layouts.from.as_ref(),
+        &layouts.output_columns,
+    )?;
+    let mut to_row =
+        next_bounded_primary_key_row(&mut to_stream, layouts.to.as_ref(), &layouts.output_columns)?;
     let mut page = BoundedTablePage {
         inserts: 0,
         deletes: 0,
         updates: 0,
         rows_scanned: 0,
-        primary_key_columns: layout.primary_key_columns.clone(),
+        primary_key_columns: layouts.primary_key_columns.clone(),
         changes: Vec::new(),
         has_more: false,
         next_offset: None,
@@ -1301,8 +1484,16 @@ fn bounded_without_rowid_table(
                 if from_identity == to_identity =>
             {
                 page.rows_scanned = page.rows_scanned.saturating_add(2);
-                from_row = next_bounded_primary_key_row(&mut from_stream, &layout)?;
-                to_row = next_bounded_primary_key_row(&mut to_stream, &layout)?;
+                from_row = next_bounded_primary_key_row(
+                    &mut from_stream,
+                    layouts.from.as_ref(),
+                    &layouts.output_columns,
+                )?;
+                to_row = next_bounded_primary_key_row(
+                    &mut to_stream,
+                    layouts.to.as_ref(),
+                    &layouts.output_columns,
+                )?;
                 (old_row != new_row).then(|| match from_identity {
                     RowIdentity::PrimaryKey(key) => {
                         RowChange::PrimaryKeyUpdate { key, old_row, new_row }
@@ -1316,7 +1507,11 @@ fn bounded_without_rowid_table(
                 if from_identity < to_identity =>
             {
                 page.rows_scanned = page.rows_scanned.saturating_add(1);
-                from_row = next_bounded_primary_key_row(&mut from_stream, &layout)?;
+                from_row = next_bounded_primary_key_row(
+                    &mut from_stream,
+                    layouts.from.as_ref(),
+                    &layouts.output_columns,
+                )?;
                 to_row = Some((to_identity, new_row));
                 match from_identity {
                     RowIdentity::PrimaryKey(key) => {
@@ -1330,7 +1525,11 @@ fn bounded_without_rowid_table(
             (Some((from_identity, old_row)), Some((to_identity, new_row))) => {
                 page.rows_scanned = page.rows_scanned.saturating_add(1);
                 from_row = Some((from_identity, old_row));
-                to_row = next_bounded_primary_key_row(&mut to_stream, &layout)?;
+                to_row = next_bounded_primary_key_row(
+                    &mut to_stream,
+                    layouts.to.as_ref(),
+                    &layouts.output_columns,
+                )?;
                 match to_identity {
                     RowIdentity::PrimaryKey(key) => {
                         Some(RowChange::PrimaryKeyInsert { key, row: new_row })
@@ -1342,7 +1541,11 @@ fn bounded_without_rowid_table(
             }
             (Some((identity, row)), None) => {
                 page.rows_scanned = page.rows_scanned.saturating_add(1);
-                from_row = next_bounded_primary_key_row(&mut from_stream, &layout)?;
+                from_row = next_bounded_primary_key_row(
+                    &mut from_stream,
+                    layouts.from.as_ref(),
+                    &layouts.output_columns,
+                )?;
                 match identity {
                     RowIdentity::PrimaryKey(key) => Some(RowChange::PrimaryKeyDelete { key, row }),
                     RowIdentity::Rowid(_) => {
@@ -1352,7 +1555,11 @@ fn bounded_without_rowid_table(
             }
             (None, Some((identity, row))) => {
                 page.rows_scanned = page.rows_scanned.saturating_add(1);
-                to_row = next_bounded_primary_key_row(&mut to_stream, &layout)?;
+                to_row = next_bounded_primary_key_row(
+                    &mut to_stream,
+                    layouts.to.as_ref(),
+                    &layouts.output_columns,
+                )?;
                 match identity {
                     RowIdentity::PrimaryKey(key) => Some(RowChange::PrimaryKeyInsert { key, row }),
                     RowIdentity::Rowid(_) => {
@@ -1382,9 +1589,170 @@ fn bounded_without_rowid_table(
     Ok(page)
 }
 
+fn bounded_without_rowid_changed_pages(
+    from_reader: &dyn VolumeRead,
+    to_reader: &dyn VolumeRead,
+    from_entry: &MasterEntry,
+    to_entry: &MasterEntry,
+    layouts: &WithoutRowidPairLayout,
+    mode: &BoundedRowDiffMode,
+) -> Result<BoundedTablePage, graft::err::GraftErr> {
+    let from_scanner = TableScanner::new(from_reader).map_err(|error| {
+        graft::err::LogicalErr::Other(format!(
+            "Failed to inspect source WITHOUT ROWID pages: {error}"
+        ))
+    })?;
+    let to_scanner = TableScanner::new(to_reader).map_err(|error| {
+        graft::err::LogicalErr::Other(format!(
+            "Failed to inspect target WITHOUT ROWID pages: {error}"
+        ))
+    })?;
+    let from_pages = from_scanner
+        .index_btree_pages(from_entry.root_page)
+        .map_err(|error| {
+            graft::err::LogicalErr::Other(format!(
+                "Failed to enumerate source WITHOUT ROWID pages: {error}"
+            ))
+        })?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let to_pages = to_scanner
+        .index_btree_pages(to_entry.root_page)
+        .map_err(|error| {
+            graft::err::LogicalErr::Other(format!(
+                "Failed to enumerate target WITHOUT ROWID pages: {error}"
+            ))
+        })?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let all_pages = from_pages.union(&to_pages).copied().collect::<Vec<_>>();
+    let mut changed_pages = Vec::new();
+    for (index, page_number) in all_pages.into_iter().enumerate() {
+        if index.is_multiple_of(1_024) {
+            bounded_cancellation_checkpoint()?;
+        }
+        if !from_pages.contains(&page_number) || !to_pages.contains(&page_number) {
+            changed_pages.push(page_number);
+            continue;
+        }
+        let page_idx = PageIdx::try_new(page_number).ok_or_else(|| {
+            graft::err::LogicalErr::Other(format!("Invalid WITHOUT ROWID page index {page_number}"))
+        })?;
+        let from_page = from_reader.read_page(page_idx)?;
+        let to_page = to_reader.read_page(page_idx)?;
+        if from_page != to_page
+            || from_scanner
+                .index_page_has_overflow(page_number)
+                .map_err(|error| {
+                    graft::err::LogicalErr::Other(format!(
+                        "Failed to inspect source WITHOUT ROWID overflow pages: {error}"
+                    ))
+                })?
+            || to_scanner
+                .index_page_has_overflow(page_number)
+                .map_err(|error| {
+                    graft::err::LogicalErr::Other(format!(
+                        "Failed to inspect target WITHOUT ROWID overflow pages: {error}"
+                    ))
+                })?
+        {
+            changed_pages.push(page_number);
+        }
+    }
+
+    let from_rows = changed_without_rowid_records(
+        &from_scanner,
+        &from_pages,
+        &changed_pages,
+        layouts
+            .from
+            .as_ref()
+            .expect("source WITHOUT ROWID layout exists"),
+        &layouts.output_columns,
+        "source",
+    )?;
+    let to_rows = changed_without_rowid_records(
+        &to_scanner,
+        &to_pages,
+        &changed_pages,
+        layouts
+            .to
+            .as_ref()
+            .expect("target WITHOUT ROWID layout exists"),
+        &layouts.output_columns,
+        "target",
+    )?;
+    let rows_scanned = from_rows.len().saturating_add(to_rows.len());
+    let all_changes = diff_sqlite_rows(from_rows, to_rows);
+    let inserts = all_changes
+        .iter()
+        .filter(|change| matches!(change, RowChange::PrimaryKeyInsert { .. }))
+        .count();
+    let deletes = all_changes
+        .iter()
+        .filter(|change| matches!(change, RowChange::PrimaryKeyDelete { .. }))
+        .count();
+    let updates = all_changes
+        .iter()
+        .filter(|change| matches!(change, RowChange::PrimaryKeyUpdate { .. }))
+        .count();
+    let (changes, has_more, next_offset) = match mode {
+        BoundedRowDiffMode::Summary => (Vec::new(), false, None),
+        BoundedRowDiffMode::Rows { offset, limit, .. } => {
+            let has_more = all_changes.len() > offset.saturating_add(*limit);
+            let changes = all_changes.into_iter().skip(*offset).take(*limit).collect();
+            (
+                changes,
+                has_more,
+                has_more.then_some(offset.saturating_add(*limit)),
+            )
+        }
+    };
+    Ok(BoundedTablePage {
+        inserts,
+        deletes,
+        updates,
+        rows_scanned,
+        primary_key_columns: layouts.primary_key_columns.clone(),
+        changes,
+        has_more,
+        next_offset,
+    })
+}
+
+fn changed_without_rowid_records(
+    scanner: &TableScanner<'_>,
+    owned_pages: &BTreeSet<u32>,
+    changed_pages: &[u32],
+    layout: &WithoutRowidLayout,
+    output_columns: &[String],
+    side: &str,
+) -> Result<BTreeMap<RowIdentity, Record>, graft::err::GraftErr> {
+    let mut rows = BTreeMap::new();
+    for page_number in changed_pages
+        .iter()
+        .copied()
+        .filter(|page_number| owned_pages.contains(page_number))
+    {
+        let records = scanner
+            .read_index_records_from_page(page_number)
+            .map_err(|error| {
+                graft::err::LogicalErr::Other(format!(
+                    "Failed to decode {side} WITHOUT ROWID page {page_number}: {error}"
+                ))
+            })?;
+        for record in records {
+            let (identity, record) = layout.decode(record, output_columns)?;
+            rows.insert(identity, record);
+        }
+    }
+    Ok(rows)
+}
+
 fn next_bounded_primary_key_row(
     stream: &mut Option<IndexRowStream<'_>>,
-    layout: &WithoutRowidLayout,
+    layout: Option<&WithoutRowidLayout>,
+    output_columns: &[String],
 ) -> Result<Option<(RowIdentity, Record)>, graft::err::GraftErr> {
     stream
         .as_mut()
@@ -1396,7 +1764,15 @@ fn next_bounded_primary_key_row(
             ))
         })?
         .flatten()
-        .map(|record| layout.decode(record))
+        .map(|record| {
+            layout
+                .ok_or_else(|| {
+                    graft::err::LogicalErr::Other(
+                        "WITHOUT ROWID stream is missing its schema layout".into(),
+                    )
+                })?
+                .decode(record, output_columns)
+        })
         .transpose()
 }
 
@@ -1407,31 +1783,33 @@ fn bounded_rowid_table(
     to_entry: Option<&MasterEntry>,
     mode: &BoundedRowDiffMode,
 ) -> Result<BoundedTablePage, graft::err::GraftErr> {
-    let from_count = from_entry
-        .map(|entry| TableScanner::new(from_reader)?.count_table_rows(entry.root_page))
-        .transpose()
-        .map_err(|error| {
-            graft::err::LogicalErr::Other(format!("Failed to count source rows: {error}"))
-        })?
-        .unwrap_or(0);
-    let to_count = to_entry
-        .map(|entry| TableScanner::new(to_reader)?.count_table_rows(entry.root_page))
-        .transpose()
-        .map_err(|error| {
-            graft::err::LogicalErr::Other(format!("Failed to count target rows: {error}"))
-        })?
-        .unwrap_or(0);
-    if matches!(mode, BoundedRowDiffMode::Summary) && (from_count == 0 || to_count == 0) {
-        return Ok(BoundedTablePage {
-            inserts: to_count,
-            deletes: from_count,
-            updates: 0,
-            rows_scanned: 0,
-            primary_key_columns: Vec::new(),
-            changes: Vec::new(),
-            has_more: false,
-            next_offset: None,
-        });
+    if matches!(mode, BoundedRowDiffMode::Summary) {
+        let from_count = from_entry
+            .map(|entry| TableScanner::new(from_reader)?.count_table_rows(entry.root_page))
+            .transpose()
+            .map_err(|error| {
+                graft::err::LogicalErr::Other(format!("Failed to count source rows: {error}"))
+            })?
+            .unwrap_or(0);
+        let to_count = to_entry
+            .map(|entry| TableScanner::new(to_reader)?.count_table_rows(entry.root_page))
+            .transpose()
+            .map_err(|error| {
+                graft::err::LogicalErr::Other(format!("Failed to count target rows: {error}"))
+            })?
+            .unwrap_or(0);
+        if from_count == 0 || to_count == 0 {
+            return Ok(BoundedTablePage {
+                inserts: to_count,
+                deletes: from_count,
+                updates: 0,
+                rows_scanned: 0,
+                primary_key_columns: Vec::new(),
+                changes: Vec::new(),
+                has_more: false,
+                next_offset: None,
+            });
+        }
     }
     let mut from_stream = from_entry
         .map(|entry| TableScanner::new(from_reader)?.into_row_stream(entry.root_page))
@@ -1692,7 +2070,7 @@ impl MaterializedSnapshot {
     pub(crate) fn from_reader(
         reader: &dyn VolumeRead,
         label: &str,
-    ) -> Result<Self, graft::err::LogicalErr> {
+    ) -> Result<Self, graft::err::GraftErr> {
         let directory = tempfile::tempdir().map_err(|error| {
             graft::err::LogicalErr::Other(format!(
                 "Failed to create temporary {label} SQLite snapshot: {error}"
@@ -1705,6 +2083,9 @@ impl MaterializedSnapshot {
             ))
         })?;
         for page_number in 1..=reader.page_count().to_u32() {
+            if page_number.is_multiple_of(1_024) {
+                bounded_cancellation_checkpoint()?;
+            }
             let page_idx = PageIdx::try_new(page_number).ok_or_else(|| {
                 graft::err::LogicalErr::Other(format!(
                     "Invalid page {page_number} while materializing {label} SQLite snapshot"
@@ -1753,7 +2134,7 @@ impl MaterializedPair {
     fn new(
         from_reader: &dyn VolumeRead,
         to_reader: &dyn VolumeRead,
-    ) -> Result<Self, graft::err::LogicalErr> {
+    ) -> Result<Self, graft::err::GraftErr> {
         Ok(Self {
             from: MaterializedSnapshot::from_reader(from_reader, "source")?,
             to: MaterializedSnapshot::from_reader(to_reader, "target")?,

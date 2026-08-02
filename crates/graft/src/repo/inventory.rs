@@ -1,6 +1,35 @@
 use super::*;
 
 impl Repository {
+    /// Refreshes repository/ref metadata on an existing status without reclassifying the
+    /// worktree. Embedders can reuse an already-proven local worktree status while still
+    /// observing fetch/push updates to remote-tracking refs.
+    pub fn refresh_status_repository_projection(&self, status: &mut RepoStatus) -> Result<()> {
+        let config = self.config()?;
+        let head = self.head()?;
+        let upstream = head
+            .branch_name()
+            .map(|branch| self.branch_upstream(branch))
+            .transpose()?
+            .flatten();
+        let head_target = self.head_target()?;
+        let upstream_status = self.upstream_status(head_target.as_deref(), upstream.as_ref())?;
+
+        status.repository_format_version = config.core.repository_format_version;
+        status.head = head;
+        status.head_target = head_target;
+        status.merge_head = self.merge_head()?;
+        status.orig_head = self.orig_head()?;
+        status.branches = self.branches()?;
+        status.remotes = self.remotes()?;
+        status.upstream = upstream;
+        status.ahead = upstream_status.as_ref().map_or(0, |value| value.ahead);
+        status.behind = upstream_status.as_ref().map_or(0, |value| value.behind);
+        status.upstream_status = upstream_status;
+        status.refresh_summary_flags();
+        Ok(())
+    }
+
     pub fn status(&self) -> Result<RepoStatus> {
         let config = self.config()?;
         let head = self.head()?;

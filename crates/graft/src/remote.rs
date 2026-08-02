@@ -42,10 +42,16 @@ const RECEIVE_PACK_HEADER_PACK_BYTES: &str = "x-graft-pack-bytes";
 const RECEIVE_PACK_HEADER_INDEX_BYTES: &str = "x-graft-index-bytes";
 const RECEIVE_PACK_HEADER_REPLACEMENT_HEX: &str = "x-graft-ref-replacement-hex";
 const RECEIVE_BUNDLE_HEADER_MANIFEST_BYTES: &str = "x-graft-bundle-manifest-bytes";
+const MULTIPART_HEADER_OBJECT_BYTES: &str = "x-graft-object-bytes";
+const MULTIPART_HEADER_UPLOAD_ID: &str = "x-graft-upload-id";
+const MULTIPART_HEADER_PART_NUMBER: &str = "x-graft-part-number";
 const MAX_UPLOAD_BUNDLE_MANIFEST_BYTES: usize = 64 * 1024;
 const MAX_UPLOAD_BUNDLE_OBJECTS: usize = 65_536;
 const MAX_UPLOAD_BUNDLE_PATH_BYTES: usize = 768;
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const MULTIPART_DISCOVERY_THRESHOLD_BYTES: usize = 64 * 1024 * 1024;
+const MAX_MULTIPART_PARTS: usize = 10_000;
+const MULTIPART_PART_ATTEMPTS: usize = 3;
 static HTTP_REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 enum RemotePath<'a> {
@@ -513,9 +519,43 @@ struct HttpRemote {
     client: reqwest::Client,
     probe_client: reqwest::Client,
     upload_client: reqwest::Client,
+    descriptor: Arc<tokio::sync::OnceCell<HttpRemoteDescriptor>>,
     request_timeout: Duration,
     url: String,
     token: Option<BearerToken>,
+    #[cfg(test)]
+    multipart_discovery_threshold: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct HttpRemoteDescriptor {
+    protocol: String,
+    version: u8,
+    #[serde(default)]
+    capabilities: HashSet<String>,
+    #[serde(default)]
+    limits: HttpRemoteLimits,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct HttpRemoteLimits {
+    max_request_bytes: Option<usize>,
+    multipart_part_bytes: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HttpMultipartStartResponse {
+    upload_id: String,
+    total_bytes: usize,
+    part_bytes: usize,
+    #[serde(default)]
+    uploaded_parts: Vec<HttpMultipartPart>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HttpMultipartPart {
+    part_number: usize,
+    bytes: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1100,14 +1140,22 @@ impl Remote {
 
     async fn put_bundle_objects(&self, objects: &[RemoteBundleObject]) -> Result<()> {
         for object in objects {
-            let bytes = object.bytes();
-            match self
-                .put_raw_if_not_exists(&object.path, bytes.clone())
-                .await
-            {
+            let upload = match &self.backend {
+                RemoteBackend::Http(remote) => {
+                    remote
+                        .put_raw_if_not_exists_stream(&object.path, object.chunks.clone())
+                        .await
+                }
+                RemoteBackend::ObjectStore(_) => {
+                    self.put_raw_if_not_exists(&object.path, object.bytes())
+                        .await
+                }
+            };
+            match upload {
                 Ok(()) => {}
                 Err(err) if err.precondition_failed() && object.allow_existing => {}
                 Err(err) if err.precondition_failed() => {
+                    let bytes = object.bytes();
                     let existing = self.get_raw(&object.path).await?;
                     if existing.as_ref() != Some(&bytes) {
                         return Err(RemoteErr::HttpStatus {
@@ -1287,9 +1335,12 @@ impl HttpRemote {
             client,
             probe_client,
             upload_client,
+            descriptor: Arc::new(tokio::sync::OnceCell::new()),
             request_timeout,
             url: url.trim_end_matches('/').to_string(),
             token,
+            #[cfg(test)]
+            multipart_discovery_threshold: MULTIPART_DISCOVERY_THRESHOLD_BYTES,
         }
     }
 
@@ -1308,6 +1359,115 @@ impl HttpRemote {
             url.push_str(&percent_encode_component(cursor));
         }
         url
+    }
+
+    async fn descriptor(&self) -> Result<&HttpRemoteDescriptor> {
+        self.descriptor
+            .get_or_try_init(|| async {
+                let response = self
+                    .send(
+                        self.probe_request(reqwest::Method::GET, self.url.clone()),
+                        "descriptor",
+                        Some(0),
+                    )
+                    .await?;
+                let response = Self::check_response(response, &self.url).await?;
+                let bytes = response
+                    .bytes()
+                    .await
+                    .map_err(|err| RemoteErr::http_transport("descriptor_body", err))?;
+                let descriptor: HttpRemoteDescriptor =
+                    serde_json::from_slice(&bytes).map_err(|err| RemoteErr::HttpStatus {
+                        status: 502,
+                        path: self.url.clone(),
+                        message: format!("invalid remote descriptor JSON: {err}"),
+                    })?;
+                if descriptor.protocol != "graft-remote" || descriptor.version != 1 {
+                    return Err(RemoteErr::HttpStatus {
+                        status: 502,
+                        path: self.url.clone(),
+                        message: "remote descriptor identifies an unsupported protocol".to_string(),
+                    });
+                }
+                if descriptor
+                    .limits
+                    .max_request_bytes
+                    .is_some_and(|bytes| bytes == 0)
+                    || descriptor
+                        .limits
+                        .multipart_part_bytes
+                        .is_some_and(|bytes| bytes == 0)
+                {
+                    return Err(RemoteErr::HttpStatus {
+                        status: 502,
+                        path: self.url.clone(),
+                        message: "remote descriptor contains invalid request limits".to_string(),
+                    });
+                }
+                if descriptor.capabilities.contains("multipart-object")
+                    && descriptor.limits.multipart_part_bytes.is_none()
+                {
+                    return Err(RemoteErr::HttpStatus {
+                        status: 502,
+                        path: self.url.clone(),
+                        message: "multipart remote does not advertise a part size".to_string(),
+                    });
+                }
+                Ok(descriptor)
+            })
+            .await
+    }
+
+    async fn multipart_part_bytes(&self, content_length: usize) -> Result<Option<usize>> {
+        let descriptor = match self.descriptor.get() {
+            Some(descriptor) => descriptor,
+            None if content_length <= self.multipart_discovery_threshold() => return Ok(None),
+            None => self.descriptor().await?,
+        };
+        if !descriptor.capabilities.contains("multipart-object") {
+            return Ok(None);
+        }
+        let direct_limit = descriptor
+            .limits
+            .max_request_bytes
+            .unwrap_or_else(|| self.multipart_discovery_threshold());
+        if content_length <= direct_limit {
+            return Ok(None);
+        }
+        let part_bytes = descriptor.limits.multipart_part_bytes.unwrap();
+        if content_length.div_ceil(part_bytes) > MAX_MULTIPART_PARTS {
+            return Err(RemoteErr::HttpStatus {
+                status: 413,
+                path: self.url.clone(),
+                message: "immutable object exceeds the advertised multipart limit".to_string(),
+            });
+        }
+        Ok(Some(part_bytes))
+    }
+
+    async fn aggregate_request_requires_multipart(&self, content_length: usize) -> Result<bool> {
+        if content_length <= self.multipart_discovery_threshold() {
+            return Ok(false);
+        }
+        let descriptor = self.descriptor().await?;
+        if !descriptor.capabilities.contains("multipart-object") {
+            return Ok(false);
+        }
+        Ok(descriptor
+            .limits
+            .max_request_bytes
+            .is_some_and(|limit| content_length > limit))
+    }
+
+    fn multipart_discovery_threshold(&self) -> usize {
+        #[cfg(test)]
+        {
+            self.multipart_discovery_threshold
+        }
+        #[cfg(not(test))]
+        {
+            MULTIPART_DISCOVERY_THRESHOLD_BYTES
+        }
     }
 
     fn request(&self, method: reqwest::Method, url: String) -> reqwest::RequestBuilder {
@@ -1692,20 +1852,7 @@ impl HttpRemote {
     }
 
     async fn put_raw_if_not_exists(&self, path: &str, bytes: Bytes) -> Result<()> {
-        let request_bytes = bytes.len() as u64;
-        let response = self
-            .send(
-                self.upload_request(
-                    reqwest::Method::PUT,
-                    self.raw_url("raw-if-not-exists", path),
-                )
-                .body(bytes),
-                "immutable_put",
-                Some(request_bytes),
-            )
-            .await?;
-        Self::check_response(response, path).await?;
-        Ok(())
+        self.put_raw_if_not_exists_chunks(path, vec![bytes]).await
     }
 
     async fn put_raw_if_not_exists_stream<I: IntoIterator<Item = Bytes>>(
@@ -1713,7 +1860,11 @@ impl HttpRemote {
         path: &str,
         chunks: I,
     ) -> Result<()> {
-        let chunks = chunks.into_iter().collect::<Vec<_>>();
+        self.put_raw_if_not_exists_chunks(path, chunks.into_iter().collect())
+            .await
+    }
+
+    async fn put_raw_if_not_exists_chunks(&self, path: &str, chunks: Vec<Bytes>) -> Result<()> {
         let content_length = chunks.iter().try_fold(0_usize, |total, chunk| {
             total
                 .checked_add(chunk.len())
@@ -1723,6 +1874,12 @@ impl HttpRemote {
                     message: "streamed upload length exceeds usize".to_string(),
                 })
         })?;
+        if let Some(part_bytes) = self.multipart_part_bytes(content_length).await? {
+            return self
+                .put_raw_if_not_exists_multipart(path, &chunks, content_length, part_bytes)
+                .await;
+        }
+
         let body = reqwest::Body::wrap_stream(stream::iter(
             chunks.into_iter().map(Ok::<Bytes, std::io::Error>),
         ));
@@ -1742,6 +1899,133 @@ impl HttpRemote {
         Ok(())
     }
 
+    async fn put_raw_if_not_exists_multipart(
+        &self,
+        path: &str,
+        chunks: &[Bytes],
+        content_length: usize,
+        part_bytes: usize,
+    ) -> Result<()> {
+        let response = self
+            .send(
+                self.upload_request(reqwest::Method::POST, self.raw_url("multipart-start", path))
+                    .header(reqwest::header::CONTENT_LENGTH, 0)
+                    .header(MULTIPART_HEADER_OBJECT_BYTES, content_length),
+                "multipart_start",
+                Some(0),
+            )
+            .await?;
+        let response = Self::check_response(response, path).await?;
+        let response_bytes = response
+            .bytes()
+            .await
+            .map_err(|err| RemoteErr::http_transport("multipart_start_body", err))?;
+        let upload: HttpMultipartStartResponse =
+            serde_json::from_slice(&response_bytes).map_err(|err| RemoteErr::HttpStatus {
+                status: 502,
+                path: path.to_string(),
+                message: format!("invalid multipart-start response: {err}"),
+            })?;
+        validate_multipart_start(&upload, content_length, part_bytes, path)?;
+        let uploaded_parts = upload
+            .uploaded_parts
+            .iter()
+            .map(|part| (part.part_number, part.bytes))
+            .collect::<HashMap<_, _>>();
+        let parts = multipart_chunks(chunks, part_bytes);
+        for (index, part) in parts.iter().enumerate() {
+            let part_number = index + 1;
+            let length = part.iter().map(Bytes::len).sum::<usize>();
+            if uploaded_parts.get(&part_number) == Some(&length) {
+                continue;
+            }
+            self.put_multipart_part(path, &upload.upload_id, part_number, part, length)
+                .await?;
+        }
+
+        let completion = self
+            .send(
+                self.upload_request(
+                    reqwest::Method::POST,
+                    self.raw_url("multipart-complete", path),
+                )
+                .header(reqwest::header::CONTENT_LENGTH, 0)
+                .header(MULTIPART_HEADER_UPLOAD_ID, &upload.upload_id),
+                "multipart_complete",
+                Some(0),
+            )
+            .await;
+        let response = match completion {
+            Ok(response) => response,
+            Err(error) => {
+                return match self.has_raw(path).await {
+                    Ok(true) => Ok(()),
+                    _ => Err(error),
+                };
+            }
+        };
+        if response.status().is_success() {
+            Self::check_response(response, path).await?;
+            return Ok(());
+        }
+        let status = response.status().as_u16();
+        let error = Self::check_response(response, path).await.unwrap_err();
+        if matches!(status, 500..=599) && self.has_raw(path).await.unwrap_or(false) {
+            return Ok(());
+        }
+        Err(error)
+    }
+
+    async fn put_multipart_part(
+        &self,
+        path: &str,
+        upload_id: &str,
+        part_number: usize,
+        chunks: &[Bytes],
+        content_length: usize,
+    ) -> Result<()> {
+        let mut last_error = None;
+        for attempt in 0..MULTIPART_PART_ATTEMPTS {
+            let request_chunks = chunks.to_vec();
+            let body = reqwest::Body::wrap_stream(stream::iter(
+                request_chunks.into_iter().map(Ok::<Bytes, std::io::Error>),
+            ));
+            let response = self
+                .send(
+                    self.upload_request(reqwest::Method::PUT, self.raw_url("multipart-part", path))
+                        .header(reqwest::header::CONTENT_LENGTH, content_length)
+                        .header(MULTIPART_HEADER_UPLOAD_ID, upload_id)
+                        .header(MULTIPART_HEADER_PART_NUMBER, part_number)
+                        .body(body),
+                    "multipart_part",
+                    Some(content_length as u64),
+                )
+                .await;
+            match response {
+                Ok(response) if response.status().is_success() => {
+                    Self::check_response(response, path).await?;
+                    return Ok(());
+                }
+                Ok(response)
+                    if attempt + 1 < MULTIPART_PART_ATTEMPTS
+                        && matches!(response.status().as_u16(), 429 | 500..=599) =>
+                {
+                    last_error = Some(Self::check_response(response, path).await.unwrap_err());
+                }
+                Ok(response) => {
+                    Self::check_response(response, path).await?;
+                    unreachable!("non-success multipart response passed validation")
+                }
+                Err(error) if attempt + 1 < MULTIPART_PART_ATTEMPTS => {
+                    last_error = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+            tokio::time::sleep(Duration::from_millis(100 * (attempt as u64 + 1))).await;
+        }
+        Err(last_error.unwrap())
+    }
+
     async fn receive_pack(
         &self,
         pack: &RemoteObjectPack,
@@ -1758,6 +2042,12 @@ impl HttpRemote {
                 path: ref_path.to_string(),
                 message: "receive-pack body length exceeds usize".to_string(),
             })?;
+        if self
+            .aggregate_request_requires_multipart(content_length)
+            .await?
+        {
+            return Ok(HttpReceivePackResult::RetryIndividually);
+        }
         let body = reqwest::Body::wrap_stream(stream::iter(
             [pack.pack.clone(), pack.index.clone()]
                 .into_iter()
@@ -1792,6 +2082,10 @@ impl HttpRemote {
         {
             Self::drain_response(response).await?;
             return Ok(HttpReceivePackResult::Unsupported);
+        }
+        if response.status().as_u16() == 413 {
+            Self::drain_response(response).await?;
+            return Ok(HttpReceivePackResult::RetryIndividually);
         }
         Self::check_response(response, ref_path).await?;
         Ok(HttpReceivePackResult::Published)
@@ -1846,6 +2140,12 @@ impl HttpRemote {
                 path: ref_path.to_string(),
                 message: "receive-bundle body length exceeds usize".to_string(),
             })?;
+        if self
+            .aggregate_request_requires_multipart(content_length)
+            .await?
+        {
+            return Ok(HttpReceivePackResult::RetryIndividually);
+        }
         let chunks = std::iter::once(Bytes::from(manifest.clone()))
             .chain(
                 objects
@@ -2218,6 +2518,75 @@ fn safe_server_timing_name(value: &str) -> Option<&'static str> {
         "total" => Some("total"),
         _ => None,
     }
+}
+
+fn validate_multipart_start(
+    upload: &HttpMultipartStartResponse,
+    total_bytes: usize,
+    part_bytes: usize,
+    path: &str,
+) -> Result<()> {
+    if upload.upload_id.is_empty()
+        || upload.upload_id.len() > 1_024
+        || upload.upload_id.chars().any(char::is_control)
+        || upload.total_bytes != total_bytes
+        || upload.part_bytes != part_bytes
+    {
+        return Err(RemoteErr::HttpStatus {
+            status: 502,
+            path: path.to_string(),
+            message: "multipart-start returned an invalid upload session".to_string(),
+        });
+    }
+    let part_count = total_bytes.div_ceil(part_bytes);
+    let mut previous = 0;
+    for part in &upload.uploaded_parts {
+        if part.part_number <= previous || part.part_number > part_count {
+            return Err(RemoteErr::HttpStatus {
+                status: 502,
+                path: path.to_string(),
+                message: "multipart-start returned invalid uploaded parts".to_string(),
+            });
+        }
+        let expected = if part.part_number == part_count {
+            total_bytes - part_bytes * (part_count - 1)
+        } else {
+            part_bytes
+        };
+        if part.bytes != expected {
+            return Err(RemoteErr::HttpStatus {
+                status: 502,
+                path: path.to_string(),
+                message: "multipart-start returned an invalid uploaded part size".to_string(),
+            });
+        }
+        previous = part.part_number;
+    }
+    Ok(())
+}
+
+fn multipart_chunks(chunks: &[Bytes], part_bytes: usize) -> Vec<Vec<Bytes>> {
+    let total_bytes = chunks.iter().map(Bytes::len).sum::<usize>();
+    let mut parts = Vec::with_capacity(total_bytes.div_ceil(part_bytes));
+    let mut part = Vec::new();
+    let mut part_len = 0;
+    for chunk in chunks {
+        let mut offset = 0;
+        while offset < chunk.len() {
+            let take = (part_bytes - part_len).min(chunk.len() - offset);
+            part.push(chunk.slice(offset..offset + take));
+            part_len += take;
+            offset += take;
+            if part_len == part_bytes {
+                parts.push(std::mem::take(&mut part));
+                part_len = 0;
+            }
+        }
+    }
+    if part_len != 0 {
+        parts.push(part);
+    }
+    parts
 }
 
 fn percent_encode_path(path: &str) -> String {
@@ -3688,6 +4057,78 @@ mod tests {
             !request
                 .lines()
                 .any(|line| { line.eq_ignore_ascii_case("Transfer-Encoding: chunked") })
+        );
+    }
+
+    #[tokio::test]
+    async fn large_http_upload_uses_and_resumes_multipart_parts() {
+        let descriptor = serde_json::json!({
+            "protocol": "graft-remote",
+            "version": 1,
+            "repository": "org/repo",
+            "capabilities": ["multipart-object"],
+            "limits": {
+                "max_request_bytes": 64 * 1024,
+                "multipart_part_bytes": 32 * 1024,
+            },
+        })
+        .to_string();
+        let start = serde_json::json!({
+            "upload_id": "upload-1",
+            "total_bytes": 70 * 1024,
+            "part_bytes": 32 * 1024,
+            "uploaded_parts": [{ "part_number": 1, "bytes": 32 * 1024 }],
+        })
+        .to_string();
+        let json_response = |body: &str| {
+            format!(
+                "HTTP/1.1 200 OK\r\nGraft-Protocol: 1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let responses = [
+            json_response(&descriptor),
+            json_response(&start),
+            "HTTP/1.1 204 No Content\r\nGraft-Protocol: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+            "HTTP/1.1 204 No Content\r\nGraft-Protocol: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+            "HTTP/1.1 204 No Content\r\nGraft-Protocol: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+        ];
+        let response_refs = responses.iter().map(String::as_str).collect::<Vec<_>>();
+        let (url, requests) = serve_http_messages(&response_refs).await;
+        let mut remote = HttpRemote::new(url, None).unwrap();
+        remote.multipart_discovery_threshold = 64 * 1024;
+        let payload = Bytes::from(vec![7_u8; 70 * 1024]);
+
+        remote
+            .put_raw_if_not_exists_stream("segments/large", [payload.clone()])
+            .await
+            .unwrap();
+
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 5);
+        assert!(String::from_utf8_lossy(&requests[0]).starts_with("GET /org/repo HTTP/1.1"));
+        assert!(
+            String::from_utf8_lossy(&requests[1])
+                .starts_with("POST /org/repo/multipart-start/segments/large")
+        );
+        assert!(
+            String::from_utf8_lossy(&requests[2])
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("x-graft-part-number: 2"))
+        );
+        assert_eq!(
+            http_request_body(&requests[2]),
+            &payload[32 * 1024..64 * 1024]
+        );
+        assert!(
+            String::from_utf8_lossy(&requests[3])
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("x-graft-part-number: 3"))
+        );
+        assert_eq!(http_request_body(&requests[3]), &payload[64 * 1024..]);
+        assert!(
+            String::from_utf8_lossy(&requests[4])
+                .starts_with("POST /org/repo/multipart-complete/segments/large")
         );
     }
 

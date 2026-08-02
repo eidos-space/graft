@@ -7,6 +7,8 @@ const os = require("node:os")
 const path = require("node:path")
 const test = require("node:test")
 
+const packageMetadata = require("../package.json")
+
 let DatabaseSync
 try {
   ;({ DatabaseSync } = require("node:sqlite"))
@@ -24,7 +26,7 @@ const {
 } = require("..")
 
 test("exposes ABI-stable SDK metadata and materialization contract", () => {
-  assert.equal(sdkVersion(), "0.3.4")
+  assert.equal(sdkVersion(), packageMetadata.version)
   for (const operation of [
     "restore",
     "restorePaths",
