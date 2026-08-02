@@ -1016,13 +1016,13 @@ pub struct SwitchNewBranchPlan {
     pub checkout: CheckoutPlan,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RepoSnapshot {
     pub page_count: PageCount,
     pub ranges: Vec<RepoLogRange>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RepoLogRange {
     pub log: LogId,
     pub start: LSN,
@@ -1031,7 +1031,7 @@ pub struct RepoLogRange {
     pub commits: Vec<RepoStorageCommit>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RepoStorageCommit {
     pub lsn: LSN,
     pub commit_hash: CommitHash,

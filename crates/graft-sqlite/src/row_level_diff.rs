@@ -800,6 +800,72 @@ pub fn bounded_row_level_diff_readers_for_summary_tables(
     )
 }
 
+/// Uses the existing page-aware rowid diff when every candidate table has an ordinary rowid
+/// layout. For these tables it is faster to decode only rows on changed B-tree pages than to merge
+/// the complete rowid stream. `WITHOUT ROWID` and schema-changing tables return `None` so callers
+/// retain the bounded primary-key path that avoids materializing large Eidos tables.
+pub fn rowid_table_summaries_for_tables(
+    from_reader: &dyn VolumeRead,
+    to_reader: &dyn VolumeRead,
+    from_lsn: LSN,
+    to_lsn: LSN,
+    tables: &BTreeSet<String>,
+) -> Result<Option<Vec<BoundedTableSummary>>, graft::err::GraftErr> {
+    if sqlite_page_size(from_reader)? != PAGESIZE.as_u32()
+        || sqlite_page_size(to_reader)? != PAGESIZE.as_u32()
+    {
+        return Ok(None);
+    }
+    let from_scanner = TableScanner::new(from_reader).map_err(|error| {
+        graft::err::LogicalErr::Other(format!("Failed to parse source B-tree: {error:?}"))
+    })?;
+    let to_scanner = TableScanner::new(to_reader).map_err(|error| {
+        graft::err::LogicalErr::Other(format!("Failed to parse target B-tree: {error:?}"))
+    })?;
+    let from_master = from_scanner.read_master_table().map_err(|error| {
+        graft::err::LogicalErr::Other(format!("Failed to read source schema: {error:?}"))
+    })?;
+    let to_master = to_scanner.read_master_table().map_err(|error| {
+        graft::err::LogicalErr::Other(format!("Failed to read target schema: {error:?}"))
+    })?;
+    for table in tables {
+        let from_entry = from_master.iter().find(|entry| entry.name == *table);
+        let to_entry = to_master.iter().find(|entry| entry.name == *table);
+        let stable_rowid_layout = match (from_entry, to_entry) {
+            (Some(from), Some(to)) => {
+                !is_without_rowid_table(from) && !is_without_rowid_table(to) && from.sql == to.sql
+            }
+            _ => false,
+        };
+        if !stable_rowid_layout {
+            return Ok(None);
+        }
+    }
+
+    let mut summaries = Vec::new();
+    for table in tables {
+        let diff = row_level_diff_readers_for_table(
+            from_reader,
+            to_reader,
+            from_lsn,
+            to_lsn,
+            Some(table),
+        )?;
+        for changes in diff.table_changes {
+            let (inserts, deletes, updates) = count_changes(&changes.changes);
+            if inserts + deletes + updates > 0 {
+                summaries.push(BoundedTableSummary {
+                    table_name: changes.table_name,
+                    inserts,
+                    deletes,
+                    updates,
+                });
+            }
+        }
+    }
+    Ok(Some(summaries))
+}
+
 fn bounded_row_diff_from_readers(
     from_reader: &dyn VolumeRead,
     to_reader: &dyn VolumeRead,

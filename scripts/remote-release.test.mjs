@@ -60,7 +60,9 @@ test("validates the checked-in Remote package release contract", async () => {
     );
     metadataByName.set(metadata.name, metadata);
   }
-  validatePackageMetadata(metadataByName, "0.2.0");
+  const version = metadataByName.get("@eidos.space/graft-remote")?.version;
+  assert.equal(typeof version, "string");
+  validatePackageMetadata(metadataByName, version);
 });
 
 test("rejects a dependency that could escape the release version", () => {

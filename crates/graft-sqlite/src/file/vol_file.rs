@@ -1,5 +1,6 @@
 use std::{
     borrow::Cow,
+    collections::BTreeMap,
     fmt::Debug,
     hash::{DefaultHasher, Hash, Hasher},
     mem,
@@ -27,7 +28,10 @@ use graft::{
 use parking_lot::{Mutex, MutexGuard};
 use sqlite_plugin::flags::{LockLevel, OpenOpts};
 
-use crate::vfs::{ErrCtx, RepoRuntimeRegistry};
+use crate::{
+    pragma::sqlite_worktree::PreparedSqliteStage,
+    vfs::{ErrCtx, RepoRuntimeRegistry},
+};
 
 use super::VfsFile;
 
@@ -134,6 +138,13 @@ pub struct VolFile {
     state: VolFileState,
     /// Message to attach to the next commit (consumed on commit).
     pub pending_message: Option<String>,
+    /// Stable `SQLite` snapshots prepared by `add` and reusable by the following commit.
+    ///
+    /// This is the repository equivalent of Git's index cache: commit consumes the exact staged
+    /// image instead of proving it again by rereading the live worktree. Entries are still matched
+    /// against the staged index before use, so stale cache entries only cause a conservative
+    /// fallback.
+    prepared_sqlite_stages: Mutex<BTreeMap<String, Arc<PreparedSqliteStage>>>,
 }
 
 impl Debug for VolFile {
@@ -247,11 +258,26 @@ impl VolFile {
             reserved,
             state: VolFileState::Idle,
             pending_message: None,
+            prepared_sqlite_stages: Mutex::new(BTreeMap::new()),
         }
     }
 
     pub fn runtime(&self) -> &Runtime {
         &self.runtime
+    }
+
+    pub(crate) fn cache_prepared_sqlite_stage(&self, key: String, prepared: PreparedSqliteStage) {
+        self.prepared_sqlite_stages
+            .lock()
+            .insert(key, Arc::new(prepared));
+    }
+
+    pub(crate) fn prepared_sqlite_stage(&self, key: &str) -> Option<Arc<PreparedSqliteStage>> {
+        self.prepared_sqlite_stages.lock().get(key).cloned()
+    }
+
+    pub(crate) fn clear_prepared_sqlite_stages(&self) {
+        self.prepared_sqlite_stages.lock().clear();
     }
 
     /// Returns the `SQLite` database selected for row-aware repository operations.

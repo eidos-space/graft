@@ -1,4 +1,13 @@
-use std::{collections::BTreeSet, ops::RangeInclusive, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeSet,
+    ops::RangeInclusive,
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use crate::core::{
     CommitHashBuilder, LogId, PageCount, PageIdx, SegmentId, VolumeId,
@@ -63,8 +72,11 @@ pub struct Runtime {
     inner: Arc<RuntimeInner>,
 }
 
+static NEXT_RUNTIME_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+
 #[derive(Debug)]
 struct RuntimeInner {
+    instance_id: u64,
     tokio: tokio::runtime::Handle,
     storage: Arc<FjallStorage>,
     remote: Arc<Remote>,
@@ -90,8 +102,19 @@ impl Runtime {
             ));
         }
         Runtime {
-            inner: Arc::new(RuntimeInner { tokio: tokio_rt, storage, remote }),
+            inner: Arc::new(RuntimeInner {
+                instance_id: NEXT_RUNTIME_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
+                tokio: tokio_rt,
+                storage,
+                remote,
+            }),
         }
+    }
+
+    /// Returns an identifier shared by clones of this runtime and unique to its
+    /// backing runtime instance for the lifetime of this process.
+    pub fn instance_id(&self) -> u64 {
+        self.inner.instance_id
     }
 
     pub(crate) fn storage(&self) -> &FjallStorage {
@@ -381,6 +404,12 @@ impl Runtime {
         self.run_action(HydrateSnapshot { snapshot })
     }
 
+    /// Returns whether a previous complete hydration of this exact snapshot is
+    /// recorded in the local storage index.
+    pub fn snapshot_hydration_cached(&self, snapshot: &Snapshot) -> Result<bool> {
+        Ok(self.storage().snapshot_hydration_cached(snapshot)?)
+    }
+
     pub fn snapshot_hydrate_from(&self, snapshot: Snapshot, remote: Arc<Remote>) -> Result<()> {
         self.snapshot_fetch_from(&snapshot, remote.clone())?;
         self.run_action_with_remote(HydrateSnapshot { snapshot }, remote)
@@ -580,7 +609,10 @@ impl Runtime {
 mod tests {
     use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
-    use crate::core::{LogId, PageIdx, lsn::LSN, page::Page};
+    use crate::{
+        core::{LogId, PageIdx, lsn::LSN, page::Page},
+        snapshot::Snapshot,
+    };
     use test_log::test;
     use tokio::time::sleep;
 
@@ -588,6 +620,66 @@ mod tests {
         local::fjall_storage::FjallStorage, remote::RemoteConfig, rt::runtime::Runtime,
         volume_reader::VolumeRead, volume_writer::VolumeWrite,
     };
+
+    #[test]
+    fn snapshot_hydration_marker_persists_and_gc_invalidates_it() {
+        let tokio_rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let remote = Arc::new(RemoteConfig::Memory.build().unwrap());
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Arc::new(FjallStorage::open(directory.path()).unwrap());
+        let runtime = Runtime::new(
+            tokio_rt.handle().clone(),
+            remote.clone(),
+            storage.clone(),
+            None,
+        );
+        let snapshot = Snapshot::empty();
+
+        assert!(!runtime.snapshot_hydration_cached(&snapshot).unwrap());
+        runtime.snapshot_hydrate(snapshot.clone()).unwrap();
+        assert!(runtime.snapshot_hydration_cached(&snapshot).unwrap());
+
+        drop(runtime);
+        drop(storage);
+        let reopened = Arc::new(FjallStorage::open(directory.path()).unwrap());
+        let runtime = Runtime::new(tokio_rt.handle().clone(), remote, reopened, None);
+        assert!(runtime.snapshot_hydration_cached(&snapshot).unwrap());
+
+        runtime.storage_gc(&BTreeSet::new(), &[], false).unwrap();
+        assert!(!runtime.snapshot_hydration_cached(&snapshot).unwrap());
+    }
+
+    #[test]
+    fn local_commits_record_side_cache_hydration_proofs() {
+        let tokio_rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let remote = Arc::new(RemoteConfig::Memory.build().unwrap());
+        let storage = Arc::new(FjallStorage::open_temporary().unwrap());
+        let runtime = Runtime::new(tokio_rt.handle().clone(), remote, storage, None);
+        let vid = runtime.volume_open(None, None, None).unwrap().vid;
+
+        let mut first = runtime.volume_writer(vid.clone()).unwrap();
+        first
+            .write_page(PageIdx::must_new(1), Page::test_filled(1))
+            .unwrap();
+        first
+            .write_page(PageIdx::must_new(2), Page::test_filled(2))
+            .unwrap();
+        let first = first.commit().unwrap().snapshot().clone();
+        assert!(runtime.snapshot_hydration_cached(&first).unwrap());
+
+        let mut second = runtime.volume_writer(vid).unwrap();
+        second
+            .write_page(PageIdx::must_new(2), Page::test_filled(3))
+            .unwrap();
+        let second = second.commit().unwrap().snapshot().clone();
+        assert!(runtime.snapshot_hydration_cached(&second).unwrap());
+    }
 
     #[test]
     fn runtime_sanity() {

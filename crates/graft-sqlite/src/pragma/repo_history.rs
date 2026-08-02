@@ -14,7 +14,7 @@ pub(super) fn run_repo_commit(
     if repo.has_configured_track_roots()? {
         stage_repo_add_all(runtime, file, &repo, None)?;
     }
-    let tables = staged_commit_table_summary(runtime, &repo)?;
+    let tables = staged_commit_table_summary_for_file(runtime, file, &repo)?;
     let commit = match repo.commit_staged_with_table_summary(message, tables) {
         Ok(commit) => commit,
         Err(graft::repo::RepoErr::NoStagedChanges) => {
@@ -23,6 +23,7 @@ pub(super) fn run_repo_commit(
         Err(err) => return Err(err.into()),
     };
     let branch = repo.current_branch()?;
+    file.clear_prepared_sqlite_stages();
     // Staging already captured the canonical SQLite snapshot in the index. Re-materializing that
     // snapshot here would replace the worktree directory entry and detach application SQLite
     // handles that were intentionally kept open across a non-materializing checkpoint.

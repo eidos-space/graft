@@ -37,7 +37,7 @@ pub(super) struct RepoSnapshotResolvePolicy {
     pub(super) normalize: bool,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct ResolvedRepoSnapshot {
     pub(super) snapshot: RepoSnapshot,
     pub(super) runtime_snapshot: graft::snapshot::Snapshot,
@@ -49,6 +49,65 @@ pub(super) struct RepoSnapshotResolver<'a> {
     pub(super) runtime: &'a Runtime,
     pub(super) remote: Option<Arc<Remote>>,
     pub(super) policy: RepoSnapshotResolvePolicy,
+}
+
+const DIFF_SNAPSHOT_CACHE_CAPACITY: usize = 32;
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct DiffSnapshotCacheKey {
+    runtime_instance_id: u64,
+    snapshot: RepoSnapshot,
+}
+
+#[derive(Clone, Debug)]
+struct DiffSnapshotCacheEntry {
+    key: DiffSnapshotCacheKey,
+    resolved: ResolvedRepoSnapshot,
+}
+
+static DIFF_SNAPSHOT_CACHE: std::sync::OnceLock<
+    parking_lot::Mutex<std::collections::VecDeque<DiffSnapshotCacheEntry>>,
+> = std::sync::OnceLock::new();
+
+fn cached_diff_snapshot(
+    runtime: &Runtime,
+    snapshot: &RepoSnapshot,
+) -> Option<ResolvedRepoSnapshot> {
+    let key = DiffSnapshotCacheKey {
+        runtime_instance_id: runtime.instance_id(),
+        snapshot: snapshot.clone(),
+    };
+    let mut cache = DIFF_SNAPSHOT_CACHE
+        .get_or_init(|| parking_lot::Mutex::new(std::collections::VecDeque::new()))
+        .lock();
+    let index = cache.iter().position(|entry| entry.key == key)?;
+    let entry = cache
+        .remove(index)
+        .expect("diff snapshot cache entry exists");
+    let resolved = entry.resolved.clone();
+    cache.push_back(entry);
+    Some(resolved)
+}
+
+fn cache_diff_snapshot(
+    runtime: &Runtime,
+    snapshot: &RepoSnapshot,
+    resolved: &ResolvedRepoSnapshot,
+) {
+    let key = DiffSnapshotCacheKey {
+        runtime_instance_id: runtime.instance_id(),
+        snapshot: snapshot.clone(),
+    };
+    let mut cache = DIFF_SNAPSHOT_CACHE
+        .get_or_init(|| parking_lot::Mutex::new(std::collections::VecDeque::new()))
+        .lock();
+    if let Some(index) = cache.iter().position(|entry| entry.key == key) {
+        cache.remove(index);
+    }
+    cache.push_back(DiffSnapshotCacheEntry { key, resolved: resolved.clone() });
+    while cache.len() > DIFF_SNAPSHOT_CACHE_CAPACITY {
+        cache.pop_front();
+    }
 }
 
 pub(super) fn hydrate_repo_file_state(
@@ -237,23 +296,31 @@ impl<'a> RepoSnapshotResolver<'a> {
         &self,
         snapshot: &RepoSnapshot,
     ) -> Result<ResolvedRepoSnapshot, ErrCtx> {
-        if self.policy.remote_mode == RepoSnapshotRemoteMode::Remote {
-            return self.resolve_snapshot_once(
+        let cacheable_diff = self.policy.purpose == RepoSnapshotPurpose::Diff
+            && self.policy.hash_policy == SnapshotHashPolicy::AllowHydratedMismatch
+            && !self.policy.normalize;
+        if cacheable_diff {
+            if let Some(resolved) = cached_diff_snapshot(self.runtime, snapshot) {
+                return Ok(resolved);
+            }
+        }
+
+        let resolved = if self.policy.remote_mode == RepoSnapshotRemoteMode::Remote {
+            self.resolve_snapshot_once(
                 snapshot,
                 RepoSnapshotResolveSource::Remote,
                 self.remote.clone(),
-            );
-        }
-
-        match self.resolve_snapshot_once(snapshot, RepoSnapshotResolveSource::Local, None) {
-            Ok(resolved) => Ok(resolved),
-            Err(local_err)
-                if self.policy.remote_mode == RepoSnapshotRemoteMode::LocalThenRemote =>
-            {
-                let Some(remote) = self.remote.clone() else {
-                    return Err(local_err);
-                };
-                self.resolve_snapshot_once(snapshot, RepoSnapshotResolveSource::Remote, Some(remote))
+            )?
+        } else {
+            match self.resolve_snapshot_once(snapshot, RepoSnapshotResolveSource::Local, None) {
+                Ok(resolved) => Ok(resolved),
+                Err(local_err)
+                    if self.policy.remote_mode == RepoSnapshotRemoteMode::LocalThenRemote =>
+                {
+                    let Some(remote) = self.remote.clone() else {
+                        return Err(local_err);
+                    };
+                    self.resolve_snapshot_once(snapshot, RepoSnapshotResolveSource::Remote, Some(remote))
                     .map_err(|remote_err| {
                         ErrCtx::PragmaErr(
                             format!(
@@ -262,9 +329,14 @@ impl<'a> RepoSnapshotResolver<'a> {
                             .into(),
                         )
                     })
-            }
-            Err(err) => Err(err),
+                }
+                Err(err) => Err(err),
+            }?
+        };
+        if cacheable_diff {
+            cache_diff_snapshot(self.runtime, snapshot, &resolved);
         }
+        Ok(resolved)
     }
 
     pub(super) fn resolve_snapshot_once(
@@ -275,21 +347,24 @@ impl<'a> RepoSnapshotResolver<'a> {
     ) -> Result<ResolvedRepoSnapshot, ErrCtx> {
         let runtime_snapshot = snapshot.to_snapshot();
         if !runtime_snapshot.is_empty() {
-            match source {
-                RepoSnapshotResolveSource::Local => {
-                    for range in &snapshot.ranges {
-                        self.runtime.fetch_log(range.log.clone(), Some(range.end))?;
+            let hydration_cached = self.runtime.snapshot_hydration_cached(&runtime_snapshot)?;
+            if !hydration_cached {
+                match source {
+                    RepoSnapshotResolveSource::Local => {
+                        for range in &snapshot.ranges {
+                            self.runtime.fetch_log(range.log.clone(), Some(range.end))?;
+                        }
+                        self.runtime.snapshot_hydrate(runtime_snapshot.clone())?;
                     }
-                    self.runtime.snapshot_hydrate(runtime_snapshot.clone())?;
-                }
-                RepoSnapshotResolveSource::Remote => {
-                    let Some(remote) = remote else {
-                        return Err(ErrCtx::PragmaErr(
-                            "snapshot resolver remote source requires a remote".into(),
-                        ));
-                    };
-                    self.runtime
-                        .snapshot_hydrate_from(runtime_snapshot.clone(), remote)?;
+                    RepoSnapshotResolveSource::Remote => {
+                        let Some(remote) = remote else {
+                            return Err(ErrCtx::PragmaErr(
+                                "snapshot resolver remote source requires a remote".into(),
+                            ));
+                        };
+                        self.runtime
+                            .snapshot_hydrate_from(runtime_snapshot.clone(), remote)?;
+                    }
                 }
             }
         }

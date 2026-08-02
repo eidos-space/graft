@@ -21,6 +21,9 @@ pub struct HydrateSnapshot {
 
 impl Action for HydrateSnapshot {
     async fn run(self, storage: Arc<FjallStorage>, remote: Arc<Remote>) -> Result<(), GraftErr> {
+        if storage.snapshot_hydration_cached(&self.snapshot)? {
+            return Ok(());
+        }
         let missing_frames = storage.read().find_missing_frames(&self.snapshot)?;
         futures::stream::iter(
             missing_frames
@@ -32,6 +35,8 @@ impl Action for HydrateSnapshot {
         .try_for_each_concurrent(HYDRATE_CONCURRENCY, |range| {
             FetchSegment { range }.run(storage.clone(), remote.clone())
         })
-        .await
+        .await?;
+        storage.mark_snapshot_hydrated(&self.snapshot)?;
+        Ok(())
     }
 }

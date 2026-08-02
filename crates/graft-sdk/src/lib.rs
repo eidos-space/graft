@@ -41,7 +41,7 @@ const MAX_BATCH_MUTATION_PATHS: usize = 1_000;
 const MAX_INVENTORY_PAGE_SIZE: usize = 1_000;
 const MAX_IGNORE_QUERY_PATHS: usize = 1_000;
 // Bump whenever persisted path classification semantics change.
-const STATUS_SNAPSHOT_SCHEMA_VERSION: u32 = 2;
+const STATUS_SNAPSHOT_SCHEMA_VERSION: u32 = 3;
 const MAX_STATUS_SNAPSHOTS: usize = 4;
 const STATUS_SNAPSHOT_MAX_BYTES: u64 = 256 * 1024 * 1024;
 const WORKTREE_STABILITY_ATTEMPTS: usize = 3;
@@ -1428,7 +1428,7 @@ impl RepositorySession {
             self.set_http_bearer_token(&options.name, token.clone())?;
         }
 
-        let result = self.with_service(|service| {
+        self.with_service(|service| {
             let remotes = execute_json(service, "json_remotes", None)?;
             let existing_url = remote_url(&remotes, &options.name)?;
             match existing_url {
@@ -1458,11 +1458,7 @@ impl RepositorySession {
                 execute_json(service, "json_branch_upstream", Some(&argument))?;
             }
             execute_json(service, "json_remotes", None)
-        });
-        if result.is_ok() {
-            let _ = self.invalidate_status_cache();
-        }
-        result
+        })
     }
 
     pub fn push(&self, remote: Option<&str>, branch: Option<&str>) -> Result<Value> {
@@ -1472,7 +1468,9 @@ impl RepositorySession {
 
     pub fn fetch(&self, remote: Option<&str>, branch: Option<&str>) -> Result<Value> {
         let argument = remote_branch_argument(remote, branch)?;
-        self.execute_json_mutating("json_fetch", argument.as_deref())
+        // Fetch updates objects and remote-tracking refs, not the local worktree. Preserve the
+        // proven local classification and refresh only the repository projection on next status.
+        self.execute_json("json_fetch", argument.as_deref())
     }
 
     pub fn pull(&self, remote: Option<&str>, branch: Option<&str>) -> Result<Value> {
@@ -1511,13 +1509,6 @@ impl RepositorySession {
             let result = execute_json(service, name, argument);
             status_cache.invalidate();
             result
-        })
-    }
-
-    fn invalidate_status_cache(&self) -> Result<()> {
-        self.with_state(|state| {
-            state.status_cache.invalidate();
-            Ok(())
         })
     }
 
@@ -1659,10 +1650,27 @@ fn refresh_incremental_status_once(
             + matching_fingerprint_count(&cache.untracked_fingerprints, &untracked);
         let paths_examined = tracked.len() + untracked.len();
         if tracked == cache.tracked_fingerprints && untracked == cache.untracked_fingerprints {
-            let status = cache
+            let previous_status = cache
                 .status
                 .clone()
                 .expect("initialized status cache contains a status");
+            let mut status = previous_status.clone();
+            repo.refresh_status_repository_projection(&mut status)
+                .map_err(repo_error)?;
+            let projection_changed = status_changed(Some(&previous_status), &status)?;
+            if projection_changed {
+                cache.generation = cache.generation.saturating_add(1).max(1);
+                cache.status = Some(status.clone());
+            }
+            let persistent_snapshot_saved = if projection_changed {
+                match persist_status_snapshot(&repo, cache) {
+                    Ok(saved) => saved,
+                    Err(error) if error.code() == SdkErrorCode::Cancelled => return Err(error),
+                    Err(_) => false,
+                }
+            } else {
+                false
+            };
             return Ok(incremental_status_result(
                 cache,
                 status,
@@ -1675,7 +1683,7 @@ fn refresh_incremental_status_once(
                     tree_cache_hit,
                     status_cache_hit: true,
                     persistent_snapshot_hit,
-                    persistent_snapshot_saved: false,
+                    persistent_snapshot_saved,
                     stability_retries: 0,
                 },
             ));
@@ -1753,9 +1761,10 @@ fn incremental_status_result(
 ) -> IncrementalStatusResult {
     telemetry.duration_us = elapsed_us(started);
     let head = cache.head_target.as_deref().unwrap_or("unborn");
-    let status_digest = serde_json::to_vec(&status)
-        .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
-        .unwrap_or_else(|_| "unavailable".to_string());
+    let status_digest = serde_json::to_vec(&status).map_or_else(
+        |_| "unavailable".to_string(),
+        |bytes| blake3::hash(&bytes).to_hex().to_string(),
+    );
     IncrementalStatusResult {
         generation: cache.generation,
         change_token: format!("{head}:{}:{status_digest}", cache.generation),
@@ -2118,17 +2127,17 @@ fn repository_metadata_fingerprint(repo: &Repository, index: &Index) -> Result<S
     hasher.update(&graft::repo::REPOSITORY_FORMAT_VERSION.to_le_bytes());
     hasher.update(graft::repo::OBJECT_FORMAT.as_bytes());
     hash_serialized(&mut hasher, index)?;
-    hash_serialized(&mut hasher, &repo.config().map_err(repo_error)?)?;
+    let config = repo.config().map_err(repo_error)?;
+    // Only settings that affect local classification belong in the persisted worktree proof.
+    // Remote URLs, upstream configuration, and remote-tracking refs are refreshed separately.
+    hash_serialized(&mut hasher, &config.files)?;
+    hash_serialized(&mut hasher, &config.track)?;
+    hash_serialized(&mut hasher, &config.worktree)?;
     hash_serialized(&mut hasher, &repo.head_target().map_err(repo_error)?)?;
     hash_serialized(&mut hasher, &repo.current_branch().map_err(repo_error)?)?;
-    for name in ["HEAD", "MERGE_HEAD", "ORIG_HEAD", "config.toml"] {
+    for name in ["HEAD", "MERGE_HEAD", "ORIG_HEAD"] {
         hash_optional_file(&mut hasher, repo.graft_dir(), &repo.graft_dir().join(name))?;
     }
-    hash_metadata_tree(
-        &mut hasher,
-        repo.graft_dir(),
-        &repo.graft_dir().join("refs"),
-    )?;
     Ok(hasher.finalize().to_hex().to_string())
 }
 
@@ -2174,33 +2183,6 @@ fn hash_ignore_sources_in_directory(
     directories.sort();
     for directory in directories {
         hash_ignore_sources_in_directory(repo, matcher, &directory, hasher)?;
-    }
-    Ok(())
-}
-
-fn hash_metadata_tree(hasher: &mut blake3::Hasher, base: &Path, directory: &Path) -> Result<()> {
-    let entries = match fs::read_dir(directory) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(repository_stale_io("read repository metadata", error)),
-    };
-    let mut paths = entries
-        .map(|entry| {
-            entry
-                .map(|entry| entry.path())
-                .map_err(|error| repository_stale_io("read repository metadata entry", error))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    paths.sort();
-    for path in paths {
-        graft::repo::cancellation_checkpoint().map_err(repo_error)?;
-        let metadata = fs::symlink_metadata(&path)
-            .map_err(|error| repository_stale_io("inspect repository metadata", error))?;
-        if metadata.is_dir() {
-            hash_metadata_tree(hasher, base, &path)?;
-        } else if metadata.is_file() {
-            hash_optional_file(hasher, base, &path)?;
-        }
     }
     Ok(())
 }
@@ -3194,6 +3176,67 @@ mod tests {
     }
 
     #[test]
+    fn remote_tracking_updates_reuse_local_status_proof_and_refresh_projection() {
+        let directory = tempfile::tempdir().unwrap();
+        let note = directory.path().join("note.txt");
+        let session = RepositorySession::new(directory.path());
+        session.open().unwrap();
+        session.init().unwrap();
+
+        fs::write(&note, "one\n").unwrap();
+        session.add_all().unwrap();
+        let first = session.commit("first").unwrap()["commit"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        session
+            .configure_remote(&RemoteConfigureOptions {
+                name: "origin".to_string(),
+                url: "https://example.invalid/acme/repo".to_string(),
+                bearer_token: None,
+                overwrite: false,
+                upstream_branch: Some("main".to_string()),
+            })
+            .unwrap();
+        let writer = Repository::open(directory.path()).unwrap();
+        writer
+            .set_remote_tracking_ref("origin", "main", &first)
+            .unwrap();
+        let initial = session.status_incremental().unwrap();
+        assert_eq!(initial.status.ahead, 0);
+
+        fs::write(&note, "two\n").unwrap();
+        session.add_all().unwrap();
+        let second = session.commit("second").unwrap()["commit"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let ahead = session.status_incremental().unwrap();
+        assert_eq!(ahead.status.ahead, 1);
+
+        writer
+            .set_remote_tracking_ref("origin", "main", &second)
+            .unwrap();
+        let hot_synced = session.status_incremental().unwrap();
+        assert!(hot_synced.telemetry.status_cache_hit);
+        assert!(hot_synced.telemetry.persistent_snapshot_saved);
+        assert_eq!(hot_synced.status.ahead, 0);
+        assert_eq!(hot_synced.status.behind, 0);
+        assert!(hot_synced.generation > ahead.generation);
+
+        session.close().unwrap();
+        writer
+            .set_remote_tracking_ref("origin", "main", &first)
+            .unwrap();
+        session.open().unwrap();
+        let reopened_ahead = session.status_incremental().unwrap();
+        assert!(reopened_ahead.telemetry.persistent_snapshot_hit);
+        assert!(reopened_ahead.telemetry.status_cache_hit);
+        assert_eq!(reopened_ahead.status.ahead, 1);
+        assert_eq!(reopened_ahead.status.behind, 0);
+    }
+
+    #[test]
     fn persistent_status_snapshot_rejects_older_classification_schema() {
         let directory = tempfile::tempdir().unwrap();
         let session = RepositorySession::new(directory.path());
@@ -3588,6 +3631,17 @@ mod tests {
             .unwrap();
         drop(database);
 
+        // Requesting one table first must not require a whole-file worktree probe.
+        let rows = session
+            .diff_sqlite_paths(&options(SqliteDiffResponse::Rows {
+                table: "archive".to_string(),
+                limit: 100,
+                after: None,
+            }))
+            .unwrap();
+        assert_eq!(rows.telemetry.rows_returned, 3);
+        assert!(rows.telemetry.rows_scanned < 2_000);
+
         let summary = session
             .diff_sqlite_paths(&options(SqliteDiffResponse::Summary))
             .unwrap();
@@ -3598,16 +3652,6 @@ mod tests {
         assert_eq!(file["summaries"][0]["deletes"], 1);
         assert_eq!(file["summaries"][0]["updates"], 1);
         assert!(summary.telemetry.rows_scanned < 2_000);
-
-        let rows = session
-            .diff_sqlite_paths(&options(SqliteDiffResponse::Rows {
-                table: "archive".to_string(),
-                limit: 100,
-                after: None,
-            }))
-            .unwrap();
-        assert_eq!(rows.telemetry.rows_returned, 3);
-        assert!(rows.telemetry.rows_scanned < 2_000);
 
         session
             .stage_paths(&StagePathsOptions {

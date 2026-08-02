@@ -1,0 +1,1135 @@
+{
+  "schema": "graft-sdk-performance-matrix-v1",
+  "generated_at": "2026-08-02T05:55:14.481Z",
+  "source_revision": "76a0219bf1c24f329f360d2a407cc453d2c73fec",
+  "sdk": {
+    "module": "workspace-sdk",
+    "version": "0.3.4"
+  },
+  "profile": "full",
+  "methodology": {
+    "iterations": 5,
+    "timing": "wall-clock milliseconds via performance.now()",
+    "percentiles": "nearest-rank over repeated resident-session reads",
+    "fixture_generation": "reported separately and excluded from Graft operation timings",
+    "isolation": "one fresh repository and Node.js child process per scale point"
+  },
+  "environment": {
+    "platform": "darwin",
+    "arch": "arm64",
+    "node": "v26.0.0",
+    "cpu": "Apple M2",
+    "cpu_count": 8,
+    "memory_bytes": 25769803776,
+    "os": "Darwin 24.6.0"
+  },
+  "total_wall_milliseconds": 594433.236,
+  "files": [
+    {
+      "fixture": {
+        "file_count": 100,
+        "file_bytes": 256,
+        "change_counts": [
+          1,
+          10,
+          100
+        ]
+      },
+      "fixture_generation": {
+        "milliseconds": 9.786,
+        "response_bytes": 0
+      },
+      "repository_bytes": 394721,
+      "peak_rss_bytes": 67829760,
+      "operations": {
+        "session_open": {
+          "milliseconds": 421.031,
+          "response_bytes": 2
+        },
+        "init": {
+          "milliseconds": 441.583,
+          "response_bytes": 308
+        },
+        "stage_initial": {
+          "milliseconds": 48.558,
+          "response_bytes": 9353
+        },
+        "commit_initial": {
+          "milliseconds": 3.446,
+          "response_bytes": 9650
+        },
+        "clean_status_hot": {
+          "samples": [
+            24.971,
+            1.893,
+            1.882,
+            1.817,
+            1.817
+          ],
+          "min": 1.817,
+          "p50": 1.882,
+          "p95": 24.971,
+          "max": 24.971,
+          "response_bytes": 1203
+        },
+        "history_summaries_50": {
+          "samples": [
+            0.283,
+            0.098,
+            0.093,
+            0.091,
+            0.088
+          ],
+          "min": 0.088,
+          "p50": 0.093,
+          "p95": 0.283,
+          "max": 0.283,
+          "response_bytes": 1380
+        },
+        "reopen": {
+          "milliseconds": 527.318,
+          "response_bytes": 2
+        },
+        "status_after_reopen": {
+          "milliseconds": 13.022,
+          "response_bytes": 1203
+        },
+        "persistent_status_hit": true
+      },
+      "mutation_rounds": [
+        {
+          "changed_paths": 1,
+          "status_dirty": {
+            "milliseconds": 19.034,
+            "response_bytes": 1532
+          },
+          "explicit_path_diff": {
+            "milliseconds": 0.753,
+            "response_bytes": 1116
+          },
+          "stage_paths": {
+            "milliseconds": 1.166,
+            "response_bytes": 320
+          },
+          "commit": {
+            "milliseconds": 1.826,
+            "response_bytes": 513
+          },
+          "status_after_commit": {
+            "milliseconds": 19.092,
+            "response_bytes": 1205
+          },
+          "status_after_commit_cache_hit": false
+        },
+        {
+          "changed_paths": 10,
+          "status_dirty": {
+            "milliseconds": 19.671,
+            "response_bytes": 4341
+          },
+          "explicit_path_diff": {
+            "milliseconds": 3.033,
+            "response_bytes": 8545
+          },
+          "stage_paths": {
+            "milliseconds": 11.055,
+            "response_bytes": 2831
+          },
+          "commit": {
+            "milliseconds": 1.964,
+            "response_bytes": 1378
+          },
+          "status_after_commit": {
+            "milliseconds": 20.049,
+            "response_bytes": 1205
+          },
+          "status_after_commit_cache_hit": false
+        },
+        {
+          "changed_paths": 100,
+          "status_dirty": {
+            "milliseconds": 21.186,
+            "response_bytes": 32422
+          },
+          "explicit_path_diff": {
+            "milliseconds": 31.077,
+            "response_bytes": 82799
+          },
+          "stage_paths": {
+            "milliseconds": 175.669,
+            "response_bytes": 27941
+          },
+          "commit": {
+            "milliseconds": 2.88,
+            "response_bytes": 10019
+          },
+          "status_after_commit": {
+            "milliseconds": 25.184,
+            "response_bytes": 1205
+          },
+          "status_after_commit_cache_hit": false
+        }
+      ],
+      "scenario_wall_milliseconds": 2010.016
+    },
+    {
+      "fixture": {
+        "file_count": 1000,
+        "file_bytes": 256,
+        "change_counts": [
+          1,
+          100,
+          1000
+        ]
+      },
+      "fixture_generation": {
+        "milliseconds": 71.085,
+        "response_bytes": 0
+      },
+      "repository_bytes": 3778374,
+      "peak_rss_bytes": 174063616,
+      "operations": {
+        "session_open": {
+          "milliseconds": 503.669,
+          "response_bytes": 2
+        },
+        "init": {
+          "milliseconds": 409.709,
+          "response_bytes": 308
+        },
+        "stage_initial": {
+          "milliseconds": 215.972,
+          "response_bytes": 93053
+        },
+        "commit_initial": {
+          "milliseconds": 12.265,
+          "response_bytes": 93350
+        },
+        "clean_status_hot": {
+          "samples": [
+            100.843,
+            13.121,
+            12.773,
+            13.077,
+            12.569
+          ],
+          "min": 12.569,
+          "p50": 13.077,
+          "p95": 100.843,
+          "max": 100.843,
+          "response_bytes": 1206
+        },
+        "history_summaries_50": {
+          "samples": [
+            0.254,
+            0.117,
+            0.105,
+            0.098,
+            0.098
+          ],
+          "min": 0.098,
+          "p50": 0.105,
+          "p95": 0.254,
+          "max": 0.254,
+          "response_bytes": 1385
+        },
+        "reopen": {
+          "milliseconds": 443.246,
+          "response_bytes": 2
+        },
+        "status_after_reopen": {
+          "milliseconds": 59.138,
+          "response_bytes": 1205
+        },
+        "persistent_status_hit": true
+      },
+      "mutation_rounds": [
+        {
+          "changed_paths": 1,
+          "status_dirty": {
+            "milliseconds": 86.105,
+            "response_bytes": 1534
+          },
+          "explicit_path_diff": {
+            "milliseconds": 0.504,
+            "response_bytes": 1116
+          },
+          "stage_paths": {
+            "milliseconds": 4.162,
+            "response_bytes": 320
+          },
+          "commit": {
+            "milliseconds": 6.121,
+            "response_bytes": 513
+          },
+          "status_after_commit": {
+            "milliseconds": 100.921,
+            "response_bytes": 1208
+          },
+          "status_after_commit_cache_hit": false
+        },
+        {
+          "changed_paths": 100,
+          "status_dirty": {
+            "milliseconds": 92.771,
+            "response_bytes": 32424
+          },
+          "explicit_path_diff": {
+            "milliseconds": 24.812,
+            "response_bytes": 82799
+          },
+          "stage_paths": {
+            "milliseconds": 606.529,
+            "response_bytes": 27941
+          },
+          "commit": {
+            "milliseconds": 8.589,
+            "response_bytes": 10019
+          },
+          "status_after_commit": {
+            "milliseconds": 103.174,
+            "response_bytes": 1208
+          },
+          "status_after_commit_cache_hit": false
+        },
+        {
+          "changed_paths": 1000,
+          "status_dirty": {
+            "milliseconds": 100.294,
+            "response_bytes": 313225
+          },
+          "explicit_path_diff": {
+            "milliseconds": 24.141,
+            "response_bytes": 82799
+          },
+          "stage_paths": {
+            "milliseconds": 13680.932,
+            "response_bytes": 279041
+          },
+          "commit": {
+            "milliseconds": 17.689,
+            "response_bytes": 96420
+          },
+          "status_after_commit": {
+            "milliseconds": 140.299,
+            "response_bytes": 1208
+          },
+          "status_after_commit_cache_hit": false
+        }
+      ],
+      "scenario_wall_milliseconds": 17172.872
+    },
+    {
+      "fixture": {
+        "file_count": 10000,
+        "file_bytes": 256,
+        "change_counts": [
+          1,
+          100,
+          1000
+        ]
+      },
+      "fixture_generation": {
+        "milliseconds": 600.09,
+        "response_bytes": 0
+      },
+      "repository_bytes": 30157379,
+      "peak_rss_bytes": 300498944,
+      "operations": {
+        "session_open": {
+          "milliseconds": 481.789,
+          "response_bytes": 2
+        },
+        "init": {
+          "milliseconds": 403.403,
+          "response_bytes": 308
+        },
+        "stage_initial": {
+          "milliseconds": 2165.45,
+          "response_bytes": 930053
+        },
+        "commit_initial": {
+          "milliseconds": 133.184,
+          "response_bytes": 930350
+        },
+        "clean_status_hot": {
+          "samples": [
+            1198.409,
+            138.295,
+            137.78,
+            137.59,
+            140.246
+          ],
+          "min": 137.59,
+          "p50": 138.295,
+          "p95": 1198.409,
+          "max": 1198.409,
+          "response_bytes": 1209
+        },
+        "history_summaries_50": {
+          "samples": [
+            0.351,
+            0.195,
+            0.151,
+            0.168,
+            0.115
+          ],
+          "min": 0.115,
+          "p50": 0.168,
+          "p95": 0.351,
+          "max": 0.351,
+          "response_bytes": 1386
+        },
+        "reopen": {
+          "milliseconds": 421.152,
+          "response_bytes": 2
+        },
+        "status_after_reopen": {
+          "milliseconds": 333.305,
+          "response_bytes": 1208
+        },
+        "persistent_status_hit": true
+      },
+      "mutation_rounds": [
+        {
+          "changed_paths": 1,
+          "status_dirty": {
+            "milliseconds": 913.149,
+            "response_bytes": 1537
+          },
+          "explicit_path_diff": {
+            "milliseconds": 0.687,
+            "response_bytes": 1116
+          },
+          "stage_paths": {
+            "milliseconds": 51.951,
+            "response_bytes": 320
+          },
+          "commit": {
+            "milliseconds": 69.624,
+            "response_bytes": 513
+          },
+          "status_after_commit": {
+            "milliseconds": 998.388,
+            "response_bytes": 1210
+          },
+          "status_after_commit_cache_hit": false
+        },
+        {
+          "changed_paths": 100,
+          "status_dirty": {
+            "milliseconds": 869.077,
+            "response_bytes": 32427
+          },
+          "explicit_path_diff": {
+            "milliseconds": 29.518,
+            "response_bytes": 82799
+          },
+          "stage_paths": {
+            "milliseconds": 5838.468,
+            "response_bytes": 27941
+          },
+          "commit": {
+            "milliseconds": 79.844,
+            "response_bytes": 10019
+          },
+          "status_after_commit": {
+            "milliseconds": 1082.308,
+            "response_bytes": 1211
+          },
+          "status_after_commit_cache_hit": false
+        },
+        {
+          "changed_paths": 1000,
+          "status_dirty": {
+            "milliseconds": 952.677,
+            "response_bytes": 313228
+          },
+          "explicit_path_diff": {
+            "milliseconds": 26.24,
+            "response_bytes": 82799
+          },
+          "stage_paths": {
+            "milliseconds": 66885.543,
+            "response_bytes": 279041
+          },
+          "commit": {
+            "milliseconds": 94.136,
+            "response_bytes": 96420
+          },
+          "status_after_commit": {
+            "milliseconds": 1157.115,
+            "response_bytes": 1211
+          },
+          "status_after_commit_cache_hit": false
+        }
+      ],
+      "scenario_wall_milliseconds": 86694.466
+    },
+    {
+      "fixture": {
+        "file_count": 50000,
+        "file_bytes": 256,
+        "change_counts": [
+          1,
+          100,
+          1000
+        ]
+      },
+      "fixture_generation": {
+        "milliseconds": 2883.192,
+        "response_bytes": 0
+      },
+      "repository_bytes": 147379419,
+      "peak_rss_bytes": 713195520,
+      "operations": {
+        "session_open": {
+          "milliseconds": 373.198,
+          "response_bytes": 2
+        },
+        "init": {
+          "milliseconds": 410.027,
+          "response_bytes": 308
+        },
+        "stage_initial": {
+          "milliseconds": 14821.72,
+          "response_bytes": 4650053
+        },
+        "commit_initial": {
+          "milliseconds": 688.356,
+          "response_bytes": 4650350
+        },
+        "clean_status_hot": {
+          "samples": [
+            6059.452,
+            721.583,
+            722.502,
+            725.639,
+            718.417
+          ],
+          "min": 718.417,
+          "p50": 722.502,
+          "p95": 6059.452,
+          "max": 6059.452,
+          "response_bytes": 1209
+        },
+        "history_summaries_50": {
+          "samples": [
+            0.688,
+            0.129,
+            0.109,
+            0.104,
+            0.104
+          ],
+          "min": 0.104,
+          "p50": 0.109,
+          "p95": 0.688,
+          "max": 0.688,
+          "response_bytes": 1386
+        },
+        "reopen": {
+          "milliseconds": 418.151,
+          "response_bytes": 2
+        },
+        "status_after_reopen": {
+          "milliseconds": 1598.785,
+          "response_bytes": 1209
+        },
+        "persistent_status_hit": true
+      },
+      "mutation_rounds": [
+        {
+          "changed_paths": 1,
+          "status_dirty": {
+            "milliseconds": 4674.521,
+            "response_bytes": 1538
+          },
+          "explicit_path_diff": {
+            "milliseconds": 0.892,
+            "response_bytes": 1116
+          },
+          "stage_paths": {
+            "milliseconds": 268.178,
+            "response_bytes": 320
+          },
+          "commit": {
+            "milliseconds": 377.285,
+            "response_bytes": 513
+          },
+          "status_after_commit": {
+            "milliseconds": 5452.068,
+            "response_bytes": 1211
+          },
+          "status_after_commit_cache_hit": false
+        },
+        {
+          "changed_paths": 100,
+          "status_dirty": {
+            "milliseconds": 4831.895,
+            "response_bytes": 32428
+          },
+          "explicit_path_diff": {
+            "milliseconds": 32.187,
+            "response_bytes": 82799
+          },
+          "stage_paths": {
+            "milliseconds": 31776.444,
+            "response_bytes": 27941
+          },
+          "commit": {
+            "milliseconds": 435.33,
+            "response_bytes": 10019
+          },
+          "status_after_commit": {
+            "milliseconds": 5578.923,
+            "response_bytes": 1211
+          },
+          "status_after_commit_cache_hit": false
+        },
+        {
+          "changed_paths": 1000,
+          "status_dirty": {
+            "milliseconds": 4811.175,
+            "response_bytes": 313229
+          },
+          "explicit_path_diff": {
+            "milliseconds": 26.299,
+            "response_bytes": 82799
+          },
+          "stage_paths": {
+            "milliseconds": 327958.755,
+            "response_bytes": 279041
+          },
+          "commit": {
+            "milliseconds": 444.161,
+            "response_bytes": 96420
+          },
+          "status_after_commit": {
+            "milliseconds": 15568.802,
+            "response_bytes": 1212
+          },
+          "status_after_commit_cache_hit": false
+        }
+      ],
+      "scenario_wall_milliseconds": 439391.84
+    }
+  ],
+  "sqlite": [
+    {
+      "fixture": {
+        "rows": 10000,
+        "payload_bytes": 64,
+        "change_counts": [
+          1,
+          100,
+          10000
+        ],
+        "database_bytes": 753664
+      },
+      "fixture_generation": {
+        "milliseconds": 10.679,
+        "response_bytes": 0
+      },
+      "repository_bytes": 1218219,
+      "peak_rss_bytes": 82804736,
+      "operations": {
+        "session_open": {
+          "milliseconds": 439.723,
+          "response_bytes": 2
+        },
+        "init": {
+          "milliseconds": 400.102,
+          "response_bytes": 310
+        },
+        "stage_initial": {
+          "milliseconds": 11.733,
+          "response_bytes": 146
+        },
+        "commit_initial": {
+          "milliseconds": 8.596,
+          "response_bytes": 446
+        },
+        "clean_status_hot": {
+          "samples": [
+            17.586,
+            0.846,
+            0.488,
+            0.56,
+            0.454
+          ],
+          "min": 0.454,
+          "p50": 0.56,
+          "p95": 17.586,
+          "max": 17.586,
+          "response_bytes": 1200
+        },
+        "history_summaries_50": {
+          "samples": [
+            0.266,
+            0.115,
+            0.1,
+            0.098,
+            0.096
+          ],
+          "min": 0.096,
+          "p50": 0.1,
+          "p95": 0.266,
+          "max": 0.266,
+          "response_bytes": 1652
+        },
+        "reopen": {
+          "milliseconds": 500.24,
+          "response_bytes": 2
+        },
+        "status_after_reopen": {
+          "milliseconds": 1.66,
+          "response_bytes": 1200
+        },
+        "persistent_status_hit": true
+      },
+      "mutation_rounds": [
+        {
+          "changed_rows": 1,
+          "status_dirty": {
+            "milliseconds": 12.955,
+            "response_bytes": 1515
+          },
+          "working_summary": {
+            "milliseconds": 17.874,
+            "response_bytes": 1116
+          },
+          "working_rows_first_100": {
+            "milliseconds": 9.959,
+            "response_bytes": 1356
+          },
+          "stage": {
+            "milliseconds": 4.673,
+            "response_bytes": 305
+          },
+          "commit": {
+            "milliseconds": 12.365,
+            "response_bytes": 512
+          },
+          "status_after_commit": {
+            "milliseconds": 13.216,
+            "response_bytes": 1203
+          },
+          "status_after_commit_cache_hit": false,
+          "historical_summary": {
+            "milliseconds": 10.21,
+            "response_bytes": 1231
+          }
+        },
+        {
+          "changed_rows": 100,
+          "status_dirty": {
+            "milliseconds": 11.096,
+            "response_bytes": 1515
+          },
+          "working_summary": {
+            "milliseconds": 9.341,
+            "response_bytes": 1117
+          },
+          "working_rows_first_100": {
+            "milliseconds": 7.427,
+            "response_bytes": 21650
+          },
+          "stage": {
+            "milliseconds": 4.601,
+            "response_bytes": 305
+          },
+          "commit": {
+            "milliseconds": 6.852,
+            "response_bytes": 514
+          },
+          "status_after_commit": {
+            "milliseconds": 14.27,
+            "response_bytes": 1203
+          },
+          "status_after_commit_cache_hit": false,
+          "historical_summary": {
+            "milliseconds": 9.351,
+            "response_bytes": 1232
+          }
+        },
+        {
+          "changed_rows": 10000,
+          "status_dirty": {
+            "milliseconds": 13.496,
+            "response_bytes": 1515
+          },
+          "working_summary": {
+            "milliseconds": 8.43,
+            "response_bytes": 1119
+          },
+          "working_rows_first_100": {
+            "milliseconds": 1.236,
+            "response_bytes": 21499
+          },
+          "stage": {
+            "milliseconds": 5.997,
+            "response_bytes": 305
+          },
+          "commit": {
+            "milliseconds": 12.917,
+            "response_bytes": 516
+          },
+          "status_after_commit": {
+            "milliseconds": 14.441,
+            "response_bytes": 1203
+          },
+          "status_after_commit_cache_hit": false,
+          "historical_summary": {
+            "milliseconds": 10.926,
+            "response_bytes": 1235
+          }
+        }
+      ],
+      "scenario_wall_milliseconds": 1758.161
+    },
+    {
+      "fixture": {
+        "rows": 100000,
+        "payload_bytes": 256,
+        "change_counts": [
+          1,
+          100,
+          10000
+        ],
+        "database_bytes": 27385856
+      },
+      "fixture_generation": {
+        "milliseconds": 136.286,
+        "response_bytes": 0
+      },
+      "repository_bytes": 31540237,
+      "peak_rss_bytes": 239583232,
+      "operations": {
+        "session_open": {
+          "milliseconds": 404.297,
+          "response_bytes": 2
+        },
+        "init": {
+          "milliseconds": 476.649,
+          "response_bytes": 310
+        },
+        "stage_initial": {
+          "milliseconds": 86.485,
+          "response_bytes": 146
+        },
+        "commit_initial": {
+          "milliseconds": 55.502,
+          "response_bytes": 446
+        },
+        "clean_status_hot": {
+          "samples": [
+            34.633,
+            0.271,
+            0.206,
+            0.203,
+            0.197
+          ],
+          "min": 0.197,
+          "p50": 0.206,
+          "p95": 34.633,
+          "max": 34.633,
+          "response_bytes": 1200
+        },
+        "history_summaries_50": {
+          "samples": [
+            0.352,
+            0.127,
+            0.12,
+            0.104,
+            0.104
+          ],
+          "min": 0.104,
+          "p50": 0.12,
+          "p95": 0.352,
+          "max": 0.352,
+          "response_bytes": 1653
+        },
+        "reopen": {
+          "milliseconds": 488.042,
+          "response_bytes": 2
+        },
+        "status_after_reopen": {
+          "milliseconds": 0.666,
+          "response_bytes": 1199
+        },
+        "persistent_status_hit": true
+      },
+      "mutation_rounds": [
+        {
+          "changed_rows": 1,
+          "status_dirty": {
+            "milliseconds": 11.627,
+            "response_bytes": 1515
+          },
+          "working_summary": {
+            "milliseconds": 214.022,
+            "response_bytes": 1119
+          },
+          "working_rows_first_100": {
+            "milliseconds": 111.946,
+            "response_bytes": 1744
+          },
+          "stage": {
+            "milliseconds": 69.135,
+            "response_bytes": 305
+          },
+          "commit": {
+            "milliseconds": 44.5,
+            "response_bytes": 512
+          },
+          "status_after_commit": {
+            "milliseconds": 38.444,
+            "response_bytes": 1203
+          },
+          "status_after_commit_cache_hit": false,
+          "historical_summary": {
+            "milliseconds": 194.427,
+            "response_bytes": 1234
+          }
+        },
+        {
+          "changed_rows": 100,
+          "status_dirty": {
+            "milliseconds": 18.985,
+            "response_bytes": 1515
+          },
+          "working_summary": {
+            "milliseconds": 192.131,
+            "response_bytes": 1121
+          },
+          "working_rows_first_100": {
+            "milliseconds": 113.353,
+            "response_bytes": 60153
+          },
+          "stage": {
+            "milliseconds": 79.009,
+            "response_bytes": 305
+          },
+          "commit": {
+            "milliseconds": 45.709,
+            "response_bytes": 514
+          },
+          "status_after_commit": {
+            "milliseconds": 35.736,
+            "response_bytes": 1203
+          },
+          "status_after_commit_cache_hit": false,
+          "historical_summary": {
+            "milliseconds": 195.525,
+            "response_bytes": 1236
+          }
+        },
+        {
+          "changed_rows": 10000,
+          "status_dirty": {
+            "milliseconds": 17.602,
+            "response_bytes": 1515
+          },
+          "working_summary": {
+            "milliseconds": 192.074,
+            "response_bytes": 1123
+          },
+          "working_rows_first_100": {
+            "milliseconds": 19.757,
+            "response_bytes": 59999
+          },
+          "stage": {
+            "milliseconds": 130.226,
+            "response_bytes": 305
+          },
+          "commit": {
+            "milliseconds": 233.181,
+            "response_bytes": 516
+          },
+          "status_after_commit": {
+            "milliseconds": 37.799,
+            "response_bytes": 1203
+          },
+          "status_after_commit_cache_hit": false,
+          "historical_summary": {
+            "milliseconds": 240.802,
+            "response_bytes": 1238
+          }
+        }
+      ],
+      "scenario_wall_milliseconds": 4161.638
+    },
+    {
+      "fixture": {
+        "rows": 1000000,
+        "payload_bytes": 384,
+        "change_counts": [
+          1,
+          100,
+          10000
+        ],
+        "database_bytes": 410636288
+      },
+      "fixture_generation": {
+        "milliseconds": 1622.74,
+        "response_bytes": 0
+      },
+      "repository_bytes": 463502481,
+      "peak_rss_bytes": 808189952,
+      "operations": {
+        "session_open": {
+          "milliseconds": 433.325,
+          "response_bytes": 2
+        },
+        "init": {
+          "milliseconds": 408.843,
+          "response_bytes": 310
+        },
+        "stage_initial": {
+          "milliseconds": 1103.629,
+          "response_bytes": 146
+        },
+        "commit_initial": {
+          "milliseconds": 2255.79,
+          "response_bytes": 446
+        },
+        "clean_status_hot": {
+          "samples": [
+            534.951,
+            0.33,
+            0.234,
+            0.212,
+            0.198
+          ],
+          "min": 0.198,
+          "p50": 0.234,
+          "p95": 534.951,
+          "max": 534.951,
+          "response_bytes": 1200
+        },
+        "history_summaries_50": {
+          "samples": [
+            0.568,
+            0.138,
+            0.12,
+            0.106,
+            0.099
+          ],
+          "min": 0.099,
+          "p50": 0.12,
+          "p95": 0.568,
+          "max": 0.568,
+          "response_bytes": 1654
+        },
+        "reopen": {
+          "milliseconds": 855.884,
+          "response_bytes": 2
+        },
+        "status_after_reopen": {
+          "milliseconds": 0.669,
+          "response_bytes": 1199
+        },
+        "persistent_status_hit": true
+      },
+      "mutation_rounds": [
+        {
+          "changed_rows": 1,
+          "status_dirty": {
+            "milliseconds": 13.66,
+            "response_bytes": 1515
+          },
+          "working_summary": {
+            "milliseconds": 3649.99,
+            "response_bytes": 1122
+          },
+          "working_rows_first_100": {
+            "milliseconds": 1675.274,
+            "response_bytes": 2003
+          },
+          "stage": {
+            "milliseconds": 1145.536,
+            "response_bytes": 305
+          },
+          "commit": {
+            "milliseconds": 1230.769,
+            "response_bytes": 512
+          },
+          "status_after_commit": {
+            "milliseconds": 546.053,
+            "response_bytes": 1204
+          },
+          "status_after_commit_cache_hit": false,
+          "historical_summary": {
+            "milliseconds": 3973.779,
+            "response_bytes": 1237
+          }
+        },
+        {
+          "changed_rows": 100,
+          "status_dirty": {
+            "milliseconds": 13.489,
+            "response_bytes": 1515
+          },
+          "working_summary": {
+            "milliseconds": 3022.43,
+            "response_bytes": 1124
+          },
+          "working_rows_first_100": {
+            "milliseconds": 1728.666,
+            "response_bytes": 85855
+          },
+          "stage": {
+            "milliseconds": 1093.235,
+            "response_bytes": 305
+          },
+          "commit": {
+            "milliseconds": 1278.913,
+            "response_bytes": 514
+          },
+          "status_after_commit": {
+            "milliseconds": 637.76,
+            "response_bytes": 1204
+          },
+          "status_after_commit_cache_hit": false,
+          "historical_summary": {
+            "milliseconds": 3921.808,
+            "response_bytes": 1239
+          }
+        },
+        {
+          "changed_rows": 10000,
+          "status_dirty": {
+            "milliseconds": 14.5,
+            "response_bytes": 1515
+          },
+          "working_summary": {
+            "milliseconds": 3284.025,
+            "response_bytes": 1126
+          },
+          "working_rows_first_100": {
+            "milliseconds": 440.102,
+            "response_bytes": 85701
+          },
+          "stage": {
+            "milliseconds": 1504.853,
+            "response_bytes": 305
+          },
+          "commit": {
+            "milliseconds": 1499.509,
+            "response_bytes": 516
+          },
+          "status_after_commit": {
+            "milliseconds": 602.307,
+            "response_bytes": 1204
+          },
+          "status_after_commit_cache_hit": false,
+          "historical_summary": {
+            "milliseconds": 4085.254,
+            "response_bytes": 1241
+          }
+        }
+      ],
+      "scenario_wall_milliseconds": 43182.919
+    }
+  ]
+}
