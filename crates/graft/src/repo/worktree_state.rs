@@ -7,6 +7,16 @@ type CachedCommitTreeState = Arc<(
     BTreeMap<String, CommitArtifactState>,
 )>;
 type CachedTreeObject = Arc<object::TreeObject>;
+type RepoStateMaps = (
+    BTreeMap<String, CommitFileState>,
+    BTreeMap<String, CommitArtifactState>,
+);
+type RevisionStates = (
+    String,
+    BTreeMap<String, CommitFileState>,
+    BTreeMap<String, CommitArtifactState>,
+);
+type RevisionStatePair = (RevisionStates, RevisionStates);
 
 static COMMIT_TREE_CACHE: OnceLock<Mutex<HashMap<(PathBuf, String), CachedCommitTreeState>>> =
     OnceLock::new();
@@ -586,11 +596,7 @@ impl Repository {
         &self,
         revision: &str,
         filter: &str,
-    ) -> Result<(
-        String,
-        BTreeMap<String, CommitFileState>,
-        BTreeMap<String, CommitArtifactState>,
-    )> {
+    ) -> Result<RevisionStates> {
         let target = self.resolve_revision(revision)?;
         let id = object::ObjectId::from_str(&target)?;
         let commit = self
@@ -616,6 +622,117 @@ impl Repository {
             }
         }
         Ok((target, files, artifacts))
+    }
+
+    /// Load only the states needed for a filtered revision diff while retaining enough
+    /// same-object peers to classify exact path moves consistently with an unfiltered diff.
+    /// Tree metadata is cheap to scan and cached; `SQLite` contents are not materialized here.
+    pub(super) fn revision_state_pair_for_filter(
+        &self,
+        from: &str,
+        to: &str,
+        filter: &str,
+    ) -> Result<RevisionStatePair> {
+        let from_target = self.resolve_revision(from)?;
+        let to_target = self.resolve_revision(to)?;
+        let from_tree = self.revision_tree(&from_target)?;
+        let to_tree = self.revision_tree(&to_target)?;
+        let filter = normalize_repo_path(filter);
+
+        let move_candidate_ids = from_tree
+            .entries
+            .iter()
+            .chain(to_tree.entries.iter())
+            .filter(|entry| repo_path_matches_filter(&entry.path, Some(&filter)))
+            .map(|entry| entry.oid.clone())
+            .collect::<BTreeSet<_>>();
+        let mut move_candidate_volumes = self.filtered_sqlite_volumes(&from_tree, &filter)?;
+        move_candidate_volumes.extend(self.filtered_sqlite_volumes(&to_tree, &filter)?);
+
+        let (from_files, from_artifacts) = self.filtered_tree_states(
+            &from_tree,
+            &filter,
+            &move_candidate_ids,
+            &move_candidate_volumes,
+        )?;
+        let (to_files, to_artifacts) = self.filtered_tree_states(
+            &to_tree,
+            &filter,
+            &move_candidate_ids,
+            &move_candidate_volumes,
+        )?;
+
+        Ok((
+            (from_target, from_files, from_artifacts),
+            (to_target, to_files, to_artifacts),
+        ))
+    }
+
+    fn revision_tree(&self, target: &str) -> Result<CachedTreeObject> {
+        let id = object::ObjectId::from_str(target)?;
+        let commit = self
+            .read_commit_object(&id)?
+            .ok_or_else(|| RepoErr::CommitNotFound(target.to_string()))?;
+        self.tree_object_from_object(&commit.tree)
+    }
+
+    fn filtered_tree_states(
+        &self,
+        tree: &object::TreeObject,
+        filter: &str,
+        move_candidate_ids: &BTreeSet<object::ObjectId>,
+        move_candidate_volumes: &BTreeSet<VolumeId>,
+    ) -> Result<RepoStateMaps> {
+        let mut files = BTreeMap::new();
+        let mut artifacts = BTreeMap::new();
+        for entry in &tree.entries {
+            let include_directly = repo_path_matches_filter(&entry.path, Some(filter))
+                || move_candidate_ids.contains(&entry.oid);
+            if !include_directly
+                && (entry.mode != object::TreeEntryMode::SqliteDatabase
+                    || move_candidate_volumes.is_empty())
+            {
+                continue;
+            }
+            cancellation_checkpoint()?;
+            let state = self.tree_entry_state(entry)?;
+            if !include_directly
+                && !matches!(
+                    &state,
+                    RepoTrackedPathState::File(file)
+                        if move_candidate_volumes.contains(&file.volume)
+                )
+            {
+                continue;
+            }
+            match state {
+                RepoTrackedPathState::File(state) => {
+                    files.insert(entry.path.clone(), state);
+                }
+                RepoTrackedPathState::Artifact(state) => {
+                    artifacts.insert(entry.path.clone(), state);
+                }
+            }
+        }
+        Ok((files, artifacts))
+    }
+
+    fn filtered_sqlite_volumes(
+        &self,
+        tree: &object::TreeObject,
+        filter: &str,
+    ) -> Result<BTreeSet<VolumeId>> {
+        let mut volumes = BTreeSet::new();
+        for entry in tree.entries.iter().filter(|entry| {
+            entry.mode == object::TreeEntryMode::SqliteDatabase
+                && repo_path_matches_filter(&entry.path, Some(filter))
+        }) {
+            cancellation_checkpoint()?;
+            if let RepoTrackedPathState::File(state) = self.tree_entry_state(entry)? {
+                volumes.insert(state.volume);
+            }
+        }
+        Ok(volumes)
     }
 
     pub(super) fn commit_path_state(
@@ -730,15 +847,7 @@ impl Repository {
         }
     }
 
-    pub(super) fn commit_tree_state(
-        &self,
-        id: &str,
-    ) -> Result<
-        Option<(
-            BTreeMap<String, CommitFileState>,
-            BTreeMap<String, CommitArtifactState>,
-        )>,
-    > {
+    pub(super) fn commit_tree_state(&self, id: &str) -> Result<Option<RepoStateMaps>> {
         let id = object::ObjectId::from_str(id)?;
         let Some(commit) = self.read_commit_object(&id)? else {
             return Ok(None);
@@ -907,57 +1016,27 @@ impl Repository {
     ) -> Result<Vec<RepoStagedChange>> {
         let head_files = self.head_files()?;
         let head_artifacts = self.head_artifacts()?;
-        let mut changes = Vec::new();
-
-        for entry in index.stage0_entries() {
-            let was_tracked =
-                head_files.contains_key(&entry.path) || head_artifacts.contains_key(&entry.path);
-            let (change, kind, storage) = if entry.file.is_some() {
-                (
-                    if was_tracked {
-                        RepoFileChange::Modified
-                    } else {
-                        RepoFileChange::Added
-                    },
-                    RepoTrackedPathKind::SqliteDatabase,
-                    RepoPathStorage::SqliteSnapshot,
-                )
-            } else if let Some(artifact) = &entry.artifact {
-                (
-                    if was_tracked {
-                        RepoFileChange::Modified
-                    } else {
-                        RepoFileChange::Added
-                    },
-                    artifact_tracked_path_kind(artifact),
-                    artifact_tracked_path_storage(artifact),
-                )
-            } else {
-                let (kind, storage) = if head_files.contains_key(&entry.path) {
-                    (
-                        RepoTrackedPathKind::SqliteDatabase,
-                        RepoPathStorage::SqliteSnapshot,
-                    )
-                } else if let Some(artifact) = head_artifacts.get(&entry.path) {
-                    (
-                        artifact_tracked_path_kind(artifact),
-                        artifact_tracked_path_storage(artifact),
-                    )
-                } else {
-                    (RepoTrackedPathKind::BinaryFile, RepoPathStorage::Inline)
-                };
-                (RepoFileChange::Deleted, kind, storage)
-            };
-
-            changes.push(RepoStagedChange {
-                path: entry.path.clone(),
-                change,
-                kind,
-                storage,
-            });
-        }
-
-        Ok(changes)
+        let files = self.files_for_worktree_status(index)?;
+        let artifacts = self.artifacts_for_worktree_status(index)?;
+        Ok(diff_repo_maps(
+            "HEAD",
+            "index",
+            &head_files,
+            &files,
+            &head_artifacts,
+            &artifacts,
+            None,
+        )
+        .paths
+        .into_iter()
+        .map(|diff| RepoStagedChange {
+            path: diff.path,
+            previous_path: diff.previous_path,
+            change: diff.change,
+            kind: diff.kind,
+            storage: diff.storage,
+        })
+        .collect())
     }
 
     pub(super) fn conflicted_changes_for_index(

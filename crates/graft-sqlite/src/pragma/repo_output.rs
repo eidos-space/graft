@@ -168,6 +168,7 @@ pub(super) fn repo_file_change_label(change: RepoFileChange) -> &'static str {
         RepoFileChange::Added => "added",
         RepoFileChange::Deleted => "deleted",
         RepoFileChange::Modified => "modified",
+        RepoFileChange::Renamed => "renamed",
     }
 }
 

@@ -768,6 +768,161 @@ fn commit_changed_paths_pages_root_and_first_parent_changes() {
 }
 
 #[test]
+fn recorded_artifact_move_is_one_rename_across_status_diff_and_history() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = Repository::init(tmp.path()).unwrap();
+    let previous = tmp.path().join("old.txt");
+    let current = tmp.path().join("folder/new.txt");
+    fs::write(&previous, "same payload\n").unwrap();
+    repo.stage_artifact_path(&previous).unwrap();
+    let base = repo.commit_staged("base").unwrap();
+
+    fs::create_dir_all(current.parent().unwrap()).unwrap();
+    fs::rename(&previous, &current).unwrap();
+    repo.stage_path_move_keys("old.txt", "folder/new.txt")
+        .unwrap();
+
+    let status = repo.status().unwrap();
+    assert_eq!(status.staged_changes.len(), 1);
+    assert_eq!(status.staged_changes[0].path, "folder/new.txt");
+    assert_eq!(
+        status.staged_changes[0].previous_path.as_deref(),
+        Some("old.txt")
+    );
+    assert_eq!(status.staged_changes[0].change, RepoFileChange::Renamed);
+
+    let staged = repo.diff_staged(Some("folder/new.txt")).unwrap();
+    assert_eq!(staged.paths.len(), 1);
+    assert_eq!(staged.paths[0].change, RepoFileChange::Renamed);
+    assert_eq!(staged.paths[0].previous_path.as_deref(), Some("old.txt"));
+    assert_eq!(staged.artifacts[0].from, staged.artifacts[0].to);
+    let by_old_path = repo.diff_staged(Some("old.txt")).unwrap();
+    assert_eq!(by_old_path.paths, staged.paths);
+
+    let moved = repo.commit_staged("move").unwrap();
+    let changed = repo
+        .commit_changed_paths_page(&moved.id, 100, None)
+        .unwrap();
+    assert_eq!(changed.parent.as_deref(), Some(base.id.as_str()));
+    assert_eq!(changed.total_changed_paths, 1);
+    assert_eq!(changed.paths[0].change, RepoFileChange::Renamed);
+    assert_eq!(changed.paths[0].previous_path.as_deref(), Some("old.txt"));
+    for path in ["old.txt", "folder/new.txt"] {
+        let detail = repo
+            .diff_revisions(&base.id, &moved.id, Some(path))
+            .unwrap();
+        assert_eq!(detail.paths.len(), 1);
+        assert_eq!(detail.paths[0].change, RepoFileChange::Renamed);
+        assert_eq!(detail.paths[0].previous_path.as_deref(), Some("old.txt"));
+        assert_eq!(detail.artifacts[0].from, detail.artifacts[0].to);
+    }
+    assert_eq!(
+        repo.history_summary_page(1, None).unwrap().commits[0]
+            .path_changes
+            .unwrap()
+            .modified,
+        1
+    );
+}
+
+#[test]
+fn recorded_sqlite_move_preserves_identity_across_later_content_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = Repository::init(tmp.path()).unwrap();
+    let previous = tmp.path().join("old.eidos");
+    let current = tmp.path().join("folder/new.eidos");
+    let volume = VolumeId::random();
+    let snapshot = Snapshot::new(LogId::random(), LSN::FIRST..=LSN::new(3), PageCount::new(7));
+    fs::write(&previous, b"physical placeholder").unwrap();
+    repo.stage_file(&previous, volume.clone(), &snapshot)
+        .unwrap();
+    let base = repo.commit_staged("base").unwrap();
+    let expected = repo.head_file(&previous).unwrap().unwrap();
+
+    fs::create_dir_all(current.parent().unwrap()).unwrap();
+    fs::rename(&previous, &current).unwrap();
+    repo.stage_path_move_keys("old.eidos", "folder/new.eidos")
+        .unwrap();
+
+    assert_eq!(repo.index_file(&current).unwrap(), Some(expected.clone()));
+    let staged = repo.diff_staged(Some("folder/new.eidos")).unwrap();
+    assert_eq!(staged.paths.len(), 1);
+    assert_eq!(staged.paths[0].change, RepoFileChange::Renamed);
+    assert_eq!(staged.files[0].from, Some(expected.clone()));
+    assert_eq!(staged.files[0].to, Some(expected.clone()));
+
+    let updated_snapshot =
+        Snapshot::new(LogId::random(), LSN::FIRST..=LSN::new(5), PageCount::new(9));
+    repo.stage_file(&current, volume, &updated_snapshot)
+        .unwrap();
+    let updated = repo.index_file(&current).unwrap().unwrap();
+    assert_ne!(updated, expected);
+    assert_eq!(updated.volume, expected.volume);
+    let staged = repo.diff_staged(Some("folder/new.eidos")).unwrap();
+    assert_eq!(staged.paths.len(), 1);
+    assert_eq!(staged.paths[0].change, RepoFileChange::Renamed);
+    assert_eq!(staged.files[0].from, Some(expected.clone()));
+    assert_eq!(staged.files[0].to, Some(updated.clone()));
+
+    let moved = repo.commit_staged("move sqlite").unwrap();
+    let changed = repo
+        .commit_changed_paths_page(&moved.id, 100, None)
+        .unwrap();
+    assert_eq!(changed.total_changed_paths, 1);
+    assert_eq!(changed.paths[0].change, RepoFileChange::Renamed);
+    assert_eq!(changed.paths[0].previous_path.as_deref(), Some("old.eidos"));
+    for path in ["old.eidos", "folder/new.eidos"] {
+        let detail = repo
+            .diff_revisions(&base.id, &moved.id, Some(path))
+            .unwrap();
+        assert_eq!(detail.paths.len(), 1);
+        assert_eq!(detail.paths[0].change, RepoFileChange::Renamed);
+        assert_eq!(detail.paths[0].previous_path.as_deref(), Some("old.eidos"));
+        assert_eq!(detail.files[0].from, Some(expected.clone()));
+        assert_eq!(detail.files[0].to, Some(updated.clone()));
+    }
+}
+
+#[test]
+fn recorded_directory_move_expands_tracked_descendants_atomically() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = Repository::init(tmp.path()).unwrap();
+    let previous = tmp.path().join("old");
+    fs::create_dir_all(previous.join("nested")).unwrap();
+    fs::write(previous.join("one.txt"), "one\n").unwrap();
+    fs::write(previous.join("nested/two.txt"), "two\n").unwrap();
+    repo.stage_artifact_path(previous.join("one.txt")).unwrap();
+    repo.stage_artifact_path(previous.join("nested/two.txt"))
+        .unwrap();
+    repo.commit_staged("base").unwrap();
+
+    fs::rename(&previous, tmp.path().join("new")).unwrap();
+    repo.stage_path_move_keys("old", "new").unwrap();
+
+    let status = repo.status().unwrap();
+    assert_eq!(status.staged_changes.len(), 2);
+    assert!(status.staged_changes.iter().all(|change| {
+        change.change == RepoFileChange::Renamed && change.previous_path.is_some()
+    }));
+    let moved = repo.commit_staged("move folder").unwrap();
+    let changed = repo
+        .commit_changed_paths_page(&moved.id, 100, None)
+        .unwrap();
+    assert_eq!(changed.total_changed_paths, 2);
+    assert_eq!(
+        changed
+            .paths
+            .iter()
+            .map(|change| (change.previous_path.as_deref(), change.path.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (Some("old/nested/two.txt"), "new/nested/two.txt"),
+            (Some("old/one.txt"), "new/one.txt")
+        ]
+    );
+}
+
+#[test]
 fn cancellation_scope_returns_cancelled_without_poisoning_repository() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = Repository::init(tmp.path()).unwrap();

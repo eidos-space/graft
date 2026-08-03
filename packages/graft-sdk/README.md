@@ -154,6 +154,7 @@ files in the Space. Changes confined to `.graft` are not counted.
 | `listRemotes` | Read a credential-free remote URL/config projection without scanning the worktree | No |
 | `addAll` | Read/import the current worktree into the index | No |
 | `stagePaths` | Stage up to 1,000 explicit paths in one serialized SDK call | No |
+| `recordPathMove` | Preserve tracked identity after a physical file or directory rename | No |
 | `untrackPaths` | Remove up to 1,000 explicit files from the index without touching the worktree | No |
 | `commit` | Advance repository history | No |
 | `diff` | Compare worktree, index, or revisions | No |
@@ -184,6 +185,14 @@ application handles after the SDK promise settles; the Graft repository session 
 still checkpoint its application databases before snapshotting when it needs a deterministic
 commit boundary. `commit` advances history from the staged canonical snapshot without writing that
 snapshot back to the worktree, so an open application SQLite handle keeps the same file identity.
+
+After the host application physically renames a tracked file or directory, call
+`recordPathMove({ previousPath, path })`. Graft atomically moves the existing index identities,
+expands tracked directory descendants internally, and does not read or re-import payloads. Status,
+staged diff, commit changed paths, and filtered historical diff then expose one `renamed` change
+with `previous_path`. Exact object moves discovered without this hint are also paired during diff,
+but the explicit operation is required to preserve a moved SQLite snapshot identity before the
+next stage.
 
 ## Lifecycle, writers, and recovery
 

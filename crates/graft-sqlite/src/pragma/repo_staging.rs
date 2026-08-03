@@ -178,6 +178,7 @@ pub(super) fn json_staged_entry_paths(
                 staged_entry_kind_storage_and_change(head.as_ref(), entry);
             Ok(crate::json::JsonRepoPathDiff {
                 path: entry.path.clone(),
+                previous_path: None,
                 change: repo_file_change_label(change).to_string(),
                 kind: repo_tracked_path_kind_json_label(kind).to_string(),
                 storage: repo_path_storage_json_label(storage).to_string(),

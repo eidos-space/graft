@@ -1375,6 +1375,7 @@ fn status_kind_filter_recomputes_paths_and_counts() {
         staged: vec!["app.db".to_string()],
         staged_changes: vec![RepoStagedChange {
             path: "app.db".to_string(),
+            previous_path: None,
             change: RepoFileChange::Modified,
             kind: RepoTrackedPathKind::SqliteDatabase,
             storage: RepoPathStorage::SqliteSnapshot,

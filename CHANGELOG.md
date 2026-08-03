@@ -1,5 +1,31 @@
 # Changelog
 
+## Graft SDK 0.3.7 — 2026-08-04
+
+### Added
+
+- Added `recordPathMove`, an index-only SDK operation that records completed file or directory
+  moves without re-reading artifact payloads or re-importing SQLite databases.
+- Added first-class `renamed` changes with `previous_path` across status, staged and historical
+  diffs, changed-path pages, bounded SQLite output, Node bindings, and TypeScript declarations.
+
+### Changed
+
+- SQLite path moves are paired by stable Volume identity, so moving an Eidos File and then editing
+  it remains one rename with ordinary row changes instead of degrading into delete plus add.
+- Exact artifact moves are paired by content object identity, directory moves expand tracked
+  descendants atomically, and path-filtered history recognizes a rename from either its old or new
+  path without hydrating unrelated SQLite contents.
+- `diffSqlitePaths` can fall back to staged state and overlay staged move identity onto current
+  worktree rows, keeping applications summary-first and free from rename reconstruction logic.
+
+### Compatibility
+
+- Existing commit objects and three-field path-change counts remain unchanged; renames contribute
+  to the existing modified count while exposing their richer per-path representation.
+- Existing SDK operations remain available. Recording a move is non-materializing and preserves
+  the worktree as the application's authoritative local state.
+
 ## Graft SDK 0.3.6 — 2026-08-03
 
 ### Added

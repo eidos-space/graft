@@ -43,6 +43,7 @@ test("exposes ABI-stable SDK metadata and materialization contract", () => {
     "listRemotes",
     "addAll",
     "stagePaths",
+    "recordPathMove",
     "untrackPaths",
     "commit",
     "diff",
@@ -164,6 +165,45 @@ test("repeated status and diff reuse one native session without a CLI", async ()
     } finally {
       restoreEnvironment("GRAFT_CLI_PATH", previousCliPath)
     }
+  })
+})
+
+test("records file moves as one rename without re-reading the payload", async () => {
+  await withTemporaryDirectory("graft-sdk-move-", async (root) => {
+    const session = await RepositorySession.open(root)
+    await session.init()
+    await fs.writeFile(path.join(root, "old.txt"), "same payload\n")
+    await session.addAll()
+    await session.commit("base")
+
+    await fs.mkdir(path.join(root, "folder"))
+    await fs.rename(
+      path.join(root, "old.txt"),
+      path.join(root, "folder", "new.txt")
+    )
+    const recorded = await session.recordPathMove({
+      previousPath: "old.txt",
+      path: "folder/new.txt",
+    })
+    assert.deepEqual(recorded, {
+      previous_path: "old.txt",
+      path: "folder/new.txt",
+      change: "renamed",
+      materializes_worktree: false,
+    })
+
+    const status = await session.statusIncremental()
+    assert.equal(status.status.staged_changes.length, 1)
+    assert.equal(status.status.staged_changes[0].change, "renamed")
+    assert.equal(status.status.staged_changes[0].previous_path, "old.txt")
+    const committed = await session.commit("move")
+    const changed = await session.commitChangedPaths({
+      revision: committed.commit.id,
+    })
+    assert.equal(changed.total_changed_paths, 1)
+    assert.equal(changed.paths[0].change, "renamed")
+    assert.equal(changed.paths[0].previous_path, "old.txt")
+    await session.close()
   })
 })
 

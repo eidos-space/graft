@@ -1,6 +1,156 @@
 use super::*;
 
 impl Repository {
+    /// Records a physical worktree rename in the index without re-reading or re-importing the
+    /// payload. This is the repository equivalent of `git mv`: the source's tracked identity is
+    /// preserved at the destination and later content edits remain ordinary unstaged changes.
+    pub fn stage_path_move_keys(
+        &self,
+        previous_path: &str,
+        path: &str,
+    ) -> Result<Vec<index::IndexEntry>> {
+        let previous_path = normalize_repo_path_key(previous_path)?;
+        let path = normalize_repo_path_key(path)?;
+        if previous_path == path {
+            return Err(RepoErr::InvalidPathMove {
+                from: previous_path,
+                to: path,
+                reason: "source and destination are identical",
+            });
+        }
+        let destination_metadata =
+            fs::symlink_metadata(self.worktree.join(&path)).map_err(|_| {
+                RepoErr::InvalidPathMove {
+                    from: previous_path.clone(),
+                    to: path.clone(),
+                    reason: "destination does not exist",
+                }
+            })?;
+        if !destination_metadata.file_type().is_file() && !destination_metadata.file_type().is_dir()
+        {
+            return Err(RepoErr::InvalidPathMove {
+                from: previous_path,
+                to: path,
+                reason: "destination is not a regular file or directory",
+            });
+        }
+        if self.worktree.join(&previous_path).exists() {
+            return Err(RepoErr::InvalidPathMove {
+                from: previous_path,
+                to: path,
+                reason: "source still exists in the worktree",
+            });
+        }
+        let files = self.index_files()?;
+        let artifacts = self.index_artifacts()?;
+        let head_files = self.head_files()?;
+        let head_artifacts = self.head_artifacts()?;
+        let mut moves = Vec::<(String, String, RepoTrackedPathState, bool)>::new();
+        if destination_metadata.file_type().is_file() {
+            let source_state = files
+                .get(&previous_path)
+                .cloned()
+                .map(RepoTrackedPathState::File)
+                .or_else(|| {
+                    artifacts
+                        .get(&previous_path)
+                        .cloned()
+                        .map(RepoTrackedPathState::Artifact)
+                })
+                .ok_or_else(|| RepoErr::PathNotTracked(previous_path.clone()))?;
+            moves.push((
+                previous_path.clone(),
+                path.clone(),
+                source_state,
+                head_files.contains_key(&previous_path)
+                    || head_artifacts.contains_key(&previous_path),
+            ));
+        } else {
+            let prefix = format!("{previous_path}/");
+            for (source, state) in
+                files
+                    .iter()
+                    .map(|(source, state)| (source, RepoTrackedPathState::File(state.clone())))
+                    .chain(artifacts.iter().map(|(source, state)| {
+                        (source, RepoTrackedPathState::Artifact(state.clone()))
+                    }))
+                    .filter(|(source, _)| source.starts_with(&prefix))
+            {
+                let suffix = source
+                    .strip_prefix(&prefix)
+                    .expect("filtered path has the source prefix");
+                let destination = format!("{path}/{suffix}");
+                moves.push((
+                    source.clone(),
+                    destination,
+                    state,
+                    head_files.contains_key(source) || head_artifacts.contains_key(source),
+                ));
+            }
+            if moves.is_empty() {
+                return Err(RepoErr::PathNotTracked(previous_path));
+            }
+        }
+        for (_, destination, _, _) in &moves {
+            if files.contains_key(destination) || artifacts.contains_key(destination) {
+                return Err(RepoErr::InvalidPathMove {
+                    from: previous_path,
+                    to: path,
+                    reason: "destination contains an already tracked path",
+                });
+            }
+            if !self.worktree.join(destination).is_file() {
+                return Err(RepoErr::InvalidPathMove {
+                    from: previous_path,
+                    to: path,
+                    reason: "a moved tracked file is missing at the destination",
+                });
+            }
+        }
+
+        let mut index = self.read_index()?;
+        if index.has_conflicts() {
+            return Err(RepoErr::UnresolvedConflicts);
+        }
+        let mut entries = Vec::with_capacity(moves.len() * 2);
+        let mut cleared = Vec::with_capacity(moves.len() * 2);
+        for (source, destination, state, source_was_committed) in moves {
+            let destination_entry = match state {
+                RepoTrackedPathState::File(file) => self.index_entry_for_state(
+                    destination.clone(),
+                    index::IndexStage::Normal,
+                    file,
+                )?,
+                RepoTrackedPathState::Artifact(artifact) => self.index_entry_for_artifact_state(
+                    destination.clone(),
+                    index::IndexStage::Normal,
+                    artifact,
+                ),
+            };
+            index.stage(destination_entry.clone());
+            entries.push(destination_entry);
+            if source_was_committed {
+                let removal = index::IndexEntry {
+                    path: source.clone(),
+                    mode: None,
+                    oid: None,
+                    stage: index::IndexStage::Normal,
+                    file: None,
+                    artifact: None,
+                };
+                index.stage(removal.clone());
+                entries.push(removal);
+            } else {
+                index.remove_path(&source);
+            }
+            cleared.push(source);
+            cleared.push(destination);
+        }
+        self.write_index(&index)?;
+        self.clear_dirty_keys(cleared.iter().map(String::as_str))?;
+        Ok(entries)
+    }
+
     pub fn commit(&self, message: impl Into<String>) -> Result<CommitObject> {
         let commit = self.commit_with_files(message, BTreeMap::new(), Vec::new())?;
         self.clear_dirty()?;

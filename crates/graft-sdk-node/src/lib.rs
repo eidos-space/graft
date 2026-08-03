@@ -5,6 +5,7 @@ use graft_sdk::{
     DiffOptions as CoreDiffOptions, DiffPathsOptions as CoreDiffPathsOptions,
     IgnoredPathsOptions as CoreIgnoredPathsOptions, InventoryKind,
     InventoryOptions as CoreInventoryOptions, ReadPathContentOptions as CoreReadPathContentOptions,
+    RecordPathMoveOptions as CoreRecordPathMoveOptions,
     RemoteConfigureOptions as CoreRemoteConfigureOptions, RepositoryOperation,
     RepositorySession as CoreRepositorySession, RestoreOptions as CoreRestoreOptions,
     RestorePathsOptions as CoreRestorePathsOptions, SdkError,
@@ -44,6 +45,8 @@ pub struct DiffPathsOptions {
 pub struct SqliteDiffPathsOptions {
     pub paths: Vec<String>,
     pub mode: String,
+    pub staged: Option<bool>,
+    pub staged_fallback: Option<bool>,
     pub root: Option<String>,
     pub from: Option<String>,
     pub to: Option<String>,
@@ -81,6 +84,13 @@ pub struct StagePathsOptions {
     pub paths: Vec<String>,
     pub expected_head: Option<String>,
     pub force: Option<bool>,
+}
+
+#[napi(object)]
+pub struct RecordPathMoveOptions {
+    pub previous_path: String,
+    pub path: String,
+    pub expected_head: Option<String>,
 }
 
 #[napi(object)]
@@ -134,6 +144,9 @@ enum JsonOperation {
     AddAll,
     StagePaths {
         options: CoreStagePathsOptions,
+    },
+    RecordPathMove {
+        options: CoreRecordPathMoveOptions,
     },
     UntrackPaths {
         options: CoreUntrackPathsOptions,
@@ -283,6 +296,11 @@ impl JsonTask {
             return serde_json::to_string(&value)
                 .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
         }
+        if let JsonOperation::RecordPathMove { options } = &self.operation {
+            let value = self.session.record_path_move(options).map_err(napi_error)?;
+            return serde_json::to_string(&value)
+                .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
+        }
         if let JsonOperation::UntrackPaths { options } = &self.operation {
             let value = self.session.untrack_paths(options).map_err(napi_error)?;
             return serde_json::to_string(&value)
@@ -317,6 +335,9 @@ impl JsonTask {
             }
             JsonOperation::AddAll => self.session.add_all(),
             JsonOperation::StagePaths { .. } => {
+                unreachable!("handled before JSON value dispatch")
+            }
+            JsonOperation::RecordPathMove { .. } => {
                 unreachable!("handled before JSON value dispatch")
             }
             JsonOperation::UntrackPaths { .. } => {
@@ -502,6 +523,25 @@ impl NodeRepositorySession {
     }
 
     #[napi]
+    pub fn record_path_move(
+        &self,
+        options: RecordPathMoveOptions,
+        signal: Option<AbortSignal>,
+    ) -> AsyncTask<JsonTask> {
+        json_task(
+            self,
+            JsonOperation::RecordPathMove {
+                options: CoreRecordPathMoveOptions {
+                    previous_path: PathBuf::from(options.previous_path),
+                    path: PathBuf::from(options.path),
+                    expected_head: options.expected_head,
+                },
+            },
+            signal,
+        )
+    }
+
+    #[napi]
     pub fn untrack_paths(
         &self,
         options: UntrackPathsOptions,
@@ -590,6 +630,8 @@ impl NodeRepositorySession {
             JsonOperation::SqliteDiffPaths {
                 options: CoreSqliteDiffPathsOptions {
                     paths: options.paths.into_iter().map(PathBuf::from).collect(),
+                    staged: options.staged.unwrap_or(false),
+                    staged_fallback: options.staged_fallback.unwrap_or(false),
                     root: options.root,
                     from: options.from,
                     to: options.to,
@@ -864,6 +906,7 @@ pub fn operation_materializes_worktree(operation: String) -> Result<bool> {
         "list_remotes" | "listRemotes" => RepositoryOperation::ListRemotes,
         "add_all" | "addAll" => RepositoryOperation::AddAll,
         "stage_paths" | "stagePaths" => RepositoryOperation::StagePaths,
+        "record_path_move" | "recordPathMove" => RepositoryOperation::RecordPathMove,
         "untrack_paths" | "untrackPaths" => RepositoryOperation::UntrackPaths,
         "commit" => RepositoryOperation::Commit,
         "diff" => RepositoryOperation::Diff,

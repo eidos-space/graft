@@ -73,6 +73,7 @@ pub(super) fn json_commit_path_changes(
         .iter()
         .map(|change| crate::json::JsonRepoPathDiff {
             path: change.path.clone(),
+            previous_path: change.previous_path.clone(),
             change: repo_file_change_label(change.change).to_string(),
             kind: repo_tracked_path_kind_json_label(change.kind).to_string(),
             storage: repo_path_storage_json_label(change.storage).to_string(),

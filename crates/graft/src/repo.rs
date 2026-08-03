@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fmt::{self, Display},
     fs,
     path::{Path, PathBuf},
@@ -278,6 +278,13 @@ pub enum RepoErr {
 
     #[error("path `{0}` is not tracked")]
     PathNotTracked(String),
+
+    #[error("cannot record path move from `{from}` to `{to}`: {reason}")]
+    InvalidPathMove {
+        from: String,
+        to: String,
+        reason: &'static str,
+    },
 
     #[error("path `{0}` is not a text artifact")]
     PathNotTextArtifact(String),
@@ -643,6 +650,8 @@ pub struct RepoCommitChangedPathsPage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitPathChange {
     pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_path: Option<String>,
     pub change: RepoFileChange,
     pub kind: RepoTrackedPathKind,
     pub storage: RepoPathStorage,
@@ -840,6 +849,8 @@ impl RepoDiff {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoPathDiff {
     pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_path: Option<String>,
     pub change: RepoFileChange,
     pub kind: RepoTrackedPathKind,
     pub storage: RepoPathStorage,
@@ -848,6 +859,8 @@ pub struct RepoPathDiff {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoFileDiff {
     pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_path: Option<String>,
     pub change: RepoFileChange,
     pub kind: RepoTrackedPathKind,
     pub storage: RepoPathStorage,
@@ -865,6 +878,8 @@ pub struct RepoWorktreeFileState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoArtifactDiff {
     pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_path: Option<String>,
     pub change: RepoFileChange,
     pub kind: RepoTrackedPathKind,
     pub storage: RepoPathStorage,
@@ -948,6 +963,7 @@ pub enum RepoFileChange {
     Added,
     Deleted,
     Modified,
+    Renamed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1153,6 +1169,7 @@ impl RepoStatus {
             storage: Option<RepoPathStorage>,
             unstaged_change: Option<RepoWorktreeChangeKind>,
             staged_change: Option<RepoFileChange>,
+            previous_path: Option<String>,
             conflicted: bool,
         }
 
@@ -1199,6 +1216,7 @@ impl RepoStatus {
             record_kind(&mut entry.kind, change.kind);
             record_storage(&mut entry.storage, change.storage);
             entry.staged_change = Some(change.change);
+            entry.previous_path = change.previous_path.clone();
         }
 
         for change in conflicted_changes {
@@ -1231,6 +1249,7 @@ impl RepoStatus {
                     let code = RepoStatusPathState::code(index_status, worktree_status);
                     RepoStatusPath {
                         path,
+                        previous_path: entry.previous_path,
                         kind,
                         storage: entry.storage.unwrap_or_else(|| default_path_storage(kind)),
                         index_status,
@@ -1273,6 +1292,8 @@ impl RepoStatusCounts {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoStatusPath {
     pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_path: Option<String>,
     pub kind: RepoTrackedPathKind,
     pub storage: RepoPathStorage,
     pub index_status: RepoStatusPathState,
@@ -1293,6 +1314,7 @@ pub enum RepoStatusPathState {
     Added,
     Modified,
     Deleted,
+    Renamed,
     Untracked,
     Unmerged,
 }
@@ -1303,6 +1325,7 @@ impl RepoStatusPathState {
             RepoFileChange::Added => Self::Added,
             RepoFileChange::Deleted => Self::Deleted,
             RepoFileChange::Modified => Self::Modified,
+            RepoFileChange::Renamed => Self::Renamed,
         }
     }
 
@@ -1329,6 +1352,7 @@ impl RepoStatusPathState {
             Self::Added => 'A',
             Self::Deleted => 'D',
             Self::Modified => 'M',
+            Self::Renamed => 'R',
             Self::None | Self::Untracked | Self::Unmerged => ' ',
         }
     }
@@ -1338,7 +1362,7 @@ impl RepoStatusPathState {
             Self::Deleted => 'D',
             Self::Modified => 'M',
             Self::Untracked => '?',
-            Self::None | Self::Added | Self::Unmerged => ' ',
+            Self::None | Self::Added | Self::Renamed | Self::Unmerged => ' ',
         }
     }
 }
@@ -1566,6 +1590,8 @@ pub struct RepoWorktreeChange {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoStagedChange {
     pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_path: Option<String>,
     pub change: RepoFileChange,
     pub kind: RepoTrackedPathKind,
     pub storage: RepoPathStorage,
@@ -2483,9 +2509,7 @@ fn diff_repo_maps(
     let path = path.map(normalize_repo_path);
     let mut keys = BTreeMap::<String, ()>::new();
     for key in from_files.keys().chain(to_files.keys()) {
-        if repo_path_matches_filter(key, path.as_deref()) {
-            keys.insert(key.clone(), ());
-        }
+        keys.insert(key.clone(), ());
     }
 
     let mut files = Vec::new();
@@ -2501,6 +2525,7 @@ fn diff_repo_maps(
         if let Some(change) = change {
             files.push(RepoFileDiff {
                 path: key.clone(),
+                previous_path: None,
                 change,
                 kind: RepoTrackedPathKind::SqliteDatabase,
                 storage: RepoPathStorage::SqliteSnapshot,
@@ -2513,9 +2538,7 @@ fn diff_repo_maps(
 
     let mut artifact_keys = BTreeMap::<String, ()>::new();
     for key in from_artifacts.keys().chain(to_artifacts.keys()) {
-        if repo_path_matches_filter(key, path.as_deref()) {
-            artifact_keys.insert(key.clone(), ());
-        }
+        artifact_keys.insert(key.clone(), ());
     }
 
     let mut artifacts = Vec::new();
@@ -2531,6 +2554,7 @@ fn diff_repo_maps(
         if let Some(change) = change {
             artifacts.push(RepoArtifactDiff {
                 path: key.clone(),
+                previous_path: None,
                 change,
                 kind: artifact_diff_kind(before.as_ref(), after.as_ref()),
                 storage: artifact_diff_storage(before.as_ref(), after.as_ref()),
@@ -2539,6 +2563,23 @@ fn diff_repo_maps(
             });
         }
     }
+
+    pair_sqlite_moves(&mut files);
+    pair_exact_artifact_renames(&mut artifacts);
+    files.retain(|diff| {
+        repo_path_matches_filter(&diff.path, path.as_deref())
+            || diff
+                .previous_path
+                .as_deref()
+                .is_some_and(|previous| repo_path_matches_filter(previous, path.as_deref()))
+    });
+    artifacts.retain(|diff| {
+        repo_path_matches_filter(&diff.path, path.as_deref())
+            || diff
+                .previous_path
+                .as_deref()
+                .is_some_and(|previous| repo_path_matches_filter(previous, path.as_deref()))
+    });
 
     let paths = repo_diff_paths(&files, &artifacts);
     RepoDiff {
@@ -2550,16 +2591,111 @@ fn diff_repo_maps(
     }
 }
 
+fn pair_sqlite_moves(files: &mut Vec<RepoFileDiff>) {
+    let mut deleted = BTreeMap::<VolumeId, VecDeque<(usize, String, CommitFileState)>>::new();
+    for (index, diff) in files.iter().enumerate() {
+        if diff.change != RepoFileChange::Deleted {
+            continue;
+        }
+        let Some(state) = diff.from.as_ref() else {
+            continue;
+        };
+        deleted.entry(state.volume.clone()).or_default().push_back((
+            index,
+            diff.path.clone(),
+            state.clone(),
+        ));
+    }
+    let mut consumed = BTreeSet::new();
+    let mut replacements = Vec::new();
+    for (added_index, added) in files.iter().enumerate() {
+        if added.change != RepoFileChange::Added {
+            continue;
+        }
+        let Some(after) = added.to.as_ref() else {
+            continue;
+        };
+        let Some((deleted_index, previous_path, before)) =
+            deleted.get_mut(&after.volume).and_then(VecDeque::pop_front)
+        else {
+            continue;
+        };
+        consumed.insert(deleted_index);
+        replacements.push((added_index, previous_path, before));
+    }
+    for (added_index, previous_path, from) in &replacements {
+        let added = &mut files[*added_index];
+        added.change = RepoFileChange::Renamed;
+        added.previous_path = Some(previous_path.clone());
+        added.from = Some(from.clone());
+    }
+    let mut index = 0;
+    files.retain(|_| {
+        let keep = !consumed.contains(&index);
+        index += 1;
+        keep
+    });
+}
+
+fn pair_exact_artifact_renames(artifacts: &mut Vec<RepoArtifactDiff>) {
+    let mut deleted =
+        BTreeMap::<object::ObjectId, VecDeque<(usize, String, CommitArtifactState)>>::new();
+    for (index, diff) in artifacts.iter().enumerate() {
+        if diff.change != RepoFileChange::Deleted {
+            continue;
+        }
+        let Some(state) = diff.from.as_ref() else {
+            continue;
+        };
+        deleted.entry(state.oid().clone()).or_default().push_back((
+            index,
+            diff.path.clone(),
+            state.clone(),
+        ));
+    }
+    let mut consumed = BTreeSet::new();
+    let mut replacements = Vec::new();
+    for (added_index, added) in artifacts.iter().enumerate() {
+        if added.change != RepoFileChange::Added {
+            continue;
+        }
+        let Some(after) = added.to.as_ref() else {
+            continue;
+        };
+        let Some((deleted_index, previous_path, before)) =
+            deleted.get_mut(after.oid()).and_then(VecDeque::pop_front)
+        else {
+            continue;
+        };
+        consumed.insert(deleted_index);
+        replacements.push((added_index, previous_path, before));
+    }
+    for (added_index, previous_path, from) in &replacements {
+        let added = &mut artifacts[*added_index];
+        added.change = RepoFileChange::Renamed;
+        added.previous_path = Some(previous_path.clone());
+        added.from = Some(from.clone());
+    }
+    let mut index = 0;
+    artifacts.retain(|_| {
+        let keep = !consumed.contains(&index);
+        index += 1;
+        keep
+    });
+}
+
 fn repo_diff_paths(files: &[RepoFileDiff], artifacts: &[RepoArtifactDiff]) -> Vec<RepoPathDiff> {
     let mut paths = Vec::with_capacity(files.len() + artifacts.len());
     paths.extend(files.iter().map(|file| RepoPathDiff {
         path: file.path.clone(),
+        previous_path: file.previous_path.clone(),
         change: file.change,
         kind: file.kind,
         storage: file.storage,
     }));
     paths.extend(artifacts.iter().map(|artifact| RepoPathDiff {
         path: artifact.path.clone(),
+        previous_path: artifact.previous_path.clone(),
         change: artifact.change,
         kind: artifact.kind,
         storage: artifact.storage,
@@ -2587,6 +2723,7 @@ fn commit_path_changes(
         .into_iter()
         .map(|path| CommitPathChange {
             path: path.path,
+            previous_path: path.previous_path,
             change: path.change,
             kind: path.kind,
             storage: path.storage,
@@ -2601,6 +2738,7 @@ fn commit_path_change_counts(changes: &[CommitPathChange]) -> CommitPathChangeCo
             RepoFileChange::Added => counts.added += 1,
             RepoFileChange::Modified => counts.modified += 1,
             RepoFileChange::Deleted => counts.deleted += 1,
+            RepoFileChange::Renamed => counts.modified += 1,
         }
     }
     counts
