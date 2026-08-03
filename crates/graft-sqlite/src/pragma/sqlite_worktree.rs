@@ -28,8 +28,10 @@ const PAGE_SCAN_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 const MIN_PAGE_HASH_CACHE_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_PAGE_HASH_CACHE_ENTRIES: usize = 4;
 const MAX_WORKTREE_DIFF_PROBES: usize = 16;
-const WORKTREE_DIFF_PROBE_VERSION: u32 = 2;
+const WORKTREE_DIFF_PROBE_VERSION: u32 = 3;
 const MAX_PERSISTED_DIFF_PROBE_BYTES: u64 = 64 * 1024;
+const PAGE_OWNERSHIP_CACHE_VERSION: u32 = 1;
+const MAX_PAGE_OWNERSHIP_CACHE_BYTES: u64 = 16 * 1024 * 1024;
 const SQLITE_FILE_CHANGE_COUNTER_OFFSET: usize = 24;
 const SQLITE_VERSION_VALID_FOR_OFFSET: usize = 92;
 const SQLITE_VOLATILE_HEADER_FIELD_BYTES: usize = 4;
@@ -59,6 +61,43 @@ struct WorktreeDiffProbeIdentity {
 struct WorktreeDiffProbe {
     matches: bool,
     table_candidates: Option<BTreeSet<String>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct SqlitePageOwnershipRange {
+    first_page: u32,
+    last_page: u32,
+    table: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct SqlitePageOwnershipIndex {
+    page_count: u32,
+    ranges: Vec<SqlitePageOwnershipRange>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedSqlitePageOwnershipPayload {
+    version: u32,
+    index: SqlitePageOwnershipIndex,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedSqlitePageOwnership {
+    payload: PersistedSqlitePageOwnershipPayload,
+    checksum: String,
+}
+
+impl SqlitePageOwnershipIndex {
+    fn table_for_page(&self, page_number: u32) -> Option<&str> {
+        let index = self
+            .ranges
+            .partition_point(|range| range.last_page < page_number);
+        self.ranges.get(index).and_then(|range| {
+            (range.first_page <= page_number && page_number <= range.last_page)
+                .then_some(range.table.as_str())
+        })
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -159,7 +198,46 @@ impl SqlitePageHashCache {
         let state_hash = sqlite_page_index_state_hash(state)?;
         Ok(self
             .directory
-            .join(format!("worktree-probe-v2-{state_hash}.json")))
+            .join(format!("worktree-probe-v3-{state_hash}.json")))
+    }
+
+    fn ownership_path_for_state(&self, state: &CommitFileState) -> Result<PathBuf, ErrCtx> {
+        let state_hash = sqlite_page_index_state_hash(state)?;
+        Ok(self
+            .directory
+            .join(format!("page-ownership-v1-{state_hash}.json")))
+    }
+
+    fn load_ownership(
+        &self,
+        state: &CommitFileState,
+    ) -> Result<Option<SqlitePageOwnershipIndex>, ErrCtx> {
+        let path = self.ownership_path_for_state(state)?;
+        let metadata = match std::fs::metadata(&path) {
+            Ok(metadata) if metadata.len() <= MAX_PAGE_OWNERSHIP_CACHE_BYTES => metadata,
+            Ok(_) => return Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        debug_assert!(metadata.len() <= MAX_PAGE_OWNERSHIP_CACHE_BYTES);
+        let persisted: PersistedSqlitePageOwnership = serde_json::from_slice(&std::fs::read(path)?)
+            .map_err(|error| {
+                ErrCtx::PragmaErr(
+                    format!("failed to decode persisted SQLite page ownership: {error}").into(),
+                )
+            })?;
+        let payload_bytes = serde_json::to_vec(&persisted.payload).map_err(|error| {
+            ErrCtx::PragmaErr(
+                format!("failed to verify persisted SQLite page ownership: {error}").into(),
+            )
+        })?;
+        if persisted.payload.version != PAGE_OWNERSHIP_CACHE_VERSION
+            || persisted.payload.index.page_count != state.snapshot.page_count.to_u32()
+            || blake3::hash(&payload_bytes).to_hex().as_str() != persisted.checksum
+        {
+            return Ok(None);
+        }
+        Ok(Some(persisted.payload.index))
     }
 
     fn load_probe(
@@ -222,29 +300,35 @@ impl SqlitePageHashCache {
             )
         })?;
         let final_path = self.probe_path_for_state(state)?;
-        let temp_path = self.directory.join(format!(
-            ".worktree-probe-v2-{}-{}.tmp",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |duration| duration.as_nanos())
-        ));
-        let file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temp_path)?;
-        let mut writer = BufWriter::new(file);
-        writer.write_all(&bytes)?;
-        writer.flush()?;
-        writer.get_ref().sync_all()?;
-        drop(writer);
-        if let Err(error) = std::fs::rename(&temp_path, &final_path) {
-            let _ = std::fs::remove_file(&temp_path);
-            if !final_path.exists() {
-                return Err(error.into());
-            }
-        }
-        Ok(())
+        write_atomic_cache_file(&self.directory, &final_path, "worktree-probe-v3", &bytes)
+    }
+
+    fn store_ownership(
+        &self,
+        state: &CommitFileState,
+        index: SqlitePageOwnershipIndex,
+    ) -> Result<(), ErrCtx> {
+        std::fs::create_dir_all(&self.directory)?;
+        let payload = PersistedSqlitePageOwnershipPayload {
+            version: PAGE_OWNERSHIP_CACHE_VERSION,
+            index,
+        };
+        let payload_bytes = serde_json::to_vec(&payload).map_err(|error| {
+            ErrCtx::PragmaErr(
+                format!("failed to encode persisted SQLite page ownership: {error}").into(),
+            )
+        })?;
+        let persisted = PersistedSqlitePageOwnership {
+            payload,
+            checksum: blake3::hash(&payload_bytes).to_hex().to_string(),
+        };
+        let bytes = serde_json::to_vec(&persisted).map_err(|error| {
+            ErrCtx::PragmaErr(
+                format!("failed to encode persisted SQLite page ownership: {error}").into(),
+            )
+        })?;
+        let final_path = self.ownership_path_for_state(state)?;
+        write_atomic_cache_file(&self.directory, &final_path, "page-ownership-v1", &bytes)
     }
 
     fn load(&self, state: &CommitFileState) -> Result<Option<Vec<[u8; PAGE_HASH_BYTES]>>, ErrCtx> {
@@ -369,6 +453,37 @@ impl SqlitePageHashCache {
     }
 }
 
+fn write_atomic_cache_file(
+    directory: &Path,
+    final_path: &Path,
+    prefix: &str,
+    bytes: &[u8],
+) -> Result<(), ErrCtx> {
+    let temp_path = directory.join(format!(
+        ".{prefix}-{}-{}.tmp",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos())
+    ));
+    let file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temp_path)?;
+    let mut writer = BufWriter::new(file);
+    writer.write_all(bytes)?;
+    writer.flush()?;
+    writer.get_ref().sync_all()?;
+    drop(writer);
+    if let Err(error) = std::fs::rename(&temp_path, final_path) {
+        let _ = std::fs::remove_file(&temp_path);
+        if !final_path.exists() {
+            return Err(error.into());
+        }
+    }
+    Ok(())
+}
+
 fn sqlite_page_index_state_hash(state: &CommitFileState) -> Result<blake3::Hash, ErrCtx> {
     let encoded = serde_json::to_vec(state).map_err(|error| {
         ErrCtx::PragmaErr(format!("failed to encode SQLite page-index state: {error}").into())
@@ -418,9 +533,13 @@ fn prune_page_hash_cache(directory: &Path, keep: &Path) {
                 .and_then(|name| name.strip_prefix("pages-v3-"))
                 .and_then(|name| name.strip_suffix(".bin"))
             {
-                let _ = std::fs::remove_file(
-                    directory.join(format!("worktree-probe-v2-{state_hash}.json")),
-                );
+                for cache_name in [
+                    format!("worktree-probe-v2-{state_hash}.json"),
+                    format!("worktree-probe-v3-{state_hash}.json"),
+                    format!("page-ownership-v1-{state_hash}.json"),
+                ] {
+                    let _ = std::fs::remove_file(directory.join(cache_name));
+                }
             }
             let _ = std::fs::remove_file(path);
         }
@@ -550,7 +669,7 @@ impl PreparedSqliteStage {
         self.physical
             .as_ref()
             .expect("deferred table candidates retain their stable SQLite snapshot")
-            .table_candidates_for_changed_pages(&self.changed_pages)
+            .table_candidates_for_changed_pages(&self.changed_pages, None, None)
     }
 
     pub(crate) fn page_hash_cache_hit(&self) -> bool {
@@ -645,40 +764,6 @@ impl PhysicalSqliteReader {
         Ok(())
     }
 
-    /// Finds tables that own pages changed from `expected` to this stable worktree snapshot.
-    ///
-    /// `dbstat` gives us `SQLite`'s page ownership without decoding every row. Returning `None`
-    /// deliberately falls back to the full logical scan whenever a changed page cannot be mapped,
-    /// preserving exact diff semantics for unusual freelist or extension layouts.
-    pub(super) fn changed_table_candidates(
-        &self,
-        expected: &dyn VolumeRead,
-    ) -> Result<Option<BTreeSet<String>>, ErrCtx> {
-        let max_page_count = self
-            .page_count()
-            .to_u32()
-            .max(expected.page_count().to_u32());
-        let mut changed_pages = BTreeSet::new();
-        for page_number in 1..=max_page_count {
-            if page_number.is_multiple_of(1_024) {
-                graft::repo::cancellation_checkpoint()?;
-            }
-            let pageidx = PageIdx::try_from(page_number).map_err(|error| {
-                ErrCtx::PragmaErr(
-                    format!("invalid SQLite page index {page_number}: {error}").into(),
-                )
-            })?;
-            if !sqlite_page_bytes_equal(
-                page_number,
-                self.read_page(pageidx)?.as_ref(),
-                expected.read_page(pageidx)?.as_ref(),
-            ) {
-                changed_pages.insert(page_number);
-            }
-        }
-        self.table_candidates_for_changed_pages(&changed_pages)
-    }
-
     /// Finds changed table candidates using the committed page index when it is available.
     ///
     /// This mirrors Git's index/stat fast path: hash the worktree sequentially in coarse chunks,
@@ -694,9 +779,6 @@ impl PhysicalSqliteReader {
         expected: &dyn VolumeRead,
     ) -> Result<Option<BTreeSet<String>>, ErrCtx> {
         let probe = self.cached_diff_probe(runtime, repo, key, expected_state, expected)?;
-        if !probe.matches && probe.table_candidates.is_none() {
-            return self.changed_table_candidates(expected);
-        }
         Ok(probe.table_candidates)
     }
 
@@ -744,21 +826,92 @@ impl PhysicalSqliteReader {
                 changed_pages.insert(page_number);
             }
         }
-        self.table_candidates_for_changed_pages(&changed_pages)
+        self.table_candidates_for_changed_pages(&changed_pages, Some(previous), None)
     }
 
     fn table_candidates_for_changed_pages(
         &self,
         changed_pages: &BTreeSet<u32>,
+        expected: Option<&dyn VolumeRead>,
+        expected_ownership: Option<&SqlitePageOwnershipIndex>,
     ) -> Result<Option<BTreeSet<String>>, ErrCtx> {
         if changed_pages.is_empty() {
             return Ok(Some(BTreeSet::new()));
         }
+        let expected_tables = expected_ownership.map(|index| {
+            changed_pages
+                .iter()
+                .filter_map(|page| index.table_for_page(*page).map(str::to_owned))
+                .collect::<BTreeSet<_>>()
+        });
+        let Some(current_owners) =
+            self.dbstat_page_owners(Some(changed_pages), expected_tables.as_ref())?
+        else {
+            return Ok(None);
+        };
+        let current_freelist = sqlite_freelist_pages(self)?;
+        let expected_freelist = expected.map(sqlite_freelist_pages).transpose()?.flatten();
+        let mut tables = BTreeSet::new();
+        for page_number in changed_pages {
+            let current_owner = current_owners.get(page_number);
+            let expected_owner =
+                expected_ownership.and_then(|index| index.table_for_page(*page_number));
+            if let Some(table) = current_owner {
+                tables.insert(table.clone());
+            }
+            if let Some(table) = expected_owner {
+                tables.insert(table.to_string());
+            }
+            if *page_number == 1 {
+                continue;
+            }
+            let absent_now = *page_number > self.page_count().to_u32();
+            let absent_before =
+                expected.is_some_and(|reader| *page_number > reader.page_count().to_u32());
+            let free_now = absent_now
+                || current_freelist
+                    .as_ref()
+                    .is_some_and(|pages| pages.contains(page_number));
+            let free_before = absent_before
+                || expected_freelist
+                    .as_ref()
+                    .is_some_and(|pages| pages.contains(page_number));
+            if expected_ownership.is_some() {
+                let schema_changed = changed_pages.contains(&1);
+                let schema_owned_allocation = schema_changed && free_before;
+                if (current_owner.is_none() && !free_now && !schema_owned_allocation)
+                    || (expected_owner.is_none() && !free_before)
+                {
+                    return Ok(None);
+                }
+                continue;
+            }
+            let free_on_both_sides = current_freelist
+                .as_ref()
+                .is_some_and(|pages| pages.contains(page_number))
+                && (absent_before
+                    || expected_freelist
+                        .as_ref()
+                        .is_some_and(|pages| pages.contains(page_number)));
+            if current_owner.is_none() && !free_on_both_sides {
+                return Ok(None);
+            }
+        }
+        Ok(Some(tables))
+    }
 
+    fn dbstat_page_owners(
+        &self,
+        filter: Option<&BTreeSet<u32>>,
+        tables: Option<&BTreeSet<String>>,
+    ) -> Result<Option<BTreeMap<u32, String>>, ErrCtx> {
         let connection = Connection::open_with_flags(
             &self.snapshot_path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
+        if let Some(tables) = tables {
+            return dbstat_page_owners_for_tables(&connection, filter, tables);
+        }
         let mut statement = match connection.prepare(
             "SELECT d.pageno, COALESCE(m.tbl_name, d.name) \
              FROM dbstat AS d \
@@ -767,31 +920,30 @@ impl PhysicalSqliteReader {
             Ok(statement) => statement,
             Err(_) => return Ok(None),
         };
-        let mut mapped_pages = BTreeSet::new();
-        let mut tables = BTreeSet::new();
         let rows = statement.query_map([], |row| {
             Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?))
         })?;
+        let mut owners = BTreeMap::new();
         for row in rows {
             let (page_number, table_name) = row?;
-            if !changed_pages.contains(&page_number) {
+            if filter.is_some_and(|pages| !pages.contains(&page_number))
+                || table_name.starts_with("sqlite_")
+            {
                 continue;
             }
-            mapped_pages.insert(page_number);
-            if !table_name.starts_with("sqlite_") {
-                tables.insert(table_name);
-            }
+            owners.insert(page_number, table_name);
         }
+        Ok(Some(owners))
+    }
 
-        // Page 1 always carries SQLite's change counter and schema cookie. Schema changes are
-        // compared separately, so it is the only unmapped page that is safe to ignore here.
-        if changed_pages
-            .iter()
-            .any(|page_number| *page_number != 1 && !mapped_pages.contains(page_number))
-        {
+    fn page_ownership_index(&self) -> Result<Option<SqlitePageOwnershipIndex>, ErrCtx> {
+        let Some(owners) = self.dbstat_page_owners(None, None)? else {
             return Ok(None);
-        }
-        Ok(Some(tables))
+        };
+        Ok(Some(SqlitePageOwnershipIndex {
+            page_count: self.page_count().to_u32(),
+            ranges: compress_page_ownership_ranges(owners),
+        }))
     }
 
     pub(super) fn matches_state(
@@ -871,19 +1023,10 @@ impl PhysicalSqliteReader {
             }
         }
         let cached_hashes = match cache.load(expected_state) {
-            Ok(Some(hashes)) => hashes,
-            Ok(None) => {
-                return Ok(WorktreeDiffProbe {
-                    matches: self.matches_state(runtime, expected_state)?,
-                    table_candidates: None,
-                });
-            }
+            Ok(hashes) => hashes,
             Err(error) => {
                 tracing::debug!(?error, "ignoring unreadable SQLite page-index cache");
-                return Ok(WorktreeDiffProbe {
-                    matches: self.matches_state(runtime, expected_state)?,
-                    table_candidates: None,
-                });
+                None
             }
         };
 
@@ -892,7 +1035,8 @@ impl PhysicalSqliteReader {
             let chunk_index = (first_page - 1) as usize / PAGE_HASH_CHUNK_PAGES;
             let current_hash = sqlite_page_chunk_hash(first_page, chunk_bytes);
             if cached_hashes
-                .get(chunk_index)
+                .as_ref()
+                .and_then(|hashes| hashes.get(chunk_index))
                 .is_some_and(|expected_hash| expected_hash == current_hash.as_bytes())
             {
                 return Ok(());
@@ -922,9 +1066,32 @@ impl PhysicalSqliteReader {
         for page_number in (self.page_count().to_u32() + 1)..=expected.page_count().to_u32() {
             changed_pages.insert(page_number);
         }
+        let expected_ownership = match cache.load_ownership(expected_state) {
+            Ok(index) => index,
+            Err(error) => {
+                tracing::debug!(?error, "ignoring unreadable SQLite page-ownership cache");
+                None
+            }
+        };
+        let table_candidates = self.table_candidates_for_changed_pages(
+            &changed_pages,
+            Some(expected),
+            expected_ownership.as_ref(),
+        )?;
+        tracing::debug!(
+            changed_pages = changed_pages.len(),
+            page_ownership_cache_hit = expected_ownership.is_some(),
+            candidate_resolution = if table_candidates.is_some() {
+                "exact"
+            } else {
+                "fallback"
+            },
+            candidate_tables = ?table_candidates,
+            "classified SQLite worktree page changes"
+        );
         let probe = WorktreeDiffProbe {
             matches: changed_pages.is_empty(),
-            table_candidates: self.table_candidates_for_changed_pages(&changed_pages)?,
+            table_candidates,
         };
         if let Err(error) = cache.store_probe(expected_state, &identity.fingerprint, &probe) {
             tracing::debug!(?error, "failed to persist SQLite worktree probe");
@@ -932,6 +1099,118 @@ impl PhysicalSqliteReader {
         store_worktree_diff_probe(identity, probe.clone());
         Ok(probe)
     }
+}
+
+fn dbstat_page_owners_for_tables(
+    connection: &Connection,
+    filter: Option<&BTreeSet<u32>>,
+    tables: &BTreeSet<String>,
+) -> Result<Option<BTreeMap<u32, String>>, ErrCtx> {
+    if tables.is_empty() {
+        return Ok(Some(BTreeMap::new()));
+    }
+    let mut schema = connection.prepare(
+        "SELECT name, tbl_name FROM sqlite_schema WHERE name IS NOT NULL AND tbl_name IS NOT NULL",
+    )?;
+    let schema_rows = schema.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut objects = Vec::new();
+    for row in schema_rows {
+        let (object_name, table_name) = row?;
+        if tables.contains(&table_name) {
+            objects.push((object_name, table_name));
+        }
+    }
+    let mut dbstat = match connection.prepare("SELECT pageno FROM dbstat WHERE name = ?1") {
+        Ok(statement) => statement,
+        Err(_) => return Ok(None),
+    };
+    let mut owners = BTreeMap::new();
+    for (object_name, table_name) in objects {
+        let pages = dbstat.query_map([object_name], |row| row.get::<_, u32>(0))?;
+        for page in pages {
+            let page_number = page?;
+            if filter.is_none_or(|changed| changed.contains(&page_number)) {
+                owners.insert(page_number, table_name.clone());
+            }
+        }
+    }
+    Ok(Some(owners))
+}
+
+fn compress_page_ownership_ranges(owners: BTreeMap<u32, String>) -> Vec<SqlitePageOwnershipRange> {
+    let mut ranges: Vec<SqlitePageOwnershipRange> = Vec::new();
+    for (page_number, table) in owners {
+        if let Some(last) = ranges.last_mut()
+            && last.last_page.checked_add(1) == Some(page_number)
+            && last.table == table
+        {
+            last.last_page = page_number;
+            continue;
+        }
+        ranges.push(SqlitePageOwnershipRange {
+            first_page: page_number,
+            last_page: page_number,
+            table,
+        });
+    }
+    ranges
+}
+
+fn sqlite_freelist_pages(reader: &dyn VolumeRead) -> Result<Option<BTreeSet<u32>>, ErrCtx> {
+    if reader.page_count().to_u32() == 0 {
+        return Ok(Some(BTreeSet::new()));
+    }
+    let header = reader.read_page(PageIdx::try_from(1_u32).map_err(|error| {
+        ErrCtx::PragmaErr(format!("invalid SQLite header page: {error}").into())
+    })?)?;
+    let raw_page_size = u16::from_be_bytes([header.as_ref()[16], header.as_ref()[17]]);
+    let page_size = if raw_page_size == 1 {
+        65_536
+    } else {
+        raw_page_size as u32
+    };
+    if page_size != PAGESIZE.as_u32() {
+        return Ok(None);
+    }
+    let mut trunk_page = sqlite_u32(header.as_ref(), 32);
+    let declared_count = sqlite_u32(header.as_ref(), 36) as usize;
+    if (trunk_page == 0) != (declared_count == 0) {
+        return Ok(None);
+    }
+    let mut pages = BTreeSet::new();
+    while trunk_page != 0 {
+        if trunk_page > reader.page_count().to_u32() || !pages.insert(trunk_page) {
+            return Ok(None);
+        }
+        let page = reader.read_page(PageIdx::try_from(trunk_page).map_err(|error| {
+            ErrCtx::PragmaErr(format!("invalid SQLite freelist page {trunk_page}: {error}").into())
+        })?)?;
+        let leaf_count = sqlite_u32(page.as_ref(), 4) as usize;
+        if leaf_count > (PAGESIZE.as_usize() - 8) / 4 {
+            return Ok(None);
+        }
+        for leaf_index in 0..leaf_count {
+            let leaf_page = sqlite_u32(page.as_ref(), 8 + leaf_index * 4);
+            if leaf_page == 0
+                || leaf_page > reader.page_count().to_u32()
+                || !pages.insert(leaf_page)
+            {
+                return Ok(None);
+            }
+        }
+        trunk_page = sqlite_u32(page.as_ref(), 0);
+    }
+    Ok((pages.len() == declared_count).then_some(pages))
+}
+
+fn sqlite_u32(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_be_bytes(
+        bytes[offset..offset + 4]
+            .try_into()
+            .expect("validated SQLite page offset"),
+    )
 }
 
 fn validate_sqlite_source(path: &Path) -> Result<(), ErrCtx> {
@@ -1337,6 +1616,16 @@ fn prepare_physical_sqlite_file_state_with_cache(
     base: Option<&CommitFileState>,
     cache: Option<&SqlitePageHashCache>,
 ) -> Result<(CommitFileState, PreparedSqliteStage), ErrCtx> {
+    let expected_ownership = match (base, cache) {
+        (Some(base), Some(cache)) => match cache.load_ownership(base) {
+            Ok(index) => index,
+            Err(error) => {
+                tracing::debug!(?error, "ignoring unreadable SQLite page-ownership cache");
+                None
+            }
+        },
+        _ => None,
+    };
     let cached_hashes = match (base, cache) {
         (Some(base), Some(cache)) => match cache.load(base) {
             Ok(hashes) => hashes,
@@ -1358,10 +1647,16 @@ fn prepare_physical_sqlite_file_state_with_cache(
             cache,
             cached_hashes,
         )?;
+        let previous_reader =
+            base.map(|state| runtime.snapshot_reader(state.snapshot.to_snapshot()));
         let prepared_table_candidates = Some(
-            locked
-                .physical
-                .table_candidates_for_changed_pages(&changed_pages)?,
+            locked.physical.table_candidates_for_changed_pages(
+                &changed_pages,
+                previous_reader
+                    .as_ref()
+                    .map(|reader| reader as &dyn VolumeRead),
+                expected_ownership.as_ref(),
+            )?,
         );
         let prepared = PreparedSqliteStage {
             physical: None,
@@ -1476,6 +1771,19 @@ fn import_sqlite_reader_state(
         && let Err(error) = cache.store(&state, &current_hashes)
     {
         tracing::debug!(?error, "failed to persist SQLite page-index cache");
+    }
+    if let Some(cache) = cache {
+        match physical.page_ownership_index() {
+            Ok(Some(index)) => {
+                if let Err(error) = cache.store_ownership(&state, index) {
+                    tracing::debug!(?error, "failed to persist SQLite page ownership");
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::debug!(?error, "failed to derive SQLite page ownership");
+            }
+        }
     }
     tracing::debug!(
         path = %path.display(),
@@ -1600,6 +1908,38 @@ mod tests {
                 .unwrap();
         }
         transaction.commit().unwrap();
+        connection
+    }
+
+    fn create_freelist_database(path: &Path) -> Connection {
+        let mut connection = Connection::open(path).unwrap();
+        connection
+            .pragma_update(None, "page_size", PAGESIZE.as_u32())
+            .unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE views(id TEXT PRIMARY KEY, layout_json TEXT NOT NULL) WITHOUT ROWID;
+                 CREATE TABLE unrelated(id INTEGER PRIMARY KEY, payload BLOB NOT NULL);
+                 INSERT INTO views(id, layout_json) VALUES ('grid', '{}');",
+            )
+            .unwrap();
+        let transaction = connection.transaction().unwrap();
+        for id in 1..=2_048_i64 {
+            transaction
+                .execute(
+                    "INSERT INTO unrelated(id, payload) VALUES (?1, ?2)",
+                    params![id, vec![id as u8; 3_000]],
+                )
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+        connection
+            .execute("DELETE FROM unrelated WHERE id <= 1024", [])
+            .unwrap();
+        let freelist_count: u32 = connection
+            .pragma_query_value(None, "freelist_count", |row| row.get(0))
+            .unwrap();
+        assert!(freelist_count > 1);
         connection
     }
 
@@ -1788,6 +2128,40 @@ mod tests {
     }
 
     #[test]
+    fn cached_stage_detects_repeated_updates_to_the_same_pages() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+        let path = temp.path().join("app.sqlite");
+        let connection = create_database(&path, "delete");
+        let runtime = test_runtime();
+        let initial = import_physical_sqlite_file_state(&runtime, &path, None).unwrap();
+
+        connection
+            .execute(
+                "UPDATE records SET payload = ?1 WHERE id = 32",
+                [vec![0xA5_u8; 3_000]],
+            )
+            .unwrap();
+        let (first, _) =
+            prepare_with_forced_page_cache(&runtime, &repo, "app.sqlite", &path, Some(&initial))
+                .unwrap();
+        assert_ne!(first.snapshot, initial.snapshot);
+
+        connection
+            .execute(
+                "UPDATE records SET payload = ?1 WHERE id = 32",
+                [vec![0x5A_u8; 3_000]],
+            )
+            .unwrap();
+        let (second, prepared) =
+            prepare_with_forced_page_cache(&runtime, &repo, "app.sqlite", &path, Some(&first))
+                .unwrap();
+
+        assert!(prepared.page_hash_cache_hit());
+        assert_ne!(second.snapshot, first.snapshot);
+    }
+
+    #[test]
     fn small_database_skips_the_persistent_page_hash_cache() {
         let temp = tempfile::tempdir().unwrap();
         let repo = Repository::init(temp.path()).unwrap();
@@ -1871,6 +2245,82 @@ mod tests {
         })
         .unwrap();
         assert!(!matches_changed);
+    }
+
+    #[test]
+    fn overflow_allocation_from_freelist_keeps_exact_table_candidates() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+        let path = temp.path().join("app.sqlite");
+        let connection = create_freelist_database(&path);
+        let runtime = test_runtime();
+        let (baseline, _) =
+            prepare_with_forced_page_cache(&runtime, &repo, "app.sqlite", &path, None).unwrap();
+        let cache = SqlitePageHashCache::new(&repo, "app.sqlite");
+        let ownership = cache.load_ownership(&baseline).unwrap().unwrap();
+        assert_eq!(ownership.table_for_page(1), None);
+        assert!(cache.ownership_path_for_state(&baseline).unwrap().is_file());
+
+        connection
+            .execute(
+                "UPDATE views SET layout_json = ?1 WHERE id = 'grid'",
+                ["x".repeat(3_000)],
+            )
+            .unwrap();
+        let overflow_pages: u32 = connection
+            .query_row(
+                "SELECT count(*) FROM dbstat WHERE name = 'views' AND pagetype = 'overflow'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(overflow_pages > 0);
+
+        let expected = runtime.snapshot_reader(baseline.snapshot.to_snapshot());
+        let candidates = with_consistent_physical_sqlite_reader(&path, |physical| {
+            physical.cached_changed_table_candidates(
+                &runtime,
+                &repo,
+                "app.sqlite",
+                &baseline,
+                &expected,
+            )
+        })
+        .unwrap();
+        assert_eq!(candidates, Some(BTreeSet::from(["views".to_string()])));
+    }
+
+    #[test]
+    fn overflow_release_to_freelist_uses_baseline_page_ownership() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+        let path = temp.path().join("app.sqlite");
+        let connection = create_freelist_database(&path);
+        connection
+            .execute(
+                "UPDATE views SET layout_json = ?1 WHERE id = 'grid'",
+                ["x".repeat(3_000)],
+            )
+            .unwrap();
+        let runtime = test_runtime();
+        let (baseline, _) =
+            prepare_with_forced_page_cache(&runtime, &repo, "app.sqlite", &path, None).unwrap();
+
+        connection
+            .execute("UPDATE views SET layout_json = '{}' WHERE id = 'grid'", [])
+            .unwrap();
+        let expected = runtime.snapshot_reader(baseline.snapshot.to_snapshot());
+        let candidates = with_consistent_physical_sqlite_reader(&path, |physical| {
+            physical.cached_changed_table_candidates(
+                &runtime,
+                &repo,
+                "app.sqlite",
+                &baseline,
+                &expected,
+            )
+        })
+        .unwrap();
+        assert_eq!(candidates, Some(BTreeSet::from(["views".to_string()])));
     }
 
     #[test]

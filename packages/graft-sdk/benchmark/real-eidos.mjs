@@ -53,6 +53,19 @@ try {
     const commit = await timed(() => session.commit("update metadata"))
     const updatedCommit = commitId(commit.value)
     const postCommitStatus = await timed(() => session.statusIncremental())
+    mutateViewLayout(target)
+    const layoutStatus = await timed(() => session.statusIncremental())
+    const layoutSummary = await timed(() =>
+      session.diffSqlitePaths({ paths: ["Untitled.eidos"], mode: "summary" })
+    )
+    const layoutRows = await timed(() =>
+      session.diffSqlitePaths({
+        paths: ["Untitled.eidos"],
+        mode: "rows",
+        table: "eidos__views",
+        rowLimit: 100,
+      })
+    )
     const historicalSummary = await timed(() =>
       session.diffSqlitePaths({
         paths: ["Untitled.eidos"],
@@ -87,6 +100,9 @@ try {
         stage_meta_change: metric(stage),
         commit_meta_change: metric(commit),
         status_after_commit: metric(postCommitStatus),
+        status_layout_dirty: metric(layoutStatus),
+        working_layout_summary: metric(layoutSummary),
+        working_layout_rows: metric(layoutRows),
         historical_summary: metric(historicalSummary),
         history_summaries_50: metric(history),
       },
@@ -111,6 +127,19 @@ function mutateMeta(databasePath) {
     database.exec(
       "UPDATE eidos__meta SET revision = revision + 1, updated_at = '2026-08-02T12:00:00.000Z' WHERE singleton = 1"
     )
+  } finally {
+    database.close()
+  }
+}
+
+function mutateViewLayout(databasePath) {
+  const database = new DatabaseSync(databasePath)
+  try {
+    database
+      .prepare(
+        "UPDATE eidos__views SET layout_json = layout_json || ?, updated_at = ? WHERE id = (SELECT min(id) FROM eidos__views)"
+      )
+      .run(" ".repeat(500), "2026-08-03T15:00:00.000Z")
   } finally {
     database.close()
   }
