@@ -1,8 +1,8 @@
 # Graft SDK performance report
 
-Date: 2026-08-02
+Date: 2026-08-03
 
-Release candidate: `@eidos.space/graft` 0.3.5
+Release candidate: `@eidos.space/graft` 0.3.6
 Baseline: published `@eidos.space/graft` 0.3.4
 
 ## Executive summary
@@ -88,7 +88,7 @@ The synthetic matrix covers:
 The paired dataset contains a 5.6 MB SQLite database with 20,000 rows, 64 text files, two binary
 files, a 10% row update, checkout, and push to a filesystem Remote.
 
-| Operation | 0.3.4 | 0.3.5 candidate | Paired change |
+| Operation | 0.3.4 | 0.3.6 candidate | Paired change |
 | --- | ---: | ---: | ---: |
 | Repository init | 4.22 ms | 4.19 ms | -2.6% |
 | Initial stage | 955.88 ms | 977.75 ms | +4.2% (noisy) |
@@ -163,9 +163,11 @@ it and keep the simpler path.
 
 The application fixture is an anonymized `Untitled.eidos` test file, copied read-only into a
 temporary repository for each run. Both compared runs used the same 460,689,408-byte source. The
-benchmark mutates only `eidos__meta` in the temporary copy.
+benchmark mutates `eidos__meta`, checkpoints it, then grows one `eidos__views.layout_json` value in
+the temporary copy. The second mutation covers overflow-page allocation from a populated freelist
+without touching the unrelated million-row table.
 
-| Operation | 0.3.4 | 0.3.5 candidate | Change |
+| Operation | 0.3.4 | 0.3.6 candidate | Change |
 | --- | ---: | ---: | ---: |
 | Session open | 464 ms | 501 ms | +8.0% |
 | Repository init | 445 ms | 410 ms | -7.8% |
@@ -174,6 +176,8 @@ benchmark mutates only `eidos__meta` in the temporary copy.
 | Dirty status | 5.40 s | 19.7 ms | -99.6% |
 | Working table summary | 18.84 s | 1.53 s | -91.9% |
 | First metadata-table row page | 10.06 s | 1.69 ms | -99.98% |
+| Working layout summary | n/a | 1.19 s | new regression case |
+| First views-table row page | n/a | 1.83 ms | new regression case |
 | Stage metadata change | 6.05 s | 1.58 s | -73.9% |
 | Commit metadata change | 21.30 s | 1.69 ms | -99.99% |
 | Post-commit status | 7.45 s | 771 ms | -89.7% |
@@ -245,7 +249,7 @@ cargo build --release --locked -p graft-tool -p graft-bench
   --candidate-graft-bin ./target/release/graft \
   --baseline-output packages/graft-sdk/benchmark/results/git-workflow-v0.3.4.json \
   --candidate-output packages/graft-sdk/benchmark/results/git-workflow-candidate.json \
-  --baseline-label graft-sdk-v0.3.4 --candidate-label graft-sdk-v0.3.5 \
+  --baseline-label graft-sdk-v0.3.4 --candidate-label graft-sdk-v0.3.6 \
   --profile ci --samples 4 --warmups 1
 ```
 

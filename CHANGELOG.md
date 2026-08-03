@@ -1,5 +1,29 @@
 # Changelog
 
+## Graft SDK 0.3.6 — 2026-08-03
+
+### Added
+
+- Added checksummed, content-addressed SQLite page-ownership indexes that map changed overflow and
+  freelist pages back to their logical tables without scanning unrelated million-row tables.
+- Added regression coverage for overflow allocation and release, repeated checkpoints in one
+  resident session, and repeated edits to the same SQLite pages.
+
+### Changed
+
+- Worktree probes now combine current `dbstat` ownership, baseline ownership, and validated
+  freelist traversal to keep changed-table classification exact across page reuse.
+- Page ownership remains replaceable derived cache data alongside page hashes and worktree probes;
+  it can be deleted or rebuilt without changing snapshots, commits, or restore semantics.
+
+### Fixed
+
+- Changing a small `eidos__views` layout value no longer falls back to scanning unrelated large
+  tables when SQLite allocates overflow pages from the freelist.
+- Checkpointing an ordinary physical SQLite file no longer turns its staged snapshot into a live
+  Volume binding, so edits made immediately after a checkpoint remain visible to status and the
+  next checkpoint.
+
 ## Graft SDK 0.3.5 — 2026-08-02
 
 ### Added

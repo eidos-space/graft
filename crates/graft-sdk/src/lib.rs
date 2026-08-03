@@ -4091,6 +4091,62 @@ mod tests {
     }
 
     #[test]
+    fn reopened_session_keeps_physical_sqlite_authoritative_after_each_checkpoint() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("app.eidos");
+        let database = Connection::open(&database_path).unwrap();
+        database
+            .execute(
+                "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+                [],
+            )
+            .unwrap();
+        database
+            .execute("INSERT INTO items (name) VALUES ('one')", [])
+            .unwrap();
+        drop(database);
+
+        let initial = RepositorySession::new(directory.path());
+        initial.open().unwrap();
+        initial.init().unwrap();
+        initial.add_all().unwrap();
+        initial.commit("initial").unwrap();
+        initial.close().unwrap();
+
+        let session = RepositorySession::new(directory.path());
+        session.open().unwrap();
+        for (name, message) in [("two", "second"), ("three", "third")] {
+            let database = Connection::open(&database_path).unwrap();
+            database
+                .execute("UPDATE items SET name = ?1 WHERE id = 1", [name])
+                .unwrap();
+            drop(database);
+
+            assert!(session.status_incremental().unwrap().status.dirty);
+            session
+                .stage_paths(&StagePathsOptions {
+                    paths: vec![PathBuf::from("app.eidos")],
+                    expected_head: None,
+                    force: false,
+                })
+                .unwrap();
+            session.commit(message).unwrap();
+            assert!(!session.status_incremental().unwrap().status.dirty);
+        }
+        session.close().unwrap();
+
+        let database = Connection::open(&database_path).unwrap();
+        assert_eq!(
+            database
+                .query_row("SELECT name FROM items WHERE id = 1", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            "three"
+        );
+    }
+
+    #[test]
     fn credentials_are_not_accepted_in_http_remote_urls() {
         let session = RepositorySession::new(".");
         for url in [

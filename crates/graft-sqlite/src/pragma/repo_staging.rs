@@ -36,7 +36,7 @@ pub(super) fn run_repo_add(
     } else {
         let state = current_repo_file_state(runtime, file)?;
         let entry = repo.stage_file_state_path(&file.tag, state)?;
-        preserve_repo_volume_binding(runtime, &repo, &entry)?;
+        preserve_repo_volume_binding(runtime, &repo, &entry, true)?;
         Ok(vec![entry])
     }
 }
@@ -504,13 +504,14 @@ pub(super) fn stage_repo_add_changes(
     let current_key = repo.file_key(&file.tag)?;
     let mut entries = Vec::with_capacity(changes.len());
     let mut prepared_entries = Vec::with_capacity(changes.len());
+    let mut volume_bound_entries = BTreeSet::new();
 
     for change in changes {
         graft::repo::cancellation_checkpoint()?;
         match change.change {
             RepoWorktreeChangeKind::Modified | RepoWorktreeChangeKind::Untracked => {
                 let physical_path = repo.worktree().join(&change.path);
-                let entry = prepare_repo_add_file(
+                let (entry, preserve_volume_binding) = prepare_repo_add_file(
                     runtime,
                     file,
                     repo,
@@ -518,6 +519,9 @@ pub(super) fn stage_repo_add_changes(
                     &change.path,
                     &physical_path,
                 )?;
+                if preserve_volume_binding {
+                    volume_bound_entries.insert(entry.path.clone());
+                }
                 prepared_entries.push(entry.clone());
                 entries.push(entry);
             }
@@ -536,7 +540,12 @@ pub(super) fn stage_repo_add_changes(
 
     repo.stage_index_entries(&prepared_entries)?;
     for entry in &prepared_entries {
-        preserve_repo_volume_binding(runtime, repo, entry)?;
+        preserve_repo_volume_binding(
+            runtime,
+            repo,
+            entry,
+            volume_bound_entries.contains(&entry.path),
+        )?;
     }
     Ok(entries)
 }
@@ -570,9 +579,10 @@ pub(super) fn stage_repo_add_file(
     key: &str,
     physical_path: &Path,
 ) -> Result<graft::repo::index::IndexEntry, ErrCtx> {
-    let entry = prepare_repo_add_file(runtime, file, repo, current_key, key, physical_path)?;
+    let (entry, preserve_volume_binding) =
+        prepare_repo_add_file(runtime, file, repo, current_key, key, physical_path)?;
     repo.stage_index_entries(std::slice::from_ref(&entry))?;
-    preserve_repo_volume_binding(runtime, repo, &entry)?;
+    preserve_repo_volume_binding(runtime, repo, &entry, preserve_volume_binding)?;
     Ok(entry)
 }
 
@@ -580,7 +590,11 @@ fn preserve_repo_volume_binding(
     runtime: &Runtime,
     repo: &Repository,
     entry: &graft::repo::index::IndexEntry,
+    preserve: bool,
 ) -> Result<(), ErrCtx> {
+    if !preserve {
+        return Ok(());
+    }
     let bound_matches_entry = match (
         entry.file.as_ref(),
         repo_file_state_for_key(runtime, repo, &entry.path)?,
@@ -605,15 +619,17 @@ pub(super) fn prepare_repo_add_file(
     current_key: &str,
     key: &str,
     physical_path: &Path,
-) -> Result<graft::repo::index::IndexEntry, ErrCtx> {
+) -> Result<(graft::repo::index::IndexEntry, bool), ErrCtx> {
     if key == current_key {
         let state = current_repo_file_state(runtime, file)?;
         repo.prepare_file_state_path(&file.tag, state)
+            .map(|entry| (entry, true))
             .map_err(Into::into)
     } else if repo_key_uses_volume_binding(repo, key)?
         && let Some(state) = repo_file_state_for_key(runtime, repo, key)?
     {
         repo.prepare_file_state_path(repo.worktree().join(key), state)
+            .map(|entry| (entry, true))
             .map_err(Into::into)
     } else if is_sqlite_database_path(physical_path)? {
         let base = repo
@@ -635,12 +651,15 @@ pub(super) fn prepare_repo_add_file(
         );
         file.cache_prepared_sqlite_stage(key.to_string(), prepared);
         repo.prepare_file_state_path(repo.worktree().join(key), state)
+            .map(|entry| (entry, false))
             .map_err(Into::into)
     } else if let Some(state) = repo_file_state_for_key(runtime, repo, key)? {
         repo.prepare_file_state_path(repo.worktree().join(key), state)
+            .map(|entry| (entry, true))
             .map_err(Into::into)
     } else {
         repo.prepare_artifact_path(physical_path)
+            .map(|entry| (entry, false))
             .map_err(Into::into)
     }
 }
