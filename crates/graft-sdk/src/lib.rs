@@ -310,6 +310,7 @@ pub enum RepositoryOperation {
     StatusIncremental,
     AddAll,
     StagePaths,
+    RecordPathMove,
     UntrackPaths,
     Commit,
     Diff,
@@ -379,6 +380,8 @@ pub enum SqliteDiffResponse {
 #[derive(Debug, Clone)]
 pub struct SqliteDiffPathsOptions {
     pub paths: Vec<PathBuf>,
+    pub staged: bool,
+    pub staged_fallback: bool,
     pub root: Option<String>,
     pub from: Option<String>,
     pub to: Option<String>,
@@ -456,6 +459,21 @@ pub struct StagePathsOptions {
     pub paths: Vec<PathBuf>,
     pub expected_head: Option<String>,
     pub force: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecordPathMoveOptions {
+    pub previous_path: PathBuf,
+    pub path: PathBuf,
+    pub expected_head: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecordPathMoveResult {
+    pub previous_path: String,
+    pub path: String,
+    pub change: &'static str,
+    pub materializes_worktree: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -809,9 +827,39 @@ impl RepositorySession {
                 }
             }
             let operation = (|| {
+                let status = service.status().map_err(repository_command_error)?;
+                let unstaged = status
+                    .unstaged_changes
+                    .iter()
+                    .map(|change| change.path.as_str())
+                    .collect::<Vec<_>>();
+                let staged = status
+                    .staged_changes
+                    .iter()
+                    .flat_map(|change| {
+                        [
+                            change.path.as_str(),
+                            change.previous_path.as_deref().unwrap_or(""),
+                        ]
+                    })
+                    .collect::<Vec<_>>();
                 let mut results = Vec::with_capacity(paths.len());
                 for path in paths {
                     graft::repo::cancellation_checkpoint().map_err(repo_error)?;
+                    let directory_prefix = format!("{path}/");
+                    let has_unstaged = unstaged.iter().any(|candidate| {
+                        *candidate == path.as_str() || candidate.starts_with(&directory_prefix)
+                    });
+                    let is_already_staged = staged.iter().any(|candidate| {
+                        *candidate == path.as_str() || candidate.starts_with(&directory_prefix)
+                    });
+                    if !has_unstaged && is_already_staged {
+                        results.push(BatchPathResult {
+                            path,
+                            result: serde_json::json!({ "already_staged": true }),
+                        });
+                        continue;
+                    }
                     let argument = if options.force {
                         format!("--force -- {}", quote_pragma_path(Path::new(&path))?)
                     } else {
@@ -829,6 +877,44 @@ impl RepositorySession {
             })();
             status_cache.invalidate();
             operation
+        })
+    }
+
+    /// Records a completed physical rename without reading the payload. The operation updates the
+    /// index atomically and preserves the tracked `SQLite` snapshot or artifact object identity.
+    pub fn record_path_move(
+        &self,
+        options: &RecordPathMoveOptions,
+    ) -> Result<RecordPathMoveResult> {
+        let previous_path = normalize_requested_path(&options.previous_path)?;
+        let path = normalize_requested_path(&options.path)?;
+        if let Some(expected_head) = &options.expected_head {
+            validate_revision(expected_head)?;
+        }
+        self.with_state(|state| {
+            let SessionState { service, status_cache } = state;
+            let service = service.as_mut().ok_or_else(session_closed_error)?;
+            let repo = service.repository().map_err(repository_command_error)?;
+            if let Some(expected_head) = &options.expected_head {
+                let actual = repo.head_target().map_err(repo_error)?;
+                if actual.as_deref() != Some(expected_head) {
+                    return Err(invalid_argument(format!(
+                        "cannot record path move because HEAD changed: expected {expected_head}, found {}",
+                        actual.as_deref().unwrap_or("unborn")
+                    )));
+                }
+            }
+            let result = repo
+                .stage_path_move_keys(&previous_path, &path)
+                .map(|_| RecordPathMoveResult {
+                    previous_path,
+                    path,
+                    change: "renamed",
+                    materializes_worktree: false,
+                })
+                .map_err(repo_error);
+            status_cache.invalidate();
+            result
         })
     }
 
@@ -1012,7 +1098,23 @@ impl RepositorySession {
         for path in paths {
             graft::repo::cancellation_checkpoint().map_err(repo_error)?;
             let argument = sqlite_diff_argument(options, Path::new(&path))?;
-            let diff = self.execute_json("json_diff", Some(&argument))?;
+            let mut diff = self.execute_json("json_diff", Some(&argument))?;
+            if options.staged_fallback && !options.staged {
+                let mut staged_options = options.clone();
+                staged_options.staged = true;
+                staged_options.staged_fallback = false;
+                let worktree_has_changes = value_changed_path_count(&diff) > 0;
+                if worktree_has_changes {
+                    staged_options.response = SqliteDiffResponse::Summary;
+                }
+                let staged_argument = sqlite_diff_argument(&staged_options, Path::new(&path))?;
+                let staged_diff = self.execute_json("json_diff", Some(&staged_argument))?;
+                if worktree_has_changes {
+                    overlay_staged_renames(&mut diff, &staged_diff);
+                } else {
+                    diff = staged_diff;
+                }
+            }
             results.push(PathDiffResult { path, diff });
         }
         let changed_paths = results
@@ -2486,6 +2588,47 @@ fn value_changed_path_count(value: &Value) -> usize {
         .map_or(0, Vec::len)
 }
 
+fn overlay_staged_renames(worktree: &mut Value, staged: &Value) {
+    let renames = staged
+        .get("paths")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|path| path.get("change").and_then(Value::as_str) == Some("renamed"))
+        .filter_map(|path| {
+            Some((
+                path.get("path")?.as_str()?.to_string(),
+                path.get("previous_path")?.as_str()?.to_string(),
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
+    if renames.is_empty() {
+        return;
+    }
+    for field in ["paths", "files"] {
+        let Some(entries) = worktree.get_mut(field).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for entry in entries {
+            let Some(object) = entry.as_object_mut() else {
+                continue;
+            };
+            let Some(previous_path) = object
+                .get("path")
+                .and_then(Value::as_str)
+                .and_then(|path| renames.get(path))
+            else {
+                continue;
+            };
+            object.insert("change".to_string(), Value::String("renamed".to_string()));
+            object.insert(
+                "previous_path".to_string(),
+                Value::String(previous_path.clone()),
+            );
+        }
+    }
+}
+
 fn value_row_diff_tables_scanned(value: &Value) -> usize {
     value
         .get("files")
@@ -2756,6 +2899,12 @@ fn diff_argument(options: &DiffOptions) -> Result<Option<String>> {
 }
 
 fn sqlite_diff_argument(options: &SqliteDiffPathsOptions, path: &Path) -> Result<String> {
+    if options.staged && (options.root.is_some() || options.from.is_some() || options.to.is_some())
+    {
+        return Err(invalid_argument(
+            "staged diff cannot be combined with root/from/to revisions",
+        ));
+    }
     if options.root.is_some() && (options.from.is_some() || options.to.is_some()) {
         return Err(invalid_argument(
             "root diff cannot be combined with from/to revisions",
@@ -2793,6 +2942,9 @@ fn sqlite_diff_argument(options: &SqliteDiffPathsOptions, path: &Path) -> Result
                 parts.push(quote_pragma_value(after)?);
             }
         }
+    }
+    if options.staged {
+        parts.push("--staged".to_string());
     }
     if let Some(root) = &options.root {
         validate_revision(root)?;
@@ -2972,6 +3124,7 @@ mod tests {
         assert!(!RepositoryOperation::ReadPathContent.materializes_worktree());
         assert!(!RepositoryOperation::AddAll.materializes_worktree());
         assert!(!RepositoryOperation::StagePaths.materializes_worktree());
+        assert!(!RepositoryOperation::RecordPathMove.materializes_worktree());
         assert!(!RepositoryOperation::UntrackPaths.materializes_worktree());
         assert!(!RepositoryOperation::Commit.materializes_worktree());
         assert!(!RepositoryOperation::History.materializes_worktree());
@@ -2986,6 +3139,35 @@ mod tests {
         assert!(!RepositoryOperation::RemoteConfigure.materializes_worktree());
         assert!(!RepositoryOperation::Push.materializes_worktree());
         assert!(!RepositoryOperation::Fetch.materializes_worktree());
+    }
+
+    #[test]
+    fn staged_move_metadata_overlays_unstaged_sqlite_rows() {
+        let mut worktree = serde_json::json!({
+            "paths": [{ "path": "new.eidos", "change": "modified" }],
+            "files": [{
+                "path": "new.eidos",
+                "change": "modified",
+                "tables": [{ "name": "Table 1", "changes": [{ "op": "insert" }] }]
+            }]
+        });
+        let staged = serde_json::json!({
+            "paths": [{
+                "path": "new.eidos",
+                "previous_path": "old.eidos",
+                "change": "renamed"
+            }]
+        });
+
+        overlay_staged_renames(&mut worktree, &staged);
+
+        assert_eq!(worktree["paths"][0]["change"], "renamed");
+        assert_eq!(worktree["files"][0]["change"], "renamed");
+        assert_eq!(worktree["files"][0]["previous_path"], "old.eidos");
+        assert_eq!(
+            worktree["files"][0]["tables"][0]["changes"][0]["op"],
+            "insert"
+        );
     }
 
     #[test]
@@ -3471,6 +3653,8 @@ mod tests {
         let updated = updated["commit"]["id"].as_str().unwrap().to_string();
         let base_options = |response| SqliteDiffPathsOptions {
             paths: vec![PathBuf::from("space.eidos")],
+            staged: false,
+            staged_fallback: false,
             root: None,
             from: Some(baseline.clone()),
             to: Some(updated.clone()),
@@ -3576,6 +3760,8 @@ mod tests {
 
         let options = |response| SqliteDiffPathsOptions {
             paths: vec![PathBuf::from("space.eidos")],
+            staged: false,
+            staged_fallback: false,
             root: None,
             from: None,
             to: None,

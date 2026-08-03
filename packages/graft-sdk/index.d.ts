@@ -34,6 +34,10 @@ export interface DiffPathsOptions extends OperationOptions {
 
 interface SqliteDiffPathsBase extends OperationOptions {
   paths: string[]
+  /** Compare HEAD to the staged index. Mutually exclusive with root/from/to. */
+  staged?: boolean
+  /** Use the staged diff when the worktree has no change for the requested path. */
+  stagedFallback?: boolean
   root?: string
   from?: string
   to?: string
@@ -84,6 +88,22 @@ export interface StagePathsOptions extends OperationOptions {
   paths: string[]
   expectedHead?: string
   force?: boolean
+}
+
+export interface RecordPathMoveOptions extends OperationOptions {
+  /** Tracked repository-relative path before the completed physical rename. */
+  previousPath: string
+  /** Repository-relative path after the completed physical rename. */
+  path: string
+  /** Compare-and-swap guard; the operation fails if HEAD differs. */
+  expectedHead?: string
+}
+
+export interface RecordPathMoveResult {
+  previous_path: string
+  path: string
+  change: "renamed"
+  materializes_worktree: false
 }
 
 export interface UntrackPathsOptions extends OperationOptions {
@@ -139,6 +159,7 @@ export interface RepositoryStatusCounts {
 
 export interface RepositoryStatusPath {
   path: string
+  previous_path?: string
   kind: RepositoryPathKind
   storage: RepositoryPathStorage
   code: string
@@ -146,7 +167,7 @@ export interface RepositoryStatusPath {
   index_status: string
   worktree_status: string
   unstaged_change?: "modified" | "deleted" | "untracked"
-  staged_change?: "added" | "modified" | "deleted"
+  staged_change?: "added" | "modified" | "deleted" | "renamed"
   [key: string]: unknown
 }
 
@@ -269,7 +290,8 @@ export interface CommitChangedPathsOptions extends OperationOptions {
 
 export interface CommitPathChange {
   path: string
-  change: "added" | "modified" | "deleted"
+  previous_path?: string
+  change: "added" | "modified" | "deleted" | "renamed"
   kind: RepositoryPathKind
   storage: RepositoryPathStorage
 }
@@ -345,7 +367,8 @@ export interface SqliteRowChangeTable {
 
 export interface BoundedSqliteDiffFile {
   path: string
-  change: "added" | "modified" | "deleted"
+  previous_path?: string
+  change: "added" | "modified" | "deleted" | "renamed"
   kind: RepositoryPathKind
   storage: RepositoryPathStorage
   row_diff_available: boolean
@@ -382,7 +405,8 @@ export interface BoundedSqliteRepositoryDiff {
   to: string
   paths: Array<{
     path: string
-    change: "added" | "modified" | "deleted"
+    previous_path?: string
+    change: "added" | "modified" | "deleted" | "renamed"
     kind: RepositoryPathKind
     storage: RepositoryPathStorage
   }>
@@ -540,6 +564,7 @@ export class RepositorySession {
   listRemotes(options?: OperationOptions): Promise<ListRemotesResult>
   addAll(options?: OperationOptions): Promise<GraftJson>
   stagePaths(options: StagePathsOptions): Promise<BatchPathsResult>
+  recordPathMove(options: RecordPathMoveOptions): Promise<RecordPathMoveResult>
   untrackPaths(options: UntrackPathsOptions): Promise<BatchPathsResult>
   commit(message: string, options?: OperationOptions): Promise<GraftJson>
   diff(options?: DiffOptions): Promise<GraftJson>

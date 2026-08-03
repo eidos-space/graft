@@ -118,6 +118,8 @@ pub struct JsonRepoBoundedDiffResult {
 #[derive(Debug, Clone, Serialize)]
 pub struct JsonRepoBoundedDiffFile {
     pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_path: Option<String>,
     pub change: String,
     pub kind: String,
     pub storage: String,
@@ -156,6 +158,8 @@ pub struct JsonBoundedRowDiffTelemetry {
 #[derive(Debug, Clone, Serialize)]
 pub struct JsonRepoPathDiff {
     pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_path: Option<String>,
     pub change: String,
     pub kind: String,
     pub storage: String,
@@ -165,6 +169,8 @@ pub struct JsonRepoPathDiff {
 #[derive(Debug, Clone, Serialize)]
 pub struct JsonRepoRowDiffFile {
     pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_path: Option<String>,
     pub change: String,
     pub kind: String,
     pub storage: String,

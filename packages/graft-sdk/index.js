@@ -83,6 +83,11 @@ class RepositorySession {
     return callJson(() => this.#native.stagePaths(stageOptions, signal))
   }
 
+  async recordPathMove(options) {
+    const { signal, ...moveOptions } = options
+    return callJson(() => this.#native.recordPathMove(moveOptions, signal))
+  }
+
   async untrackPaths(options) {
     const { signal, ...untrackOptions } = options
     return callJson(() => this.#native.untrackPaths(untrackOptions, signal))

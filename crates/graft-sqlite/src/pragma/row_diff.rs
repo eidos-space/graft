@@ -201,6 +201,7 @@ pub(super) fn json_repo_row_diff(
         .iter()
         .map(|path| crate::json::JsonRepoPathDiff {
             path: path.path.clone(),
+            previous_path: path.previous_path.clone(),
             change: repo_file_change_label(path.change).to_string(),
             kind: repo_tracked_path_kind_json_label(path.kind).to_string(),
             storage: repo_path_storage_json_label(path.storage).to_string(),
@@ -216,6 +217,7 @@ pub(super) fn json_repo_row_diff(
             match repo_file_row_diff(runtime, repo, file, table) {
                 Ok(Some(row_diff)) => Ok(crate::json::JsonRepoRowDiffFile {
                     path: file.path.clone(),
+                    previous_path: file.previous_path.clone(),
                     change,
                     kind,
                     storage,
@@ -234,6 +236,7 @@ pub(super) fn json_repo_row_diff(
                 }),
                 Ok(None) => Ok(crate::json::JsonRepoRowDiffFile {
                     path: file.path.clone(),
+                    previous_path: file.previous_path.clone(),
                     change: change.clone(),
                     kind,
                     storage,
@@ -250,6 +253,7 @@ pub(super) fn json_repo_row_diff(
                 }),
                 Err(err) => Ok(crate::json::JsonRepoRowDiffFile {
                     path: file.path.clone(),
+                    previous_path: file.previous_path.clone(),
                     change: change.clone(),
                     kind,
                     storage,
@@ -319,6 +323,7 @@ pub(super) fn json_repo_bounded_diff(
         .iter()
         .map(|path| crate::json::JsonRepoPathDiff {
             path: path.path.clone(),
+            previous_path: path.previous_path.clone(),
             change: repo_file_change_label(path.change).to_string(),
             kind: repo_tracked_path_kind_json_label(path.kind).to_string(),
             storage: repo_path_storage_json_label(path.storage).to_string(),
@@ -338,6 +343,7 @@ pub(super) fn json_repo_bounded_diff(
             match repo_file_bounded_row_diff(runtime, repo, file, mode) {
                 Ok(Some(row_diff)) => Ok(crate::json::JsonRepoBoundedDiffFile {
                     path: file.path.clone(),
+                    previous_path: file.previous_path.clone(),
                     change,
                     kind,
                     storage,
@@ -420,6 +426,7 @@ fn unavailable_bounded_file(
 ) -> crate::json::JsonRepoBoundedDiffFile {
     crate::json::JsonRepoBoundedDiffFile {
         path: file.path.clone(),
+        previous_path: file.previous_path.clone(),
         change: change.to_string(),
         kind,
         storage,

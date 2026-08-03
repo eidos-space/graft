@@ -18,9 +18,8 @@ impl Repository {
 
     pub fn diff_revisions(&self, from: &str, to: &str, path: Option<&str>) -> Result<RepoDiff> {
         if let Some(path) = path {
-            let (from_id, from_files, from_artifacts) =
-                self.revision_states_for_filter(from, path)?;
-            let (to_id, to_files, to_artifacts) = self.revision_states_for_filter(to, path)?;
+            let ((from_id, from_files, from_artifacts), (to_id, to_files, to_artifacts)) =
+                self.revision_state_pair_for_filter(from, to, path)?;
             return Ok(diff_repo_maps(
                 from_id,
                 to_id,
