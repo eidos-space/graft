@@ -1,5 +1,42 @@
 # Changelog
 
+## Graft 0.12.0 — 2026-08-10
+
+### Added
+
+- Commit history now records aggregate path-change counts and exposes bounded changed-path
+  summaries without hydrating every tracked SQLite database or artifact.
+- Repository status and diffs preserve path identity across moves, including first-class rename
+  information for SQLite databases and exact-content artifacts.
+- HTTP Remotes support streamed clone bundles and resumable multipart uploads for large immutable
+  objects.
+
+### Changed
+
+- Large-repository status, history, explicit-path diffs, ignore checks, and SQLite row diffs use
+  persistent classification caches and bounded page-aware algorithms.
+- Physical SQLite files retain their worktree identity across checkpoints, while sparse and
+  WITHOUT ROWID table diffs avoid scanning unrelated rows.
+- The documentation site now serves the canonical installer directly from
+  https://graft.eidos.space/install.sh.
+
+### Fixed
+
+- Large Remote pushes reconcile ambiguous publication outcomes, tolerate proxy-safe existence
+  probes, and resume completed multipart upload parts after interruption.
+- SQLite page indexing normalizes volatile header counters and tracks overflow and freelist page
+  ownership without changing authoritative repository data.
+- The installer now selects stable vX.Y.Z CLI releases instead of mistaking independent SDK or
+  Remote releases for CLI versions.
+
+### Compatibility
+
+- Commit objects written by v0.12.0 may contain the path-changes header. Older CLIs, including
+  v0.11.0, reject those objects; upgrade every CLI that opens a repository before writing commits
+  with v0.12.0. Existing objects created by older releases remain readable.
+- Derived SQLite caches are replaceable and may be removed or rebuilt without affecting snapshots,
+  commits, or restore behavior.
+
 ## Graft SDK 0.3.7 — 2026-08-04
 
 ### Added

@@ -5,10 +5,12 @@ on:
     branches: ["main"]
     paths:
       - "docs/**"
+      - "install.sh"
   pull_request:
     branches: ["main"]
     paths:
       - "docs/**"
+      - "install.sh"
   workflow_dispatch:
   schedule:
     # Run every day at 7:00 AM UTC = 12:00 AM PST
@@ -42,12 +44,14 @@ jobs:
         run: |
           pnpm install
           pnpm build
+          cmp ../install.sh dist/install.sh
+          sh -n dist/install.sh
 
       - name: Cache lychee results
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: docs/.lycheecache
-          key: ${{ runner.os }}-lychee-${{ hashFiles('docs/pnpm-lock.yaml', 'docs/src/**', 'docs/public/**', 'docs/astro.config.mjs') }}
+          key: ${{ runner.os }}-lychee-${{ hashFiles('install.sh', 'docs/pnpm-lock.yaml', 'docs/src/**', 'docs/public/**', 'docs/astro.config.mjs') }}
           restore-keys: |
             ${{ runner.os }}-lychee-
 
