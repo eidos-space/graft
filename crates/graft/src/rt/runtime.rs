@@ -29,7 +29,6 @@ use crate::{
     rt::{
         action::{
             Action, FetchLog, FetchSegment, HydrateSnapshot, PreparedSnapshotPush, RemoteCommit,
-            SnapshotPush, SnapshotsPush,
         },
         task::{autosync::AutosyncTask, supervise},
     },
@@ -426,11 +425,25 @@ impl Runtime {
     }
 
     pub fn snapshot_push_to(&self, snapshot: Snapshot, remote: Arc<Remote>) -> Result<()> {
-        self.run_action_with_remote(SnapshotPush { snapshot }, remote)
+        self.snapshots_push_to(vec![snapshot], remote)
     }
 
     pub fn snapshots_push_to(&self, snapshots: Vec<Snapshot>, remote: Arc<Remote>) -> Result<()> {
-        self.run_action_with_remote(SnapshotsPush { snapshots }, remote)
+        let prepared = self.snapshots_prepare_push_to(snapshots, remote.clone())?;
+        let publication = prepared.publish(remote);
+        let Some(cancellation) = crate::repo::active_cancellation_token() else {
+            return self.inner.tokio.block_on(publication);
+        };
+
+        self.inner.tokio.block_on(async {
+            tokio::select! {
+                biased;
+                () = crate::repo::wait_for_cancellation(cancellation) => {
+                    Err(LogicalErr::Cancelled.into())
+                }
+                result = publication => result,
+            }
+        })
     }
 
     pub fn snapshots_prepare_push_to(
@@ -444,6 +457,7 @@ impl Runtime {
                 self.inner.storage.clone(),
                 remote,
                 snapshots,
+                crate::repo::active_cancellation_token(),
             ))
     }
 
@@ -693,6 +707,86 @@ mod tests {
             ),
             "unexpected result: {result:?}"
         );
+    }
+
+    #[test]
+    fn prepared_snapshot_push_observes_repository_cancellation() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_started, cancel_after_request) = mpsc::channel();
+        let (release_server, wait_for_result) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0_u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            request_started.send(()).unwrap();
+            let _ = wait_for_result.recv_timeout(Duration::from_secs(2));
+            let _ = stream.write_all(
+                b"HTTP/1.1 404 Not Found\r\nGraft-Protocol: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+        });
+
+        let remote = Arc::new(
+            RemoteConfig::Http {
+                url: format!("http://{address}/org/repo"),
+                token_env: None,
+            }
+            .build()
+            .unwrap(),
+        );
+        let tokio_rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let storage = Arc::new(FjallStorage::open_temporary().unwrap());
+        let runtime = Runtime::new(tokio_rt.handle().clone(), remote.clone(), storage, None);
+        let vid = runtime.volume_open(None, None, None).unwrap().vid;
+        for value in [1, 2] {
+            let mut writer = runtime.volume_writer(vid.clone()).unwrap();
+            writer
+                .write_page(PageIdx::must_new(1), Page::test_filled(value))
+                .unwrap();
+            writer.commit().unwrap();
+        }
+        let snapshot = runtime.volume_snapshot(&vid).unwrap();
+
+        let cancellation = crate::repo::CancellationToken::new();
+        let cancellation_worker = cancellation.clone();
+        let canceller = thread::spawn(move || {
+            cancel_after_request.recv().unwrap();
+            cancellation_worker.cancel();
+        });
+        let result = crate::repo::with_cancellation(&cancellation, || {
+            runtime.snapshots_prepare_push_to(vec![snapshot], remote)
+        });
+        release_server.send(()).unwrap();
+        canceller.join().unwrap();
+        server.join().unwrap();
+
+        assert!(
+            matches!(
+                result,
+                Err(crate::GraftErr::Logical(crate::LogicalErr::Cancelled))
+            ),
+            "unexpected result: {result:?}"
+        );
+        // Preparation awaits its blocking collection/build workers before returning,
+        // so the caller can immediately continue using the same storage.
+        let mut writer = runtime.volume_writer(vid).unwrap();
+        writer
+            .write_page(PageIdx::must_new(2), Page::test_filled(3))
+            .unwrap();
+        writer.commit().unwrap();
     }
 
     #[test]

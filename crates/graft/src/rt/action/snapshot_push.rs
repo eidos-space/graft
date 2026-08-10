@@ -17,23 +17,12 @@ use crate::{
     GraftErr, LogicalErr,
     local::fjall_storage::FjallStorage,
     remote::{Remote, segment::SegmentBuilder},
-    rt::action::{Action, Result},
+    repo::CancellationToken,
+    rt::action::Result,
     snapshot::Snapshot,
 };
 
 const SEGMENT_EXISTS_CONCURRENCY: usize = 5;
-
-/// Publishes the commits and segments referenced by a snapshot to a remote,
-/// preserving the snapshot's original log IDs and LSNs.
-#[derive(Debug)]
-pub struct SnapshotPush {
-    pub snapshot: Snapshot,
-}
-
-#[derive(Debug)]
-pub struct SnapshotsPush {
-    pub snapshots: Vec<Snapshot>,
-}
 
 #[derive(Debug)]
 struct SnapshotUpload {
@@ -74,7 +63,7 @@ impl PreparedSnapshotPush {
         Ok(objects)
     }
 
-    async fn publish(self, remote: Arc<Remote>) -> Result<()> {
+    pub(crate) async fn publish(self, remote: Arc<Remote>) -> Result<()> {
         let upload_trace = crate::trace::PushTraceSpan::new("sqlite_snapshot_http_upload");
         let upload_concurrency = remote.snapshot_upload_concurrency();
         let result = stream::iter(self.uploads)
@@ -92,29 +81,13 @@ impl PreparedSnapshotPush {
     }
 }
 
-impl Action for SnapshotPush {
-    async fn run(self, storage: Arc<FjallStorage>, remote: Arc<Remote>) -> Result<()> {
-        prepare_snapshots(storage, remote.clone(), vec![self.snapshot])
-            .await?
-            .publish(remote)
-            .await
-    }
-}
-
-impl Action for SnapshotsPush {
-    async fn run(self, storage: Arc<FjallStorage>, remote: Arc<Remote>) -> Result<()> {
-        prepare_snapshots(storage, remote.clone(), self.snapshots)
-            .await?
-            .publish(remote)
-            .await
-    }
-}
-
 pub(crate) async fn prepare_snapshots(
     storage: Arc<FjallStorage>,
     remote: Arc<Remote>,
     snapshots: Vec<Snapshot>,
+    cancellation: Option<CancellationToken>,
 ) -> Result<PreparedSnapshotPush> {
+    cancellation_checkpoint(&cancellation)?;
     if snapshots.is_empty() {
         return Ok(PreparedSnapshotPush::default());
     }
@@ -122,22 +95,36 @@ pub(crate) async fn prepare_snapshots(
     let collect_trace = crate::trace::PushTraceSpan::new("sqlite_snapshot_collect");
     let commits = spawn_blocking({
         let storage = storage.clone();
-        move || collect_snapshots_commits(storage, snapshots)
+        let cancellation = cancellation.clone();
+        move || collect_snapshots_commits(storage, snapshots, cancellation)
     })
     .await
     .expect("snapshot upload commit collection task failed")?;
     collect_trace.finish(&[("commits", commits.len() as u64)]);
     let negotiation_trace = crate::trace::PushTraceSpan::new("sqlite_segment_negotiation");
     let existing_segments = if commits.len() > 1 {
-        existing_remote_segments(remote.clone(), &commits).await?
+        let negotiation = existing_remote_segments(remote.clone(), &commits);
+        if let Some(cancellation) = cancellation.clone() {
+            tokio::select! {
+                biased;
+                () = crate::repo::wait_for_cancellation(cancellation) => {
+                    return Err(LogicalErr::Cancelled.into());
+                }
+                result = negotiation => result?,
+            }
+        } else {
+            negotiation.await?
+        }
     } else {
         BTreeSet::new()
     };
     negotiation_trace.finish(&[("existing_segments", existing_segments.len() as u64)]);
     let build_trace = crate::trace::PushTraceSpan::new("sqlite_snapshot_build");
-    let uploads = spawn_blocking(move || build_uploads(storage, commits, existing_segments))
-        .await
-        .expect("snapshot upload build task failed")?;
+    let uploads = spawn_blocking(move || {
+        build_uploads(storage, commits, existing_segments, cancellation)
+    })
+    .await
+    .expect("snapshot upload build task failed")?;
     let segment_bytes = uploads
         .iter()
         .filter_map(|upload| upload.segment.as_ref())
@@ -182,15 +169,20 @@ async fn upload_snapshot_commit(remote: Arc<Remote>, commit: Commit) -> Result<(
 fn collect_snapshots_commits(
     storage: Arc<FjallStorage>,
     snapshots: Vec<Snapshot>,
+    cancellation: Option<CancellationToken>,
 ) -> std::result::Result<Vec<Commit>, GraftErr> {
     let reader = storage.read();
     let mut commits = BTreeMap::<(LogId, LSN), Commit>::new();
     for snapshot in snapshots {
-        let mut snapshot_commits = reader
-            .commits(&snapshot)
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+        cancellation_checkpoint(&cancellation)?;
+        let mut snapshot_commits = Vec::new();
+        for commit in reader.commits(&snapshot) {
+            cancellation_checkpoint(&cancellation)?;
+            snapshot_commits.push(commit?);
+        }
         snapshot_commits.reverse();
         for commit in snapshot_commits {
+            cancellation_checkpoint(&cancellation)?;
             let key = (commit.log.clone(), commit.lsn);
             if let Some(existing) = commits.get(&key) {
                 if existing != &commit {
@@ -237,11 +229,13 @@ fn build_uploads(
     storage: Arc<FjallStorage>,
     commits: Vec<Commit>,
     existing_segments: BTreeSet<SegmentId>,
+    cancellation: Option<CancellationToken>,
 ) -> std::result::Result<Vec<SnapshotUpload>, GraftErr> {
     let reader = storage.read();
     let mut available_or_planned_segments = existing_segments;
     let mut uploads = Vec::with_capacity(commits.len());
     for commit in commits {
+        cancellation_checkpoint(&cancellation)?;
         let Some(segment_idx) = commit.segment_idx.clone() else {
             let commit_hash = CommitHashBuilder::new(
                 commit.log.clone(),
@@ -263,7 +257,9 @@ fn build_uploads(
         if segment_available_or_planned && !segment_idx.frames.is_empty() {
             let commit_hash = match commit.commit_hash.clone() {
                 Some(commit_hash) => commit_hash,
-                None => commit_hash_for_segment_idx(&reader, &commit, &segment_idx)?,
+                None => {
+                    commit_hash_for_segment_idx(&reader, &commit, &segment_idx, &cancellation)?
+                }
             };
             uploads.push(SnapshotUpload {
                 commit: commit
@@ -275,7 +271,7 @@ fn build_uploads(
         }
 
         let (segment_idx, chunks, commit_hash) =
-            build_segment_for_commit(&reader, &commit, segment_idx, retain_chunks)?;
+            build_segment_for_commit(&reader, &commit, segment_idx, retain_chunks, &cancellation)?;
         let sid = segment_idx.sid.clone();
         uploads.push(SnapshotUpload {
             commit: commit
@@ -292,6 +288,7 @@ fn commit_hash_for_segment_idx(
     reader: &crate::local::fjall_storage::ReadGuard<'_>,
     commit: &Commit,
     segment_idx: &SegmentIdx,
+    cancellation: &Option<CancellationToken>,
 ) -> std::result::Result<CommitHash, GraftErr> {
     let mut hash_builder = CommitHashBuilder::new(
         commit.log.clone(),
@@ -301,6 +298,7 @@ fn commit_hash_for_segment_idx(
     );
 
     for pageidx in segment_idx.pageset.iter() {
+        cancellation_checkpoint(cancellation)?;
         let page = reader
             .read_page(segment_idx.sid.clone(), pageidx)?
             .ok_or_else(|| {
@@ -320,6 +318,7 @@ fn build_segment_for_commit(
     commit: &Commit,
     segment_idx: SegmentIdx,
     retain_chunks: bool,
+    cancellation: &Option<CancellationToken>,
 ) -> std::result::Result<(SegmentIdx, Vec<Bytes>, CommitHash), GraftErr> {
     let mut segment_builder = if retain_chunks {
         SegmentBuilder::new()
@@ -334,6 +333,7 @@ fn build_segment_for_commit(
     );
 
     for pageidx in segment_idx.pageset.iter() {
+        cancellation_checkpoint(cancellation)?;
         let page = reader
             .read_page(segment_idx.sid.clone(), pageidx)?
             .ok_or_else(|| {
@@ -349,4 +349,16 @@ fn build_segment_for_commit(
     let (frames, chunks) = segment_builder.finish();
     let commit_hash = hash_builder.build();
     Ok((segment_idx.with_frames(frames), chunks, commit_hash))
+}
+
+fn cancellation_checkpoint(
+    cancellation: &Option<CancellationToken>,
+) -> std::result::Result<(), GraftErr> {
+    if cancellation
+        .as_ref()
+        .is_some_and(CancellationToken::is_cancelled)
+    {
+        return Err(LogicalErr::Cancelled.into());
+    }
+    Ok(())
 }
