@@ -2738,7 +2738,11 @@ fn execute_json(
 }
 
 fn repository_command_error(error: ErrCtx) -> SdkError {
-    if matches!(&error, ErrCtx::Repo(graft::repo::RepoErr::Cancelled)) {
+    if matches!(
+        &error,
+        ErrCtx::Repo(graft::repo::RepoErr::Cancelled)
+            | ErrCtx::Graft(graft::GraftErr::Logical(graft::LogicalErr::Cancelled))
+    ) {
         return SdkError::new(SdkErrorCode::Cancelled, "operation cancelled");
     }
     let message = error.to_string();

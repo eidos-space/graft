@@ -171,6 +171,24 @@ export interface RepositoryStatusPath {
   [key: string]: unknown
 }
 
+export type RepositoryUpstreamState =
+  | "up_to_date"
+  | "ahead"
+  | "behind"
+  | "diverged"
+
+export interface RepositoryUpstreamStatus {
+  remote: string
+  branch: string
+  local: string
+  remote_target: string
+  /** Present when state is `diverged`. */
+  common_ancestor?: string
+  ahead: number
+  behind: number
+  state: RepositoryUpstreamState
+}
+
 export interface RepositoryStatus {
   worktree: string
   graft_dir: string
@@ -188,6 +206,10 @@ export interface RepositoryStatus {
   unstaged: string[]
   staged: string[]
   conflicted: string[]
+  upstream: { remote: string; branch: string } | null
+  upstream_status?: RepositoryUpstreamStatus
+  ahead: number
+  behind: number
   [key: string]: unknown
 }
 

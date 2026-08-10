@@ -142,7 +142,7 @@ pub fn cancellation_checkpoint() -> Result<()> {
     Ok(())
 }
 
-fn active_cancellation_token() -> Option<CancellationToken> {
+pub(crate) fn active_cancellation_token() -> Option<CancellationToken> {
     ACTIVE_CANCELLATION.with(|active| active.borrow().clone())
 }
 
@@ -1565,6 +1565,8 @@ pub struct RepoUpstreamStatus {
     pub branch: String,
     pub local: String,
     pub remote_target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub common_ancestor: Option<String>,
     pub ahead: usize,
     pub behind: usize,
     pub state: RepoUpstreamState,
@@ -2238,7 +2240,7 @@ fn block_on_remote<T>(
     })
 }
 
-async fn wait_for_cancellation(cancellation: CancellationToken) {
+pub(crate) async fn wait_for_cancellation(cancellation: CancellationToken) {
     while !cancellation.is_cancelled() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }

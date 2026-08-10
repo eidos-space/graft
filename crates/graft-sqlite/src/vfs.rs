@@ -22,8 +22,8 @@ use parking_lot::Mutex;
 use sqlite_plugin::{
     flags::{AccessFlags, CreateMode, LockLevel, OpenKind, OpenMode, OpenOpts},
     vars::{
-        self, SQLITE_BUSY, SQLITE_BUSY_SNAPSHOT, SQLITE_CANTOPEN, SQLITE_INTERNAL, SQLITE_IOERR,
-        SQLITE_NOTFOUND,
+        self, SQLITE_BUSY, SQLITE_BUSY_SNAPSHOT, SQLITE_CANTOPEN, SQLITE_INTERNAL,
+        SQLITE_INTERRUPT, SQLITE_IOERR, SQLITE_NOTFOUND,
     },
     vfs::{Pragma, PragmaErr, SqliteErr, Vfs, VfsResult},
 };
@@ -107,6 +107,7 @@ impl ErrCtx {
             GraftErr::Storage(_) => SQLITE_IOERR,
             GraftErr::Remote(_) => SQLITE_IOERR,
             GraftErr::Logical(err) => match err {
+                LogicalErr::Cancelled => SQLITE_INTERRUPT,
                 LogicalErr::VolumeNotFound(_) => SQLITE_IOERR,
                 LogicalErr::VolumeConcurrentWrite(_) => SQLITE_BUSY_SNAPSHOT,
                 LogicalErr::VolumeNeedsRecovery(_)

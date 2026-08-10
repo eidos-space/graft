@@ -24,6 +24,9 @@ impl From<FjallStorageErr> for GraftErr {
 
 #[derive(Debug, thiserror::Error)]
 pub enum LogicalErr {
+    #[error("operation cancelled")]
+    Cancelled,
+
     #[error("Concurrent write to Volume {0}")]
     VolumeConcurrentWrite(VolumeId),
 

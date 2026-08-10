@@ -226,6 +226,10 @@ relevant `.gitignore` / `.graftignore` sources, and current tracked/untracked me
 corrupt/truncated file, or orphan temporary file causes a full rebuild; partial snapshots are never
 used. The cache stores no bearer credential or absolute worktree path.
 
+`status.upstream_status` reports the exact Local and Remote-tracking heads plus ahead/behind counts.
+When the histories diverge it also reports `common_ancestor`; consumers must stop before pull or
+push and preserve both heads instead of selecting a winner implicitly.
+
 `telemetry.persistent_snapshot_hit` is true only when the persisted classification survives all
 validation and supplies the returned status. `persistent_snapshot_saved` reports a successful
 durable update, and `stability_retries` reports bounded retries caused by concurrent path changes.

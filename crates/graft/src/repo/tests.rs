@@ -4726,6 +4726,191 @@ fn pull_plan_freezes_fetched_target_before_tracking_ref_moves() {
 }
 
 #[test]
+fn upstream_status_reports_heads_and_common_ancestor_for_divergence() {
+    let remote_dir = tempfile::tempdir().unwrap();
+    let remote = RemoteConfig::Fs {
+        root: remote_dir.path().to_string_lossy().into_owned(),
+    };
+
+    let source_dir = tempfile::tempdir().unwrap();
+    let source = Repository::init(source_dir.path()).unwrap();
+    source.remote_add("origin", remote.clone()).unwrap();
+    let base = source.commit("base").unwrap();
+    source.push("origin", "main").unwrap();
+
+    let clone_dir = tempfile::tempdir().unwrap();
+    let clone = Repository::init(clone_dir.path()).unwrap();
+    clone.remote_add("origin", remote).unwrap();
+    clone.set_branch_upstream("main", "origin", "main").unwrap();
+    clone.pull("origin", "main", "main").unwrap();
+
+    let remote_commit = source.commit("remote").unwrap();
+    source.push("origin", "main").unwrap();
+    let local_commit = clone.commit("local").unwrap();
+    clone.fetch("origin", "main").unwrap();
+
+    assert_eq!(
+        clone.status().unwrap().upstream_status,
+        Some(RepoUpstreamStatus {
+            remote: "origin".to_string(),
+            branch: "main".to_string(),
+            local: local_commit.id,
+            remote_target: remote_commit.id,
+            common_ancestor: Some(base.id),
+            ahead: 1,
+            behind: 1,
+            state: RepoUpstreamState::Diverged,
+        })
+    );
+}
+
+#[test]
+fn upstream_status_prefers_the_nearest_common_ancestor_after_a_merge() {
+    let remote_dir = tempfile::tempdir().unwrap();
+    let remote = RemoteConfig::Fs {
+        root: remote_dir.path().to_string_lossy().into_owned(),
+    };
+
+    let source_dir = tempfile::tempdir().unwrap();
+    let source = Repository::init(source_dir.path()).unwrap();
+    source.remote_add("origin", remote.clone()).unwrap();
+    source.commit("root").unwrap();
+    source.commit("branch point").unwrap();
+    source.branch_create("side", None).unwrap();
+    let shared_first_parent = source.commit("main before merge").unwrap();
+    source.push("origin", "main").unwrap();
+
+    let clone_dir = tempfile::tempdir().unwrap();
+    let clone = Repository::init(clone_dir.path()).unwrap();
+    clone.remote_add("origin", remote).unwrap();
+    clone.set_branch_upstream("main", "origin", "main").unwrap();
+    clone.pull("origin", "main", "main").unwrap();
+
+    source.switch_branch("side").unwrap();
+    source.commit("side before merge").unwrap();
+    source.switch_branch("main").unwrap();
+    source.merge_revision("side").unwrap();
+    source.commit("merge").unwrap();
+    source.push("origin", "main").unwrap();
+
+    clone.commit("local after shared first parent").unwrap();
+    clone.fetch("origin", "main").unwrap();
+
+    assert_eq!(
+        clone
+            .status()
+            .unwrap()
+            .upstream_status
+            .unwrap()
+            .common_ancestor,
+        Some(shared_first_parent.id)
+    );
+}
+
+#[test]
+fn pull_plan_starts_snapshot_checkout_with_fresh_http_pool() {
+    use std::io::{ErrorKind, Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    fn read_headers(stream: &mut std::net::TcpStream) -> Vec<u8> {
+        let mut request = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !request.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).unwrap();
+            request.push(byte[0]);
+        }
+        request
+    }
+
+    fn write_response(stream: &mut std::net::TcpStream, body: &[u8]) {
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nGraft-Protocol: 1\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .unwrap();
+        stream.write_all(body).unwrap();
+        stream.flush().unwrap();
+    }
+
+    let repo_dir = tempfile::tempdir().unwrap();
+    let repo = Repository::init(repo_dir.path()).unwrap();
+    let commit = repo.commit("base").unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let head = format!("{}\n", commit.id);
+    let server = thread::spawn(move || {
+        let (mut first, _) = listener.accept().unwrap();
+        assert!(
+            String::from_utf8_lossy(&read_headers(&mut first))
+                .starts_with("GET /org/repo/raw/refs/heads/main ")
+        );
+        write_response(&mut first, head.as_bytes());
+
+        first.set_nonblocking(true).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut reused_request = Vec::new();
+        loop {
+            let mut buffer = [0_u8; 1024];
+            match first.read(&mut buffer) {
+                Ok(0) => {}
+                Ok(read) => {
+                    reused_request.extend_from_slice(&buffer[..read]);
+                    if reused_request
+                        .windows(4)
+                        .any(|window| window == b"\r\n\r\n")
+                    {
+                        write_response(&mut first, b"reused");
+                        return;
+                    }
+                }
+                Err(err) if err.kind() == ErrorKind::WouldBlock => {}
+                Err(err) => panic!("failed reading reused connection: {err}"),
+            }
+
+            match listener.accept() {
+                Ok((mut fresh, _)) => {
+                    fresh.set_nonblocking(false).unwrap();
+                    read_headers(&mut fresh);
+                    write_response(&mut fresh, b"fresh");
+                    return;
+                }
+                Err(err) if err.kind() == ErrorKind::WouldBlock => {}
+                Err(err) => panic!("failed accepting fresh connection: {err}"),
+            }
+
+            assert!(
+                Instant::now() < deadline,
+                "client sent neither a reused nor a fresh request"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    });
+
+    repo.remote_add(
+        "origin",
+        RemoteConfig::Http {
+            url: format!("http://{address}/org/repo"),
+            token_env: None,
+        },
+    )
+    .unwrap();
+
+    repo.plan_pull("origin", "main", "main").unwrap();
+    let checkout_remote = repo.remote_store("origin").unwrap();
+    let connection = block_on_remote(checkout_remote.get_raw("snapshot-phase-probe"))
+        .unwrap()
+        .unwrap();
+    server.join().unwrap();
+
+    assert_eq!(connection.as_ref(), b"fresh");
+}
+
+#[test]
 fn discover_from_nested_path() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = Repository::init(tmp.path()).unwrap();
