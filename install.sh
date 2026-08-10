@@ -104,9 +104,13 @@ make_temp_dir() {
 resolve_version() {
   if [ "$VERSION_INPUT" = "latest" ] || [ -z "$VERSION_INPUT" ]; then
     release_json="${tmp_dir}/release.json"
-    download "https://api.github.com/repos/${REPO}/releases/latest" "$release_json"
-    tag="$(sed -n 's/^[[:space:]]*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' "$release_json" | head -n 1)"
-    [ -n "$tag" ] || fail "could not resolve latest release tag for ${REPO}"
+    download "https://api.github.com/repos/${REPO}/releases?per_page=100" "$release_json"
+    tag="$(
+      sed -n \
+        's/^[[:space:]]*"tag_name":[[:space:]]*"\(v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)".*/\1/p' \
+        "$release_json" | head -n 1
+    )"
+    [ -n "$tag" ] || fail "could not resolve latest stable CLI release tag for ${REPO}"
     VERSION="${tag#v}"
   else
     VERSION="${VERSION_INPUT#v}"
