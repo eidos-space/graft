@@ -499,6 +499,10 @@ impl Repository {
 
         let fetch = self.fetch(remote, remote_branch)?;
         let merge = self.plan_merge_revision(&format!("refs/remotes/{remote}/{remote_branch}"))?;
+        // Snapshot hydration runs on the retained runtime after repository objects are fetched on
+        // the repository runtime. Do not carry a pooled HTTP/1 connection across that boundary:
+        // some proxies leave it readable but unusable for the first storage-commit request.
+        self.remote_credentials.reset_http_clients();
         Ok(PullPlan {
             remote: remote.to_string(),
             remote_branch: remote_branch.to_string(),
@@ -532,6 +536,8 @@ impl Repository {
         }
         let fetch = fetch.pop().expect("length checked");
         let merge = self.plan_merge_revision(&format!("refs/remotes/{remote}/{}", fetch.branch))?;
+        // Keep the same object-fetch to snapshot-hydration boundary as branch-based pulls.
+        self.remote_credentials.reset_http_clients();
         Ok(PullPlan {
             remote: remote.to_string(),
             remote_branch: fetch.branch.clone(),

@@ -518,12 +518,20 @@ impl Repository {
             (0, _) => RepoUpstreamState::Behind,
             _ => RepoUpstreamState::Diverged,
         };
+        // The common ancestor is only needed to explain a divergence. Avoid a
+        // third graph walk on the status hot path for the linear cases.
+        let common_ancestor = if state == RepoUpstreamState::Diverged {
+            self.merge_base(local, &remote_target)?
+        } else {
+            None
+        };
 
         Ok(Some(RepoUpstreamStatus {
             remote: upstream.remote.clone(),
             branch: upstream.branch.clone(),
             local: local.to_string(),
             remote_target,
+            common_ancestor,
             ahead,
             behind,
             state,
