@@ -4765,6 +4765,49 @@ fn upstream_status_reports_heads_and_common_ancestor_for_divergence() {
 }
 
 #[test]
+fn upstream_status_prefers_the_nearest_common_ancestor_after_a_merge() {
+    let remote_dir = tempfile::tempdir().unwrap();
+    let remote = RemoteConfig::Fs {
+        root: remote_dir.path().to_string_lossy().into_owned(),
+    };
+
+    let source_dir = tempfile::tempdir().unwrap();
+    let source = Repository::init(source_dir.path()).unwrap();
+    source.remote_add("origin", remote.clone()).unwrap();
+    source.commit("root").unwrap();
+    source.commit("branch point").unwrap();
+    source.branch_create("side", None).unwrap();
+    let shared_first_parent = source.commit("main before merge").unwrap();
+    source.push("origin", "main").unwrap();
+
+    let clone_dir = tempfile::tempdir().unwrap();
+    let clone = Repository::init(clone_dir.path()).unwrap();
+    clone.remote_add("origin", remote).unwrap();
+    clone.set_branch_upstream("main", "origin", "main").unwrap();
+    clone.pull("origin", "main", "main").unwrap();
+
+    source.switch_branch("side").unwrap();
+    source.commit("side before merge").unwrap();
+    source.switch_branch("main").unwrap();
+    source.merge_revision("side").unwrap();
+    source.commit("merge").unwrap();
+    source.push("origin", "main").unwrap();
+
+    clone.commit("local after shared first parent").unwrap();
+    clone.fetch("origin", "main").unwrap();
+
+    assert_eq!(
+        clone
+            .status()
+            .unwrap()
+            .upstream_status
+            .unwrap()
+            .common_ancestor,
+        Some(shared_first_parent.id)
+    );
+}
+
+#[test]
 fn pull_plan_starts_snapshot_checkout_with_fresh_http_pool() {
     use std::io::{ErrorKind, Read, Write};
     use std::net::TcpListener;

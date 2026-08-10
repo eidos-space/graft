@@ -276,7 +276,20 @@ impl Runtime {
     }
 
     pub fn volume_push(&self, vid: VolumeId) -> Result<()> {
-        self.run_action(RemoteCommit { vid })
+        // RemoteCommit builds a segment on Tokio's blocking pool before entering its
+        // durable publish/recovery protocol. Returning cancellation while that worker is
+        // still active would race an immediate retry, so only honor an already-requested
+        // cancellation at this safe boundary and otherwise settle the whole action.
+        if crate::repo::active_cancellation_token()
+            .as_ref()
+            .is_some_and(crate::repo::CancellationToken::is_cancelled)
+        {
+            return Err(LogicalErr::Cancelled.into());
+        }
+        let action = RemoteCommit { vid }
+            .run(self.inner.storage.clone(), self.inner.remote.clone())
+            .instrument(tracing::debug_span!("Action::run", action = "RemoteCommit"));
+        self.inner.tokio.block_on(action)
     }
 
     pub fn volume_status(&self, vid: &VolumeId) -> Result<VolumeStatus> {

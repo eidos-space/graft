@@ -704,32 +704,76 @@ impl Repository {
     }
 
     pub(super) fn merge_base(&self, left: &str, right: &str) -> Result<Option<String>> {
-        let mut left_ancestors = BTreeMap::<String, ()>::new();
-        let mut stack = vec![left.to_string()];
+        let mut parents = BTreeMap::<String, Vec<String>>::new();
+        let left_distances = self.ancestor_distances(left, &mut parents)?;
+        let right_distances = self.ancestor_distances(right, &mut parents)?;
+        let common = left_distances
+            .keys()
+            .filter(|id| right_distances.contains_key(*id))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if common.is_empty() {
+            return Ok(None);
+        }
+
+        // A best merge base cannot be an ancestor of another common ancestor. Walk from
+        // every common node's parents once and mark all older common nodes as dominated.
+        let mut dominated = BTreeSet::new();
+        let mut seen = BTreeSet::new();
+        let mut stack = common
+            .iter()
+            .flat_map(|id| parents.get(id).into_iter().flatten().cloned())
+            .collect::<Vec<_>>();
         while let Some(id) = stack.pop() {
-            if left_ancestors.insert(id.clone(), ()).is_some() {
+            if !seen.insert(id.clone()) {
                 continue;
             }
-            for parent in commit_parent_ids(&self.read_commit(&id)?) {
-                stack.push(parent);
+            if common.contains(&id) {
+                dominated.insert(id.clone());
+            }
+            if let Some(node_parents) = parents.get(&id) {
+                stack.extend(node_parents.iter().cloned());
             }
         }
 
-        let mut stack = vec![right.to_string()];
-        let mut seen = BTreeMap::<String, ()>::new();
-        while let Some(id) = stack.pop() {
-            if seen.insert(id.clone(), ()).is_some() {
+        // Criss-cross histories can have multiple incomparable best bases. This API returns
+        // one, so prefer the one nearest to both heads and use the object ID as a stable tie-break.
+        Ok(common
+            .into_iter()
+            .filter(|id| !dominated.contains(id))
+            .min_by_key(|id| {
+                let left = left_distances[id];
+                let right = right_distances[id];
+                (left.max(right), left + right, id.clone())
+            }))
+    }
+
+    fn ancestor_distances(
+        &self,
+        start: &str,
+        parents: &mut BTreeMap<String, Vec<String>>,
+    ) -> Result<BTreeMap<String, usize>> {
+        let mut distances = BTreeMap::new();
+        let mut queue = VecDeque::from([(start.to_string(), 0)]);
+        while let Some((id, distance)) = queue.pop_front() {
+            if distances.contains_key(&id) {
                 continue;
             }
-            if left_ancestors.contains_key(&id) {
-                return Ok(Some(id));
-            }
-            for parent in commit_parent_ids(&self.read_commit(&id)?) {
-                stack.push(parent);
-            }
+            distances.insert(id.clone(), distance);
+            let node_parents = if let Some(node_parents) = parents.get(&id) {
+                node_parents.clone()
+            } else {
+                let node_parents = commit_parent_ids(&self.read_commit(&id)?);
+                parents.insert(id.clone(), node_parents.clone());
+                node_parents
+            };
+            queue.extend(
+                node_parents
+                    .into_iter()
+                    .map(|parent| (parent, distance + 1)),
+            );
         }
-
-        Ok(None)
+        Ok(distances)
     }
 
     pub(super) fn head_files(&self) -> Result<BTreeMap<String, CommitFileState>> {

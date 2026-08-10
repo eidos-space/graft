@@ -12,7 +12,7 @@
 - Incremental Pull starts snapshot hydration with a fresh HTTP connection pool after fetching the
   repository graph, preventing a stale pooled HTTP/1 connection from stalling the first storage
   request until the 30-second transport timeout.
-- Abort signals now interrupt in-flight snapshot hydration and other Runtime remote actions, return
+- Abort signals now interrupt in-flight snapshot hydration and prepared snapshot Push work, return
   the stable SDK cancelled error, and leave retry/reopen recovery available to the host application.
 
 ### Compatibility
