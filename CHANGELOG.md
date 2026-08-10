@@ -1,5 +1,26 @@
 # Changelog
 
+## Graft SDK 0.3.8 — 2026-08-10
+
+### Added
+
+- Diverged upstream status now exposes the exact Local head, Remote-tracking head, and common
+  ancestor through Rust serialization and the npm TypeScript contract.
+
+### Fixed
+
+- Incremental Pull starts snapshot hydration with a fresh HTTP connection pool after fetching the
+  repository graph, preventing a stale pooled HTTP/1 connection from stalling the first storage
+  request until the 30-second transport timeout.
+- Abort signals now interrupt in-flight snapshot hydration and other Runtime remote actions, return
+  the stable SDK cancelled error, and leave retry/reopen recovery available to the host application.
+
+### Compatibility
+
+- Repository and Remote protocol formats are unchanged. Existing consumers can ignore the optional
+  `common_ancestor` field; hosts that close SQLite handles around Pull should pass an AbortSignal and
+  still validate and reopen their handles when a cancelled materialization settles.
+
 ## Graft 0.12.0 — 2026-08-10
 
 ### Added
