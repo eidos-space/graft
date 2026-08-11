@@ -1,5 +1,47 @@
 # Changelog
 
+## Graft 0.13.0 — 2026-08-11
+
+### Added
+
+- Added a durable merge workflow across the core repository service, Rust SDK, Node.js contract,
+  and WebAssembly runtime: callers can fetch, plan, apply, inspect, continue, or abort an
+  up-to-date, fast-forward, or three-way merge without reconstructing repository state.
+- Merge conflicts expose stable path details and base/ours/theirs/result content, with text edits,
+  whole-path ours/theirs choices, and per-row SQLite ours/theirs resolutions guarded by immutable
+  plan and merge tokens.
+- The Playground now includes repeatable common-ancestor branch fixtures, durable conflict recovery
+  after reload, stale-token demonstrations, and real WASM coverage for the complete merge lifecycle.
+- Added versioned English and Chinese specifications for repositories, snapshots, diffs, merge,
+  remote sync, SQLite integration, runtime adapters, and physical worktree materialization.
+
+### Changed
+
+- Merge status is reconstructed from durable repository refs and index stages, so interrupted or
+  reopened sessions retain both sides and a clear continue-or-abort recovery path.
+- Playground commit history now keeps changed files inside expandable commits and opens one
+  full-width, Eidos-style diff inspector only when a path is selected.
+- Documentation now defines stage and commit as non-materializing operations and distinguishes
+  physical worktree replacement from snapshot hydration, row-diff compatibility materialization,
+  and export.
+
+### Fixed
+
+- Snapshot preparation validates hydration markers and fetches the exact missing LSN range instead
+  of trusting incomplete local state, repairing holes without re-fetching already available data.
+- Merge application rejects stale plans, changed HEADs, concurrent writers, and invalid resolution
+  tokens without silently overwriting either side of a conflict.
+
+### Compatibility
+
+- Repository and Remote object formats are unchanged. Active merge recovery adds only ordinary
+  repository refs and index stages; clients that do not use the new workflow can continue reading
+  existing repositories.
+- Operations that may replace SQLite worktree files still require applications to close long-lived
+  database handles first and reopen them after success, failure recovery, continue, or abort.
+- The independently versioned `@eidos.space/graft` npm package is not published by the `v0.13.0`
+  core tag; its merge API will ship through a separate SDK release.
+
 ## Graft SDK 0.3.8 — 2026-08-10
 
 ### Added

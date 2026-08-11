@@ -269,6 +269,25 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Checkout release notes
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: Prepare changelog release notes
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          awk -v heading="## Graft ${RELEASE_VERSION} —" '
+            index($0, heading) == 1 { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+            END { if (!found) exit 2 }
+          ' CHANGELOG.md > RELEASE_NOTES.md
+          test -s RELEASE_NOTES.md
+
       - name: Download extension artifacts
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
@@ -349,5 +368,6 @@ jobs:
           draft: ${{ needs.metadata.outputs.draft }}
           prerelease: ${{ needs.metadata.outputs.prerelease }}
           make_latest: ${{ needs.metadata.outputs.prerelease == 'false' }}
+          body_path: RELEASE_NOTES.md
           fail_on_unmatched_files: true
           files: release-assets/*
