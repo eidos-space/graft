@@ -1,6 +1,6 @@
 {
   "name": "@eidos.space/graft",
-  "version": "0.3.8",
+  "version": "0.3.9",
   "description": "Long-lived in-process Graft repository sessions for Node.js and Electron.",
   "license": "MIT OR Apache-2.0",
   "repository": {
@@ -29,7 +29,8 @@
   "files": [
     "index.js",
     "index.d.ts",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md"
   ],
   "engines": {
     "node": ">=20"
