@@ -32,6 +32,12 @@ test("exposes ABI-stable SDK metadata and materialization contract", () => {
     "restorePaths",
     "pull",
     "cloneRepository",
+    "applyMerge",
+    "setMergePathResult",
+    "resolveMergeRow",
+    "writeAndStageTextResult",
+    "continueMerge",
+    "abortMerge",
   ]) {
     assert.equal(operationMaterializesWorktree(operation), true)
   }
@@ -59,6 +65,11 @@ test("exposes ABI-stable SDK metadata and materialization contract", () => {
     "configureRemote",
     "push",
     "fetch",
+    "planMerge",
+    "getMergeStatus",
+    "listMergePaths",
+    "listMergeConflicts",
+    "readMergeVersion",
   ]) {
     assert.equal(operationMaterializesWorktree(operation), false)
   }
@@ -912,6 +923,216 @@ test(
         "whole Space\nupdated\n"
       )
 
+      await Promise.all([sourceSession.close(), cloneSession.close()])
+    })
+  }
+)
+
+test("plans and resolves a durable Git-like text merge", async () => {
+  await withTemporaryDirectory("graft-sdk-merge-", async (temporaryRoot) => {
+    const source = path.join(temporaryRoot, "source")
+    const remote = path.join(temporaryRoot, "remote")
+    const clone = path.join(temporaryRoot, "clone")
+    await Promise.all([fs.mkdir(source), fs.mkdir(remote), fs.mkdir(clone)])
+
+    await fs.writeFile(path.join(source, "note.txt"), "base\n")
+    const sourceSession = await RepositorySession.open(source)
+    await sourceSession.init()
+    await sourceSession.addAll()
+    await sourceSession.commit("base")
+    await sourceSession.configureRemote({
+      name: "origin",
+      url: `fs://${remote}`,
+      upstreamBranch: "main",
+    })
+    await sourceSession.push()
+
+    const cloneSession = await RepositorySession.open(clone)
+    await cloneSession.cloneRepository({ remoteUrl: `fs://${remote}` })
+
+    await fs.writeFile(path.join(source, "note.txt"), "hosted\n")
+    await sourceSession.addAll()
+    await sourceSession.commit("hosted edit")
+    await sourceSession.push()
+
+    await fs.writeFile(path.join(clone, "note.txt"), "local\n")
+    await cloneSession.addAll()
+    const local = await cloneSession.commit("local edit")
+    await cloneSession.fetch()
+
+    const plan = await cloneSession.planMerge({
+      revision: "origin/main",
+      expectedHead: local.commit.id,
+    })
+    assert.equal(plan.kind, "three_way")
+    assert.deepEqual(plan.conflicted_paths, ["note.txt"])
+
+    const applied = await cloneSession.applyMerge({
+      revision: "origin/main",
+      expectedHead: local.commit.id,
+      planToken: plan.plan_token,
+    })
+    assert.equal(applied.merge.state, "merging")
+    assert.equal(applied.merge.unmerged_count, 1)
+    const stateToken = applied.merge.state_token
+
+    const paths = await cloneSession.listMergePaths({
+      expectedStateToken: stateToken,
+    })
+    assert.deepEqual(
+      paths.items.map((item) => [item.path, item.state]),
+      [["note.txt", "unmerged"]]
+    )
+    const conflicts = await cloneSession.listMergeConflicts({
+      path: "note.txt",
+      expectedStateToken: stateToken,
+    })
+    assert.equal(conflicts.items.length, 1)
+    assert.equal(conflicts.items[0].kind, "file")
+
+    const [base, ours, theirs] = await Promise.all(
+      ["base", "ours", "theirs"].map((version) =>
+        cloneSession.readMergeVersion({
+          path: "note.txt",
+          version,
+          maxBytes: 1024,
+          expectedStateToken: stateToken,
+        })
+      )
+    )
+    assert.equal(base.content.content, "base\n")
+    assert.equal(ours.content.content, "local\n")
+    assert.equal(theirs.content.content, "hosted\n")
+
+    await cloneSession.close()
+    await cloneSession.open()
+    const reopened = await cloneSession.getMergeStatus()
+    assert.equal(reopened.state, "merging")
+    assert.equal(reopened.state_token, stateToken)
+
+    await assert.rejects(
+      cloneSession.writeAndStageTextResult({
+        path: "note.txt",
+        content: "stale\n",
+        expectedStateToken: "stale",
+      }),
+      (error) => {
+        assert.equal(error.code, "GRAFT_SDK_REPOSITORY_STALE")
+        return true
+      }
+    )
+
+    const resolved = await cloneSession.writeAndStageTextResult({
+      path: "note.txt",
+      content: "resolved\n",
+      expectedStateToken: reopened.state_token,
+    })
+    assert.equal(resolved.merge.state, "merging")
+    assert.equal(resolved.merge.unmerged_count, 0)
+    const completed = await cloneSession.continueMerge({
+      message: "merge hosted",
+      expectedStateToken: resolved.merge.state_token,
+    })
+    assert.equal(completed.merge.state, "none")
+    assert.equal(
+      await fs.readFile(path.join(clone, "note.txt"), "utf8"),
+      "resolved\n"
+    )
+    const commit = await cloneSession.commitDetails(
+      completed.output.commit.id
+    )
+    assert.equal(commit.parents.length, 2)
+
+    await Promise.all([sourceSession.close(), cloneSession.close()])
+  })
+})
+
+test(
+  "resolves a fetched SQLite row conflict through the public SDK",
+  nodeSqliteTest,
+  async () => {
+    await withTemporaryDirectory("graft-sdk-row-merge-", async (root) => {
+      const source = path.join(root, "source")
+      const remote = path.join(root, "remote")
+      const clone = path.join(root, "clone")
+      await Promise.all([fs.mkdir(source), fs.mkdir(remote), fs.mkdir(clone)])
+      const sourceDatabasePath = path.join(source, "space.eidos")
+      const cloneDatabasePath = path.join(clone, "space.eidos")
+
+      const database = new DatabaseSync(sourceDatabasePath)
+      database.exec(`
+        CREATE TABLE docs (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO docs VALUES (1, 'base');
+      `)
+      database.close()
+
+      const sourceSession = await RepositorySession.open(source)
+      await sourceSession.init()
+      await sourceSession.addAll()
+      await sourceSession.commit("base")
+      await sourceSession.configureRemote({
+        name: "origin",
+        url: `fs://${remote}`,
+        upstreamBranch: "main",
+      })
+      await sourceSession.push()
+
+      const cloneSession = await RepositorySession.open(clone)
+      await cloneSession.cloneRepository({ remoteUrl: `fs://${remote}` })
+
+      const hosted = new DatabaseSync(sourceDatabasePath)
+      hosted.exec("UPDATE docs SET value = 'hosted' WHERE id = 1")
+      hosted.close()
+      await sourceSession.addAll()
+      await sourceSession.commit("hosted row")
+      await sourceSession.push()
+
+      const local = new DatabaseSync(cloneDatabasePath)
+      local.exec("UPDATE docs SET value = 'local' WHERE id = 1")
+      local.close()
+      await cloneSession.addAll()
+      const localCommit = await cloneSession.commit("local row")
+      await cloneSession.fetch()
+
+      const plan = await cloneSession.planMerge({
+        revision: "origin/main",
+        expectedHead: localCommit.commit.id,
+      })
+      const applied = await cloneSession.applyMerge({
+        revision: "origin/main",
+        expectedHead: localCommit.commit.id,
+        planToken: plan.plan_token,
+      })
+      assert.equal(applied.merge.state, "merging")
+      const conflicts = await cloneSession.listMergeConflicts({
+        path: "space.eidos",
+        expectedStateToken: applied.merge.state_token,
+      })
+      assert.equal(conflicts.items.length, 1)
+      assert.equal(conflicts.items[0].kind, "row")
+      assert.equal(conflicts.items[0].rowid, 1)
+
+      const resolved = await cloneSession.resolveMergeRow({
+        path: "space.eidos",
+        table: "docs",
+        identity: 1,
+        result: "theirs",
+        expectedStateToken: applied.merge.state_token,
+      })
+      assert.equal(resolved.merge.state, "merging")
+      assert.equal(resolved.merge.unmerged_count, 0)
+      const completed = await cloneSession.continueMerge({
+        message: "merge hosted row",
+        expectedStateToken: resolved.merge.state_token,
+      })
+      assert.equal(completed.merge.state, "none")
+
+      const merged = new DatabaseSync(cloneDatabasePath, { readOnly: true })
+      assert.equal(
+        merged.prepare("SELECT value FROM docs WHERE id = 1").get().value,
+        "hosted"
+      )
+      merged.close()
       await Promise.all([sourceSession.close(), cloneSession.close()])
     })
   }

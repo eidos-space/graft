@@ -1176,6 +1176,7 @@ dependencies = [
  "anyhow",
  "clap",
  "graft",
+ "graft-sdk",
  "graft-sqlite",
  "rusqlite",
  "serde_json",

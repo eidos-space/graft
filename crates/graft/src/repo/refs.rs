@@ -776,6 +776,16 @@ impl Repository {
         Ok(distances)
     }
 
+    /// Finds the best common ancestor for two revisions without mutating repository state.
+    ///
+    /// This is the public plumbing counterpart used by embedders that need to present the
+    /// base/ours/theirs sides of an in-progress merge after reopening a process.
+    pub fn merge_base_between(&self, left: &str, right: &str) -> Result<Option<String>> {
+        let left = self.resolve_revision(left)?;
+        let right = self.resolve_revision(right)?;
+        self.merge_base(&left, &right)
+    }
+
     pub(super) fn head_files(&self) -> Result<BTreeMap<String, CommitFileState>> {
         Ok(self
             .head_target()?

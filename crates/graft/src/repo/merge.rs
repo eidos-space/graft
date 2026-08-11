@@ -166,6 +166,16 @@ impl Repository {
         if self.merge_head()?.is_some() {
             return Err(RepoErr::MergeInProgress);
         }
+        let expected = match &plan.outcome {
+            MergeOutcome::FastForward { from, .. } => from.clone(),
+            MergeOutcome::AlreadyUpToDate { head } | MergeOutcome::Merged { head, .. } => {
+                Some(head.clone())
+            }
+        };
+        let actual = self.head_target()?;
+        if actual != expected {
+            return Err(RepoErr::MergePlanStale { expected, actual });
+        }
 
         match &plan.outcome {
             MergeOutcome::FastForward { to, .. } => {

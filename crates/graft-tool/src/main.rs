@@ -10,7 +10,14 @@ use graft::{
     core::{LogId, SegmentId, VolumeId},
     repo::Repository,
 };
+use graft_sdk::{
+    AbortMergeOptions, ApplyMergeOptions, ContinueMergeOptions, ListMergeConflictsOptions,
+    ListMergePathsOptions, MergePathFilter, MergePathResult, MergeVersion, PlanMergeOptions,
+    ReadMergeVersionOptions, RepositorySession, ResolveMergeRowOptions, SetMergePathResultOptions,
+    WriteAndStageTextResultOptions,
+};
 use rusqlite::{Batch, Connection, fallible_iterator::FallibleIterator, types::ValueRef};
+use serde_json::Value;
 
 #[derive(Subcommand)]
 enum Command {
@@ -49,6 +56,13 @@ enum Command {
             allow_hyphen_values = true
         )]
         sql: Vec<String>,
+    },
+
+    /// Move one path inside the browser worktree
+    #[command(name = "browser-move", hide = true)]
+    BrowserMove {
+        source: PathBuf,
+        destination: PathBuf,
     },
 
     /// Clone a remote Graft repository into the database path worktree
@@ -392,6 +406,13 @@ enum Command {
     /// Show unresolved merge conflicts
     Conflicts(ConflictsArgs),
 
+    /// Run the contract-shaped merge operations used by the browser adapter
+    #[command(name = "merge-api", hide = true)]
+    MergeApi {
+        #[command(subcommand)]
+        command: MergeApiCommand,
+    },
+
     /// Resolve a database conflict using one side
     #[command(group(
         ArgGroup::new("resolve_side")
@@ -448,6 +469,109 @@ enum Command {
 
     /// Push local branches to a remote
     Push(RemotePushArgs),
+}
+
+#[derive(Subcommand)]
+enum MergeApiCommand {
+    /// Compute a merge plan without changing the repository
+    Plan {
+        revision: String,
+        #[arg(long)]
+        expected_head: Option<String>,
+    },
+    /// Apply a previously returned plan token
+    Apply {
+        revision: String,
+        #[arg(long)]
+        expected_head: Option<String>,
+        #[arg(long)]
+        plan_token: String,
+    },
+    /// Read the durable merge state
+    Status,
+    /// List merge paths using the durable state token
+    Paths {
+        #[arg(long, default_value = "all")]
+        filter: String,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        #[arg(long)]
+        after: Option<String>,
+        #[arg(long)]
+        state_token: String,
+    },
+    /// List structured conflicts for one merge path
+    Conflicts {
+        path: PathBuf,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        #[arg(long)]
+        after: Option<String>,
+        #[arg(long)]
+        state_token: String,
+    },
+    /// Read one of base/ours/theirs/result for a merge path
+    Version {
+        path: PathBuf,
+        #[arg(value_enum)]
+        version: MergeApiVersion,
+        #[arg(long, default_value_t = 8 * 1024 * 1024)]
+        max_bytes: u64,
+        #[arg(long)]
+        state_token: String,
+    },
+    /// Select ours or theirs for a whole conflicted path
+    Path {
+        path: PathBuf,
+        #[arg(value_enum)]
+        result: MergeApiResult,
+        #[arg(long)]
+        state_token: String,
+    },
+    /// Select ours or theirs for one SQLite row conflict
+    Row {
+        path: PathBuf,
+        table: String,
+        identity: String,
+        #[arg(value_enum)]
+        result: MergeApiResult,
+        #[arg(long)]
+        state_token: String,
+    },
+    /// Write and stage an edited text result
+    Text {
+        path: PathBuf,
+        #[arg(long)]
+        content: String,
+        #[arg(long)]
+        state_token: String,
+    },
+    /// Commit the resolved merge
+    Continue {
+        #[arg(short, long)]
+        message: String,
+        #[arg(long)]
+        state_token: String,
+    },
+    /// Abort the merge and restore the original head
+    Abort {
+        #[arg(long)]
+        state_token: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum MergeApiVersion {
+    Base,
+    Ours,
+    Theirs,
+    Result,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum MergeApiResult {
+    Ours,
+    Theirs,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -916,6 +1040,9 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
             print_output(run_repo_init(args.json)?);
         }
         Command::Sql { sql } => print_output(run_sql(db_override, &sql)?),
+        Command::BrowserMove { source, destination } => {
+            run_browser_move(&source, &destination)?;
+        }
         Command::Clone { json, branch_option, remote, branch } => {
             let branch = branch_option.as_deref().or(branch.as_deref());
             let arg = repo_clone_arg(&remote, branch);
@@ -1403,6 +1530,9 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
                 None,
             )?);
         }
+        Command::MergeApi { command } => {
+            print_output(Some(run_merge_api(db_override, command)?));
+        }
         Command::Resolve { json, ours, theirs, manual, row, path } => {
             let path = path.as_deref().or(db_override);
             let arg = repo_resolve_arg(ours, theirs, manual, row.as_deref(), path)?;
@@ -1551,6 +1681,22 @@ fn run_repo_init(json: bool) -> Result<Option<String>> {
     )))
 }
 
+#[cfg(target_arch = "wasm32")]
+fn run_browser_move(source: &Path, destination: &Path) -> Result<()> {
+    std::fs::rename(source, destination).with_context(|| {
+        format!(
+            "failed to move {} to {} inside the browser worktree",
+            source.display(),
+            destination.display()
+        )
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn run_browser_move(_source: &Path, _destination: &Path) -> Result<()> {
+    bail!("browser-move is only available in the browser build")
+}
+
 fn run_sql(db_override: Option<&Path>, sql_parts: &[String]) -> Result<Option<String>> {
     let sql = if sql_parts.is_empty() {
         let mut sql = String::new();
@@ -1682,6 +1828,11 @@ fn repo_log_arg(limit: Option<usize>, after: Option<&str>) -> Result<String> {
 }
 
 fn validate_command_repo_paths(command: &Command) -> Result<()> {
+    if let Command::BrowserMove { source, destination } = command {
+        validate_cli_repo_path(source, true)?;
+        validate_cli_repo_path(destination, true)?;
+        return Ok(());
+    }
     let (path, lossless_serialization) = match command {
         Command::Add(args) => (args.path.as_deref(), true),
         Command::Rm(args) => (args.path.as_deref(), false),
@@ -2431,6 +2582,126 @@ fn execute_repository_command(
 ) -> Result<Option<String>> {
     let command = graft_sqlite::repo_service::RepositoryCommand::parse(suffix, arg)?;
     graft_sqlite::repo_service::execute_repository_command(db, command).map_err(anyhow::Error::from)
+}
+
+fn run_merge_api(db_override: Option<&Path>, command: MergeApiCommand) -> Result<String> {
+    let target = match db_override {
+        Some(path) => resolve_cli_db(Some(path))?,
+        None => resolve_repo_workspace_session()?,
+    };
+    let session = RepositorySession::new(target);
+    session.open().map_err(anyhow::Error::from)?;
+    let output = run_merge_api_command(&session, command);
+    let close = session.close().map_err(anyhow::Error::from);
+    close?;
+    let value = output?;
+    serde_json::to_string(&value).context("failed to serialize merge API output")
+}
+
+fn run_merge_api_command(session: &RepositorySession, command: MergeApiCommand) -> Result<Value> {
+    let value = match command {
+        MergeApiCommand::Plan { revision, expected_head } => serde_json::to_value(
+            session.plan_merge(&PlanMergeOptions { revision, expected_head })?,
+        )?,
+        MergeApiCommand::Apply { revision, expected_head, plan_token } => {
+            serde_json::to_value(session.apply_merge(&ApplyMergeOptions {
+                revision,
+                expected_head,
+                plan_token,
+            })?)?
+        }
+        MergeApiCommand::Status => serde_json::to_value(session.get_merge_status()?)?,
+        MergeApiCommand::Paths { filter, limit, after, state_token } => {
+            serde_json::to_value(session.list_merge_paths(&ListMergePathsOptions {
+                filter: parse_merge_api_filter(&filter)?,
+                limit,
+                after,
+                expected_state_token: state_token,
+            })?)?
+        }
+        MergeApiCommand::Conflicts { path, limit, after, state_token } => {
+            serde_json::to_value(session.list_merge_conflicts(&ListMergeConflictsOptions {
+                path,
+                limit,
+                after,
+                expected_state_token: state_token,
+            })?)?
+        }
+        MergeApiCommand::Version { path, version, max_bytes, state_token } => {
+            serde_json::to_value(session.read_merge_version(&ReadMergeVersionOptions {
+                path,
+                version: merge_api_version(version),
+                max_bytes,
+                expected_state_token: state_token,
+            })?)?
+        }
+        MergeApiCommand::Path { path, result, state_token } => {
+            serde_json::to_value(session.set_merge_path_result(&SetMergePathResultOptions {
+                path,
+                result: merge_api_result(result),
+                expected_state_token: state_token,
+            })?)?
+        }
+        MergeApiCommand::Row {
+            path,
+            table,
+            identity,
+            result,
+            state_token,
+        } => {
+            let identity = serde_json::from_str(&identity)
+                .context("merge-api row identity must be valid JSON")?;
+            serde_json::to_value(session.resolve_merge_row(&ResolveMergeRowOptions {
+                path,
+                table,
+                identity,
+                result: merge_api_result(result),
+                expected_state_token: state_token,
+            })?)?
+        }
+        MergeApiCommand::Text { path, content, state_token } => serde_json::to_value(
+            session.write_and_stage_text_result(&WriteAndStageTextResultOptions {
+                path,
+                content,
+                expected_state_token: state_token,
+            })?,
+        )?,
+        MergeApiCommand::Continue { message, state_token } => {
+            serde_json::to_value(session.continue_merge(&ContinueMergeOptions {
+                message,
+                expected_state_token: state_token,
+            })?)?
+        }
+        MergeApiCommand::Abort { state_token } => serde_json::to_value(
+            session.abort_merge(&AbortMergeOptions { expected_state_token: state_token })?,
+        )?,
+    };
+    Ok(value)
+}
+
+fn parse_merge_api_filter(value: &str) -> Result<MergePathFilter> {
+    match value {
+        "all" => Ok(MergePathFilter::All),
+        "unmerged" => Ok(MergePathFilter::Unmerged),
+        "resolved" => Ok(MergePathFilter::Resolved),
+        _ => bail!("merge-api paths filter must be all, unmerged, or resolved"),
+    }
+}
+
+const fn merge_api_version(value: MergeApiVersion) -> MergeVersion {
+    match value {
+        MergeApiVersion::Base => MergeVersion::Base,
+        MergeApiVersion::Ours => MergeVersion::Ours,
+        MergeApiVersion::Theirs => MergeVersion::Theirs,
+        MergeApiVersion::Result => MergeVersion::Result,
+    }
+}
+
+const fn merge_api_result(value: MergeApiResult) -> MergePathResult {
+    match value {
+        MergeApiResult::Ours => MergePathResult::Ours,
+        MergeApiResult::Theirs => MergePathResult::Theirs,
+    }
 }
 
 fn execute_sql(db: &Path, sql: &str) -> Result<Option<String>> {

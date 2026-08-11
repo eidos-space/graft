@@ -3513,6 +3513,33 @@ fn merge_plan_freezes_target_before_branch_moves() {
 }
 
 #[test]
+fn merge_plan_rejects_a_moved_local_head() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = Repository::init(tmp.path()).unwrap();
+    let base = repo.commit("base").unwrap();
+    repo.switch_new_branch("feature", None).unwrap();
+    let feature = repo.commit("feature").unwrap();
+    repo.switch_branch("main").unwrap();
+
+    let plan = repo.plan_merge_revision("feature").unwrap();
+    assert_eq!(
+        plan.outcome,
+        MergeOutcome::FastForward {
+            from: Some(base.id.clone()),
+            to: feature.id,
+        }
+    );
+    let moved = repo.commit("main moved after plan").unwrap();
+
+    assert!(matches!(
+        repo.apply_merge_plan(&plan),
+        Err(RepoErr::MergePlanStale { expected, actual })
+            if expected == Some(base.id) && actual == Some(moved.id.clone())
+    ));
+    assert_eq!(repo.head_target().unwrap(), Some(moved.id));
+}
+
+#[test]
 fn merge_revision_stages_clean_delete_from_theirs() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = Repository::init(tmp.path()).unwrap();

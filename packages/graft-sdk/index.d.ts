@@ -139,6 +139,193 @@ export interface CloneOptions extends OperationOptions {
   bearerToken?: string
 }
 
+export type MergePlanKind = "up_to_date" | "fast_forward" | "three_way"
+
+export interface PlanMergeOptions extends OperationOptions {
+  revision: string
+  /** Optional compare-and-swap guard for the current local HEAD. */
+  expectedHead?: string
+}
+
+export interface ApplyMergeOptions extends OperationOptions {
+  revision: string
+  /** HEAD returned by planMerge, or omitted when applying onto an unborn branch. */
+  expectedHead?: string
+  /** Opaque token returned by planMerge for this exact immutable plan. */
+  planToken: string
+}
+
+export interface MergePlanResult {
+  kind: MergePlanKind
+  expected_head: string | null
+  target: string
+  merge_base: string | null
+  staged_paths: string[]
+  conflicted_paths: string[]
+  plan_token: string
+}
+
+export type MergeStatus =
+  | { state: "none" }
+  | {
+      state: "merging"
+      orig_head: string
+      merge_head: string
+      merge_base: string | null
+      staged_count: number
+      unmerged_count: number
+      state_token: string
+    }
+
+export interface MergeApplyResult {
+  plan: MergePlanResult
+  output: GraftJson
+  merge: MergeStatus
+}
+
+export type MergePathFilter = "all" | "unmerged" | "resolved"
+export type MergePathState = "unmerged" | "resolved"
+
+export interface ListMergePathsOptions extends OperationOptions {
+  filter?: MergePathFilter
+  limit?: number
+  after?: string
+  expectedStateToken: string
+}
+
+export interface MergePath {
+  path: string
+  state: MergePathState
+  kind: RepositoryPathKind
+  storage: RepositoryPathStorage
+  has_base: boolean
+  has_ours: boolean
+  has_theirs: boolean
+}
+
+export interface MergePathPage {
+  state_token: string
+  items: MergePath[]
+  next_cursor: string | null
+}
+
+export interface ListMergeConflictsOptions extends OperationOptions {
+  path: string
+  limit?: number
+  after?: string
+  expectedStateToken: string
+}
+
+export interface MergeSchemaColumnChange {
+  side: "ours" | "theirs" | string
+  operation: string
+  from?: string
+  to?: string
+}
+
+export interface MergeConflict {
+  id: string
+  path: string
+  path_kind: RepositoryPathKind
+  storage: RepositoryPathStorage
+  kind: "row" | "schema" | "opaque" | "file" | string
+  reason: string
+  status: "resolved" | "unresolved"
+  resolution?: "ours" | "theirs"
+  table?: string
+  columns?: string[]
+  rowid?: number
+  key?: Record<string, unknown>
+  ours_rowid?: number
+  theirs_rowid?: number
+  ours_key?: Record<string, unknown>
+  theirs_key?: Record<string, unknown>
+  semantic_key?: string[]
+  name?: string
+  entry_type?: string
+  column_changes?: MergeSchemaColumnChange[]
+  change?: string
+  owner?: string
+  ours_op?: string
+  theirs_op?: string
+  base_row?: unknown[]
+  ours_row?: unknown[]
+  theirs_row?: unknown[]
+  message?: string
+  [key: string]: unknown
+}
+
+export interface MergeConflictPage {
+  state_token: string
+  path: string
+  items: MergeConflict[]
+  next_cursor: string | null
+}
+
+export type MergeVersion = "base" | "ours" | "theirs" | "result"
+
+export interface ReadMergeVersionOptions extends OperationOptions {
+  path: string
+  version: MergeVersion
+  /** UTF-8 content limit in bytes. Range: 1–8,388,608. */
+  maxBytes: number
+  expectedStateToken: string
+}
+
+export type MergeContentState =
+  | { state: "absent" }
+  | { state: "utf8"; content: string; size: number }
+  | { state: "too_large"; size: number }
+  | { state: "missing_payload"; size: number }
+  | { state: "invalid_utf8"; size: number }
+
+export interface MergeContent {
+  version: MergeVersion
+  revision: string | null
+  path: string
+  kind: RepositoryPathKind | null
+  storage: RepositoryPathStorage | null
+  content: MergeContentState
+  state_token: string
+}
+
+export type MergePathResult = "ours" | "theirs"
+
+export interface SetMergePathResultOptions extends OperationOptions {
+  path: string
+  result: MergePathResult
+  expectedStateToken: string
+}
+
+export interface ResolveMergeRowOptions extends OperationOptions {
+  path: string
+  table: string
+  /** Integer rowid or an object containing every declared primary-key field. */
+  identity: number | Record<string, unknown>
+  result: MergePathResult
+  expectedStateToken: string
+}
+
+export interface WriteAndStageTextResultOptions extends OperationOptions {
+  path: string
+  content: string
+  expectedStateToken: string
+}
+
+export interface ContinueMergeOptions extends OperationOptions {
+  message: string
+  expectedStateToken: string
+}
+
+export interface AbortMergeOptions extends OperationOptions {
+  expectedStateToken: string
+}
+
+export interface MergeOperationResult {
+  output: GraftJson
+  merge: MergeStatus
+}
+
 export type GraftJson = Record<string, unknown> | unknown[]
 
 export type RepositoryPathKind =
@@ -614,6 +801,25 @@ export class RepositorySession {
   push(options?: RemoteOperationOptions): Promise<GraftJson>
   fetch(options?: RemoteOperationOptions): Promise<GraftJson>
   pull(options?: RemoteOperationOptions): Promise<GraftJson>
+  planMerge(options: PlanMergeOptions): Promise<MergePlanResult>
+  applyMerge(options: ApplyMergeOptions): Promise<MergeApplyResult>
+  getMergeStatus(options?: OperationOptions): Promise<MergeStatus>
+  listMergePaths(options: ListMergePathsOptions): Promise<MergePathPage>
+  listMergeConflicts(
+    options: ListMergeConflictsOptions
+  ): Promise<MergeConflictPage>
+  readMergeVersion(options: ReadMergeVersionOptions): Promise<MergeContent>
+  setMergePathResult(
+    options: SetMergePathResultOptions
+  ): Promise<MergeOperationResult>
+  resolveMergeRow(
+    options: ResolveMergeRowOptions
+  ): Promise<MergeOperationResult>
+  writeAndStageTextResult(
+    options: WriteAndStageTextResultOptions
+  ): Promise<MergeOperationResult>
+  continueMerge(options: ContinueMergeOptions): Promise<MergeOperationResult>
+  abortMerge(options: AbortMergeOptions): Promise<MergeOperationResult>
   cloneRepository(options: CloneOptions): Promise<GraftJson>
 }
 

@@ -1,16 +1,26 @@
 use std::{path::PathBuf, sync::Arc};
 
 use graft_sdk::{
+    AbortMergeOptions as CoreAbortMergeOptions, ApplyMergeOptions as CoreApplyMergeOptions,
     CancellationToken, CommitChangedPathsOptions as CoreCommitChangedPathsOptions,
-    DiffOptions as CoreDiffOptions, DiffPathsOptions as CoreDiffPathsOptions,
-    IgnoredPathsOptions as CoreIgnoredPathsOptions, InventoryKind,
-    InventoryOptions as CoreInventoryOptions, ReadPathContentOptions as CoreReadPathContentOptions,
+    ContinueMergeOptions as CoreContinueMergeOptions, DiffOptions as CoreDiffOptions,
+    DiffPathsOptions as CoreDiffPathsOptions, IgnoredPathsOptions as CoreIgnoredPathsOptions,
+    InventoryKind, InventoryOptions as CoreInventoryOptions,
+    ListMergeConflictsOptions as CoreListMergeConflictsOptions,
+    ListMergePathsOptions as CoreListMergePathsOptions, MergePathFilter as CoreMergePathFilter,
+    MergePathResult as CoreMergePathResult, MergeVersion as CoreMergeVersion,
+    PlanMergeOptions as CorePlanMergeOptions,
+    ReadMergeVersionOptions as CoreReadMergeVersionOptions,
+    ReadPathContentOptions as CoreReadPathContentOptions,
     RecordPathMoveOptions as CoreRecordPathMoveOptions,
     RemoteConfigureOptions as CoreRemoteConfigureOptions, RepositoryOperation,
-    RepositorySession as CoreRepositorySession, RestoreOptions as CoreRestoreOptions,
+    RepositorySession as CoreRepositorySession,
+    ResolveMergeRowOptions as CoreResolveMergeRowOptions, RestoreOptions as CoreRestoreOptions,
     RestorePathsOptions as CoreRestorePathsOptions, SdkError,
+    SetMergePathResultOptions as CoreSetMergePathResultOptions,
     SqliteDiffPathsOptions as CoreSqliteDiffPathsOptions, SqliteDiffResponse,
     StagePathsOptions as CoreStagePathsOptions, UntrackPathsOptions as CoreUntrackPathsOptions,
+    WriteAndStageTextResultOptions as CoreWriteAndStageTextResultOptions,
 };
 use napi::{
     Env, Error, Result, Status, Task,
@@ -135,6 +145,77 @@ pub struct CloneOptions {
     pub bearer_token: Option<String>,
 }
 
+#[napi(object)]
+pub struct PlanMergeOptions {
+    pub revision: String,
+    pub expected_head: Option<String>,
+}
+
+#[napi(object)]
+pub struct ApplyMergeOptions {
+    pub revision: String,
+    pub expected_head: Option<String>,
+    pub plan_token: String,
+}
+
+#[napi(object)]
+pub struct ListMergePathsOptions {
+    pub filter: String,
+    pub limit: u32,
+    pub after: Option<String>,
+    pub expected_state_token: String,
+}
+
+#[napi(object)]
+pub struct ListMergeConflictsOptions {
+    pub path: String,
+    pub limit: u32,
+    pub after: Option<String>,
+    pub expected_state_token: String,
+}
+
+#[napi(object)]
+pub struct ReadMergeVersionOptions {
+    pub path: String,
+    pub version: String,
+    pub max_bytes: u32,
+    pub expected_state_token: String,
+}
+
+#[napi(object)]
+pub struct SetMergePathResultOptions {
+    pub path: String,
+    pub result: String,
+    pub expected_state_token: String,
+}
+
+#[napi(object)]
+pub struct ResolveMergeRowOptions {
+    pub path: String,
+    pub table: String,
+    pub identity: String,
+    pub result: String,
+    pub expected_state_token: String,
+}
+
+#[napi(object)]
+pub struct WriteAndStageTextResultOptions {
+    pub path: String,
+    pub content: String,
+    pub expected_state_token: String,
+}
+
+#[napi(object)]
+pub struct ContinueMergeOptions {
+    pub message: String,
+    pub expected_state_token: String,
+}
+
+#[napi(object)]
+pub struct AbortMergeOptions {
+    pub expected_state_token: String,
+}
+
 enum JsonOperation {
     Init,
     Status,
@@ -214,6 +295,37 @@ enum JsonOperation {
         remote_url: String,
         branch: Option<String>,
         bearer_token: Option<String>,
+    },
+    PlanMerge {
+        options: CorePlanMergeOptions,
+    },
+    ApplyMerge {
+        options: CoreApplyMergeOptions,
+    },
+    GetMergeStatus,
+    ListMergePaths {
+        options: CoreListMergePathsOptions,
+    },
+    ListMergeConflicts {
+        options: CoreListMergeConflictsOptions,
+    },
+    ReadMergeVersion {
+        options: CoreReadMergeVersionOptions,
+    },
+    SetMergePathResult {
+        options: CoreSetMergePathResultOptions,
+    },
+    ResolveMergeRow {
+        options: CoreResolveMergeRowOptions,
+    },
+    WriteAndStageTextResult {
+        options: CoreWriteAndStageTextResultOptions,
+    },
+    ContinueMerge {
+        options: CoreContinueMergeOptions,
+    },
+    AbortMerge {
+        options: CoreAbortMergeOptions,
     },
 }
 
@@ -326,6 +438,79 @@ impl JsonTask {
             return serde_json::to_string(&value)
                 .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
         }
+        match &self.operation {
+            JsonOperation::PlanMerge { options } => {
+                let value = self.session.plan_merge(options).map_err(napi_error)?;
+                return serde_json::to_string(&value)
+                    .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
+            }
+            JsonOperation::ApplyMerge { options } => {
+                let value = self.session.apply_merge(options).map_err(napi_error)?;
+                return serde_json::to_string(&value)
+                    .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
+            }
+            JsonOperation::GetMergeStatus => {
+                let value = self.session.get_merge_status().map_err(napi_error)?;
+                return serde_json::to_string(&value)
+                    .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
+            }
+            JsonOperation::ListMergePaths { options } => {
+                let value = self.session.list_merge_paths(options).map_err(napi_error)?;
+                return serde_json::to_string(&value)
+                    .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
+            }
+            JsonOperation::ListMergeConflicts { options } => {
+                let value = self
+                    .session
+                    .list_merge_conflicts(options)
+                    .map_err(napi_error)?;
+                return serde_json::to_string(&value)
+                    .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
+            }
+            JsonOperation::ReadMergeVersion { options } => {
+                let value = self
+                    .session
+                    .read_merge_version(options)
+                    .map_err(napi_error)?;
+                return serde_json::to_string(&value)
+                    .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
+            }
+            JsonOperation::SetMergePathResult { options } => {
+                let value = self
+                    .session
+                    .set_merge_path_result(options)
+                    .map_err(napi_error)?;
+                return serde_json::to_string(&value)
+                    .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
+            }
+            JsonOperation::ResolveMergeRow { options } => {
+                let value = self
+                    .session
+                    .resolve_merge_row(options)
+                    .map_err(napi_error)?;
+                return serde_json::to_string(&value)
+                    .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
+            }
+            JsonOperation::WriteAndStageTextResult { options } => {
+                let value = self
+                    .session
+                    .write_and_stage_text_result(options)
+                    .map_err(napi_error)?;
+                return serde_json::to_string(&value)
+                    .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
+            }
+            JsonOperation::ContinueMerge { options } => {
+                let value = self.session.continue_merge(options).map_err(napi_error)?;
+                return serde_json::to_string(&value)
+                    .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
+            }
+            JsonOperation::AbortMerge { options } => {
+                let value = self.session.abort_merge(options).map_err(napi_error)?;
+                return serde_json::to_string(&value)
+                    .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
+            }
+            _ => {}
+        }
         let value = match &mut self.operation {
             JsonOperation::Init => self.session.init(),
             JsonOperation::Status => self.session.status(),
@@ -383,6 +568,19 @@ impl JsonTask {
             JsonOperation::Clone { remote_url, branch, bearer_token } => self
                 .session
                 .clone_repository(remote_url, branch.as_deref(), bearer_token.take()),
+            JsonOperation::PlanMerge { .. }
+            | JsonOperation::ApplyMerge { .. }
+            | JsonOperation::GetMergeStatus
+            | JsonOperation::ListMergePaths { .. }
+            | JsonOperation::ListMergeConflicts { .. }
+            | JsonOperation::ReadMergeVersion { .. }
+            | JsonOperation::SetMergePathResult { .. }
+            | JsonOperation::ResolveMergeRow { .. }
+            | JsonOperation::WriteAndStageTextResult { .. }
+            | JsonOperation::ContinueMerge { .. }
+            | JsonOperation::AbortMerge { .. } => {
+                unreachable!("handled before JSON value dispatch")
+            }
         }
         .map_err(napi_error)?;
         serde_json::to_string(&value)
@@ -878,6 +1076,223 @@ impl NodeRepositorySession {
         json_task(self, JsonOperation::Pull { remote, branch }, signal)
     }
 
+    #[napi(js_name = "planMerge")]
+    pub fn plan_merge(
+        &self,
+        options: PlanMergeOptions,
+        signal: Option<AbortSignal>,
+    ) -> AsyncTask<JsonTask> {
+        json_task(
+            self,
+            JsonOperation::PlanMerge {
+                options: CorePlanMergeOptions {
+                    revision: options.revision,
+                    expected_head: options.expected_head,
+                },
+            },
+            signal,
+        )
+    }
+
+    #[napi(js_name = "applyMerge")]
+    pub fn apply_merge(
+        &self,
+        options: ApplyMergeOptions,
+        signal: Option<AbortSignal>,
+    ) -> AsyncTask<JsonTask> {
+        json_task(
+            self,
+            JsonOperation::ApplyMerge {
+                options: CoreApplyMergeOptions {
+                    revision: options.revision,
+                    expected_head: options.expected_head,
+                    plan_token: options.plan_token,
+                },
+            },
+            signal,
+        )
+    }
+
+    #[napi(js_name = "getMergeStatus")]
+    pub fn get_merge_status(&self, signal: Option<AbortSignal>) -> AsyncTask<JsonTask> {
+        json_task(self, JsonOperation::GetMergeStatus, signal)
+    }
+
+    #[napi(js_name = "listMergePaths")]
+    pub fn list_merge_paths(
+        &self,
+        options: ListMergePathsOptions,
+        signal: Option<AbortSignal>,
+    ) -> Result<AsyncTask<JsonTask>> {
+        let filter = match options.filter.as_str() {
+            "all" => CoreMergePathFilter::All,
+            "unmerged" => CoreMergePathFilter::Unmerged,
+            "resolved" => CoreMergePathFilter::Resolved,
+            value => return Err(invalid_enum("merge path filter", value)),
+        };
+        Ok(json_task(
+            self,
+            JsonOperation::ListMergePaths {
+                options: CoreListMergePathsOptions {
+                    filter,
+                    limit: options.limit as usize,
+                    after: options.after,
+                    expected_state_token: options.expected_state_token,
+                },
+            },
+            signal,
+        ))
+    }
+
+    #[napi(js_name = "listMergeConflicts")]
+    pub fn list_merge_conflicts(
+        &self,
+        options: ListMergeConflictsOptions,
+        signal: Option<AbortSignal>,
+    ) -> AsyncTask<JsonTask> {
+        json_task(
+            self,
+            JsonOperation::ListMergeConflicts {
+                options: CoreListMergeConflictsOptions {
+                    path: PathBuf::from(options.path),
+                    limit: options.limit as usize,
+                    after: options.after,
+                    expected_state_token: options.expected_state_token,
+                },
+            },
+            signal,
+        )
+    }
+
+    #[napi(js_name = "readMergeVersion")]
+    pub fn read_merge_version(
+        &self,
+        options: ReadMergeVersionOptions,
+        signal: Option<AbortSignal>,
+    ) -> Result<AsyncTask<JsonTask>> {
+        let version = match options.version.as_str() {
+            "base" => CoreMergeVersion::Base,
+            "ours" => CoreMergeVersion::Ours,
+            "theirs" => CoreMergeVersion::Theirs,
+            "result" => CoreMergeVersion::Result,
+            value => return Err(invalid_enum("merge version", value)),
+        };
+        Ok(json_task(
+            self,
+            JsonOperation::ReadMergeVersion {
+                options: CoreReadMergeVersionOptions {
+                    path: PathBuf::from(options.path),
+                    version,
+                    max_bytes: options.max_bytes as u64,
+                    expected_state_token: options.expected_state_token,
+                },
+            },
+            signal,
+        ))
+    }
+
+    #[napi(js_name = "setMergePathResult")]
+    pub fn set_merge_path_result(
+        &self,
+        options: SetMergePathResultOptions,
+        signal: Option<AbortSignal>,
+    ) -> Result<AsyncTask<JsonTask>> {
+        let result = parse_merge_path_result(&options.result)?;
+        Ok(json_task(
+            self,
+            JsonOperation::SetMergePathResult {
+                options: CoreSetMergePathResultOptions {
+                    path: PathBuf::from(options.path),
+                    result,
+                    expected_state_token: options.expected_state_token,
+                },
+            },
+            signal,
+        ))
+    }
+
+    #[napi(js_name = "resolveMergeRow")]
+    pub fn resolve_merge_row(
+        &self,
+        options: ResolveMergeRowOptions,
+        signal: Option<AbortSignal>,
+    ) -> Result<AsyncTask<JsonTask>> {
+        let result = parse_merge_path_result(&options.result)?;
+        let identity = serde_json::from_str(&options.identity).map_err(|error| {
+            Error::new(
+                Status::InvalidArg,
+                format!("merge row identity must be valid JSON: {error}"),
+            )
+        })?;
+        Ok(json_task(
+            self,
+            JsonOperation::ResolveMergeRow {
+                options: CoreResolveMergeRowOptions {
+                    path: PathBuf::from(options.path),
+                    table: options.table,
+                    identity,
+                    result,
+                    expected_state_token: options.expected_state_token,
+                },
+            },
+            signal,
+        ))
+    }
+
+    #[napi(js_name = "writeAndStageTextResult")]
+    pub fn write_and_stage_text_result(
+        &self,
+        options: WriteAndStageTextResultOptions,
+        signal: Option<AbortSignal>,
+    ) -> AsyncTask<JsonTask> {
+        json_task(
+            self,
+            JsonOperation::WriteAndStageTextResult {
+                options: CoreWriteAndStageTextResultOptions {
+                    path: PathBuf::from(options.path),
+                    content: options.content,
+                    expected_state_token: options.expected_state_token,
+                },
+            },
+            signal,
+        )
+    }
+
+    #[napi(js_name = "continueMerge")]
+    pub fn continue_merge(
+        &self,
+        options: ContinueMergeOptions,
+        signal: Option<AbortSignal>,
+    ) -> AsyncTask<JsonTask> {
+        json_task(
+            self,
+            JsonOperation::ContinueMerge {
+                options: CoreContinueMergeOptions {
+                    message: options.message,
+                    expected_state_token: options.expected_state_token,
+                },
+            },
+            signal,
+        )
+    }
+
+    #[napi(js_name = "abortMerge")]
+    pub fn abort_merge(
+        &self,
+        options: AbortMergeOptions,
+        signal: Option<AbortSignal>,
+    ) -> AsyncTask<JsonTask> {
+        json_task(
+            self,
+            JsonOperation::AbortMerge {
+                options: CoreAbortMergeOptions {
+                    expected_state_token: options.expected_state_token,
+                },
+            },
+            signal,
+        )
+    }
+
     #[napi(js_name = "cloneRepository")]
     pub fn clone_repository(
         &self,
@@ -927,6 +1342,19 @@ pub fn operation_materializes_worktree(operation: String) -> Result<bool> {
         "fetch" => RepositoryOperation::Fetch,
         "pull" => RepositoryOperation::Pull,
         "clone" | "cloneRepository" => RepositoryOperation::Clone,
+        "plan_merge" | "planMerge" => RepositoryOperation::PlanMerge,
+        "apply_merge" | "applyMerge" => RepositoryOperation::ApplyMerge,
+        "get_merge_status" | "getMergeStatus" => RepositoryOperation::GetMergeStatus,
+        "list_merge_paths" | "listMergePaths" => RepositoryOperation::ListMergePaths,
+        "list_merge_conflicts" | "listMergeConflicts" => RepositoryOperation::ListMergeConflicts,
+        "read_merge_version" | "readMergeVersion" => RepositoryOperation::ReadMergeVersion,
+        "set_merge_path_result" | "setMergePathResult" => RepositoryOperation::SetMergePathResult,
+        "resolve_merge_row" | "resolveMergeRow" => RepositoryOperation::ResolveMergeRow,
+        "write_and_stage_text_result" | "writeAndStageTextResult" => {
+            RepositoryOperation::WriteAndStageTextResult
+        }
+        "continue_merge" | "continueMerge" => RepositoryOperation::ContinueMerge,
+        "abort_merge" | "abortMerge" => RepositoryOperation::AbortMerge,
         _ => {
             return Err(Error::new(
                 Status::InvalidArg,
@@ -974,6 +1402,18 @@ fn json_task(
         },
         signal,
     )
+}
+
+fn invalid_enum(label: &str, value: &str) -> Error {
+    Error::new(Status::InvalidArg, format!("unknown {label} `{value}`"))
+}
+
+fn parse_merge_path_result(value: &str) -> Result<CoreMergePathResult> {
+    match value {
+        "ours" => Ok(CoreMergePathResult::Ours),
+        "theirs" => Ok(CoreMergePathResult::Theirs),
+        value => Err(invalid_enum("merge path result", value)),
+    }
 }
 
 fn napi_error(error: SdkError) -> Error {

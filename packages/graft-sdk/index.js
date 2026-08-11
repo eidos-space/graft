@@ -180,6 +180,110 @@ class RepositorySession {
     return callJson(() => this.#native.pull(remote, branch, signal))
   }
 
+  async planMerge(options) {
+    const { signal, ...mergeOptions } = options
+    return callJson(() => this.#native.planMerge(mergeOptions, signal))
+  }
+
+  async applyMerge(options) {
+    const { signal, ...mergeOptions } = options
+    return callJson(() => this.#native.applyMerge(mergeOptions, signal))
+  }
+
+  async getMergeStatus({ signal } = {}) {
+    return callJson(() => this.#native.getMergeStatus(signal))
+  }
+
+  async listMergePaths(options) {
+    const {
+      signal,
+      filter = "all",
+      limit = 100,
+      after,
+      expectedStateToken,
+    } = options
+    return callJson(() =>
+      this.#native.listMergePaths(
+        {
+          filter,
+          limit,
+          after,
+          expectedStateToken,
+        },
+        signal
+      )
+    )
+  }
+
+  async listMergeConflicts(options) {
+    const {
+      signal,
+      path: conflictPath,
+      limit = 100,
+      after,
+      expectedStateToken,
+    } = options
+    return callJson(() =>
+      this.#native.listMergeConflicts(
+        {
+          path: conflictPath,
+          limit,
+          after,
+          expectedStateToken,
+        },
+        signal
+      )
+    )
+  }
+
+  async readMergeVersion(options) {
+    const { signal, ...readOptions } = options
+    return callJson(() =>
+      this.#native.readMergeVersion(readOptions, signal)
+    )
+  }
+
+  async setMergePathResult(options) {
+    const { signal, ...resultOptions } = options
+    return callJson(() =>
+      this.#native.setMergePathResult(resultOptions, signal)
+    )
+  }
+
+  async resolveMergeRow(options) {
+    const { signal, identity, ...rowOptions } = options
+    return callJson(() =>
+      this.#native.resolveMergeRow(
+        {
+          ...rowOptions,
+          identity: JSON.stringify(identity),
+        },
+        signal
+      )
+    )
+  }
+
+  async writeAndStageTextResult(options) {
+    const { signal, ...resultOptions } = options
+    return callJson(() =>
+      this.#native.writeAndStageTextResult(resultOptions, signal)
+    )
+  }
+
+  async continueMerge(options) {
+    const { signal, ...continueOptions } = options
+    return callJson(() =>
+      this.#native.continueMerge(continueOptions, signal)
+    )
+  }
+
+  async abortMerge(options) {
+    const { signal, ...abortOptions } = options
+    return callJson(() =>
+      this.#native.abortMerge(abortOptions, signal)
+    )
+  }
+
   async cloneRepository(options) {
     const { signal, ...cloneOptions } = options
     return callJson(() => this.#native.cloneRepository(cloneOptions, signal))
