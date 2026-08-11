@@ -51,6 +51,10 @@ Keep these versions equal:
 - `crates/graft-sdk-node/Cargo.toml`
 - every `@eidos.space/graft-*` optional dependency in the root package
 
+Add a matching `## Graft SDK X.Y.Z — YYYY-MM-DD` entry to
+`packages/graft-sdk/CHANGELOG.md`. The release workflow extracts that exact section for the
+GitHub release body.
+
 The five optional dependencies are release-artifact metadata. Keep them out of the source root
 package so `pnpm install --frozen-lockfile` does not resolve an unpublished version; after the five
 native packages are assembled, `release:prepare` injects exact dependencies matching the root
@@ -77,8 +81,10 @@ The tag workflow:
 4. generates one constrained optional npm package per platform and proves the artifact set is
    complete;
 5. publishes platform packages before the `@eidos.space/graft` root package;
-6. creates a GitHub SDK release containing every addon and `SHA256SUMS`;
-7. installs the public root package on all supported platforms and opens a real repository session.
+6. creates a GitHub SDK release from the matching SDK changelog section and attaches every addon
+   plus `SHA256SUMS`;
+7. installs the public root package on all supported platforms, opens a real repository session,
+   and verifies the up-to-date merge plan/apply path.
 
 ### First npm publish
 

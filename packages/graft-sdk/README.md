@@ -68,9 +68,9 @@ under `asarUnpack`, and load it in the utility process. `GRAFT_SDK_NATIVE_PATH` 
 packaging harnesses at an explicit addon path.
 
 Published packages use the standard native optional-dependency model: the root package contains
-the JavaScript wrapper, declarations, and README; each platform package contains exactly one
-`.node` binary plus `os`, `cpu`, and (on Linux) `libc` constraints. Consumers do not need a Rust
-toolchain or system SQLite library, and the package has no install script.
+the JavaScript wrapper, declarations, README, and changelog; each platform package contains exactly
+one `.node` binary plus `os`, `cpu`, and (on Linux) `libc` constraints. Consumers do not need a
+Rust toolchain or system SQLite library, and the package has no install script.
 
 ## Use
 
@@ -544,10 +544,11 @@ retaining the repository runtime across calls.
 An annotated `graft-sdk-vX.Y.Z` tag on a commit already merged into `main` starts
 `.github/workflows/sdk-release.yml`. The workflow builds every advertised target, tests each
 binary on Node.js 20 and 24, assembles and verifies all optional packages, publishes platform
-packages before the root package, creates a GitHub SDK release with checksums, then installs the
-public root package on every supported platform under Node.js 20 and 24 and exercises
-`statusIncremental`, metadata, remotes, history summaries, and explicit-path diff. Publishing uses
-npm OIDC Trusted Publishing; the SDK workflow does not read a persistent npm token. After each npm
+packages before the root package, creates a GitHub SDK release from the matching entry in
+[`CHANGELOG.md`](CHANGELOG.md) with checksums, then installs the public root package on every
+supported platform under Node.js 20 and 24 and exercises `statusIncremental`, metadata, remotes,
+history summaries, explicit-path diff, and an up-to-date merge plan/apply cycle. Publishing uses npm
+OIDC Trusted Publishing; the SDK workflow does not read a persistent npm token. After each npm
 publish, the job allows up to ten minutes for the immutable version to become visible through the
 registry read path before it advances to the next package.
 
