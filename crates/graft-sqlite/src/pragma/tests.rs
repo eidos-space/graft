@@ -2,45 +2,7 @@ use super::*;
 use graft::repo::{RepoConflictChange, RepoStagedChange, RepoStatusCounts, RepoWorktreeChange};
 
 #[test]
-fn legacy_volume_pragmas_are_debug_only() {
-    let legacy = Pragma { name: "graft_volume_push", arg: None };
-    assert!(VfsPragma::try_from(&legacy).is_err());
-
-    let debug = Pragma {
-        name: "graft_debug_volume_push",
-        arg: None,
-    };
-    assert!(matches!(
-        VfsPragma::try_from(&debug).unwrap().0,
-        GraftCommand::VolumePush
-    ));
-}
-
-#[test]
-fn repository_commands_are_not_exposed_as_sqlite_pragmas() {
-    for name in [
-        "graft_status",
-        "graft_json_status",
-        "graft_add",
-        "graft_json_commit",
-        "graft_checkout",
-        "graft_fetch",
-        "graft_repo_status",
-        "graft_remove",
-        "graft_branch_move",
-        "graft_branch_set_upstream",
-        "graft_branch_set_upstream_to",
-        "graft_tag_rm",
-        "graft_remote_rm",
-        "graft_remote_mv",
-    ] {
-        let pragma = Pragma { name, arg: Some("app.db") };
-        assert!(
-            VfsPragma::try_from(&pragma).is_err(),
-            "{name} should be rejected"
-        );
-    }
-
+fn repository_commands_are_parsed_for_the_command_service() {
     let status = Pragma { name: "graft_status", arg: None };
     assert!(matches!(
         GraftCommand::parse(&status).unwrap(),
@@ -564,18 +526,6 @@ fn parse_remote_branch_arg_supports_all_remote() {
         }
     );
     assert!(parse_remote_branch_arg(Some("--all origin main")).is_err());
-}
-
-#[test]
-fn parse_debug_diff_lsn_arg_requires_two_log_refs() {
-    let log: LogId = "74ggbzxuMf-2uAmM7FwXntwW".parse().unwrap();
-    let (from, to) =
-        parse_debug_diff_lsn_arg("74ggbzxuMf-2uAmM7FwXntwW:2 74ggbzxuMf-2uAmM7FwXntwW:3").unwrap();
-
-    assert_eq!(from, LogRef::new(log.clone(), LSN::new(2)));
-    assert_eq!(to, LogRef::new(log, LSN::new(3)));
-    assert!(parse_debug_diff_lsn_arg("74ggbzxuMf-2uAmM7FwXntwW:2").is_err());
-    assert!(parse_debug_diff_lsn_arg("2 3").is_err());
 }
 
 #[test]

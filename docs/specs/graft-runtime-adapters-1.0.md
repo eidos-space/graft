@@ -28,7 +28,7 @@ Rust RepositorySession (retained) --+--> RepositoryCommandService
 Node-API 8 async class --> JS API --+           +--> SQLite diff/merge/worktree
                                                 +--> official remotes
 
-Browser UI --> Worker --> real graft-tool WASM --> same Rust command paths
+Browser UI --> Worker --> real graft-cli WASM --> same Rust command paths
 ```
 
 `RepositoryCommandService` is the control-plane owner for command execution.
@@ -36,9 +36,8 @@ It opens/retains repository runtime and storage coordination, parses no UI
 state, and executes typed `RepositoryCommand` values directly. It does not open
 a SQLite connection or route production repository operations through PRAGMA.
 
-The SQLite VFS is a separate data plane described by [Graft SQLite Integration
-1.0](./graft-sqlite-integration-1.0.md). Repository semantics belong to their
-domain specifications; this document owns adapter mapping and host lifecycle.
+Repository semantics belong to their domain specifications; this document owns
+adapter mapping and host lifecycle.
 
 ## 2. Command service
 
@@ -334,7 +333,7 @@ process rather than the renderer.
 
 ## 12. Browser/WASM profile
 
-The Playground compiles the real `graft-tool` Rust binary for Emscripten and
+The Playground compiles the real `graft-cli` Rust binary for Emscripten and
 runs it off the UI thread:
 
 ```text
@@ -362,7 +361,7 @@ Current browser limitations are explicit:
 - the native Node SDK package and `.node` addon cannot load in a browser;
 - remote synchronization is intentionally unavailable in the WASM build;
 - browser filesystem/handle behavior is composed through OPFS/WasmFS; and
-- only operations compiled and bridged by `graft-tool` are available.
+- only operations compiled and bridged by `graft-cli` are available.
 
 A browser profile MUST not claim native SDK or remote conformance for an
 unavailable operation. Test doubles may test UI states but are not evidence of

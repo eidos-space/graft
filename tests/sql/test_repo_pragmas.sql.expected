@@ -1,9 +1,0 @@
-.echo on
-.open "file:project/app.db?vfs=graft"
-CREATE TABLE accounts (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
--- Repository control belongs to the graft CLI, not the SQLite VFS.
-(1) repository command `graft_status` is not available through SQLite; use the graft CLI in "pragma graft_status;"
-Parse error near line 5: repository command `graft_status` is not available through SQLite; use the graft CLI
-pragma graft_status;
-
-SQLite Exit Code = 1

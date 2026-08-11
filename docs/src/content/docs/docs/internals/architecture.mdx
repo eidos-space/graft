@@ -4,21 +4,20 @@ description: How the Graft core, SQLite integration, CLI, repository layer, and 
 ---
 
 This page is for contributors and advanced debugging. Product integrations
-should normally use the CLI, JSON output, and config reference. The SQLite
-extension is an optional data-plane integration.
+should normally use the CLI, JSON output, Node.js/Electron SDK, and config
+reference.
 
 ## Layers
 
 ```text
 Application
   ordinary SQLite connection -> physical worktree database
-  optional SQLite connection using vfs=graft
   graft CLI / JSON
+  Node.js / Electron SDK
 
 graft-sqlite
-  repository command service (control plane)
+  repository command service
   physical SQLite snapshot/import boundary
-  optional VFS + VFS diagnostic PRAGMAs (data plane)
 
 graft
   repository model
@@ -35,9 +34,8 @@ Remote storage
 | Crate | Role |
 | --- | --- |
 | `graft` | Core storage, repository objects, refs, index, merge, sync, remotes. |
-| `graft-sqlite` | Repository command service, physical SQLite import boundary, and optional SQLite VFS. |
-| `graft-ext` | Dynamic/static SQLite extension wrapper. |
-| `graft-tool` | CLI that maps arguments to repository operations. |
+| `graft-sqlite` | Repository command service and physical SQLite snapshot/import boundary. |
+| `graft-cli` | CLI that maps arguments to repository operations. |
 | `graft-test` | Integration test harnesses and workloads. |
 | `graft-tracing` | Tracing setup helpers. |
 
@@ -67,11 +65,8 @@ SQLite commits to a physical database (main file and possibly WAL)
   -> SQLite snapshots are materialized back to physical worktree files
 ```
 
-The optional Graft VFS skips the physical import step because SQLite writes
-Volume pages directly. That direct mapping requires SQLite `page_size=4096`.
-Physical import can capture databases with larger legal page sizes, such as
-8 KiB, while still storing their images in 4 KiB Graft chunks. The VFS does not
-expose repository commands.
+Physical import can capture databases with legal SQLite page sizes such as
+8 KiB while still storing their images in 4 KiB Graft chunks.
 
 For file artifacts, staging records inline blobs or external payload pointers.
 

@@ -76,7 +76,7 @@ pub(super) fn json_fetch_command_outcome(
 
 pub(super) fn run_repo_pull(
     runtime: &Runtime,
-    file: &mut VolFile,
+    file: &mut RepositorySessionContext,
     remote: Option<String>,
     branch: Option<String>,
     refspec: Option<String>,
@@ -89,13 +89,12 @@ pub(super) fn run_repo_pull(
     if !file.is_idle() {
         return pragma_err!("cannot pull while there is an open transaction");
     }
-    let _workspace_checkout = begin_workspace_checkout(file)?;
     if repo_has_work_in_progress_for_file(runtime, file, &repo)? {
         return pragma_err!("cannot pull with staged or unstaged changes");
     }
     let local_branch = repo
         .current_branch()?
-        .ok_or_else(|| ErrCtx::PragmaErr("cannot pull in detached HEAD".into()))?;
+        .ok_or_else(|| ErrCtx::InvalidCommand("cannot pull in detached HEAD".into()))?;
     let (remote, mut plan) = if let Some(refspec) = refspec {
         let remote = repo_default_remote(&repo, remote)?;
         let plan = repo.plan_pull_refspec(&remote, &refspec, &local_branch)?;
@@ -293,7 +292,7 @@ pub(super) fn repo_push_branches(
 ) -> Result<(String, String, String), ErrCtx> {
     let current_branch = repo
         .current_branch()?
-        .ok_or_else(|| ErrCtx::PragmaErr("cannot push in detached HEAD".into()))?;
+        .ok_or_else(|| ErrCtx::InvalidCommand("cannot push in detached HEAD".into()))?;
     let upstream = repo.default_remote_branch(remote.as_deref(), branch.as_deref())?;
     let local_branch = branch.unwrap_or(current_branch);
     Ok((upstream.remote, local_branch, upstream.branch))

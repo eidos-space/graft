@@ -44,8 +44,7 @@ fi
 RELEASE_CRATES=(
     graft
     graft-sqlite
-    graft-ext
-    graft-tool
+    graft-cli
     graft-test
     graft-tracing
 )
@@ -57,12 +56,6 @@ for crate in "${RELEASE_CRATES[@]}"; do
         exit 1
     fi
 done
-
-SQLPKG_VERSION="$(python3 -c 'import json; print(json.load(open("sqlpkg.json"))["version"])')"
-if [[ "$SQLPKG_VERSION" != "$VERSION" ]]; then
-    echo "Error: sqlpkg.json is $SQLPKG_VERSION, expected $VERSION."
-    exit 1
-fi
 
 cargo metadata --locked --format-version 1 --no-deps >/dev/null
 cargo check --workspace --all-targets --locked
@@ -80,7 +73,7 @@ fi
 if [[ "$EXECUTE" == "true" ]]; then
     git tag -a "$TAG_NAME" -m "Release $TAG_NAME"
     git push origin "refs/tags/$TAG_NAME"
-    echo "Pushed $TAG_NAME. The SQLite extension and CLI release workflow is now running."
+    echo "Pushed $TAG_NAME. The CLI release workflow is now running."
 else
     echo "Release checks passed. To create and push $TAG_NAME, run:"
     echo "  $0 --execute $VERSION"

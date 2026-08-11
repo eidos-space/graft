@@ -65,13 +65,3 @@ checkout、switch、restore 或 reset 需要替换物理 database 时，Graft �
 exclusive lock、处理旧 WAL、清理 sidecar，再执行 atomic rename。如果其他 writer
 仍然活跃，操作会失败而不是从它下面替换 main file。执行 branch operation 前应关闭
 长时间存在的 database connection。
-
-## 可选 Live VFS 模式
-
-应用明确需要 SQLite commit 直接推进 Graft Volume 时，可以加载 extension 并使用
-`vfs=graft`。这是高级 data-plane 模式，不是 repository control plane；status、
-stage、history、merge 和 sync 仍使用 CLI。与物理 staging 不同，live Graft VFS
-写入路径要求 SQLite `page_size=4096`，因为一个 SQLite page 会直接映射到一个
-Graft page。
-
-不要让同一个逻辑 database 同时接受普通 file VFS 和 Graft VFS 的写入。

@@ -378,7 +378,7 @@ it is not a loose repository-object collector.
 External-payload prune retains payloads referenced by the active index and by
 commits reachable from local branches, remote-tracking refs, and tags. SQLite
 storage GC additionally roots index snapshots, `HEAD`, branches, merge/original
-heads, remote-tracking refs, tags, and the currently open VFS volume. These
+heads, remote-tracking refs, and tags. These
 reachability domains MUST NOT be conflated. Version 1.0 does not expose a
 command that deletes unreachable loose repository objects.
 

@@ -20,12 +20,6 @@ Graft tree 中跟踪的非 SQLite 文件 entry。文本可以 inline，二进制
 
 按 content hash 存储在普通 commit/tree object 外部的文件字节。
 
-## Graft VFS
-
-Graft SQLite extension 注册的可选 virtual file system。它让 SQLite 直接读写
-Graft page storage，属于数据面；repository status、add、commit、branch 和 sync
-仍由 CLI control plane 负责。默认 worktree 模式使用普通物理 SQLite 文件。
-
 ## Index
 
 worktree 和下一个 commit 之间的 staging area。冲突时也保存 base/ours/theirs

@@ -172,7 +172,6 @@ Start with the CLI unless your application needs a more specialized boundary.
 | [CLI](https://graft.eidos.space/docs/quickstart/cli/) | You are evaluating Graft, scripting workflows, or running one-shot commands. |
 | CLI with [JSON output](https://graft.eidos.space/docs/reference/json-output/) | Your application or agent needs structured status, diff, history, conflict, or sync results. |
 | [Node.js/Electron SDK](https://graft.eidos.space/docs/guides/node-electron-sdk/) | A Node.js or Electron app needs a long-lived in-process repository session. |
-| [SQLite extension](https://graft.eidos.space/docs/quickstart/sqlite-extension/) | Your application deliberately wants live SQLite pages stored through `vfs=graft`. |
 | [Remote service packages](https://graft.eidos.space/docs/guides/http-remote/) | You want to host the Graft HTTP remote protocol. |
 
 Install the resident Node.js/Electron SDK with:
@@ -224,7 +223,7 @@ the [HTTP remote guide](https://graft.eidos.space/docs/guides/http-remote/).
 
 Graft is experimental. The CLI, repository configuration, JSON output,
 Node.js/Electron SDK, and remote service protocol are the intended integration
-surfaces. Storage layouts, object serialization, debug PRAGMAs, and internal
+surfaces. Storage layouts, object serialization, and internal
 Rust module boundaries are implementation details and may change.
 
 ## Documentation

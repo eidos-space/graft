@@ -3,7 +3,7 @@ use super::*;
 pub(super) fn append_row_merge_analysis(
     output: &mut String,
     runtime: &Runtime,
-    file: &VolFile,
+    file: &RepositorySessionContext,
     repo: &Repository,
     outcome: &MergeOutcome,
     remote: Option<Arc<Remote>>,
@@ -119,7 +119,7 @@ pub(super) fn format_current_file_row_merge_analysis(
 
 pub(super) fn current_file_status_row_merge_analysis(
     runtime: &Runtime,
-    file: &VolFile,
+    file: &RepositorySessionContext,
     repo: &Repository,
     remote: Option<Arc<Remote>>,
 ) -> Result<Option<JsonRowMergeAnalysis>, ErrCtx> {
@@ -131,7 +131,7 @@ pub(super) fn current_file_status_row_merge_analysis(
 
 pub(super) fn current_file_status_row_merge_analysis_lossy(
     runtime: &Runtime,
-    file: &VolFile,
+    file: &RepositorySessionContext,
     repo: &Repository,
     remote: Option<Arc<Remote>>,
 ) -> Option<JsonRowMergeAnalysis> {
@@ -779,7 +779,7 @@ pub(super) struct RowAutoMergeResult {
 
 pub(super) fn try_row_auto_merge_current_file_conflict(
     runtime: &Runtime,
-    file: &mut VolFile,
+    file: &mut RepositorySessionContext,
     repo: &Repository,
     outcome: &MergeOutcome,
     remote: Option<Arc<Remote>>,
@@ -807,7 +807,7 @@ pub(super) fn try_row_auto_merge_current_file_conflict(
 
 pub(super) fn try_row_auto_merge_current_file_status_conflict(
     runtime: &Runtime,
-    file: &mut VolFile,
+    file: &mut RepositorySessionContext,
     repo: &Repository,
     remote: Option<Arc<Remote>>,
 ) -> Result<Option<RowAutoMergeResult>, ErrCtx> {
@@ -816,7 +816,7 @@ pub(super) fn try_row_auto_merge_current_file_status_conflict(
 
 pub(super) fn try_row_merge_current_file_status_conflict(
     runtime: &Runtime,
-    file: &mut VolFile,
+    file: &mut RepositorySessionContext,
     repo: &Repository,
     remote: Option<Arc<Remote>>,
     allow_partial: bool,
@@ -874,7 +874,7 @@ pub(super) fn try_row_merge_current_file_status_conflict(
 }
 
 fn selected_repository_database_key(
-    file: &VolFile,
+    file: &RepositorySessionContext,
     repo: &Repository,
 ) -> Result<Option<String>, ErrCtx> {
     file.repository_database_path()
@@ -884,7 +884,7 @@ fn selected_repository_database_key(
 
 fn checkout_selected_repository_database(
     runtime: &Runtime,
-    file: &mut VolFile,
+    file: &mut RepositorySessionContext,
     repo: &Repository,
     key: &str,
     state: &CommitFileState,
@@ -989,7 +989,7 @@ pub(super) fn validate_row_merge_sqlite(
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|err| row_auto_merge_sqlite_err(path, "read integrity_check", err))?;
     if integrity_rows.is_empty() || integrity_rows.iter().any(|row| row != "ok") {
-        return Err(ErrCtx::PragmaErr(
+        return Err(ErrCtx::InvalidCommand(
             format!(
                 "row-level auto-merge failed integrity_check at `{}`: {}",
                 path.display(),
@@ -1017,7 +1017,7 @@ pub(super) fn validate_row_merge_sqlite(
             .get::<_, String>(2)
             .unwrap_or_else(|_| "<unknown>".into());
         let fkid = row.get::<_, i64>(3).unwrap_or_default();
-        return Err(ErrCtx::PragmaErr(
+        return Err(ErrCtx::InvalidCommand(
             format!(
                 "row-level auto-merge failed foreign_key_check at `{}`: table={table}, rowid={}, parent={parent}, fkid={fkid}",
                 path.display(),
@@ -1033,7 +1033,7 @@ pub(super) fn validate_row_merge_sqlite(
 }
 
 pub(super) fn row_auto_merge_sqlite_err(path: &Path, action: &str, err: rusqlite::Error) -> ErrCtx {
-    ErrCtx::PragmaErr(
+    ErrCtx::InvalidCommand(
         format!(
             "could not {action} for row-level auto-merge at `{}`: {err}",
             path.display()

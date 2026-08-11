@@ -4,7 +4,7 @@ const COMMIT_NO_STAGED_CHANGES: &str = "[graft:commit:no-staged-changes]";
 
 pub(super) fn run_repo_commit(
     runtime: &Runtime,
-    file: &mut VolFile,
+    file: &mut RepositorySessionContext,
     message: String,
 ) -> Result<RepoCommitOutcome, ErrCtx> {
     if !file.is_idle() {

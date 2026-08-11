@@ -1394,7 +1394,7 @@ export function App() {
                 </small>
               </span>
               <span className="header-storage-state" title={t("tree.vfsTitle")}>
-                <b>VFS</b>
+                <b>DB</b>
                 <em>{t("tree.vfsShort")}</em>
               </span>
               <span className="header-storage-state" title={t("tree.materializedTitle")}>

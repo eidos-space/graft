@@ -1,4 +1,4 @@
-name: Release SQLite Extension and CLI
+name: Release Graft CLI
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
       - "v*"
 
 concurrency:
-  group: sqlite-extension-release-${{ github.ref }}
+  group: cli-release-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
@@ -23,7 +23,6 @@ jobs:
     outputs:
       version: ${{ steps.meta.outputs.version }}
       release_tag: ${{ steps.meta.outputs.release_tag }}
-      draft: ${{ steps.meta.outputs.draft }}
       prerelease: ${{ steps.meta.outputs.prerelease }}
     steps:
       - name: Checkout release commit
@@ -37,33 +36,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
-          raw_version="${GITHUB_REF_NAME}"
-          draft="false"
-          prerelease="false"
-          version="${raw_version#v}"
-          version_regex='^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$'
-          if [[ ! "$version" =~ $version_regex ]]; then
+          version="${GITHUB_REF_NAME#v}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
             echo "::error::release version must match X.Y.Z or X.Y.Z-rc.N"
             exit 1
           fi
-
-          release_tag="v${version}"
+          prerelease="false"
           if [[ "$version" == *-* ]]; then
             prerelease="true"
           fi
-
           echo "version=${version}" >> "$GITHUB_OUTPUT"
-          echo "release_tag=${release_tag}" >> "$GITHUB_OUTPUT"
-          echo "draft=${draft}" >> "$GITHUB_OUTPUT"
+          echo "release_tag=v${version}" >> "$GITHUB_OUTPUT"
           echo "prerelease=${prerelease}" >> "$GITHUB_OUTPUT"
-
-          {
-            echo "Version: ${version}"
-            echo "Tag: ${release_tag}"
-            echo "Draft: ${draft}"
-            echo "Prerelease: ${prerelease}"
-          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Validate release commit and crate versions
         shell: bash
@@ -72,17 +56,15 @@ jobs:
         run: |
           set -euo pipefail
           git fetch --no-tags origin main:refs/remotes/origin/main
-          HEAD_COMMIT="$(git rev-parse HEAD)"
-          if ! git merge-base --is-ancestor "$HEAD_COMMIT" origin/main; then
-            echo "::error::release commit $HEAD_COMMIT is not reachable from origin/main"
+          if ! git merge-base --is-ancestor "$(git rev-parse HEAD)" origin/main; then
+            echo "::error::release commit is not reachable from origin/main"
             exit 1
           fi
           if ! git ls-remote --exit-code origin "refs/tags/${GITHUB_REF_NAME}^{}" >/dev/null; then
             echo "::error::release tag ${GITHUB_REF_NAME} must be annotated"
             exit 1
           fi
-
-          crates=(graft graft-sqlite graft-ext graft-tool graft-test graft-tracing)
+          crates=(graft graft-sqlite graft-cli graft-test graft-tracing)
           for crate in "${crates[@]}"; do
             crate_version="$(cargo pkgid -p "$crate" | sed 's/.*#//')"
             if [[ "$crate_version" != "$RELEASE_VERSION" ]]; then
@@ -90,175 +72,89 @@ jobs:
               exit 1
             fi
           done
-          sqlpkg_version="$(python3 -c 'import json; print(json.load(open("sqlpkg.json"))["version"])')"
-          if [[ "$sqlpkg_version" != "$RELEASE_VERSION" ]]; then
-            echo "::error::sqlpkg.json is $sqlpkg_version, expected $RELEASE_VERSION"
-            exit 1
-          fi
           cargo metadata --locked --format-version 1 --no-deps >/dev/null
 
   build:
     name: Build ${{ matrix.target }}
     needs: metadata
     runs-on: ${{ matrix.runner }}
-    permissions:
-      contents: read
     strategy:
       fail-fast: false
       matrix:
         include:
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-            library: libgraft_ext.so
           - runner: ubuntu-24.04
             target: aarch64-unknown-linux-gnu
-            library: libgraft_ext.so
           - runner: macos-15-intel
             target: x86_64-apple-darwin
-            library: libgraft_ext.dylib
           - runner: macos-15
             target: aarch64-apple-darwin
-            library: libgraft_ext.dylib
           - runner: windows-2022
             target: x86_64-pc-windows-msvc
-            library: graft_ext.dll
           - runner: windows-2022
             target: aarch64-pc-windows-msvc
-            library: graft_ext.dll
     defaults:
       run:
         shell: bash
     steps:
-      - name: Checkout
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
           persist-credentials: false
 
       - name: Install Linux dependencies
         if: startsWith(matrix.runner, 'ubuntu')
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y clang libclang-dev build-essential
+        run: sudo apt-get update && sudo apt-get install -y build-essential
 
       - name: Install Linux aarch64 linker
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
-          set -euo pipefail
           sudo apt-get install -y gcc-aarch64-linux-gnu
           echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
 
-      - name: Configure macOS libclang
-        if: startsWith(matrix.runner, 'macos')
-        run: |
-          set -euo pipefail
-          brew install llvm
-          llvm_prefix="$(brew --prefix llvm)"
-          libclang_path="${llvm_prefix}/lib/libclang.dylib"
-          if [[ ! -f "$libclang_path" ]]; then
-            echo "::error::could not find libclang at $libclang_path"
-            exit 1
-          fi
-          echo "LIBCLANG_PATH=${llvm_prefix}/lib" >> "$GITHUB_ENV"
-          echo "Using libclang at $libclang_path"
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
 
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
         with:
-          key: sqlite-extension-${{ matrix.target }}
-
-      - name: Build SQLite extension
-        run: |
-          set -euo pipefail
-          cargo build \
-            --release \
-            --no-default-features \
-            --features dynamic,bundled-sqlite \
-            --package graft-ext \
-            --target "${{ matrix.target }}"
+          key: cli-${{ matrix.target }}
 
       - name: Build CLI
-        run: |
-          set -euo pipefail
-          cargo build \
-            --release \
-            --package graft-tool \
-            --target "${{ matrix.target }}"
+        run: cargo build --release --package graft-cli --target "${{ matrix.target }}"
 
       - name: Smoke test CLI
         if: matrix.target != 'aarch64-unknown-linux-gnu' && matrix.target != 'aarch64-pc-windows-msvc'
         run: |
-          set -euo pipefail
           binary="target/${{ matrix.target }}/release/graft"
           if [[ "${{ matrix.target }}" == *"windows"* ]]; then
             binary="${binary}.exe"
           fi
           "$binary" --help >/dev/null
 
-      - name: Stage extension artifact
-        run: |
-          set -euo pipefail
-
-          artifact_dir="package/${{ matrix.target }}"
-          mkdir -p "$artifact_dir"
-
-          cp "target/${{ matrix.target }}/release/${{ matrix.library }}" "$artifact_dir/"
-          cp LICENSE-APACHE LICENSE-MIT "$artifact_dir/"
-
-          cat > "$artifact_dir/README.txt" <<EOF
-          SQLite Graft extension
-          Version: ${{ needs.metadata.outputs.version }}
-          Target: ${{ matrix.target }}
-          Source: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}
-
-          Load this dynamic SQLite extension with SQLite's load_extension support.
-          EOF
-
       - name: Stage CLI artifact
         run: |
-          set -euo pipefail
-
-          artifact_dir="cli-package/${{ matrix.target }}"
+          artifact_dir="package/${{ matrix.target }}"
           mkdir -p "$artifact_dir"
-
           binary="graft"
           if [[ "${{ matrix.target }}" == *"windows"* ]]; then
             binary="graft.exe"
           fi
-
           cp "target/${{ matrix.target }}/release/${binary}" "$artifact_dir/"
           cp LICENSE-APACHE LICENSE-MIT "$artifact_dir/"
-
           cat > "$artifact_dir/README.txt" <<EOF
           Graft CLI
           Version: ${{ needs.metadata.outputs.version }}
           Target: ${{ matrix.target }}
           Source: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}
-
-          Run ./graft --help or graft.exe --help to see available repository commands.
           EOF
 
-      - name: Upload build artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: graft-sqlite-extension-${{ matrix.target }}
-          path: package/${{ matrix.target }}
-          if-no-files-found: error
-          retention-days: 7
-
-      - name: Upload CLI artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: graft-cli-${{ matrix.target }}
-          path: cli-package/${{ matrix.target }}
+          path: package/${{ matrix.target }}
           if-no-files-found: error
           retention-days: 7
 
@@ -269,17 +165,14 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Checkout release notes
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
 
       - name: Prepare changelog release notes
-        shell: bash
         env:
           RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
         run: |
-          set -euo pipefail
           awk -v heading="## Graft ${RELEASE_VERSION} —" '
             index($0, heading) == 1 { found = 1; next }
             found && /^## / { exit }
@@ -288,14 +181,7 @@ jobs:
           ' CHANGELOG.md > RELEASE_NOTES.md
           test -s RELEASE_NOTES.md
 
-      - name: Download extension artifacts
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
-        with:
-          pattern: graft-sqlite-extension-*
-          path: downloaded/
-
-      - name: Download CLI artifacts
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           pattern: graft-cli-*
           path: downloaded/
@@ -307,65 +193,37 @@ jobs:
           shopt -s nullglob
           sudo apt-get update
           sudo apt-get install -y zip
-
           mkdir -p release-assets
           asset_dir="$PWD/release-assets"
           version="${{ needs.metadata.outputs.version }}"
-
-          package_dir() {
-            local dir="$1"
-            local archive_base="$2"
-            local target="$3"
-
-            if [[ "$target" == *"windows"* ]]; then
-              (cd "$dir" && zip -r "${asset_dir}/${archive_base}.zip" .)
-            else
-              tar -czf "${asset_dir}/${archive_base}.tar.gz" -C "$dir" .
-            fi
-          }
-
-          extension_dirs=(downloaded/graft-sqlite-extension-*)
-          if ((${#extension_dirs[@]} == 0)); then
-            echo "::error::no SQLite extension artifacts were downloaded"
-            exit 1
-          fi
-
-          for dir in "${extension_dirs[@]}"; do
-            target="${dir#downloaded/graft-sqlite-extension-}"
-            archive_base="sqlite-graft-${version}-${target}"
-            package_dir "$dir" "$archive_base" "$target"
-          done
-
           cli_dirs=(downloaded/graft-cli-*)
           if ((${#cli_dirs[@]} == 0)); then
             echo "::error::no CLI artifacts were downloaded"
             exit 1
           fi
-
           for dir in "${cli_dirs[@]}"; do
             target="${dir#downloaded/graft-cli-}"
             archive_base="graft-cli-${version}-${target}"
-            package_dir "$dir" "$archive_base" "$target"
+            if [[ "$target" == *"windows"* ]]; then
+              (cd "$dir" && zip -r "${asset_dir}/${archive_base}.zip" .)
+            else
+              tar -czf "${asset_dir}/${archive_base}.tar.gz" -C "$dir" .
+            fi
           done
-
           (cd release-assets && sha256sum * > SHA256SUMS)
-          ls -lah release-assets
 
-      - name: Upload packaged artifacts
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: sqlite-extension-release-assets
+          name: cli-release-assets
           path: release-assets/
           if-no-files-found: error
           retention-days: 30
 
-      - name: Create or update GitHub release
-        uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2
+      - uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2
         with:
           name: ${{ needs.metadata.outputs.release_tag }}
           tag_name: ${{ needs.metadata.outputs.release_tag }}
           target_commitish: ${{ github.sha }}
-          draft: ${{ needs.metadata.outputs.draft }}
           prerelease: ${{ needs.metadata.outputs.prerelease }}
           make_latest: ${{ needs.metadata.outputs.prerelease == 'false' }}
           body_path: RELEASE_NOTES.md

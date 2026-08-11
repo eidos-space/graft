@@ -4,17 +4,19 @@ use std::{
     fs::File,
     io::{Read, Seek, SeekFrom, Write as IoWrite},
     path::{Path, PathBuf},
-    str::FromStr,
     sync::{
         Arc, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
 };
 
+use crate::{
+    error::ErrCtx,
+    session::{RepositorySessionContext, should_discover_repo},
+};
 use graft::core::{
     LogId, PageCount, PageIdx, VolumeId,
     byte_unit::ByteUnit,
-    logref::LogRef,
     lsn::{LSN, LSNRangeExt},
     page::{PAGESIZE, Page},
 };
@@ -30,26 +32,11 @@ use graft::repo::{
     RepoTrackedPath, RepoTrackedPathDetail, RepoTrackedPathEntry, RepoTrackedPathKind,
     RepoWorktreeChangeKind, RepoWorktreeFileState, Repository, ResetMode, ResetOutcome, TagInfo,
 };
-use graft::{
-    rt::runtime::Runtime, volume::AheadStatus, volume_reader::VolumeRead,
-    volume_writer::VolumeWrite,
-};
-use indoc::{formatdoc, indoc, writedoc};
+use graft::{rt::runtime::Runtime, volume_reader::VolumeRead, volume_writer::VolumeWrite};
+use indoc::formatdoc;
 use parking_lot::Mutex;
 use rusqlite::config::DbConfig;
 use serde::{Deserialize, Serialize};
-use sqlite_plugin::{
-    vars::SQLITE_ERROR,
-    vfs::{Pragma, PragmaErr},
-};
-use tryiter::TryIteratorExt;
-use zerocopy::FromBytes;
-
-use crate::{
-    dbg::SqliteHeader,
-    file::vol_file::{VolFile, WorkspaceCheckoutGuard},
-    vfs::{ErrCtx, should_discover_repo},
-};
 
 macro_rules! pluralize {
     ($n:expr, $s:literal) => {
@@ -59,7 +46,7 @@ macro_rules! pluralize {
 
 macro_rules! pragma_err {
     ($msg:expr) => {
-        Err(ErrCtx::PragmaErr($msg.into()))
+        Err(ErrCtx::InvalidCommand($msg.into()))
     };
 }
 
@@ -85,38 +72,68 @@ mod row_diff;
 mod row_merge_output;
 pub(crate) mod spec;
 pub(crate) mod sqlite_worktree;
-mod volume_output;
 
 use self::{
     jobs::*, json::*, output_types::*, parse::*, repo_checkout::*, repo_conflicts::*, repo_core::*,
     repo_diff::*, repo_history::*, repo_merge::*, repo_output::*, repo_paths::*, repo_refs::*,
     repo_remote_output::*, repo_snapshot::*, repo_staging::*, repo_switch::*, repo_sync::*,
-    row_diff::*, row_merge_output::*, spec::*, sqlite_worktree::*, volume_output::*,
+    row_diff::*, row_merge_output::*, spec::*, sqlite_worktree::*,
 };
 
 const SQLITE_DATABASE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
 static NEXT_JOB_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Format Unix milliseconds as `YYYY-MM-DD HH:MM:SS` without another dependency.
+fn format_unix_millis(timestamp_ms: u64) -> String {
+    let seconds = (timestamp_ms / 1000) as i64;
+    let days = seconds / 86_400;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = (z - era * 146_097) as u32;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = (year_of_era as i64) + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = if month_prime < 10 {
+        month_prime + 3
+    } else {
+        month_prime - 9
+    };
+    let year = if month <= 2 { year + 1 } else { year };
+    let day_seconds = seconds.rem_euclid(86_400) as u32;
+    format!(
+        "{year}-{month:02}-{day:02} {:02}:{:02}:{:02}",
+        day_seconds / 3_600,
+        (day_seconds / 60) % 60,
+        day_seconds % 60
+    )
+}
+
+pub(crate) struct Pragma<'a> {
+    name: &'a str,
+    arg: Option<&'a str>,
+}
+
+#[derive(Debug)]
+pub(crate) enum PragmaErr {
+    NotFound,
+    Fail(Option<String>),
+}
+
+impl PragmaErr {
+    fn required_arg(pragma: &Pragma<'_>) -> Self {
+        Self::Fail(Some(format!(
+            "command `{}` requires an argument",
+            pragma.name
+        )))
+    }
+}
+
 /// Helper to create pragma errors concisely
 fn pragma_fail(msg: impl Display) -> PragmaErr {
-    PragmaErr::Fail(SQLITE_ERROR, Some(msg.to_string()))
-}
-
-/// Helper to parse with automatic error conversion
-fn parse_or_fail<T>(s: &str) -> Result<T, PragmaErr>
-where
-    T: FromStr,
-    T::Err: Display,
-{
-    s.parse().map_err(pragma_fail)
-}
-
-/// Helper to parse an optional value from colon-separated parts
-fn parse_optional<T: FromStr>(s: Option<&&str>) -> Result<Option<T>, PragmaErr>
-where
-    T::Err: Display,
-{
-    s.map(|s| parse_or_fail(s)).transpose()
+    PragmaErr::Fail(Some(msg.to_string()))
 }
 
 /// Extension trait for Pragma to get required arguments
@@ -131,33 +148,11 @@ impl<'a> PragmaExt<'a> for Pragma<'a> {
 }
 
 pub(crate) enum GraftCommand {
-    /// `pragma graft_debug_volume_list;`
-    VolumeList,
-
-    /// `pragma graft_debug_volume_json_list;`
-    VolumeJsonList,
-
     /// `pragma graft_tags;`
     Tags,
 
     /// `pragma graft_json_tags [= "--with-status"];`
     JsonTags { mode: JsonTagsMode },
-
-    /// `pragma graft_debug_volume_tags;`
-    VolumeTags,
-
-    /// `pragma graft_debug_volume_switch = "local_vid[:local[:remote]]";`
-    VolumeSwitch {
-        vid: VolumeId,
-        local: Option<LogId>,
-        remote: Option<LogId>,
-    },
-
-    /// `pragma graft_debug_volume_clone [= "remote"];`
-    VolumeClone { remote: Option<LogId> },
-
-    /// `pragma graft_debug_volume_fork;`
-    VolumeFork,
 
     /// `pragma graft_checkout = "[--force] rev [-- path]";`
     RepoCheckout { spec: RepoCheckoutSpec },
@@ -177,14 +172,8 @@ pub(crate) enum GraftCommand {
     /// `pragma graft_json_export = "[--source rev] --output output.db [-- path]";`
     JsonExport { spec: RepoExportSpec },
 
-    /// `pragma graft_debug_volume_info;`
-    VolumeInfo,
-
     /// `pragma graft_status [= "[--kind kind]"];`
     Status { spec: StatusSpec },
-
-    /// `pragma graft_debug_volume_status;`
-    VolumeStatus,
 
     /// `pragma graft_init [= "[--worktree] path"];`
     RepoInit { spec: RepoInitSpec },
@@ -397,9 +386,6 @@ pub(crate) enum GraftCommand {
     /// `pragma graft_json_remotes;`
     JsonRemotes,
 
-    /// `pragma graft_debug_volume_snapshot;`
-    VolumeSnapshot,
-
     /// `pragma graft_fetch;`
     Fetch {
         remote: Option<String>,
@@ -479,21 +465,6 @@ pub(crate) enum GraftCommand {
         force: bool,
     },
 
-    /// `pragma graft_debug_volume_fetch;`
-    VolumeFetch,
-
-    /// `pragma graft_debug_volume_pull;`
-    VolumePull,
-
-    /// `pragma graft_debug_volume_push;`
-    VolumePush,
-
-    /// `pragma graft_debug_volume_audit;`
-    VolumeAudit,
-
-    /// `pragma graft_debug_volume_json_audit;`
-    VolumeJsonAudit,
-
     /// `pragma graft_audit [= "[--repair [remote]]"];`
     RepoAudit { spec: RepoAuditSpec },
 
@@ -563,47 +534,9 @@ pub(crate) enum GraftCommand {
     /// `pragma graft_json_config_unset = "key";`
     JsonConfigUnset { key: String },
 
-    /// `pragma graft_debug_volume_hydrate;`
-    VolumeHydrate,
-
-    /// `pragma graft_version;`
-    Version,
-
-    /// `pragma graft_debug_volume_import = "PATH";`
-    VolumeImport,
-
-    /// `pragma graft_debug_volume_export = "PATH";`
-    VolumeExport(PathBuf),
-
-    /// `pragma graft_debug_volume_dump_header;`
-    VolumeDumpSqliteHeader,
-
-    /// `pragma graft_debug_volume_dump_commit = "logid:LSN";`
-    VolumeDumpCommit { logref: LogRef },
-
-    /// `pragma graft_debug_log_lsn;`
-    /// Display storage commit history for the current Volume by LSN.
-    DebugLogLsn,
-
-    /// `pragma graft_debug_show_lsn = "logid:LSN";`
-    /// Display storage commit details for an internal Log/LSN coordinate.
-    DebugShowLsn { logref: LogRef },
-
-    /// `pragma graft_debug_diff_lsn = "logid:from logid:to";`
-    /// Compare storage commits by internal Log/LSN coordinates.
-    DebugDiffLsn { from: LogRef, to: LogRef },
-
     /// `pragma graft_log;`
     /// Display repository commit history
     Log,
-
-    /// `pragma graft_debug_volume_checkout_lsn = "LSN";`
-    /// Checkout to specified local LSN (creates new Volume)
-    VolumeCheckoutLsn { lsn: LSN },
-
-    /// `pragma graft_debug_volume_reset_to = "LSN";`
-    /// Reset current tag to specified LSN
-    VolumeResetTo { lsn: LSN },
 
     /// `pragma graft_reset = "[--soft|--mixed|--hard] rev";`
     /// Reset the current repository branch to a revision
@@ -612,11 +545,6 @@ pub(crate) enum GraftCommand {
     /// `pragma graft_json_reset = "[--soft|--mixed|--hard] rev";`
     /// Reset the current repository branch to a revision and return JSON
     JsonReset { rev: String, mode: ResetMode },
-
-    /// `pragma graft_debug_volume_diff = "from_lsn,to_lsn[,mode]";`
-    /// Compare legacy Volume commits by LSN
-    /// mode: omitted=default (page + table level), "rows"=row-level detailed comparison
-    VolumeDiff { from: LSN, to: LSN, mode: DiffMode },
 
     /// `pragma graft_diff = "[--rows] [--kind kind] [--staged] [rev] [rev] [-- path]";`
     /// Compare repository commits by revision syntax
@@ -631,10 +559,6 @@ pub(crate) enum GraftCommand {
     /// Repository commit history as JSON array, or app-facing JSON object with status
     JsonLog { spec: JsonLogSpec },
 
-    /// `pragma graft_debug_volume_json_diff = "from_lsn,to_lsn[,mode]";`
-    /// Legacy Volume diff as JSON. mode: omitted=summary, "rows"=row-level detail
-    VolumeJsonDiff { from: LSN, to: LSN, mode: DiffMode },
-
     /// `pragma graft_json_diff = "[--rows] [--content [--max-content-bytes bytes]] [--kind kind] [--staged] [rev] [rev] [-- path] | --root rev [-- path]";`
     /// Repository diff as JSON
     JsonRepoDiff { spec: RepoDiffSpec },
@@ -642,22 +566,6 @@ pub(crate) enum GraftCommand {
     /// `pragma graft_json_show = "rev";`
     /// Commit details as JSON
     JsonShow { target: String },
-
-    /// `pragma graft_debug_volume_json_info;`
-    /// Volume info as JSON
-    VolumeJsonInfo,
-
-    /// `pragma graft_debug_volume_table_log = 'table_name';`
-    /// Show commits that modified the given table
-    VolumeTableLog { table: String },
-
-    /// `pragma graft_debug_volume_json_table_log = 'table_name';`
-    /// Show commits that modified the given table, as JSON
-    VolumeJsonTableLog { table: String },
-
-    /// `pragma graft_debug_volume_set_message = 'message';`
-    /// Set a human-readable message for the next commit
-    VolumeSetMessage { message: String },
 }
 
 impl GraftCommand {
@@ -666,16 +574,8 @@ impl GraftCommand {
             && prefix == "graft"
         {
             return match suffix {
-                "debug_volume_list" => Ok(GraftCommand::VolumeList),
-                "debug_volume_json_list" => Ok(GraftCommand::VolumeJsonList),
                 "tags" => Ok(GraftCommand::Tags),
                 "json_tags" => Ok(GraftCommand::JsonTags { mode: parse_json_tags_arg(p.arg)? }),
-                "debug_volume_tags" => Ok(GraftCommand::VolumeTags),
-                "debug_volume_clone" => {
-                    let remote = p.arg.map(parse_or_fail).transpose()?;
-                    Ok(GraftCommand::VolumeClone { remote })
-                }
-                "debug_volume_fork" => Ok(GraftCommand::VolumeFork),
                 "checkout" => {
                     let arg = p.require_arg()?;
                     let spec = parse_repo_checkout_arg(arg)?;
@@ -706,27 +606,7 @@ impl GraftCommand {
                     let spec = parse_repo_export_arg(arg)?;
                     Ok(GraftCommand::JsonExport { spec })
                 }
-                "debug_volume_new" => Ok(GraftCommand::VolumeSwitch {
-                    vid: VolumeId::random(),
-                    local: None,
-                    remote: None,
-                }),
-                "debug_volume_switch" => {
-                    let parts: Vec<&str> = p.require_arg()?.split(':').collect();
-                    if parts.is_empty() || parts.len() > 3 {
-                        return Err(pragma_fail(
-                            "argument must be in the form: `local_vid[:local[:remote]]`",
-                        ));
-                    }
-                    Ok(GraftCommand::VolumeSwitch {
-                        vid: parse_or_fail(parts[0])?,
-                        local: parse_optional(parts.get(1))?,
-                        remote: parse_optional(parts.get(2))?,
-                    })
-                }
-                "debug_volume_info" => Ok(GraftCommand::VolumeInfo),
                 "status" => Ok(GraftCommand::Status { spec: parse_status_arg(p.arg)? }),
-                "debug_volume_status" => Ok(GraftCommand::VolumeStatus),
                 "init" => Ok(GraftCommand::RepoInit { spec: parse_repo_init_arg(p.arg)? }),
                 "json_init" => Ok(GraftCommand::JsonRepoInit { spec: parse_repo_init_arg(p.arg)? }),
                 "clone" => {
@@ -884,7 +764,6 @@ impl GraftCommand {
                 }
                 "remotes" => Ok(GraftCommand::Remotes),
                 "json_remotes" => Ok(GraftCommand::JsonRemotes),
-                "debug_volume_snapshot" => Ok(GraftCommand::VolumeSnapshot),
                 "fetch" => {
                     let arg = parse_remote_branch_arg(p.arg)?;
                     if arg.force {
@@ -951,11 +830,6 @@ impl GraftCommand {
                         parse_remote_branch_arg(p.arg)?;
                     Ok(GraftCommand::JsonPush { remote, branch, refspec, all, force })
                 }
-                "debug_volume_fetch" => Ok(GraftCommand::VolumeFetch),
-                "debug_volume_pull" => Ok(GraftCommand::VolumePull),
-                "debug_volume_push" => Ok(GraftCommand::VolumePush),
-                "debug_volume_audit" => Ok(GraftCommand::VolumeAudit),
-                "debug_volume_json_audit" => Ok(GraftCommand::VolumeJsonAudit),
                 "audit" => Ok(GraftCommand::RepoAudit { spec: parse_repo_audit_arg(p.arg)? }),
                 "json_audit" => {
                     Ok(GraftCommand::JsonRepoAudit { spec: parse_repo_audit_arg(p.arg)? })
@@ -1021,34 +895,7 @@ impl GraftCommand {
                 "json_config_unset" => {
                     Ok(GraftCommand::JsonConfigUnset { key: p.require_arg()?.to_string() })
                 }
-                "debug_volume_hydrate" => Ok(GraftCommand::VolumeHydrate),
-                "version" => Ok(GraftCommand::Version),
-                "debug_volume_import" => {
-                    let _ = p.require_arg()?;
-                    Ok(GraftCommand::VolumeImport)
-                }
-                "debug_volume_export" => {
-                    Ok(GraftCommand::VolumeExport(PathBuf::from(p.require_arg()?)))
-                }
-                "debug_volume_dump_header" => Ok(GraftCommand::VolumeDumpSqliteHeader),
-                "debug_volume_dump_commit" => {
-                    Ok(GraftCommand::VolumeDumpCommit { logref: parse_or_fail(p.require_arg()?)? })
-                }
-                "debug_log_lsn" => Ok(GraftCommand::DebugLogLsn),
-                "debug_show_lsn" => {
-                    Ok(GraftCommand::DebugShowLsn { logref: parse_or_fail(p.require_arg()?)? })
-                }
-                "debug_diff_lsn" => {
-                    let (from, to) = parse_debug_diff_lsn_arg(p.require_arg()?)?;
-                    Ok(GraftCommand::DebugDiffLsn { from, to })
-                }
                 "log" => Ok(GraftCommand::Log),
-                "debug_volume_checkout_lsn" => {
-                    Ok(GraftCommand::VolumeCheckoutLsn { lsn: parse_or_fail(p.require_arg()?)? })
-                }
-                "debug_volume_reset_to" => {
-                    Ok(GraftCommand::VolumeResetTo { lsn: parse_or_fail(p.require_arg()?)? })
-                }
                 "reset" => {
                     let (mode, rev) = parse_repo_reset_arg(p.require_arg()?)?;
                     Ok(GraftCommand::Reset { rev, mode })
@@ -1061,31 +908,13 @@ impl GraftCommand {
                     let spec = parse_repo_diff_arg(p.arg)?;
                     Ok(GraftCommand::RepoDiff { spec })
                 }
-                "debug_volume_diff" => {
-                    let (from, to, mode) = parse_volume_diff_arg(p.require_arg()?)?;
-                    Ok(GraftCommand::VolumeDiff { from, to, mode })
-                }
                 "show" => Ok(GraftCommand::Show { target: p.require_arg()?.to_string() }),
                 "json_log" => Ok(GraftCommand::JsonLog { spec: parse_json_log_arg(p.arg)? }),
                 "json_diff" => {
                     let spec = parse_repo_diff_arg(p.arg)?;
                     Ok(GraftCommand::JsonRepoDiff { spec })
                 }
-                "debug_volume_json_diff" => {
-                    let (from, to, mode) = parse_volume_diff_arg(p.require_arg()?)?;
-                    Ok(GraftCommand::VolumeJsonDiff { from, to, mode })
-                }
                 "json_show" => Ok(GraftCommand::JsonShow { target: p.require_arg()?.to_string() }),
-                "debug_volume_json_info" => Ok(GraftCommand::VolumeJsonInfo),
-                "debug_volume_table_log" => {
-                    Ok(GraftCommand::VolumeTableLog { table: p.require_arg()?.to_string() })
-                }
-                "debug_volume_json_table_log" => {
-                    Ok(GraftCommand::VolumeJsonTableLog { table: p.require_arg()?.to_string() })
-                }
-                "debug_volume_set_message" => {
-                    Ok(GraftCommand::VolumeSetMessage { message: p.require_arg()?.to_string() })
-                }
                 _ => Err(pragma_fail(format!("invalid graft pragma `{}`", p.name))),
             };
         }
@@ -1096,100 +925,25 @@ impl GraftCommand {
         let full_name = format!("graft_{name}");
         let input = Pragma { name: &full_name, arg: argument };
         let command = Self::parse(&input).map_err(|error| match error {
-            PragmaErr::NotFound => ErrCtx::UnknownPragma,
-            PragmaErr::Fail(_, message) => ErrCtx::PragmaErr(
+            PragmaErr::NotFound => ErrCtx::UnknownCommand,
+            PragmaErr::Fail(message) => ErrCtx::InvalidCommand(
                 message
                     .unwrap_or_else(|| "invalid repository command".to_string())
                     .into(),
             ),
         })?;
-        if command.is_vfs_pragma() {
-            return Err(ErrCtx::PragmaErr(
-                format!("`{name}` is a VFS command, not a repository command").into(),
-            ));
-        }
         Ok(command)
-    }
-
-    pub(crate) fn is_vfs_pragma(&self) -> bool {
-        matches!(
-            self,
-            Self::VolumeList
-                | Self::VolumeJsonList
-                | Self::VolumeTags
-                | Self::VolumeSwitch { .. }
-                | Self::VolumeClone { .. }
-                | Self::VolumeFork
-                | Self::VolumeInfo
-                | Self::VolumeStatus
-                | Self::VolumeSnapshot
-                | Self::VolumeFetch
-                | Self::VolumePull
-                | Self::VolumePush
-                | Self::VolumeAudit
-                | Self::VolumeJsonAudit
-                | Self::VolumeHydrate
-                | Self::Version
-                | Self::VolumeImport
-                | Self::VolumeExport(_)
-                | Self::VolumeDumpSqliteHeader
-                | Self::VolumeDumpCommit { .. }
-                | Self::DebugLogLsn
-                | Self::DebugShowLsn { .. }
-                | Self::DebugDiffLsn { .. }
-                | Self::VolumeCheckoutLsn { .. }
-                | Self::VolumeResetTo { .. }
-                | Self::VolumeDiff { .. }
-                | Self::VolumeJsonDiff { .. }
-                | Self::VolumeJsonInfo
-                | Self::VolumeTableLog { .. }
-                | Self::VolumeJsonTableLog { .. }
-                | Self::VolumeSetMessage { .. }
-        )
-    }
-}
-
-pub(crate) struct VfsPragma(GraftCommand);
-
-impl TryFrom<&Pragma<'_>> for VfsPragma {
-    type Error = PragmaErr;
-
-    fn try_from(p: &Pragma<'_>) -> Result<Self, Self::Error> {
-        Self::parse(p, false)
-    }
-}
-
-impl VfsPragma {
-    pub(crate) fn parse(
-        p: &Pragma<'_>,
-        allow_repository_commands: bool,
-    ) -> Result<Self, PragmaErr> {
-        let command = GraftCommand::parse(p)?;
-        if command.is_vfs_pragma() || allow_repository_commands {
-            Ok(Self(command))
-        } else {
-            Err(pragma_fail(format!(
-                "repository command `{}` is not available through SQLite; use the graft CLI",
-                p.name
-            )))
-        }
-    }
-
-    pub(crate) fn eval(
-        self,
-        runtime: &Runtime,
-        file: &mut VolFile,
-    ) -> Result<Option<String>, ErrCtx> {
-        self.0.eval(runtime, file)
     }
 }
 
 impl GraftCommand {
-    pub fn eval(self, _runtime: &Runtime, file: &mut VolFile) -> Result<Option<String>, ErrCtx> {
+    pub fn eval(
+        self,
+        _runtime: &Runtime,
+        file: &mut RepositorySessionContext,
+    ) -> Result<Option<String>, ErrCtx> {
         let runtime = file.runtime().clone();
         match self {
-            GraftCommand::VolumeList => Ok(Some(format_volumes(&runtime, file)?)),
-            GraftCommand::VolumeJsonList => Ok(Some(to_json(&json_volumes(&runtime, file)?)?)),
             GraftCommand::Tags => {
                 let repo = repo_for_file(file)?;
                 Ok(Some(format_repo_tags(&repo.tags()?)?))
@@ -1209,46 +963,6 @@ impl GraftCommand {
                     }
                 }
             }
-            GraftCommand::VolumeTags => Ok(Some(format_tags(&runtime, file)?)),
-
-            GraftCommand::VolumeClone { remote } => {
-                if !file.is_idle() {
-                    return pragma_err!("cannot clone while there is an open transaction");
-                }
-
-                let remote = match remote {
-                    Some(remote) => remote,
-                    None => runtime.volume_get(&file.vid)?.remote,
-                };
-                let volume = runtime.volume_open(None, None, Some(remote))?;
-                file.switch_volume(&volume.vid)?;
-
-                Ok(Some(format!(
-                    "Created new Volume {} from remote Log {}",
-                    volume.vid, volume.remote
-                )))
-            }
-
-            GraftCommand::VolumeFork => {
-                if !file.is_idle() {
-                    return pragma_err!("cannot fork while there is an open transaction");
-                }
-
-                let snapshot = file.snapshot_or_latest()?;
-                let missing = runtime.snapshot_missing_pages(&snapshot)?;
-                if missing.is_empty() {
-                    let volume = runtime.volume_from_snapshot(&snapshot)?;
-                    file.switch_volume(&volume.vid)?;
-
-                    Ok(Some(format!(
-                        "Forked current snapshot into Volume: {}",
-                        volume.vid,
-                    )))
-                } else {
-                    pragma_err!("ERROR: must hydrate volume before forking")
-                }
-            }
-
             GraftCommand::RepoCheckout { spec } => {
                 let outcome = run_repo_checkout(&runtime, file, spec)?;
                 Ok(Some(format_checkout_outcome(&outcome)))
@@ -1304,29 +1018,12 @@ impl GraftCommand {
                 })?))
             }
 
-            GraftCommand::VolumeSwitch { vid, local, remote } => {
-                if !file.is_idle() {
-                    return pragma_err!("cannot switch while there is an open transaction");
-                }
-
-                let volume = runtime.volume_open(Some(vid), local, remote)?;
-                file.switch_volume(&volume.vid)?;
-
-                Ok(Some(format!(
-                    "Switched to Volume {} with local Log {} and remote Log {}",
-                    volume.vid, volume.local, volume.remote,
-                )))
-            }
-
-            GraftCommand::VolumeInfo => Ok(Some(format_volume_info(&runtime, file)?)),
             GraftCommand::Status { spec } => {
                 let repo = repo_for_file(file)?;
                 let status = repo_status_for_file(&runtime, file, &repo)?;
                 let status = filter_repo_status_by_kind(status, spec.kind);
                 Ok(Some(format_repo_status(&status)?))
             }
-            GraftCommand::VolumeStatus => Ok(Some(format_volume_status(&runtime, file)?)),
-
             GraftCommand::RepoInit { spec } => {
                 let outcome = run_repo_init(file, spec)?;
                 Ok(Some(format_repo_init_outcome(&outcome)))
@@ -1862,11 +1559,6 @@ impl GraftCommand {
                 })?))
             }
 
-            GraftCommand::VolumeSnapshot => {
-                let snapshot = file.snapshot_or_latest()?;
-                Ok(Some(format!("{snapshot:?}")))
-            }
-
             GraftCommand::Fetch { remote, branch, refspec, all } => {
                 let repo = repo_for_file(file)?;
                 Ok(Some(run_repo_fetch(&repo, remote, branch, refspec, all)?))
@@ -1948,14 +1640,6 @@ impl GraftCommand {
                 let repo = repo_for_file(file)?;
                 let outcome = run_repo_push(&runtime, &repo, remote, branch, refspec, all, force)?;
                 Ok(Some(to_json(&json_push_command_outcome(&repo, &outcome)?)?))
-            }
-            GraftCommand::VolumeFetch => Ok(Some(fetch_or_pull(&runtime, file, false)?)),
-            GraftCommand::VolumePull => Ok(Some(fetch_or_pull(&runtime, file, true)?)),
-            GraftCommand::VolumePush => Ok(Some(push(&runtime, file)?)),
-
-            GraftCommand::VolumeAudit => Ok(Some(format_volume_audit(&runtime, file)?)),
-            GraftCommand::VolumeJsonAudit => {
-                Ok(Some(to_json(&json_volume_audit(&runtime, file)?)?))
             }
             GraftCommand::RepoAudit { spec } => {
                 let repo = repo_for_file(file)?;
@@ -2196,88 +1880,9 @@ impl GraftCommand {
                 })?))
             }
 
-            GraftCommand::VolumeHydrate => {
-                let snapshot = file.snapshot_or_latest()?;
-                runtime.snapshot_hydrate(snapshot)?;
-                Ok(None)
-            }
-
-            GraftCommand::Version => {
-                const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
-                const GITHUB_SHA: Option<&str> = option_env!("GITHUB_SHA");
-                let mut out = format!("Graft Version: {PKG_VERSION}");
-                if let Some(sha) = GITHUB_SHA {
-                    writeln!(&mut out, "\nGit Commit: {sha}")?;
-                }
-                Ok(Some(out))
-            }
-
-            GraftCommand::VolumeImport => {
-                pragma_err!(
-                    "deprecated: use `vacuum into` instead: https://graft.rs/r/graft_import"
-                )
-            }
-
-            GraftCommand::VolumeExport(path) => volume_export(&runtime, file, path).map(Some),
-
-            GraftCommand::VolumeDumpSqliteHeader => {
-                let reader = runtime.volume_reader(file.vid.clone())?;
-                let page = reader.read_page(PageIdx::FIRST)?;
-                let header = SqliteHeader::read_from_bytes(&page[..100])
-                    .expect("failed to parse SQLite header");
-                Ok(Some(format!("{header:#?}")))
-            }
-
-            GraftCommand::VolumeDumpCommit { logref } => {
-                format_debug_show_lsn(&runtime, &logref).map(Some)
-            }
-
-            GraftCommand::DebugLogLsn => format_debug_log_lsn(&runtime, file).map(Some),
-
-            GraftCommand::DebugShowLsn { logref } => {
-                format_debug_show_lsn(&runtime, &logref).map(Some)
-            }
-
-            GraftCommand::DebugDiffLsn { from, to } => {
-                if from.log != to.log {
-                    return pragma_err!("debug LSN diff requires both refs to use the same log");
-                }
-                let diff = runtime.diff_commits(&from.log, from.lsn, to.lsn)?;
-                Ok(Some(format_debug_page_diff(&diff)))
-            }
-
             GraftCommand::Log => {
                 let repo = repo_for_file(file)?;
                 Ok(Some(format_repo_log(&repo)?))
-            }
-
-            GraftCommand::VolumeCheckoutLsn { lsn } => {
-                if !file.is_idle() {
-                    return pragma_err!("cannot checkout while there is an open transaction");
-                }
-
-                let new_volume = runtime.volume_checkout(&file.vid, lsn)?;
-                file.switch_volume(&new_volume.vid)?;
-
-                Ok(Some(format!(
-                    "Checked out LSN {} into new Volume {} (local log: {})",
-                    lsn, new_volume.vid, new_volume.local
-                )))
-            }
-
-            GraftCommand::VolumeResetTo { lsn } => {
-                if !file.is_idle() {
-                    return pragma_err!("cannot reset while there is an open transaction");
-                }
-
-                let tag = file.tag.clone();
-                let new_volume = runtime.volume_reset_to(&tag, lsn)?;
-                file.switch_volume(&new_volume.vid)?;
-
-                Ok(Some(format!(
-                    "Reset tag '{}' to LSN {} (new Volume: {}, local log: {})",
-                    tag, lsn, new_volume.vid, new_volume.local
-                )))
             }
 
             GraftCommand::Reset { rev, mode } => {
@@ -2303,27 +1908,6 @@ impl GraftCommand {
                     outcome: outcome.outcome,
                     paths: outcome.paths,
                 })?))
-            }
-
-            GraftCommand::VolumeDiff { from, to, mode } => {
-                if !file.is_idle() {
-                    return pragma_err!("cannot diff while there is an open transaction");
-                }
-                match mode {
-                    DiffMode::Default => {
-                        // Built-in table-level diff using our B-tree parser
-                        let report =
-                            crate::sql_diff::generate_diff_report(&runtime, file, from, to)?;
-                        Ok(Some(report))
-                    }
-                    DiffMode::Rows => {
-                        // Row-level detailed diff
-                        row_diff_impl(&runtime, file, from, to)
-                    }
-                    DiffMode::SqliteSummary => {
-                        pragma_err!("SQLite summary mode is only available for repository diffs")
-                    }
-                }
             }
 
             GraftCommand::RepoDiff { spec } => {
@@ -2380,69 +1964,6 @@ impl GraftCommand {
                             next_cursor,
                             has_more,
                         })?))
-                    }
-                }
-            }
-
-            GraftCommand::VolumeJsonDiff { from, to, mode } => {
-                if !file.is_idle() {
-                    return pragma_err!("cannot diff while there is an open transaction");
-                }
-                match mode {
-                    DiffMode::Default => {
-                        let diff =
-                            crate::row_level_diff::row_level_diff(&runtime, &file.vid, from, to)
-                                .map_err(|e| {
-                                    ErrCtx::PragmaErr(format!("Diff error: {e:?}").into())
-                                })?;
-                        let tables: Vec<crate::json::JsonTableSummary> = diff
-                            .table_changes
-                            .iter()
-                            .map(|t| {
-                                let (inserts, deletes, updates) = count_changes_json(&t.changes);
-                                crate::json::JsonTableSummary {
-                                    name: t.table_name.clone(),
-                                    inserts,
-                                    deletes,
-                                    updates,
-                                }
-                            })
-                            .collect();
-                        let result = crate::json::JsonDiffResult {
-                            from_lsn: from.to_u64(),
-                            to_lsn: to.to_u64(),
-                            logical_status: diff.logical_status().as_str().to_string(),
-                            capabilities: json_diff_capabilities(&diff),
-                            limitations: json_diff_limitations(&diff),
-                            tables,
-                            opaque_changes: json_opaque_changes(&diff.opaque_changes),
-                        };
-                        Ok(Some(serde_json::to_string(&result).map_err(|e| {
-                            ErrCtx::PragmaErr(format!("JSON error: {e}").into())
-                        })?))
-                    }
-                    DiffMode::Rows => {
-                        let diff =
-                            crate::row_level_diff::row_level_diff(&runtime, &file.vid, from, to)
-                                .map_err(|e| {
-                                    ErrCtx::PragmaErr(format!("Diff error: {e:?}").into())
-                                })?;
-                        let tables = json_table_changes(&diff.table_changes);
-                        let result = crate::json::JsonRowDiffResult {
-                            from_lsn: from.to_u64(),
-                            to_lsn: to.to_u64(),
-                            logical_status: diff.logical_status().as_str().to_string(),
-                            capabilities: json_diff_capabilities(&diff),
-                            limitations: json_diff_limitations(&diff),
-                            tables,
-                            opaque_changes: json_opaque_changes(&diff.opaque_changes),
-                        };
-                        Ok(Some(serde_json::to_string(&result).map_err(|e| {
-                            ErrCtx::PragmaErr(format!("JSON error: {e}").into())
-                        })?))
-                    }
-                    DiffMode::SqliteSummary => {
-                        pragma_err!("SQLite summary mode is only available for repository diffs")
                     }
                 }
             }
@@ -2539,64 +2060,13 @@ impl GraftCommand {
                     commit,
                 })?))
             }
-
-            GraftCommand::VolumeJsonInfo => {
-                let result = json_volume_info(&runtime, file)?;
-                Ok(Some(serde_json::to_string(&result).map_err(|e| {
-                    ErrCtx::PragmaErr(format!("JSON error: {e}").into())
-                })?))
-            }
-
-            GraftCommand::VolumeTableLog { table } => {
-                let entries = table_log_entries(&runtime, &file.vid, &table)?;
-                if entries.is_empty() {
-                    return Ok(Some(format!("No changes found for table '{table}'.")));
-                }
-                let mut f = String::new();
-                writeln!(&mut f, "Changes for table '{table}':")?;
-                writeln!(
-                    &mut f,
-                    "{:<6} {:<20} {:<10} DETAIL",
-                    "LSN", "WHEN", "CHANGES"
-                )?;
-                writeln!(&mut f, "{}", "-".repeat(75))?;
-                for e in entries {
-                    writeln!(
-                        &mut f,
-                        "{:<6} {:<20} {:<10} {}",
-                        e.lsn, e.when, e.summary, e.detail
-                    )?;
-                }
-                Ok(Some(f))
-            }
-
-            GraftCommand::VolumeJsonTableLog { table } => {
-                let entries = table_log_entries(&runtime, &file.vid, &table)?;
-                let json_entries: Vec<crate::json::JsonTableLogEntry> = entries
-                    .iter()
-                    .map(|e| crate::json::JsonTableLogEntry {
-                        lsn: e.lsn,
-                        timestamp_ms: e.timestamp_ms,
-                        summary: e.summary.clone(),
-                        detail: e.detail.clone(),
-                    })
-                    .collect();
-                Ok(Some(serde_json::to_string(&json_entries).map_err(|e| {
-                    ErrCtx::PragmaErr(format!("JSON error: {e}").into())
-                })?))
-            }
-
-            GraftCommand::VolumeSetMessage { message } => {
-                file.pending_message = Some(message.clone());
-                Ok(Some(format!("Commit message set: '{message}'")))
-            }
         }
     }
 }
 
 fn run_repo_storage_gc(
     runtime: &Runtime,
-    file: &mut VolFile,
+    file: &mut RepositorySessionContext,
     dry_run: bool,
 ) -> Result<graft::local::fjall_storage::StorageGcOutcome, ErrCtx> {
     if !file.is_idle() {
@@ -2605,11 +2075,10 @@ fn run_repo_storage_gc(
 
     let repo = repo_for_file(file)?;
     let states = repo.referenced_storage_states()?;
-    let mut root_volumes = states
+    let root_volumes = states
         .iter()
         .map(|state| state.volume.clone())
         .collect::<BTreeSet<_>>();
-    root_volumes.insert(file.vid.clone());
     let root_snapshots = states
         .iter()
         .map(|state| state.snapshot.to_snapshot())

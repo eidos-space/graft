@@ -236,7 +236,7 @@ tracked artifact/external payload，并可从 remote 修复可获取的 object/p
 
 Payload prune 保留 active index 以及 local branch、remote-tracking ref、tag reachable
 commit 引用的 payload。SQLite storage GC 还以 index snapshot、`HEAD`、branch、
-merge/original head、remote ref、tag 和当前 VFS volume 为 root。这些 domain 不能
+merge/original head、remote ref 和 tag 为 root。这些 domain 不能
 混用。1.0 没有删除 unreachable loose object 的 public command。
 
 ## 10. 原子性、并发与失败

@@ -79,11 +79,11 @@ jobs:
             .benchmark-baseline -> target
 
       - name: Build candidate and benchmark harness
-        run: cargo build --release --locked -p graft-tool -p graft-bench
+        run: cargo build --release --locked -p graft-cli -p graft-bench
 
       - name: Build baseline
         working-directory: .benchmark-baseline
-        run: cargo build --release --locked -p graft-tool
+        run: cargo build --release --locked -p graft-cli
 
       - name: Run interleaved benchmarks
         env:

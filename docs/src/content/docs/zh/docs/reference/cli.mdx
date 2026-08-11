@@ -3,9 +3,8 @@ title: CLI
 description: graft 命令行接口参考。
 ---
 
-`graft` CLI 是 repository control plane，用于本地开发、脚本、应用集成和手动
-仓库操作。它直接调用 repository service，不需要 SQLite 扩展或 repository
-PRAGMA 作为传输层。
+`graft` CLI 用于本地开发、脚本、应用集成和手动仓库操作。它直接调用 typed
+repository service。
 
 ## 全局选项
 
@@ -27,7 +26,7 @@ cat script.sql | graft sql --db data.sqlite
 ```
 
 `graft sql` 使用普通 SQLite 连接打开 worktree 中的物理数据库文件。这是在本地
-使用 Graft 最简单的方式，不需要加载 SQLite 扩展。
+使用 Graft 最简单的方式。
 
 它要求显式 `--db` 路径和已存在的 `.graft/` 仓库。先在 worktree 里运行一次 `graft init`，再通过 CLI 创建或修改数据库。
 

@@ -24,12 +24,11 @@ Node-API async -> JavaScript -------+          +--> core/runtime
                                                +--> SQLite diff/merge/worktree
                                                +--> official remotes
 
-Browser UI -> Worker -> real graft-tool WASM -> 同一 Rust command path
+Browser UI -> Worker -> real graft-cli WASM -> 同一 Rust command path
 ```
 
 Command service 直接执行 typed `RepositoryCommand`，retain runtime/storage lock；
-它不打开 SQLite connection，也不通过 production PRAGMA 路由 repository command。
-SQLite VFS 是独立 data plane。
+它不打开 SQLite connection，也不通过 SQL 路由 repository command。
 
 ## 2. Command service
 
@@ -226,7 +225,7 @@ OPFS 持久化 repository；`/tmp` memory-backed，避免 temp SQLite DB 泄漏�
 不是 pure mock；worker/session 重开后从 durable state reload。
 
 当前 browser 边界：native Node addon 不可加载、remote sync 有意禁用、filesystem
-由 OPFS/WasmFS 组合、只支持编译并 bridge 的 graft-tool operation。UI mock 只能测
+由 OPFS/WasmFS 组合、只支持编译并 bridge 的 graft-cli operation。UI mock 只能测
 presentation，不能作为 core conformance。
 
 ## 13. Conformance

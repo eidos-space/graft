@@ -92,16 +92,3 @@ another operation that replaces the worktree file, close long-lived database
 connections. Graft obtains an exclusive SQLite lock, folds a WAL into the old
 main file, removes sidecars, and refuses replacement while another writer is
 active.
-
-## Optional Live VFS Mode
-
-The SQLite extension can open a path with `vfs=graft` when an application wants
-SQLite commits to advance a live Graft Volume directly. This is an advanced
-data-plane mode, not the repository control plane. Repository status, staging,
-history, merge, and sync still use the CLI. Unlike physical staging, the live
-Graft VFS write path requires SQLite `page_size=4096` because each SQLite page
-maps directly to one Graft page.
-
-Do not edit the same logical database simultaneously through the Graft VFS and
-the platform's normal file VFS. Choose one write path and close live
-connections before branch operations that replace or rebind database state.

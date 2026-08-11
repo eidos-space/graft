@@ -2,7 +2,7 @@ use super::*;
 
 pub(super) fn repo_diff_for_spec(
     runtime: &Runtime,
-    file: &VolFile,
+    file: &RepositorySessionContext,
     repo: &Repository,
     spec: RepoDiffSpec,
 ) -> Result<RepoDiff, ErrCtx> {
@@ -23,7 +23,7 @@ pub(super) fn repo_diff_for_spec(
                     Ok(metadata) if metadata.file_type().is_dir() => {
                         repo_worktree_diff_for_filter(runtime, file, repo, None, &key)
                     }
-                    Ok(metadata) if !metadata.file_type().is_file() => Err(ErrCtx::PragmaErr(
+                    Ok(metadata) if !metadata.file_type().is_file() => Err(ErrCtx::InvalidCommand(
                         format!("path `{}` is not a regular file", physical_path.display()).into(),
                     )),
                     Ok(_) if is_sqlite_database_path(&physical_path)? => {
@@ -81,7 +81,7 @@ pub(super) fn repo_diff_for_spec(
                     Ok(metadata) if metadata.file_type().is_dir() => {
                         repo_worktree_diff_for_filter(runtime, file, repo, Some(&rev), &key)
                     }
-                    Ok(metadata) if !metadata.file_type().is_file() => Err(ErrCtx::PragmaErr(
+                    Ok(metadata) if !metadata.file_type().is_file() => Err(ErrCtx::InvalidCommand(
                         format!("path `{}` is not a regular file", physical_path.display()).into(),
                     )),
                     Ok(_) if is_sqlite_database_path(&physical_path)? => {
@@ -179,7 +179,7 @@ pub(super) fn repo_text_content_for_path(
 
 pub(super) fn repo_worktree_diff_for_filter(
     runtime: &Runtime,
-    file: &VolFile,
+    file: &RepositorySessionContext,
     repo: &Repository,
     rev: Option<&str>,
     filter: &str,
@@ -353,7 +353,7 @@ pub(super) fn repo_key_matches_filter(key: &str, filter: &str) -> bool {
 
 pub(crate) fn repo_status_for_file(
     runtime: &Runtime,
-    file: &VolFile,
+    file: &RepositorySessionContext,
     repo: &Repository,
 ) -> Result<RepoStatus, ErrCtx> {
     let mut status = repo.status()?;
@@ -555,7 +555,7 @@ fn repo_diff_physical_sqlite_file_for_bounded_rows(
 
 pub(super) fn repo_has_work_in_progress_for_file(
     runtime: &Runtime,
-    file: &VolFile,
+    file: &RepositorySessionContext,
     repo: &Repository,
 ) -> Result<bool, ErrCtx> {
     let status = repo_status_for_file(runtime, file, repo)?;
@@ -571,7 +571,7 @@ pub(super) fn repo_has_work_in_progress_for_file(
 
 pub(super) fn ensure_checkout_plan_preserves_untracked_paths(
     runtime: &Runtime,
-    file: &VolFile,
+    file: &RepositorySessionContext,
     repo: &Repository,
     plan: &CheckoutPlan,
 ) -> Result<(), ErrCtx> {
@@ -586,7 +586,7 @@ pub(super) fn ensure_checkout_plan_preserves_untracked_paths(
 
 pub(super) fn ensure_checkout_key_preserves_untracked_path(
     runtime: &Runtime,
-    file: &VolFile,
+    file: &RepositorySessionContext,
     repo: &Repository,
     key: &str,
 ) -> Result<(), ErrCtx> {
@@ -596,7 +596,7 @@ pub(super) fn ensure_checkout_key_preserves_untracked_path(
 
 pub(super) fn ensure_checkout_keys_preserve_untracked_paths(
     runtime: &Runtime,
-    file: &VolFile,
+    file: &RepositorySessionContext,
     repo: &Repository,
     keys: &BTreeSet<String>,
 ) -> Result<(), ErrCtx> {
@@ -648,7 +648,7 @@ pub(super) fn staged_commit_table_summary(
 
 pub(super) fn staged_commit_table_summary_for_file(
     runtime: &Runtime,
-    file: &VolFile,
+    file: &RepositorySessionContext,
     repo: &Repository,
 ) -> Result<Vec<CommitTableSummary>, ErrCtx> {
     staged_commit_table_summary_with_prepared(runtime, repo, Some(file))
@@ -657,7 +657,7 @@ pub(super) fn staged_commit_table_summary_for_file(
 fn staged_commit_table_summary_with_prepared(
     runtime: &Runtime,
     repo: &Repository,
-    prepared_file: Option<&VolFile>,
+    prepared_file: Option<&RepositorySessionContext>,
 ) -> Result<Vec<CommitTableSummary>, ErrCtx> {
     let diff = repo.diff_staged(None)?;
     let mut by_name = BTreeMap::<String, CommitTableSummary>::new();
@@ -674,7 +674,7 @@ fn repo_file_table_summary_with_prepared(
     runtime: &Runtime,
     repo: &Repository,
     file: &graft::repo::RepoFileDiff,
-    prepared_file: Option<&VolFile>,
+    prepared_file: Option<&RepositorySessionContext>,
 ) -> Result<Vec<CommitTableSummary>, ErrCtx> {
     match (&file.from, &file.to) {
         (Some(from), Some(to)) => {
@@ -715,7 +715,7 @@ fn repo_file_table_summary_with_prepared(
                 to_lsn,
                 &crate::row_level_diff::BoundedRowDiffMode::Summary,
             )
-            .map_err(|error| ErrCtx::PragmaErr(format!("Diff error: {error:?}").into()))?;
+            .map_err(|error| ErrCtx::InvalidCommand(format!("Diff error: {error:?}").into()))?;
             Ok(diff
                 .summaries
                 .into_iter()
@@ -749,7 +749,7 @@ fn staged_worktree_table_summary(
     file: &graft::repo::RepoFileDiff,
     from_snapshot: &graft::snapshot::Snapshot,
     to_snapshot: &graft::snapshot::Snapshot,
-    prepared_file: Option<&VolFile>,
+    prepared_file: Option<&RepositorySessionContext>,
 ) -> Result<Option<Vec<CommitTableSummary>>, ErrCtx> {
     let prepared =
         prepared_file.and_then(|prepared_file| prepared_file.prepared_sqlite_stage(&file.path));
@@ -789,7 +789,7 @@ fn staged_worktree_table_summary(
         to_lsn,
         &tables,
     )
-    .map_err(|error| ErrCtx::PragmaErr(format!("Diff error: {error:?}").into()))?
+    .map_err(|error| ErrCtx::InvalidCommand(format!("Diff error: {error:?}").into()))?
     {
         return Ok(Some(
             summaries
@@ -812,7 +812,7 @@ fn staged_worktree_table_summary(
         to_lsn,
         &tables,
     )
-    .map_err(|error| ErrCtx::PragmaErr(format!("Diff error: {error:?}").into()))?;
+    .map_err(|error| ErrCtx::InvalidCommand(format!("Diff error: {error:?}").into()))?;
     Ok(Some(
         diff.summaries
             .into_iter()
@@ -852,10 +852,10 @@ fn snapshot_table_summary_from_reader(
     mode: SnapshotSummaryMode,
 ) -> Result<Vec<CommitTableSummary>, ErrCtx> {
     let materialized = crate::row_level_diff::MaterializedSnapshot::from_reader(reader, "summary")
-        .map_err(|error| ErrCtx::PragmaErr(format!("Snapshot error: {error}").into()))?;
+        .map_err(|error| ErrCtx::InvalidCommand(format!("Snapshot error: {error}").into()))?;
     let connection = materialized.connection();
     let master = crate::row_level_diff::read_master_table_sqlite(connection, "summary")
-        .map_err(|error| ErrCtx::PragmaErr(format!("Schema error: {error}").into()))?;
+        .map_err(|error| ErrCtx::InvalidCommand(format!("Schema error: {error}").into()))?;
     let mut summaries = Vec::new();
     let ignored_tables = crate::row_level_diff::ignored_row_diff_tables(&master, &[]);
 
@@ -873,12 +873,12 @@ fn snapshot_table_summary_from_reader(
                 |row| row.get(0),
             )
             .map_err(|error| {
-                ErrCtx::PragmaErr(
+                ErrCtx::InvalidCommand(
                     format!("Could not count rows in table '{}': {error}", entry.name).into(),
                 )
             })?;
         let row_count = usize::try_from(row_count).map_err(|_| {
-            ErrCtx::PragmaErr(format!("Invalid row count for table '{}'", entry.name).into())
+            ErrCtx::InvalidCommand(format!("Invalid row count for table '{}'", entry.name).into())
         })?;
         let summary = match mode {
             SnapshotSummaryMode::Inserted => table_summary(entry.name, row_count, 0, 0),
@@ -943,7 +943,7 @@ pub(super) fn is_sqlite_sidecar_path(path: &Path) -> bool {
 
 pub(super) fn current_repo_file_state(
     runtime: &Runtime,
-    file: &VolFile,
+    file: &RepositorySessionContext,
 ) -> Result<CommitFileState, ErrCtx> {
     let snapshot = file.snapshot_or_latest()?;
     Ok(CommitFileState {
@@ -993,7 +993,7 @@ pub(super) fn repo_snapshot_with_commit_hashes(
         for lsn in range.lsns.iter() {
             let commit_hash =
                 repo_storage_commit_hash(runtime, &range.log, lsn)?.ok_or_else(|| {
-                    ErrCtx::PragmaErr(
+                    ErrCtx::InvalidCommand(
                         format!(
                             "snapshot references missing storage commit {:?}/{}",
                             range.log, lsn

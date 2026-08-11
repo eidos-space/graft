@@ -1,7 +1,7 @@
 use super::*;
 
 pub(super) fn run_repo_init(
-    file: &mut VolFile,
+    file: &mut RepositorySessionContext,
     spec: RepoInitSpec,
 ) -> Result<RepoInitOutcome, ErrCtx> {
     if !file.is_idle() {
@@ -28,7 +28,7 @@ pub(super) fn run_repo_init(
 }
 
 pub(super) fn resolve_repo_worktree_arg(
-    file: &VolFile,
+    file: &RepositorySessionContext,
     worktree: &Path,
 ) -> Result<PathBuf, ErrCtx> {
     if worktree.is_absolute() {
@@ -47,7 +47,7 @@ pub(super) fn format_repo_init_outcome(outcome: &RepoInitOutcome) -> String {
     )
 }
 
-pub(crate) fn repo_for_file(file: &mut VolFile) -> Result<Repository, ErrCtx> {
+pub(crate) fn repo_for_file(file: &mut RepositorySessionContext) -> Result<Repository, ErrCtx> {
     if let Some(repo) = &file.repo {
         return Ok(repo.clone());
     }
@@ -64,7 +64,7 @@ pub(crate) fn repo_for_file(file: &mut VolFile) -> Result<Repository, ErrCtx> {
 }
 
 pub(super) fn run_repo_clone(
-    file: &mut VolFile,
+    file: &mut RepositorySessionContext,
     spec: RepoCloneSpec,
 ) -> Result<RepoCloneOutcome, ErrCtx> {
     if !file.is_idle() {

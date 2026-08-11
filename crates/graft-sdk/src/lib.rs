@@ -24,12 +24,12 @@ use graft::{
     remote::{RemoteConfig, RemoteCredentialErr, RemoteCredentials},
 };
 use graft_sqlite::{
+    error::ErrCtx,
     repo_service::{
         RepositoryCommand, RepositoryCommandService,
         RepositoryResolveOptions as ServiceResolveOptions,
         RepositoryResolveRow as ServiceResolveRow, RepositoryResolveSide as ServiceResolveSide,
     },
-    vfs::ErrCtx,
 };
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};

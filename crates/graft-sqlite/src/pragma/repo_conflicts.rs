@@ -6,7 +6,7 @@ pub(super) fn conflict_side_state(
     side: ResolveSide,
 ) -> Result<RepoConflictSideState, ErrCtx> {
     let Some(stage) = side.index_stage() else {
-        return Err(ErrCtx::PragmaErr(
+        return Err(ErrCtx::InvalidCommand(
             "manual resolution does not have an index conflict stage".into(),
         ));
     };
@@ -38,7 +38,7 @@ pub(super) fn conflict_side_state(
 
 pub(super) fn resolve_repo_conflict_for_file(
     runtime: &Runtime,
-    file: &mut VolFile,
+    file: &mut RepositorySessionContext,
     repo: &Repository,
     spec: RepoResolveSpec,
 ) -> Result<RepoResolveConflictOutcome, ErrCtx> {
@@ -147,7 +147,7 @@ pub(super) fn resolve_repo_conflict_for_file(
 
 pub(super) fn resolve_repo_row_conflict(
     runtime: &Runtime,
-    file: &mut VolFile,
+    file: &mut RepositorySessionContext,
     repo: &Repository,
     key: &str,
     physical_path: &Path,
@@ -156,7 +156,7 @@ pub(super) fn resolve_repo_row_conflict(
     row: &RepoResolveRowSpec,
 ) -> Result<String, ErrCtx> {
     if side == ResolveSide::Manual {
-        return Err(ErrCtx::PragmaErr(
+        return Err(ErrCtx::InvalidCommand(
             "row conflict resolution requires `--ours` or `--theirs`".into(),
         ));
     }
@@ -165,7 +165,7 @@ pub(super) fn resolve_repo_row_conflict(
     let mut resolution_state =
         read_row_conflict_resolution_state(repo, status.merge_head.as_deref())?;
     let Some((base, ours, theirs)) = current_file_conflict_states(repo, key)? else {
-        return Err(ErrCtx::PragmaErr(
+        return Err(ErrCtx::InvalidCommand(
             format!("path `{key}` has no row conflict stages").into(),
         ));
     };
@@ -176,7 +176,7 @@ pub(super) fn resolve_repo_row_conflict(
 
     let plan = plan_repo_snapshot_merge(runtime, repo, &base, &ours, &theirs)?;
     if !plan.schema_conflicts().is_empty() || plan.has_opaque_changes() {
-        return Err(ErrCtx::PragmaErr(
+        return Err(ErrCtx::InvalidCommand(
             "row conflict resolution is not available with schema or opaque conflicts".into(),
         ));
     }
@@ -184,7 +184,7 @@ pub(super) fn resolve_repo_row_conflict(
         conflict.table == row.table && row_identities_match(&conflict.identity, &row.identity)
     });
     let Some(requested_conflict) = requested_conflict else {
-        return Err(ErrCtx::PragmaErr(
+        return Err(ErrCtx::InvalidCommand(
             format!(
                 "path `{key}` has no row conflict for {} {}",
                 row.table,
@@ -194,7 +194,7 @@ pub(super) fn resolve_repo_row_conflict(
         ));
     };
     if requested_conflict.reason == crate::row_merge::RowMergeConflictReason::SemanticKey {
-        return Err(ErrCtx::PragmaErr(
+        return Err(ErrCtx::InvalidCommand(
             format!(
                 "semantic key conflict for {} {} requires manual file resolution",
                 row.table,
@@ -306,7 +306,7 @@ pub(super) fn materialize_row_conflict_resolution_state(
         };
         let Some(row_sql) = plan.conflict_apply_sql(side, &conflict.table, &conflict.identity)
         else {
-            return Err(ErrCtx::PragmaErr(
+            return Err(ErrCtx::InvalidCommand(
                 format!(
                     "could not generate row resolution for {} {}",
                     conflict.table,
@@ -456,7 +456,7 @@ pub(super) fn read_row_conflict_resolution_state(
     let path = row_conflict_resolution_state_path(repo);
     let state = match std::fs::read_to_string(&path) {
         Ok(raw) => serde_json::from_str::<RowConflictResolutionState>(&raw).map_err(|err| {
-            ErrCtx::PragmaErr(
+            ErrCtx::InvalidCommand(
                 format!(
                     "could not parse row conflict resolution state `{}`: {err}",
                     path.display()
@@ -486,7 +486,9 @@ pub(super) fn write_row_conflict_resolution_state(
         std::fs::create_dir_all(parent)?;
     }
     let raw = serde_json::to_string_pretty(state).map_err(|err| {
-        ErrCtx::PragmaErr(format!("could not encode row conflict resolution state: {err}").into())
+        ErrCtx::InvalidCommand(
+            format!("could not encode row conflict resolution state: {err}").into(),
+        )
     })?;
     std::fs::write(path, raw)?;
     Ok(())

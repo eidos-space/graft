@@ -94,6 +94,6 @@ Applications can invoke the same CLI with `--json` and consume structured
 status, diff, conflict, and sync results. SQLite itself remains an ordinary
 physical worktree file, so existing database libraries need no custom VFS.
 
-The SQLite extension is optional. It provides the Graft VFS for applications
-that deliberately want live page storage, plus version and low-level debug
-PRAGMAs. Repository operations remain in the CLI control plane.
+Applications that need a resident in-process boundary can use the Node.js and
+Electron SDK. It exposes the same repository operations without launching a
+new CLI process for each command.

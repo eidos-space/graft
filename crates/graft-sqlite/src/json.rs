@@ -1,25 +1,10 @@
-//! JSON output types for graft pragmas.
+//! JSON output types for repository commands.
 //! These mirror the internal types but use only serde-serializable primitives,
 //! avoiding the need to add Serialize to every core graft type.
 
 use std::collections::BTreeMap;
 
 use serde::Serialize;
-
-/// Commit log entry (for `graft_json_log`)
-#[derive(Debug, Clone, Serialize)]
-pub struct JsonCommit {
-    pub lsn: u64,
-    pub page_count: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub segment: Option<String>,
-    pub is_checkpoint: bool,
-    pub changed_pages: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub timestamp_ms: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
-}
 
 /// Table summary in a diff (for `graft_json_diff`)
 #[derive(Debug, Clone, Serialize)]
@@ -40,24 +25,12 @@ pub struct JsonOpaqueChange {
     pub owner: Option<String>,
 }
 
-/// A row-diff semantic limitation or unsupported SQLite surface.
+/// A row-diff semantic limitation or unsupported `SQLite` surface.
 #[derive(Debug, Clone, Serialize)]
 pub struct JsonDiffLimitation {
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subject: Option<String>,
-}
-
-/// Diff result (for `graft_json_diff`, default mode)
-#[derive(Debug, Clone, Serialize)]
-pub struct JsonDiffResult {
-    pub from_lsn: u64,
-    pub to_lsn: u64,
-    pub logical_status: String,
-    pub capabilities: Vec<String>,
-    pub limitations: Vec<JsonDiffLimitation>,
-    pub tables: Vec<JsonTableSummary>,
-    pub opaque_changes: Vec<JsonOpaqueChange>,
 }
 
 /// A single row change (for `graft_json_diff`, rows mode)
@@ -83,18 +56,6 @@ pub struct JsonTableChanges {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub primary_key_columns: Vec<String>,
     pub changes: Vec<JsonRowChange>,
-}
-
-/// Row-level diff result (for `graft_json_diff`, rows mode)
-#[derive(Debug, Clone, Serialize)]
-pub struct JsonRowDiffResult {
-    pub from_lsn: u64,
-    pub to_lsn: u64,
-    pub logical_status: String,
-    pub capabilities: Vec<String>,
-    pub limitations: Vec<JsonDiffLimitation>,
-    pub tables: Vec<JsonTableChanges>,
-    pub opaque_changes: Vec<JsonOpaqueChange>,
 }
 
 /// Row-level repository diff result (for `graft_json_diff --rows`)
@@ -193,68 +154,6 @@ pub struct JsonRowDiffTelemetry {
     pub requested_table: Option<String>,
     pub tables_considered: usize,
     pub tables_scanned: usize,
-}
-
-/// Table entry in show output (for `graft_json_show`)
-#[derive(Debug, Clone, Serialize)]
-pub struct JsonTableEntry {
-    #[serde(rename = "type")]
-    pub entry_type: String,
-    pub name: String,
-    pub root_page: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rows: Option<usize>,
-}
-
-/// Commit detail (for `graft_json_show`)
-#[derive(Debug, Clone, Serialize)]
-pub struct JsonShowResult {
-    pub lsn: u64,
-    pub page_count: u32,
-    pub is_checkpoint: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub segment: Option<String>,
-    pub changed_pages: usize,
-    pub tables: Vec<JsonTableEntry>,
-}
-
-/// Debug Volume info (for `graft_debug_volume_json_info`)
-#[derive(Debug, Clone, Serialize)]
-pub struct JsonVolumeInfo {
-    pub vid: String,
-    pub local: String,
-    pub remote: String,
-    pub page_count: u32,
-    pub snapshot_size_bytes: u64,
-    pub snapshot_pages: u32,
-}
-
-/// Debug table log entry (for `graft_debug_volume_json_table_log`)
-#[derive(Debug, Clone, Serialize)]
-pub struct JsonTableLogEntry {
-    pub lsn: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub timestamp_ms: Option<u64>,
-    pub summary: String,
-    pub detail: String,
-}
-
-// ============================================================
-// Conversion helpers
-// ============================================================
-
-impl JsonCommit {
-    pub fn from_commit_info(ci: &graft::CommitInfo) -> Self {
-        Self {
-            lsn: ci.lsn.to_u64(),
-            page_count: ci.page_count.to_u32(),
-            segment: ci.segment_id.as_ref().map(|s| s.short()),
-            is_checkpoint: ci.is_checkpoint,
-            changed_pages: ci.changed_pages,
-            timestamp_ms: ci.timestamp,
-            message: ci.message.clone(),
-        }
-    }
 }
 
 impl JsonRowChange {

@@ -1,22 +1,13 @@
 use super::*;
 
-pub(super) fn begin_workspace_checkout(file: &VolFile) -> Result<WorkspaceCheckoutGuard, ErrCtx> {
-    file.try_workspace_checkout().ok_or_else(|| {
-        ErrCtx::PragmaErr(
-            "cannot update the worktree while another SQLite write transaction is open".into(),
-        )
-    })
-}
-
 pub(super) fn run_repo_checkout(
     runtime: &Runtime,
-    file: &mut VolFile,
+    file: &mut RepositorySessionContext,
     spec: RepoCheckoutSpec,
 ) -> Result<JsonCheckoutOutcome, ErrCtx> {
     if !file.is_idle() {
         return pragma_err!("cannot checkout while there is an open transaction");
     }
-    let _workspace_checkout = begin_workspace_checkout(file)?;
     let repo = repo_for_file(file)?;
     match spec {
         RepoCheckoutSpec::Detach { rev, force } => {
@@ -69,7 +60,7 @@ pub(super) fn run_repo_checkout(
 
 pub(super) fn checkout_repo_path_from_revision(
     runtime: &Runtime,
-    file: &mut VolFile,
+    file: &mut RepositorySessionContext,
     repo: &Repository,
     rev: &str,
     path: &str,
@@ -134,13 +125,13 @@ pub(super) fn checkout_repo_path_from_revision(
                 path_details,
             })
         }
-        Err(err) => Err(err.into()),
+        Err(err) => Err(err),
     }
 }
 
 pub(super) fn checkout_repo_key_from_revision(
     runtime: &Runtime,
-    file: &mut VolFile,
+    file: &mut RepositorySessionContext,
     repo: &Repository,
     rev: &str,
     key: &str,
@@ -304,7 +295,7 @@ pub(super) fn revision_has_repo_key(
 
 pub(super) fn stage_checkout_deletion_for_key(
     runtime: &Runtime,
-    file: &mut VolFile,
+    file: &mut RepositorySessionContext,
     repo: &Repository,
     key: &str,
 ) -> Result<(), ErrCtx> {
@@ -368,14 +359,13 @@ pub(super) fn format_checkout_outcome(outcome: &JsonCheckoutOutcome) -> String {
 
 pub(super) fn run_repo_reset(
     runtime: &Runtime,
-    file: &mut VolFile,
+    file: &mut RepositorySessionContext,
     rev: &str,
     mode: ResetMode,
 ) -> Result<RepoResetCommandOutcome, ErrCtx> {
     if !file.is_idle() {
         return pragma_err!("cannot reset while there is an open transaction");
     }
-    let _workspace_checkout = begin_workspace_checkout(file)?;
 
     let repo = repo_for_file(file)?;
     let current_state = current_repo_file_state(runtime, file)?;
@@ -633,7 +623,7 @@ pub(super) fn json_path_action(
 
 pub(super) fn checkout_repo_head(
     runtime: &Runtime,
-    file: &mut VolFile,
+    file: &mut RepositorySessionContext,
     repo: &Repository,
     remote: Option<Arc<Remote>>,
 ) -> Result<(), ErrCtx> {
@@ -648,7 +638,7 @@ pub(super) fn checkout_repo_head(
 
 pub(super) fn checkout_repo_plan(
     runtime: &Runtime,
-    file: &mut VolFile,
+    file: &mut RepositorySessionContext,
     repo: &Repository,
     plan: &CheckoutPlan,
     previous_files: &BTreeMap<String, CommitFileState>,
@@ -665,7 +655,7 @@ pub(super) fn checkout_repo_plan(
 
 struct WorkspaceCheckout<'a> {
     runtime: &'a Runtime,
-    file: &'a mut VolFile,
+    file: &'a mut RepositorySessionContext,
     repo: &'a Repository,
     current_key: String,
 }
@@ -673,7 +663,7 @@ struct WorkspaceCheckout<'a> {
 impl<'a> WorkspaceCheckout<'a> {
     fn new(
         runtime: &'a Runtime,
-        file: &'a mut VolFile,
+        file: &'a mut RepositorySessionContext,
         repo: &'a Repository,
     ) -> Result<Self, ErrCtx> {
         let current_key = repo.file_key(&file.tag)?;
@@ -973,7 +963,7 @@ pub(super) fn remove_materialized_repo_file(repo: &Repository, key: &str) -> Res
     match std::fs::symlink_metadata(&path) {
         Ok(metadata) => {
             if !metadata.file_type().is_file() {
-                return Err(ErrCtx::PragmaErr(
+                return Err(ErrCtx::InvalidCommand(
                     format!("path `{}` is not a regular file", path.display()).into(),
                 ));
             }
@@ -999,7 +989,7 @@ pub(super) struct RepoRestoreKeyPlan {
 
 pub(super) fn restore_repo_path(
     runtime: &Runtime,
-    file: &mut VolFile,
+    file: &mut RepositorySessionContext,
     repo: &Repository,
     spec: &RepoRestoreSpec,
 ) -> Result<JsonRestoreOutcome, ErrCtx> {
@@ -1024,7 +1014,7 @@ pub(super) fn restore_repo_path(
     }
 
     let path = spec.path.as_deref().ok_or_else(|| {
-        ErrCtx::PragmaErr("restore requires a path unless --staged --all is used".into())
+        ErrCtx::InvalidCommand("restore requires a path unless --staged --all is used".into())
     })?;
     let (key, physical_path) = repo_restore_path_arg(repo, path)?;
     let is_directory = std::fs::symlink_metadata(&physical_path)
@@ -1043,7 +1033,7 @@ pub(super) fn restore_repo_path(
 
 pub(super) fn restore_repo_staged_all(
     runtime: &Runtime,
-    file: &mut VolFile,
+    file: &mut RepositorySessionContext,
     repo: &Repository,
     spec: &RepoRestoreSpec,
 ) -> Result<JsonRestoreOutcome, ErrCtx> {
@@ -1059,7 +1049,7 @@ pub(super) fn restore_repo_staged_all(
 
 pub(super) fn restore_repo_directory(
     runtime: &Runtime,
-    file: &mut VolFile,
+    file: &mut RepositorySessionContext,
     repo: &Repository,
     spec: &RepoRestoreSpec,
     key: &str,
@@ -1079,7 +1069,7 @@ pub(super) fn restore_repo_directory(
 
 pub(super) fn restore_repo_keys(
     runtime: &Runtime,
-    file: &mut VolFile,
+    file: &mut RepositorySessionContext,
     repo: &Repository,
     spec: &RepoRestoreSpec,
     keys: Vec<String>,
@@ -1194,7 +1184,7 @@ pub(super) fn plan_restore_repo_keys(
                     &head_artifacts,
                 )
             {
-                return Err(ErrCtx::PragmaErr(
+                return Err(ErrCtx::InvalidCommand(
                     format!("path `{key}` is not tracked").into(),
                 ));
             }
@@ -1242,7 +1232,7 @@ pub(super) fn can_plan_restore_deletion(
 
 pub(super) fn preflight_restore_repo_keys(
     runtime: &Runtime,
-    file: &VolFile,
+    file: &RepositorySessionContext,
     repo: &Repository,
     plan: &[RepoRestoreKeyPlan],
 ) -> Result<(), ErrCtx> {
@@ -1335,7 +1325,7 @@ pub(super) fn preflight_restore_repo_key_path(
 }
 
 pub(super) fn ensure_restore_keys_preserve_untracked_paths(
-    file: &VolFile,
+    file: &RepositorySessionContext,
     repo: &Repository,
     plan: &[RepoRestoreKeyPlan],
 ) -> Result<(), ErrCtx> {
@@ -1455,7 +1445,7 @@ pub(super) fn remove_empty_restore_directory(directory: &Path) -> Result<(), Err
 
 pub(super) fn apply_restored_repo_key(
     runtime: &Runtime,
-    file: &mut VolFile,
+    file: &mut RepositorySessionContext,
     repo: &Repository,
     key: &str,
     restored: Option<&RestoredRepoPathState>,
@@ -1487,7 +1477,7 @@ pub(super) fn apply_restored_repo_key(
 
 pub(super) fn restore_repo_key(
     runtime: &Runtime,
-    file: &mut VolFile,
+    file: &mut RepositorySessionContext,
     repo: &Repository,
     spec: &RepoRestoreSpec,
     key: &str,
@@ -1535,7 +1525,7 @@ pub(super) fn restore_repo_key(
             repo.index_has_key(key)?
         };
         if !can_restore_deletion {
-            return Err(ErrCtx::PragmaErr(
+            return Err(ErrCtx::InvalidCommand(
                 format!("path `{key}` is not tracked").into(),
             ));
         }
@@ -1726,7 +1716,7 @@ pub(super) fn format_repo_path_list(count: usize, paths: Vec<String>) -> String 
 
 pub(super) fn export_repo_path(
     runtime: &Runtime,
-    file: &VolFile,
+    file: &RepositorySessionContext,
     repo: &Repository,
     spec: &RepoExportSpec,
 ) -> Result<String, ErrCtx> {
@@ -1759,7 +1749,7 @@ pub(super) fn export_repo_path(
         return Ok(key);
     }
 
-    Err(ErrCtx::PragmaErr(
+    Err(ErrCtx::InvalidCommand(
         format!(
             "worktree database `{key}` does not exist; pass --source to export a repository revision"
         )
@@ -1769,7 +1759,7 @@ pub(super) fn export_repo_path(
 
 pub(super) fn update_worktree_state_after_index_restore_key(
     runtime: &Runtime,
-    file: &VolFile,
+    file: &RepositorySessionContext,
     repo: &Repository,
     key: &str,
 ) -> Result<(), ErrCtx> {
@@ -1823,7 +1813,7 @@ pub(super) fn update_restored_worktree_state_key(
 
 pub(super) fn checkout_repo_file_state(
     runtime: &Runtime,
-    file: &mut VolFile,
+    file: &mut RepositorySessionContext,
     state: &CommitFileState,
     remote: Option<Arc<Remote>>,
 ) -> Result<(), ErrCtx> {
@@ -1846,7 +1836,7 @@ pub(super) fn checkout_repo_file_state_to_path(
     if let Ok(metadata) = std::fs::symlink_metadata(&path)
         && !metadata.file_type().is_file()
     {
-        return Err(ErrCtx::PragmaErr(
+        return Err(ErrCtx::InvalidCommand(
             format!(
                 "path `{}` is not a regular SQLite database file",
                 path.display()
@@ -1871,7 +1861,7 @@ pub(super) fn checkout_repo_file_state_to_key(
     if let Ok(metadata) = std::fs::symlink_metadata(&path)
         && !metadata.file_type().is_file()
     {
-        return Err(ErrCtx::PragmaErr(
+        return Err(ErrCtx::InvalidCommand(
             format!(
                 "path `{}` is not a regular SQLite database file",
                 path.display()
@@ -1896,7 +1886,7 @@ pub(super) fn checkout_repo_file_state_to_prepared_key(
     if let Ok(metadata) = std::fs::symlink_metadata(&path)
         && !metadata.file_type().is_file()
     {
-        return Err(ErrCtx::PragmaErr(
+        return Err(ErrCtx::InvalidCommand(
             format!(
                 "path `{}` is not a regular SQLite database file",
                 path.display()
@@ -1977,7 +1967,7 @@ fn write_sqlite_file_to_path_inner(
     if let Ok(metadata) = std::fs::symlink_metadata(path)
         && !metadata.file_type().is_file()
     {
-        return Err(ErrCtx::PragmaErr(
+        return Err(ErrCtx::InvalidCommand(
             format!(
                 "path `{}` is not a regular SQLite database file",
                 path.display()
@@ -2029,7 +2019,7 @@ fn write_sqlite_file_to_path_inner(
         }
     }
 
-    Err(ErrCtx::PragmaErr(
+    Err(ErrCtx::InvalidCommand(
         format!(
             "could not create temporary checkout file for `{}`",
             path.display()
@@ -2069,7 +2059,7 @@ fn replace_prepared_sqlite_file(
 
         if let Err(replace_error) = std::fs::rename(temporary, destination) {
             if let Err(restore_error) = std::fs::rename(&backup, destination) {
-                return Err(ErrCtx::PragmaErr(
+                return Err(ErrCtx::InvalidCommand(
                     format!(
                         "failed to replace SQLite database `{}`: {replace_error}; \
                          failed to restore the original database: {restore_error}",
@@ -2125,7 +2115,7 @@ fn write_repo_file_state_to_prepared_path(
 
 pub(super) fn checkout_merge_outcome(
     runtime: &Runtime,
-    file: &mut VolFile,
+    file: &mut RepositorySessionContext,
     repo: &Repository,
     outcome: &MergeOutcome,
     fast_forward_plan: Option<&CheckoutPlan>,
@@ -2175,7 +2165,7 @@ pub(super) fn checkout_merge_outcome(
 
 fn checkout_merged_repo_paths(
     runtime: &Runtime,
-    file: &mut VolFile,
+    file: &mut RepositorySessionContext,
     repo: &Repository,
     staged: &[String],
     previous_files: &BTreeMap<String, CommitFileState>,

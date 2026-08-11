@@ -54,11 +54,6 @@ export const sidebar = [
         slug: "docs/quickstart/cli",
       },
       {
-        label: "SQLite Extension",
-        translations: { "zh-CN": "SQLite 扩展" },
-        slug: "docs/quickstart/sqlite-extension",
-      },
-      {
         label: "App-State Walkthrough",
         translations: { "zh-CN": "应用状态演练" },
         slug: "docs/quickstart/app-state-walkthrough",
@@ -164,11 +159,6 @@ export const sidebar = [
     collapsed: true,
     items: [
       { label: "CLI", slug: "docs/reference/cli" },
-      {
-        label: "VFS PRAGMAs",
-        translations: { "zh-CN": "VFS PRAGMA" },
-        slug: "docs/reference/pragmas",
-      },
       {
         label: "JSON Output",
         translations: { "zh-CN": "JSON 输出" },

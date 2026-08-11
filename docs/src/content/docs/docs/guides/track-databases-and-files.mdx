@@ -143,6 +143,3 @@ graft add data.sqlite
 manual checkpointing is unnecessary. It compares the consistent snapshot with
 the staged or committed base and writes only changed 4 KiB Graft storage
 chunks, independently of the physical database's SQLite page size.
-
-The optional `vfs=graft` mode advances live Graft Volume pages directly. Do not
-mix normal-file writes and Graft-VFS writes for the same logical database.

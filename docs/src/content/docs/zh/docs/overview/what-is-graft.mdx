@@ -82,5 +82,5 @@ graft commit -m "seed notes"
 应用可以调用带 `--json` 的 CLI，直接消费结构化 status、diff、conflict 和 sync
 结果。SQLite 仍是普通物理 worktree 文件，现有数据库 library 不需要自定义 VFS。
 
-SQLite extension 是可选项：它为明确需要 live page storage 的应用提供 Graft VFS，
-以及 version 和低层 debug PRAGMA。repository 操作仍然属于 CLI control plane。
+需要常驻进程内边界的应用可以使用 Node.js 与 Electron SDK。它提供相同的
+repository 操作，不必为每条命令启动新的 CLI 进程。

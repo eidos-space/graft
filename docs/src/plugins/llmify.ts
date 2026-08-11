@@ -19,7 +19,7 @@ application state that can be inspected, restored, branched, merged, and synced.
 
 - **App-state commits**: SQLite databases, text files, binary files, and external payloads can live in one repository tree.
 - **Git-like workflows**: status, add, commit, branch, switch, diff, restore, merge, fetch, pull, push, and clone.
-- **SQLite integration**: use ordinary SQLite worktree files by default, with an optional Graft VFS for live page storage.
+- **SQLite integration**: use ordinary SQLite worktree files with consistent snapshot staging and materialization.
 - **Row-aware review**: supported SQLite changes can be shown as row and schema diffs instead of opaque file changes.
 - **Application UI support**: JSON output describes status, diffs, conflicts, payloads, config, and sync state.
 - **Remote sync**: use filesystem, S3-compatible, or Graft HTTP remotes.

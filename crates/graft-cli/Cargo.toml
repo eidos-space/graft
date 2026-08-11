@@ -1,5 +1,5 @@
 [package]
-name = "graft-tool"
+name = "graft-cli"
 version = "0.13.0"
 edition = "2024"
 authors = { workspace = true }

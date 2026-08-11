@@ -774,25 +774,6 @@ pub(super) struct RepoResolveConflictOutcome {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(super) struct JsonVolumeListEntry {
-    pub(super) id: String,
-    pub(super) local: String,
-    pub(super) remote: String,
-    pub(super) status: String,
-    pub(super) current: bool,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub(super) struct JsonVolumeAudit {
-    pub(super) local_pages: usize,
-    pub(super) total_pages: usize,
-    pub(super) percentage: f64,
-    pub(super) needs_hydrate: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) checksum: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
 pub(super) struct JsonRepoArtifactAudit {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) current_head: Option<String>,

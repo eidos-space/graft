@@ -1,12 +1,12 @@
 import { expect, test, type Page } from "@playwright/test";
 import { readFileSync } from "node:fs";
 
-const graftToolManifest = readFileSync(
-  new URL("../../../crates/graft-tool/Cargo.toml", import.meta.url),
+const graftCliManifest = readFileSync(
+  new URL("../../../crates/graft-cli/Cargo.toml", import.meta.url),
   "utf8",
 );
-const graftVersion = graftToolManifest.match(/^version = "([^"]+)"$/m)?.[1];
-if (!graftVersion) throw new Error("Could not read the graft-tool version");
+const graftVersion = graftCliManifest.match(/^version = "([^"]+)"$/m)?.[1];
+if (!graftVersion) throw new Error("Could not read the graft-cli version");
 
 interface CommandResult {
   code: number;

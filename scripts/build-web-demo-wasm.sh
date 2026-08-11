@@ -33,15 +33,15 @@ export RUSTFLAGS="-C opt-level=1 \
 -C link-arg=-sALLOW_MEMORY_GROWTH=1"
 
 cd "$repo_dir"
-cargo build -p graft-tool --target wasm32-unknown-emscripten --release
+cargo build -p graft-cli --target wasm32-unknown-emscripten --release
 
 mkdir -p web-demo/public/wasm
 cp target/wasm32-unknown-emscripten/release/graft.js web-demo/public/wasm/graft.js
 cp target/wasm32-unknown-emscripten/release/graft.wasm web-demo/public/wasm/graft.wasm
 
-graft_version="$(sed -nE 's/^version = "([^"]+)"/\1/p' crates/graft-tool/Cargo.toml | head -1)"
+graft_version="$(sed -nE 's/^version = "([^"]+)"/\1/p' crates/graft-cli/Cargo.toml | head -1)"
 if [[ -z "$graft_version" ]]; then
-  echo "Could not determine graft-tool version." >&2
+  echo "Could not determine graft-cli version." >&2
   exit 1
 fi
 if command -v sha256sum >/dev/null 2>&1; then

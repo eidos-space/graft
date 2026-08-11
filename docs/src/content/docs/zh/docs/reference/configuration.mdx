@@ -127,11 +127,7 @@ repository state，不替换实时 worktree 文件。
 
 这提供项目隔离。两个目录都可以包含 `data.sqlite`，但它们不会共享 storage、refs、branches、remotes、index state 或 materialized worktree files。
 
-## Loader Defaults
-
-动态 SQLite 扩展仍然可以有进程级默认值，用于测试和诊断。这些默认值不是 repository state。
-
-普通仓库模式中：
+Repository mode 中：
 
 - 不依赖环境变量识别项目身份
 - 不使用用户级配置保存 refs 或 remotes

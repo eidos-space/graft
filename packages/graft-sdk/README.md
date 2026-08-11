@@ -503,7 +503,7 @@ legacy environment-backed behavior as a compatibility path; that policy is not u
 Build the release CLI and addon, then run:
 
 ```sh
-cargo build --release -p graft-tool
+cargo build --release -p graft-cli
 pnpm --dir packages/graft-sdk bench
 pnpm --dir packages/graft-sdk bench:large
 ```

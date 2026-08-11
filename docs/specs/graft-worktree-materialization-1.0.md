@@ -516,7 +516,7 @@ Current repository evidence includes:
 - `crates/graft-sdk/src/lib.rs` materialization classification tests;
 - `packages/graft-sdk/test/repository-session.test.js` ABI/gate, open-handle,
   restore, staging, and identity tests;
-- `crates/graft-tool/src/main.rs` CLI commit, switch, clone, and physical-file
+- `crates/graft-cli/src/main.rs` CLI commit, switch, clone, and physical-file
   tests;
 - `crates/graft-sqlite/src/pragma/sqlite_worktree.rs` WAL, replacement guard,
   sidecar, and physical snapshot tests;

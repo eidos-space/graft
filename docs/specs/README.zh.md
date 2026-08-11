@@ -22,16 +22,14 @@ adapter 只映射行为，不重新定义行为。
 | Merge 与冲突恢复 | [Graft Merge 1.0](./graft-merge-1.0.md) | [中文](./graft-merge-1.0.zh.md) | repository merge + SQLite row merge |
 | Remote 与同步 | [Graft Remote Sync 1.0](./graft-remote-sync-1.0.md) | [中文](./graft-remote-sync-1.0.zh.md) | repository sync + remote protocol |
 | Runtime、CLI 与 SDK adapter | [Graft Runtime and Adapters 1.0](./graft-runtime-adapters-1.0.md) | [中文](./graft-runtime-adapters-1.0.zh.md) | command service + SDK adapter |
-| SQLite extension 与 VFS | [Graft SQLite Integration 1.0](./graft-sqlite-integration-1.0.md) | [中文](./graft-sqlite-integration-1.0.zh.md) | `graft-sqlite` + `graft-ext` |
 | 物理 worktree 投影 | [Graft Worktree Materialization 1.0](./graft-worktree-materialization-1.0.md) | [中文](./graft-worktree-materialization-1.0.zh.md) | SQLite worktree adapter |
 
 ## 阅读顺序
 
 Repository 规格定义 identity、object、ref 与 index；Storage 规格定义 SQLite
 snapshot object 引用的 page/log 基础；Diff 与 Merge 消费两者；Remote Sync
-传输 immutable 与 mutable state；Runtime/Adapter 将操作暴露给 host。SQLite
-Integration 与 Worktree Materialization 是两种不同投影：前者通过 VFS 提供实时
-SQLite I/O，后者在物理 worktree 中创建或替换普通文件。
+传输 immutable 与 mutable state；Runtime/Adapter 将操作暴露给 host；Worktree
+Materialization 在物理 worktree 中创建或替换普通 SQLite 文件。
 
 ```text
 Repository objects / refs / index
@@ -115,7 +113,6 @@ release claim。
 | Merge | core merge 与 SQLite row merge/output | topology/conflict/resolution/reopen/browser fixture |
 | Remote | repository sync、remote/runtime action、`packages/graft-remote` | Rust 与 framework/Hono/Cloudflare protocol test |
 | Runtime/Adapter | command service、Rust/Node SDK、web worker | lifecycle/cache/cancel/error/contract/Playwright |
-| SQLite Integration | VFS/VolFile/PRAGMA 与 `graft-ext` | lock/import/error/PRAGMA/dynamic/static test |
 | Materialization | checkout/snapshot/merge worktree path | WAL/replacement/recovery/gate integration test |
 
 表格是证据导航，不按文件划分职责；跨多个 crate 的行为仍只有前文列出的单一

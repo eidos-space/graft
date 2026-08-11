@@ -6,8 +6,7 @@ description: 创建 Graft 仓库、提交 SQLite 数据和文件、查看行级 
 import { Aside, Steps } from "@astrojs/starlight/components";
 
 CLI 是试用 Graft 的最短路径。`graft sql` 打开普通物理 SQLite worktree 文件；
-repository command 直接调用 Graft control-plane service，不经过 SQLite extension
-或 repository PRAGMA。
+repository command 直接调用 Graft 的 typed service。
 
 <Aside type="tip" title="想要零安装体验？">
   先打开 [Playground 导览](/zh/docs/quickstart/playground/)。它会在浏览器 OPFS
