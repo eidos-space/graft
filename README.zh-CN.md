@@ -160,7 +160,6 @@ graft commit -m "Import SQLite transaction"
 | [CLI](https://graft.eidos.space/zh/docs/quickstart/cli/) | 评估 Graft、编写脚本或执行一次性命令 |
 | CLI + [JSON 输出](https://graft.eidos.space/zh/docs/reference/json-output/) | 应用或 agent 需要结构化的状态、diff、历史、冲突或同步结果 |
 | [Node.js/Electron SDK](https://graft.eidos.space/zh/docs/guides/node-electron-sdk/) | Node.js 或 Electron 应用需要长驻的进程内仓库会话 |
-| [SQLite 扩展](https://graft.eidos.space/zh/docs/quickstart/sqlite-extension/) | 应用希望通过 `vfs=graft` 直接存储实时 SQLite 页面 |
 | [远程服务组件](https://graft.eidos.space/zh/docs/guides/http-remote/) | 希望托管 Graft HTTP 远程协议 |
 
 安装 Node.js/Electron 常驻 SDK：
@@ -210,8 +209,8 @@ Bearer token 从环境变量读取，不会保存在远程 URL 中。详细说�
 ## 项目状态
 
 Graft 目前仍是实验性项目。CLI、仓库配置、JSON 输出、Node.js/Electron SDK
-和远程服务协议是预期对外使用的集成界面。存储布局、对象序列化、调试 PRAGMA
-和内部 Rust 模块边界属于实现细节，未来可能发生变化。
+和远程服务协议是预期对外使用的集成界面。存储布局、对象序列化和内部 Rust
+模块边界属于实现细节，未来可能发生变化。
 
 ## 文档
 

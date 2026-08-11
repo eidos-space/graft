@@ -243,7 +243,7 @@ GRAFT_REAL_EIDOS_SOURCE=/absolute/path/to/Untitled.eidos \
 Run the deterministic paired core benchmark with two release binaries:
 
 ```sh
-cargo build --release --locked -p graft-tool -p graft-bench
+cargo build --release --locked -p graft-cli -p graft-bench
 ./target/release/graft-bench run-paired \
   --baseline-graft-bin /path/to/0.3.4/graft \
   --candidate-graft-bin ./target/release/graft \

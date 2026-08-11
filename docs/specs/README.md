@@ -25,7 +25,6 @@ or implementation techniques that have no observable effect.
 | Merge and conflict recovery | [Graft Merge 1.0](./graft-merge-1.0.md) | [中文](./graft-merge-1.0.zh.md) | repository merge + SQLite row merge |
 | Remotes and synchronization | [Graft Remote Sync 1.0](./graft-remote-sync-1.0.md) | [中文](./graft-remote-sync-1.0.zh.md) | repository sync + remote protocol |
 | Runtime, CLI, and SDK adapters | [Graft Runtime and Adapters 1.0](./graft-runtime-adapters-1.0.md) | [中文](./graft-runtime-adapters-1.0.zh.md) | command service + SDK adapters |
-| SQLite extension and VFS | [Graft SQLite Integration 1.0](./graft-sqlite-integration-1.0.md) | [中文](./graft-sqlite-integration-1.0.zh.md) | `graft-sqlite` + `graft-ext` |
 | Physical worktree projection | [Graft Worktree Materialization 1.0](./graft-worktree-materialization-1.0.md) | [中文](./graft-worktree-materialization-1.0.zh.md) | SQLite worktree adapter |
 
 ## Reading order
@@ -34,9 +33,8 @@ The repository specification defines identity, objects, refs, and index state.
 The storage specification defines the page/log substrate referenced by SQLite
 snapshot objects. Diff and merge consume both models. Remote sync transports
 their immutable and mutable state. Runtime/adapters expose those operations to
-hosts. SQLite integration and worktree materialization are two different host
-projections: the former serves live SQLite I/O through a VFS; the latter
-creates or replaces ordinary files in a physical worktree.
+hosts. Worktree materialization creates or replaces ordinary SQLite files in a
+physical worktree.
 
 ```text
 Repository objects / refs / index
@@ -134,7 +132,6 @@ conformance targets rather than release claims.
 | Merge | `crates/graft/src/repo/merge.rs`, `graft-sqlite` row merge/output | core topology, SQLite conflict/resolution, reopen and browser fixture tests |
 | Remote Sync | repository sync, remote/runtime actions, `packages/graft-remote` | Rust remote tests plus framework/Hono/Cloudflare protocol tests |
 | Runtime and Adapters | command service, Rust SDK, Node addon/package, `web-demo` worker | lifecycle/cache/cancel/error/contract tests and Playwright WASM tests |
-| SQLite Integration | `graft-sqlite` VFS/VolFile/PRAGMA and `graft-ext` | VFS lock/import/error, PRAGMA, dynamic/static extension tests |
 | Materialization | `graft-sqlite` checkout/snapshot/merge worktree paths | WAL/replacement/recovery/operation-gate integration tests |
 
 The tables identify evidence, not ownership by filename. A behavior spanning

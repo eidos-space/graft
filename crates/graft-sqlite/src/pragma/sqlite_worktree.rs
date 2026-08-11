@@ -222,12 +222,12 @@ impl SqlitePageHashCache {
         debug_assert!(metadata.len() <= MAX_PAGE_OWNERSHIP_CACHE_BYTES);
         let persisted: PersistedSqlitePageOwnership = serde_json::from_slice(&std::fs::read(path)?)
             .map_err(|error| {
-                ErrCtx::PragmaErr(
+                ErrCtx::InvalidCommand(
                     format!("failed to decode persisted SQLite page ownership: {error}").into(),
                 )
             })?;
         let payload_bytes = serde_json::to_vec(&persisted.payload).map_err(|error| {
-            ErrCtx::PragmaErr(
+            ErrCtx::InvalidCommand(
                 format!("failed to verify persisted SQLite page ownership: {error}").into(),
             )
         })?;
@@ -255,12 +255,12 @@ impl SqlitePageHashCache {
         debug_assert!(metadata.len() <= MAX_PERSISTED_DIFF_PROBE_BYTES);
         let persisted: PersistedWorktreeDiffProbe = serde_json::from_slice(&std::fs::read(path)?)
             .map_err(|error| {
-            ErrCtx::PragmaErr(
+            ErrCtx::InvalidCommand(
                 format!("failed to decode persisted SQLite worktree probe: {error}").into(),
             )
         })?;
         let payload_bytes = serde_json::to_vec(&persisted.payload).map_err(|error| {
-            ErrCtx::PragmaErr(
+            ErrCtx::InvalidCommand(
                 format!("failed to verify persisted SQLite worktree probe: {error}").into(),
             )
         })?;
@@ -286,7 +286,7 @@ impl SqlitePageHashCache {
             probe: probe.clone(),
         };
         let payload_bytes = serde_json::to_vec(&payload).map_err(|error| {
-            ErrCtx::PragmaErr(
+            ErrCtx::InvalidCommand(
                 format!("failed to encode persisted SQLite worktree probe: {error}").into(),
             )
         })?;
@@ -295,7 +295,7 @@ impl SqlitePageHashCache {
             checksum: blake3::hash(&payload_bytes).to_hex().to_string(),
         };
         let bytes = serde_json::to_vec(&persisted).map_err(|error| {
-            ErrCtx::PragmaErr(
+            ErrCtx::InvalidCommand(
                 format!("failed to encode persisted SQLite worktree probe: {error}").into(),
             )
         })?;
@@ -314,7 +314,7 @@ impl SqlitePageHashCache {
             index,
         };
         let payload_bytes = serde_json::to_vec(&payload).map_err(|error| {
-            ErrCtx::PragmaErr(
+            ErrCtx::InvalidCommand(
                 format!("failed to encode persisted SQLite page ownership: {error}").into(),
             )
         })?;
@@ -323,7 +323,7 @@ impl SqlitePageHashCache {
             checksum: blake3::hash(&payload_bytes).to_hex().to_string(),
         };
         let bytes = serde_json::to_vec(&persisted).map_err(|error| {
-            ErrCtx::PragmaErr(
+            ErrCtx::InvalidCommand(
                 format!("failed to encode persisted SQLite page ownership: {error}").into(),
             )
         })?;
@@ -486,13 +486,13 @@ fn write_atomic_cache_file(
 
 fn sqlite_page_index_state_hash(state: &CommitFileState) -> Result<blake3::Hash, ErrCtx> {
     let encoded = serde_json::to_vec(state).map_err(|error| {
-        ErrCtx::PragmaErr(format!("failed to encode SQLite page-index state: {error}").into())
+        ErrCtx::InvalidCommand(format!("failed to encode SQLite page-index state: {error}").into())
     })?;
     Ok(blake3::hash(&encoded))
 }
 
 fn page_hash_cache_size_error() -> ErrCtx {
-    ErrCtx::PragmaErr("SQLite page-index size exceeds supported limits".into())
+    ErrCtx::InvalidCommand("SQLite page-index size exceeds supported limits".into())
 }
 
 fn write_page_hash_cache_bytes(
@@ -550,12 +550,11 @@ fn page_hash_chunk_count(page_count: usize) -> usize {
     page_count.div_ceil(PAGE_HASH_CHUNK_PAGES)
 }
 
-/// Hashes SQLite pages using the same content semantics as the Graft VFS.
+/// Hash `SQLite` pages using stable database-content semantics.
 ///
-/// SQLite's online backup rewrites the file change counter and version-valid-for number on page
-/// 1. They are cache invalidation hints rather than database content, and the Graft VFS already
-/// ignores writes that only touch these fields. Excluding them here keeps page indexes portable
-/// between raw rollback-journal snapshots and online-backup snapshots.
+/// `SQLite`'s online backup rewrites two cache-invalidation counters on page 1. They are not
+/// database content, so excluding them keeps page indexes portable between rollback-journal and
+/// online-backup snapshots.
 fn sqlite_page_chunk_hash(first_page: u32, bytes: &[u8]) -> blake3::Hash {
     if first_page != 1 {
         return blake3::hash(bytes);
@@ -712,7 +711,7 @@ impl PhysicalSqliteReader {
 
         let page_size = PAGESIZE.as_usize();
         if metadata.len() % page_size as u64 != 0 {
-            return Err(ErrCtx::PragmaErr(
+            return Err(ErrCtx::InvalidCommand(
                 format!(
                     "SQLite database `{}` is not an even multiple of {page_size} bytes",
                     path.display()
@@ -723,7 +722,7 @@ impl PhysicalSqliteReader {
 
         let page_count = metadata.len() / page_size as u64;
         let page_count = u32::try_from(page_count).map_err(|_| {
-            ErrCtx::PragmaErr(
+            ErrCtx::InvalidCommand(
                 format!("SQLite database `{}` has too many pages", path.display()).into(),
             )
         })?;
@@ -804,7 +803,7 @@ impl PhysicalSqliteReader {
                 graft::repo::cancellation_checkpoint()?;
             }
             let pageidx = PageIdx::try_from(page_number).map_err(|error| {
-                ErrCtx::PragmaErr(
+                ErrCtx::InvalidCommand(
                     format!("invalid SQLite page index {page_number}: {error}").into(),
                 )
             })?;
@@ -959,7 +958,9 @@ impl PhysicalSqliteReader {
         for page_number in 1..=self.page_count().to_u32() {
             graft::repo::cancellation_checkpoint()?;
             let pageidx = PageIdx::try_from(page_number).map_err(|err| {
-                ErrCtx::PragmaErr(format!("invalid SQLite page index {page_number}: {err}").into())
+                ErrCtx::InvalidCommand(
+                    format!("invalid SQLite page index {page_number}: {err}").into(),
+                )
             })?;
             if !sqlite_page_bytes_equal(
                 page_number,
@@ -1047,7 +1048,7 @@ impl PhysicalSqliteReader {
             {
                 let page_number = first_page + page_offset as u32;
                 let pageidx = PageIdx::try_from(page_number).map_err(|error| {
-                    ErrCtx::PragmaErr(
+                    ErrCtx::InvalidCommand(
                         format!("invalid SQLite page index {page_number}: {error}").into(),
                     )
                 })?;
@@ -1163,7 +1164,7 @@ fn sqlite_freelist_pages(reader: &dyn VolumeRead) -> Result<Option<BTreeSet<u32>
         return Ok(Some(BTreeSet::new()));
     }
     let header = reader.read_page(PageIdx::try_from(1_u32).map_err(|error| {
-        ErrCtx::PragmaErr(format!("invalid SQLite header page: {error}").into())
+        ErrCtx::InvalidCommand(format!("invalid SQLite header page: {error}").into())
     })?)?;
     let raw_page_size = u16::from_be_bytes([header.as_ref()[16], header.as_ref()[17]]);
     let page_size = if raw_page_size == 1 {
@@ -1185,7 +1186,9 @@ fn sqlite_freelist_pages(reader: &dyn VolumeRead) -> Result<Option<BTreeSet<u32>
             return Ok(None);
         }
         let page = reader.read_page(PageIdx::try_from(trunk_page).map_err(|error| {
-            ErrCtx::PragmaErr(format!("invalid SQLite freelist page {trunk_page}: {error}").into())
+            ErrCtx::InvalidCommand(
+                format!("invalid SQLite freelist page {trunk_page}: {error}").into(),
+            )
         })?)?;
         let leaf_count = sqlite_u32(page.as_ref(), 4) as usize;
         if leaf_count > (PAGESIZE.as_usize() - 8) / 4 {
@@ -1216,7 +1219,7 @@ fn sqlite_u32(bytes: &[u8], offset: usize) -> u32 {
 fn validate_sqlite_source(path: &Path) -> Result<(), ErrCtx> {
     let metadata = std::fs::symlink_metadata(path)?;
     if !metadata.file_type().is_file() {
-        return Err(ErrCtx::PragmaErr(
+        return Err(ErrCtx::InvalidCommand(
             format!(
                 "path `{}` is not a regular SQLite database file",
                 path.display()
@@ -1226,7 +1229,7 @@ fn validate_sqlite_source(path: &Path) -> Result<(), ErrCtx> {
     }
 
     if metadata.len() < 100 {
-        return Err(ErrCtx::PragmaErr(
+        return Err(ErrCtx::InvalidCommand(
             format!("path `{}` is not a SQLite database", path.display()).into(),
         ));
     }
@@ -1239,14 +1242,14 @@ fn validate_sqlite_source(path: &Path) -> Result<(), ErrCtx> {
 
 fn validate_sqlite_header(path: &Path, header: &[u8; 100]) -> Result<(), ErrCtx> {
     if &header[..SQLITE_DATABASE_MAGIC.len()] != SQLITE_DATABASE_MAGIC {
-        return Err(ErrCtx::PragmaErr(
+        return Err(ErrCtx::InvalidCommand(
             format!("path `{}` is not a SQLite database", path.display()).into(),
         ));
     }
 
     let sqlite_page_size = sqlite_page_size_from_header(header);
     if !(512..=65_536).contains(&sqlite_page_size) || !sqlite_page_size.is_power_of_two() {
-        return Err(ErrCtx::PragmaErr(
+        return Err(ErrCtx::InvalidCommand(
             format!(
                 "SQLite database `{}` declares invalid page size {sqlite_page_size}",
                 path.display()
@@ -1288,7 +1291,7 @@ fn backup_sqlite_source(path: &Path, snapshot_path: &Path) -> Result<(), ErrCtx>
             rusqlite::backup::StepResult::More => continue,
             rusqlite::backup::StepResult::Busy | rusqlite::backup::StepResult::Locked => {
                 if Instant::now() >= deadline {
-                    return Err(ErrCtx::PragmaErr(
+                    return Err(ErrCtx::InvalidCommand(
                         format!(
                             "timed out waiting for a consistent SQLite snapshot of `{}`",
                             path.display()
@@ -1472,7 +1475,7 @@ pub(super) fn prepare_sqlite_path_for_replacement(
                 ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked
             ) =>
         {
-            return Err(ErrCtx::PragmaErr(
+            return Err(ErrCtx::InvalidCommand(
                 format!(
                     "cannot replace SQLite database `{}` while another transaction is active",
                     path.display()
@@ -1491,7 +1494,7 @@ pub(super) fn prepare_sqlite_path_for_replacement(
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })?;
         if busy != 0 || log_pages != checkpointed_pages {
-            return Err(ErrCtx::PragmaErr(
+            return Err(ErrCtx::InvalidCommand(
                 format!(
                     "cannot replace SQLite database `{}` while its WAL is in use",
                     path.display()
@@ -1502,7 +1505,7 @@ pub(super) fn prepare_sqlite_path_for_replacement(
         let normalized: String =
             connection.query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))?;
         if !normalized.eq_ignore_ascii_case("delete") {
-            return Err(ErrCtx::PragmaErr(
+            return Err(ErrCtx::InvalidCommand(
                 format!(
                     "could not detach WAL before replacing SQLite database `{}`",
                     path.display()
@@ -1519,7 +1522,7 @@ pub(super) fn prepare_sqlite_path_for_replacement(
                 ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked
             ) =>
         {
-            return Err(ErrCtx::PragmaErr(
+            return Err(ErrCtx::InvalidCommand(
                 format!(
                     "cannot replace SQLite database `{}` while another transaction is active",
                     path.display()
@@ -1557,7 +1560,7 @@ fn remove_sqlite_sidecars(path: &Path) -> Result<(), ErrCtx> {
         match std::fs::symlink_metadata(&sidecar) {
             Ok(metadata) if metadata.file_type().is_file() => std::fs::remove_file(sidecar)?,
             Ok(_) => {
-                return Err(ErrCtx::PragmaErr(
+                return Err(ErrCtx::InvalidCommand(
                     format!(
                         "SQLite sidecar `{}` is not a regular file",
                         sidecar.display()
@@ -1722,7 +1725,7 @@ fn import_sqlite_reader_state(
         for (page_offset, page_bytes) in chunk_bytes.chunks_exact(PAGESIZE.as_usize()).enumerate() {
             let page_number = first_page + page_offset as u32;
             let pageidx = PageIdx::try_from(page_number).map_err(|error| {
-                ErrCtx::PragmaErr(
+                ErrCtx::InvalidCommand(
                     format!("invalid SQLite page index in `{}`: {error}", path.display()).into(),
                 )
             })?;
@@ -1740,7 +1743,7 @@ fn import_sqlite_reader_state(
             changed_pages.insert(page_number);
             let target = ensure_import_target(runtime, base, &mut target)?;
             let page = Page::try_from(page_bytes).map_err(|error| {
-                ErrCtx::PragmaErr(
+                ErrCtx::InvalidCommand(
                     format!("invalid SQLite page in `{}`: {error}", path.display()).into(),
                 )
             })?;

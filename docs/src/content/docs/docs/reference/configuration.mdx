@@ -136,11 +136,7 @@ Repository-mode SQLite data is stored under:
 
 This makes project data isolated. Two directories can both contain `data.sqlite` without sharing storage, refs, branches, remotes, index state, or materialized worktree files.
 
-## Loader Defaults
-
-The dynamic SQLite extension can still have process-level defaults for tests and diagnostics. Those defaults are not repository state.
-
-In normal repository mode:
+In repository mode:
 
 - do not rely on environment variables for project identity
 - do not use user-wide config for refs or remotes

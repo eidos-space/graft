@@ -350,7 +350,7 @@ impl<'a> RepoSnapshotResolver<'a> {
                     };
                     self.resolve_snapshot_once(snapshot, RepoSnapshotResolveSource::Remote, Some(remote))
                     .map_err(|remote_err| {
-                        ErrCtx::PragmaErr(
+                        ErrCtx::InvalidCommand(
                             format!(
                                 "local snapshot hydrate failed: {local_err}; remote snapshot hydrate failed: {remote_err}"
                             )
@@ -386,7 +386,7 @@ impl<'a> RepoSnapshotResolver<'a> {
                     }
                     RepoSnapshotResolveSource::Remote => {
                         let Some(remote) = remote else {
-                            return Err(ErrCtx::PragmaErr(
+                            return Err(ErrCtx::InvalidCommand(
                                 "snapshot resolver remote source requires a remote".into(),
                             ));
                         };
@@ -448,7 +448,7 @@ pub(super) fn verify_repo_snapshot_commit_hashes(
         let mut expected_commits = range.commits.iter();
         for lsn in (range.start..=range.end).iter() {
             let Some(expected) = expected_commits.next() else {
-                return Err(ErrCtx::PragmaErr(
+                return Err(ErrCtx::InvalidCommand(
                     format!(
                         "snapshot references missing storage commit hash for {:?}/{}",
                         range.log, lsn
@@ -458,7 +458,7 @@ pub(super) fn verify_repo_snapshot_commit_hashes(
             };
             if expected.lsn != lsn {
                 if expected.lsn > lsn {
-                    return Err(ErrCtx::PragmaErr(
+                    return Err(ErrCtx::InvalidCommand(
                         format!(
                             "snapshot references missing storage commit hash for {:?}/{}",
                             range.log, lsn
@@ -466,7 +466,7 @@ pub(super) fn verify_repo_snapshot_commit_hashes(
                         .into(),
                     ));
                 }
-                return Err(ErrCtx::PragmaErr(
+                return Err(ErrCtx::InvalidCommand(
                     format!(
                         "snapshot storage commit hash out of order for {:?}: expected LSN {}, got {}",
                         range.log, lsn, expected.lsn
@@ -475,7 +475,7 @@ pub(super) fn verify_repo_snapshot_commit_hashes(
                 ));
             }
             let Some(actual) = repo_storage_commit_hash(runtime, &range.log, lsn)? else {
-                return Err(ErrCtx::PragmaErr(
+                return Err(ErrCtx::InvalidCommand(
                     format!(
                         "snapshot references missing storage commit {:?}/{}",
                         range.log, lsn
@@ -486,7 +486,7 @@ pub(super) fn verify_repo_snapshot_commit_hashes(
             if actual != expected.commit_hash {
                 match hash_policy {
                     SnapshotHashPolicy::Strict => {
-                        return Err(ErrCtx::PragmaErr(
+                        return Err(ErrCtx::InvalidCommand(
                             format!(
                                 "snapshot storage commit hash mismatch for {:?}/{}: expected {}, got {}",
                                 range.log, lsn, expected.commit_hash, actual
@@ -501,7 +501,7 @@ pub(super) fn verify_repo_snapshot_commit_hashes(
             }
         }
         if let Some(extra) = expected_commits.next() {
-            return Err(ErrCtx::PragmaErr(
+            return Err(ErrCtx::InvalidCommand(
                 format!(
                     "snapshot references extra storage commit hash for {:?}/{} outside {}..={}",
                     range.log, extra.lsn, range.start, range.end

@@ -106,6 +106,3 @@ graft add data.sqlite
 WAL frames，因此不需要手动 checkpoint。Graft 把快照与 staged/HEAD 基线按
 4 KiB Graft storage chunk 比较，只写入变化的 chunks；这个粒度与物理数据库的
 SQLite page size 无关。没有净变化时不会产生新的 storage commit。
-
-需要 live page-storage 的应用仍可显式使用 Graft VFS，但同一个数据库应选择一种
-写入路径，不要在普通文件模式和 VFS 模式之间混写。

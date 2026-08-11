@@ -13,8 +13,8 @@ graft status --json
 graft diff --json --rows HEAD~1 HEAD data.sqlite
 ```
 
-The SQLite extension does not expose repository JSON PRAGMAs. Embedded
-applications should invoke the CLI control plane and decode its JSON response.
+Embedded applications can invoke the CLI and decode its JSON response, or use
+the Node.js/Electron SDK for a resident in-process session.
 
 ## Repository Position
 

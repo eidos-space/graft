@@ -1,23 +1,16 @@
-pub mod workload;
-
 use std::{
-    ffi::CString,
     ops::{Deref, DerefMut},
     sync::{Arc, Once},
     thread::JoinHandle,
 };
 
-use graft::core::LogId;
 use graft::{
     local::fjall_storage::FjallStorage,
     remote::{Remote, RemoteConfig},
     rt::runtime::Runtime,
 };
-use graft_sqlite::vfs::GraftVfs;
 use graft_tracing::{SubscriberInitExt, TracingConsumer, setup_tracing_with_writer};
 use precept::dispatch::test::TestDispatch;
-use rusqlite::{Connection, ToSql};
-use sqlite_plugin::vfs::{RegisterOpts, register_static};
 use tokio::sync::Notify;
 use tracing_subscriber::fmt::TestWriter;
 
@@ -38,9 +31,6 @@ pub struct GraftTestRuntime {
     runtime: Runtime,
     remote: Arc<Remote>,
     shutdown_tx: Arc<tokio::sync::Notify>,
-
-    // this is set the first time a vfs is created for this test runtime
-    vfs_id: Option<CString>,
 }
 
 impl Deref for GraftTestRuntime {
@@ -82,13 +72,7 @@ impl GraftTestRuntime {
             .spawn(move || tokio_rt.block_on(async { shutdown_rx.notified().await }))
             .expect("failed to spawn backend thread");
 
-        GraftTestRuntime {
-            thread,
-            runtime,
-            remote,
-            shutdown_tx,
-            vfs_id: None,
-        }
+        GraftTestRuntime { thread, runtime, remote, shutdown_tx }
     }
 
     /// Spawn a new runtime connected to the same remote as this runtime
@@ -96,85 +80,8 @@ impl GraftTestRuntime {
         Self::with_remote(self.remote.clone())
     }
 
-    pub fn open_sqlite(&mut self, dbname: &str, remote: Option<LogId>) -> GraftSqliteConn {
-        let vfs_id = self.ensure_vfs();
-        let conn = Connection::open(format!("file:{dbname}?vfs={vfs_id}")).unwrap();
-        let conn = GraftSqliteConn { conn };
-        if let Some(remote) = remote {
-            conn.graft_pragma_arg("debug_volume_clone", remote.serialize())
-                .unwrap();
-        }
-        conn
-    }
-
     pub fn shutdown(self) -> std::thread::Result<()> {
         self.shutdown_tx.notify_one();
         self.thread.join()
-    }
-
-    /// Ensures the VFS is registered and returns its name.
-    pub fn ensure_vfs(&mut self) -> &str {
-        let vfs_id = self.vfs_id.get_or_insert_with(|| {
-            // generate a 16 byte random ascii CString
-            let vfs_id = {
-                let mut bytes = [0u8; 16];
-                for byte in bytes.iter_mut() {
-                    *byte = rand::random::<u8>() % 26 + b'a';
-                }
-                CString::new(bytes.to_vec()).unwrap()
-            };
-            register_static(
-                vfs_id.clone(),
-                GraftVfs::new_with_repository_pragmas_for_tests(self.runtime.clone()),
-                RegisterOpts { make_default: false },
-            )
-            .expect("failed to register vfs");
-            vfs_id
-        });
-        vfs_id.to_str().unwrap()
-    }
-}
-
-pub struct GraftSqliteConn {
-    conn: rusqlite::Connection,
-}
-
-impl Deref for GraftSqliteConn {
-    type Target = rusqlite::Connection;
-
-    fn deref(&self) -> &Self::Target {
-        &self.conn
-    }
-}
-
-impl DerefMut for GraftSqliteConn {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.conn
-    }
-}
-
-impl From<GraftSqliteConn> for rusqlite::Connection {
-    fn from(conn: GraftSqliteConn) -> rusqlite::Connection {
-        conn.conn
-    }
-}
-
-impl GraftSqliteConn {
-    pub fn graft_pragma(&self, suffix: &str) -> rusqlite::Result<()> {
-        let pragma = format!("graft_{suffix}");
-        self.pragma_query(None, &pragma, |row| {
-            let output: String = row.get(0).unwrap();
-            tracing::debug!("{pragma} output: {output}");
-            Ok(())
-        })
-    }
-
-    pub fn graft_pragma_arg<T: ToSql>(&self, suffix: &str, arg: T) -> rusqlite::Result<()> {
-        let pragma = format!("graft_{suffix}");
-        self.pragma(None, &pragma, arg, |row| {
-            let output: String = row.get(0).unwrap();
-            tracing::debug!("{pragma} output: {output}");
-            Ok(())
-        })
     }
 }

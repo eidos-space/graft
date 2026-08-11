@@ -19,8 +19,8 @@ The `ci` profile uses the same deterministic dataset on every run:
 Fixture creation and application mutations happen outside the timed regions.
 The measured operations are repository initialization, initial and incremental
 staging and commits, row-level diff, checkout/materialization, and a filesystem
-remote push. CLI process startup and VFS registration are intentionally included
-because they are part of the user-visible latency.
+remote push. CLI process startup is intentionally included because it is part
+of the user-visible latency.
 
 Checkout is measured in a second, identically generated local repository before
 any remote synchronization. This keeps the checkout fixture on a branch tip with

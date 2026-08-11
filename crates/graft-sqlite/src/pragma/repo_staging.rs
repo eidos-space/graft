@@ -11,7 +11,7 @@ struct RepoAddGuard {
 
 pub(super) fn run_repo_add(
     runtime: &Runtime,
-    file: &mut VolFile,
+    file: &mut RepositorySessionContext,
     spec: &RepoAddSpec,
 ) -> Result<Vec<graft::repo::index::IndexEntry>, ErrCtx> {
     if !file.is_idle() {
@@ -43,7 +43,7 @@ pub(super) fn run_repo_add(
 
 fn validate_repo_add_guard(
     runtime: &Runtime,
-    file: &VolFile,
+    file: &RepositorySessionContext,
     repo: &Repository,
     spec: &RepoAddSpec,
 ) -> Result<Option<RepoAddGuard>, ErrCtx> {
@@ -52,13 +52,13 @@ fn validate_repo_add_guard(
     };
     let current_head = repo.head_target()?;
     if current_head.as_ref() != expected_head.as_ref() {
-        return Err(ErrCtx::PragmaErr(ADD_EXPECTED_HEAD_MISMATCH.into()));
+        return Err(ErrCtx::InvalidCommand(ADD_EXPECTED_HEAD_MISMATCH.into()));
     }
 
     let path = spec
         .path
         .as_deref()
-        .ok_or_else(|| ErrCtx::PragmaErr("add --expected-head requires one path".into()))?;
+        .ok_or_else(|| ErrCtx::InvalidCommand("add --expected-head requires one path".into()))?;
     let path_str = path
         .to_str()
         .ok_or_else(|| graft::repo::RepoErr::NonUtf8Path(path.to_path_buf()))?;
@@ -75,10 +75,10 @@ fn validate_repo_add_guard(
         .filter(|change| repo_key_matches_filter(&change.path, &filter))
         .collect::<Vec<_>>();
     if changes.is_empty() {
-        return Err(ErrCtx::PragmaErr(ADD_PATH_NO_CHANGES.into()));
+        return Err(ErrCtx::InvalidCommand(ADD_PATH_NO_CHANGES.into()));
     }
     if changes.iter().any(|change| change.conflicted) {
-        return Err(ErrCtx::PragmaErr(ADD_PATH_CONFLICTED.into()));
+        return Err(ErrCtx::InvalidCommand(ADD_PATH_CONFLICTED.into()));
     }
     let already_staged = changes.iter().all(|change| {
         change.worktree_status == graft::repo::RepoStatusPathState::None
@@ -89,7 +89,7 @@ fn validate_repo_add_guard(
 
 fn validate_single_repo_add_path(
     runtime: &Runtime,
-    file: &VolFile,
+    file: &RepositorySessionContext,
     repo: &Repository,
     path: &Path,
     force: bool,
@@ -114,7 +114,7 @@ fn validate_single_repo_add_path(
         .iter()
         .any(|entry| entry.path == key && entry.stage != graft::repo::index::IndexStage::Normal)
     {
-        return Err(ErrCtx::PragmaErr(ADD_PATH_CONFLICTED.into()));
+        return Err(ErrCtx::InvalidCommand(ADD_PATH_CONFLICTED.into()));
     }
     let staged = index
         .stage0_entries()
@@ -162,7 +162,7 @@ fn validate_single_repo_add_path(
     } else if had_staged_entry {
         Ok(Some(true))
     } else {
-        Err(ErrCtx::PragmaErr(ADD_PATH_NO_CHANGES.into()))
+        Err(ErrCtx::InvalidCommand(ADD_PATH_NO_CHANGES.into()))
     }
 }
 
@@ -319,7 +319,7 @@ pub(super) fn staged_entry_kind_storage_and_change(
 
 pub(super) fn stage_repo_add_path(
     runtime: &Runtime,
-    file: &mut VolFile,
+    file: &mut RepositorySessionContext,
     repo: &Repository,
     path: &Path,
     force: bool,
@@ -425,7 +425,7 @@ pub(super) fn stage_repo_add_path(
     }
 
     if !metadata.is_file() {
-        return Err(ErrCtx::PragmaErr(
+        return Err(ErrCtx::InvalidCommand(
             format!(
                 "path `{}` is not a regular file or directory",
                 physical_path.display()
@@ -483,7 +483,7 @@ pub(super) fn stage_repo_add_topology_removals(
 
 pub(super) fn stage_repo_add_all(
     runtime: &Runtime,
-    file: &mut VolFile,
+    file: &mut RepositorySessionContext,
     repo: &Repository,
     kind: Option<RepoTrackedPathKind>,
 ) -> Result<Vec<graft::repo::index::IndexEntry>, ErrCtx> {
@@ -498,7 +498,7 @@ pub(super) fn stage_repo_add_all(
 
 pub(super) fn stage_repo_add_changes(
     runtime: &Runtime,
-    file: &mut VolFile,
+    file: &mut RepositorySessionContext,
     repo: &Repository,
     changes: Vec<graft::repo::RepoWorktreeChange>,
 ) -> Result<Vec<graft::repo::index::IndexEntry>, ErrCtx> {
@@ -574,7 +574,7 @@ pub(super) fn stage_repo_add_deletion(
 
 pub(super) fn stage_repo_add_file(
     runtime: &Runtime,
-    file: &VolFile,
+    file: &RepositorySessionContext,
     repo: &Repository,
     current_key: &str,
     key: &str,
@@ -615,7 +615,7 @@ fn preserve_repo_volume_binding(
 
 pub(super) fn prepare_repo_add_file(
     runtime: &Runtime,
-    file: &VolFile,
+    file: &RepositorySessionContext,
     repo: &Repository,
     current_key: &str,
     key: &str,
@@ -696,7 +696,7 @@ pub(super) fn collect_repo_add_directory_files(
 
 pub(super) fn ignored_add_path_error<T>(repo: &Repository, path: &Path) -> Result<T, ErrCtx> {
     let key = repo.file_key(path)?;
-    Err(ErrCtx::PragmaErr(
+    Err(ErrCtx::InvalidCommand(
         format!("path `{key}` is ignored; use `--force` to add it").into(),
     ))
 }
@@ -717,7 +717,7 @@ pub(super) fn format_added_entries(entries: &[graft::repo::index::IndexEntry]) -
 
 pub(super) fn run_repo_remove(
     runtime: &Runtime,
-    file: &mut VolFile,
+    file: &mut RepositorySessionContext,
     spec: &RepoRemoveSpec,
 ) -> Result<Vec<JsonPathAction>, ErrCtx> {
     if !file.is_idle() {
@@ -740,7 +740,7 @@ pub(super) fn run_repo_remove(
 
 pub(super) fn stage_repo_remove_path(
     runtime: &Runtime,
-    file: &mut VolFile,
+    file: &mut RepositorySessionContext,
     repo: &Repository,
     path: &Path,
     cached: bool,
@@ -768,7 +768,7 @@ pub(super) fn stage_repo_remove_path(
                 runtime, file, repo, &key, cached,
             )?])
         }
-        Ok(_) => Err(ErrCtx::PragmaErr(
+        Ok(_) => Err(ErrCtx::InvalidCommand(
             format!(
                 "path `{}` is not a regular file or directory",
                 physical_path.display()
@@ -787,7 +787,7 @@ pub(super) fn stage_repo_remove_path(
 
 pub(super) fn stage_repo_remove_directory(
     runtime: &Runtime,
-    file: &mut VolFile,
+    file: &mut RepositorySessionContext,
     repo: &Repository,
     directory_key: &str,
     cached: bool,
@@ -847,7 +847,7 @@ pub(super) fn repo_directory_key(repo: &Repository, path: &Path) -> Result<Strin
 
 pub(super) fn stage_repo_remove_key(
     runtime: &Runtime,
-    file: &mut VolFile,
+    file: &mut RepositorySessionContext,
     repo: &Repository,
     key: &str,
     cached: bool,
@@ -1006,7 +1006,7 @@ pub(super) fn remove_physical_sqlite_file(
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => {
             if !metadata.file_type().is_file() {
-                return Err(ErrCtx::PragmaErr(
+                return Err(ErrCtx::InvalidCommand(
                     format!(
                         "path `{}` is not a regular SQLite database file",
                         path.display()
@@ -1029,7 +1029,7 @@ pub(super) fn remove_physical_artifact_file(path: &Path) -> Result<(), ErrCtx> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => {
             if !metadata.file_type().is_file() {
-                return Err(ErrCtx::PragmaErr(
+                return Err(ErrCtx::InvalidCommand(
                     format!("path `{}` is not a regular file", path.display()).into(),
                 ));
             }

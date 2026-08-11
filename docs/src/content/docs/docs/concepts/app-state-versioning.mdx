@@ -106,5 +106,5 @@ graft commit -m "save checkpoint"
 
 Applications can invoke the CLI with `--json` to consume the same repository
 model without scraping terminal text. They continue to open normal SQLite
-worktree files through their existing database library. The optional Graft VFS
-is a separate live page-storage mode, not a second repository command API.
+worktree files through their existing database library, or use the resident
+Node.js/Electron SDK for in-process repository operations.

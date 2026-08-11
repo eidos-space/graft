@@ -2,12 +2,11 @@ use super::*;
 
 pub(super) fn run_repo_merge_abort(
     runtime: &Runtime,
-    file: &mut VolFile,
+    file: &mut RepositorySessionContext,
 ) -> Result<RepoMergeAbortCommandOutcome, ErrCtx> {
     if !file.is_idle() {
         return pragma_err!("cannot abort merge while there is an open transaction");
     }
-    let _workspace_checkout = begin_workspace_checkout(file)?;
     let repo = repo_for_file(file)?;
     let plan = repo.plan_merge_abort()?;
     let previous_files = current_repo_files_for_checkout(&repo)?;
@@ -33,7 +32,7 @@ pub(super) fn run_repo_merge_abort(
 
 pub(super) fn run_repo_merge_continue(
     runtime: &Runtime,
-    file: &mut VolFile,
+    file: &mut RepositorySessionContext,
     message: String,
 ) -> Result<RepoCommitOutcome, ErrCtx> {
     if !file.is_idle() {
@@ -54,13 +53,12 @@ pub(super) fn run_repo_merge_continue(
 
 pub(super) fn run_repo_merge(
     runtime: &Runtime,
-    file: &mut VolFile,
+    file: &mut RepositorySessionContext,
     rev: &str,
 ) -> Result<RepoMergeCommandOutcome, ErrCtx> {
     if !file.is_idle() {
         return pragma_err!("cannot merge while there is an open transaction");
     }
-    let _workspace_checkout = begin_workspace_checkout(file)?;
     let repo = repo_for_file(file)?;
     if repo_has_work_in_progress_for_file(runtime, file, &repo)? {
         return pragma_err!("cannot merge with staged or unstaged changes");

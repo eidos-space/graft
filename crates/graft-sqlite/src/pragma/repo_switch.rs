@@ -2,14 +2,13 @@ use super::*;
 
 pub(super) fn run_repo_switch_branch(
     runtime: &Runtime,
-    file: &mut VolFile,
+    file: &mut RepositorySessionContext,
     name: String,
     force: bool,
 ) -> Result<RepoSwitchOutcome, ErrCtx> {
     if !file.is_idle() {
         return pragma_err!("cannot switch branches while there is an open transaction");
     }
-    let _workspace_checkout = begin_workspace_checkout(file)?;
     let repo = repo_for_file(file)?;
     let plan = repo.plan_switch_branch(&name)?;
     prepare_repo_switch_checkout(runtime, file, &repo, &plan, force)?;
@@ -34,7 +33,7 @@ pub(super) fn run_repo_switch_branch(
 
 pub(super) fn run_repo_switch_create(
     runtime: &Runtime,
-    file: &mut VolFile,
+    file: &mut RepositorySessionContext,
     name: String,
     start_point: Option<String>,
     force: bool,
@@ -42,7 +41,6 @@ pub(super) fn run_repo_switch_create(
     if !file.is_idle() {
         return pragma_err!("cannot switch branches while there is an open transaction");
     }
-    let _workspace_checkout = begin_workspace_checkout(file)?;
     let repo = repo_for_file(file)?;
     let plan = repo.plan_switch_new_branch(&name, start_point.as_deref())?;
     prepare_repo_switch_checkout(runtime, file, &repo, &plan.checkout, force)?;
@@ -67,7 +65,7 @@ pub(super) fn run_repo_switch_create(
 
 pub(super) fn prepare_repo_switch_checkout(
     runtime: &Runtime,
-    file: &mut VolFile,
+    file: &mut RepositorySessionContext,
     repo: &Repository,
     plan: &CheckoutPlan,
     force: bool,

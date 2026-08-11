@@ -459,7 +459,7 @@ Replacement 使用同目录 temporary file 和逐路径 backup restoration；当
 - `crates/graft-sdk/src/lib.rs` 的 materialization classification tests；
 - `packages/graft-sdk/test/repository-session.test.js` 的 ABI/gate、open-handle、
   restore、staging 和 identity tests；
-- `crates/graft-tool/src/main.rs` 的 CLI commit、switch、clone 和 physical-file tests；
+- `crates/graft-cli/src/main.rs` 的 CLI commit、switch、clone 和 physical-file tests；
 - `crates/graft-sqlite/src/pragma/sqlite_worktree.rs` 的 WAL、replacement guard、
   sidecar 和 physical snapshot tests；
 - Rust SDK 中关于 merge topology、durable status、resolution、stale token、continue、

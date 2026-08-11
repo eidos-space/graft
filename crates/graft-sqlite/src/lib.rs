@@ -1,17 +1,8 @@
-pub mod file;
+pub mod error;
 pub mod json;
 pub mod pragma;
 pub mod repo_service;
 pub mod row_level_diff;
 pub mod row_merge;
-pub mod sql_diff;
+mod session;
 pub mod sqlite_parse;
-pub mod vfs;
-
-mod dbg;
-
-#[cfg(feature = "register-static")]
-pub mod register;
-
-#[cfg(feature = "register-static")]
-pub use register::register_static;

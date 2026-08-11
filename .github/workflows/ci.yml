@@ -36,7 +36,7 @@ jobs:
       - name: system dependencies
         uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # latest
         with:
-          packages: clang libclang-dev llvm libncurses-dev build-essential libreadline-dev
+          packages: build-essential
           version: 1.0
 
       - uses: extractions/setup-just@e33e0265a09d6d736e2ee1e0eb685ef1de4669ff # v3
@@ -70,20 +70,11 @@ jobs:
       - name: Cargo doctests
         run: cargo test --doc
 
-      - name: Cache SQLite
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: target/sqlite-*/sqlite3
-          key: ${{ runner.os }}-sqlite3-${{ hashFiles('tasks/sqlite/*') }}
-
-      - name: SQLite Tests
-        run: just run sqlite test
-
       - name: Clippy
         # Lint first-party crates without re-linting the pinned vendored sources.
         # The vendored crates retain their upstream lint policy and are still
         # compiled as dependencies and exercised by the workspace test suite.
-        run: cargo clippy --workspace --all-targets --exclude fjall --exclude sqlite-plugin --no-deps
+        run: cargo clippy --workspace --all-targets --exclude fjall --no-deps
 
   msrv:
     name: Check MSRV 1.91
@@ -94,7 +85,7 @@ jobs:
       - name: system dependencies
         uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # latest
         with:
-          packages: clang libclang-dev llvm libncurses-dev build-essential libreadline-dev
+          packages: build-essential
           version: 1.0
 
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5

@@ -2,8 +2,8 @@
 
 Graft has three independent release trains:
 
-- [`.github/workflows/sqlite-extension-release.yml`](.github/workflows/sqlite-extension-release.yml)
-  publishes the SQLite extension and `graft` CLI from annotated `vX.Y.Z` tags.
+- [`.github/workflows/cli-release.yml`](.github/workflows/cli-release.yml)
+  publishes the `graft` CLI from annotated `vX.Y.Z` tags.
 - [`.github/workflows/sdk-release.yml`](.github/workflows/sdk-release.yml) validates pull requests
   and publishes `@eidos.space/graft` from annotated `graft-sdk-vX.Y.Z` tags.
 - [`.github/workflows/remote-release.yml`](.github/workflows/remote-release.yml) validates and
@@ -40,7 +40,9 @@ just run release --execute <VERSION>
 
 `VERSION` must use `X.Y.Z` or `X.Y.Z-rc.N`. The script rejects dirty worktrees, untracked files, version mismatches, non-main commits, and existing tags.
 
-Pushing the tag starts the release workflow. It builds all CLI and extension targets, packages them, generates `SHA256SUMS`, and only then creates or updates the GitHub release. A version containing a suffix such as `-rc.1` is published as a prerelease.
+Pushing the tag starts the release workflow. It builds all CLI targets, packages them, generates
+`SHA256SUMS`, and only then creates or updates the GitHub release. A version containing a suffix
+such as `-rc.1` is published as a prerelease.
 
 ## Prepare an SDK release
 
@@ -56,7 +58,7 @@ package so `pnpm install --frozen-lockfile` does not resolve an unpublished vers
 native packages are assembled, `release:prepare` injects exact dependencies matching the root
 version and `release:verify` checks all six manifests before publication.
 
-The SDK version is independent from the CLI/SQLite version. Before tagging, merge the SDK pull
+The SDK version is independent from the CLI version. Before tagging, merge the SDK pull
 request and wait for the full `Release Graft SDK` pull-request matrix. It builds every advertised
 binary and tests it on Node.js 20 and 24.
 

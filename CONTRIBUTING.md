@@ -52,7 +52,6 @@ To build and run Graft, ensure you have the following dependencies installed:
 | rust + cargo  | [rustup]               |
 | just          | [just]                 |
 | cargo nextest | [nextest]              |
-| clang + llvm  | System package manager |
 | Node.js 24    | [nodejs.org]            |
 | pnpm 10       | [pnpm]                  |
 
@@ -61,12 +60,6 @@ To build and run Graft, ensure you have the following dependencies installed:
 [nextest]: https://nexte.st/docs/installation/pre-built-binaries/
 [nodejs.org]: https://nodejs.org/
 [pnpm]: https://pnpm.io/installation
-
-> [!IMPORTANT]
-> Graft uses [`bindgen`] to generate Rust bindings for SQLite, which requires a working installation of Clang and LLVM. If you're not sure whether your system is set up correctly, follow the [official bindgen setup guide] for instructions tailored to your platform. This step is essential—missing or misconfigured Clang will cause build failures when compiling the `graft-sqlite` and `graft-sqlite-extension` crates.
-
-[`bindgen`]: https://rust-lang.github.io/rust-bindgen/
-[official bindgen setup guide]: https://rust-lang.github.io/rust-bindgen/requirements.html
 
 The easiest way to ensure everything works is to run the tests. This can be done via `just test` for a single command that runs everything, or you can run individual test suites like so:
 
@@ -77,28 +70,17 @@ cargo nextest run
 cargo nextest run -p graft
 cargo nextest run runtime_sanity
 
-# Run SQLite tests
-just run sqlite test
-
 # Build and test the resident Node.js/Electron SDK
 pnpm install --frozen-lockfile
 pnpm --dir packages/graft-sdk build:native
 pnpm --dir packages/graft-sdk test
 ```
 
-Next, if you'd like to run Graft locally you can use `just run sqlite shell` to spin up a SQLite shell.
-
-```bash
-just run sqlite shell
-```
-
 Further reading:
 
 - For a detailed overview of how Graft works, see [graft.rs/docs/internals].
-- For an overview of how to use the Graft SQLite extension, see [graft.rs/docs/sqlite].
 
 [graft.rs/docs/internals]: https://graft.rs/docs/internals/
-[graft.rs/docs/sqlite]: https://graft.rs/docs/sqlite/
 
 ## Pull Request (PR) process
 

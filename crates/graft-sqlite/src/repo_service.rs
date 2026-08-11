@@ -1,7 +1,4 @@
-//! Repository command execution without routing through `SQLite` PRAGMAs.
-//!
-//! This is the control-plane entry point for CLI and embedding use cases. The `SQLite` VFS remains
-//! a data-plane component and only exposes VFS-specific diagnostics and controls.
+//! Repository command execution for CLI and embedding use cases.
 
 use std::{
     path::{Path, PathBuf},
@@ -18,7 +15,7 @@ use graft::{
 };
 
 use crate::{
-    file::vol_file::VolFile,
+    error::ErrCtx,
     pragma::{
         GraftCommand,
         parse::parse_row_identity,
@@ -27,13 +24,13 @@ use crate::{
         spec::{RepoResolveRowSpec, RepoResolveSpec, ResolveSide},
         sqlite_worktree::physical_sqlite_file_matches_state,
     },
-    vfs::{ErrCtx, RepoRuntimeRegistry},
+    session::{RepoRuntimeRegistry, RepositorySessionContext},
 };
 
 /// A parsed, type-checked repository control-plane command.
 ///
-/// Parsing is kept at the CLI adapter boundary. Once constructed, command execution no longer
-/// carries a string command name or `SQLite` PRAGMA value through the service layer.
+/// Parsing is kept at the adapter boundary. Once constructed, command execution carries a typed
+/// command through the service layer.
 pub struct RepositoryCommand {
     command: GraftCommand,
 }
@@ -66,7 +63,7 @@ impl RepositoryCommand {
         Ok(Self { command })
     }
 
-    /// Creates a typed merge command without passing a PRAGMA argument through the SDK.
+    /// Creates a typed merge command for the SDK.
     pub fn merge(revision: impl Into<String>) -> Self {
         Self {
             command: GraftCommand::JsonMerge { rev: revision.into() },
@@ -86,11 +83,11 @@ impl RepositoryCommand {
             .row
             .map(|row| {
                 let identity = serde_json::to_string(&row.identity)
-                    .map_err(|error| ErrCtx::PragmaErr(error.to_string().into()))?;
+                    .map_err(|error| ErrCtx::InvalidCommand(error.to_string().into()))?;
                 Ok::<RepoResolveRowSpec, ErrCtx>(RepoResolveRowSpec {
                     table: row.table,
                     identity: parse_row_identity(&identity).map_err(|error| {
-                        ErrCtx::PragmaErr(format!("invalid row identity: {error:?}").into())
+                        ErrCtx::InvalidCommand(format!("invalid row identity: {error:?}").into())
                     })?,
                 })
             })
@@ -115,9 +112,9 @@ impl RepositoryCommand {
 
 /// Executes one repository command against the repository containing `target`.
 ///
-/// The command is evaluated directly against a repository-scoped Graft runtime. No `SQLite`
-/// connection is opened and no PRAGMA is issued. `target` may be a worktree database path or the
-/// repository's `.graft` directory for commands that operate on the whole worktree.
+/// The command is evaluated directly against a repository-scoped Graft runtime. `target` may be a
+/// worktree database path or the repository's `.graft` directory for commands that operate on the
+/// whole worktree.
 pub fn execute_repository_command(
     target: &Path,
     command: RepositoryCommand,
@@ -132,7 +129,7 @@ pub fn execute_repository_command(
 /// dropped. Callers must serialize [`Self::execute`] within one service; separate services for
 /// separate repositories may execute concurrently.
 pub struct RepositoryCommandService {
-    file: VolFile,
+    file: RepositorySessionContext,
     credentials: RemoteCredentials,
 }
 
@@ -163,7 +160,7 @@ impl RepositoryCommandService {
             .as_ref()
             .filter(|repo| target != repo.graft_dir())
             .map(|_| target.to_path_buf());
-        let mut file = VolFile::new_repository_session(
+        let mut file = RepositorySessionContext::new(
             runtime,
             session_path.to_string_lossy().into_owned(),
             repository_database,
@@ -223,7 +220,7 @@ impl RepositoryCommandService {
             .map_err(Into::into)
     }
 
-    /// Compares a physical SQLite worktree file with its tracked snapshot.
+    /// Compares a physical `SQLite` worktree file with its tracked snapshot.
     pub fn physical_sqlite_matches(
         &self,
         path: &Path,

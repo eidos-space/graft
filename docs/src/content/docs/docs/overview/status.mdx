@@ -19,8 +19,6 @@ documentation unless a page labels them as unreleased.
   `diff`, `checkout`, `restore`, `export`, `reset`, `branch`, `switch`, `tag`,
   `merge`, `conflicts`, `resolve`, `remote`, `ls-remote`, `fetch`, `pull`, and
   `push`.
-- A SQLite extension that provides the optional Graft VFS plus version and
-  low-level `graft_debug_*` diagnostics.
 - Repository-local state under `.graft/`.
 - Multiple tracked SQLite database paths in one worktree.
 - Text and binary file artifacts in the same commit tree as SQLite snapshots.
@@ -46,7 +44,6 @@ Treat these as implementation details:
 
 - storage LSNs
 - page and segment layout
-- debug pragmas
 - object serialization internals
 - internal Rust module boundaries
 
@@ -72,7 +69,7 @@ writer.
 
 ## Release Artifacts
 
-Prebuilt CLI and SQLite extension archives are published with the
+Prebuilt CLI archives are published with the
 [v0.13.0 GitHub release](https://github.com/eidos-space/graft/releases/latest).
 The resident Node.js/Electron SDK is independently versioned and published as
 [`@eidos.space/graft`](https://github.com/eidos-space/graft).

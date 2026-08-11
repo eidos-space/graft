@@ -3,21 +3,20 @@ title: 架构
 description: Graft core、SQLite integration、CLI、repository layer 和 remotes 的关系。
 ---
 
-本页面面向贡献者和高级调试。产品集成通常应使用 CLI、JSON 输出和配置参考；
-SQLite extension 是可选 data-plane integration。
+本页面面向贡献者和高级调试。产品集成通常应使用 CLI、JSON 输出、
+Node.js/Electron SDK 和配置参考。
 
 ## Layers
 
 ```text
 Application
   ordinary SQLite connection -> physical worktree database
-  optional SQLite connection using vfs=graft
   graft CLI / JSON
+  Node.js / Electron SDK
 
 graft-sqlite
-  repository command service (control plane)
+  repository command service
   physical SQLite snapshot/import boundary
-  optional VFS + VFS diagnostic PRAGMAs (data plane)
 
 graft
   repository model
@@ -31,9 +30,8 @@ graft
 | Crate | 作用 |
 | --- | --- |
 | `graft` | core storage、repository objects、refs、index、merge、sync、remotes。 |
-| `graft-sqlite` | repository command service、物理 SQLite import boundary 和可选 SQLite VFS。 |
-| `graft-ext` | SQLite extension wrapper。 |
-| `graft-tool` | CLI。 |
+| `graft-sqlite` | repository command service 和物理 SQLite snapshot/import boundary。 |
+| `graft-cli` | CLI。 |
 | `graft-test` | integration tests 和 workloads。 |
 | `graft-tracing` | tracing helpers。 |
 
@@ -65,9 +63,8 @@ SQLite commits to physical database (main file and possibly WAL)
   -> SQLite snapshots are materialized to physical worktree files
 ```
 
-可选 Graft VFS 会直接写 Volume page，因此跳过 physical import；这个直接映射要求
-SQLite `page_size=4096`。physical import 可以捕获例如 8 KiB page size 的合法
-数据库，同时仍按 4 KiB Graft chunk 存储其镜像。VFS 不暴露 repository command。
+physical import 可以捕获例如 8 KiB page size 的合法 SQLite 数据库，同时仍按
+4 KiB Graft chunk 存储其镜像。
 
 checkout materialize 物理 database 前会取得 SQLite replacement lock、处理 WAL 并清理
 sidecar。活跃 writer 会阻止替换。

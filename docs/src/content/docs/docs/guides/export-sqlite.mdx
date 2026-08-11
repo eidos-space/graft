@@ -62,8 +62,7 @@ graft commit -m "import external edit"
 `graft add` includes committed WAL frames without checkpointing the source and
 stores only 4 KiB Graft chunks that differ from the staged or committed base,
 independently of the physical database's SQLite page size. Application code can
-therefore use its normal SQLite connection. Use `vfs=graft` only when the
-application deliberately chooses the optional live Volume mode.
+therefore use its normal SQLite connection.
 
 ## Disable Materialization
 

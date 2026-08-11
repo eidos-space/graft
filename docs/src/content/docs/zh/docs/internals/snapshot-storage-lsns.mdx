@@ -40,11 +40,7 @@ LSN 是 storage log 内的 logical sequence number：
 
 LSN 本身不是全局唯一，也不是 hash。它必须和 `LogId` 一起解释。
 
-debug pragma：
-
-```sql
-PRAGMA graft_debug_log_lsn;
-```
+LSN 是内部 storage coordinate，不属于 repository CLI 或 SDK 契约。
 
 ## Storage Commit Hash
 

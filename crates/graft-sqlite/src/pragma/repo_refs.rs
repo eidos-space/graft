@@ -1,7 +1,7 @@
 use super::*;
 
 pub(super) fn run_repo_branch_create(
-    file: &mut VolFile,
+    file: &mut RepositorySessionContext,
     name: String,
     start_point: Option<String>,
 ) -> Result<BranchInfo, ErrCtx> {
@@ -15,7 +15,7 @@ pub(super) fn run_repo_branch_create(
 }
 
 pub(super) fn run_repo_branch_delete(
-    file: &mut VolFile,
+    file: &mut RepositorySessionContext,
     name: String,
     force: bool,
 ) -> Result<BranchInfo, ErrCtx> {
@@ -24,7 +24,7 @@ pub(super) fn run_repo_branch_delete(
 }
 
 pub(super) fn run_repo_branch_rename(
-    file: &mut VolFile,
+    file: &mut RepositorySessionContext,
     old: Option<String>,
     new: String,
     force: bool,
@@ -33,7 +33,7 @@ pub(super) fn run_repo_branch_rename(
     let old = match old {
         Some(old) => old,
         None => repo.current_branch()?.ok_or_else(|| {
-            ErrCtx::PragmaErr("cannot rename current branch in detached HEAD".into())
+            ErrCtx::InvalidCommand("cannot rename current branch in detached HEAD".into())
         })?,
     };
     let branch = repo.branch_rename(&old, &new, force)?;
@@ -41,7 +41,7 @@ pub(super) fn run_repo_branch_rename(
 }
 
 pub(super) fn run_repo_branch_upstream(
-    file: &mut VolFile,
+    file: &mut RepositorySessionContext,
     branch: Option<String>,
     remote: String,
     remote_branch: String,
@@ -53,7 +53,7 @@ pub(super) fn run_repo_branch_upstream(
 }
 
 pub(super) fn run_repo_branch_unset_upstream(
-    file: &mut VolFile,
+    file: &mut RepositorySessionContext,
     branch: Option<String>,
 ) -> Result<BranchInfo, ErrCtx> {
     let repo = repo_for_file(file)?;
@@ -68,14 +68,14 @@ pub(super) fn current_or_named_branch(
 ) -> Result<String, ErrCtx> {
     match branch {
         Some(branch) => Ok(branch),
-        None => repo
-            .current_branch()?
-            .ok_or_else(|| ErrCtx::PragmaErr(format!("cannot {action} in detached HEAD").into())),
+        None => repo.current_branch()?.ok_or_else(|| {
+            ErrCtx::InvalidCommand(format!("cannot {action} in detached HEAD").into())
+        }),
     }
 }
 
 pub(super) fn json_branch_mutation_outcome(
-    file: &mut VolFile,
+    file: &mut RepositorySessionContext,
     operation: &'static str,
     branch: BranchInfo,
     old_branch: Option<String>,
@@ -92,7 +92,7 @@ pub(super) fn json_branch_mutation_outcome(
 }
 
 pub(super) fn json_tag_mutation_outcome(
-    file: &mut VolFile,
+    file: &mut RepositorySessionContext,
     operation: &'static str,
     tag: TagInfo,
 ) -> Result<JsonTagMutationOutcome, ErrCtx> {
@@ -107,7 +107,7 @@ pub(super) fn json_tag_mutation_outcome(
 }
 
 pub(super) fn json_remote_mutation_outcome(
-    file: &mut VolFile,
+    file: &mut RepositorySessionContext,
     operation: &'static str,
     remote: RemoteInfo,
     old_name: Option<String>,
@@ -124,7 +124,7 @@ pub(super) fn json_remote_mutation_outcome(
 }
 
 pub(super) fn run_repo_tag_create(
-    file: &mut VolFile,
+    file: &mut RepositorySessionContext,
     name: String,
     target: Option<String>,
     message: Option<String>,
@@ -140,7 +140,10 @@ pub(super) fn run_repo_tag_create(
     }
 }
 
-pub(super) fn run_repo_tag_delete(file: &mut VolFile, name: String) -> Result<TagInfo, ErrCtx> {
+pub(super) fn run_repo_tag_delete(
+    file: &mut RepositorySessionContext,
+    name: String,
+) -> Result<TagInfo, ErrCtx> {
     let repo = repo_for_file(file)?;
     repo.tag_delete(&name).map_err(Into::into)
 }

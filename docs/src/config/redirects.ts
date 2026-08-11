@@ -7,7 +7,9 @@ export const SHORT_CODES = [
 
 export const DOC_REDIRECTS = {
   "/docs/get-started/cli/": "/docs/quickstart/cli/",
-  "/docs/get-started/sqlite-extension/": "/docs/quickstart/sqlite-extension/",
+  "/docs/get-started/sqlite-extension/": "/docs/quickstart/cli/",
+  "/docs/quickstart/sqlite-extension/": "/docs/quickstart/cli/",
+  "/docs/reference/pragmas/": "/docs/reference/cli/",
   "/docs/get-started/usage-guide/": "/docs/quickstart/app-state-walkthrough/",
   "/docs/guides/cloudflare-remote/": "/docs/guides/http-remote/",
   "/docs/concepts/physical-files-volumes/": "/docs/concepts/sqlite-snapshots/",
@@ -21,7 +23,9 @@ export const DOC_REDIRECTS = {
   "/docs/internals/row-diff-v2/": "/docs/internals/row-diff-engine/",
   "/docs/internals/http-remote-protocol/": "/docs/reference/remote-protocol/",
   "/zh/docs/get-started/cli/": "/zh/docs/quickstart/cli/",
-  "/zh/docs/get-started/sqlite-extension/": "/zh/docs/quickstart/sqlite-extension/",
+  "/zh/docs/get-started/sqlite-extension/": "/zh/docs/quickstart/cli/",
+  "/zh/docs/quickstart/sqlite-extension/": "/zh/docs/quickstart/cli/",
+  "/zh/docs/reference/pragmas/": "/zh/docs/reference/cli/",
   "/zh/docs/get-started/usage-guide/": "/zh/docs/quickstart/app-state-walkthrough/",
   "/zh/docs/guides/cloudflare-remote/": "/zh/docs/guides/http-remote/",
   "/zh/docs/concepts/physical-files-volumes/": "/zh/docs/concepts/sqlite-snapshots/",

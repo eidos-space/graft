@@ -5,18 +5,18 @@ import { fileURLToPath } from "node:url";
 const demoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repositoryRoot = resolve(demoRoot, "..");
 const cargoManifest = await readFile(
-  resolve(repositoryRoot, "crates/graft-tool/Cargo.toml"),
+  resolve(repositoryRoot, "crates/graft-cli/Cargo.toml"),
   "utf8",
 );
 const sourceVersion = cargoManifest.match(/^version = "([^"]+)"$/m)?.[1];
-if (!sourceVersion) throw new Error("Could not read the graft-tool version");
+if (!sourceVersion) throw new Error("Could not read the graft-cli version");
 
 const runtimeDirectory = resolve(demoRoot, "public/wasm");
 const runtimeManifestPath = resolve(runtimeDirectory, "version.json");
 const runtimeManifest = JSON.parse(await readFile(runtimeManifestPath, "utf8"));
 if (runtimeManifest.version !== sourceVersion) {
   throw new Error(
-    `Playground Wasm is ${runtimeManifest.version ?? "unversioned"}, but graft-tool is ${sourceVersion}. Run pnpm build:wasm.`,
+    `Playground Wasm is ${runtimeManifest.version ?? "unversioned"}, but graft-cli is ${sourceVersion}. Run pnpm build:wasm.`,
   );
 }
 

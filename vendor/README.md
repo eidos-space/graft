@@ -27,23 +27,3 @@ open the same database concurrently from multiple browser workers or tabs.
 
 Remove this vendored copy once an upstream Fjall release supports this
 Emscripten behavior and Graft has upgraded to it.
-
-## `sqlite-plugin` 0.9.0
-
-- Upstream: <https://github.com/orbitinghail/sqlite-plugin>
-- Upstream revision recorded by the crate: `eb4caa9d6d592344cf4affc7c57143a1a8cf2078`
-- Local patch locations: `build.rs` and `src/vfs.rs`
-
-The local patches address two issues:
-
-1. SQLite's `sqlite3_mprintf` treats its first argument as a format string.
-   Passing PRAGMA output directly corrupts literal percent sequences and can
-   read nonexistent variadic arguments. The patch copies output through the
-   constant `"%s"` format and includes a regression test with Unicode and `%`.
-2. Bindgen omits several static SQLite entry points for the Emscripten target.
-   The build script appends the required declarations; the symbols are supplied
-   by `libsqlite3-sys` at link time.
-
-The whitespace-only change in `sqlite3/sqlite3ext.h` is not a behavioral patch.
-Remove this vendored copy once upstream releases contain both functional fixes
-and Graft has upgraded to that release.

@@ -8,7 +8,7 @@ repository = { workspace = true }
 homepage = { workspace = true }
 rust-version = { workspace = true }
 
-description = "A SQLite extension which uses Graft to replicate to and from object storage."
+description = "SQLite snapshot, diff, merge, and worktree support for Graft repositories."
 
 [lints]
 workspace = true
@@ -20,12 +20,10 @@ serde_json = "1.0"
 
 blake3 = { workspace = true }
 bytes = { workspace = true }
-enum_dispatch = { workspace = true }
 indoc = { workspace = true }
 itertools = { workspace = true }
 parking_lot = { workspace = true }
 rusqlite = { workspace = true, features = ["backup"] }
-sqlite-plugin = { workspace = true, default-features = false }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
@@ -34,10 +32,4 @@ zerocopy = { workspace = true }
 
 [features]
 default = []
-# export a register_static method allowing the Graft SQLite extension to be
-# statically setup in a Rust project
-register-static = ["sqlite-plugin/static"]
 bundled-sqlite = ["rusqlite/bundled"]
-# Keeps the pre-migration repository/VFS integration suite available without widening the
-# production SQLite extension surface. Only graft-test enables this constructor.
-test-repository-pragmas = []

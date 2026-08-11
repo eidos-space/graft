@@ -93,7 +93,7 @@ export function ExplorerPane({
       const state = storageStateRef.current;
       if (row.kind !== "file" || !state.logicalSqlitePaths.has(row.path)) return null;
       return state.virtualSqlitePaths.has(row.path)
-        ? { text: "VFS", title: state.vfsTitle }
+        ? { text: "DB", title: state.vfsTitle }
         : { text: "OPFS", title: state.materializedTitle };
     },
     search: true,

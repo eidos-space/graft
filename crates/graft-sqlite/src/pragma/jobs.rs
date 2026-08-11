@@ -73,11 +73,11 @@ impl AsyncJobRegistry {
         let jobs = self.jobs.lock();
         let job = jobs.get(id).ok_or_else(|| unknown_job(id))?;
         match job.state {
-            AsyncJobState::Running => Err(ErrCtx::PragmaErr(
+            AsyncJobState::Running => Err(ErrCtx::InvalidCommand(
                 format!("job `{id}` is still running").into(),
             )),
             AsyncJobState::Done => Ok(job.result.clone().unwrap_or_default()),
-            AsyncJobState::Failed => Err(ErrCtx::PragmaErr(
+            AsyncJobState::Failed => Err(ErrCtx::InvalidCommand(
                 format!(
                     "job `{id}` failed: {}",
                     job.error.as_deref().unwrap_or("unknown error")
@@ -104,7 +104,7 @@ impl AsyncJobResultFormat {
 }
 
 pub(super) fn unknown_job(id: &str) -> ErrCtx {
-    ErrCtx::PragmaErr(format!("unknown job `{id}`").into())
+    ErrCtx::InvalidCommand(format!("unknown job `{id}`").into())
 }
 
 #[derive(Debug, Clone)]

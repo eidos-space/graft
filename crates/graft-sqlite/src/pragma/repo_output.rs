@@ -206,7 +206,9 @@ pub(super) fn repo_file_row_diff(
             )
             .map(Some)
             .map_err(|err| {
-                ErrCtx::PragmaErr(format!("Row diff error for `{}`: {err:?}", file.path).into())
+                ErrCtx::InvalidCommand(
+                    format!("Row diff error for `{}`: {err:?}", file.path).into(),
+                )
             });
         };
         resolver.resolve_snapshot(&from.snapshot)?;
@@ -222,7 +224,7 @@ pub(super) fn repo_file_row_diff(
         )
         .map(Some)
         .map_err(|err| {
-            ErrCtx::PragmaErr(format!("Row diff error for `{}`: {err:?}", file.path).into())
+            ErrCtx::InvalidCommand(format!("Row diff error for `{}`: {err:?}", file.path).into())
         });
     }
     let row_diff = match (&file.from, &file.to) {
@@ -267,7 +269,7 @@ pub(super) fn repo_file_row_diff(
         (None, None) => return Ok(None),
     };
     row_diff.map(Some).map_err(|err| {
-        ErrCtx::PragmaErr(format!("Row diff error for `{}`: {err:?}", file.path).into())
+        ErrCtx::InvalidCommand(format!("Row diff error for `{}`: {err:?}", file.path).into())
     })
 }
 
@@ -323,7 +325,7 @@ pub(super) fn repo_file_bounded_row_diff(
                         )
                     };
                     rows.map(Some).map_err(|error| {
-                        ErrCtx::PragmaErr(
+                        ErrCtx::InvalidCommand(
                             format!("Bounded row diff error for `{}`: {error:?}", file.path).into(),
                         )
                     })
@@ -338,7 +340,7 @@ pub(super) fn repo_file_bounded_row_diff(
                     )
                     .map(Some)
                     .map_err(|error| {
-                        ErrCtx::PragmaErr(
+                        ErrCtx::InvalidCommand(
                             format!("Bounded row diff error for `{}`: {error:?}", file.path).into(),
                         )
                     })
@@ -397,7 +399,9 @@ pub(super) fn repo_file_bounded_row_diff(
         (None, None) => return Ok(None),
     };
     result.map(Some).map_err(|error| {
-        ErrCtx::PragmaErr(format!("Bounded row diff error for `{}`: {error:?}", file.path).into())
+        ErrCtx::InvalidCommand(
+            format!("Bounded row diff error for `{}`: {error:?}", file.path).into(),
+        )
     })
 }
 
@@ -1244,7 +1248,7 @@ pub(super) fn format_merge_outcome(outcome: &MergeOutcome) -> Result<String, Err
 
 pub(super) fn format_merge_outcome_with_row_auto_merge(
     runtime: &Runtime,
-    file: &VolFile,
+    file: &RepositorySessionContext,
     repo: &Repository,
     outcome: &MergeOutcome,
     row_auto_merge: Option<&RowAutoMergeResult>,
@@ -1389,7 +1393,7 @@ pub(super) fn format_pull_outcome(outcome: &PullOutcome) -> Result<String, ErrCt
 
 pub(super) fn format_pull_outcome_with_row_analysis(
     runtime: &Runtime,
-    file: &VolFile,
+    file: &RepositorySessionContext,
     repo: &Repository,
     outcome: &PullOutcome,
     remote: Option<Arc<Remote>>,

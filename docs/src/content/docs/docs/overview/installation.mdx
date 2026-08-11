@@ -1,12 +1,12 @@
 ---
 title: Installation
-description: Install the Graft CLI, build from source, and get the SQLite extension.
+description: Install the Graft CLI, build from source, and add the Node.js SDK.
 ---
 
 import { Aside } from "@astrojs/starlight/components";
 
-The fastest way to try Graft is the CLI. Applications can later load the
-SQLite extension, or use the resident Node.js/Electron SDK.
+The fastest way to try Graft is the CLI. Applications can later use the
+resident Node.js/Electron SDK for an in-process integration.
 
 ## Install The CLI
 
@@ -21,7 +21,7 @@ Then check the binary:
 
 ```bash
 graft --version
-# graft-tool 0.13.0
+# graft-cli 0.13.0
 ```
 
 <Aside type="note" title="Latest release">
@@ -36,7 +36,7 @@ Prebuilt archives are also available from the
 From the repository root:
 
 ```bash
-cargo build -p graft-tool --bin graft --release
+cargo build -p graft-cli --bin graft --release
 ```
 
 The binary is written to:
@@ -53,25 +53,6 @@ ln -sf "$(pwd)/target/release/graft" ~/.local/bin/graft
 hash -r
 graft --help
 ```
-
-## Build The SQLite Extension
-
-Build the dynamic SQLite extension:
-
-```bash
-cargo build -p graft-ext --release
-```
-
-The exact library filename depends on the platform. It is written under
-`target/release/` and can be loaded by SQLite:
-
-```sql
-.load ./libgraft_ext
-```
-
-Use the extension when your app deliberately wants the Graft VFS as a live
-page-storage data plane. Repository commands are not exposed as SQLite
-PRAGMAs; use the CLI and its JSON output for the control plane.
 
 ## Build The Docs
 
@@ -94,6 +75,6 @@ binaries. Continue with the [Node.js and Electron SDK guide](/docs/guides/node-e
 
 ## Next
 
-Run the [CLI quickstart](/docs/quickstart/cli/) first. Use the
-[SQLite extension quickstart](/docs/quickstart/sqlite-extension/) only when the
-application deliberately opts into the Graft VFS.
+Run the [CLI quickstart](/docs/quickstart/cli/) first, then use the
+[Node.js and Electron SDK guide](/docs/guides/node-electron-sdk/) when an
+application needs a resident repository session.

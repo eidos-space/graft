@@ -23,13 +23,6 @@ version.
 File bytes stored by content hash outside normal commit/tree objects. Used for
 binary files and configured external paths.
 
-## Graft VFS
-
-The optional SQLite virtual file system registered by the Graft extension. It
-writes live database pages directly to a Graft Volume. It is a data-plane mode,
-not the repository command API; the default worktree uses ordinary SQLite
-files.
-
 ## Index
 
 The staging area between the worktree and the next commit. During conflicts,

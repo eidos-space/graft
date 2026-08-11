@@ -1,19 +1,17 @@
 use std::path::PathBuf;
 
-use graft::{
-    core::{byte_unit::ByteUnit, logref::LogRef, lsn::LSN},
-    remote::RemoteConfig,
-    repo::{DEFAULT_TEXT_DIFF_CONTENT_LIMIT, RepoTrackedPathKind, ResetMode},
-};
-use sqlite_plugin::vfs::PragmaErr;
-
 use super::{
     BranchListMode, DiffMode, JsonConfigListMode, JsonFetchAsyncMode, JsonLogMode, JsonLogSpec,
     JsonTagsMode, LargeFileFetchSpec, LargeFilePruneSpec, LargeFileStatusSpec, LsFilesSpec,
-    RepoAddSpec, RepoAuditSpec, RepoCheckoutSpec, RepoCloneSpec, RepoDiffSpec, RepoDiffTarget,
-    RepoExportSpec, RepoInitSpec, RepoRemoveSpec, RepoResolveRowSpec, RepoResolveSpec,
-    RepoRestoreSpec, RepoRowPageSpec, RepoTextContentSpec, ResolveSide, StatusSpec, StorageGcSpec,
-    parse_or_fail, pragma_fail,
+    PragmaErr, RepoAddSpec, RepoAuditSpec, RepoCheckoutSpec, RepoCloneSpec, RepoDiffSpec,
+    RepoDiffTarget, RepoExportSpec, RepoInitSpec, RepoRemoveSpec, RepoResolveRowSpec,
+    RepoResolveSpec, RepoRestoreSpec, RepoRowPageSpec, RepoTextContentSpec, ResolveSide,
+    StatusSpec, StorageGcSpec, pragma_fail,
+};
+use graft::{
+    core::byte_unit::ByteUnit,
+    remote::RemoteConfig,
+    repo::{DEFAULT_TEXT_DIFF_CONTENT_LIMIT, RepoTrackedPathKind, ResetMode},
 };
 
 pub(super) fn parse_remote_add(arg: &str) -> Result<(String, RemoteConfig), PragmaErr> {
@@ -670,34 +668,6 @@ pub(super) fn parse_repo_diff_arg(arg: Option<&str>) -> Result<RepoDiffSpec, Pra
         table,
         row_page,
     })
-}
-
-pub(super) fn parse_volume_diff_arg(arg: &str) -> Result<(LSN, LSN, DiffMode), PragmaErr> {
-    let parts: Vec<&str> = arg.split(',').collect();
-    if parts.len() < 2 || parts.len() > 3 {
-        return Err(pragma_fail(
-            "argument must be in the form: `from_lsn,to_lsn[,mode]`",
-        ));
-    }
-    let mode = if parts.len() == 3 {
-        match parts[2] {
-            "rows" => DiffMode::Rows,
-            _ => return Err(pragma_fail("mode must be 'rows' or omitted")),
-        }
-    } else {
-        DiffMode::Default
-    };
-    Ok((parse_or_fail(parts[0])?, parse_or_fail(parts[1])?, mode))
-}
-
-pub(super) fn parse_debug_diff_lsn_arg(arg: &str) -> Result<(LogRef, LogRef), PragmaErr> {
-    let parts: Vec<&str> = arg.split_whitespace().collect();
-    match parts.as_slice() {
-        [from, to] => Ok((parse_or_fail(from)?, parse_or_fail(to)?)),
-        _ => Err(pragma_fail(
-            "argument must be in the form: `from_log:from_lsn to_log:to_lsn`",
-        )),
-    }
 }
 
 pub(super) fn parse_repo_add_arg(arg: Option<&str>) -> Result<RepoAddSpec, PragmaErr> {

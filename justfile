@@ -1,11 +1,6 @@
 set unstable := true
 
 GIT_SHA := `git describe --abbrev=40 --always --dirty --match=nevermatch 2>/dev/null`
-GIT_SUMMARY := `git show --no-patch 2>/dev/null`
-DOCKER_PLATFORM := "linux/amd64"
-ANTITHESIS_REGISTRY := "us-central1-docker.pkg.dev/molten-verve-216720/orbitinghail-repository"
-CONFIG_ANTITHESIS_TAG := ANTITHESIS_REGISTRY / "config:" + GIT_SHA
-TEST_CLIENT_ANTITHESIS_TAG := ANTITHESIS_REGISTRY / "test_client:" + GIT_SHA
 
 default:
     @just --list
@@ -50,11 +45,10 @@ run *args:
 test:
     cargo nextest run
     cargo test --doc
-    just run sqlite test
 
 # Run the reproducible end-to-end speed and storage benchmark.
 benchmark profile='ci' samples='5' warmups='1' output='target/benchmark/current.json':
-    cargo build --release --locked -p graft-tool -p graft-bench
+    cargo build --release --locked -p graft-cli -p graft-bench
     ./target/release/graft-bench run \
       --graft-bin ./target/release/graft \
       --output {{ quote(output) }} \
@@ -76,39 +70,3 @@ benchmark-compare baseline candidate output='target/benchmark/comparison.md':
 
 build-all:
     cargo build
-    cargo build --no-default-features --features register-static --package graft-sqlite
-    cargo build --no-default-features --features static --package graft-ext
-    cargo build --no-default-features --features dynamic --package graft-ext
-
-test-workload-image:
-    docker build \
-      --platform {{ DOCKER_PLATFORM }} \
-      --target test_client \
-      -t test_client \
-      -t {{ TEST_CLIENT_ANTITHESIS_TAG }} \
-      -f antithesis.Dockerfile \
-      .
-
-antithesis-config-image:
-    docker build \
-      --platform {{ DOCKER_PLATFORM }} \
-      -t antithesis-config \
-      -t {{ CONFIG_ANTITHESIS_TAG }} \
-      --build-arg TAG={{ GIT_SHA }} \
-      tests/antithesis
-
-antithesis-build: antithesis-config-image test-workload-image
-
-antithesis-push: antithesis-build
-    docker push {{ CONFIG_ANTITHESIS_TAG }}
-    docker push {{ TEST_CLIENT_ANTITHESIS_TAG }}
-
-antithesis-run duration='120': antithesis-push
-    snouty run \
-      --webhook basic_test \
-      --antithesis.test_name 'graft test workload' \
-      --antithesis.description '{{ GIT_SUMMARY }}' \
-      --antithesis.config_image '{{ CONFIG_ANTITHESIS_TAG }}' \
-      --antithesis.images '{{ TEST_CLIENT_ANTITHESIS_TAG }}' \
-      --antithesis.duration {{ duration }} \
-      --antithesis.report.recipients 'antithesis-results@orbitinghail.dev'

@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Renamed the Rust CLI package and crate directory from `graft-tool` to `graft-cli`. The installed
+  executable remains `graft`.
+- Repository commands now retain repository-scoped session state directly instead of reusing a
+  live SQLite VFS file handle.
+
+### Removed
+
+- Removed the dynamic/static SQLite extension, custom Graft VFS, debug Volume PRAGMAs, vendored
+  `sqlite-plugin`, and their extension-only SQL and Antithesis test infrastructure.
+- Removed SQLite extension release artifacts and installation documentation. Applications should
+  use ordinary SQLite worktree files through the CLI or a resident Node.js/Electron SDK session.
+
+### Compatibility
+
+- Repository objects, snapshots, remotes, CLI commands, the `graft` executable name, and the SDK
+  repository model are unchanged. Applications that load `libgraft_ext` or open databases with
+  `vfs=graft` must migrate to physical SQLite worktree files.
+
 ## Graft 0.13.0 — 2026-08-11
 
 ### Added

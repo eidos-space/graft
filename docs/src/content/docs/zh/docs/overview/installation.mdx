@@ -1,12 +1,11 @@
 ---
 title: 安装
-description: 安装 Graft CLI、从源码构建，并获取 SQLite 扩展。
+description: 安装 Graft CLI、从源码构建，并接入 Node.js SDK。
 ---
 
 import { Aside } from "@astrojs/starlight/components";
 
-最快的试用方式是 CLI。应用集成时可加载 SQLite extension、静态链接扩展，或使用常驻
-Node.js/Electron SDK。
+最快的试用方式是 CLI。需要进程内集成时，应用可以使用常驻 Node.js/Electron SDK。
 
 ## 安装 CLI
 
@@ -14,7 +13,7 @@ Node.js/Electron SDK。
 curl -fsSL https://graft.eidos.space/install.sh \
   | GRAFT_VERSION=0.13.0 sh
 graft --version
-# graft-tool 0.13.0
+# graft-cli 0.13.0
 ```
 
 <Aside type="note" title="最新 release">
@@ -30,7 +29,7 @@ graft --version
 在仓库根目录：
 
 ```bash
-cargo build -p graft-tool --bin graft --release
+cargo build -p graft-cli --bin graft --release
 ```
 
 生成位置：
@@ -47,21 +46,6 @@ ln -sf "$(pwd)/target/release/graft" ~/.local/bin/graft
 hash -r
 graft --help
 ```
-
-## 构建 SQLite 扩展
-
-```bash
-cargo build -p graft-ext --release
-```
-
-平台相关的动态库会写入 `target/release/`。在 SQLite shell 中加载：
-
-```sql
-.load ./libgraft_ext
-```
-
-只有应用明确需要 Graft VFS 作为 live page-storage 数据面时才需要扩展。
-repository 命令不通过 SQLite PRAGMA 暴露；control plane 使用 CLI 及其 JSON 输出。
 
 ## 构建文档
 
@@ -80,5 +64,5 @@ pnpm add @eidos.space/graft
 npm package 提供长生命周期的进程内 repository session 和预构建 Node-API 8 binary。
 继续阅读 [Node.js 与 Electron SDK](/zh/docs/guides/node-electron-sdk/)。
 
-下一步先跑 [CLI 快速开始](/zh/docs/quickstart/cli/)。需要显式接入可选 Graft VFS
-时，再看 [SQLite 扩展快速开始](/zh/docs/quickstart/sqlite-extension/)。
+下一步先跑 [CLI 快速开始](/zh/docs/quickstart/cli/)。应用需要常驻 repository session
+时，再看 [Node.js 与 Electron SDK](/zh/docs/guides/node-electron-sdk/)。
