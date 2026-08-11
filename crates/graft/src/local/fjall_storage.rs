@@ -198,10 +198,30 @@ impl FjallStorage {
         &self,
         snapshot: &Snapshot,
     ) -> Result<bool, FjallStorageErr> {
-        Ok(self
+        let marker = self
             .hydration_cache_dir
-            .join(hydrated_snapshot_key(snapshot))
-            .is_file())
+            .join(hydrated_snapshot_key(snapshot));
+        if !marker.is_file() {
+            return Ok(false);
+        }
+
+        // The commit index is derived state and can outlive an individual commit after an
+        // interrupted or older hydrate. Never let such a stale marker suppress a remote repair.
+        let reader = self.read();
+        for range in snapshot.iter() {
+            for lsn in range.lsns.iter() {
+                if reader.get_commit(&range.log, lsn)?.is_none() {
+                    drop(reader);
+                    match std::fs::remove_file(&marker) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
     }
 
     pub(crate) fn mark_snapshot_hydrated(

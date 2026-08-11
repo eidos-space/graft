@@ -17,6 +17,8 @@ use crate::{
 #[derive(Debug)]
 pub struct FetchLog {
     pub log: LogId,
+    /// Optional lower bound for repairing a known snapshot range.
+    pub min_lsn: Option<LSN>,
     pub max_lsn: Option<LSN>,
 }
 
@@ -26,18 +28,34 @@ impl Action for FetchLog {
         let mut batch = storage.batch();
 
         // calculate the lsn range to retrieve
-        let start = reader
-            .latest_lsn(&self.log)?
-            .map_or(LSN::FIRST, |lsn| lsn.next());
+        let start = match self.min_lsn {
+            Some(min_lsn) => min_lsn,
+            None => reader
+                .latest_lsn(&self.log)?
+                .map_or(LSN::FIRST, |lsn| lsn.next()),
+        };
         let end = self.max_lsn.unwrap_or(LSN::LAST);
         let lsns = start..=end;
 
         tracing::debug!(log = ?self.log, lsns = %lsns.to_string(), "fetching log");
 
-        // figure out which lsns we are missing
-        let existing_lsns = storage.read().lsns(&self.log, &lsns)?;
-        let missing_lsns =
-            (RangeOnce::new(lsns) - existing_lsns.into_ranges()).flat_map(|r| r.iter());
+        // Snapshot hydration supplies an exact lower bound and must repair holes even when the
+        // derived LSN index says a commit exists. Unbounded sync can keep using the indexed tail.
+        let missing_lsns: Box<dyn Iterator<Item = LSN> + Send> = if self.min_lsn.is_some() {
+            let mut missing = Vec::new();
+            for lsn in lsns.iter() {
+                if reader.get_commit(&self.log, lsn)?.is_none() {
+                    missing.push(lsn);
+                }
+            }
+            Box::new(missing.into_iter())
+        } else {
+            let existing_lsns = storage.read().lsns(&self.log, &lsns)?;
+            Box::new(
+                (RangeOnce::new(lsns) - existing_lsns.into_ranges())
+                    .flat_map(|range| range.iter()),
+            )
+        };
 
         let mut seen_lsns = HashSet::new();
         let mut checkpoints = HashSet::new();

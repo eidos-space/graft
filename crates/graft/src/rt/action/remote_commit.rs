@@ -331,6 +331,7 @@ async fn attempt_recovery(
         // if our pending commit already landed.
         FetchLog {
             log: volume.remote.clone(),
+            min_lsn: None,
             max_lsn: None,
         }
         .run(storage.clone(), remote.clone())
