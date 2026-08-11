@@ -1,6 +1,5 @@
 import { type CSSProperties, useCallback, useEffect, useRef, useState } from "react";
 import { BinaryDiffPane } from "./components/BinaryDiffPane";
-import { CommitFilesPane } from "./components/CommitFilesPane";
 import {
   ConflictResolver,
   type ConflictResolutionRequest,
@@ -42,6 +41,17 @@ import type {
   BranchList,
   CommitInfo,
   DiffView,
+  MergeApplyResult,
+  MergeConflict,
+  MergeConflictPage,
+  MergeContent,
+  MergeContentState,
+  MergeOperationResult,
+  MergePath,
+  MergePathPage,
+  MergePlanResult,
+  MergeStatus,
+  MergeVersion,
   OpfsEntry,
   RepoLog,
   RepoConflictList,
@@ -74,6 +84,8 @@ const emptyConflicts: RepoConflictList = {
   conflicts: [],
   paths: [],
 };
+
+const emptyMergeStatus: MergeStatus = { state: "none" };
 
 type JsonContentState = {
   content?: string;
@@ -119,6 +131,42 @@ function isPreviewableImagePath(path: string) {
 
 function commandError(stderr: string[], fallback: string) {
   return stderr.join("\n").trim() || fallback;
+}
+
+async function runMergeApi<T>(client: GraftClient, args: string[]) {
+  const result = await client.run(["merge-api", ...args]);
+  if (result.code !== 0) {
+    throw new Error(commandError(result.stderr, "Merge API command failed"));
+  }
+  return parseJsonOutput<T>(result);
+}
+
+function mergeConflictsToList(
+  status: MergeStatus,
+  paths: MergePath[],
+  pages: MergeConflictPage[],
+  repositoryStatus: RepoStatus,
+): RepoConflictList {
+  const conflicts = pages.flatMap((page) => page.items);
+  return {
+    conflicts,
+    current_branch: repositoryStatus.current_branch,
+    current_head: repositoryStatus.current_head,
+    merge_head: status.state === "merging" ? status.merge_head : undefined,
+    paths: paths.map((path) => {
+      const pathConflicts = conflicts.filter((conflict) => conflict.path === path.path);
+      const unresolved = pathConflicts.filter((conflict) => conflict.status !== "resolved").length;
+      return {
+        kind: path.kind,
+        path: path.path,
+        resolved: pathConflicts.length - unresolved,
+        status: unresolved === 0 ? "resolved" : "unresolved",
+        storage: path.storage,
+        total: pathConflicts.length,
+        unresolved,
+      };
+    }),
+  };
 }
 
 function clamp(value: number, minimum: number, maximum: number) {
@@ -168,6 +216,8 @@ export function App() {
   const [repositoryReady, setRepositoryReady] = useState(false);
   const [status, setStatus] = useState<RepoStatus>(emptyStatus);
   const [conflicts, setConflicts] = useState<RepoConflictList>(emptyConflicts);
+  const [mergeStatus, setMergeStatus] = useState<MergeStatus>(emptyMergeStatus);
+  const [mergePaths, setMergePaths] = useState<MergePath[]>([]);
   const [trackedPaths, setTrackedPaths] = useState<RepoTrackedPath[]>([]);
   const [history, setHistory] = useState<CommitInfo[]>([]);
   const [branches, setBranches] = useState<BranchInfo[]>([]);
@@ -189,9 +239,6 @@ export function App() {
   const [explorerWidth, setExplorerWidth] = useState(() =>
     savedNumber("graft-explorer-width", 292),
   );
-  const [commitFilesWidth, setCommitFilesWidth] = useState(() =>
-    savedNumber("graft-commit-files-width", 286),
-  );
   const [guideWidth, setGuideWidth] = useState(() =>
     savedNumber("graft-guide-width", 344),
   );
@@ -212,6 +259,15 @@ export function App() {
   surfaceRef.current = surface;
 
   useEffect(() => {
+    if (!import.meta.env.DEV) return;
+    const testWindow = window as typeof window & { graftPlaygroundClient?: GraftClient };
+    testWindow.graftPlaygroundClient = client;
+    return () => {
+      if (testWindow.graftPlaygroundClient === client) delete testWindow.graftPlaygroundClient;
+    };
+  }, [client]);
+
+  useEffect(() => {
     localStorage.setItem("graft-guide-open", String(guideOpen));
   }, [guideOpen]);
 
@@ -221,10 +277,9 @@ export function App() {
 
   useEffect(() => {
     localStorage.setItem("graft-explorer-width", String(explorerWidth));
-    localStorage.setItem("graft-commit-files-width", String(commitFilesWidth));
     localStorage.setItem("graft-guide-width", String(guideWidth));
     localStorage.setItem("graft-terminal-height", String(terminalHeight));
-  }, [commitFilesWidth, explorerWidth, guideWidth, terminalHeight]);
+  }, [explorerWidth, guideWidth, terminalHeight]);
 
   useEffect(() => {
     localStorage.setItem("graft-terminal-open", String(terminalOpen));
@@ -399,6 +454,8 @@ export function App() {
       setRepositoryReady(false);
       setStatus(emptyStatus);
       setConflicts(emptyConflicts);
+      setMergeStatus(emptyMergeStatus);
+      setMergePaths([]);
       setTrackedPaths([]);
       setHistory([]);
       setBranches([]);
@@ -419,6 +476,8 @@ export function App() {
       setRepositoryReady(false);
       setStatus(emptyStatus);
       setConflicts(emptyConflicts);
+      setMergeStatus(emptyMergeStatus);
+      setMergePaths([]);
       setTrackedPaths([]);
       setHistory([]);
       setBranches([]);
@@ -427,15 +486,49 @@ export function App() {
     }
 
     const nextStatus = parseJsonOutput<RepoStatus>(statusResult);
-    const [logResult, branchResult, trackedResult, conflictResult] = await Promise.all([
+    const [logResult, branchResult, trackedResult] = await Promise.all([
       client.run(["log", "--json", "--limit", "24"]),
       client.run(["branch", "--json"]),
       client.run(["ls-files", "--json"]),
-      nextStatus.merge_head
-        ? client.run(["conflicts", "--json"])
-        : Promise.resolve(undefined),
     ]);
     if (token !== refreshToken.current) return;
+
+    let nextMergeStatus: MergeStatus = emptyMergeStatus;
+    let nextMergePaths: MergePath[] = [];
+    let nextConflicts = emptyConflicts;
+    if (nextStatus.merge_head) {
+      try {
+        nextMergeStatus = await runMergeApi<MergeStatus>(client, ["status"]);
+        if (nextMergeStatus.state === "merging") {
+          const pathPage = await runMergeApi<MergePathPage>(client, [
+            "paths",
+            "--state-token",
+            nextMergeStatus.state_token,
+          ]);
+          nextMergePaths = pathPage.items;
+          const conflictPages = await Promise.all(
+            nextMergePaths.map((path) =>
+              runMergeApi<MergeConflictPage>(client, [
+                "conflicts",
+                path.path,
+                "--state-token",
+                nextMergeStatus.state === "merging"
+                  ? nextMergeStatus.state_token
+                  : pathPage.state_token,
+              ]),
+            ),
+          );
+          nextConflicts = mergeConflictsToList(
+            nextMergeStatus,
+            nextMergePaths,
+            conflictPages,
+            nextStatus,
+          );
+        }
+      } catch (error) {
+        setMessage(error instanceof Error ? error.message : String(error));
+      }
+    }
 
     // Raw index conflicts intentionally make the normal tracked inventory
     // unavailable in some Graft builds. Status + conflicts remain authoritative
@@ -461,16 +554,25 @@ export function App() {
     setRepositoryReady(true);
     setWorkspaceVersion((current) => current + 1);
     setStatus(nextStatus);
-    setConflicts(
-      conflictResult?.code === 0
-        ? parseJsonOutput<RepoConflictList>(conflictResult)
-        : emptyConflicts,
-    );
+    setMergeStatus(nextMergeStatus);
+    setMergePaths(nextMergePaths);
+    setConflicts(nextConflicts);
     setTrackedPaths(nextTrackedPaths);
     setHistory(logResult.code === 0 ? parseJsonOutput<RepoLog>(logResult).commits : []);
     setBranches(
       branchResult.code === 0 ? parseJsonOutput<BranchList>(branchResult).branches : [],
     );
+    if (
+      nextMergeStatus.state === "merging" &&
+      nextMergePaths.length > 0 &&
+      activeSurface.type !== "conflict"
+    ) {
+      const recoveryPath =
+        nextMergePaths.find((item) => item.state === "unmerged")?.path ?? nextMergePaths[0].path;
+      setSelectedVersionPath(recoveryPath);
+      setSelectedChangeSection("unstaged");
+      setSurface({ path: recoveryPath, type: "conflict" });
+    }
     if (activeSurface.type === "conflict" && !nextStatus.merge_head) {
       setSurface({ type: "empty" });
       setSelectedVersionPath(undefined);
@@ -544,23 +646,28 @@ export function App() {
     async (branch: string) => {
       setBusy(true);
       try {
-        const result = await client.run(["merge", "--json", branch]);
-        if (result.code !== 0) {
-          throw new Error(commandError(result.stderr, t("status.graftFailed")));
+        const plan = await runMergeApi<MergePlanResult>(client, ["plan", branch]);
+        const applyArgs = ["apply", branch, "--plan-token", plan.plan_token];
+        if (plan.expected_head) {
+          applyArgs.push("--expected-head", plan.expected_head);
         }
-        const payload = parseJsonOutput<JsonMergeOutcome>(result);
-        const conflictPath = payload.paths?.find((path) => path.action === "conflicted")?.path;
+        const applied = await runMergeApi<MergeApplyResult>(client, applyArgs);
+        const conflictPath = applied.plan.conflicted_paths[0];
         setMessage(
-          conflictPath
+          applied.merge.state === "merging" && applied.merge.unmerged_count > 0
             ? t("status.mergeHasConflicts", { branch })
-            : t("status.mergeStarted", { branch }),
+            : t("status.mergePlanApplied", { kind: plan.kind.replaceAll("_", " ") }),
         );
         await refresh();
         setSidebarTab("version");
         setVersionTab("changes");
         setSelectedVersionPath(conflictPath);
         setSelectedChangeSection(conflictPath ? "unstaged" : undefined);
-        setSurface({ path: conflictPath ?? "", type: "conflict" });
+        setSurface(
+          applied.merge.state === "merging"
+            ? { path: conflictPath ?? "", type: "conflict" }
+            : { type: "empty" },
+        );
         setMobilePane("editor");
       } catch (error) {
         setMessage(error instanceof Error ? error.message : String(error));
@@ -575,25 +682,38 @@ export function App() {
     async (request: ConflictResolutionRequest) => {
       setBusy(true);
       try {
-        const args = ["resolve", "--json", `--${request.resolution}`];
-        if (request.row) {
-          args.push("--row", request.row.table, String(request.row.rowid));
+        if (mergeStatus.state !== "merging") {
+          throw new Error(t("status.startMergeFirst"));
         }
-        args.push(request.path);
-        const result = await client.run(args);
-        if (result.code !== 0) {
-          throw new Error(commandError(result.stderr, t("status.graftFailed")));
-        }
-        const payload = parseJsonOutput<JsonResolveOutcome>(result);
+        const args = request.row
+          ? [
+              "row",
+              request.path,
+              request.row.table,
+              JSON.stringify(request.row.identity),
+              request.resolution,
+              "--state-token",
+              mergeStatus.state_token,
+            ]
+          : [
+              "path",
+              request.path,
+              request.resolution,
+              "--state-token",
+              mergeStatus.state_token,
+            ];
+        const payload = await runMergeApi<MergeOperationResult>(client, args);
+        const remaining =
+          payload.merge.state === "merging" ? payload.merge.unmerged_count : 0;
         setMessage(
-          payload.remaining_conflicts === 0
+          remaining === 0
             ? t("status.allConflictsResolved")
             : t("status.conflictResolved", {
-                count: payload.remaining_conflicts,
+                count: remaining,
                 path: request.path,
               }),
         );
-        if (payload.remaining_conflicts === 0) {
+        if (remaining === 0) {
           setGuideProgress((current) =>
             current.includes("resolve-conflict")
               ? current
@@ -606,23 +726,78 @@ export function App() {
         setSelectedChangeSection("unstaged");
         return true;
       } catch (error) {
-        setMessage(error instanceof Error ? error.message : String(error));
+        const detail = error instanceof Error ? error.message : String(error);
         await refresh();
+        setMessage(detail);
         return false;
       } finally {
         setBusy(false);
       }
     },
-    [client, refresh, t],
+    [client, mergeStatus, refresh, t],
+  );
+
+  const readMergeVersion = useCallback(
+    async (path: string, version: MergeVersion): Promise<MergeContent | undefined> => {
+      if (mergeStatus.state !== "merging") return undefined;
+      try {
+        return await runMergeApi<MergeContent>(client, [
+          "version",
+          path,
+          version,
+          "--state-token",
+          mergeStatus.state_token,
+        ]);
+      } catch (error) {
+        setMessage(error instanceof Error ? error.message : String(error));
+        return undefined;
+      }
+    },
+    [client, mergeStatus],
+  );
+
+  const writeTextResult = useCallback(
+    async (path: string, content: string) => {
+      if (mergeStatus.state !== "merging") return false;
+      setBusy(true);
+      try {
+        await runMergeApi<MergeOperationResult>(client, [
+          "text",
+          path,
+          "--content",
+          content,
+          "--state-token",
+          mergeStatus.state_token,
+        ]);
+        setMessage(t("status.textResolutionSaved", { path }));
+        await refresh();
+        setSurface({ path, type: "conflict" });
+        setSelectedVersionPath(path);
+        setSelectedChangeSection("unstaged");
+        return true;
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        await refresh();
+        setMessage(detail);
+        return false;
+      } finally {
+        setBusy(false);
+      }
+    },
+    [client, mergeStatus, refresh, t],
   );
 
   const abortMerge = useCallback(async () => {
     setBusy(true);
     try {
-      const result = await client.run(["merge", "--json", "--abort"]);
-      if (result.code !== 0) {
-        throw new Error(commandError(result.stderr, t("status.graftFailed")));
+      if (mergeStatus.state !== "merging") {
+        throw new Error(t("status.startMergeFirst"));
       }
+      await runMergeApi<MergeOperationResult>(client, [
+        "abort",
+        "--state-token",
+        mergeStatus.state_token,
+      ]);
       setSurface({ type: "empty" });
       setSelectedVersionPath(undefined);
       setSelectedChangeSection(undefined);
@@ -635,22 +810,22 @@ export function App() {
     } finally {
       setBusy(false);
     }
-  }, [client, refresh, t]);
+  }, [client, mergeStatus, refresh, t]);
 
   const continueMerge = useCallback(
     async (commitMessage: string) => {
       setBusy(true);
       try {
-        const result = await client.run([
-          "merge",
-          "--json",
-          "--continue",
+        if (mergeStatus.state !== "merging") {
+          throw new Error(t("status.startMergeFirst"));
+        }
+        await runMergeApi<MergeOperationResult>(client, [
+          "continue",
           "-m",
           commitMessage,
+          "--state-token",
+          mergeStatus.state_token,
         ]);
-        if (result.code !== 0) {
-          throw new Error(commandError(result.stderr, t("status.graftFailed")));
-        }
         setSurface({ type: "empty" });
         setSelectedVersionPath(undefined);
         setSelectedChangeSection(undefined);
@@ -669,7 +844,7 @@ export function App() {
         setBusy(false);
       }
     },
-    [client, refresh, t],
+    [client, mergeStatus, refresh, t],
   );
 
   const discardWorktreePaths = useCallback(
@@ -970,6 +1145,81 @@ export function App() {
     }
   }, [client, openFile, refresh, t]);
 
+  const createMergeFixture = useCallback(async () => {
+    setBusy(true);
+    setMessage(t("status.creatingMergeFixture"));
+    const fixtureText = "merge-lab/fixture.txt";
+    const fixtureDb = "merge-lab/fixture.sqlite";
+    const oursBranch = "merge-lab/ours";
+    const theirsBranch = "merge-lab/theirs";
+    try {
+      const currentEntries = await scanOpfs();
+      if (
+        currentEntries.some((entry) => entry.path === fixtureText || entry.path === fixtureDb) ||
+        branches.some((branch) => branch.name === oursBranch || branch.name === theirsBranch)
+      ) {
+        throw new Error(t("status.mergeFixtureExists"));
+      }
+      if (status.merge_head || status.work_in_progress) {
+        throw new Error(t("status.mergeFixtureCleanFirst"));
+      }
+
+      const runChecked = async (args: string[], label: string) => {
+        const result = await client.run(args);
+        if (result.code !== 0) {
+          throw new Error(`${label}: ${commandError(result.stderr, t("status.graftFailed"))}`);
+        }
+      };
+
+      if (!repositoryReady) await runChecked(["init", "--json"], "initialize repository");
+      await writeOpfsText(fixtureText, "base line\nkeep this context\n", "/", true);
+      await runChecked(
+        [
+          "--db",
+          fixtureDb,
+          "sql",
+          "CREATE TABLE notes(id INTEGER PRIMARY KEY, value TEXT); INSERT INTO notes(id, value) VALUES (1, 'base row');",
+        ],
+        "create merge fixture database",
+      );
+      await runChecked(["add", "--json", "--all"], "stage merge fixture base");
+      await runChecked(["commit", "--json", "-m", "Merge lab base"], "commit merge fixture base");
+      const baseStatus = parseJsonOutput<RepoStatus>(await client.run(["status", "--json"]));
+      if (!baseStatus.current_head) throw new Error("Merge fixture did not create a base commit");
+
+      await runChecked(["switch", "--json", "-c", oursBranch], "create ours branch");
+      await writeOpfsText(fixtureText, "ours line\nkeep this context\n");
+      await runChecked(
+        ["--db", fixtureDb, "sql", "UPDATE notes SET value = 'ours row' WHERE id = 1;"],
+        "edit ours database",
+      );
+      await runChecked(["add", "--json", "--all"], "stage ours changes");
+      await runChecked(["commit", "--json", "-m", "Merge lab ours"], "commit ours changes");
+
+      await runChecked(
+        ["switch", "--json", "-c", theirsBranch, baseStatus.current_head],
+        "create theirs branch",
+      );
+      await writeOpfsText(fixtureText, "theirs line\nkeep this context\n");
+      await runChecked(
+        ["--db", fixtureDb, "sql", "UPDATE notes SET value = 'theirs row' WHERE id = 1;"],
+        "edit theirs database",
+      );
+      await runChecked(["add", "--json", "--all"], "stage theirs changes");
+      await runChecked(["commit", "--json", "-m", "Merge lab theirs"], "commit theirs changes");
+      await runChecked(["switch", "--json", oursBranch], "return to ours branch");
+
+      await refresh();
+      setSidebarTab("version");
+      setVersionTab("changes");
+      setMessage(t("status.mergeFixtureCreated"));
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  }, [branches, client, refresh, repositoryReady, status.merge_head, status.work_in_progress, t]);
+
   const loadHistoryDiff = useCallback(
     async (commit: CommitInfo, path?: string) => {
       const change = historyChange(commit, path);
@@ -1071,6 +1321,28 @@ export function App() {
     return true;
   }, [history, loadHistoryDiff, t]);
 
+  const toggleHistoryCommit = useCallback(
+    (commit: CommitInfo) => {
+      const isClosing = selectedHistoryId === commit.id;
+      setSelectedHistoryId(isClosing ? undefined : commit.id);
+      setSelectedVersionPath(undefined);
+      setSelectedChangeSection(undefined);
+      if (
+        surfaceRef.current.type === "diff" &&
+        surfaceRef.current.diff.label?.startsWith("HISTORY")
+      ) {
+        setSurface({ type: "empty" });
+      }
+    },
+    [selectedHistoryId],
+  );
+
+  const closeDiff = useCallback(() => {
+    setSurface({ type: "empty" });
+    setSelectedVersionPath(undefined);
+    setSelectedChangeSection(undefined);
+  }, []);
+
   const runGuideAction = useCallback(
     async (action: GuideAction) => {
       if (action === "open-row-diff") return openGuideRowDiff();
@@ -1086,11 +1358,6 @@ export function App() {
     surface.type === "file" || surface.type === "sqlite"
       ? entries.find((entry) => entry.path === surface.path)
       : undefined;
-  const selectedHistoryCommit = history.find(
-    (commit) => commit.id === selectedHistoryId,
-  );
-  const historyReviewOpen =
-    repositoryReady && sidebarTab === "version" && versionTab === "history";
   const mobilePaneLabels: Record<MobilePane, string> = {
     editor: t("app.editor"),
     sidebar: t("app.sidebar"),
@@ -1206,7 +1473,6 @@ export function App() {
         className={`ide-workspace mobile-${mobilePane} ${guideOpen ? "has-guide" : ""} ${terminalOpen ? "" : "terminal-closed"}`}
         style={
           {
-            "--commit-files-width": `${commitFilesWidth}px`,
             "--explorer-width": `${explorerWidth}px`,
             "--guide-width": `${guideWidth}px`,
             "--terminal-height": `${terminalHeight}px`,
@@ -1279,11 +1545,13 @@ export function App() {
                         t("status.branchCreated", { name }),
                       )
                     }
+                    onCreateMergeFixture={createMergeFixture}
                     onDiscardPaths={discardWorktreePaths}
                     onMergeBranch={mergeBranch}
                     onReset={resetVersion}
                     onSelectHistory={(commit, path) => void loadHistoryDiff(commit, path)}
                     onSelectPath={(path, section) => void loadCurrentDiff(path, status, section)}
+                    onToggleHistory={toggleHistoryCommit}
                     onStageAll={() =>
                       runGuiCommand(
                         ["add", "--json", "--all"],
@@ -1304,9 +1572,6 @@ export function App() {
                     }
                     onTabChange={(tab) => {
                       setVersionTab(tab);
-                      if (tab === "history" && !selectedHistoryId && history[0]) {
-                        void loadHistoryDiff(history[0]);
-                      }
                     }}
                     onUnstageAll={() =>
                       runGuiCommand(
@@ -1346,35 +1611,19 @@ export function App() {
         />
 
         <div className={`ide-main ${terminalOpen ? "" : "is-terminal-closed"}`}>
-          <div
-            className={`primary-surface ${historyReviewOpen ? "is-history-review" : ""}`}
-            data-area="editor"
-          >
-            {historyReviewOpen && (
-              <CommitFilesPane
-                commit={selectedHistoryCommit}
-                onSelectPath={(commit, path) => void loadHistoryDiff(commit, path)}
-                selectedPath={selectedVersionPath}
-              />
-            )}
-            {historyReviewOpen && (
-              <ResizeHandle
-                axis="vertical"
-                className="commit-files-resize-handle"
-                label={t("app.resizeCommitFiles")}
-                onDelta={(delta) =>
-                  setCommitFilesWidth((current) => clamp(current + delta, 220, 420))
-                }
-              />
-            )}
+          <div className="primary-surface" data-area="editor">
             <div className="primary-content">
             {surface.type === "conflict" ? (
               <ConflictResolver
                 busy={busy}
                 conflicts={conflicts}
+                mergePaths={mergePaths}
+                mergeStatus={mergeStatus}
                 onAbort={abortMerge}
                 onContinue={continueMerge}
+                onReadVersion={readMergeVersion}
                 onResolve={resolveConflict}
+                onWriteTextResult={writeTextResult}
                 onSelectPath={(path) => {
                   setSelectedVersionPath(path);
                   setSelectedChangeSection("unstaged");
@@ -1401,11 +1650,11 @@ export function App() {
               />
             ) : surface.type === "diff" ? (
               surface.diff.kind === "sqlite_database" ? (
-                <SqliteDiffPane diff={surface.diff} />
+                <SqliteDiffPane diff={surface.diff} onClose={closeDiff} />
               ) : surface.diff.kind === "binary_file" ? (
-                <BinaryDiffPane diff={surface.diff} />
+                <BinaryDiffPane diff={surface.diff} onClose={closeDiff} />
               ) : (
-                <DiffPane diff={surface.diff} />
+                <DiffPane diff={surface.diff} onClose={closeDiff} />
               )
             ) : (
               <section className="welcome-surface">

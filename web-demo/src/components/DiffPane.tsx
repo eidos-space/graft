@@ -1,11 +1,19 @@
 import { parseDiffFromFile } from "@pierre/diffs";
-import { FileDiff } from "@pierre/diffs/react";
-import { useMemo } from "react";
+import { FileDiff, Virtualizer } from "@pierre/diffs/react";
+import { useMemo, useState } from "react";
 import { useI18n } from "../i18n";
 import type { TextDiffView } from "../types";
+import { DiffInspectorHeader } from "./DiffInspectorHeader";
 
-export function DiffPane({ diff }: { diff: TextDiffView }) {
-  const { t } = useI18n();
+function byteCount(value: string, locale: string) {
+  return new Intl.NumberFormat(locale, { notation: "compact" }).format(
+    new TextEncoder().encode(value).byteLength,
+  );
+}
+
+export function DiffPane({ diff, onClose }: { diff: TextDiffView; onClose: () => void }) {
+  const { locale, t } = useI18n();
+  const [layout, setLayout] = useState<"split" | "unified">("split");
   const label =
     diff.label === "HISTORY DIFF"
       ? t("diff.history")
@@ -41,36 +49,64 @@ export function DiffPane({ diff }: { diff: TextDiffView }) {
   );
 
   return (
-    <section className="diff-surface" aria-label={t("diff.label", { path: diff.path })}>
-      <header className="surface-tabbar">
-        <div className="surface-file-tab is-diff">
-          <span className="file-glyph" aria-hidden="true">
-            ±
-          </span>
-          <strong>{diff.path}</strong>
+    <section
+      className="diff-surface version-inspector"
+      aria-label={t("diff.label", { path: diff.path })}
+    >
+      <DiffInspectorHeader
+        mode={diff.label?.startsWith("HISTORY") ? t("version.history") : t("version.changes")}
+        onClose={onClose}
+        path={diff.path}
+      />
+      <div className="version-text-diff">
+        <header className="diff-inspector-toolbar version-text-diff-toolbar">
+          <div>
+            <strong>{t("diff.textChanges")}</strong>
+            <span>
+              {byteCount(diff.before, locale)} B
+              <i aria-hidden="true"> → </i>
+              {byteCount(diff.after, locale)} B
+              <i aria-hidden="true"> · </i>
+              {label}
+              <i aria-hidden="true"> · </i>
+              {description}
+            </span>
+          </div>
+          <div className="version-text-diff-layout" aria-label={t("diff.layout")}>
+            <button
+              aria-pressed={layout === "split"}
+              onClick={() => setLayout("split")}
+              type="button"
+            >
+              {t("diff.split")}
+            </button>
+            <button
+              aria-pressed={layout === "unified"}
+              onClick={() => setLayout("unified")}
+              type="button"
+            >
+              {t("diff.unified")}
+            </button>
+          </div>
+        </header>
+        <div className="diff-editor-scroll version-text-diff-surface">
+          <Virtualizer className="version-text-diff-virtualizer">
+            <FileDiff
+              fileDiff={fileDiff}
+              options={{
+                diffStyle: layout,
+                disableFileHeader: true,
+                hunkSeparators: "simple",
+                lineDiffType: "word",
+                overflow: "scroll",
+                stickyHeader: false,
+                theme: "pierre-light",
+                themeType: "light",
+              }}
+            />
+          </Virtualizer>
         </div>
-        <div className="surface-actions">
-          <span>{label}</span>
-        </div>
-      </header>
-      <div className="diff-editor-scroll">
-        <FileDiff
-          fileDiff={fileDiff}
-          options={{
-            diffStyle: "split",
-            hunkSeparators: "simple",
-            lineDiffType: "word",
-            overflow: "wrap",
-            stickyHeader: true,
-            theme: "pierre-light",
-            themeType: "light",
-          }}
-        />
       </div>
-      <footer className="surface-statusbar">
-        <span>{diff.kind.replaceAll("_", " ")}</span>
-        <span>{description}</span>
-      </footer>
     </section>
   );
 }

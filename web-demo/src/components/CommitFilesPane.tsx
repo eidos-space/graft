@@ -17,6 +17,7 @@ function kindLabel(kind: CommitChange["kind"], t: Translate) {
 function changeLabel(change: CommitChange["change"], t: Translate) {
   if (change === "added") return t("version.change.added");
   if (change === "deleted") return t("version.change.deleted");
+  if (change === "renamed") return t("version.change.renamed");
   return t("version.change.modified");
 }
 
@@ -62,6 +63,9 @@ export function CommitFilesPane({
               {changes.length > 0 ? (
                 changes.map((change) => {
                   const active = selectedPath === change.path;
+                  const displayPath = change.previous_path
+                    ? `${change.previous_path} → ${change.path}`
+                    : change.path;
                   return (
                     <button
                       aria-current={active ? "page" : undefined}
@@ -72,13 +76,13 @@ export function CommitFilesPane({
                       className={active ? "is-selected" : ""}
                       key={change.path}
                       onClick={() => onSelectPath(commit, change.path)}
-                      title={change.path}
+                      title={displayPath}
                       type="button"
                     >
                       <span className={`change-code change-${change.change}`}>
                         {change.change.slice(0, 1).toUpperCase()}
                       </span>
-                      <strong>{change.path}</strong>
+                      <strong>{displayPath}</strong>
                       <small>
                         {kindLabel(change.kind, t)} · {changeLabel(change.change, t)}
                       </small>

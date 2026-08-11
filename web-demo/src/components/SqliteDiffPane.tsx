@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useI18n } from "../i18n";
 import type { SqliteDiffView, SqliteRowChange } from "../types";
+import { DiffInspectorHeader } from "./DiffInspectorHeader";
 
 function displayValue(value: unknown) {
   if (value === null) return "NULL";
@@ -40,7 +41,13 @@ function ValueDiff({
   );
 }
 
-export function SqliteDiffPane({ diff }: { diff: SqliteDiffView }) {
+export function SqliteDiffPane({
+  diff,
+  onClose,
+}: {
+  diff: SqliteDiffView;
+  onClose: () => void;
+}) {
   const { t } = useI18n();
   const label =
     diff.label === "HISTORY ROW DIFF"
@@ -74,112 +81,95 @@ export function SqliteDiffPane({ diff }: { diff: SqliteDiffView }) {
 
   return (
     <section
-      className="sqlite-diff-surface"
+      className="sqlite-diff-surface version-inspector"
       aria-label={t("sqliteDiff.label", { path: diff.path })}
     >
-      <header className="surface-tabbar">
-        <div className="surface-file-tab is-sqlite-diff">
-          <span className="file-glyph" aria-hidden="true">
-            ▦
-          </span>
-          <strong>{diff.path}</strong>
-        </div>
-        <div className="surface-actions sqlite-diff-heading">
-          <span>{label}</span>
-          <b>{t("sqliteDiff.rows", { count: total })}</b>
-        </div>
-      </header>
+      <DiffInspectorHeader
+        mode={diff.label?.startsWith("HISTORY") ? t("version.history") : t("version.changes")}
+        onClose={onClose}
+        path={diff.path}
+      />
 
       <div className="sqlite-diff-workspace">
-        <aside className="sqlite-diff-tables" aria-label={t("sqliteDiff.changedTablesAria")}>
-          <div className="sqlite-diff-section-label">{t("sqliteDiff.changedTables")}</div>
-          {diff.tables.map((item) => (
-            <button
-              aria-current={table?.name === item.name ? "page" : undefined}
-              key={item.name}
-              onClick={() => setTableName(item.name)}
-              type="button"
-            >
-              <span aria-hidden="true">▦</span>
-              <strong>{item.name}</strong>
-              <small>{item.changes.length}</small>
-            </button>
-          ))}
-        </aside>
-
-        <div className="sqlite-diff-data">
-          <div className="sqlite-diff-summary" aria-label={t("sqliteDiff.summary")}>
-            <div className="is-insert">
-              <span>+</span>
-              <strong>{counts.insert}</strong>
-              <small>{t("sqliteDiff.inserted")}</small>
-            </div>
-            <div className="is-update">
-              <span>±</span>
-              <strong>{counts.update}</strong>
-              <small>{t("sqliteDiff.updated")}</small>
-            </div>
-            <div className="is-delete">
-              <span>−</span>
-              <strong>{counts.delete}</strong>
-              <small>{t("sqliteDiff.deleted")}</small>
+        <header className="diff-inspector-toolbar sqlite-diff-toolbar">
+          <div>
+            <strong>{label}</strong>
+            <span>
+              {t("sqliteDiff.rows", { count: total })}
+              <i aria-hidden="true"> · </i>
+              {description}
+            </span>
+          </div>
+          <div className="sqlite-diff-controls">
+            <label>
+              <span className="sr-only">{t("sqliteDiff.changedTablesAria")}</span>
+              <select
+                aria-label={t("sqliteDiff.changedTablesAria")}
+                onChange={(event) => setTableName(event.target.value)}
+                value={table?.name ?? ""}
+              >
+                {diff.tables.map((item) => (
+                  <option key={item.name} value={item.name}>
+                    {item.name} ({item.changes.length})
+                  </option>
+                ))}
+              </select>
+            </label>
+            <div className="sqlite-diff-counts" aria-label={t("sqliteDiff.summary")}>
+              <span className="is-insert">+{counts.insert}</span>
+              <span className="is-update">±{counts.update}</span>
+              <span className="is-delete">−{counts.delete}</span>
             </div>
           </div>
+        </header>
 
-          <div className="sqlite-diff-grid-scroll">
-            {table ? (
-              <table className="sqlite-diff-grid">
-                <thead>
-                  <tr>
-                    <th className="operation-column">{t("sqliteDiff.change")}</th>
-                    <th className="diff-rowid-column">rowid</th>
-                    {table.columns.map((column) => (
-                      <th key={column}>{column}</th>
+        <div className="sqlite-diff-grid-scroll">
+          {table ? (
+            <table className="sqlite-diff-grid">
+              <thead>
+                <tr>
+                  <th className="operation-column">{t("sqliteDiff.change")}</th>
+                  <th className="diff-rowid-column">rowid</th>
+                  {table.columns.map((column) => (
+                    <th key={column}>{column}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {table.changes.map((change, rowIndex) => (
+                  <tr className={`row-diff-${change.op}`} key={`${change.rowid}-${rowIndex}`}>
+                    <td className="operation-column">
+                      <span className={`operation-badge is-${change.op}`}>
+                        {t(
+                          change.op === "insert"
+                            ? "sqliteDiff.inserted"
+                            : change.op === "delete"
+                              ? "sqliteDiff.deleted"
+                              : "sqliteDiff.updated",
+                        )}
+                      </span>
+                    </td>
+                    <td className="diff-rowid-column">{change.rowid}</td>
+                    {table.columns.map((column, columnIndex) => (
+                      <td key={column}>
+                        <ValueDiff
+                          after={change.values[columnIndex]}
+                          before={change.old_values?.[columnIndex]}
+                          operation={change.op}
+                        />
+                      </td>
                     ))}
                   </tr>
-                </thead>
-                <tbody>
-                  {table.changes.map((change, rowIndex) => (
-                    <tr className={`row-diff-${change.op}`} key={`${change.rowid}-${rowIndex}`}>
-                      <td className="operation-column">
-                        <span className={`operation-badge is-${change.op}`}>
-                          {t(
-                            change.op === "insert"
-                              ? "sqliteDiff.inserted"
-                              : change.op === "delete"
-                                ? "sqliteDiff.deleted"
-                                : "sqliteDiff.updated",
-                          )}
-                        </span>
-                      </td>
-                      <td className="diff-rowid-column">{change.rowid}</td>
-                      {table.columns.map((column, columnIndex) => (
-                        <td key={column}>
-                          <ValueDiff
-                            after={change.values[columnIndex]}
-                            before={change.old_values?.[columnIndex]}
-                            operation={change.op}
-                          />
-                        </td>
-                      ))}
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            ) : (
-              <div className="surface-message compact">
-                {t("sqliteDiff.noChanges")}
-              </div>
-            )}
-          </div>
+                ))}
+              </tbody>
+            </table>
+          ) : (
+            <div className="surface-message compact">
+              {t("sqliteDiff.noChanges")}
+            </div>
+          )}
         </div>
       </div>
-
-      <footer className="surface-statusbar sqlite-diff-status">
-        <span>{t("sqliteDiff.database")}</span>
-        <span>{t("sqliteDiff.legend")}</span>
-        <span>{description}</span>
-      </footer>
     </section>
   );
 }

@@ -1,4 +1,12 @@
 import { expect, test, type Page } from "@playwright/test";
+import { readFileSync } from "node:fs";
+
+const graftToolManifest = readFileSync(
+  new URL("../../../crates/graft-tool/Cargo.toml", import.meta.url),
+  "utf8",
+);
+const graftVersion = graftToolManifest.match(/^version = "([^"]+)"$/m)?.[1];
+if (!graftVersion) throw new Error("Could not read the graft-tool version");
 
 interface CommandResult {
   code: number;
@@ -19,6 +27,44 @@ async function run(page: Page, args: string[]) {
   }, args);
   expect(result.code, result.stderr.join("\n")).toBe(0);
   return result;
+}
+
+async function runRaw(page: Page, args: string[]) {
+  return page.evaluate(async (command) => {
+    const client = (
+      window as typeof window & {
+        graftTestClient: {
+          run(args: string[]): Promise<CommandResult>;
+        };
+      }
+    ).graftTestClient;
+    return client.run(command);
+  }, args);
+}
+
+async function runPlaygroundRaw(page: Page, args: string[]) {
+  return page.evaluate(async (command) => {
+    const client = (
+      window as typeof window & {
+        graftPlaygroundClient: {
+          run(args: string[]): Promise<CommandResult>;
+        };
+      }
+    ).graftPlaygroundClient;
+    return client.run(command);
+  }, args);
+}
+
+async function playgroundMergeApi<T>(page: Page, args: string[]) {
+  const result = await runPlaygroundRaw(page, ["merge-api", ...args]);
+  expect(result.code, result.stderr.join("\n")).toBe(0);
+  return JSON.parse(result.stdout.join("\n")) as T;
+}
+
+async function mergeApi<T>(page: Page, args: string[]) {
+  const result = await runRaw(page, ["merge-api", ...args]);
+  expect(result.code, result.stderr.join("\n")).toBe(0);
+  return JSON.parse(result.stdout.join("\n")) as T;
 }
 
 async function writeOpfs(page: Page, path: string, contents: string) {
@@ -78,7 +124,219 @@ async function openVersionPanel(page: Page) {
   await expect(page.locator(".version-panel")).toBeVisible({ timeout: 30_000 });
 }
 
-test("history uses vertical files above an editor-aligned terminal and changes remain split", async ({
+test("runtime and version views expose first-class path renames", async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem("graft-guide-open", "false");
+    localStorage.setItem("graft-language", "en");
+  });
+  await page.goto("/e2e.html?reset=1");
+  await expect(page.locator("html")).toHaveAttribute("data-ready", "true");
+  await run(page, ["init"]);
+  await writeOpfs(page, "notes.txt", "path identity stays intact\n");
+  await run(page, ["add", "--all"]);
+  await run(page, ["commit", "-m", "Add notes"]);
+  await run(page, [
+    "--browser-cwd",
+    "/",
+    "browser-move",
+    "/notes.txt",
+    "/archive-notes.txt",
+  ]);
+  await run(page, ["add", "--all"]);
+
+  await openVersionPanel(page);
+  await expect(page.locator(".graft-version")).toHaveAttribute(
+    "data-graft-version",
+    graftVersion,
+  );
+  const rename = page.locator(".changes-section .change-row");
+  await expect(rename).toHaveCount(1);
+  await expect(rename).toContainText("notes.txt → archive-notes.txt");
+  await expect(rename.locator(".change-renamed")).toHaveText("R");
+  await rename.locator(".change-main").click();
+  await expect(page.locator(".diff-surface")).toBeVisible();
+
+  await page.getByLabel("Commit message").fill("Archive notes");
+  await page.getByRole("button", { name: "Commit", exact: true }).click();
+  await expect(page.locator(".empty-list")).toContainText("clean");
+  await page.locator(".segmented-control button").nth(1).click();
+  await page.locator(".history-entry > button").first().click();
+  const committedRename = page.locator(".commit-file-list > button");
+  await expect(committedRename).toHaveCount(1);
+  await expect(committedRename).toContainText("notes.txt → archive-notes.txt");
+  await expect(committedRename.locator(".change-renamed")).toHaveText("R");
+});
+
+test("WASM merge-api plans up-to-date, fast-forward, and three-way histories", async ({ page }) => {
+  const apiPage = await page.context().newPage();
+  await apiPage.goto("/e2e.html?reset=1");
+  await expect(apiPage.locator("html")).toHaveAttribute("data-ready", "true");
+  await run(apiPage, ["init"]);
+  const branchList = JSON.parse(
+    (await run(apiPage, ["branch", "--json"])).stdout.join("\n"),
+  ) as { branches: Array<{ current: boolean; name: string }> };
+  const initialBranch = branchList.branches.find((branch) => branch.current)?.name ?? "main";
+  await writeOpfs(apiPage, "merge-plan.txt", "base\n");
+  await run(apiPage, ["add", "--all"]);
+  await run(apiPage, ["commit", "-m", "plan base"]);
+
+  await run(apiPage, ["switch", "-c", "merge-plan/target"]);
+  await writeOpfs(apiPage, "merge-plan.txt", "target\n");
+  await run(apiPage, ["add", "--all"]);
+  await run(apiPage, ["commit", "-m", "plan target"]);
+  await run(apiPage, ["switch", initialBranch]);
+
+  const fastForward = await mergeApi<{ kind: string }>(apiPage, [
+    "plan",
+    "merge-plan/target",
+  ]);
+  expect(fastForward.kind).toBe("fast_forward");
+
+  const upToDate = await mergeApi<{ kind: string }>(apiPage, ["plan", initialBranch]);
+  expect(upToDate.kind).toBe("up_to_date");
+
+  await writeOpfs(apiPage, "merge-plan.txt", "local\n");
+  await run(apiPage, ["add", "--all"]);
+  await run(apiPage, ["commit", "-m", "plan local"]);
+  const threeWay = await mergeApi<{ kind: string; plan_token: string }>(apiPage, [
+    "plan",
+    "merge-plan/target",
+  ]);
+  expect(threeWay.kind).toBe("three_way");
+  expect(threeWay.plan_token).toMatch(/.+/);
+  await apiPage.close();
+});
+
+test("merge lab keeps durable text and SQLite conflicts recoverable", async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem("graft-guide-open", "false");
+    localStorage.setItem("graft-language", "en");
+  });
+  // Seed before opening the Playground so the harness worker is torn down on
+  // navigation. A second long-lived WASM worker can race the UI's OPFS handles.
+  await page.goto("/e2e.html?reset=1");
+  await expect(page.locator("html")).toHaveAttribute("data-ready", "true");
+  await run(page, ["init"]);
+
+  await openVersionPanel(page);
+  await page.getByRole("button", { name: "Merge lab", exact: true }).click();
+  await expect(page.locator('option[value="merge-lab/theirs"]')).toHaveCount(1, {
+    timeout: 30_000,
+  });
+
+  await page.locator(".branch-merge-toggle").click();
+  await page.locator(".branch-merge select").selectOption("merge-lab/theirs");
+  await page.locator(".branch-merge button").click();
+  await expect(page.locator(".conflict-workspace")).toBeVisible({ timeout: 30_000 });
+  await expect(page.locator(".conflict-lineage")).toContainText("LOCAL");
+  await expect(page.locator(".conflict-lineage")).toContainText("HOSTED");
+  await expect(page.locator(".conflict-lineage")).toContainText("BASE");
+  await expect(page.locator(".conflict-progress code")).toContainText("state");
+  await page.locator(".conflict-paths button").filter({ hasText: "fixture.txt" }).click();
+  await expect(page.locator(".conflict-text-review")).toBeVisible();
+  await expect(page.locator(".conflict-row-comparison")).toHaveCount(0);
+
+  const mergeStatus = await playgroundMergeApi<{
+    state: "merging";
+    state_token: string;
+    unmerged_count: number;
+  }>(page, ["status"]);
+  expect(mergeStatus.state).toBe("merging");
+  expect(mergeStatus.unmerged_count).toBeGreaterThanOrEqual(2);
+
+  const stale = await runPlaygroundRaw(page, [
+    "merge-api",
+    "path",
+    "merge-lab/fixture.txt",
+    "ours",
+    "--state-token",
+    "stale-token",
+  ]);
+  expect(stale.code).not.toBe(0);
+  expect(`${stale.stderr.join("\n")} ${stale.stdout.join("\n")}`).toMatch(/token|state|stale/i);
+
+  await page.screenshot({ path: "test-results/merge-conflict-workbench.png", fullPage: true });
+  const resultEditor = page.locator(".conflict-result-editor textarea");
+  await expect(resultEditor).toHaveValue(/ours line/);
+  await resultEditor.fill("resolved result\nkeep this context\n");
+  await page.getByRole("button", { name: "Save result", exact: true }).click();
+  await expect(
+    page.locator(".conflict-paths button").filter({ hasText: "fixture.txt" }),
+  ).toContainText("0 unresolved");
+
+  await page.locator(".conflict-paths button").filter({ hasText: "fixture.sqlite" }).click();
+  await expect(page.locator(".conflict-row-comparison")).toBeVisible();
+  await expect(page.locator(".conflict-row-comparison")).toContainText("ours row");
+  await expect(page.locator(".conflict-row-comparison")).toContainText("theirs row");
+  const chooseOurs = page.getByRole("button", { name: "Choose ours", exact: true });
+  await expect(chooseOurs).toBeEnabled();
+  await chooseOurs.click();
+  await expect(
+    page.locator(".conflict-paths button").filter({ hasText: "fixture.sqlite" }),
+  ).toContainText("0 unresolved", { timeout: 30_000 });
+  await expect(page.getByRole("button", { name: "Finish merge", exact: true })).toBeVisible();
+
+  const resolvedStatus = await playgroundMergeApi<{
+    state: "merging";
+    unmerged_count: number;
+  }>(page, ["status"]);
+  expect(resolvedStatus.state).toBe("merging");
+  expect(resolvedStatus.unmerged_count).toBe(0);
+
+  await page.reload();
+  await expect(page.locator(".conflict-workspace")).toBeVisible({ timeout: 30_000 });
+  await expect(page.locator(".conflict-progress code")).toContainText("state");
+  await expect(page.getByRole("button", { name: "Finish merge", exact: true })).toBeVisible();
+  await page.screenshot({ path: "test-results/merge-recovered-after-reload.png", fullPage: true });
+
+  await page.getByLabel("Merge commit message").fill("Merge lab resolution");
+  await page.getByRole("button", { name: "Finish merge", exact: true }).click();
+  await expect(page.locator(".conflict-workspace")).toHaveCount(0);
+  await expect(page.locator(".version-panel")).toContainText("Merge lab resolution");
+});
+
+test("merge lab applies whole-path sides and aborts back to the original head", async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem("graft-guide-open", "false");
+    localStorage.setItem("graft-language", "en");
+  });
+  await page.goto("/e2e.html?reset=1");
+  await expect(page.locator("html")).toHaveAttribute("data-ready", "true");
+  await run(page, ["init"]);
+  await openVersionPanel(page);
+  await page.getByRole("button", { name: "Merge lab", exact: true }).click();
+  await expect(page.locator('option[value="merge-lab/theirs"]')).toHaveCount(1, {
+    timeout: 30_000,
+  });
+  await page.locator(".branch-merge-toggle").click();
+  await page.locator(".branch-merge select").selectOption("merge-lab/theirs");
+  await page.locator(".branch-merge button").click();
+  await expect(page.locator(".conflict-workspace")).toBeVisible({ timeout: 30_000 });
+
+  await page.getByRole("button", { name: "Use all ours", exact: true }).click();
+  await expect(
+    page.locator(".conflict-paths button").filter({ hasText: "fixture.sqlite" }),
+  ).toContainText("0 unresolved", { timeout: 30_000 });
+  await page.locator(".conflict-paths button").filter({ hasText: "fixture.txt" }).click();
+  await page.getByRole("button", { name: "Use all theirs", exact: true }).click();
+  await expect(
+    page.locator(".conflict-paths button").filter({ hasText: "fixture.txt" }),
+  ).toContainText("0 unresolved", { timeout: 30_000 });
+
+  const resolved = await playgroundMergeApi<{ state: "merging"; unmerged_count: number }>(
+    page,
+    ["status"],
+  );
+  expect(resolved.state).toBe("merging");
+  expect(resolved.unmerged_count).toBe(0);
+  await page.getByRole("button", { name: "Abort merge", exact: true }).click();
+  await expect(page.locator(".conflict-workspace")).toHaveCount(0);
+  await expect(page.locator('.branch-bar select')).toHaveValue("merge-lab/ours");
+  const aborted = await playgroundMergeApi<{ state: string }>(page, ["status"]);
+  expect(aborted.state).toBe("none");
+});
+
+test("history expands files inside each commit and keeps one full-width diff inspector", async ({
   page,
 }) => {
   await page.addInitScript(() => {
@@ -96,8 +354,14 @@ test("history uses vertical files above an editor-aligned terminal and changes r
   await page.screenshot({ path: "test-results/staged-and-unstaged-sections.png" });
 
   await page.locator(".segmented-control button").nth(1).click();
+  await expect(page.locator(".commit-file-list > button")).toHaveCount(0);
   await page.locator(".history-entry > button").first().click();
-  const files = page.locator(".commit-file-list > button");
+  const expandedCommit = page.locator(".history-entry").first();
+  await expect(expandedCommit.locator(".history-entry-toggle")).toHaveAttribute(
+    "aria-expanded",
+    "true",
+  );
+  const files = expandedCommit.locator(".commit-file-list > button");
   await expect(files).toHaveCount(3);
   const first = await files.nth(0).boundingBox();
   const second = await files.nth(1).boundingBox();
@@ -114,6 +378,8 @@ test("history uses vertical files above an editor-aligned terminal and changes r
   expect(editor).not.toBeNull();
   expect(content).not.toBeNull();
   expect(terminal).not.toBeNull();
+  expect(Math.abs(content!.x - editor!.x)).toBeLessThan(1);
+  expect(Math.abs(content!.width - editor!.width)).toBeLessThan(1);
   expect(terminal!.x).toBeGreaterThanOrEqual(sidebar!.x + sidebar!.width);
   expect(Math.abs(terminal!.x - editor!.x)).toBeLessThan(1);
   expect(Math.abs(terminal!.width - editor!.width)).toBeLessThan(1);
@@ -132,6 +398,22 @@ test("history uses vertical files above an editor-aligned terminal and changes r
   await page.screenshot({ path: "test-results/terminal-editor-aligned-with-guide.png" });
   await page.getByRole("button", { name: "Hide guide", exact: true }).click();
 
+  await files.filter({ hasText: "README.md" }).click();
+  await expect(page.locator(".version-inspector")).toBeVisible();
+  await expect(page.locator(".diff-inspector-breadcrumb")).toContainText(
+    "History›README.md",
+  );
+  await expect(page.getByRole("button", { name: "Split", exact: true })).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
+  await page.getByRole("button", { name: "Unified", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Unified", exact: true })).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
+  await page.screenshot({ path: "test-results/history-inline-files-text-diff.png" });
+
   await files.filter({ hasText: "assets/sample.png" }).click();
   const image = page.locator(".binary-image-history img");
   await expect(image).toHaveCount(1);
@@ -139,7 +421,11 @@ test("history uses vertical files above an editor-aligned terminal and changes r
   await expect.poll(() => image.evaluate((node) => node.naturalWidth)).toBeGreaterThan(0);
   await page.screenshot({ path: "test-results/history-image-preview.png" });
 
-  await page.screenshot({ path: "test-results/history-three-pane-terminal-span.png" });
+  await page.screenshot({ path: "test-results/history-inline-files-image-diff.png" });
+
+  await expandedCommit.locator(".history-entry-toggle").click();
+  await expect(expandedCommit.locator(".commit-file-list > button")).toHaveCount(0);
+  await expect(page.locator(".version-inspector")).toHaveCount(0);
 
   await page.locator(".segmented-control button").nth(0).click();
   await page.getByRole("button", { name: "Stage all", exact: true }).click();

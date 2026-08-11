@@ -319,6 +319,24 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
           window.clearTimeout(timeout);
         }
       }
+      if (command === "mv") {
+        if (args.length < 2) throw new Error(t("terminal.mvMissing"));
+        if (args.length > 2) throw new Error(t("terminal.mvTooMany"));
+        const source = resolveOpfsPath(args[0], cwd.current);
+        const destination = resolveOpfsPath(args[1], cwd.current);
+        const result = await client.run([
+          "--browser-cwd",
+          cwd.current,
+          "browser-move",
+          source,
+          destination,
+        ]);
+        if (result.code !== 0) {
+          throw new Error(result.stderr.join("\n") || t("status.graftFailed"));
+        }
+        printLines([t("terminal.mvMoved", { destination, source })]);
+        return true;
+      }
       if (command === "rm") {
         const recursive = args.some((arg) => arg.startsWith("-") && arg.includes("r"));
         const force = args.some((arg) => arg.startsWith("-") && arg.includes("f"));
