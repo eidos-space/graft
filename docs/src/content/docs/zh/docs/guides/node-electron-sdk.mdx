@@ -56,7 +56,8 @@ binary package；首版覆盖 macOS arm64/x64、Linux glibc arm64/x64 和 Window
 | `init`、`status`、`statusIncremental`、`repositoryMetadata`、`listRemotes`、`addAll`、`stagePaths`、`untrackPaths`、`commit` | 否 |
 | `diff`、`diffPaths`、`readPathContent`、`history`、`historySummaries`、`commitDetails`、`commitChangedPaths`、`isIgnoredPath`、`isIgnoredPaths`、`inventory` | 否 |
 | `configureRemote`、`push`、`fetch` | 否 |
-| `restore`、`restorePaths`、`pull`、`cloneRepository` | **是** |
+| `planMerge`、`getMergeStatus`、`listMergePaths`、`listMergeConflicts`、`readMergeVersion` | 否 |
+| `restore`、`restorePaths`、`pull`、`cloneRepository`、`applyMerge`、`setMergePathResult`、`resolveMergeRow`、`writeAndStageTextResult`、`continueMerge`、`abortMerge` | **是** |
 
 materializing 操作前先阻止新的应用写入、排空 transaction，并关闭受影响的 SQLite
 handle；SDK promise 结束后重新打开并验证。Graft repository session 本身可以继续常驻。

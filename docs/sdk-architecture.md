@@ -39,9 +39,10 @@ runtime registry once. Subsequent commands use the retained service instead of r
 setup. The CLI continues calling `execute_repository_command`, which opens a service for one
 command and therefore preserves existing behavior.
 
-All commands still use the official repository pragmas and JSON output functions. This keeps
-repository rules, conflict behavior, worktree materialization, and FS/S3/HTTP remote protocols in
-one implementation.
+Commands call the typed `RepositoryCommandService` and repository core directly; the SDK does not
+open a SQLite connection or transport repository operations through PRAGMAs. The CLI uses the same
+service as a one-shot adapter, keeping repository rules, conflict behavior, worktree
+materialization, and FS/S3/HTTP remote protocols in one implementation.
 
 ## Concurrency invariant
 
@@ -90,9 +91,10 @@ remote bearer credentials are never part of repository config or the snapshot.
 
 ## Worktree and application database handles
 
-Only `restore`, `restorePaths`, `pull`, and `cloneRepository` can replace tracked physical
-worktree files. Eidos must close affected application SQLite handles before these calls and reopen
-them afterward.
+`restore`, `restorePaths`, `pull`, `cloneRepository`, merge apply/resolution, edited text staging,
+merge continue, and merge abort can replace tracked physical worktree files. Eidos must close
+affected application SQLite handles before these calls and reopen them afterward. Merge planning,
+status, conflict inspection, and version reads are non-materializing.
 `init` writes `.graft`, while `fetch`, `push`, and remote configuration change only repository or
 remote state.
 

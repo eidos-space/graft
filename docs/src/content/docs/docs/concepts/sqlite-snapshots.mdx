@@ -52,9 +52,10 @@ include. Uncommitted transactions are never staged.
 
 ## Materialized Files
 
-By default, Graft materializes committed SQLite snapshots back to normal
-database files in the worktree after commit, checkout, switch, pull, and
-merge-continue.
+By default, checkout-style operations and merge operations that apply, resolve,
+continue, or abort a candidate may materialize committed SQLite snapshots back
+to normal database files in the worktree. Staging and commit do not replace the
+live worktree file.
 
 That lets standard SQLite tools inspect the current state:
 

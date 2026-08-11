@@ -110,7 +110,10 @@ external_paths = ["assets/**", "attachments/**"]
 materialize_sqlite = true
 ```
 
-默认值是 `true`。commit、checkout、switch、pull 或 merge-continue 之后，Graft 会把已跟踪 SQLite snapshot materialize 到它们的 repo-relative database path，例如 `data.sqlite` 或 `sub-app/main.sqlite`。
+默认值是 `true`。Checkout 类操作，以及 apply、resolve、continue 或 abort merge
+candidate 的操作，可能把已跟踪 SQLite snapshot materialize 到对应的 repo-relative
+database path，例如 `data.sqlite` 或 `sub-app/main.sqlite`。Stage 与 commit 只记录
+repository state，不替换实时 worktree 文件。
 
 只有在集成方明确想要 volume-only database path、不希望 worktree 出现普通 SQLite 文件时，才把它设为 `false`。
 

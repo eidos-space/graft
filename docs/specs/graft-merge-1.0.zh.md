@@ -1,0 +1,213 @@
+# Graft Merge 1.0（中文参考）
+
+状态：与当前实现对齐的规范草案
+版本：1.0
+发布日期：2026-08-11
+规范语言：英文
+
+## 摘要
+
+本规格定义 merge plan/apply、fast-forward 与 three-way topology、path/SQLite row
+conflict、durable merge state、version inspection、resolution、stale token、continue、
+abort，以及 process/session 重开后的恢复。
+
+核心安全规则：plan 只读，apply 不能静默覆盖分叉双方。每个 unresolved path 都要
+保留可用 base/ours/theirs 与 durable recovery 路径。
+
+## 1. 范围与术语
+
+`ours` 是 plan 时 local `HEAD`；`theirs` 是 target commit；`base` 是 merge base；
+`result` 是当前 staged/candidate path。Object/index、diff、物理文件 replacement
+分别由 Repository、Diff、Worktree Materialization 规格负责。
+
+## 2. 状态机
+
+```text
+idle -> plan: up_to_date | fast_forward | three_way
+                 |              |              |
+              unchanged    fast-forward   durable merging
+                                               |
+                                   resolve -> continue/abort
+```
+
+同一 repository 只能有一个 active merge。已有 merge 时 apply 新 candidate 必须失败；
+plan 不能替换 active merge。
+
+## 3. Planning
+
+`planMerge` 解析 target/graph 并计算 path/SQLite comparison。Retained SDK 与 browser
+API 返回 plan token；one-shot human CLI 可以在一个 command 内 plan+apply 而不暴露
+token。可以 hydrate immutable object/page，但不能移动 ref、改 index、写 merge
+record、resolve 或 materialize。CLI apply 仍会在 core 中校验 expected `HEAD`。
+
+| outcome | 条件 | 计划效果 |
+| --- | --- | --- |
+| `up_to_date` | target 是 ours ancestor（含相等） | 无变化 |
+| `fast_forward` | ours 是 target ancestor | HEAD/branch 移到 target，并按规则投影 |
+| `three_way` | 双方从 base 分叉 | stage clean result，durable 保存 conflict |
+
+Unborn branch 在允许时可 FF。若没有共同祖先，当前实现返回
+`merge_base = null`，并以 empty base 做 three-way path comparison；双方同 path add
+会成为 add/add conflict（除非完全相同）。Client 必须明确显示 absent base，不能伪造
+共同祖先。
+
+若存在多个不可比较的 best merge base，实现按“到两 head 的较大距离、距离和、
+object ID”依次取最小值，确定性选择一个；1.0 不合成 recursive merge base。
+
+当前 plan token 是精确 serialized immutable merge plan 的 BLAKE3，覆盖 revision/
+target、topology、checkout action、candidate index 与 outcome。它对 client opaque，
+不是 repository credential 或 global nonce。Apply 在当前状态重新计算 plan 并比较。
+Malformed/mismatched/stale token 必须无副作用失败；unchanged up-to-date no-op 可能仍
+可重复使用，而 state-changing outcome 会因状态变化或 active record 自动失效。
+Client 遇 stale 后重新 status/plan。
+
+## 4. Path-level three-way
+
+| 关系 | 结果 |
+| --- | --- |
+| `O == T` | 共同版本 |
+| `O == B`, `T != B` | theirs |
+| `T == B`, `O != B` | ours |
+| 仅一侧 add | added side |
+| 双方 add identical | shared addition |
+| 一侧 delete、另一侧 unchanged | deletion |
+| divergent modify/modify、add/add、modify/delete | conflict，除非 type-specific merge 成功 |
+
+Clean path 变成 Normal index/staged deletion。Conflict 保留可用 Base/Ours/Theirs
+stage；缺 stage 表示该侧 deletion/不存在。不能按时间戳自动选一侧。Path kind 或
+storage class 分叉也属于 conflict，除非有明确规则。
+
+## 5. SQLite three-way merge
+
+只有 base/ours/theirs 都是 compatible SQLite snapshot，且 logical diff 能安全识别
+相关 surface 时才做 row merge。Missing、add/delete、malformed、unsupported 或
+incompatible 情况 fallback whole-path conflict。
+
+独立 row change 合并；identical touch 合并为一次；同 identity 的不兼容 update/
+delete 等形成 row conflict。两个独立 insert 若仅 rowid 碰撞，只有在双方都是
+insert、table 没有 `INTEGER PRIMARY KEY` rowid alias、两侧 semantic key 都可得且
+互不相同时，才可省略 theirs requested rowid 让 SQLite 分配新值；不能 remap
+declared PK 或隐藏 referential/opaque 不确定性。
+
+Semantic key 的选择顺序是 `merge.semantic_keys.<table>`、可解析的
+`merge.default_semantic_keys`，再到 parsed schema 中第一个不是 rowid alias 的 declared
+primary-key/unique constraint。它用于发现不同 storage identity 但业务键重复的
+insert。冲突不能 auto-remap；当前必须 whole-file/manual resolve。
+
+Schema 只通过支持的 deterministic resolver 合并。当前 built-in 只支持 compatible
+`add_column -> alter_table_add_column`；divergent definition、delete/modify 与其他
+operation 保持 conflict。
+
+默认 opaque/internal resolver：
+
+| subject | resolver |
+| --- | --- |
+| `index_btree` | `reindex` |
+| `sqlite_sequence` | `sequence_max` |
+| `sqlite_stat1` ... `sqlite_stat4` | `rebuild` |
+
+Unknown/disabled/incompatible opaque change 必须保持 conflict；resolver 不是任意 SQL
+hook。
+
+Candidate 在隔离 temp DB 构造；受控 replay 时关闭 FK/trigger side effect，排除
+generated/configured column，完成后执行 integrity 与 foreign-key check。验证失败
+不能替换 staged result/worktree，temp 成功失败都要清理。
+
+## 6. Durable merge state
+
+Three-way apply 持久化：
+
+- `ORIG_HEAD` 中的 original local commit；
+- `MERGE_HEAD` 中的 target；
+- Base/Ours/Theirs/Normal index stage；
+- 可用时的 row selection/candidate state；
+- 可确定性重建 merge state token 的 status/index/resolution 输入。
+
+当前 state token 前缀为 `graft-merge-v1:`，hash 完整 repository status、index 与可选
+`row-conflict-resolutions.json`。状态不变时跨 close/reopen 稳定；index/status/row
+selection 变化后 token 改变。
+
+Worktree 不是唯一记录。关闭进程和 SDK session 后重开必须恢复相同 unresolved count
+与 versions。Record 缺失/不一致必须作为可恢复 corruption 报告，不能把当前物理
+bytes 猜成 intended result。
+
+## 7. Status 与 conflict inspection
+
+`getMergeStatus` 至少报告 active、ours/theirs/base、current token/state identity、
+unresolved count 与 can-continue。List API 按 path 确定排序并 bounded；当前 SDK
+merge path 最大 500、conflict 最大 1000。Result 必须说明 path、category、可用
+version 与 row/schema/opaque detail；截断要显式。
+
+`readMergeVersion` 精确读取 `base/ours/theirs/result`；absent side 不能替代。只读。
+
+## 8. Resolution
+
+所有 resolution mutation 必须基于 current state。Retained SDK/browser `merge-api` 必须
+带 current token，stale token 不能改变 path/selection。One-shot human CLI 不暴露
+client-held token；它获取 repository coordination、重新读取当前 state 后立即执行。
+
+- `setMergePathResult` 选择整 path ours/theirs，支持 file、SQLite 与 deletion，收敛
+  为 Normal 或 staged deletion；merge 完成/abort 前仍须可恢复未选 side。
+- `writeAndStageTextResult` 对 eligible UTF-8 text 写入并 stage 精确 result；binary、
+  invalid input、token/path mismatch 或写失败要保留原 conflict。
+- `resolveMergeRow` 对 eligible row conflict 选 ours/theirs，并持久化 selection、重建/
+  更新 candidate、验证。全部 row resolved 且无 schema/opaque conflict 后 path 收敛。
+
+Semantic-key、schema、opaque、malformed 或 unsupported conflict 不能 per-row resolve，
+必须明确要求 whole-path/manual result。
+
+Resolution 是否写普通 SQLite worktree，以及 WAL/lock/sidecar/replacement/rollback，
+只由 Materialization 规格定义。
+
+## 9. Continue 与 abort
+
+`continueMerge` 必须验证 active，且 token-based adapter 的 token current；同时无
+conflict stage、所有 row/schema/
+opaque resolution 完成、candidate/payload 可用有效、`HEAD` 仍是 ours。它用精确
+staged result 创建两个 parent（ours first、theirs second）的 commit。Commit/ref
+成功后才能清 merge record。失败后必须是 recoverable active merge 或完整 commit，
+不能 half-state。
+
+`abortMerge` 恢复记录的 original state，清 conflict/index row state，并在恢复成功
+后删 merge record。物理恢复遵守 Materialization。恢复失败要保留 record，明确
+允许 retry/manual recovery。
+
+## 10. FF 与 up-to-date
+
+`up_to_date` 不产生 commit/index/ref/worktree/merge-state 变化。`fast_forward` 直接
+移动 branch/HEAD 到 target，按 checkout 规则更新 index/worktree，不创建 merge
+commit 或 active state。只有 `three_way` 能进入 active merge 并最后形成双 parent。
+
+## 11. 并发、错误与恢复
+
+Merge mutation 由 repository coordination 与 expected-state 串行。HEAD/index/token/
+row/path 并发变化必须报 stale/busy。Safe boundary 前取消无效果；durable apply 后
+取消必须返回可观察 status，不能删除 continue/abort 所需 record。
+
+Crash/reopen 后恢复入口始终是：
+
+```text
+inspect -> continue resolving -> continue
+inspect -> abort
+```
+
+Startup 不能为了清 conflict 自动选 ours/theirs。
+
+## 12. Conformance
+
+至少测试：三种 topology、plan 只读与 stale token、所有 path 关系、SQLite 独立/
+冲突 row、composite key/rowid remap/semantic key、schema/opaque resolver、candidate
+validation rollback、whole-path/text/row resolution、关闭重开、continue 双 parent、
+abort 恢复，以及 durable/physical boundary 的 crash/failure。
+
+当前证据位于 `crates/graft/src/repo/merge.rs`、repository merge test、
+`crates/graft-sqlite/src/` row-merge test、command service、Rust/Node SDK test 和
+Playground browser fixture。
+
+## 13. 已知限制
+
+- Unrelated history 使用 empty base（`merge_base = null`），不合成 ancestor。
+- Semantic-key conflict 需要 whole-file/manual resolution。
+- 有 schema/opaque conflict 时不能 per-row selection。
+- 只接受文档化 schema/internal resolver。
+- 多 path 物理投影可恢复但不是单一 filesystem transaction。

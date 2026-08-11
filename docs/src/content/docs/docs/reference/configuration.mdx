@@ -118,7 +118,11 @@ The optional `[worktree]` section controls whether committed SQLite snapshots ar
 materialize_sqlite = true
 ```
 
-This is `true` by default. After commit, checkout, switch, pull, or merge-continue, Graft materializes tracked SQLite snapshots at their repo-relative database paths, such as `data.sqlite` or `sub-app/main.sqlite`.
+This is `true` by default. Checkout-style operations and merge operations that
+apply, resolve, continue, or abort a candidate may materialize tracked SQLite
+snapshots at their repo-relative database paths, such as `data.sqlite` or
+`sub-app/main.sqlite`. Staging and commit record repository state without
+replacing the live worktree file.
 
 Set it to `false` only for integrations that intentionally want volume-only database paths and do not want ordinary SQLite files in the worktree.
 
