@@ -1,5 +1,6 @@
 import { useI18n } from "../i18n";
 import type { BinaryContentState, BinaryDiffView } from "../types";
+import { DiffInspectorHeader } from "./DiffInspectorHeader";
 
 function formatSize(bytes: number | undefined, locale: string, unavailable: string) {
   if (bytes === undefined) return unavailable;
@@ -71,25 +72,28 @@ function ImageRevision({
   );
 }
 
-export function BinaryDiffPane({ diff }: { diff: BinaryDiffView }) {
+export function BinaryDiffPane({
+  diff,
+  onClose,
+}: {
+  diff: BinaryDiffView;
+  onClose: () => void;
+}) {
   const { locale, t } = useI18n();
   const fileName = diff.path.split("/").at(-1) ?? diff.path;
   const mimeType = imageMimeType(diff.path);
   const hasImageHistory = Boolean(mimeType && (diff.before || diff.after));
 
   return (
-    <section className="binary-diff-surface" aria-label={t("binaryDiff.label", { path: diff.path })}>
-      <header className="surface-tabbar">
-        <div className="surface-file-tab is-diff is-binary">
-          <span className="file-glyph" aria-hidden="true">
-            ◇
-          </span>
-          <strong>{diff.path}</strong>
-        </div>
-        <div className="surface-actions">
-          <span>{t("binaryDiff.change")}</span>
-        </div>
-      </header>
+    <section
+      className="binary-diff-surface version-inspector"
+      aria-label={t("binaryDiff.label", { path: diff.path })}
+    >
+      <DiffInspectorHeader
+        mode={diff.label?.startsWith("HISTORY") ? t("version.history") : t("version.changes")}
+        onClose={onClose}
+        path={diff.path}
+      />
 
       <div className={`binary-diff-content ${hasImageHistory ? "has-image-history" : ""}`}>
         <div className="binary-diff-heading">
@@ -135,11 +139,6 @@ export function BinaryDiffPane({ diff }: { diff: BinaryDiffView }) {
         </dl>
         {diff.description && <p className="binary-diff-revision">{diff.description}</p>}
       </div>
-
-      <footer className="surface-statusbar">
-        <span>{t("version.kind.binary_file")}</span>
-        <span>{t("binaryDiff.managed")}</span>
-      </footer>
     </section>
   );
 }

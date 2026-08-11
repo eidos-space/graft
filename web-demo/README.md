@@ -55,6 +55,6 @@ React UI ──messages──> Web Worker ──callMain──> graft.wasm
    └──────── File System Access API ───────────┴──> OPFS /
 ```
 
-Remote synchronization is intentionally unavailable in this first browser
+Remote synchronization is intentionally unavailable in this browser
 build. Local repository commands, SQLite snapshots, branches, history, status,
-staging, commits, and diffs run entirely on-device.
+rename-aware staging, commits, and diffs run entirely on-device.

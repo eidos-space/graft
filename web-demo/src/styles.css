@@ -4042,6 +4042,10 @@ body.is-resizing-rows * {
   }
 }
 
+.change-renamed {
+  color: #205ea6;
+}
+
 @media (max-width: 560px) {
   .brand small {
     display: none;
@@ -6248,11 +6252,12 @@ textarea:focus-visible {
 
 .branch-bar {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
+  grid-template-columns: minmax(0, 1fr) auto auto auto;
 }
 
 .branch-create-toggle,
-.branch-merge-toggle {
+.branch-merge-toggle,
+.merge-fixture-toggle {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -6273,7 +6278,8 @@ textarea:focus-visible {
 .branch-create-toggle:hover:not(:disabled),
 .branch-create-toggle[aria-expanded="true"],
 .branch-merge-toggle:hover:not(:disabled),
-.branch-merge-toggle[aria-expanded="true"] {
+.branch-merge-toggle[aria-expanded="true"],
+.merge-fixture-toggle:hover:not(:disabled) {
   color: #ffffff;
   background: var(--swiss-ink);
 }
@@ -6282,6 +6288,11 @@ textarea:focus-visible {
   color: var(--swiss-red);
   font-family: "SFMono-Regular", Consolas, monospace;
   font-size: 12px;
+}
+
+.merge-fixture-toggle > span:first-child {
+  color: var(--swiss-red);
+  font-size: 11px;
 }
 
 .branch-merge {
@@ -7011,5 +7022,530 @@ textarea:focus-visible {
 
   .capabilities > span:not(.graft-version) {
     display: none;
+  }
+}
+
+/* Contract-shaped merge review: keep lineage and the editable result visible
+   without adding a second generic card system to the existing workbench. */
+.conflict-lineage {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
+  padding: 7px 17px;
+  border-bottom: 1px solid var(--swiss-line);
+  color: var(--swiss-muted);
+  font-size: 8px;
+}
+
+.conflict-lineage span {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 5px;
+  border: 1px solid var(--swiss-line);
+  background: var(--swiss-soft);
+}
+
+.conflict-lineage strong {
+  color: var(--swiss-ink);
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 7px;
+  letter-spacing: 0.08em;
+}
+
+.conflict-lineage i {
+  color: var(--swiss-muted);
+  font-style: normal;
+}
+
+.conflict-progress code {
+  grid-column: 1 / -1;
+  color: var(--swiss-muted);
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 7px;
+}
+
+.conflict-text-review {
+  display: grid;
+  gap: 8px;
+  margin: 0 16px 10px;
+  padding: 10px;
+  border: 1px solid var(--swiss-ink);
+  background: var(--swiss-soft);
+}
+
+.conflict-text-review > header,
+.conflict-version-grid article > header,
+.conflict-result-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.conflict-text-review > header > div {
+  display: grid;
+  gap: 2px;
+}
+
+.conflict-text-review > header span,
+.conflict-result-editor > span {
+  color: var(--swiss-red);
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 7px;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.conflict-text-review > header strong {
+  font-size: 10px;
+}
+
+.conflict-text-review > header small,
+.conflict-result-footer small {
+  color: var(--swiss-muted);
+  font-size: 7px;
+}
+
+.conflict-version-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 5px;
+}
+
+.conflict-version-grid article {
+  min-width: 0;
+  border: 1px solid var(--swiss-line);
+  background: var(--swiss-surface);
+}
+
+.conflict-version-grid article > header {
+  padding: 4px 5px;
+  border-bottom: 1px solid var(--swiss-line);
+}
+
+.conflict-version-grid article > header strong {
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 7px;
+  letter-spacing: 0.08em;
+}
+
+.conflict-version-grid article > header small {
+  color: var(--swiss-muted);
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 7px;
+}
+
+.conflict-version-grid pre {
+  min-height: 76px;
+  max-height: 136px;
+  margin: 0;
+  padding: 6px;
+  overflow: auto;
+  color: var(--swiss-muted);
+  font: 8px/1.5 "SFMono-Regular", Consolas, monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.conflict-result-editor {
+  display: grid;
+  gap: 4px;
+}
+
+.conflict-result-editor textarea {
+  min-height: 112px;
+  resize: vertical;
+  border: 1px solid var(--swiss-ink);
+  border-radius: 0;
+  padding: 7px;
+  color: var(--swiss-ink);
+  background: var(--swiss-surface);
+  font: 9px/1.5 "SFMono-Regular", Consolas, monospace;
+}
+
+.conflict-result-editor textarea:focus {
+  outline: 2px solid var(--swiss-red);
+  outline-offset: 1px;
+}
+
+.conflict-result-footer button {
+  min-height: 25px;
+  padding: 4px 8px;
+  border: 1px solid var(--swiss-red);
+  border-radius: 0;
+  color: #ffffff;
+  background: var(--swiss-red);
+  font: inherit;
+  font-size: 8px;
+  font-weight: 750;
+  cursor: pointer;
+}
+
+.conflict-result-footer button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+@media (max-width: 900px) {
+  .conflict-version-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Eidos Lite-style history disclosure and single-surface diff inspection. */
+.history-list .history-entry-toggle {
+  grid-template-columns: 20px minmax(0, 1fr) 18px;
+  min-height: 50px;
+  padding: 6px 8px;
+}
+
+.history-list .history-entry-toggle > span:nth-child(2) {
+  display: grid;
+  align-content: center;
+  min-width: 0;
+}
+
+.history-list .history-entry-toggle.is-selected {
+  background: var(--swiss-soft);
+  box-shadow: inset 2px 0 var(--swiss-red);
+}
+
+.history-disclosure {
+  display: grid;
+  place-items: center;
+  color: var(--swiss-muted);
+  font: 16px/1 "SFMono-Regular", Consolas, monospace;
+}
+
+.history-entry-expanded {
+  margin-left: 19px;
+  border-left: 1px solid var(--swiss-line);
+  border-bottom: 1px solid var(--swiss-line);
+  background: color-mix(in srgb, var(--swiss-soft) 56%, var(--swiss-surface));
+}
+
+.history-commit-files-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 25px;
+  padding: 0 8px;
+  border-bottom: 1px solid var(--swiss-line);
+  color: var(--swiss-muted);
+  font: 700 7px/1 "SFMono-Regular", Consolas, monospace;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.history-commit-files-heading b {
+  color: var(--swiss-red);
+  font: inherit;
+}
+
+.history-list .commit-file-list {
+  display: grid;
+  grid-auto-rows: minmax(36px, auto);
+  max-height: none;
+  overflow: visible;
+}
+
+.history-list .commit-file-list > button {
+  grid-template-columns: 23px minmax(0, 1fr);
+  gap: 4px;
+  min-height: 36px;
+  padding: 4px 7px;
+  border-bottom-color: var(--swiss-line);
+}
+
+.history-list .commit-file-list > button:last-child {
+  border-bottom: 0;
+}
+
+.history-list .commit-file-list > button > span:last-child {
+  display: grid;
+  min-width: 0;
+}
+
+.history-list .commit-file-list strong,
+.history-list .commit-file-list small {
+  overflow: hidden;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.history-list .commit-file-list strong {
+  font-size: 9px;
+}
+
+.history-list .commit-file-list small {
+  max-width: none;
+  font-size: 7px;
+}
+
+.history-list .commit-file-list > button.is-selected {
+  background: var(--swiss-surface);
+  box-shadow: inset 2px 0 var(--swiss-red);
+}
+
+.history-entry-expanded .history-reset-action {
+  border-top: 1px solid var(--swiss-line);
+  border-bottom: 0;
+  background: transparent;
+}
+
+.primary-surface,
+.primary-surface.is-history-review {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+}
+
+.primary-content,
+.primary-surface.is-history-review .primary-content {
+  grid-column: 1;
+  grid-row: 1;
+  min-width: 0;
+  min-height: 0;
+}
+
+.version-inspector {
+  display: grid;
+  grid-template-rows: 38px minmax(0, 1fr);
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--swiss-surface);
+}
+
+.diff-inspector-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+  padding: 0 7px 0 12px;
+  border-bottom: 1px solid var(--swiss-line);
+  background: var(--swiss-soft);
+}
+
+.diff-inspector-breadcrumb {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  color: var(--swiss-muted);
+  font-size: 10px;
+}
+
+.diff-inspector-breadcrumb span {
+  flex: 0 0 auto;
+}
+
+.diff-inspector-breadcrumb i {
+  color: var(--swiss-line);
+  font-style: normal;
+}
+
+.diff-inspector-breadcrumb strong {
+  overflow: hidden;
+  color: var(--swiss-ink);
+  font-size: 10px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.diff-inspector-header > button {
+  display: grid;
+  place-items: center;
+  width: 25px;
+  height: 25px;
+  border: 0;
+  color: var(--swiss-muted);
+  background: transparent;
+  font-size: 17px;
+  cursor: pointer;
+}
+
+.diff-inspector-header > button:hover,
+.diff-inspector-header > button:focus-visible {
+  color: var(--swiss-ink);
+  background: var(--swiss-line);
+}
+
+.diff-inspector-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+  min-height: 48px;
+  padding: 6px 10px 6px 12px;
+  border-bottom: 1px solid var(--swiss-line);
+  background: var(--swiss-surface);
+}
+
+.diff-inspector-toolbar > div:first-child {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.diff-inspector-toolbar strong {
+  color: var(--swiss-ink);
+  font-size: 10px;
+  font-weight: 650;
+}
+
+.diff-inspector-toolbar span {
+  overflow: hidden;
+  color: var(--swiss-muted);
+  font: 8px/1.35 "SFMono-Regular", Consolas, monospace;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.diff-inspector-toolbar i {
+  font-style: normal;
+}
+
+.version-text-diff {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.version-text-diff-layout {
+  display: flex;
+  flex: 0 0 auto;
+  padding: 2px;
+  border: 1px solid var(--swiss-line);
+  background: var(--swiss-soft);
+}
+
+.version-text-diff-layout button {
+  min-height: 23px;
+  padding: 2px 8px;
+  border: 0;
+  color: var(--swiss-muted);
+  background: transparent;
+  font-size: 8px;
+  cursor: pointer;
+}
+
+.version-text-diff-layout button[aria-pressed="true"] {
+  color: var(--swiss-ink);
+  background: var(--swiss-surface);
+  box-shadow: 0 0 0 1px var(--swiss-line);
+}
+
+.diff-editor-scroll.version-text-diff-surface {
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.version-text-diff-virtualizer {
+  width: 100%;
+  height: 100%;
+  overflow: auto;
+}
+
+.sqlite-diff-workspace {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr);
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.sqlite-diff-toolbar {
+  grid-column: 1;
+  grid-row: 1;
+}
+
+.sqlite-diff-controls,
+.sqlite-diff-counts {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex: 0 0 auto;
+}
+
+.sqlite-diff-controls select {
+  max-width: 190px;
+  height: 26px;
+  padding: 2px 24px 2px 7px;
+  border: 1px solid var(--swiss-line);
+  border-radius: 0;
+  color: var(--swiss-ink);
+  background: var(--swiss-surface);
+  font: 8px/1 "SFMono-Regular", Consolas, monospace;
+}
+
+.sqlite-diff-counts {
+  gap: 4px;
+}
+
+.sqlite-diff-counts span {
+  padding: 3px 5px;
+  border: 1px solid var(--swiss-line);
+  background: var(--swiss-soft);
+  font-weight: 700;
+}
+
+.sqlite-diff-counts .is-insert {
+  color: var(--swiss-green);
+}
+
+.sqlite-diff-counts .is-update {
+  color: var(--swiss-amber);
+}
+
+.sqlite-diff-counts .is-delete {
+  color: var(--swiss-red);
+}
+
+.sqlite-diff-workspace > .sqlite-diff-grid-scroll {
+  grid-column: 1;
+  grid-row: 2;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+}
+
+.binary-diff-surface.version-inspector {
+  grid-template-rows: 38px minmax(0, 1fr);
+}
+
+.binary-diff-surface.version-inspector .binary-diff-content {
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+}
+
+@media (max-width: 620px) {
+  .diff-inspector-toolbar {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .version-text-diff-layout,
+  .sqlite-diff-controls {
+    align-self: flex-start;
+  }
+
+  .sqlite-diff-controls {
+    max-width: 100%;
   }
 }

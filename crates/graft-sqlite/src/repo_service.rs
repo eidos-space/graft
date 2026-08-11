@@ -3,7 +3,10 @@
 //! This is the control-plane entry point for CLI and embedding use cases. The `SQLite` VFS remains
 //! a data-plane component and only exposes VFS-specific diagnostics and controls.
 
-use std::{path::Path, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use graft::{
     remote::{RemoteConfig, RemoteCredentialErr, RemoteCredentials},
@@ -17,7 +20,11 @@ use graft::{
 use crate::{
     file::vol_file::VolFile,
     pragma::{
-        GraftCommand, repo_core::repo_for_file, repo_diff::repo_status_for_file,
+        GraftCommand,
+        parse::parse_row_identity,
+        repo_core::repo_for_file,
+        repo_diff::repo_status_for_file,
+        spec::{RepoResolveRowSpec, RepoResolveSpec, ResolveSide},
         sqlite_worktree::physical_sqlite_file_matches_state,
     },
     vfs::{ErrCtx, RepoRuntimeRegistry},
@@ -31,10 +38,78 @@ pub struct RepositoryCommand {
     command: GraftCommand,
 }
 
+/// A side from the three-way index selected by an SDK conflict resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepositoryResolveSide {
+    Ours,
+    Theirs,
+}
+
+/// A stable `SQLite` row identity accepted by the repository merge driver.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RepositoryResolveRow {
+    pub table: String,
+    pub identity: serde_json::Value,
+}
+
+/// Typed conflict resolution input for embedders.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RepositoryResolveOptions {
+    pub side: RepositoryResolveSide,
+    pub path: Option<PathBuf>,
+    pub row: Option<RepositoryResolveRow>,
+}
+
 impl RepositoryCommand {
     pub fn parse(name: &str, argument: Option<&str>) -> Result<Self, ErrCtx> {
         let command = GraftCommand::parse_repository(name, argument)?;
         Ok(Self { command })
+    }
+
+    /// Creates a typed merge command without passing a PRAGMA argument through the SDK.
+    pub fn merge(revision: impl Into<String>) -> Self {
+        Self {
+            command: GraftCommand::JsonMerge { rev: revision.into() },
+        }
+    }
+
+    pub fn conflicts() -> Self {
+        Self { command: GraftCommand::JsonConflicts }
+    }
+
+    pub fn resolve(options: RepositoryResolveOptions) -> Result<Self, ErrCtx> {
+        let side = match options.side {
+            RepositoryResolveSide::Ours => ResolveSide::Ours,
+            RepositoryResolveSide::Theirs => ResolveSide::Theirs,
+        };
+        let row = options
+            .row
+            .map(|row| {
+                let identity = serde_json::to_string(&row.identity)
+                    .map_err(|error| ErrCtx::PragmaErr(error.to_string().into()))?;
+                Ok::<RepoResolveRowSpec, ErrCtx>(RepoResolveRowSpec {
+                    table: row.table,
+                    identity: parse_row_identity(&identity).map_err(|error| {
+                        ErrCtx::PragmaErr(format!("invalid row identity: {error:?}").into())
+                    })?,
+                })
+            })
+            .transpose()?;
+        Ok(Self {
+            command: GraftCommand::JsonResolveConflict {
+                spec: RepoResolveSpec { side, path: options.path, row },
+            },
+        })
+    }
+
+    pub fn merge_continue(message: impl Into<String>) -> Self {
+        Self {
+            command: GraftCommand::JsonMergeContinue { message: message.into() },
+        }
+    }
+
+    pub fn merge_abort() -> Self {
+        Self { command: GraftCommand::JsonMergeAbort }
     }
 }
 

@@ -67,7 +67,11 @@ pub(super) fn run_repo_merge(
     }
     clear_row_conflict_resolution_state(&repo)?;
     let plan = repo.plan_merge_revision(rev)?;
-    let plan = prepare_repo_merge_plan(runtime, &plan, None)?;
+    // A merge may target a fetched remote-tracking revision whose SQLite storage commits are
+    // not hydrated yet. Prefer local storage for base/ours and fall back to the configured remote
+    // for missing target commits, keeping ordinary local-branch merges offline-capable.
+    let remote = repo_merge_remote_store(&repo, rev, &plan.target)?;
+    let plan = prepare_repo_merge_plan(runtime, &plan, remote)?;
     ensure_checkout_plan_preserves_untracked_paths(runtime, file, &repo, &plan.checkout)?;
     let previous_files = current_repo_files_for_checkout(&repo)?;
     let previous_artifacts = current_repo_artifacts_for_checkout(&repo)?;
@@ -106,6 +110,34 @@ pub(super) fn run_repo_merge(
     )?;
     let branch = repo.current_branch()?;
     Ok(RepoMergeCommandOutcome { outcome, branch, paths, row_auto_merge })
+}
+
+fn repo_merge_remote_store(
+    repo: &Repository,
+    rev: &str,
+    target: &str,
+) -> Result<Option<Arc<Remote>>, ErrCtx> {
+    let remote_branches = repo.remote_tracking_branches()?;
+    let remote_ref = rev.strip_prefix("refs/remotes/").unwrap_or(rev);
+
+    if let Some(branch) = remote_branches
+        .iter()
+        .find(|branch| format!("{}/{}", branch.remote, branch.branch) == remote_ref)
+    {
+        return Ok(Some(Arc::new(repo.remote_store(&branch.remote)?)));
+    }
+
+    let mut target_remotes = remote_branches
+        .iter()
+        .filter(|branch| branch.head == target)
+        .map(|branch| branch.remote.as_str());
+    if let Some(remote) = target_remotes.next()
+        && target_remotes.all(|candidate| candidate == remote)
+    {
+        return Ok(Some(Arc::new(repo.remote_store(remote)?)));
+    }
+
+    Ok(repo_default_remote_store(repo))
 }
 
 pub(super) fn merge_fast_forward_head(outcome: &MergeOutcome) -> Option<String> {

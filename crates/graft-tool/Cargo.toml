@@ -1,6 +1,6 @@
 [package]
 name = "graft-tool"
-version = "0.12.0"
+version = "0.13.0"
 edition = "2024"
 authors = { workspace = true }
 license = { workspace = true }
@@ -15,15 +15,14 @@ path = "src/main.rs"
 
 [dependencies]
 graft = { path = "../graft" }
+graft-sdk = { path = "../graft-sdk" }
 graft-sqlite = { path = "../graft-sqlite" }
 
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 rusqlite = { workspace = true, features = ["bundled"] }
-tempfile = { workspace = true }
-
-[dev-dependencies]
 serde_json = "1.0"
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

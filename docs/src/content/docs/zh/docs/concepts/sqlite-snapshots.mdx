@@ -40,8 +40,9 @@ storage commit。rollback-journal database 使用同一流程，只是通常没�
 
 ## Materialized Files
 
-默认情况下，commit、checkout、switch、pull、merge-continue 后，Graft 会把
-tracked SQLite snapshot 写回 worktree 中的普通 SQLite 文件。
+默认情况下，checkout 类操作，以及 apply、resolve、continue 或 abort merge
+candidate 的操作，可能把 tracked SQLite snapshot 写回 worktree 中的普通 SQLite
+文件。Stage 与 commit 不替换实时 worktree 文件。
 
 ```bash
 sqlite3 data.sqlite "SELECT count(*) FROM notes;"

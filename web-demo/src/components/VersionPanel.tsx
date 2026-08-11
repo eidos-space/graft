@@ -19,11 +19,13 @@ interface VersionPanelProps {
   history: CommitInfo[];
   onCommit: (message: string) => Promise<void>;
   onCreateBranch: (name: string) => Promise<void>;
+  onCreateMergeFixture: () => Promise<void>;
   onDiscardPaths: (paths: string[]) => Promise<boolean>;
   onMergeBranch: (branch: string) => Promise<void>;
   onReset: (target: string, mode: ResetMode) => Promise<boolean>;
   onTabChange: (tab: VersionTab) => void;
   onSelectHistory: (commit: CommitInfo, path?: string) => void;
+  onToggleHistory: (commit: CommitInfo) => void;
   onSelectPath: (path: string, section: ChangeSection) => void;
   onStageAll: () => Promise<void>;
   onStagePath: (path: string) => Promise<void>;
@@ -59,6 +61,7 @@ function statusLabel(status: string | undefined, t: Translate) {
   if (status === "untracked") return t("version.change.untracked");
   if (status === "added") return t("version.change.added");
   if (status === "deleted") return t("version.change.deleted");
+  if (status === "renamed") return t("version.change.renamed");
   if (status === "conflicted") return t("version.change.conflicted");
   return t("version.change.modified");
 }
@@ -70,11 +73,13 @@ export function VersionPanel({
   history,
   onCommit,
   onCreateBranch,
+  onCreateMergeFixture,
   onDiscardPaths,
   onMergeBranch,
   onReset,
   onTabChange,
   onSelectHistory,
+  onToggleHistory,
   onSelectPath,
   onStageAll,
   onStagePath,
@@ -172,6 +177,16 @@ export function VersionPanel({
               <span aria-hidden="true">⇢</span>
               <span>{t("version.merge")}</span>
             </button>
+            <button
+              className="merge-fixture-toggle"
+              disabled={busy || status.work_in_progress}
+              onClick={() => void onCreateMergeFixture()}
+              title={t("version.mergeFixtureHelp")}
+              type="button"
+            >
+              <span aria-hidden="true">✦</span>
+              <span>{t("version.mergeFixture")}</span>
+            </button>
           </div>
 
           {branchComposerOpen && (
@@ -267,7 +282,9 @@ export function VersionPanel({
                 history={history}
                 onRequestReset={setResetTarget}
                 onSelect={onSelectHistory}
+                onToggle={onToggleHistory}
                 selectedId={selectedHistoryId}
+                selectedPath={selectedPath}
               />
             )}
           </div>
@@ -363,6 +380,9 @@ function ChangesList({
       : path.conflicted
         ? "conflicted"
         : (path.unstaged_change ?? "modified");
+    const displayPath = path.previous_path
+      ? `${path.previous_path} → ${path.path}`
+      : path.path;
     return (
       <div
         className={`change-row ${selectedPath === path.path && selectedSection === section ? "is-selected" : ""}`}
@@ -377,7 +397,7 @@ function ChangesList({
             {change === "conflicted" ? "!" : change.slice(0, 1).toUpperCase()}
           </span>
           <span>
-            <strong>{path.path}</strong>
+            <strong title={displayPath}>{displayPath}</strong>
             <small>
               <span>{kindLabel(path.kind, t)}</span>
               <i aria-hidden="true">·</i>
@@ -511,14 +531,18 @@ function HistoryList({
   history,
   onRequestReset,
   onSelect,
+  onToggle,
   selectedId,
+  selectedPath,
 }: {
   branch?: string;
   currentHead?: string;
   history: CommitInfo[];
   onRequestReset: (commit: CommitInfo) => void;
-  onSelect: (commit: CommitInfo) => void;
+  onSelect: (commit: CommitInfo, path: string) => void;
+  onToggle: (commit: CommitInfo) => void;
   selectedId?: string;
+  selectedPath?: string;
 }) {
   const { locale, t } = useI18n();
   if (history.length === 0) return <div className="empty-list">{t("version.noCommits")}</div>;
@@ -530,8 +554,9 @@ function HistoryList({
         return (
           <div className="history-entry" key={commit.id}>
             <button
-              className={selected ? "is-selected" : ""}
-              onClick={() => onSelect(commit)}
+              aria-expanded={selected}
+              className={`history-entry-toggle ${selected ? "is-selected" : ""}`}
+              onClick={() => onToggle(commit)}
               type="button"
             >
               <span className="history-rail" aria-hidden="true">
@@ -546,13 +571,60 @@ function HistoryList({
                   {t("version.changes").toLowerCase()}
                 </small>
               </span>
+              <span className="history-disclosure" aria-hidden="true">
+                {selected ? "⌄" : "›"}
+              </span>
             </button>
-            {selected && commit.id !== currentHead && (
-              <div className="history-reset-action">
-                <span>{t("version.moveHere", { branch: branch ?? "HEAD" })}</span>
-                <button onClick={() => onRequestReset(commit)} type="button">
-                  {t("version.reset")}
-                </button>
+            {selected && (
+              <div className="history-entry-expanded">
+                <div className="history-commit-files-heading">
+                  <span>{t("version.commitFiles")}</span>
+                  <b>{changes.length}</b>
+                </div>
+                <div className="commit-file-list">
+                  {changes.length > 0 ? (
+                    changes.map((change) => {
+                      const active = selectedPath === change.path;
+                      const displayPath = change.previous_path
+                        ? `${change.previous_path} → ${change.path}`
+                        : change.path;
+                      return (
+                        <button
+                          aria-current={active ? "page" : undefined}
+                          aria-label={t("version.openCommitFile", {
+                            commit: commit.id.slice(0, 8),
+                            path: change.path,
+                          })}
+                          className={active ? "is-selected" : ""}
+                          key={`${commit.id}:${change.path}`}
+                          onClick={() => onSelect(commit, change.path)}
+                          title={displayPath}
+                          type="button"
+                        >
+                          <span className={`change-code change-${change.change}`}>
+                            {change.change.slice(0, 1).toUpperCase()}
+                          </span>
+                          <span>
+                            <strong>{displayPath}</strong>
+                            <small>
+                              {kindLabel(change.kind, t)} · {statusLabel(change.change, t)}
+                            </small>
+                          </span>
+                        </button>
+                      );
+                    })
+                  ) : (
+                    <div className="commit-files-empty">{t("version.noCommitFiles")}</div>
+                  )}
+                </div>
+                {commit.id !== currentHead && (
+                  <div className="history-reset-action">
+                    <span>{t("version.moveHere", { branch: branch ?? "HEAD" })}</span>
+                    <button onClick={() => onRequestReset(commit)} type="button">
+                      {t("version.reset")}
+                    </button>
+                  </div>
+                )}
               </div>
             )}
           </div>

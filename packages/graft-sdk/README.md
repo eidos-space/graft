@@ -175,10 +175,18 @@ files in the Space. Changes confined to `.graft` are not counted.
 | `fetch` | Receive objects/refs into `.graft` | No |
 | `pull` | Fetch, integrate, and check out the result | **Yes** |
 | `cloneRepository` | Populate a new worktree from a remote | **Yes** |
+| `planMerge` | Compute an immutable up-to-date, fast-forward, or three-way plan | No |
+| `applyMerge` | Apply a reviewed plan under HEAD/plan-token guards | **Yes** |
+| `getMergeStatus` | Reconstruct the active merge from `ORIG_HEAD`, `MERGE_HEAD`, and index stages | No |
+| `listMergePaths`, `listMergeConflicts` | Page merge paths and selected-path conflict details | No |
+| `readMergeVersion` | Read bounded base/ours/theirs/result content | No |
+| `setMergePathResult`, `resolveMergeRow` | Select ours/theirs for a path or SQLite row | **Yes** |
+| `writeAndStageTextResult` | Atomically replace and stage an edited UTF-8 result | **Yes** |
+| `continueMerge`, `abortMerge` | Commit or restore a guarded active merge | **Yes** |
 
-`operationMaterializesWorktree(name)` exposes this contract to the Eidos gate. Before `restore`,
-`restorePaths`, `pull`, or `cloneRepository`, Eidos must checkpoint and close application SQLite
-handles for paths that can be replaced. `stagePaths` never materializes the worktree. Reopen
+`operationMaterializesWorktree(name)` exposes this contract to the Eidos gate. Before any method
+marked **Yes**, Eidos must checkpoint and close application SQLite handles for paths that can be
+replaced. `stagePaths` and merge inspection methods never materialize the worktree. Reopen
 application handles after the SDK promise settles; the Graft repository session itself stays open.
 
 `addAll` reads SQLite files and their committed/WAL state but does not replace them. Eidos should
@@ -345,6 +353,72 @@ text only when `kind === "text_file"` and `content.state === "utf8"`.
 
 `commitDetails(id)` remains available for compatible callers that deliberately need the full
 tree-backed commit payload; history lists should not use it.
+
+## Durable merge workflow
+
+The merge API follows Git's durable model rather than creating an SDK-only session record. A true
+three-way merge leaves `HEAD` unchanged, records `ORIG_HEAD` and `MERGE_HEAD`, and stores Base,
+Ours, and Theirs as index stages 1, 2, and 3. Resolving one path collapses only that path to stage 0.
+`getMergeStatus()` therefore survives process restarts and returns `{ state: "none" }` when no
+merge is active or the current heads, counts, and an opaque `state_token` while merging.
+
+Always plan before applying:
+
+```js
+const head = (await session.repositoryMetadata()).current_head
+const plan = await session.planMerge({
+  revision: "origin/main",
+  ...(head ? { expectedHead: head } : {}),
+})
+
+const applied = await session.applyMerge({
+  revision: "origin/main",
+  ...(head ? { expectedHead: head } : {}),
+  planToken: plan.plan_token,
+})
+```
+
+Up-to-date and fast-forward plans finish without an active merge. For a true merge, pass the latest
+`state_token` to every paged read and mutation. Any intervening ref, index, worktree, or resolution
+change rejects the stale call with `GRAFT_SDK_REPOSITORY_STALE`.
+
+```js
+let merge = applied.merge
+const page = await session.listMergePaths({
+  filter: "unmerged",
+  expectedStateToken: merge.state_token,
+})
+
+const versions = await Promise.all(
+  ["base", "ours", "theirs", "result"].map((version) =>
+    session.readMergeVersion({
+      path: page.items[0].path,
+      version,
+      maxBytes: 1024 * 1024,
+      expectedStateToken: merge.state_token,
+    })
+  )
+)
+
+const resolved = await session.writeAndStageTextResult({
+  path: page.items[0].path,
+  content: editedResult,
+  expectedStateToken: merge.state_token,
+})
+
+await session.continueMerge({
+  message: "Merge hosted changes",
+  expectedStateToken: resolved.merge.state_token,
+})
+```
+
+`setMergePathResult` accepts `result: "ours" | "theirs"`. `resolveMergeRow` accepts the same
+choice plus a table and stable row identity. Arbitrary edited SQLite row results are intentionally
+not part of this contract yet. Conflict paths are paged directly from the index; detailed SQLite
+results are exposed as bounded pages for the selected path. The current analyzer still computes
+the repository conflict set before filtering that page; path-scoped streaming analysis is follow-up
+work. The host must validate Eidos File semantics before calling `continueMerge`, then pass the
+exact token that was validated.
 
 For working changes, pass `status.status.paths` to `diffPaths`. The API accepts normalized explicit
 logical paths, sorts/deduplicates them, and pages them with `limit`/`after`. It never recursively

@@ -240,6 +240,12 @@ pub enum RepoErr {
     #[error("merge already in progress")]
     MergeInProgress,
 
+    #[error("merge plan is stale: expected HEAD {expected:?}, found {actual:?}")]
+    MergePlanStale {
+        expected: Option<String>,
+        actual: Option<String>,
+    },
+
     #[error("no merge in progress")]
     NoMergeInProgress,
 

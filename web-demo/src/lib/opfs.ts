@@ -161,8 +161,13 @@ export async function readOpfsText(path: string, cwd = "/") {
   return preview.text ?? "";
 }
 
-export async function writeOpfsText(path: string, contents: string, cwd = "/") {
-  const handle = await fileHandle(path, cwd, true);
+export async function writeOpfsText(
+  path: string,
+  contents: string,
+  cwd = "/",
+  createParents = false,
+) {
+  const handle = await fileHandle(path, cwd, true, createParents);
   const writable = await handle.createWritable();
   await writable.write(contents);
   await writable.close();

@@ -6,9 +6,10 @@
   "scripts": {
     "build:wasm": "../scripts/build-web-demo-wasm.sh",
     "dev": "vite",
-    "build": "tsc -b && vite build",
-    "build:site": "tsc -b && vite build --base=/playground/",
-    "test:e2e": "playwright test",
+    "verify:wasm": "node scripts/verify-wasm-version.mjs",
+    "build": "pnpm verify:wasm && tsc -b && vite build",
+    "build:site": "pnpm verify:wasm && tsc -b && vite build --base=/playground/",
+    "test:e2e": "pnpm verify:wasm && playwright test",
     "preview": "vite preview"
   },
   "dependencies": {

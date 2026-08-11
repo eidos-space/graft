@@ -192,9 +192,9 @@ impl ResolveSide {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RepoResolveSpec {
-    pub(super) side: ResolveSide,
-    pub(super) path: Option<PathBuf>,
-    pub(super) row: Option<RepoResolveRowSpec>,
+    pub(crate) side: ResolveSide,
+    pub(crate) path: Option<PathBuf>,
+    pub(crate) row: Option<RepoResolveRowSpec>,
 }
 
 pub(super) enum RepoConflictSideState {
@@ -205,8 +205,8 @@ pub(super) enum RepoConflictSideState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RepoResolveRowSpec {
-    pub(super) table: String,
-    pub(super) identity: crate::row_level_diff::RowIdentity,
+    pub(crate) table: String,
+    pub(crate) identity: crate::row_level_diff::RowIdentity,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

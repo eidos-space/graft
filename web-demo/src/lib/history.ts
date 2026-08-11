@@ -11,5 +11,9 @@ export function historyChange(
   path?: string,
 ): CommitChange | undefined {
   const changes = historyChanges(commit);
-  return path ? changes.find((change) => change.path === path) : changes[0];
+  return path
+    ? changes.find(
+        (change) => change.path === path || change.previous_path === path,
+      )
+    : changes[0];
 }

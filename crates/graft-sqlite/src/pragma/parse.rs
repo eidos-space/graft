@@ -1742,7 +1742,9 @@ pub(super) fn parse_repo_resolve_arg(arg: &str) -> Result<RepoResolveSpec, Pragm
     })
 }
 
-fn parse_row_identity(value: &str) -> Result<crate::row_level_diff::RowIdentity, PragmaErr> {
+pub(crate) fn parse_row_identity(
+    value: &str,
+) -> Result<crate::row_level_diff::RowIdentity, PragmaErr> {
     if let Ok(rowid) = value.parse::<i64>() {
         return Ok(crate::row_level_diff::RowIdentity::Rowid(rowid));
     }

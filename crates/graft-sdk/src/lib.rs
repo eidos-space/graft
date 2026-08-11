@@ -14,13 +14,21 @@ use std::{
 };
 
 pub use graft::repo::{CancellationToken, RepoPathContent, RepoPathContentState};
-use graft::repo::{CommitArtifactState, CommitFileState, RepoStatus, Repository, index::Index};
+use graft::repo::{
+    CommitArtifactState, CommitFileState, MergeOutcome, MergePlan, RepoPathStorage, RepoStatus,
+    RepoTrackedPathKind, Repository,
+    index::{Index, IndexEntry, IndexStage},
+};
 use graft::{
     core::byte_unit::ByteUnit,
     remote::{RemoteConfig, RemoteCredentialErr, RemoteCredentials},
 };
 use graft_sqlite::{
-    repo_service::{RepositoryCommand, RepositoryCommandService},
+    repo_service::{
+        RepositoryCommand, RepositoryCommandService,
+        RepositoryResolveOptions as ServiceResolveOptions,
+        RepositoryResolveRow as ServiceResolveRow, RepositoryResolveSide as ServiceResolveSide,
+    },
     vfs::ErrCtx,
 };
 use parking_lot::Mutex;
@@ -40,6 +48,8 @@ pub const MAX_PATH_CONTENT_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_BATCH_MUTATION_PATHS: usize = 1_000;
 const MAX_INVENTORY_PAGE_SIZE: usize = 1_000;
 const MAX_IGNORE_QUERY_PATHS: usize = 1_000;
+const MAX_MERGE_PATH_PAGE_SIZE: usize = 500;
+const MAX_MERGE_CONFLICT_PAGE_SIZE: usize = 1_000;
 // Bump whenever persisted path classification semantics change.
 const STATUS_SNAPSHOT_SCHEMA_VERSION: u32 = 3;
 const MAX_STATUS_SNAPSHOTS: usize = 4;
@@ -332,6 +342,17 @@ pub enum RepositoryOperation {
     Fetch,
     Pull,
     Clone,
+    PlanMerge,
+    ApplyMerge,
+    GetMergeStatus,
+    ListMergePaths,
+    ListMergeConflicts,
+    ReadMergeVersion,
+    SetMergePathResult,
+    ResolveMergeRow,
+    WriteAndStageTextResult,
+    ContinueMerge,
+    AbortMerge,
 }
 
 impl RepositoryOperation {
@@ -339,9 +360,211 @@ impl RepositoryOperation {
     pub const fn materializes_worktree(self) -> bool {
         matches!(
             self,
-            Self::Restore | Self::RestorePaths | Self::Pull | Self::Clone
+            Self::Restore
+                | Self::RestorePaths
+                | Self::Pull
+                | Self::Clone
+                | Self::ApplyMerge
+                | Self::SetMergePathResult
+                | Self::ResolveMergeRow
+                | Self::WriteAndStageTextResult
+                | Self::ContinueMerge
+                | Self::AbortMerge
         )
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct PlanMergeOptions {
+    pub revision: String,
+    pub expected_head: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ApplyMergeOptions {
+    pub revision: String,
+    /// The HEAD observed while planning, or `None` for an unborn branch.
+    pub expected_head: Option<String>,
+    pub plan_token: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MergePlanKind {
+    UpToDate,
+    FastForward,
+    ThreeWay,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergePlanResult {
+    pub kind: MergePlanKind,
+    pub expected_head: Option<String>,
+    pub target: String,
+    pub merge_base: Option<String>,
+    pub staged_paths: Vec<String>,
+    pub conflicted_paths: Vec<String>,
+    pub plan_token: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum MergeStatus {
+    None,
+    Merging {
+        orig_head: String,
+        merge_head: String,
+        merge_base: Option<String>,
+        staged_count: usize,
+        unmerged_count: usize,
+        state_token: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergeApplyResult {
+    pub plan: MergePlanResult,
+    pub output: Value,
+    pub merge: MergeStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergePathFilter {
+    All,
+    Unmerged,
+    Resolved,
+}
+
+#[derive(Debug, Clone)]
+pub struct ListMergePathsOptions {
+    pub filter: MergePathFilter,
+    pub limit: usize,
+    pub after: Option<String>,
+    pub expected_state_token: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MergePathState {
+    Unmerged,
+    Resolved,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergePath {
+    pub path: String,
+    pub state: MergePathState,
+    pub kind: RepoTrackedPathKind,
+    pub storage: RepoPathStorage,
+    pub has_base: bool,
+    pub has_ours: bool,
+    pub has_theirs: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergePathPage {
+    pub state_token: String,
+    pub items: Vec<MergePath>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ListMergeConflictsOptions {
+    pub path: PathBuf,
+    pub limit: usize,
+    pub after: Option<String>,
+    pub expected_state_token: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergeConflictPage {
+    pub state_token: String,
+    pub path: String,
+    pub items: Vec<Value>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeVersion {
+    Base,
+    Ours,
+    Theirs,
+    Result,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReadMergeVersionOptions {
+    pub path: PathBuf,
+    pub version: MergeVersion,
+    pub max_bytes: u64,
+    pub expected_state_token: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum MergeContentState {
+    Absent,
+    Utf8 { content: String, size: u64 },
+    TooLarge { size: u64 },
+    MissingPayload { size: u64 },
+    InvalidUtf8 { size: u64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeContent {
+    pub version: String,
+    pub revision: Option<String>,
+    pub path: String,
+    pub kind: Option<RepoTrackedPathKind>,
+    pub storage: Option<RepoPathStorage>,
+    pub content: MergeContentState,
+    pub state_token: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergePathResult {
+    Ours,
+    Theirs,
+}
+
+#[derive(Debug, Clone)]
+pub struct SetMergePathResultOptions {
+    pub path: PathBuf,
+    pub result: MergePathResult,
+    pub expected_state_token: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolveMergeRowOptions {
+    pub path: PathBuf,
+    pub table: String,
+    pub identity: Value,
+    pub result: MergePathResult,
+    pub expected_state_token: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct WriteAndStageTextResultOptions {
+    pub path: PathBuf,
+    pub content: String,
+    pub expected_state_token: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ContinueMergeOptions {
+    pub message: String,
+    pub expected_state_token: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct AbortMergeOptions {
+    pub expected_state_token: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergeOperationResult {
+    pub output: Value,
+    pub merge: MergeStatus,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1580,6 +1803,343 @@ impl RepositorySession {
         self.execute_json_mutating("json_pull", argument.as_deref())
     }
 
+    /// Computes merge topology and path conflicts without changing refs, index, or worktree.
+    pub fn plan_merge(&self, options: &PlanMergeOptions) -> Result<MergePlanResult> {
+        validate_revision(&options.revision)?;
+        if let Some(expected_head) = &options.expected_head {
+            validate_revision(expected_head)?;
+        }
+        self.with_service(|service| {
+            let repo = service.repository().map_err(repository_command_error)?;
+            ensure_expected_head(&repo, options.expected_head.as_deref())?;
+            let plan = repo
+                .plan_merge_revision(&options.revision)
+                .map_err(repo_error)?;
+            merge_plan_result(&plan)
+        })
+    }
+
+    /// Applies a previously reviewed merge plan under HEAD and plan-token compare-and-swap guards.
+    pub fn apply_merge(&self, options: &ApplyMergeOptions) -> Result<MergeApplyResult> {
+        validate_revision(&options.revision)?;
+        if let Some(expected_head) = &options.expected_head {
+            validate_revision(expected_head)?;
+        }
+        if options.plan_token.trim().is_empty() {
+            return Err(invalid_argument("merge plan token must not be empty"));
+        }
+        self.with_state(|state| {
+            let SessionState { service, status_cache } = state;
+            let service = service.as_mut().ok_or_else(session_closed_error)?;
+            let repo = service.repository().map_err(repository_command_error)?;
+            ensure_expected_head(&repo, options.expected_head.as_deref())?;
+            let plan = repo
+                .plan_merge_revision(&options.revision)
+                .map_err(repo_error)?;
+            let summary = merge_plan_result(&plan)?;
+            if summary.plan_token != options.plan_token {
+                return Err(repository_stale_error(
+                    "merge plan changed; plan the merge again",
+                ));
+            }
+            let output = execute_json_command(
+                service,
+                RepositoryCommand::merge(options.revision.clone()),
+                "merge",
+            )?;
+            status_cache.invalidate();
+            let incremental = refresh_incremental_status(service, status_cache)?;
+            let merge = merge_status_from_incremental(service, &incremental)?;
+            Ok(MergeApplyResult { plan: summary, output, merge })
+        })
+    }
+
+    /// Reconstructs the singleton merge state from durable refs and index stages.
+    pub fn get_merge_status(&self) -> Result<MergeStatus> {
+        self.with_state(|state| {
+            let SessionState { service, status_cache } = state;
+            let service = service.as_mut().ok_or_else(session_closed_error)?;
+            let incremental = refresh_incremental_status(service, status_cache)?;
+            merge_status_from_incremental(service, &incremental)
+        })
+    }
+
+    /// Lists merge paths in stable path order without running `SQLite` row analysis.
+    pub fn list_merge_paths(&self, options: &ListMergePathsOptions) -> Result<MergePathPage> {
+        validate_page_limit(options.limit, MAX_MERGE_PATH_PAGE_SIZE, "merge path")?;
+        self.with_state(|state| {
+            let SessionState { service, status_cache } = state;
+            let service = service.as_mut().ok_or_else(session_closed_error)?;
+            let incremental =
+                require_merge_state_token(service, status_cache, &options.expected_state_token)?;
+            let repo = service.repository().map_err(repository_command_error)?;
+            let index = repo.read_index().map_err(repo_error)?;
+            let state_token = durable_merge_state_token(&repo, &incremental.status, &index)?;
+            let mut items = merge_paths_for_index(&index)
+                .into_iter()
+                .filter(|item| match options.filter {
+                    MergePathFilter::All => true,
+                    MergePathFilter::Unmerged => item.state == MergePathState::Unmerged,
+                    MergePathFilter::Resolved => item.state == MergePathState::Resolved,
+                })
+                .collect::<Vec<_>>();
+            let start = page_start_for_cursor(
+                &items,
+                options.after.as_deref(),
+                |item| item.path.clone(),
+                "merge path",
+            )?;
+            let has_more = items.len().saturating_sub(start) > options.limit;
+            items = items.into_iter().skip(start).take(options.limit).collect();
+            let next_cursor = has_more
+                .then(|| items.last().map(|item| item.path.clone()))
+                .flatten();
+            Ok(MergePathPage { state_token, items, next_cursor })
+        })
+    }
+
+    /// Returns one bounded conflict page for a selected path.
+    pub fn list_merge_conflicts(
+        &self,
+        options: &ListMergeConflictsOptions,
+    ) -> Result<MergeConflictPage> {
+        validate_page_limit(
+            options.limit,
+            MAX_MERGE_CONFLICT_PAGE_SIZE,
+            "merge conflict",
+        )?;
+        let path = normalize_requested_path(&options.path)?;
+        self.with_state(|state| {
+            let SessionState { service, status_cache } = state;
+            let service = service.as_mut().ok_or_else(session_closed_error)?;
+            let incremental =
+                require_merge_state_token(service, status_cache, &options.expected_state_token)?;
+            let repo = service.repository().map_err(repository_command_error)?;
+            let index = repo.read_index().map_err(repo_error)?;
+            let state_token = durable_merge_state_token(&repo, &incremental.status, &index)?;
+            let output =
+                execute_json_command(service, RepositoryCommand::conflicts(), "conflicts")?;
+            let conflicts = output
+                .get("conflicts")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    SdkError::new(
+                        SdkErrorCode::InvalidResponse,
+                        "conflicts response did not contain a conflict array",
+                    )
+                })?;
+            let mut items = conflicts
+                .iter()
+                .filter(|item| item.get("path").and_then(Value::as_str) == Some(path.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
+            items.sort_by(|left, right| conflict_id(left).cmp(conflict_id(right)));
+            let start = page_start_for_cursor(
+                &items,
+                options.after.as_deref(),
+                |item| conflict_id(item).to_string(),
+                "merge conflict",
+            )?;
+            let has_more = items.len().saturating_sub(start) > options.limit;
+            items = items.into_iter().skip(start).take(options.limit).collect();
+            let next_cursor = has_more
+                .then(|| items.last().map(|item| conflict_id(item).to_string()))
+                .flatten();
+            Ok(MergeConflictPage { state_token, path, items, next_cursor })
+        })
+    }
+
+    /// Reads a bounded Base/Ours/Theirs revision or the current editable worktree result.
+    pub fn read_merge_version(&self, options: &ReadMergeVersionOptions) -> Result<MergeContent> {
+        if options.max_bytes == 0 || options.max_bytes > MAX_PATH_CONTENT_BYTES {
+            return Err(invalid_argument(format!(
+                "merge content max_bytes must be between 1 and {MAX_PATH_CONTENT_BYTES}"
+            )));
+        }
+        let path = normalize_requested_path(&options.path)?;
+        self.with_state(|state| {
+            let SessionState { service, status_cache } = state;
+            let service = service.as_mut().ok_or_else(session_closed_error)?;
+            let incremental =
+                require_merge_state_token(service, status_cache, &options.expected_state_token)?;
+            let repo = service.repository().map_err(repository_command_error)?;
+            let index = repo.read_index().map_err(repo_error)?;
+            let state_token = durable_merge_state_token(&repo, &incremental.status, &index)?;
+            let (orig_head, merge_head, merge_base) = active_merge_heads(&repo, &incremental)?;
+            if options.version == MergeVersion::Result {
+                return read_worktree_merge_content(&repo, &path, options.max_bytes, state_token);
+            }
+            let (label, revision) = match options.version {
+                MergeVersion::Base => ("base", merge_base),
+                MergeVersion::Ours => ("ours", Some(orig_head)),
+                MergeVersion::Theirs => ("theirs", Some(merge_head)),
+                MergeVersion::Result => unreachable!("handled above"),
+            };
+            let Some(revision) = revision else {
+                return Ok(MergeContent {
+                    version: label.to_string(),
+                    revision: None,
+                    path,
+                    kind: None,
+                    storage: None,
+                    content: MergeContentState::Absent,
+                    state_token,
+                });
+            };
+            let content = repo
+                .read_path_content(&revision, &path, ByteUnit::new(options.max_bytes))
+                .map_err(repo_error)?;
+            Ok(project_merge_content(
+                label,
+                Some(revision),
+                content,
+                state_token,
+            ))
+        })
+    }
+
+    /// Selects stage 2 or stage 3 for one conflicted path and collapses it to stage 0.
+    pub fn set_merge_path_result(
+        &self,
+        options: &SetMergePathResultOptions,
+    ) -> Result<MergeOperationResult> {
+        let path = normalize_requested_path(&options.path)?;
+        self.mutate_merge_with_resolution(
+            &path,
+            None,
+            options.result,
+            &options.expected_state_token,
+        )
+    }
+
+    /// Selects ours or theirs for one `SQLite` row conflict.
+    pub fn resolve_merge_row(
+        &self,
+        options: &ResolveMergeRowOptions,
+    ) -> Result<MergeOperationResult> {
+        if options.table.trim().is_empty() {
+            return Err(invalid_argument("merge row table must not be empty"));
+        }
+        if !matches!(options.identity, Value::Number(_) | Value::Object(_)) {
+            return Err(invalid_argument(
+                "merge row identity must be a JSON number or object",
+            ));
+        }
+        let path = normalize_requested_path(&options.path)?;
+        self.mutate_merge_with_resolution(
+            &path,
+            Some(ServiceResolveRow {
+                table: options.table.clone(),
+                identity: options.identity.clone(),
+            }),
+            options.result,
+            &options.expected_state_token,
+        )
+    }
+
+    /// Writes an edited UTF-8 result and stages it as the complete resolution for one text path.
+    pub fn write_and_stage_text_result(
+        &self,
+        options: &WriteAndStageTextResultOptions,
+    ) -> Result<MergeOperationResult> {
+        if options.content.len() as u64 > MAX_PATH_CONTENT_BYTES {
+            return Err(invalid_argument(format!(
+                "edited merge result exceeds {MAX_PATH_CONTENT_BYTES} bytes"
+            )));
+        }
+        let path = normalize_requested_path(&options.path)?;
+        self.with_state(|state| {
+            let SessionState { service, status_cache } = state;
+            let service = service.as_mut().ok_or_else(session_closed_error)?;
+            require_merge_state_token(service, status_cache, &options.expected_state_token)?;
+            let repo = service.repository().map_err(repository_command_error)?;
+            ensure_text_merge_conflict(&repo, &path)?;
+            let physical_path = repo.worktree().join(&path);
+            write_merge_text_result(&repo, &physical_path, options.content.as_bytes())?;
+            let entry = repo
+                .resolve_artifact_conflict_from_path(&physical_path)
+                .map_err(repo_error)?;
+            status_cache.invalidate();
+            let incremental = refresh_incremental_status(service, status_cache)?;
+            let merge = merge_status_from_incremental(service, &incremental)?;
+            Ok(MergeOperationResult {
+                output: serde_json::json!({
+                    "operation": "write_and_stage_text_result",
+                    "path": entry.path,
+                    "resolution": "edited",
+                }),
+                merge,
+            })
+        })
+    }
+
+    /// Completes the current merge only if the candidate still matches the validated token.
+    pub fn continue_merge(&self, options: &ContinueMergeOptions) -> Result<MergeOperationResult> {
+        if options.message.trim().is_empty() || options.message.contains('\0') {
+            return Err(invalid_argument(
+                "merge commit message must not be empty or contain NUL",
+            ));
+        }
+        self.with_state(|state| {
+            let SessionState { service, status_cache } = state;
+            let service = service.as_mut().ok_or_else(session_closed_error)?;
+            require_merge_state_token(service, status_cache, &options.expected_state_token)?;
+            let output = execute_json_command(
+                service,
+                RepositoryCommand::merge_continue(options.message.clone()),
+                "merge_continue",
+            )?;
+            status_cache.invalidate();
+            let incremental = refresh_incremental_status(service, status_cache)?;
+            let merge = merge_status_from_incremental(service, &incremental)?;
+            Ok(MergeOperationResult { output, merge })
+        })
+    }
+
+    /// Aborts the current merge only if the merge state still matches the caller's token.
+    pub fn abort_merge(&self, options: &AbortMergeOptions) -> Result<MergeOperationResult> {
+        self.with_state(|state| {
+            let SessionState { service, status_cache } = state;
+            let service = service.as_mut().ok_or_else(session_closed_error)?;
+            require_merge_state_token(service, status_cache, &options.expected_state_token)?;
+            let output =
+                execute_json_command(service, RepositoryCommand::merge_abort(), "merge_abort")?;
+            status_cache.invalidate();
+            let incremental = refresh_incremental_status(service, status_cache)?;
+            let merge = merge_status_from_incremental(service, &incremental)?;
+            Ok(MergeOperationResult { output, merge })
+        })
+    }
+
+    fn mutate_merge_with_resolution(
+        &self,
+        path: &str,
+        row: Option<ServiceResolveRow>,
+        result: MergePathResult,
+        expected_state_token: &str,
+    ) -> Result<MergeOperationResult> {
+        self.with_state(|state| {
+            let SessionState { service, status_cache } = state;
+            let service = service.as_mut().ok_or_else(session_closed_error)?;
+            require_merge_state_token(service, status_cache, expected_state_token)?;
+            let side = match result {
+                MergePathResult::Ours => ServiceResolveSide::Ours,
+                MergePathResult::Theirs => ServiceResolveSide::Theirs,
+            };
+            let command = RepositoryCommand::resolve(ServiceResolveOptions {
+                side,
+                path: Some(PathBuf::from(path)),
+                row,
+            })
+            .map_err(repository_command_error)?;
+            let output = execute_json_command(service, command, "resolve_conflict")?;
+            status_cache.invalidate();
+            let incremental = refresh_incremental_status(service, status_cache)?;
+            let merge = merge_status_from_incremental(service, &incremental)?;
+            Ok(MergeOperationResult { output, merge })
+        })
+    }
+
     pub fn clone_repository(
         &self,
         remote_url: &str,
@@ -1723,6 +2283,9 @@ fn refresh_incremental_status_once(
     let repo = service.repository().map_err(repository_command_error)?;
     let head_target = repo.head_target().map_err(repo_error)?;
     let index = repo.read_index().map_err(repo_error)?;
+    if index.has_conflicts() {
+        return refresh_conflicted_incremental_status(service, cache, started, head_target, index);
+    }
     let persistent_snapshot_hit = if cache.persistent_snapshot_attempted {
         false
     } else {
@@ -1850,6 +2413,54 @@ fn refresh_incremental_status_once(
             status_cache_hit: false,
             persistent_snapshot_hit: false,
             persistent_snapshot_saved,
+            stability_retries: 0,
+        },
+    ))
+}
+
+fn refresh_conflicted_incremental_status(
+    service: &mut RepositoryCommandService,
+    cache: &mut IncrementalStatusCache,
+    started: Instant,
+    head_target: Option<String>,
+    index: Index,
+) -> Result<IncrementalStatusResult> {
+    let previous_status = cache.status.clone();
+    let status = service.status().map_err(repository_command_error)?;
+    let repo = service.repository().map_err(repository_command_error)?;
+    if repo.head_target().map_err(repo_error)? != head_target
+        || repo.read_index().map_err(repo_error)? != index
+    {
+        return Err(repository_stale_error(
+            "repository refs or conflict index changed while status was being collected",
+        ));
+    }
+    cache.files.clear();
+    cache.artifacts.clear();
+    cache.tracked_fingerprints.clear();
+    cache.untracked_fingerprints.clear();
+    cache.head_target = head_target;
+    cache.index = index;
+    cache.index_metadata_initialized = true;
+    cache.initialized = true;
+    cache.persistent_snapshot_attempted = false;
+    if status_changed(previous_status.as_ref(), &status)? {
+        cache.generation = cache.generation.saturating_add(1).max(1);
+    }
+    cache.status = Some(status.clone());
+    Ok(incremental_status_result(
+        cache,
+        status,
+        started,
+        StatusTelemetry {
+            duration_us: 0,
+            paths_examined: cache.index.entries.len(),
+            metadata_cache_hits: 0,
+            metadata_cache_misses: cache.index.entries.len(),
+            tree_cache_hit: false,
+            status_cache_hit: false,
+            persistent_snapshot_hit: false,
+            persistent_snapshot_saved: false,
             stability_retries: 0,
         },
     ))
@@ -2737,6 +3348,28 @@ fn execute_json(
     })
 }
 
+fn execute_json_command(
+    service: &mut RepositoryCommandService,
+    command: RepositoryCommand,
+    operation: &str,
+) -> Result<Value> {
+    let output = service
+        .execute(command)
+        .map_err(repository_command_error)?
+        .ok_or_else(|| {
+            SdkError::new(
+                SdkErrorCode::InvalidResponse,
+                format!("repository command `{operation}` returned no JSON"),
+            )
+        })?;
+    serde_json::from_str(&output).map_err(|error| {
+        SdkError::new(
+            SdkErrorCode::InvalidResponse,
+            format!("repository command `{operation}` returned invalid JSON: {error}"),
+        )
+    })
+}
+
 fn repository_command_error(error: ErrCtx) -> SdkError {
     if matches!(
         &error,
@@ -2751,24 +3384,38 @@ fn repository_command_error(error: ErrCtx) -> SdkError {
 }
 
 fn sdk_error_code_for_error(error: &ErrCtx, message: &str) -> SdkErrorCode {
-    use graft::{
-        remote::{HttpTransportErrorKind, RemoteErr},
-        repo::RepoErr,
-    };
+    #[cfg(target_arch = "wasm32")]
+    {
+        // Browser builds use graft::remote_wasm, which deliberately exposes a
+        // smaller error surface because network remotes are not available in
+        // the Playground. Keep the stable generic mapping here instead of
+        // making the WASM SDK depend on native transport variants.
+        let _ = error;
+        return sdk_error_code_for_message(message);
+    }
 
-    match error {
-        ErrCtx::Repo(RepoErr::Remote(RemoteErr::PublicationUnconfirmed { .. })) => {
-            SdkErrorCode::RemotePublicationUnconfirmed
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use graft::{
+            remote::{HttpTransportErrorKind, RemoteErr},
+            repo::RepoErr,
+        };
+
+        match error {
+            ErrCtx::Repo(RepoErr::Remote(RemoteErr::PublicationUnconfirmed { .. })) => {
+                SdkErrorCode::RemotePublicationUnconfirmed
+            }
+            ErrCtx::Repo(RepoErr::Remote(RemoteErr::PublicationOutcomeUnknown { .. })) => {
+                SdkErrorCode::RemotePublicationOutcomeUnknown
+            }
+            ErrCtx::Repo(RepoErr::Remote(remote_error))
+                if remote_error.http_transport_kind() == Some(HttpTransportErrorKind::Timeout) =>
+            {
+                SdkErrorCode::RemoteTransportTimeout
+            }
+            ErrCtx::Repo(RepoErr::MergePlanStale { .. }) => SdkErrorCode::RepositoryStale,
+            _ => sdk_error_code_for_message(message),
         }
-        ErrCtx::Repo(RepoErr::Remote(RemoteErr::PublicationOutcomeUnknown { .. })) => {
-            SdkErrorCode::RemotePublicationOutcomeUnknown
-        }
-        ErrCtx::Repo(RepoErr::Remote(remote_error))
-            if remote_error.http_transport_kind() == Some(HttpTransportErrorKind::Timeout) =>
-        {
-            SdkErrorCode::RemoteTransportTimeout
-        }
-        _ => sdk_error_code_for_message(message),
     }
 }
 
@@ -2976,6 +3623,397 @@ fn quote_pragma_value(value: &str) -> Result<String> {
     Ok(format!("\"{escaped}\""))
 }
 
+fn ensure_expected_head(repo: &Repository, expected_head: Option<&str>) -> Result<()> {
+    let Some(expected_head) = expected_head else {
+        return Ok(());
+    };
+    let actual = repo.head_target().map_err(repo_error)?;
+    if actual.as_deref() != Some(expected_head) {
+        return Err(repository_stale_error(format!(
+            "repository HEAD changed: expected {expected_head}, found {}",
+            actual.as_deref().unwrap_or("unborn")
+        )));
+    }
+    Ok(())
+}
+
+fn merge_plan_result(plan: &MergePlan) -> Result<MergePlanResult> {
+    let encoded = serde_json::to_vec(plan).map_err(|error| {
+        SdkError::new(
+            SdkErrorCode::InvalidResponse,
+            format!("failed to encode merge plan: {error}"),
+        )
+    })?;
+    let plan_token = blake3::hash(&encoded).to_hex().to_string();
+    let (kind, expected_head, merge_base, staged_paths, conflicted_paths) = match &plan.outcome {
+        MergeOutcome::AlreadyUpToDate { head } => (
+            MergePlanKind::UpToDate,
+            Some(head.clone()),
+            None,
+            Vec::new(),
+            Vec::new(),
+        ),
+        MergeOutcome::FastForward { from, .. } => (
+            MergePlanKind::FastForward,
+            from.clone(),
+            None,
+            Vec::new(),
+            Vec::new(),
+        ),
+        MergeOutcome::Merged { head, merge_base, staged, conflicted, .. } => (
+            MergePlanKind::ThreeWay,
+            Some(head.clone()),
+            merge_base.clone(),
+            staged.clone(),
+            conflicted.clone(),
+        ),
+    };
+    Ok(MergePlanResult {
+        kind,
+        expected_head,
+        target: plan.target.clone(),
+        merge_base,
+        staged_paths,
+        conflicted_paths,
+        plan_token,
+    })
+}
+
+fn merge_status_from_incremental(
+    service: &mut RepositoryCommandService,
+    incremental: &IncrementalStatusResult,
+) -> Result<MergeStatus> {
+    let Some(merge_head) = incremental.status.merge_head.clone() else {
+        return Ok(MergeStatus::None);
+    };
+    let orig_head = incremental.status.orig_head.clone().ok_or_else(|| {
+        SdkError::new(
+            SdkErrorCode::InvalidResponse,
+            "repository has MERGE_HEAD without ORIG_HEAD",
+        )
+    })?;
+    let repo = service.repository().map_err(repository_command_error)?;
+    let merge_base = repo
+        .merge_base_between(&orig_head, &merge_head)
+        .map_err(repo_error)?;
+    let index = repo.read_index().map_err(repo_error)?;
+    let state_token = durable_merge_state_token(&repo, &incremental.status, &index)?;
+    Ok(MergeStatus::Merging {
+        orig_head,
+        merge_head,
+        merge_base,
+        staged_count: incremental.status.counts.staged,
+        unmerged_count: incremental.status.counts.conflicted,
+        state_token,
+    })
+}
+
+fn active_merge_heads(
+    repo: &Repository,
+    incremental: &IncrementalStatusResult,
+) -> Result<(String, String, Option<String>)> {
+    let merge_head =
+        incremental.status.merge_head.clone().ok_or_else(|| {
+            SdkError::new(SdkErrorCode::RepositoryCommand, "no merge in progress")
+        })?;
+    let orig_head = incremental.status.orig_head.clone().ok_or_else(|| {
+        SdkError::new(
+            SdkErrorCode::InvalidResponse,
+            "repository has MERGE_HEAD without ORIG_HEAD",
+        )
+    })?;
+    let merge_base = repo
+        .merge_base_between(&orig_head, &merge_head)
+        .map_err(repo_error)?;
+    Ok((orig_head, merge_head, merge_base))
+}
+
+fn require_merge_state_token(
+    service: &mut RepositoryCommandService,
+    status_cache: &mut IncrementalStatusCache,
+    expected_state_token: &str,
+) -> Result<IncrementalStatusResult> {
+    if expected_state_token.trim().is_empty() {
+        return Err(invalid_argument("merge state token must not be empty"));
+    }
+    let incremental = refresh_incremental_status(service, status_cache)?;
+    if incremental.status.merge_head.is_none() {
+        return Err(SdkError::new(
+            SdkErrorCode::RepositoryCommand,
+            "no merge in progress",
+        ));
+    }
+    let repo = service.repository().map_err(repository_command_error)?;
+    let index = repo.read_index().map_err(repo_error)?;
+    let actual_state_token = durable_merge_state_token(&repo, &incremental.status, &index)?;
+    if actual_state_token != expected_state_token {
+        return Err(repository_stale_error(
+            "merge state changed; refresh the merge before retrying",
+        ));
+    }
+    Ok(incremental)
+}
+
+fn durable_merge_state_token(
+    repo: &Repository,
+    status: &RepoStatus,
+    index: &Index,
+) -> Result<String> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"graft-merge-state-v1\0");
+    hash_serialized(&mut hasher, status)?;
+    hash_serialized(&mut hasher, index)?;
+    hash_optional_file(
+        &mut hasher,
+        repo.graft_dir(),
+        &repo.graft_dir().join("row-conflict-resolutions.json"),
+    )?;
+    Ok(format!("graft-merge-v1:{}", hasher.finalize().to_hex()))
+}
+
+fn validate_page_limit(limit: usize, maximum: usize, label: &str) -> Result<()> {
+    if limit == 0 || limit > maximum {
+        return Err(invalid_argument(format!(
+            "{label} limit must be between 1 and {maximum}"
+        )));
+    }
+    Ok(())
+}
+
+fn page_start_for_cursor<T>(
+    items: &[T],
+    after: Option<&str>,
+    key: impl Fn(&T) -> String,
+    label: &str,
+) -> Result<usize> {
+    let Some(after) = after else {
+        return Ok(0);
+    };
+    items
+        .iter()
+        .position(|item| key(item) == after)
+        .map(|index| index + 1)
+        .ok_or_else(|| invalid_argument(format!("unknown {label} cursor")))
+}
+
+fn merge_paths_for_index(index: &Index) -> Vec<MergePath> {
+    let mut entries = BTreeMap::<String, Vec<&IndexEntry>>::new();
+    for entry in &index.entries {
+        entries.entry(entry.path.clone()).or_default().push(entry);
+    }
+    entries
+        .into_iter()
+        .map(|(path, entries)| {
+            let state = if entries
+                .iter()
+                .any(|entry| entry.stage != IndexStage::Normal)
+            {
+                MergePathState::Unmerged
+            } else {
+                MergePathState::Resolved
+            };
+            let (kind, storage) = merge_path_descriptor(&entries);
+            MergePath {
+                path,
+                state,
+                kind,
+                storage,
+                has_base: entries.iter().any(|entry| entry.stage == IndexStage::Base),
+                has_ours: entries.iter().any(|entry| entry.stage == IndexStage::Ours),
+                has_theirs: entries
+                    .iter()
+                    .any(|entry| entry.stage == IndexStage::Theirs),
+            }
+        })
+        .collect()
+}
+
+fn merge_path_descriptor(entries: &[&IndexEntry]) -> (RepoTrackedPathKind, RepoPathStorage) {
+    if entries.iter().any(|entry| entry.file.is_some()) {
+        return (
+            RepoTrackedPathKind::SqliteDatabase,
+            RepoPathStorage::SqliteSnapshot,
+        );
+    }
+    if let Some(artifact) = entries.iter().find_map(|entry| entry.artifact.as_ref()) {
+        return (
+            artifact.kind(),
+            if artifact.is_large() {
+                RepoPathStorage::External
+            } else {
+                RepoPathStorage::Inline
+            },
+        );
+    }
+    (RepoTrackedPathKind::BinaryFile, RepoPathStorage::Inline)
+}
+
+fn conflict_id(conflict: &Value) -> &str {
+    conflict.get("id").and_then(Value::as_str).unwrap_or("")
+}
+
+fn project_merge_content(
+    version: &str,
+    revision: Option<String>,
+    content: RepoPathContent,
+    state_token: String,
+) -> MergeContent {
+    let content_state = match content.content {
+        RepoPathContentState::Absent => MergeContentState::Absent,
+        RepoPathContentState::Utf8 { content, size, .. } => {
+            MergeContentState::Utf8 { content, size }
+        }
+        RepoPathContentState::TooLarge { size, .. } => MergeContentState::TooLarge { size },
+        RepoPathContentState::MissingPayload { size, .. } => {
+            MergeContentState::MissingPayload { size }
+        }
+        RepoPathContentState::InvalidUtf8 { size, .. } => MergeContentState::InvalidUtf8 { size },
+    };
+    MergeContent {
+        version: version.to_string(),
+        revision,
+        path: content.path,
+        kind: content.kind,
+        storage: content.storage,
+        content: content_state,
+        state_token,
+    }
+}
+
+fn read_worktree_merge_content(
+    repo: &Repository,
+    path: &str,
+    max_bytes: u64,
+    state_token: String,
+) -> Result<MergeContent> {
+    let index = repo.read_index().map_err(repo_error)?;
+    let path_entries = index
+        .entries
+        .iter()
+        .filter(|entry| entry.path == path)
+        .collect::<Vec<_>>();
+    let descriptor = (!path_entries.is_empty()).then(|| merge_path_descriptor(&path_entries));
+    let physical_path = repo.worktree().join(path);
+    let metadata = match fs::metadata(&physical_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(MergeContent {
+                version: "result".to_string(),
+                revision: None,
+                path: path.to_string(),
+                kind: descriptor.map(|value| value.0),
+                storage: descriptor.map(|value| value.1),
+                content: MergeContentState::Absent,
+                state_token,
+            });
+        }
+        Err(error) => return Err(repository_command_error(ErrCtx::IoErr(error))),
+    };
+    let size = metadata.len();
+    let content = if size > max_bytes {
+        MergeContentState::TooLarge { size }
+    } else {
+        let bytes = fs::read(&physical_path)
+            .map_err(|error| repository_command_error(ErrCtx::IoErr(error)))?;
+        match String::from_utf8(bytes) {
+            Ok(content) => MergeContentState::Utf8 { content, size },
+            Err(_) => MergeContentState::InvalidUtf8 { size },
+        }
+    };
+    Ok(MergeContent {
+        version: "result".to_string(),
+        revision: None,
+        path: path.to_string(),
+        kind: descriptor.map(|value| value.0),
+        storage: descriptor.map(|value| value.1),
+        content,
+        state_token,
+    })
+}
+
+fn ensure_text_merge_conflict(repo: &Repository, path: &str) -> Result<()> {
+    let index = repo.read_index().map_err(repo_error)?;
+    let entries = index
+        .entries
+        .iter()
+        .filter(|entry| entry.path == path)
+        .collect::<Vec<_>>();
+    if !entries
+        .iter()
+        .any(|entry| entry.stage != IndexStage::Normal)
+    {
+        return Err(repository_command_error(ErrCtx::Repo(
+            graft::repo::RepoErr::PathNotConflicted(path.to_string()),
+        )));
+    }
+    let artifacts = entries
+        .iter()
+        .filter_map(|entry| entry.artifact.as_ref())
+        .collect::<Vec<_>>();
+    if artifacts.is_empty()
+        || entries.iter().any(|entry| entry.file.is_some())
+        || artifacts
+            .iter()
+            .any(|artifact| artifact.kind() != RepoTrackedPathKind::TextFile)
+    {
+        return Err(repository_command_error(ErrCtx::Repo(
+            graft::repo::RepoErr::PathNotTextArtifact(path.to_string()),
+        )));
+    }
+    Ok(())
+}
+
+fn write_merge_text_result(repo: &Repository, path: &Path, bytes: &[u8]) -> Result<()> {
+    let Some(parent) = path.parent() else {
+        return Err(invalid_argument(
+            "edited merge path has no parent directory",
+        ));
+    };
+    fs::create_dir_all(parent).map_err(|error| repository_command_error(ErrCtx::IoErr(error)))?;
+    repo.file_key(path).map_err(repo_error)?;
+    let temp_directory = repo.graft_dir().join("tmp");
+    fs::create_dir_all(&temp_directory)
+        .map_err(|error| repository_command_error(ErrCtx::IoErr(error)))?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp_path = temp_directory.join(format!(
+        "sdk-merge-result-{}-{nonce}.tmp",
+        std::process::id()
+    ));
+    let backup_path = temp_directory.join(format!(
+        "sdk-merge-result-{}-{nonce}.backup",
+        std::process::id()
+    ));
+    let mut temp = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)
+        .map_err(|error| repository_command_error(ErrCtx::IoErr(error)))?;
+    if let Err(error) = temp.write_all(bytes).and_then(|()| temp.sync_all()) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(repository_command_error(ErrCtx::IoErr(error)));
+    }
+    drop(temp);
+    let had_original = path.exists();
+    if had_original {
+        fs::rename(path, &backup_path)
+            .map_err(|error| repository_command_error(ErrCtx::IoErr(error)))?;
+    }
+    if let Err(error) = fs::rename(&temp_path, path) {
+        if had_original {
+            let _ = fs::rename(&backup_path, path);
+        }
+        let _ = fs::remove_file(&temp_path);
+        return Err(repository_command_error(ErrCtx::IoErr(error)));
+    }
+    if had_original {
+        let _ = fs::remove_file(backup_path);
+    }
+    Ok(())
+}
+
 fn remote_branch_argument(remote: Option<&str>, branch: Option<&str>) -> Result<Option<String>> {
     if let Some(remote) = remote {
         validate_remote_name(remote)?;
@@ -3120,6 +4158,12 @@ mod tests {
         assert!(RepositoryOperation::RestorePaths.materializes_worktree());
         assert!(RepositoryOperation::Pull.materializes_worktree());
         assert!(RepositoryOperation::Clone.materializes_worktree());
+        assert!(RepositoryOperation::ApplyMerge.materializes_worktree());
+        assert!(RepositoryOperation::SetMergePathResult.materializes_worktree());
+        assert!(RepositoryOperation::ResolveMergeRow.materializes_worktree());
+        assert!(RepositoryOperation::WriteAndStageTextResult.materializes_worktree());
+        assert!(RepositoryOperation::ContinueMerge.materializes_worktree());
+        assert!(RepositoryOperation::AbortMerge.materializes_worktree());
         assert!(!RepositoryOperation::Init.materializes_worktree());
         assert!(!RepositoryOperation::Status.materializes_worktree());
         assert!(!RepositoryOperation::StatusIncremental.materializes_worktree());
@@ -3143,6 +4187,561 @@ mod tests {
         assert!(!RepositoryOperation::RemoteConfigure.materializes_worktree());
         assert!(!RepositoryOperation::Push.materializes_worktree());
         assert!(!RepositoryOperation::Fetch.materializes_worktree());
+        assert!(!RepositoryOperation::PlanMerge.materializes_worktree());
+        assert!(!RepositoryOperation::GetMergeStatus.materializes_worktree());
+        assert!(!RepositoryOperation::ListMergePaths.materializes_worktree());
+        assert!(!RepositoryOperation::ListMergeConflicts.materializes_worktree());
+        assert!(!RepositoryOperation::ReadMergeVersion.materializes_worktree());
+    }
+
+    #[test]
+    fn merge_plan_applies_to_an_unborn_branch() {
+        let directory = tempfile::tempdir().unwrap();
+        let note = directory.path().join("note.txt");
+        let repo = Repository::init(directory.path()).unwrap();
+        fs::write(&note, "target\n").unwrap();
+        repo.stage_artifact_path(&note).unwrap();
+        let target = repo.commit_staged("target").unwrap();
+        repo.branch_create_unborn("empty").unwrap();
+        repo.switch_branch("empty").unwrap();
+        fs::remove_file(&note).unwrap();
+        drop(repo);
+
+        let session = RepositorySession::new(directory.path());
+        session.open().unwrap();
+        let plan = session
+            .plan_merge(&PlanMergeOptions {
+                revision: target.id.clone(),
+                expected_head: None,
+            })
+            .unwrap();
+        assert_eq!(plan.kind, MergePlanKind::FastForward);
+        assert_eq!(plan.expected_head, None);
+
+        let applied = session
+            .apply_merge(&ApplyMergeOptions {
+                revision: target.id.clone(),
+                expected_head: None,
+                plan_token: plan.plan_token,
+            })
+            .unwrap();
+        assert_eq!(applied.merge, MergeStatus::None);
+        assert_eq!(fs::read_to_string(&note).unwrap(), "target\n");
+        assert_eq!(
+            session.repository_metadata().unwrap().current_head,
+            Some(target.id)
+        );
+    }
+
+    #[test]
+    fn git_like_text_merge_survives_reopen_and_stages_edited_result() {
+        let directory = tempfile::tempdir().unwrap();
+        let note = directory.path().join("note.txt");
+        let repo = Repository::init(directory.path()).unwrap();
+
+        fs::write(&note, "base\n").unwrap();
+        repo.stage_artifact_path(&note).unwrap();
+        let base = repo.commit_staged("base").unwrap();
+        repo.switch_new_branch("hosted", None).unwrap();
+        fs::write(&note, "hosted\n").unwrap();
+        repo.stage_artifact_path(&note).unwrap();
+        let theirs = repo.commit_staged("hosted edit").unwrap();
+        repo.switch_branch("main").unwrap();
+        fs::write(&note, "local\n").unwrap();
+        repo.stage_artifact_path(&note).unwrap();
+        let ours = repo.commit_staged("local edit").unwrap();
+        drop(repo);
+
+        let session = RepositorySession::new(directory.path());
+        session.open().unwrap();
+        let plan = session
+            .plan_merge(&PlanMergeOptions {
+                revision: theirs.id.clone(),
+                expected_head: Some(ours.id.clone()),
+            })
+            .unwrap();
+        assert_eq!(plan.kind, MergePlanKind::ThreeWay);
+        assert_eq!(plan.merge_base.as_deref(), Some(base.id.as_str()));
+        assert_eq!(plan.conflicted_paths, vec!["note.txt"]);
+
+        let applied = session
+            .apply_merge(&ApplyMergeOptions {
+                revision: theirs.id.clone(),
+                expected_head: Some(ours.id.clone()),
+                plan_token: plan.plan_token,
+            })
+            .unwrap();
+        let MergeStatus::Merging {
+            orig_head,
+            merge_head,
+            unmerged_count,
+            state_token,
+            ..
+        } = applied.merge
+        else {
+            panic!("expected an active merge");
+        };
+        assert_eq!(orig_head, ours.id);
+        assert_eq!(merge_head, theirs.id);
+        assert_eq!(unmerged_count, 1);
+
+        let paths = session
+            .list_merge_paths(&ListMergePathsOptions {
+                filter: MergePathFilter::All,
+                limit: 10,
+                after: None,
+                expected_state_token: state_token.clone(),
+            })
+            .unwrap();
+        assert_eq!(paths.items.len(), 1);
+        assert_eq!(paths.items[0].path, "note.txt");
+        assert_eq!(paths.items[0].state, MergePathState::Unmerged);
+        assert!(paths.items[0].has_base);
+        assert!(paths.items[0].has_ours);
+        assert!(paths.items[0].has_theirs);
+
+        for (version, expected) in [
+            (MergeVersion::Base, "base\n"),
+            (MergeVersion::Ours, "local\n"),
+            (MergeVersion::Theirs, "hosted\n"),
+        ] {
+            let content = session
+                .read_merge_version(&ReadMergeVersionOptions {
+                    path: PathBuf::from("note.txt"),
+                    version,
+                    max_bytes: 1024,
+                    expected_state_token: state_token.clone(),
+                })
+                .unwrap();
+            assert!(matches!(
+                content.content,
+                MergeContentState::Utf8 { ref content, .. } if content == expected
+            ));
+        }
+
+        session.close().unwrap();
+        session.open().unwrap();
+        let reopened = session.get_merge_status().unwrap();
+        let MergeStatus::Merging { state_token: reopened_token, .. } = reopened else {
+            panic!("expected merge state after reopen");
+        };
+        assert_eq!(reopened_token, state_token);
+
+        let stale = session
+            .write_and_stage_text_result(&WriteAndStageTextResultOptions {
+                path: PathBuf::from("note.txt"),
+                content: "resolved\n".to_string(),
+                expected_state_token: "stale".to_string(),
+            })
+            .unwrap_err();
+        assert_eq!(stale.code(), SdkErrorCode::RepositoryStale);
+
+        let resolved = session
+            .write_and_stage_text_result(&WriteAndStageTextResultOptions {
+                path: PathBuf::from("note.txt"),
+                content: "resolved\n".to_string(),
+                expected_state_token: reopened_token,
+            })
+            .unwrap();
+        let MergeStatus::Merging {
+            unmerged_count,
+            state_token: resolved_token,
+            ..
+        } = resolved.merge
+        else {
+            panic!("expected merge state until continue");
+        };
+        assert_eq!(unmerged_count, 0);
+        assert_eq!(fs::read_to_string(&note).unwrap(), "resolved\n");
+
+        let completed = session
+            .continue_merge(&ContinueMergeOptions {
+                message: "merge hosted".to_string(),
+                expected_state_token: resolved_token,
+            })
+            .unwrap();
+        assert_eq!(completed.merge, MergeStatus::None);
+        session.close().unwrap();
+
+        let repo = Repository::open(directory.path()).unwrap();
+        let commit = repo
+            .read_commit(&repo.head_target().unwrap().unwrap())
+            .unwrap();
+        assert_eq!(commit.parents.len(), 2);
+        assert_eq!(fs::read_to_string(note).unwrap(), "resolved\n");
+    }
+
+    #[test]
+    fn merge_path_result_selects_ours_and_theirs() {
+        for (result, expected) in [
+            (MergePathResult::Ours, "local\n"),
+            (MergePathResult::Theirs, "hosted\n"),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let note = directory.path().join("note.txt");
+            let repo = Repository::init(directory.path()).unwrap();
+
+            fs::write(&note, "base\n").unwrap();
+            repo.stage_artifact_path(&note).unwrap();
+            repo.commit_staged("base").unwrap();
+            repo.switch_new_branch("hosted", None).unwrap();
+            fs::write(&note, "hosted\n").unwrap();
+            repo.stage_artifact_path(&note).unwrap();
+            let theirs = repo.commit_staged("hosted edit").unwrap();
+            repo.switch_branch("main").unwrap();
+            fs::write(&note, "local\n").unwrap();
+            repo.stage_artifact_path(&note).unwrap();
+            let ours = repo.commit_staged("local edit").unwrap();
+            drop(repo);
+
+            let session = RepositorySession::new(directory.path());
+            session.open().unwrap();
+            let plan = session
+                .plan_merge(&PlanMergeOptions {
+                    revision: theirs.id.clone(),
+                    expected_head: Some(ours.id.clone()),
+                })
+                .unwrap();
+            let applied = session
+                .apply_merge(&ApplyMergeOptions {
+                    revision: theirs.id,
+                    expected_head: Some(ours.id),
+                    plan_token: plan.plan_token,
+                })
+                .unwrap();
+            let MergeStatus::Merging { state_token, .. } = applied.merge else {
+                panic!("expected an active merge");
+            };
+
+            let resolved = session
+                .set_merge_path_result(&SetMergePathResultOptions {
+                    path: PathBuf::from("note.txt"),
+                    result,
+                    expected_state_token: state_token.clone(),
+                })
+                .unwrap();
+            let MergeStatus::Merging {
+                unmerged_count,
+                state_token: resolved_token,
+                ..
+            } = resolved.merge
+            else {
+                panic!("expected merge state until continue or abort");
+            };
+            assert_eq!(unmerged_count, 0);
+            assert_ne!(resolved_token, state_token);
+            assert_eq!(fs::read_to_string(&note).unwrap(), expected);
+
+            let paths = session
+                .list_merge_paths(&ListMergePathsOptions {
+                    filter: MergePathFilter::Resolved,
+                    limit: 10,
+                    after: None,
+                    expected_state_token: resolved_token.clone(),
+                })
+                .unwrap();
+            assert_eq!(paths.items.len(), 1);
+            assert_eq!(paths.items[0].state, MergePathState::Resolved);
+
+            session
+                .abort_merge(&AbortMergeOptions { expected_state_token: resolved_token })
+                .unwrap();
+            assert_eq!(fs::read_to_string(&note).unwrap(), "local\n");
+            session.close().unwrap();
+        }
+    }
+
+    #[test]
+    fn sqlite_row_resolutions_survive_reopen_and_keep_both_selected_sides() {
+        let root = tempfile::tempdir().unwrap();
+        let source_directory = root.path().join("source");
+        let remote_directory = root.path().join("remote");
+        let decoy_remote_directory = root.path().join("decoy-remote");
+        let clone_directory = root.path().join("clone");
+        fs::create_dir_all(&source_directory).unwrap();
+        fs::create_dir_all(&remote_directory).unwrap();
+        fs::create_dir_all(&decoy_remote_directory).unwrap();
+        fs::create_dir_all(&clone_directory).unwrap();
+        let source_database = source_directory.join("space.eidos");
+        let clone_database = clone_directory.join("space.eidos");
+
+        {
+            let database = Connection::open(&source_database).unwrap();
+            database
+                .execute_batch(
+                    "CREATE TABLE docs (id INTEGER PRIMARY KEY, value TEXT NOT NULL);\
+                     INSERT INTO docs VALUES (1, 'base-one'), (2, 'base-two');",
+                )
+                .unwrap();
+        }
+
+        let source = RepositorySession::new(&source_directory);
+        source.open().unwrap();
+        source.init().unwrap();
+        source.add_all().unwrap();
+        source.commit("base").unwrap();
+        source
+            .configure_remote(&RemoteConfigureOptions {
+                name: "origin".to_string(),
+                url: format!("fs://{}", remote_directory.display()),
+                bearer_token: None,
+                overwrite: false,
+                upstream_branch: Some("main".to_string()),
+            })
+            .unwrap();
+        source.push(None, None).unwrap();
+
+        let clone = RepositorySession::new(&clone_directory);
+        clone.open().unwrap();
+        clone
+            .clone_repository(&format!("fs://{}", remote_directory.display()), None, None)
+            .unwrap();
+        clone
+            .configure_remote(&RemoteConfigureOptions {
+                name: "origin".to_string(),
+                url: format!("fs://{}", decoy_remote_directory.display()),
+                bearer_token: None,
+                overwrite: true,
+                upstream_branch: Some("main".to_string()),
+            })
+            .unwrap();
+        clone
+            .configure_remote(&RemoteConfigureOptions {
+                name: "backup".to_string(),
+                url: format!("fs://{}", remote_directory.display()),
+                bearer_token: None,
+                overwrite: false,
+                upstream_branch: None,
+            })
+            .unwrap();
+
+        {
+            let database = Connection::open(&source_database).unwrap();
+            database
+                .execute_batch(
+                    "UPDATE docs SET value = 'hosted-one' WHERE id = 1;\
+                     UPDATE docs SET value = 'hosted-two' WHERE id = 2;",
+                )
+                .unwrap();
+        }
+        source.add_all().unwrap();
+        source.commit("hosted rows").unwrap();
+        source.push(None, None).unwrap();
+
+        {
+            let database = Connection::open(&clone_database).unwrap();
+            database
+                .execute_batch(
+                    "UPDATE docs SET value = 'local-one' WHERE id = 1;\
+                     UPDATE docs SET value = 'local-two' WHERE id = 2;",
+                )
+                .unwrap();
+        }
+        clone.add_all().unwrap();
+        let local_head = clone.commit("local rows").unwrap()["commit"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        clone.fetch(Some("backup"), Some("main")).unwrap();
+
+        let plan = clone
+            .plan_merge(&PlanMergeOptions {
+                revision: "backup/main".to_string(),
+                expected_head: Some(local_head.clone()),
+            })
+            .unwrap();
+        assert_eq!(plan.kind, MergePlanKind::ThreeWay);
+        assert_eq!(plan.conflicted_paths, vec!["space.eidos"]);
+        let applied = clone
+            .apply_merge(&ApplyMergeOptions {
+                revision: "backup/main".to_string(),
+                expected_head: Some(local_head),
+                plan_token: plan.plan_token,
+            })
+            .unwrap();
+        let MergeStatus::Merging { state_token, unmerged_count, .. } = applied.merge else {
+            panic!("expected SQLite merge conflict");
+        };
+        assert_eq!(unmerged_count, 1);
+
+        let conflicts = clone
+            .list_merge_conflicts(&ListMergeConflictsOptions {
+                path: PathBuf::from("space.eidos"),
+                limit: 10,
+                after: None,
+                expected_state_token: state_token.clone(),
+            })
+            .unwrap();
+        assert_eq!(conflicts.items.len(), 2);
+        assert!(conflicts.items.iter().all(|item| item["kind"] == "row"));
+        assert!(
+            conflicts
+                .items
+                .iter()
+                .all(|item| item["status"] == "unresolved")
+        );
+
+        let first = clone
+            .resolve_merge_row(&ResolveMergeRowOptions {
+                path: PathBuf::from("space.eidos"),
+                table: "docs".to_string(),
+                identity: json!(1),
+                result: MergePathResult::Ours,
+                expected_state_token: state_token,
+            })
+            .unwrap();
+        let MergeStatus::Merging {
+            state_token: partial_token,
+            unmerged_count,
+            ..
+        } = first.merge
+        else {
+            panic!("expected the second row conflict to remain");
+        };
+        assert_eq!(unmerged_count, 1);
+
+        clone.close().unwrap();
+        clone.open().unwrap();
+        let MergeStatus::Merging { state_token: reopened_token, .. } =
+            clone.get_merge_status().unwrap()
+        else {
+            panic!("expected durable row resolution state");
+        };
+        assert_eq!(reopened_token, partial_token);
+        let partial = clone
+            .list_merge_conflicts(&ListMergeConflictsOptions {
+                path: PathBuf::from("space.eidos"),
+                limit: 10,
+                after: None,
+                expected_state_token: reopened_token.clone(),
+            })
+            .unwrap();
+        assert_eq!(
+            partial
+                .items
+                .iter()
+                .filter(|item| item["status"] == "resolved")
+                .count(),
+            1
+        );
+
+        let second = clone
+            .resolve_merge_row(&ResolveMergeRowOptions {
+                path: PathBuf::from("space.eidos"),
+                table: "docs".to_string(),
+                identity: json!(2),
+                result: MergePathResult::Theirs,
+                expected_state_token: reopened_token,
+            })
+            .unwrap();
+        let MergeStatus::Merging {
+            state_token: resolved_token,
+            unmerged_count,
+            ..
+        } = second.merge
+        else {
+            panic!("expected merge state until continue");
+        };
+        assert_eq!(unmerged_count, 0);
+        {
+            let database = Connection::open(&clone_database).unwrap();
+            let rows = database
+                .prepare("SELECT id, value FROM docs ORDER BY id")
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(
+                rows,
+                vec![(1, "local-one".to_string()), (2, "hosted-two".to_string())]
+            );
+        }
+
+        let completed = clone
+            .continue_merge(&ContinueMergeOptions {
+                message: "merge selected rows".to_string(),
+                expected_state_token: resolved_token,
+            })
+            .unwrap();
+        assert_eq!(completed.merge, MergeStatus::None);
+        let commit_id = completed.output["commit"]["id"].as_str().unwrap();
+        assert_eq!(
+            clone.commit_details(commit_id).unwrap()["parents"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        clone.close().unwrap();
+        source.close().unwrap();
+    }
+
+    #[test]
+    fn merge_plan_and_abort_reject_stale_tokens_and_restore_orig_head() {
+        let directory = tempfile::tempdir().unwrap();
+        let note = directory.path().join("note.txt");
+        let repo = Repository::init(directory.path()).unwrap();
+        fs::write(&note, "base\n").unwrap();
+        repo.stage_artifact_path(&note).unwrap();
+        repo.commit_staged("base").unwrap();
+        repo.switch_new_branch("hosted", None).unwrap();
+        fs::write(&note, "hosted\n").unwrap();
+        repo.stage_artifact_path(&note).unwrap();
+        let theirs = repo.commit_staged("hosted edit").unwrap();
+        repo.switch_branch("main").unwrap();
+        fs::write(&note, "local\n").unwrap();
+        repo.stage_artifact_path(&note).unwrap();
+        let ours = repo.commit_staged("local edit").unwrap();
+        drop(repo);
+
+        let session = RepositorySession::new(directory.path());
+        session.open().unwrap();
+        let plan = session
+            .plan_merge(&PlanMergeOptions {
+                revision: theirs.id.clone(),
+                expected_head: Some(ours.id.clone()),
+            })
+            .unwrap();
+        let stale_plan = session
+            .apply_merge(&ApplyMergeOptions {
+                revision: theirs.id.clone(),
+                expected_head: Some(ours.id.clone()),
+                plan_token: "stale".to_string(),
+            })
+            .unwrap_err();
+        assert_eq!(stale_plan.code(), SdkErrorCode::RepositoryStale);
+        let applied = session
+            .apply_merge(&ApplyMergeOptions {
+                revision: theirs.id,
+                expected_head: Some(ours.id.clone()),
+                plan_token: plan.plan_token,
+            })
+            .unwrap();
+        let MergeStatus::Merging { state_token, .. } = applied.merge else {
+            panic!("expected merge state");
+        };
+        let stale_abort = session
+            .abort_merge(&AbortMergeOptions {
+                expected_state_token: "stale".to_string(),
+            })
+            .unwrap_err();
+        assert_eq!(stale_abort.code(), SdkErrorCode::RepositoryStale);
+        let aborted = session
+            .abort_merge(&AbortMergeOptions { expected_state_token: state_token })
+            .unwrap();
+        assert_eq!(aborted.merge, MergeStatus::None);
+        assert_eq!(fs::read_to_string(&note).unwrap(), "local\n");
+        assert_eq!(
+            session
+                .repository_metadata()
+                .unwrap()
+                .current_head
+                .as_deref(),
+            Some(ours.id.as_str())
+        );
     }
 
     #[test]

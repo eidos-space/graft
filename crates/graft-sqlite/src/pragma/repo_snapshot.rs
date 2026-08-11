@@ -187,8 +187,18 @@ pub(super) fn prepare_repo_merge_plan(
     } else {
         SnapshotHashPolicy::Strict
     };
-    RepoSnapshotResolver::normalizing(runtime, remote, RepoSnapshotPurpose::Merge, hash_policy)
+    if remote.is_some() {
+        RepoSnapshotResolver::normalizing_local_then_remote(
+            runtime,
+            remote,
+            RepoSnapshotPurpose::Merge,
+            hash_policy,
+        )
         .resolve_merge_plan(plan)
+    } else {
+        RepoSnapshotResolver::normalizing(runtime, remote, RepoSnapshotPurpose::Merge, hash_policy)
+            .resolve_merge_plan(plan)
+    }
 }
 
 impl<'a> RepoSnapshotResolver<'a> {
@@ -251,6 +261,24 @@ impl<'a> RepoSnapshotResolver<'a> {
                 remote_mode: RepoSnapshotRemoteMode::LocalThenRemote,
                 hash_policy,
                 normalize: false,
+            },
+        }
+    }
+
+    pub(super) fn normalizing_local_then_remote(
+        runtime: &'a Runtime,
+        remote: Option<Arc<Remote>>,
+        purpose: RepoSnapshotPurpose,
+        hash_policy: SnapshotHashPolicy,
+    ) -> Self {
+        Self {
+            runtime,
+            remote,
+            policy: RepoSnapshotResolvePolicy {
+                purpose,
+                remote_mode: RepoSnapshotRemoteMode::LocalThenRemote,
+                hash_policy,
+                normalize: hash_policy != SnapshotHashPolicy::Strict,
             },
         }
     }

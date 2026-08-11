@@ -332,7 +332,7 @@ impl Runtime {
 // log methods
 impl Runtime {
     pub fn fetch_log(&self, log: LogId, max_lsn: Option<LSN>) -> Result<()> {
-        self.run_action(FetchLog { log, max_lsn })
+        self.run_action(FetchLog { log, min_lsn: None, max_lsn })
     }
 
     pub fn fetch_log_from(
@@ -341,7 +341,24 @@ impl Runtime {
         max_lsn: Option<LSN>,
         remote: Arc<Remote>,
     ) -> Result<()> {
-        self.run_action_with_remote(FetchLog { log, max_lsn }, remote)
+        self.run_action_with_remote(FetchLog { log, min_lsn: None, max_lsn }, remote)
+    }
+
+    fn fetch_log_range_from(
+        &self,
+        log: LogId,
+        min_lsn: LSN,
+        max_lsn: LSN,
+        remote: Arc<Remote>,
+    ) -> Result<()> {
+        self.run_action_with_remote(
+            FetchLog {
+                log,
+                min_lsn: Some(min_lsn),
+                max_lsn: Some(max_lsn),
+            },
+            remote,
+        )
     }
 
     pub fn get_commit(&self, log: &LogId, lsn: LSN) -> Result<Option<Commit>> {
@@ -476,7 +493,12 @@ impl Runtime {
 
     pub fn snapshot_fetch_from(&self, snapshot: &Snapshot, remote: Arc<Remote>) -> Result<()> {
         for range in snapshot.iter() {
-            self.fetch_log_from(range.log.clone(), Some(*range.lsns.end()), remote.clone())?;
+            self.fetch_log_range_from(
+                range.log.clone(),
+                *range.lsns.start(),
+                *range.lsns.end(),
+                remote.clone(),
+            )?;
         }
         self.ensure_snapshot_commits(snapshot)
     }
@@ -830,6 +852,26 @@ mod tests {
         assert!(runtime.snapshot_hydration_cached(&snapshot).unwrap());
 
         runtime.storage_gc(&BTreeSet::new(), &[], false).unwrap();
+        assert!(!runtime.snapshot_hydration_cached(&snapshot).unwrap());
+    }
+
+    #[test]
+    fn stale_snapshot_hydration_marker_does_not_hide_a_missing_commit() {
+        let tokio_rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let remote = Arc::new(RemoteConfig::Memory.build().unwrap());
+        let storage = Arc::new(FjallStorage::open_temporary().unwrap());
+        let runtime = Runtime::new(tokio_rt.handle().clone(), remote, storage.clone(), None);
+        let snapshot = Snapshot::new(
+            LogId::random(),
+            LSN::FIRST..=LSN::FIRST,
+            crate::core::PageCount::new(1),
+        );
+
+        storage.mark_snapshot_hydrated(&snapshot).unwrap();
+        assert!(!runtime.snapshot_hydration_cached(&snapshot).unwrap());
         assert!(!runtime.snapshot_hydration_cached(&snapshot).unwrap());
     }
 

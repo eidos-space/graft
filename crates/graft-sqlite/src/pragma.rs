@@ -66,7 +66,7 @@ macro_rules! pragma_err {
 mod jobs;
 mod json;
 mod output_types;
-mod parse;
+pub(crate) mod parse;
 mod repo_checkout;
 mod repo_conflicts;
 pub(crate) mod repo_core;
@@ -83,7 +83,7 @@ mod repo_switch;
 mod repo_sync;
 mod row_diff;
 mod row_merge_output;
-mod spec;
+pub(crate) mod spec;
 pub(crate) mod sqlite_worktree;
 mod volume_output;
 

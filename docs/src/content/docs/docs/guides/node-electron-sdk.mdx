@@ -72,7 +72,8 @@ install-time compiler or binary downloader.
 | `init`, `status`, `statusIncremental`, `repositoryMetadata`, `listRemotes`, `addAll`, `stagePaths`, `untrackPaths`, `commit` | No |
 | `diff`, `diffPaths`, `readPathContent`, `history`, `historySummaries`, `commitDetails`, `commitChangedPaths`, `isIgnoredPath`, `isIgnoredPaths`, `inventory` | No |
 | `configureRemote`, `push`, `fetch` | No |
-| `restore`, `restorePaths`, `pull`, `cloneRepository` | **Yes** |
+| `planMerge`, `getMergeStatus`, `listMergePaths`, `listMergeConflicts`, `readMergeVersion` | No |
+| `restore`, `restorePaths`, `pull`, `cloneRepository`, `applyMerge`, `setMergePathResult`, `resolveMergeRow`, `writeAndStageTextResult`, `continueMerge`, `abortMerge` | **Yes** |
 
 Before a materializing operation, stop new application writes, drain transactions, and close the
 affected SQLite handles. Reopen and validate those handles after the SDK promise settles. The Graft

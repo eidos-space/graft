@@ -79,7 +79,10 @@ impl Task for AutosyncTask {
             // execute all scheduled fetches
             let mut futures: FuturesUnordered<_> = fetches
                 .into_iter()
-                .map(|log| FetchLog { log, max_lsn: None }.run(storage.clone(), remote.clone()))
+                .map(|log| {
+                    FetchLog { log, min_lsn: None, max_lsn: None }
+                        .run(storage.clone(), remote.clone())
+                })
                 .collect();
             while let Some(result) = futures.next().await {
                 if let Err(err) = result {
