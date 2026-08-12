@@ -1255,6 +1255,7 @@ pub(super) fn format_merge_outcome_with_row_auto_merge(
     remote: Option<Arc<Remote>>,
 ) -> Result<String, ErrCtx> {
     let display_outcome = row_auto_merge
+        .filter(|result| result.resolved)
         .map(|result| merge_outcome_with_row_auto_merge(outcome, &result.key))
         .unwrap_or_else(|| outcome.clone());
     let mut f = format_merge_outcome(&display_outcome)?;
@@ -1313,6 +1314,12 @@ pub(super) fn append_row_auto_merge_result(
     )?;
     writeln!(output, "  ours: {} row change(s)", result.ours_changes)?;
     writeln!(output, "  theirs: {} row change(s)", result.theirs_changes)?;
+    if result.requires_validation {
+        writeln!(
+            output,
+            "  candidate requires application recomputation and validation before staging"
+        )?;
+    }
     Ok(())
 }
 

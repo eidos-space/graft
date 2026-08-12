@@ -356,6 +356,31 @@ impl TableChanges {
 
         sql
     }
+
+    pub(crate) fn format_record_update(
+        &self,
+        generated_columns: &BTreeMap<String, GeneratedColumnKind>,
+        identity: &RowIdentity,
+        row: &Record,
+    ) -> String {
+        match identity {
+            RowIdentity::Rowid(rowid) => format_sql_update(
+                &self.table_name,
+                &self.columns,
+                self.rowid_alias.as_deref(),
+                generated_columns,
+                *rowid,
+                row,
+            ),
+            RowIdentity::PrimaryKey(key) => format_sql_update_by_primary_key(
+                &self.table_name,
+                &self.columns,
+                generated_columns,
+                key,
+                row,
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -372,6 +397,16 @@ pub enum SchemaChangeKind {
     Added,
     Deleted,
     Modified,
+}
+
+impl SchemaChangeKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Added => "added",
+            Self::Deleted => "deleted",
+            Self::Modified => "modified",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -828,9 +863,14 @@ pub fn rowid_table_summaries_for_tables(
     let to_master = to_scanner.read_master_table().map_err(|error| {
         graft::err::LogicalErr::Other(format!("Failed to read target schema: {error:?}"))
     })?;
+    let ignored_tables = HashSet::new();
     for table in tables {
-        let from_entry = from_master.iter().find(|entry| entry.name == *table);
-        let to_entry = to_master.iter().find(|entry| entry.name == *table);
+        let from_entry = from_master
+            .iter()
+            .find(|entry| entry.name == *table && is_diffable_table(entry, &ignored_tables));
+        let to_entry = to_master
+            .iter()
+            .find(|entry| entry.name == *table && is_diffable_table(entry, &ignored_tables));
         let stable_rowid_layout = match (from_entry, to_entry) {
             (Some(from), Some(to)) => {
                 !is_without_rowid_table(from) && !is_without_rowid_table(to) && from.sql == to.sql
@@ -939,8 +979,12 @@ fn bounded_row_diff_from_readers(
 
     for table_name in table_names {
         bounded_cancellation_checkpoint()?;
-        let from_entry = from_master.iter().find(|entry| entry.name == table_name);
-        let to_entry = to_master.iter().find(|entry| entry.name == table_name);
+        let from_entry = from_master
+            .iter()
+            .find(|entry| entry.name == table_name && is_diffable_table(entry, &ignored_tables));
+        let to_entry = to_master
+            .iter()
+            .find(|entry| entry.name == table_name && is_diffable_table(entry, &ignored_tables));
         let entry = to_entry
             .or(from_entry)
             .expect("bounded table exists in one side");
@@ -2310,8 +2354,12 @@ fn row_level_diff_from_readers(
     // Compare each table
     for table_name in all_tables {
         tables_scanned += 1;
-        let from_entry = from_master.iter().find(|e| e.name == table_name);
-        let to_entry = to_master.iter().find(|e| e.name == table_name);
+        let from_entry = from_master
+            .iter()
+            .find(|entry| entry.name == table_name && is_diffable_table(entry, &ignored_tables));
+        let to_entry = to_master
+            .iter()
+            .find(|entry| entry.name == table_name && is_diffable_table(entry, &ignored_tables));
 
         // Get columns from schema (prefer to-entry, fallback to from-entry)
         let column_infos: Vec<ColumnInfo> = to_entry

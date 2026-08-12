@@ -19,9 +19,10 @@ use crate::{
     pragma::{
         GraftCommand,
         parse::parse_row_identity,
+        repo_conflicts::{resolve_repo_cell_conflict, stage_repo_worktree_sqlite_result},
         repo_core::repo_for_file,
         repo_diff::repo_status_for_file,
-        spec::{RepoResolveRowSpec, RepoResolveSpec, ResolveSide},
+        spec::{RepoResolveCellSpec, RepoResolveRowSpec, RepoResolveSpec, ResolveSide},
         sqlite_worktree::physical_sqlite_file_matches_state,
     },
     session::{RepoRuntimeRegistry, RepositorySessionContext},
@@ -55,6 +56,33 @@ pub struct RepositoryResolveOptions {
     pub side: RepositoryResolveSide,
     pub path: Option<PathBuf>,
     pub row: Option<RepositoryResolveRow>,
+}
+
+/// Typed whole-table row-conflict selection for embedders.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RepositoryResolveTableOptions {
+    pub side: RepositoryResolveSide,
+    pub path: PathBuf,
+    pub table: String,
+}
+
+/// Typed field-level row-conflict selection for embedders.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RepositoryResolveCellOptions {
+    pub side: RepositoryResolveSide,
+    pub path: PathBuf,
+    pub table: String,
+    pub identity: serde_json::Value,
+    pub column: String,
+}
+
+/// The effective, versioned merge policy observed by an embedded repository session.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RepositoryMergePolicy {
+    pub version: u32,
+    pub token: String,
+    pub active_merge: bool,
+    pub policy: graft::repo::MergeConfig,
 }
 
 impl RepositoryCommand {
@@ -97,6 +125,32 @@ impl RepositoryCommand {
                 spec: RepoResolveSpec { side, path: options.path, row },
             },
         })
+    }
+
+    pub fn resolve_table(options: RepositoryResolveTableOptions) -> Self {
+        let side = match options.side {
+            RepositoryResolveSide::Ours => ResolveSide::Ours,
+            RepositoryResolveSide::Theirs => ResolveSide::Theirs,
+        };
+        Self {
+            command: GraftCommand::JsonResolveTableConflict {
+                path: options.path,
+                table: options.table,
+                side,
+            },
+        }
+    }
+
+    pub fn unresolve(path: PathBuf) -> Self {
+        Self {
+            command: GraftCommand::JsonUnresolveConflict { path },
+        }
+    }
+
+    pub fn record_merge_path_resolution(path: PathBuf, resolution: &'static str) -> Self {
+        Self {
+            command: GraftCommand::JsonRecordMergePathResolution { path, resolution },
+        }
     }
 
     pub fn merge_continue(message: impl Into<String>) -> Self {
@@ -158,7 +212,7 @@ impl RepositoryCommandService {
         );
         let repository_database = repo
             .as_ref()
-            .filter(|repo| target != repo.graft_dir())
+            .filter(|repo| target != repo.graft_dir() && !target.is_dir())
             .map(|_| target.to_path_buf());
         let mut file = RepositorySessionContext::new(
             runtime,
@@ -188,6 +242,66 @@ impl RepositoryCommandService {
         let runtime = self.file.runtime().clone();
         let repo = repo_for_file(&mut self.file)?;
         repo_status_for_file(&runtime, &self.file, &repo)
+    }
+
+    /// Returns the effective policy, using the frozen snapshot while a merge is active.
+    pub fn merge_policy(&mut self) -> Result<RepositoryMergePolicy, ErrCtx> {
+        let repo = self.repository()?;
+        if let Some((policy, token, version)) =
+            crate::pragma::repo_conflicts::active_merge_policy(&repo)?
+        {
+            return Ok(RepositoryMergePolicy {
+                version,
+                token,
+                active_merge: true,
+                policy,
+            });
+        }
+        let policy = repo.config()?.merge.effective();
+        policy.validate()?;
+        Ok(RepositoryMergePolicy {
+            version: graft::repo::MERGE_POLICY_VERSION,
+            token: policy.policy_token(),
+            active_merge: false,
+            policy,
+        })
+    }
+
+    /// Applies one ours/theirs selection to a structured `SQLite` cell conflict.
+    pub fn resolve_cell(
+        &mut self,
+        options: RepositoryResolveCellOptions,
+    ) -> Result<String, ErrCtx> {
+        let side = match options.side {
+            RepositoryResolveSide::Ours => ResolveSide::Ours,
+            RepositoryResolveSide::Theirs => ResolveSide::Theirs,
+        };
+        let encoded = serde_json::to_string(&options.identity)
+            .map_err(|error| ErrCtx::InvalidCommand(error.to_string().into()))?;
+        let identity = parse_row_identity(&encoded).map_err(|error| {
+            ErrCtx::InvalidCommand(format!("invalid row identity: {error:?}").into())
+        })?;
+        let runtime = self.file.runtime().clone();
+        let repo = repo_for_file(&mut self.file)?;
+        resolve_repo_cell_conflict(
+            &runtime,
+            &mut self.file,
+            &repo,
+            &options.path,
+            side,
+            &RepoResolveCellSpec {
+                table: options.table,
+                identity,
+                column: options.column,
+            },
+        )
+    }
+
+    /// Validates and stages the current physical `SQLite` file as the resolved merge result.
+    pub fn stage_worktree_sqlite_result(&mut self, path: &Path) -> Result<String, ErrCtx> {
+        let runtime = self.file.runtime().clone();
+        let repo = repo_for_file(&mut self.file)?;
+        stage_repo_worktree_sqlite_result(&runtime, &repo, path)
     }
 
     /// Lists commit metadata without hydrating any commit trees or blobs.

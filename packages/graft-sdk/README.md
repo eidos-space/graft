@@ -176,11 +176,15 @@ files in the Space. Changes confined to `.graft` are not counted.
 | `pull` | Fetch, integrate, and check out the result | **Yes** |
 | `cloneRepository` | Populate a new worktree from a remote | **Yes** |
 | `planMerge` | Compute an immutable up-to-date, fast-forward, or three-way plan | No |
+| `getMergePolicy`, `validateMergePolicy`, `setMergePolicy` | Read, validate, or CAS-update the versioned finite merge policy | No |
 | `applyMerge` | Apply a reviewed plan under HEAD/plan-token guards | **Yes** |
 | `getMergeStatus` | Reconstruct the active merge from `ORIG_HEAD`, `MERGE_HEAD`, and index stages | No |
 | `listMergePaths`, `listMergeConflicts` | Page merge paths and selected-path conflict details | No |
 | `readMergeVersion` | Read bounded base/ours/theirs/result content | No |
-| `setMergePathResult`, `resolveMergeRow` | Select ours/theirs for a path or SQLite row | **Yes** |
+| `diffMergeSqlite` | Diff immutable base/ours/theirs SQLite versions during an active merge | No |
+| `setMergePathResult`, `resolveMergeRow`, `resolveMergeCell`, `resolveMergeTable` | Select ours/theirs for a path, SQLite row, cell, or table | **Yes** |
+| `unresolveMergePath` | Restore a resolved path to its original merge conflict stages | **Yes** |
+| `stageMergeSqliteResult` | Validate and stage an application-edited SQLite candidate without replacing the worktree | No |
 | `writeAndStageTextResult` | Atomically replace and stage an edited UTF-8 result | **Yes** |
 | `continueMerge`, `abortMerge` | Commit or restore a guarded active merge | **Yes** |
 
@@ -413,12 +417,67 @@ await session.continueMerge({
 ```
 
 `setMergePathResult` accepts `result: "ours" | "theirs"`. `resolveMergeRow` accepts the same
-choice plus a table and stable row identity. Arbitrary edited SQLite row results are intentionally
-not part of this contract yet. Conflict paths are paged directly from the index; detailed SQLite
-results are exposed as bounded pages for the selected path. The current analyzer still computes
+choice plus a table and stable row identity. With explicit `same_row_merge`,
+`resolveMergeCell` selects one structured conflicting column while retaining automatically
+combined fields. `resolveMergeTable` atomically applies one choice to
+all safely row-resolvable conflicts in a table while retaining both sides' non-conflicting rows;
+schema, opaque, and semantic-key conflicts are rejected. `unresolveMergePath` restores the
+original stages and worktree conflict candidate for any staged path resolution. Application-edited
+SQLite candidates close through the validated `stageMergeSqliteResult` operation. Resolved and
+unresolved conflicts remain queryable from the durable merge-session journal until continue or abort.
+Detailed SQLite results are exposed as bounded pages for the selected path. The analyzer computes
 the repository conflict set before filtering that page; path-scoped streaming analysis is follow-up
 work. The host must validate Eidos File semantics before calling `continueMerge`, then pass the
 exact token that was validated.
+
+Merge policy is a versioned, data-only SDK contract:
+
+```js
+const current = await session.getMergePolicy({ signal })
+const next = await session.setMergePolicy({
+  expectedPolicyToken: current.policy_token,
+  signal,
+  policy: {
+    version: 1,
+    same_row_merge: true,
+    semantic_keys: { records: ["external_id"] },
+    semantic_key_collations: {
+      records: { external_id: "nocase" },
+    },
+    column_resolvers: {
+      records: {
+        updated_at: "max_timestamp",
+        search_text: "recompute",
+      },
+    },
+  },
+})
+```
+
+The finite managed resolver set is `ignore_for_conflict`, `max`, `min`,
+`max_timestamp`, and `recompute`; no resolver executes application code. A
+`recompute` candidate remains unresolved with a `recompute_required` validation
+artifact. After application-owned recomputation, call
+`stageMergeSqliteResult({ path, expectedStateToken, signal })`; Graft captures
+the exact SQLite file, validates integrity and foreign keys in a private
+database, then stages it. Policy is frozen for an active three-way merge, and
+both merge plans/status report the actual policy token/version.
+
+`diffMergeSqlite({ path, from, to, mode, expectedStateToken, signal })` compares any two distinct
+immutable versions from `"base" | "ours" | "theirs"` while the merge is active. Summary mode
+returns bounded table, schema, and opaque-change facts; rows mode additionally requires `table`
+and accepts `rowLimit`/`rowAfter`. Schema entries include `name`, `entry_type`, `op`, `sql`, and
+optional `old_sql`. The operation is read-only, is valid with unresolved index conflicts, checks
+the merge state token before inspection, supports cancellation, and never materializes the
+worktree. A client can compose base-to-ours and base-to-theirs calls into a generic three-way
+SQLite view, then apply its own domain-level interpretation.
+
+When one side differs physically but its supported logical SQLite diff from Base is empty, and
+analysis reports no schema conflict, row conflict, opaque change, or limitation, Graft may safely
+collapse that path to Ours. `listMergeConflicts` reports the same conclusion for an older active
+merge as `auto_resolvable: true`, `recommended_result: "ours"`, and reason
+`theirs_logically_equivalent_to_base`; clients must not treat unsupported or limited analysis as
+logical equivalence.
 
 For working changes, pass `status.status.paths` to `diffPaths`. The API accepts normalized explicit
 logical paths, sorts/deduplicates them, and pages them with `limit`/`after`. It never recursively

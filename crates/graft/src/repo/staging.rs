@@ -258,6 +258,42 @@ impl Repository {
         self.clear_dirty_keys(entries.iter().map(|entry| entry.path.as_str()))
     }
 
+    /// Restores the original non-normal index stages for one path in an active merge.
+    ///
+    /// Embedders use this as the repository-level equivalent of Git's resolve-undo. The caller
+    /// supplies stages captured from the same durable merge session; this method validates that
+    /// they address exactly one normalized path before replacing the current stage-0 result.
+    pub fn restore_merge_conflict_stages(
+        &self,
+        path: impl AsRef<Path>,
+        entries: &[index::IndexEntry],
+    ) -> Result<()> {
+        let key = self.file_key(path)?;
+        if self.merge_head()?.is_none() {
+            return Err(RepoErr::NoMergeInProgress);
+        }
+        if entries.is_empty()
+            || entries
+                .iter()
+                .any(|entry| entry.path != key || entry.stage == index::IndexStage::Normal)
+        {
+            return Err(RepoErr::PathNotConflicted(key));
+        }
+        let mut stages = BTreeSet::new();
+        if entries
+            .iter()
+            .any(|entry| !stages.insert(u8::from(entry.stage)))
+        {
+            return Err(RepoErr::PathNotConflicted(key));
+        }
+
+        let mut index = self.read_index()?;
+        index.remove_path(&key);
+        index.stage_all(entries.iter().cloned());
+        self.write_index(&index)?;
+        self.clear_dirty_key(&key)
+    }
+
     pub fn resolve_file_conflict(
         &self,
         path: impl AsRef<Path>,

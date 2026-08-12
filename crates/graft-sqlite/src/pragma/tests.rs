@@ -1336,6 +1336,7 @@ fn status_kind_filter_recomputes_paths_and_counts() {
             kind: RepoTrackedPathKind::BinaryFile,
             storage: RepoPathStorage::External,
         }],
+        path_diagnostics: Vec::new(),
         branches: Vec::new(),
         remotes: Vec::new(),
         upstream: None,

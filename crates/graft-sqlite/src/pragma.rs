@@ -55,7 +55,7 @@ mod json;
 mod output_types;
 pub(crate) mod parse;
 mod repo_checkout;
-mod repo_conflicts;
+pub(crate) mod repo_conflicts;
 pub(crate) mod repo_core;
 pub(crate) mod repo_diff;
 mod repo_history;
@@ -337,6 +337,22 @@ pub(crate) enum GraftCommand {
 
     /// `pragma graft_json_resolve_conflict = "--ours|--theirs|--manual [path]";`
     JsonResolveConflict { spec: RepoResolveSpec },
+
+    /// Typed SDK-only atomic table conflict selection.
+    JsonResolveTableConflict {
+        path: PathBuf,
+        table: String,
+        side: ResolveSide,
+    },
+
+    /// Typed SDK-only path resolve-undo operation.
+    JsonUnresolveConflict { path: PathBuf },
+
+    /// Typed SDK-only journal update after staging an edited path result.
+    JsonRecordMergePathResolution {
+        path: PathBuf,
+        resolution: &'static str,
+    },
 
     /// `pragma graft_remote_add = "name remote-uri";`
     RemoteAdd { name: String, config: RemoteConfig },
@@ -1431,6 +1447,59 @@ impl GraftCommand {
                     resolution: side.label(),
                     remaining_conflicts,
                 })?))
+            }
+
+            GraftCommand::JsonResolveTableConflict { path, table, side } => {
+                if !file.is_idle() {
+                    return pragma_err!("cannot resolve while there is an open transaction");
+                }
+                let repo = repo_for_file(file)?;
+                let outcome =
+                    resolve_repo_table_conflicts(&runtime, file, &repo, &path, &table, side)?;
+                let remote = repo_default_remote_store(&repo);
+                let remaining_conflicts =
+                    unresolved_conflict_artifact_count(&runtime, &repo, remote)?;
+                let (current_head, current_branch) = repo_head_and_branch(&repo)?;
+                Ok(Some(to_json(&serde_json::json!({
+                    "operation": "resolve_merge_table",
+                    "current_head": current_head,
+                    "current_branch": current_branch,
+                    "path": outcome.path,
+                    "path_kind": repo_tracked_path_kind_json_label(outcome.path_kind),
+                    "storage": repo_path_storage_json_label(outcome.path_storage),
+                    "table": table,
+                    "resolution": side.label(),
+                    "remaining_conflicts": remaining_conflicts,
+                }))?))
+            }
+
+            GraftCommand::JsonUnresolveConflict { path } => {
+                if !file.is_idle() {
+                    return pragma_err!("cannot unresolve while there is an open transaction");
+                }
+                let repo = repo_for_file(file)?;
+                let outcome = unresolve_repo_conflict_for_file(&runtime, file, &repo, &path)?;
+                let (current_head, current_branch) = repo_head_and_branch(&repo)?;
+                Ok(Some(to_json(&serde_json::json!({
+                    "operation": "unresolve_merge_path",
+                    "current_head": current_head,
+                    "current_branch": current_branch,
+                    "path": outcome.path,
+                    "path_kind": repo_tracked_path_kind_json_label(outcome.path_kind),
+                    "storage": repo_path_storage_json_label(outcome.path_storage),
+                    "resolution": "unresolved",
+                }))?))
+            }
+
+            GraftCommand::JsonRecordMergePathResolution { path, resolution } => {
+                let repo = repo_for_file(file)?;
+                let (key, _) = repo_physical_path_arg(&repo, &path)?;
+                set_merge_path_resolution(&repo, &key, Some(resolution))?;
+                Ok(Some(to_json(&serde_json::json!({
+                    "operation": "record_merge_path_resolution",
+                    "path": key,
+                    "resolution": resolution,
+                }))?))
             }
 
             GraftCommand::RemoteAdd { name, config } => {

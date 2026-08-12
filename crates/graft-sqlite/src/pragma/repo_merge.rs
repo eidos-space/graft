@@ -43,6 +43,8 @@ pub(super) fn run_repo_merge_continue(
         return pragma_err!("no merge in progress");
     }
     try_row_auto_merge_current_file_status_conflict(runtime, file, &repo, None)?;
+    let conflicted = repo.status()?.conflicted;
+    try_row_auto_merge_paths(runtime, file, &repo, &conflicted, None, false)?;
     let tables = staged_commit_table_summary(runtime, &repo)?;
     let commit = repo.commit_staged_with_table_summary(message, tables)?;
     let materialized = materialize_commit_sqlite_files(runtime, &repo, &commit)?;
@@ -87,7 +89,8 @@ pub(super) fn run_repo_merge(
         &previous_artifacts,
         None,
     )?;
-    let row_auto_merge = match try_row_auto_merge_current_file_conflict(
+    initialize_merge_resolution_state(&repo)?;
+    let mut row_auto_merge = match try_row_auto_merge_current_file_conflict(
         runtime, file, &repo, &outcome, None, true,
     ) {
         Ok(row_auto_merge) => row_auto_merge,
@@ -96,8 +99,23 @@ pub(super) fn run_repo_merge(
             None
         }
     };
-    if let Some(row_auto_merge) = &row_auto_merge {
+    if let Some(row_auto_merge) = &row_auto_merge
+        && row_auto_merge.resolved
+    {
         outcome = merge_outcome_with_row_auto_merge(&outcome, &row_auto_merge.key);
+    }
+    match try_row_auto_merge_conflicts(runtime, file, &repo, &outcome, None, true) {
+        Ok(results) => {
+            for result in results {
+                if result.resolved {
+                    outcome = merge_outcome_with_row_auto_merge(&outcome, &result.key);
+                }
+                if row_auto_merge.is_none() {
+                    row_auto_merge = Some(result);
+                }
+            }
+        }
+        Err(err) => tracing::warn!("SQLite auto-merge unavailable: {err}"),
     }
     let paths = merge_path_actions(
         &repo,

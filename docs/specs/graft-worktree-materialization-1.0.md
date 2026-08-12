@@ -260,9 +260,11 @@ conservative gate; “actual” describes the normal path for the operation.
 | CLI / SDK | `clone` / `cloneRepository` | Yes | Creates a repository and checks out the selected branch |
 | CLI | `merge <rev>` | Yes | Applies merge outcome and checkout; may leave conflict paths at existing ours state |
 | SDK / hidden CLI `merge-api` | `planMerge` | No | Computes up-to-date, fast-forward, or three-way plan only |
+| SDK | `getMergePolicy`, `validateMergePolicy`, `setMergePolicy` | No | Reads, validates, or CAS-updates policy; never replaces worktree files |
 | SDK / hidden CLI `merge-api` | `applyMerge` | Yes | Up-to-date normally changes nothing; fast-forward checks out; three-way writes merge state/index and materializes clean paths according to policy |
 | CLI / SDK | `setMergePathResult` / `resolve` whole path | Yes | Writes the selected path result and collapses its conflict stage |
-| CLI / SDK | `resolveMergeRow` | Yes | Writes the current row-resolution candidate; may materialize a merged SQLite result |
+| CLI / SDK | `resolveMergeRow`, `resolveMergeCell`, `resolveMergeTable` | Yes | Writes the current row/cell/table resolution candidate; may materialize a merged SQLite result |
+| SDK | `stageMergeSqliteResult` | No | Captures and validates the existing application-edited worktree file, then changes index/journal only |
 | CLI / SDK | `writeAndStageTextResult` / `resolve --manual` | Yes | Writes and stages the edited physical result |
 | CLI / SDK | `continueMerge` / `merge --continue` | Yes | Commits the resolved merge and the current CLI path materialization step may rewrite SQLite snapshots |
 | CLI / SDK | `abortMerge` / `merge --abort` | Yes | Restores `ORIG_HEAD` and applies the abort checkout plan |
@@ -363,15 +365,22 @@ active merge, or token mismatch MUST fail without applying the candidate plan.
 Whole-path ours/theirs selection writes the selected SQLite snapshot or file
 artifact to the physical path, updates the volume binding, and collapses the
 path to stage 0. A deleted side removes the corresponding materialized path.
-Row-level ours/theirs resolution computes a new SQLite snapshot from the
-three-way row plan, writes the current candidate to the physical path, and
-keeps durable row-resolution state until all row conflicts for the file are
-resolved. Text editing writes the supplied UTF-8 bytes to the physical path
-and stages the result.
+Row- and table-level ours/theirs resolution computes a new SQLite snapshot from
+the three-way row plan, writes the current candidate to the physical path, and
+keeps the durable merge-resolution journal until continue or abort. Table
+selection materializes one validated candidate for the complete atomic
+operation. Text editing writes the supplied UTF-8 bytes to the physical path
+and stages the result. Path resolve-undo restores the original conflict stages
+and conflict worktree candidate from that journal.
 
 These operations are marked materializing even when a specific path is already
 equal to the selected result. The host MUST use the state token returned by
 merge inspection and MUST treat a stale token as a retry-from-status event.
+
+Active-merge SQLite inspection (`diffMergeSqlite`) compares immutable
+Base/Ours/Theirs revisions and is non-materializing. It remains valid with
+unresolved index stages and does not require application SQLite handles to be
+closed.
 
 ### 7.4 Continue and abort
 
@@ -474,6 +483,13 @@ until the first owner closes or releases its storage lock. External ordinary
 SQLite writes are observed by later status/stage operations; they are not
 silently merged into an already captured staged snapshot.
 
+A tracked SQLite path whose physical file is malformed, corrupt, or cannot be
+analyzed MUST remain dirty and include a structured `path_diagnostics` item
+with `corrupt`, `analysis_failed`, or `skipped` state. `addAll` MUST NOT silently
+skip it, and a later no-staged-changes commit MUST NOT make status clean. The
+diagnostic states whether the current worktree bytes are protected by the
+index.
+
 Merge state is durable in refs/index metadata (`ORIG_HEAD`, `MERGE_HEAD`, and
 index stages). Closing/reopening a session reconstructs merge status from that
 state. The host may keep the repository session resident across application
@@ -557,4 +573,3 @@ browser to exercise the real merge workflow without loading native Node code.
 - [Repository merge core](../../crates/graft/src/repo/merge.rs)
 - [SQLite checkout and replacement adapter](../../crates/graft-sqlite/src/pragma/repo_checkout.rs)
 - [SQLite worktree locking and WAL adapter](../../crates/graft-sqlite/src/pragma/sqlite_worktree.rs)
-- [Eidos Specifications index](https://github.com/eidos-space/eidos/tree/main/docs/specs)

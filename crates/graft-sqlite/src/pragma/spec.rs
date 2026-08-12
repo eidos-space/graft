@@ -209,10 +209,41 @@ pub(crate) struct RepoResolveRowSpec {
     pub(crate) identity: crate::row_level_diff::RowIdentity,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RepoResolveCellSpec {
+    pub(crate) table: String,
+    pub(crate) identity: crate::row_level_diff::RowIdentity,
+    pub(crate) column: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(super) struct MergeResolutionPathState {
+    pub(super) original_entries: Vec<graft::repo::index::IndexEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) resolution: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(super) struct RowConflictResolutionState {
+    #[serde(default)]
+    pub(super) schema_version: u32,
+    #[serde(default)]
+    pub(super) orig_head: Option<String>,
     pub(super) merge_head: Option<String>,
+    #[serde(default)]
+    pub(super) merge_policy: graft::repo::MergeConfig,
+    #[serde(default)]
+    pub(super) policy_token: String,
+    #[serde(default)]
+    pub(super) policy_version: u32,
+    #[serde(default)]
+    pub(super) paths: BTreeMap<String, MergeResolutionPathState>,
+    #[serde(default)]
     pub(super) rows: BTreeMap<String, String>,
+    #[serde(default)]
+    pub(super) cells: BTreeMap<String, String>,
+    #[serde(default)]
+    pub(super) analysis_errors: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

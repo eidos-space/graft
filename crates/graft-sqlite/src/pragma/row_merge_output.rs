@@ -213,19 +213,15 @@ pub(super) fn current_file_row_merge_analysis(
                 columns: conflict.columns.clone(),
                 rowid,
                 key,
-                ours_rowid: (conflict.ours_identity != conflict.identity)
-                    .then_some(ours_rowid)
-                    .flatten(),
-                theirs_rowid: (conflict.theirs_identity != conflict.identity)
-                    .then_some(theirs_rowid)
-                    .flatten(),
-                ours_key: (conflict.ours_identity != conflict.identity)
-                    .then_some(ours_key)
-                    .flatten(),
-                theirs_key: (conflict.theirs_identity != conflict.identity)
-                    .then_some(theirs_key)
-                    .flatten(),
+                ours_rowid,
+                theirs_rowid,
+                ours_key,
+                theirs_key,
                 semantic_key: conflict.semantic_key.clone(),
+                semantic_key_collations: json_semantic_key_collations(
+                    conflict.semantic_key_collations.as_deref(),
+                ),
+                cells: json_cell_conflicts(&conflict.cell_conflicts),
                 ours: row_change_kind_label(conflict.ours),
                 theirs: row_change_kind_label(conflict.theirs),
                 base_row: json_record_values_opt(conflict.base_row.as_ref()),
@@ -258,7 +254,10 @@ pub(super) fn current_file_row_merge_analysis(
     if plan.opaque_changes() > 0 {
         blocked_reasons.push("opaque_changes");
     }
-    if apply_changes == 0 {
+    if !plan.limitations().is_empty() {
+        blocked_reasons.push("analysis_limitations");
+    }
+    if apply_changes == 0 && !plan.can_resolve_to_ours_without_apply() {
         blocked_reasons.push("no_applicable_changes");
     }
     let can_auto_merge = blocked_reasons.is_empty();
@@ -291,7 +290,10 @@ pub(super) fn row_merge_apply_policy(
         foreign_keys: "disabled_during_apply_checked_after",
         triggers: "disabled_during_apply",
         validation: vec!["integrity_check", "foreign_key_check"],
+        same_row_merge: policy.same_row_merge,
         default_semantic_keys: policy.default_semantic_keys.clone(),
+        semantic_keys: policy.semantic_keys.clone(),
+        semantic_key_collations: policy.semantic_key_collations.clone(),
         internal_resolvers: json_internal_resolvers(policy),
         schema_resolvers: policy
             .schema_resolvers
@@ -309,6 +311,7 @@ pub(super) fn row_merge_apply_policy(
                 columns: columns.clone(),
             })
             .collect(),
+        column_resolvers: policy.column_resolvers.clone(),
     }
 }
 
@@ -331,9 +334,11 @@ pub(super) fn repo_conflict_artifacts(
     remote: Option<Arc<Remote>>,
 ) -> Result<JsonConflictList, ErrCtx> {
     let status = repo.status()?;
-    let resolution_state = read_row_conflict_resolution_state(repo, status.merge_head.as_deref())?;
+    let resolution_state = read_row_conflict_resolution_state(repo, &status)?;
     let mut conflicts = Vec::new();
-    for path in &status.conflicted {
+    let mut conflict_paths = status.conflicted.iter().cloned().collect::<BTreeSet<_>>();
+    conflict_paths.extend(resolution_state.paths.keys().cloned());
+    for path in &conflict_paths {
         conflicts.extend(repo_path_conflict_artifacts(
             runtime,
             repo,
@@ -456,18 +461,45 @@ pub(super) fn repo_path_conflict_artifacts(
     remote: Option<Arc<Remote>>,
     resolution_state: &RowConflictResolutionState,
 ) -> Result<Vec<JsonConflictArtifact>, ErrCtx> {
-    let (path_kind, path_storage) = conflict_path_descriptor(repo, key)?;
+    let original_entries = original_conflict_entries(repo, resolution_state, key)?;
+    let (path_kind, path_storage) = conflict_path_descriptor_from_entries(&original_entries);
     let path_kind_label = repo_tracked_path_kind_json_label(path_kind);
     let path_storage_label = repo_path_storage_json_label(path_storage);
-    let Some((base, ours, theirs)) = current_file_conflict_states(repo, key)? else {
-        return Ok(vec![file_conflict_artifact(
+    let path_resolution = resolution_state
+        .paths
+        .get(key)
+        .and_then(|path| path.resolution.as_deref())
+        .and_then(merge_resolution_label);
+    let path_is_unmerged = repo
+        .read_index()?
+        .conflicted_paths()
+        .iter()
+        .any(|path| path == key);
+    if path_is_unmerged && let Some(error) = resolution_state.analysis_errors.get(key) {
+        let mut artifact = file_conflict_artifact(
+            key,
+            path_kind_label,
+            path_storage_label,
+            "validation",
+            "candidate_validation_failed",
+            Some(error.clone()),
+        );
+        artifact.auto_resolvable = Some(false);
+        artifact.recommended_action = Some("inspect_candidate_constraints");
+        return Ok(vec![artifact]);
+    }
+    let Some((base, ours, theirs)) = original_file_conflict_states(repo, resolution_state, key)?
+    else {
+        let mut artifact = file_conflict_artifact(
             key,
             path_kind_label,
             path_storage_label,
             "file",
             "add_delete_conflict",
             Some("merge involves add/delete of this tracked path".to_string()),
-        )]);
+        );
+        apply_path_resolution(&mut artifact, path_resolution);
+        return Ok(vec![artifact]);
     };
 
     let result = (|| {
@@ -478,19 +510,44 @@ pub(super) fn repo_path_conflict_artifacts(
         let mut artifacts = Vec::new();
 
         for conflict in &plan.analysis.conflicts {
-            let resolution = resolution_state
-                .rows
-                .get(&row_conflict_resolution_key(
-                    key,
-                    &conflict.table,
-                    &conflict.identity,
-                ))
-                .and_then(|label| match label.as_str() {
-                    "ours" => Some("ours"),
-                    "theirs" => Some("theirs"),
-                    _ => None,
-                });
-            artifacts.push(JsonConflictArtifact {
+            let row_resolution = path_resolution.or_else(|| {
+                resolution_state
+                    .rows
+                    .get(&row_conflict_resolution_key(
+                        key,
+                        &conflict.table,
+                        &conflict.identity,
+                    ))
+                    .and_then(|label| match label.as_str() {
+                        "ours" => Some("ours"),
+                        "theirs" => Some("theirs"),
+                        _ => None,
+                    })
+            });
+            let cells = conflict
+                .cell_conflicts
+                .iter()
+                .map(|cell| JsonCellConflict {
+                    column: cell.column.clone(),
+                    base: crate::json::JsonRowChange::value_to_json(&cell.base),
+                    ours: crate::json::JsonRowChange::value_to_json(&cell.ours),
+                    theirs: crate::json::JsonRowChange::value_to_json(&cell.theirs),
+                    resolution: resolution_state
+                        .cells
+                        .get(&cell_conflict_resolution_key(
+                            key,
+                            &conflict.table,
+                            &conflict.identity,
+                            &cell.column,
+                        ))
+                        .and_then(|selection| merge_resolution_label(selection)),
+                })
+                .collect::<Vec<_>>();
+            let resolution = row_resolution.or_else(|| {
+                (!cells.is_empty() && cells.iter().all(|cell| cell.resolution.is_some()))
+                    .then_some("cells")
+            });
+            let artifact = JsonConflictArtifact {
                 id: format!(
                     "{}:row:{}:{}",
                     key,
@@ -508,23 +565,22 @@ pub(super) fn repo_path_conflict_artifacts(
                     "unresolved"
                 },
                 resolution,
+                auto_resolvable: None,
+                recommended_result: None,
+                recommended_action: None,
                 table: Some(conflict.table.clone()),
                 columns: Some(conflict.columns.clone()).filter(|columns| !columns.is_empty()),
                 rowid: conflict.identity.rowid(),
-                ours_rowid: (conflict.ours_identity != conflict.identity)
-                    .then(|| conflict.ours_identity.rowid())
-                    .flatten(),
-                theirs_rowid: (conflict.theirs_identity != conflict.identity)
-                    .then(|| conflict.theirs_identity.rowid())
-                    .flatten(),
+                ours_rowid: conflict.ours_identity.rowid(),
+                theirs_rowid: conflict.theirs_identity.rowid(),
                 key: json_row_identity(&conflict.identity).1,
-                ours_key: (conflict.ours_identity != conflict.identity)
-                    .then(|| json_row_identity(&conflict.ours_identity).1)
-                    .flatten(),
-                theirs_key: (conflict.theirs_identity != conflict.identity)
-                    .then(|| json_row_identity(&conflict.theirs_identity).1)
-                    .flatten(),
+                ours_key: json_row_identity(&conflict.ours_identity).1,
+                theirs_key: json_row_identity(&conflict.theirs_identity).1,
                 semantic_key: conflict.semantic_key.clone(),
+                semantic_key_collations: json_semantic_key_collations(
+                    conflict.semantic_key_collations.as_deref(),
+                ),
+                cells,
                 name: None,
                 entry_type: None,
                 column_changes: Vec::new(),
@@ -536,11 +592,12 @@ pub(super) fn repo_path_conflict_artifacts(
                 ours_row: json_record_values_opt(conflict.ours_row.as_ref()),
                 theirs_row: json_record_values_opt(conflict.theirs_row.as_ref()),
                 message: None,
-            });
+            };
+            artifacts.push(artifact);
         }
 
         for conflict in plan.schema_conflicts() {
-            artifacts.push(JsonConflictArtifact {
+            let mut artifact = JsonConflictArtifact {
                 id: format!("{}:schema:{}:{}", key, conflict.entry_type, conflict.name),
                 path: key.to_string(),
                 path_kind: "sqlite_database",
@@ -549,6 +606,9 @@ pub(super) fn repo_path_conflict_artifacts(
                 reason: conflict.reason.as_str(),
                 status: "unresolved",
                 resolution: None,
+                auto_resolvable: None,
+                recommended_result: None,
+                recommended_action: None,
                 table: None,
                 columns: None,
                 rowid: None,
@@ -558,6 +618,8 @@ pub(super) fn repo_path_conflict_artifacts(
                 ours_key: None,
                 theirs_key: None,
                 semantic_key: None,
+                semantic_key_collations: None,
+                cells: Vec::new(),
                 name: Some(conflict.name.clone()),
                 entry_type: Some(conflict.entry_type.clone()),
                 column_changes: json_schema_column_changes(&conflict.column_changes),
@@ -569,11 +631,13 @@ pub(super) fn repo_path_conflict_artifacts(
                 ours_row: None,
                 theirs_row: None,
                 message: Some(conflict.message.to_string()),
-            });
+            };
+            apply_path_resolution(&mut artifact, path_resolution);
+            artifacts.push(artifact);
         }
 
         for change in plan.unresolved_opaque_changes() {
-            artifacts.push(JsonConflictArtifact {
+            let mut artifact = JsonConflictArtifact {
                 id: format!("{}:opaque:{}:{}", key, change.reason.as_str(), change.name),
                 path: key.to_string(),
                 path_kind: "sqlite_database",
@@ -582,6 +646,9 @@ pub(super) fn repo_path_conflict_artifacts(
                 reason: change.reason.as_str(),
                 status: "unresolved",
                 resolution: None,
+                auto_resolvable: None,
+                recommended_result: None,
+                recommended_action: None,
                 table: None,
                 columns: None,
                 rowid: None,
@@ -591,6 +658,8 @@ pub(super) fn repo_path_conflict_artifacts(
                 ours_key: None,
                 theirs_key: None,
                 semantic_key: None,
+                semantic_key_collations: None,
+                cells: Vec::new(),
                 name: Some(change.name.clone()),
                 entry_type: None,
                 column_changes: Vec::new(),
@@ -602,18 +671,96 @@ pub(super) fn repo_path_conflict_artifacts(
                 ours_row: None,
                 theirs_row: None,
                 message: Some(opaque_conflict_message(change).to_string()),
-            });
+            };
+            apply_path_resolution(&mut artifact, path_resolution);
+            artifacts.push(artifact);
         }
 
-        if artifacts.is_empty() && plan.apply_change_count() == 0 {
-            artifacts.push(file_conflict_artifact(
+        for pending in plan.pending_recomputations() {
+            let mut artifact = file_conflict_artifact(
                 key,
                 path_kind_label,
                 path_storage_label,
-                "file",
-                "no_applicable_changes",
-                Some("no row or schema conflict details were produced".to_string()),
-            ));
+                "validation",
+                "recompute_required",
+                Some(
+                    "the merge candidate is materialized but these managed columns must be recomputed and the worktree SQLite result staged explicitly"
+                        .to_string(),
+                ),
+            );
+            artifact.id = format!(
+                "{}:validation:{}:{}",
+                key,
+                pending.table,
+                row_identity_label(&pending.identity)
+            );
+            artifact.table = Some(pending.table.clone());
+            artifact.columns = Some(pending.columns.clone());
+            artifact.rowid = pending.identity.rowid();
+            artifact.key = json_row_identity(&pending.identity).1;
+            artifact.recommended_action = Some("stage_worktree_result");
+            apply_path_resolution(&mut artifact, path_resolution);
+            artifacts.push(artifact);
+        }
+
+        if artifacts.is_empty() {
+            if plan.can_resolve_to_ours_without_apply() {
+                if path_is_unmerged || path_resolution.is_some() {
+                    let (reason, message) = if plan.theirs_logical_status()
+                        == crate::row_level_diff::LogicalDiffStatus::FileChangedNoSupportedLogicalChanges
+                    {
+                        (
+                            "theirs_logically_equivalent_to_base",
+                            "theirs has no supported logical SQLite changes relative to base; keeping ours preserves the complete supported merge result",
+                        )
+                    } else {
+                        (
+                            "merge_result_matches_ours",
+                            "all supported changes from theirs are already represented by ours; no SQLite changes need to be applied",
+                        )
+                    };
+                    let mut artifact = file_conflict_artifact(
+                        key,
+                        path_kind_label,
+                        path_storage_label,
+                        "file",
+                        reason,
+                        Some(message.to_string()),
+                    );
+                    artifact.auto_resolvable = Some(true);
+                    artifact.recommended_result = Some("ours");
+                    artifact.recommended_action = Some("apply_merge");
+                    apply_path_resolution(&mut artifact, path_resolution);
+                    artifacts.push(artifact);
+                }
+            } else if plan.apply_change_count() > 0 && path_is_unmerged {
+                let mut artifact = file_conflict_artifact(
+                    key,
+                    path_kind_label,
+                    path_storage_label,
+                    "file",
+                    "automatic_merge_available",
+                    Some(
+                        "a validated SQLite candidate can be materialized by applyMerge or continueMerge"
+                            .to_string(),
+                    ),
+                );
+                artifact.auto_resolvable = Some(true);
+                artifact.recommended_result = Some("merged");
+                artifact.recommended_action = Some("apply_merge");
+                artifacts.push(artifact);
+            } else {
+                let mut artifact = file_conflict_artifact(
+                    key,
+                    path_kind_label,
+                    path_storage_label,
+                    "file",
+                    "no_applicable_changes",
+                    Some("no row or schema conflict details were produced".to_string()),
+                );
+                apply_path_resolution(&mut artifact, path_resolution);
+                artifacts.push(artifact);
+            }
         }
 
         Ok::<_, ErrCtx>(artifacts)
@@ -621,14 +768,56 @@ pub(super) fn repo_path_conflict_artifacts(
 
     match result {
         Ok(artifacts) => Ok(artifacts),
-        Err(err) => Ok(vec![file_conflict_artifact(
-            key,
-            path_kind_label,
-            path_storage_label,
-            "file",
-            "analysis_error",
-            Some(format!("row-level conflict analysis unavailable: {err}")),
-        )]),
+        Err(err) => {
+            let mut artifact = file_conflict_artifact(
+                key,
+                path_kind_label,
+                path_storage_label,
+                "file",
+                "analysis_error",
+                Some(format!("row-level conflict analysis unavailable: {err}")),
+            );
+            apply_path_resolution(&mut artifact, path_resolution);
+            Ok(vec![artifact])
+        }
+    }
+}
+
+fn conflict_path_descriptor_from_entries(
+    entries: &[graft::repo::index::IndexEntry],
+) -> (RepoTrackedPathKind, RepoPathStorage) {
+    for entry in entries {
+        if entry.file.is_some() {
+            return (
+                RepoTrackedPathKind::SqliteDatabase,
+                RepoPathStorage::SqliteSnapshot,
+            );
+        }
+        if let Some(artifact) = &entry.artifact {
+            return (
+                artifact_checkout_path_kind(artifact),
+                artifact_checkout_path_storage(artifact),
+            );
+        }
+    }
+    (RepoTrackedPathKind::BinaryFile, RepoPathStorage::Inline)
+}
+
+fn merge_resolution_label(label: &str) -> Option<&'static str> {
+    match label {
+        "ours" => Some("ours"),
+        "theirs" => Some("theirs"),
+        "manual" => Some("manual"),
+        "edited" => Some("edited"),
+        "cells" => Some("cells"),
+        _ => None,
+    }
+}
+
+fn apply_path_resolution(artifact: &mut JsonConflictArtifact, resolution: Option<&'static str>) {
+    if resolution.is_some() {
+        artifact.status = "resolved";
+        artifact.resolution = resolution;
     }
 }
 
@@ -649,6 +838,9 @@ pub(super) fn file_conflict_artifact(
         reason,
         status: "unresolved",
         resolution: None,
+        auto_resolvable: None,
+        recommended_result: None,
+        recommended_action: None,
         table: None,
         columns: None,
         rowid: None,
@@ -658,6 +850,8 @@ pub(super) fn file_conflict_artifact(
         ours_key: None,
         theirs_key: None,
         semantic_key: None,
+        semantic_key_collations: None,
+        cells: Vec::new(),
         name: None,
         entry_type: None,
         column_changes: Vec::new(),
@@ -682,6 +876,35 @@ pub(super) fn json_record_values_opt(
             .map(crate::json::JsonRowChange::value_to_json)
             .collect()
     })
+}
+
+fn json_semantic_key_collations(
+    collations: Option<&[graft::repo::SemanticKeyCollation]>,
+) -> Option<Vec<&'static str>> {
+    collations.map(|collations| {
+        collations
+            .iter()
+            .map(|collation| match collation {
+                graft::repo::SemanticKeyCollation::Binary => "binary",
+                graft::repo::SemanticKeyCollation::NoCase => "nocase",
+            })
+            .collect()
+    })
+}
+
+fn json_cell_conflicts(
+    conflicts: &[crate::row_merge::RowMergeCellConflict],
+) -> Vec<JsonCellConflict> {
+    conflicts
+        .iter()
+        .map(|cell| JsonCellConflict {
+            column: cell.column.clone(),
+            base: crate::json::JsonRowChange::value_to_json(&cell.base),
+            ours: crate::json::JsonRowChange::value_to_json(&cell.ours),
+            theirs: crate::json::JsonRowChange::value_to_json(&cell.theirs),
+            resolution: None,
+        })
+        .collect()
 }
 
 fn json_row_identity(
@@ -775,6 +998,8 @@ pub(super) struct RowAutoMergeResult {
     pub(super) applied_changes: usize,
     pub(super) ours_changes: usize,
     pub(super) theirs_changes: usize,
+    pub(super) resolved: bool,
+    pub(super) requires_validation: bool,
 }
 
 pub(super) fn try_row_auto_merge_current_file_conflict(
@@ -803,6 +1028,159 @@ pub(super) fn try_row_auto_merge_current_file_conflict(
         true,
         physical_replacement_prepared,
     )
+}
+
+/// Resolves every conflict-free `SQLite` candidate in a merge outcome.
+///
+/// Directory-backed SDK sessions do not have one selected database file. This pass therefore
+/// plans every conflicted `SQLite` path and materializes any required SQL into private temporary
+/// databases before changing the index or worktree.
+pub(super) fn try_row_auto_merge_conflicts(
+    runtime: &Runtime,
+    file: &mut RepositorySessionContext,
+    repo: &Repository,
+    outcome: &MergeOutcome,
+    remote: Option<Arc<Remote>>,
+    physical_replacement_prepared: bool,
+) -> Result<Vec<RowAutoMergeResult>, ErrCtx> {
+    let MergeOutcome::Merged { conflicted, .. } = outcome else {
+        return Ok(Vec::new());
+    };
+    try_row_auto_merge_paths(
+        runtime,
+        file,
+        repo,
+        conflicted,
+        remote,
+        physical_replacement_prepared,
+    )
+}
+
+/// Resolves the safe `SQLite` subset of `conflicted` after preparing every candidate first.
+///
+/// Planning first ensures that hydration or analysis failures cannot occur after an earlier path
+/// has already been staged. Filesystem or index I/O may still fail while applying a prepared
+/// result, just like an ordinary multi-path checkout.
+pub(super) fn try_row_auto_merge_paths(
+    runtime: &Runtime,
+    file: &mut RepositorySessionContext,
+    repo: &Repository,
+    conflicted: &[String],
+    remote: Option<Arc<Remote>>,
+    physical_replacement_prepared: bool,
+) -> Result<Vec<RowAutoMergeResult>, ErrCtx> {
+    type PreparedCandidate = (CommitFileState, usize, usize, usize, bool);
+
+    let mut candidates = Vec::new();
+    let mut analyzed = BTreeSet::new();
+    let mut failures = BTreeMap::new();
+    for key in conflicted {
+        let prepared = (|| -> Result<Option<PreparedCandidate>, ErrCtx> {
+            let Some((base, ours, theirs)) = current_file_conflict_states(repo, key)? else {
+                return Ok(None);
+            };
+            hydrate_repo_file_state_for(runtime, &base, None, RepoSnapshotPurpose::Merge)?;
+            hydrate_repo_file_state_for(runtime, &ours, None, RepoSnapshotPurpose::Merge)?;
+            hydrate_repo_file_state_for(
+                runtime,
+                &theirs,
+                remote.clone(),
+                RepoSnapshotPurpose::Merge,
+            )?;
+            let plan = plan_repo_snapshot_merge(runtime, repo, &base, &ours, &theirs)?;
+            if plan.has_conflicts() || plan.has_opaque_changes() || !plan.limitations().is_empty() {
+                return Ok(None);
+            }
+            let applied_changes = plan.apply_change_count();
+            let merged = if plan.can_resolve_to_ours_without_apply() {
+                ours
+            } else if applied_changes > 0 {
+                materialize_row_auto_merge_state(
+                    runtime,
+                    repo,
+                    key,
+                    &ours,
+                    &plan.theirs_apply_sql(),
+                )?
+            } else {
+                return Ok(None);
+            };
+            Ok(Some((
+                merged,
+                applied_changes,
+                plan.analysis.ours_changes,
+                plan.analysis.theirs_changes,
+                plan.requires_validation(),
+            )))
+        })();
+        match prepared {
+            Ok(Some((
+                merged,
+                applied_changes,
+                ours_changes,
+                theirs_changes,
+                requires_validation,
+            ))) => {
+                analyzed.insert(key.clone());
+                candidates.push((
+                    key.clone(),
+                    merged,
+                    applied_changes,
+                    ours_changes,
+                    theirs_changes,
+                    requires_validation,
+                ));
+            }
+            Ok(None) => {
+                analyzed.insert(key.clone());
+            }
+            Err(error) => {
+                failures.insert(key.clone(), error.to_string());
+            }
+        };
+    }
+
+    let status = repo.status()?;
+    if status.merge_head.is_some() {
+        let mut state = read_row_conflict_resolution_state(repo, &status)?;
+        let mut changed = false;
+        for key in analyzed {
+            changed |= state.analysis_errors.remove(&key).is_some();
+        }
+        for (key, error) in failures {
+            changed |= state.analysis_errors.get(&key) != Some(&error);
+            state.analysis_errors.insert(key, error);
+        }
+        if changed {
+            write_row_conflict_resolution_state(repo, &state)?;
+        }
+    }
+
+    let mut resolved = Vec::new();
+    for (key, merged, applied_changes, ours_changes, theirs_changes, requires_validation) in
+        candidates
+    {
+        checkout_selected_repository_database(
+            runtime,
+            file,
+            repo,
+            &key,
+            &merged,
+            physical_replacement_prepared,
+        )?;
+        if !requires_validation {
+            repo.resolve_file_conflict(repo.worktree().join(&key), Some(merged))?;
+        }
+        resolved.push(RowAutoMergeResult {
+            key,
+            applied_changes,
+            ours_changes,
+            theirs_changes,
+            resolved: !requires_validation,
+            requires_validation,
+        });
+    }
+    Ok(resolved)
 }
 
 pub(super) fn try_row_auto_merge_current_file_status_conflict(
@@ -841,7 +1219,7 @@ pub(super) fn try_row_merge_current_file_status_conflict(
     let plan = plan_repo_snapshot_merge(runtime, repo, &base, &ours, &theirs)?;
     if plan.has_opaque_changes()
         || !plan.schema_conflicts().is_empty()
-        || plan.apply_change_count() == 0
+        || !plan.limitations().is_empty()
     {
         return Ok(None);
     }
@@ -850,6 +1228,28 @@ pub(super) fn try_row_merge_current_file_status_conflict(
     }
 
     let applied_changes = plan.apply_change_count();
+    if plan.can_resolve_to_ours_without_apply() {
+        checkout_selected_repository_database(
+            runtime,
+            file,
+            repo,
+            &key,
+            &ours,
+            physical_replacement_prepared,
+        )?;
+        repo.resolve_file_conflict(repo.worktree().join(&key), Some(ours))?;
+        return Ok(Some(RowAutoMergeResult {
+            key,
+            applied_changes,
+            ours_changes: plan.analysis.ours_changes,
+            theirs_changes: plan.analysis.theirs_changes,
+            resolved: true,
+            requires_validation: false,
+        }));
+    }
+    if applied_changes == 0 {
+        return Ok(None);
+    }
     let sql = plan.theirs_apply_sql();
     let merged = materialize_row_auto_merge_state(runtime, repo, &key, &ours, &sql)?;
     checkout_selected_repository_database(
@@ -863,13 +1263,18 @@ pub(super) fn try_row_merge_current_file_status_conflict(
     if plan.analysis.has_conflicts() {
         return Ok(None);
     }
-    repo.resolve_file_conflict(repo.worktree().join(&key), Some(merged))?;
+    let requires_validation = plan.requires_validation();
+    if !requires_validation {
+        repo.resolve_file_conflict(repo.worktree().join(&key), Some(merged))?;
+    }
 
     Ok(Some(RowAutoMergeResult {
         key,
         applied_changes,
         ours_changes: plan.analysis.ours_changes,
         theirs_changes: plan.analysis.theirs_changes,
+        resolved: !requires_validation,
+        requires_validation,
     }))
 }
 
@@ -991,8 +1396,7 @@ pub(super) fn validate_row_merge_sqlite(
     if integrity_rows.is_empty() || integrity_rows.iter().any(|row| row != "ok") {
         return Err(ErrCtx::InvalidCommand(
             format!(
-                "row-level auto-merge failed integrity_check at `{}`: {}",
-                path.display(),
+                "row-level auto-merge failed integrity_check: {}",
                 integrity_rows.join("; ")
             )
             .into(),
@@ -1019,8 +1423,7 @@ pub(super) fn validate_row_merge_sqlite(
         let fkid = row.get::<_, i64>(3).unwrap_or_default();
         return Err(ErrCtx::InvalidCommand(
             format!(
-                "row-level auto-merge failed foreign_key_check at `{}`: table={table}, rowid={}, parent={parent}, fkid={fkid}",
-                path.display(),
+                "row-level auto-merge failed foreign_key_check: table={table}, rowid={}, parent={parent}, fkid={fkid}",
                 rowid
                     .map(|rowid| rowid.to_string())
                     .unwrap_or_else(|| "NULL".to_string())
@@ -1032,12 +1435,10 @@ pub(super) fn validate_row_merge_sqlite(
     Ok(())
 }
 
-pub(super) fn row_auto_merge_sqlite_err(path: &Path, action: &str, err: rusqlite::Error) -> ErrCtx {
-    ErrCtx::InvalidCommand(
-        format!(
-            "could not {action} for row-level auto-merge at `{}`: {err}",
-            path.display()
-        )
-        .into(),
-    )
+pub(super) fn row_auto_merge_sqlite_err(
+    _path: &Path,
+    action: &str,
+    err: rusqlite::Error,
+) -> ErrCtx {
+    ErrCtx::InvalidCommand(format!("could not {action} for row-level auto-merge: {err}").into())
 }

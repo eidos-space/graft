@@ -86,12 +86,14 @@ limitation 不一定代表 merge 失败。它表示结果应该带上正确 cave
 
 ```toml
 [merge]
-default_semantic_keys = ["_id"]
+same_row_merge = true
+default_semantic_keys = ["external_id"]
 
 [merge.semantic_keys]
-eidos__tree = ["id"]
-eidos__kv = ["key"]
-eidos__messages = ["chat_id", "id"]
+records = ["external_id"]
+
+[merge.semantic_key_collations.records]
+external_id = "nocase"
 
 [merge.internal_resolvers]
 sqlite_sequence = "sequence_max"
@@ -103,7 +105,11 @@ index_btree = "reindex"
 add_column = "alter_table_add_column"
 
 [merge.generated_columns]
-eidos__references = ["display_text"]
+legacy_records = ["search_text"]
+
+[merge.column_resolvers.records]
+updated_at = "max_timestamp"
+search_text = "recompute"
 ```
 
 应用应该从自己的 schema policy 生成这段配置。Graft 的内置默认值会保持保守；应用表通常需要应用自己提供 semantic keys。
@@ -152,8 +158,8 @@ Semantic keys 会增加一层应用级 conflict 检测。例如两个分支插�
 default_semantic_keys = ["_id"]
 
 [merge.semantic_keys]
-eidos__kv = ["key"]
-eidos__messages = ["chat_id", "id"]
+settings = ["key"]
+messages = ["thread_id", "external_id"]
 ```
 
 table-specific keys 会覆盖该表的 default。default 只会应用到包含所有配置列的表。
@@ -161,7 +167,43 @@ table-specific keys 会覆盖该表的 default。default 只会应用到包含�
 Row conflict reasons 包括：
 
 - `row_conflict`：两边以不兼容方式触碰了同一个 row identity
-- `semantic_key_conflict`：两边插入或触碰了具有同一配置语义身份的 rows
+- `cell_conflict`：显式启用同一行合并后，同一列得到不同值
+- `semantic_key_conflict`：insert/insert、insert/update 或 update/update 的结果具有同一配置语义身份
+
+Semantic key 默认使用 `BINARY`，也可以按 table/column 显式启用 SQLite 内建 ASCII
+`NOCASE`：
+
+```toml
+[merge.semantic_key_collations.records]
+external_id = "nocase"
+```
+
+Conflict 输出包含双方物理 identity、展示用 semantic key 和 collation。
+
+## 同一行与 Managed Columns
+
+同一行字段合并必须显式启用：
+
+```toml
+[merge]
+same_row_merge = true
+```
+
+启用后，变更列不重叠则组合，同一列值相同则折叠，同一列值不同则保留结构化 cell
+conflict；delete/update 仍是 conflict。
+
+Managed column 只允许 Graft 的有限 resolver：
+
+| Resolver | 含义 |
+| --- | --- |
+| `ignore_for_conflict` | 仅双方都改 managed value 时保留 Ours；单边变化仍保留。 |
+| `max`, `min` | 对支持的 SQLite value 选择有序最大或最小值。 |
+| `max_timestamp` | 对 integer 或规范化可排序 text timestamp 选择最大值。 |
+| `recompute` | replay 时省略该列，并要求应用自行重算和校验。 |
+
+`recompute` 不运行应用代码；它返回 `recompute_required` validation artifact，并物化其余
+字段候选。应用重算后调用 `stageMergeSqliteResult`，Graft 捕获精确数据库，在 private
+storage 中执行 integrity/FK check 后才 stage。
 
 ## Generated Columns
 
@@ -172,7 +214,19 @@ Generated columns 很难仅从原始 SQLite pages 重建。应用知道某些列
 my_table = ["search_text", "computed_total"]
 ```
 
-这是应用 schema policy，应该和应用实际创建的 schema 保持一致。
+这是应用 schema policy，应该和应用实际创建的 schema 保持一致。该旧配置会归一化成
+managed-column 的 `recompute` resolver。
+
+## Typed SDK 与 Policy Freeze
+
+Node/Electron SDK 提供 `getMergePolicy`、`validateMergePolicy`、`setMergePolicy`。
+Version 1 是只含有限 resolver 的 data-only ABI。每个 effective policy 有稳定
+`policy_token`，set 需要 `expectedPolicyToken`，merge plan 把 token/version 绑定到
+`plan_token`。
+
+Three-way apply 会把 effective policy 冻结到 active merge journal；`getMergeStatus`
+报告实际 token/version。完成或 abort 并 replan 前不能修改 policy。所有异步 policy SDK
+调用都接受 `AbortSignal`。
 
 ## Apply Policy 和验证
 
@@ -192,7 +246,8 @@ apply policy 会出现在 conflict analysis JSON 中：
   "apply_policy": {
     "foreign_keys": "disabled_during_apply_checked_after",
     "triggers": "disabled_during_apply",
-    "validation": ["integrity_check", "foreign_key_check"]
+    "validation": ["integrity_check", "foreign_key_check"],
+    "same_row_merge": true
   }
 }
 ```

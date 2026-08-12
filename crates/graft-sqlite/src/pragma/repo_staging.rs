@@ -632,36 +632,47 @@ pub(super) fn prepare_repo_add_file(
         repo.prepare_file_state_path(repo.worktree().join(key), state)
             .map(|entry| (entry, true))
             .map_err(Into::into)
-    } else if is_sqlite_database_path(physical_path)? {
+    } else {
         let base = repo
             .index_files()?
             .get(key)
             .cloned()
             .or(repo.head_file(physical_path)?);
-        let (state, prepared) = prepare_cached_physical_sqlite_file_state(
-            runtime,
-            repo,
-            key,
-            physical_path,
-            base.as_ref(),
-        )?;
-        tracing::debug!(
-            key,
-            page_hash_cache_hit = prepared.page_hash_cache_hit(),
-            "prepared repository SQLite stage"
-        );
-        file.cache_prepared_sqlite_stage(key.to_string(), prepared);
-        repo.prepare_file_state_path(repo.worktree().join(key), state)
-            .map(|entry| (entry, false))
-            .map_err(Into::into)
-    } else if let Some(state) = repo_file_state_for_key(runtime, repo, key)? {
-        repo.prepare_file_state_path(repo.worktree().join(key), state)
-            .map(|entry| (entry, true))
-            .map_err(Into::into)
-    } else {
-        repo.prepare_artifact_path(physical_path)
-            .map(|entry| (entry, false))
-            .map_err(Into::into)
+        let is_sqlite = is_sqlite_database_path(physical_path)?;
+        if base.is_some() && !is_sqlite {
+            return Err(ErrCtx::InvalidCommand(
+                format!(
+                    "[graft:add:sqlite-analysis-failed] tracked SQLite path `{key}` is corrupt or contains non-SQLite content; the index was not changed"
+                )
+                .into(),
+            ));
+        }
+        if is_sqlite {
+            let (state, prepared) = prepare_cached_physical_sqlite_file_state(
+                runtime,
+                repo,
+                key,
+                physical_path,
+                base.as_ref(),
+            )?;
+            tracing::debug!(
+                key,
+                page_hash_cache_hit = prepared.page_hash_cache_hit(),
+                "prepared repository SQLite stage"
+            );
+            file.cache_prepared_sqlite_stage(key.to_string(), prepared);
+            repo.prepare_file_state_path(repo.worktree().join(key), state)
+                .map(|entry| (entry, false))
+                .map_err(Into::into)
+        } else if let Some(state) = repo_file_state_for_key(runtime, repo, key)? {
+            repo.prepare_file_state_path(repo.worktree().join(key), state)
+                .map(|entry| (entry, true))
+                .map_err(Into::into)
+        } else {
+            repo.prepare_artifact_path(physical_path)
+                .map(|entry| (entry, false))
+                .map_err(Into::into)
+        }
     }
 }
 

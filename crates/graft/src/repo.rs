@@ -39,8 +39,9 @@ pub use config::{
     CONFIG_KEY_MERGE_DEFAULT_SEMANTIC_KEYS, CONFIG_KEY_MERGE_GENERATED_COLUMNS_PREFIX,
     CONFIG_KEY_MERGE_INTERNAL_RESOLVERS_PREFIX, CONFIG_KEY_MERGE_SCHEMA_RESOLVERS_PREFIX,
     CONFIG_KEY_MERGE_SEMANTIC_KEYS_PREFIX, CONFIG_KEY_TRACK_DEFAULT_ROOTS,
-    CONFIG_KEY_TRACK_USER_ROOTS, CONFIG_KEY_WORKTREE_MATERIALIZE_SQLITE, FileConfig, MergeConfig,
-    RepoConfig, RepoConfigEntry, TrackConfig, WorktreeConfig,
+    CONFIG_KEY_TRACK_USER_ROOTS, CONFIG_KEY_WORKTREE_MATERIALIZE_SQLITE, FileConfig,
+    MERGE_POLICY_VERSION, ManagedColumnResolver, MergeConfig, RepoConfig, RepoConfigEntry,
+    SemanticKeyCollation, TrackConfig, WorktreeConfig,
 };
 pub use object::{CommitPathChangeCounts, CommitTableSummary};
 
@@ -1128,6 +1129,8 @@ pub struct RepoStatus {
     pub conflicted: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conflicted_changes: Vec<RepoConflictChange>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path_diagnostics: Vec<RepoPathDiagnostic>,
     pub branches: Vec<BranchInfo>,
     pub remotes: Vec<RemoteInfo>,
     pub upstream: Option<BranchUpstream>,
@@ -1137,6 +1140,23 @@ pub struct RepoStatus {
     pub ahead: usize,
     #[serde(default)]
     pub behind: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoPathDiagnostic {
+    pub path: String,
+    pub status: RepoPathDiagnosticStatus,
+    pub operation: String,
+    pub protected_by_index: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepoPathDiagnosticStatus {
+    Skipped,
+    Corrupt,
+    AnalysisFailed,
 }
 
 impl RepoStatus {

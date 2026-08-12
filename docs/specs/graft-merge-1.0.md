@@ -42,7 +42,7 @@ plan: up_to_date | fast_forward | three_way
   v                      v                       v
 unchanged            fast-forward       merging (durable)
                                              |
-                              resolve paths / rows / text
+                         resolve paths / rows / cells / text
                                              |
                                   +----------+----------+
                                   |                     |
@@ -90,8 +90,8 @@ than synthesizing a recursive merge base.
 ### 3.3 Plan token
 
 The current plan token is the BLAKE3 digest of the exact serialized immutable
-merge plan, including revision/target, expected topology, checkout actions,
-candidate index, and outcome. It is opaque to clients and is not a repository
+merge plan plus the effective policy token/version, including revision/target,
+expected topology, checkout actions, candidate index, and outcome. It is opaque to clients and is not a repository
 credential or globally unique nonce. Apply recomputes the plan against current
 state and compares the digest. A malformed, mismatched, or stale token MUST
 return a stale/invalid error and MUST make no merge-state change. Reapplying an
@@ -138,7 +138,12 @@ explicit clean path rule applies.
 
 Independent row changes merge. Identical changes on both sides collapse to one.
 Conflicting changes to the same row identity produce a row conflict, including
-incompatible update/update, update/delete, and delete/update pairs.
+incompatible update/update, update/delete, and delete/update pairs. Same-row
+field merging is disabled by default. With the versioned policy's
+`same_row_merge` flag enabled, update/update may combine columns using Base:
+disjoint changed-column sets combine, equal values for a column collapse, and
+different values for the same column produce a structured cell conflict.
+Delete/update remains a conflict.
 
 Two independently inserted rowid rows that collide MAY be merged by omitting
 theirs' requested rowid and allowing SQLite to allocate a fresh one only when
@@ -146,14 +151,17 @@ both changes are inserts, the table has no `INTEGER PRIMARY KEY` rowid alias,
 both semantic keys are known, and those semantic keys differ. It MUST NOT remap
 a declared primary key or hide referential/opaque uncertainty.
 
-### 5.3 Semantic insert keys
+### 5.3 Semantic keys
 
-Semantic keys detect business-level duplicate inserts whose storage row
-identities differ. Selection order is a table-specific
+Semantic keys detect result-level collisions whose storage row identities
+differ, including insert/insert, insert/update, and update/update. Selection order is a table-specific
 `merge.semantic_keys.<table>` override, a resolvable
 `merge.default_semantic_keys` list, then the first parsed declared primary-key
-or unique constraint that is not merely the rowid alias. A collision becomes a
-semantic-key conflict and MUST NOT be auto-remapped.
+or unique constraint that is not merely the rowid alias. `BINARY` is the
+default comparison; a configured `NOCASE` comparison follows SQLite's built-in
+ASCII case folding. A collision becomes a semantic-key conflict and MUST NOT be
+auto-remapped. It reports the two physical identities, display semantic key,
+and applied collation without assigning business meaning.
 
 Semantic-key conflicts currently require a whole-file/manual result; per-row
 ours/theirs selection is not sufficient because both physical identities may
@@ -182,14 +190,38 @@ names are validated repository configuration, not arbitrary SQL hooks.
 
 ### 5.6 Candidate database construction
 
-The engine builds the SQLite candidate in an isolated temporary database. It
+The engine builds every SQLite candidate in an isolated temporary database. It
 applies supported row/schema/internal resolutions with foreign-key and trigger
 side effects disabled for controlled replay, excludes configured/generated
 columns from writes, then validates the candidate with SQLite integrity and
 foreign-key checks before accepting it.
 
 A candidate that fails validation MUST NOT replace the staged result or
-worktree. Temporary databases are cleaned on success and failure.
+worktree or change the prior merge journal. Temporary databases are cleaned on
+success and failure. Directory repository sessions MUST plan every conflicted
+SQLite path; each unmerged path exposes structured conflicts, a validation or
+analysis error, a limitation, or an explicit executable action.
+
+### 5.7 Managed columns
+
+The finite managed-column resolver vocabulary is `ignore_for_conflict`, `max`,
+`min`, `max_timestamp`, and `recompute`. Resolvers never execute application
+code. `recompute` omits the column from replay, materializes the otherwise
+merged candidate, and leaves the path unresolved with a recomputation contract.
+After application-owned recomputation and validation, `stageMergeSqliteResult`
+captures the physical database, re-runs integrity and foreign-key checks on the
+exact private snapshot, then stages it. The legacy `generated_columns` setting
+normalizes to `recompute`.
+
+### 5.8 Versioned policy and CAS
+
+The typed SDK exposes `getMergePolicy`, `validateMergePolicy`, and
+`setMergePolicy`. Policy version 1 contains only the finite resolver vocabulary.
+Every effective policy has a stable `policy_token`; setting policy requires the
+previous token. `planToken` binds the target plan, policy token, and policy
+version. A three-way apply freezes the effective policy in the durable merge
+journal; changing it requires completing or aborting the merge and replanning.
+Planning, status, and policy results report the actual token and version.
 
 ## 6. Durable merge state
 
@@ -199,14 +231,17 @@ processes and SDK sessions close:
 - original local commit in `ORIG_HEAD`;
 - target commit in `MERGE_HEAD`;
 - Base/Ours/Theirs/Normal index stages;
-- persisted SQLite row-conflict selections/candidate state where applicable;
+- a `merge-resolution-session.json` journal containing the original conflict
+  stages, frozen policy/token/version, whole-path resolution, SQLite row/cell
+  selections, and per-path analysis state where applicable;
 - all status/index/resolution inputs from which the merge state token is
   deterministically reconstructed.
 
 The current state token is prefixed `graft-merge-v1:` and hashes the complete
-repository status, index, and optional `row-conflict-resolutions.json`. It is
+repository status, index, and optional `merge-resolution-session.json`. It is
 stable across close/reopen when state is unchanged and changes after an index,
-status, or row-selection transition.
+status, path-resolution, row-selection, or resolve-undo transition. The journal
+MUST remain until successful `continueMerge` or `abortMerge`.
 
 The physical worktree is not the sole record of a merge. Reopening the
 repository MUST recover the same unresolved path/conflict count and available
@@ -226,9 +261,38 @@ Each conflict identifies its path, conflict category, available versions, and
 row/schema/opaque detail needed to choose a supported resolution. Truncation or
 pagination MUST be explicit.
 
+During an active merge, conflict inspection MUST retain the original conflict
+records for paths that have already collapsed to Normal/staged results. Their
+current `status` and `resolution` MUST be reported so a client can reopen and
+render the resolved SQLite tables without reconstructing them from worktree
+bytes.
+
 `readMergeVersion(path, version)` returns exact `base`, `ours`, `theirs`, or
 current `result` content/snapshot. An unavailable side is reported as absent,
 not substituted. Version reads are read-only.
+
+`resolveMergeCell` selects ours or theirs for one structured cell conflict. It
+uses the same state-token CAS and journal as row/table resolution; selection is
+durable across reopen and is cleared by `unresolveMergePath` or abort.
+
+`diffMergeSqlite(path, from, to, response)` compares two distinct immutable
+`base`, `ours`, or `theirs` revisions during the active merge. It MUST remain
+available while the index contains unresolved conflicts, MUST use the active
+merge state token, MUST be cancellable and bounded, and MUST NOT write the
+worktree, index, refs, or merge journal. Its generic result includes supported
+table/row facts, schema entries (`name`, `entry_type`, `op`, new SQL, and old
+SQL where present), opaque changes, analysis limitations, and explicit logical
+status. Clients form a three-way view by comparing Base to each side.
+
+If one side is physically different from Base but this analysis reports no
+supported logical change, schema or row conflict, opaque change, or limitation,
+the engine MAY resolve the file-level conflict to the other side without
+applying SQL. For the common case where Theirs is logically equivalent to Base,
+the safe result is Ours: this preserves every supported non-conflicting local
+change and avoids an arbitrary whole-file choice. An existing active merge that
+predates automatic resolution MUST expose this as an auto-resolvable conflict
+with `recommended_result = ours`. Any opaque change or analysis limitation
+prohibits this equivalence rule.
 
 ## 8. Resolution operations
 
@@ -265,7 +329,24 @@ Per-row selection is unavailable for semantic-key, schema, opaque, malformed,
 or unsupported conflicts. Clients MUST be told to use a whole-path/manual
 result rather than receiving a false successful row resolution.
 
-### 8.4 Physical projection
+### 8.4 Table ours/theirs
+
+`resolveMergeTable` selects one side for every independently row-resolvable
+conflict in one SQLite table. It MUST preserve non-conflicting changes from
+both sides, build and validate one candidate, materialize at most once, and
+publish one new merge state. Schema, opaque, or semantic-key conflicts MUST be
+rejected before any worktree, index, or journal mutation. A later call may
+replace the table's earlier selection with the other side.
+
+### 8.5 Path resolve-undo
+
+`unresolveMergePath` restores a resolved path's original Base/Ours/Theirs
+stages and merge worktree candidate from the active session journal. It clears
+that path's row and whole-path selections but retains the journal so the path
+can be resolved again. It is valid only during the same active merge and MUST
+honor the current state token without side effects on stale input.
+
+### 8.6 Physical projection
 
 Whether a resolution updates an ordinary SQLite worktree path, and how WAL,
 locks, sidecars, replacement, and rollback work, is defined exclusively by the
@@ -288,7 +369,7 @@ claimed if a required projection fails without a valid recovery record.
 It creates one repository commit with two parents, ours first and theirs
 second, using the exact staged result and required supplied merge message. Only
 after successful commit/ref publication may it clear `MERGE_HEAD`, `ORIG_HEAD`,
-and row-resolution state. A failure MUST leave a recoverable active merge or a
+and merge-resolution journal. A failure MUST leave a recoverable active merge or a
 fully completed commit, never an unlabelled half-state.
 
 ### 9.2 Abort

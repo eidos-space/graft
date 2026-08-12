@@ -43,4 +43,12 @@ cargo build --manifest-path "${workspace_dir}/Cargo.toml" \
 
 mkdir -p "${output_dir}"
 cp "${cargo_library}" "${package_library}"
+case "${rust_target}" in
+  aarch64-apple-darwin|x86_64-apple-darwin)
+    # Rust's linker-generated ad-hoc signature can retain the pre-link file
+    # coverage after incremental release builds. Re-sign the final Node
+    # artifact so dyld validates the complete copied file.
+    codesign --force --sign - "${package_library}"
+    ;;
+esac
 echo "${package_library}"

@@ -3,23 +3,31 @@ use std::{path::PathBuf, sync::Arc};
 use graft_sdk::{
     AbortMergeOptions as CoreAbortMergeOptions, ApplyMergeOptions as CoreApplyMergeOptions,
     CancellationToken, CommitChangedPathsOptions as CoreCommitChangedPathsOptions,
-    ContinueMergeOptions as CoreContinueMergeOptions, DiffOptions as CoreDiffOptions,
+    ContinueMergeOptions as CoreContinueMergeOptions,
+    DiffMergeSqliteOptions as CoreDiffMergeSqliteOptions, DiffOptions as CoreDiffOptions,
     DiffPathsOptions as CoreDiffPathsOptions, IgnoredPathsOptions as CoreIgnoredPathsOptions,
     InventoryKind, InventoryOptions as CoreInventoryOptions,
     ListMergeConflictsOptions as CoreListMergeConflictsOptions,
     ListMergePathsOptions as CoreListMergePathsOptions, MergePathFilter as CoreMergePathFilter,
-    MergePathResult as CoreMergePathResult, MergeVersion as CoreMergeVersion,
+    MergePathResult as CoreMergePathResult, MergePolicyDocument as CoreMergePolicyDocument,
+    MergeSqliteVersion as CoreMergeSqliteVersion, MergeVersion as CoreMergeVersion,
     PlanMergeOptions as CorePlanMergeOptions,
     ReadMergeVersionOptions as CoreReadMergeVersionOptions,
     ReadPathContentOptions as CoreReadPathContentOptions,
     RecordPathMoveOptions as CoreRecordPathMoveOptions,
     RemoteConfigureOptions as CoreRemoteConfigureOptions, RepositoryOperation,
     RepositorySession as CoreRepositorySession,
-    ResolveMergeRowOptions as CoreResolveMergeRowOptions, RestoreOptions as CoreRestoreOptions,
+    ResolveMergeCellOptions as CoreResolveMergeCellOptions,
+    ResolveMergeRowOptions as CoreResolveMergeRowOptions,
+    ResolveMergeTableOptions as CoreResolveMergeTableOptions, RestoreOptions as CoreRestoreOptions,
     RestorePathsOptions as CoreRestorePathsOptions, SdkError,
     SetMergePathResultOptions as CoreSetMergePathResultOptions,
+    SetMergePolicyOptions as CoreSetMergePolicyOptions,
     SqliteDiffPathsOptions as CoreSqliteDiffPathsOptions, SqliteDiffResponse,
-    StagePathsOptions as CoreStagePathsOptions, UntrackPathsOptions as CoreUntrackPathsOptions,
+    StageMergeSqliteResultOptions as CoreStageMergeSqliteResultOptions,
+    StagePathsOptions as CoreStagePathsOptions,
+    UnresolveMergePathOptions as CoreUnresolveMergePathOptions,
+    UntrackPathsOptions as CoreUntrackPathsOptions,
     WriteAndStageTextResultOptions as CoreWriteAndStageTextResultOptions,
 };
 use napi::{
@@ -159,6 +167,12 @@ pub struct ApplyMergeOptions {
 }
 
 #[napi(object)]
+pub struct SetMergePolicyOptions {
+    pub policy_json: String,
+    pub expected_policy_token: String,
+}
+
+#[napi(object)]
 pub struct ListMergePathsOptions {
     pub filter: String,
     pub limit: u32,
@@ -183,6 +197,18 @@ pub struct ReadMergeVersionOptions {
 }
 
 #[napi(object)]
+pub struct DiffMergeSqliteOptions {
+    pub path: String,
+    pub from: String,
+    pub to: String,
+    pub mode: String,
+    pub table: Option<String>,
+    pub row_limit: Option<u32>,
+    pub row_after: Option<String>,
+    pub expected_state_token: String,
+}
+
+#[napi(object)]
 pub struct SetMergePathResultOptions {
     pub path: String,
     pub result: String,
@@ -195,6 +221,36 @@ pub struct ResolveMergeRowOptions {
     pub table: String,
     pub identity: String,
     pub result: String,
+    pub expected_state_token: String,
+}
+
+#[napi(object)]
+pub struct ResolveMergeCellOptions {
+    pub path: String,
+    pub table: String,
+    pub identity: String,
+    pub column: String,
+    pub result: String,
+    pub expected_state_token: String,
+}
+
+#[napi(object)]
+pub struct ResolveMergeTableOptions {
+    pub path: String,
+    pub table: String,
+    pub result: String,
+    pub expected_state_token: String,
+}
+
+#[napi(object)]
+pub struct UnresolveMergePathOptions {
+    pub path: String,
+    pub expected_state_token: String,
+}
+
+#[napi(object)]
+pub struct StageMergeSqliteResultOptions {
+    pub path: String,
     pub expected_state_token: String,
 }
 
@@ -299,6 +355,14 @@ enum JsonOperation {
     PlanMerge {
         options: CorePlanMergeOptions,
     },
+    GetMergePolicy,
+    ValidateMergePolicy {
+        policy_json: String,
+    },
+    SetMergePolicy {
+        policy_json: String,
+        expected_policy_token: String,
+    },
     ApplyMerge {
         options: CoreApplyMergeOptions,
     },
@@ -312,11 +376,26 @@ enum JsonOperation {
     ReadMergeVersion {
         options: CoreReadMergeVersionOptions,
     },
+    DiffMergeSqlite {
+        options: CoreDiffMergeSqliteOptions,
+    },
     SetMergePathResult {
         options: CoreSetMergePathResultOptions,
     },
     ResolveMergeRow {
         options: CoreResolveMergeRowOptions,
+    },
+    ResolveMergeCell {
+        options: CoreResolveMergeCellOptions,
+    },
+    ResolveMergeTable {
+        options: CoreResolveMergeTableOptions,
+    },
+    StageMergeSqliteResult {
+        options: CoreStageMergeSqliteResultOptions,
+    },
+    UnresolveMergePath {
+        options: CoreUnresolveMergePathOptions,
     },
     WriteAndStageTextResult {
         options: CoreWriteAndStageTextResultOptions,
@@ -439,6 +518,31 @@ impl JsonTask {
                 .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
         }
         match &self.operation {
+            JsonOperation::GetMergePolicy => {
+                let value = self.session.get_merge_policy().map_err(napi_error)?;
+                return serde_json::to_string(&value)
+                    .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
+            }
+            JsonOperation::ValidateMergePolicy { policy_json } => {
+                let policy = serde_json::from_str::<CoreMergePolicyDocument>(policy_json)
+                    .map_err(|error| Error::new(Status::InvalidArg, error.to_string()))?;
+                let value = self.session.validate_merge_policy(&policy);
+                return serde_json::to_string(&value)
+                    .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
+            }
+            JsonOperation::SetMergePolicy { policy_json, expected_policy_token } => {
+                let policy = serde_json::from_str::<CoreMergePolicyDocument>(policy_json)
+                    .map_err(|error| Error::new(Status::InvalidArg, error.to_string()))?;
+                let value = self
+                    .session
+                    .set_merge_policy(&CoreSetMergePolicyOptions {
+                        policy,
+                        expected_policy_token: expected_policy_token.clone(),
+                    })
+                    .map_err(napi_error)?;
+                return serde_json::to_string(&value)
+                    .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
+            }
             JsonOperation::PlanMerge { options } => {
                 let value = self.session.plan_merge(options).map_err(napi_error)?;
                 return serde_json::to_string(&value)
@@ -475,6 +579,14 @@ impl JsonTask {
                 return serde_json::to_string(&value)
                     .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
             }
+            JsonOperation::DiffMergeSqlite { options } => {
+                let value = self
+                    .session
+                    .diff_merge_sqlite(options)
+                    .map_err(napi_error)?;
+                return serde_json::to_string(&value)
+                    .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
+            }
             JsonOperation::SetMergePathResult { options } => {
                 let value = self
                     .session
@@ -487,6 +599,38 @@ impl JsonTask {
                 let value = self
                     .session
                     .resolve_merge_row(options)
+                    .map_err(napi_error)?;
+                return serde_json::to_string(&value)
+                    .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
+            }
+            JsonOperation::ResolveMergeCell { options } => {
+                let value = self
+                    .session
+                    .resolve_merge_cell(options)
+                    .map_err(napi_error)?;
+                return serde_json::to_string(&value)
+                    .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
+            }
+            JsonOperation::ResolveMergeTable { options } => {
+                let value = self
+                    .session
+                    .resolve_merge_table(options)
+                    .map_err(napi_error)?;
+                return serde_json::to_string(&value)
+                    .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
+            }
+            JsonOperation::StageMergeSqliteResult { options } => {
+                let value = self
+                    .session
+                    .stage_merge_sqlite_result(options)
+                    .map_err(napi_error)?;
+                return serde_json::to_string(&value)
+                    .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
+            }
+            JsonOperation::UnresolveMergePath { options } => {
+                let value = self
+                    .session
+                    .unresolve_merge_path(options)
                     .map_err(napi_error)?;
                 return serde_json::to_string(&value)
                     .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
@@ -569,13 +713,21 @@ impl JsonTask {
                 .session
                 .clone_repository(remote_url, branch.as_deref(), bearer_token.take()),
             JsonOperation::PlanMerge { .. }
+            | JsonOperation::GetMergePolicy
+            | JsonOperation::ValidateMergePolicy { .. }
+            | JsonOperation::SetMergePolicy { .. }
             | JsonOperation::ApplyMerge { .. }
             | JsonOperation::GetMergeStatus
             | JsonOperation::ListMergePaths { .. }
             | JsonOperation::ListMergeConflicts { .. }
             | JsonOperation::ReadMergeVersion { .. }
+            | JsonOperation::DiffMergeSqlite { .. }
             | JsonOperation::SetMergePathResult { .. }
             | JsonOperation::ResolveMergeRow { .. }
+            | JsonOperation::ResolveMergeCell { .. }
+            | JsonOperation::ResolveMergeTable { .. }
+            | JsonOperation::StageMergeSqliteResult { .. }
+            | JsonOperation::UnresolveMergePath { .. }
             | JsonOperation::WriteAndStageTextResult { .. }
             | JsonOperation::ContinueMerge { .. }
             | JsonOperation::AbortMerge { .. } => {
@@ -1094,6 +1246,40 @@ impl NodeRepositorySession {
         )
     }
 
+    #[napi(js_name = "getMergePolicy")]
+    pub fn get_merge_policy(&self, signal: Option<AbortSignal>) -> AsyncTask<JsonTask> {
+        json_task(self, JsonOperation::GetMergePolicy, signal)
+    }
+
+    #[napi(js_name = "validateMergePolicy")]
+    pub fn validate_merge_policy(
+        &self,
+        policy_json: String,
+        signal: Option<AbortSignal>,
+    ) -> AsyncTask<JsonTask> {
+        json_task(
+            self,
+            JsonOperation::ValidateMergePolicy { policy_json },
+            signal,
+        )
+    }
+
+    #[napi(js_name = "setMergePolicy")]
+    pub fn set_merge_policy(
+        &self,
+        options: SetMergePolicyOptions,
+        signal: Option<AbortSignal>,
+    ) -> AsyncTask<JsonTask> {
+        json_task(
+            self,
+            JsonOperation::SetMergePolicy {
+                policy_json: options.policy_json,
+                expected_policy_token: options.expected_policy_token,
+            },
+            signal,
+        )
+    }
+
     #[napi(js_name = "applyMerge")]
     pub fn apply_merge(
         &self,
@@ -1191,6 +1377,36 @@ impl NodeRepositorySession {
         ))
     }
 
+    #[napi(js_name = "diffMergeSqlite")]
+    pub fn diff_merge_sqlite(
+        &self,
+        options: DiffMergeSqliteOptions,
+        signal: Option<AbortSignal>,
+    ) -> Result<AsyncTask<JsonTask>> {
+        let response = match options.mode.as_str() {
+            "summary" => SqliteDiffResponse::Summary,
+            "rows" => SqliteDiffResponse::Rows {
+                table: options.table.unwrap_or_default(),
+                limit: options.row_limit.unwrap_or(100) as usize,
+                after: options.row_after,
+            },
+            value => return Err(invalid_enum("merge SQLite diff mode", value)),
+        };
+        Ok(json_task(
+            self,
+            JsonOperation::DiffMergeSqlite {
+                options: CoreDiffMergeSqliteOptions {
+                    path: PathBuf::from(options.path),
+                    from: parse_merge_sqlite_version(&options.from)?,
+                    to: parse_merge_sqlite_version(&options.to)?,
+                    response,
+                    expected_state_token: options.expected_state_token,
+                },
+            },
+            signal,
+        ))
+    }
+
     #[napi(js_name = "setMergePathResult")]
     pub fn set_merge_path_result(
         &self,
@@ -1237,6 +1453,92 @@ impl NodeRepositorySession {
             },
             signal,
         ))
+    }
+
+    #[napi(js_name = "resolveMergeCell")]
+    pub fn resolve_merge_cell(
+        &self,
+        options: ResolveMergeCellOptions,
+        signal: Option<AbortSignal>,
+    ) -> Result<AsyncTask<JsonTask>> {
+        let result = parse_merge_path_result(&options.result)?;
+        let identity = serde_json::from_str(&options.identity).map_err(|error| {
+            Error::new(
+                Status::InvalidArg,
+                format!("merge cell identity must be valid JSON: {error}"),
+            )
+        })?;
+        Ok(json_task(
+            self,
+            JsonOperation::ResolveMergeCell {
+                options: CoreResolveMergeCellOptions {
+                    path: PathBuf::from(options.path),
+                    table: options.table,
+                    identity,
+                    column: options.column,
+                    result,
+                    expected_state_token: options.expected_state_token,
+                },
+            },
+            signal,
+        ))
+    }
+
+    #[napi(js_name = "resolveMergeTable")]
+    pub fn resolve_merge_table(
+        &self,
+        options: ResolveMergeTableOptions,
+        signal: Option<AbortSignal>,
+    ) -> Result<AsyncTask<JsonTask>> {
+        let result = parse_merge_path_result(&options.result)?;
+        Ok(json_task(
+            self,
+            JsonOperation::ResolveMergeTable {
+                options: CoreResolveMergeTableOptions {
+                    path: PathBuf::from(options.path),
+                    table: options.table,
+                    result,
+                    expected_state_token: options.expected_state_token,
+                },
+            },
+            signal,
+        ))
+    }
+
+    #[napi(js_name = "stageMergeSqliteResult")]
+    pub fn stage_merge_sqlite_result(
+        &self,
+        options: StageMergeSqliteResultOptions,
+        signal: Option<AbortSignal>,
+    ) -> AsyncTask<JsonTask> {
+        json_task(
+            self,
+            JsonOperation::StageMergeSqliteResult {
+                options: CoreStageMergeSqliteResultOptions {
+                    path: PathBuf::from(options.path),
+                    expected_state_token: options.expected_state_token,
+                },
+            },
+            signal,
+        )
+    }
+
+    #[napi(js_name = "unresolveMergePath")]
+    pub fn unresolve_merge_path(
+        &self,
+        options: UnresolveMergePathOptions,
+        signal: Option<AbortSignal>,
+    ) -> AsyncTask<JsonTask> {
+        json_task(
+            self,
+            JsonOperation::UnresolveMergePath {
+                options: CoreUnresolveMergePathOptions {
+                    path: PathBuf::from(options.path),
+                    expected_state_token: options.expected_state_token,
+                },
+            },
+            signal,
+        )
     }
 
     #[napi(js_name = "writeAndStageTextResult")]
@@ -1343,13 +1645,23 @@ pub fn operation_materializes_worktree(operation: String) -> Result<bool> {
         "pull" => RepositoryOperation::Pull,
         "clone" | "cloneRepository" => RepositoryOperation::Clone,
         "plan_merge" | "planMerge" => RepositoryOperation::PlanMerge,
+        "get_merge_policy" | "getMergePolicy" => RepositoryOperation::GetMergePolicy,
+        "validate_merge_policy" | "validateMergePolicy" => RepositoryOperation::ValidateMergePolicy,
+        "set_merge_policy" | "setMergePolicy" => RepositoryOperation::SetMergePolicy,
         "apply_merge" | "applyMerge" => RepositoryOperation::ApplyMerge,
         "get_merge_status" | "getMergeStatus" => RepositoryOperation::GetMergeStatus,
         "list_merge_paths" | "listMergePaths" => RepositoryOperation::ListMergePaths,
         "list_merge_conflicts" | "listMergeConflicts" => RepositoryOperation::ListMergeConflicts,
         "read_merge_version" | "readMergeVersion" => RepositoryOperation::ReadMergeVersion,
+        "diff_merge_sqlite" | "diffMergeSqlite" => RepositoryOperation::DiffMergeSqlite,
         "set_merge_path_result" | "setMergePathResult" => RepositoryOperation::SetMergePathResult,
         "resolve_merge_row" | "resolveMergeRow" => RepositoryOperation::ResolveMergeRow,
+        "resolve_merge_cell" | "resolveMergeCell" => RepositoryOperation::ResolveMergeCell,
+        "resolve_merge_table" | "resolveMergeTable" => RepositoryOperation::ResolveMergeTable,
+        "stage_merge_sqlite_result" | "stageMergeSqliteResult" => {
+            RepositoryOperation::StageMergeSqliteResult
+        }
+        "unresolve_merge_path" | "unresolveMergePath" => RepositoryOperation::UnresolveMergePath,
         "write_and_stage_text_result" | "writeAndStageTextResult" => {
             RepositoryOperation::WriteAndStageTextResult
         }
@@ -1413,6 +1725,15 @@ fn parse_merge_path_result(value: &str) -> Result<CoreMergePathResult> {
         "ours" => Ok(CoreMergePathResult::Ours),
         "theirs" => Ok(CoreMergePathResult::Theirs),
         value => Err(invalid_enum("merge path result", value)),
+    }
+}
+
+fn parse_merge_sqlite_version(value: &str) -> Result<CoreMergeSqliteVersion> {
+    match value {
+        "base" => Ok(CoreMergeSqliteVersion::Base),
+        "ours" => Ok(CoreMergeSqliteVersion::Ours),
+        "theirs" => Ok(CoreMergeSqliteVersion::Theirs),
+        value => Err(invalid_enum("merge SQLite version", value)),
     }
 }
 
