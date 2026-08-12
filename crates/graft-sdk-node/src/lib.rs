@@ -25,14 +25,16 @@ use graft_sdk::{
     SetMergePolicyOptions as CoreSetMergePolicyOptions,
     SqliteDiffPathsOptions as CoreSqliteDiffPathsOptions, SqliteDiffResponse,
     StageMergeSqliteResultOptions as CoreStageMergeSqliteResultOptions,
-    StagePathsOptions as CoreStagePathsOptions,
+    StagePathsOptions as CoreStagePathsOptions, TransferDirection as CoreTransferDirection,
+    TransferProgress as CoreTransferProgress, TransferProgressReporter,
     UnresolveMergePathOptions as CoreUnresolveMergePathOptions,
     UntrackPathsOptions as CoreUntrackPathsOptions,
     WriteAndStageTextResultOptions as CoreWriteAndStageTextResultOptions,
 };
 use napi::{
     Env, Error, Result, Status, Task,
-    bindgen_prelude::{AbortSignal, AsyncTask},
+    bindgen_prelude::{AbortSignal, AsyncTask, FnArgs},
+    threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode},
 };
 use napi_derive::napi;
 
@@ -152,6 +154,21 @@ pub struct CloneOptions {
     pub branch: Option<String>,
     pub bearer_token: Option<String>,
 }
+
+#[napi(object)]
+pub struct NodeTransferProgress {
+    pub direction: String,
+    pub transferred_bytes: f64,
+    pub total_bytes: Option<f64>,
+}
+
+type TransferProgressCallback = ThreadsafeFunction<
+    FnArgs<(NodeTransferProgress,)>,
+    (),
+    FnArgs<(NodeTransferProgress,)>,
+    Status,
+    false,
+>;
 
 #[napi(object)]
 pub struct PlanMergeOptions {
@@ -412,6 +429,7 @@ pub struct JsonTask {
     session: Arc<CoreRepositorySession>,
     operation: JsonOperation,
     cancellation: CancellationToken,
+    progress: Option<Arc<TransferProgressCallback>>,
 }
 
 impl Task for JsonTask {
@@ -420,6 +438,18 @@ impl Task for JsonTask {
 
     fn compute(&mut self) -> Result<Self::Output> {
         let cancellation = self.cancellation.clone();
+        let progress = self.progress.clone();
+        if let Some(progress) = progress {
+            let reporter = TransferProgressReporter::new(move |event| {
+                let _ = progress.call(
+                    FnArgs::from((node_transfer_progress(event),)),
+                    ThreadsafeFunctionCallMode::NonBlocking,
+                );
+            });
+            return graft_sdk::with_transfer_progress(&reporter, || {
+                graft_sdk::with_cancellation(&cancellation, || self.compute_inner())
+            });
+        }
         graft_sdk::with_cancellation(&cancellation, || self.compute_inner())
     }
 
@@ -1204,8 +1234,14 @@ impl NodeRepositorySession {
         remote: Option<String>,
         branch: Option<String>,
         signal: Option<AbortSignal>,
+        progress: Option<TransferProgressCallback>,
     ) -> AsyncTask<JsonTask> {
-        json_task(self, JsonOperation::Push { remote, branch }, signal)
+        json_task_with_progress(
+            self,
+            JsonOperation::Push { remote, branch },
+            signal,
+            progress,
+        )
     }
 
     #[napi]
@@ -1214,8 +1250,14 @@ impl NodeRepositorySession {
         remote: Option<String>,
         branch: Option<String>,
         signal: Option<AbortSignal>,
+        progress: Option<TransferProgressCallback>,
     ) -> AsyncTask<JsonTask> {
-        json_task(self, JsonOperation::Fetch { remote, branch }, signal)
+        json_task_with_progress(
+            self,
+            JsonOperation::Fetch { remote, branch },
+            signal,
+            progress,
+        )
     }
 
     #[napi]
@@ -1224,8 +1266,14 @@ impl NodeRepositorySession {
         remote: Option<String>,
         branch: Option<String>,
         signal: Option<AbortSignal>,
+        progress: Option<TransferProgressCallback>,
     ) -> AsyncTask<JsonTask> {
-        json_task(self, JsonOperation::Pull { remote, branch }, signal)
+        json_task_with_progress(
+            self,
+            JsonOperation::Pull { remote, branch },
+            signal,
+            progress,
+        )
     }
 
     #[napi(js_name = "planMerge")]
@@ -1600,8 +1648,9 @@ impl NodeRepositorySession {
         &self,
         options: CloneOptions,
         signal: Option<AbortSignal>,
+        progress: Option<TransferProgressCallback>,
     ) -> AsyncTask<JsonTask> {
-        json_task(
+        json_task_with_progress(
             self,
             JsonOperation::Clone {
                 remote_url: options.remote_url,
@@ -1609,6 +1658,7 @@ impl NodeRepositorySession {
                 bearer_token: options.bearer_token,
             },
             signal,
+            progress,
         )
     }
 }
@@ -1701,6 +1751,15 @@ fn json_task(
     operation: JsonOperation,
     signal: Option<AbortSignal>,
 ) -> AsyncTask<JsonTask> {
+    json_task_with_progress(session, operation, signal, None)
+}
+
+fn json_task_with_progress(
+    session: &NodeRepositorySession,
+    operation: JsonOperation,
+    signal: Option<AbortSignal>,
+    progress: Option<TransferProgressCallback>,
+) -> AsyncTask<JsonTask> {
     let cancellation = CancellationToken::new();
     if let Some(signal) = signal.as_ref() {
         let abort_token = cancellation.clone();
@@ -1711,9 +1770,22 @@ fn json_task(
             session: session.session.clone(),
             operation,
             cancellation,
+            progress: progress.map(Arc::new),
         },
         signal,
     )
+}
+
+fn node_transfer_progress(progress: CoreTransferProgress) -> NodeTransferProgress {
+    NodeTransferProgress {
+        direction: match progress.direction {
+            CoreTransferDirection::Upload => "upload",
+            CoreTransferDirection::Download => "download",
+        }
+        .to_string(),
+        transferred_bytes: progress.transferred_bytes as f64,
+        total_bytes: progress.total_bytes.map(|bytes| bytes as f64),
+    }
 }
 
 fn invalid_enum(label: &str, value: &str) -> Error {

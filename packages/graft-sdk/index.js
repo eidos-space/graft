@@ -166,18 +166,18 @@ class RepositorySession {
   }
 
   async push(options = {}) {
-    const { remote, branch, signal } = options
-    return callJson(() => this.#native.push(remote, branch, signal))
+    const { remote, branch, signal, onProgress } = options
+    return callJson(() => this.#native.push(remote, branch, signal, onProgress))
   }
 
   async fetch(options = {}) {
-    const { remote, branch, signal } = options
-    return callJson(() => this.#native.fetch(remote, branch, signal))
+    const { remote, branch, signal, onProgress } = options
+    return callJson(() => this.#native.fetch(remote, branch, signal, onProgress))
   }
 
   async pull(options = {}) {
-    const { remote, branch, signal } = options
-    return callJson(() => this.#native.pull(remote, branch, signal))
+    const { remote, branch, signal, onProgress } = options
+    return callJson(() => this.#native.pull(remote, branch, signal, onProgress))
   }
 
   async getMergePolicy({ signal } = {}) {
@@ -351,8 +351,10 @@ class RepositorySession {
   }
 
   async cloneRepository(options) {
-    const { signal, ...cloneOptions } = options
-    return callJson(() => this.#native.cloneRepository(cloneOptions, signal))
+    const { signal, onProgress, ...cloneOptions } = options
+    return callJson(() =>
+      this.#native.cloneRepository(cloneOptions, signal, onProgress)
+    )
   }
 }
 

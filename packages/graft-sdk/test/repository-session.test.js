@@ -3,6 +3,7 @@
 const assert = require("node:assert/strict")
 const { spawnSync } = require("node:child_process")
 const fs = require("node:fs/promises")
+const http = require("node:http")
 const os = require("node:os")
 const path = require("node:path")
 const test = require("node:test")
@@ -1395,6 +1396,53 @@ test("keeps HTTP credentials in memory and redacts command errors", async () => 
       return true
     })
     await session.close()
+  })
+})
+
+test("reports real HTTP response bytes through the JavaScript progress callback", async () => {
+  await withTemporaryDirectory("graft-sdk-http-progress-", async (root) => {
+    const body = Buffer.from("invalid-remote-head\n")
+    const server = http.createServer((_request, response) => {
+      response.writeHead(200, {
+        "content-length": body.length,
+        "graft-protocol": "1",
+      })
+      response.end(body)
+    })
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve))
+    const address = server.address()
+    assert.ok(address && typeof address !== "string")
+    const session = await RepositorySession.open(root)
+    const progress = []
+
+    try {
+      await session.init()
+      await session.configureRemote({
+        name: "origin",
+        url: `graft+http://127.0.0.1:${address.port}/org/repository`,
+        upstreamBranch: "main",
+      })
+      await assert.rejects(
+        session.fetch({ onProgress: (event) => progress.push(event) })
+      )
+      await new Promise((resolve) => setImmediate(resolve))
+
+      assert.ok(
+        progress.some(
+          (event) =>
+            event.direction === "download" &&
+            event.transferredBytes >= body.length &&
+            event.totalBytes >= body.length
+        ),
+        JSON.stringify(progress)
+      )
+    } finally {
+      await session.close()
+      server.closeAllConnections()
+      await new Promise((resolve, reject) => {
+        server.close((error) => (error ? reject(error) : resolve()))
+      })
+    }
   })
 })
 

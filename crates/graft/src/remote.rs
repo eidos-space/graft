@@ -13,6 +13,7 @@ use std::{
 };
 
 use crate::core::{LogId, SegmentId, cbe::CBE64, commit::Commit, lsn::LSN};
+use crate::repo::{TransferDirection, TransferProgressHandle, begin_transfer_progress};
 use bilrost::{Message, OwnedMessage};
 use bytes::Bytes;
 use futures::{
@@ -1695,9 +1696,9 @@ impl HttpRemote {
             unreachable!("an HTTP 404 cannot pass response validation")
         }
         let response = Self::check_response(response, path).await?;
-        Ok(Some(response.bytes().await.map_err(|err| {
-            RemoteErr::http_transport("get_body", err)
-        })?))
+        Ok(Some(
+            tracked_response_bytes(response, "get_body", TransferDirection::Download).await?,
+        ))
     }
 
     async fn drain_response(response: reqwest::Response) -> Result<()> {
@@ -1729,10 +1730,7 @@ impl HttpRemote {
             )
             .await?;
         let response = Self::check_response(response, path).await?;
-        response
-            .bytes()
-            .await
-            .map_err(|err| RemoteErr::http_transport("range_get_body", err))
+        tracked_response_bytes(response, "range_get_body", TransferDirection::Download).await
     }
 
     async fn list_raw(&self, prefix: &str) -> Result<Vec<String>> {
@@ -1804,7 +1802,8 @@ impl HttpRemote {
         }
         let response = Self::check_response(response, ref_path).await?;
         let manifest_bytes = upload_bundle_manifest_length(response.headers(), ref_path)?;
-        let mut body = HttpDownloadBody::new(response.bytes_stream());
+        let total_bytes = response.content_length();
+        let mut body = HttpDownloadBody::new(response.bytes_stream(), total_bytes);
         let manifest = body.read_exact(manifest_bytes, ref_path).await?;
         let manifest = decode_upload_bundle_manifest(&manifest, ref_path)?;
         validate_upload_bundle_manifest(&manifest, ref_path)?;
@@ -1842,7 +1841,7 @@ impl HttpRemote {
         let response = self
             .send(
                 self.upload_request(reqwest::Method::PUT, self.raw_url("raw", path))
-                    .body(bytes),
+                    .body(tracked_upload_body(vec![bytes], request_bytes)),
                 "put",
                 Some(request_bytes),
             )
@@ -1880,9 +1879,7 @@ impl HttpRemote {
                 .await;
         }
 
-        let body = reqwest::Body::wrap_stream(stream::iter(
-            chunks.into_iter().map(Ok::<Bytes, std::io::Error>),
-        ));
+        let body = tracked_upload_body(chunks, content_length as u64);
         let response = self
             .send(
                 self.upload_request(
@@ -1987,9 +1984,7 @@ impl HttpRemote {
         let mut last_error = None;
         for attempt in 0..MULTIPART_PART_ATTEMPTS {
             let request_chunks = chunks.to_vec();
-            let body = reqwest::Body::wrap_stream(stream::iter(
-                request_chunks.into_iter().map(Ok::<Bytes, std::io::Error>),
-            ));
+            let body = tracked_upload_body(request_chunks, content_length as u64);
             let response = self
                 .send(
                     self.upload_request(reqwest::Method::PUT, self.raw_url("multipart-part", path))
@@ -2048,11 +2043,10 @@ impl HttpRemote {
         {
             return Ok(HttpReceivePackResult::RetryIndividually);
         }
-        let body = reqwest::Body::wrap_stream(stream::iter(
-            [pack.pack.clone(), pack.index.clone()]
-                .into_iter()
-                .map(Ok::<Bytes, std::io::Error>),
-        ));
+        let body = tracked_upload_body(
+            vec![pack.pack.clone(), pack.index.clone()],
+            content_length as u64,
+        );
         let response = self
             .send(
                 self.upload_request(
@@ -2154,9 +2148,7 @@ impl HttpRemote {
             )
             .chain([pack.pack.clone(), pack.index.clone()])
             .collect::<Vec<_>>();
-        let body = reqwest::Body::wrap_stream(stream::iter(
-            chunks.into_iter().map(Ok::<Bytes, std::io::Error>),
-        ));
+        let body = tracked_upload_body(chunks, content_length as u64);
         let response = self
             .send(
                 // A receive-bundle is the only mutation after the ref read in the fast path.
@@ -2268,15 +2260,18 @@ type DownloadStream =
 struct HttpDownloadBody {
     stream: DownloadStream,
     buffered: Bytes,
+    progress: Option<TransferProgressHandle>,
 }
 
 impl HttpDownloadBody {
     fn new(
         stream: impl Stream<Item = std::result::Result<Bytes, reqwest::Error>> + Send + 'static,
+        total_bytes: Option<u64>,
     ) -> Self {
         Self {
             stream: Box::pin(stream),
             buffered: Bytes::new(),
+            progress: begin_transfer_progress(TransferDirection::Download, total_bytes),
         }
     }
 
@@ -2336,14 +2331,56 @@ impl HttpDownloadBody {
         loop {
             match self.stream.next().await {
                 Some(Ok(bytes)) if bytes.is_empty() => {}
-                Some(Ok(bytes)) => return Ok(Some(bytes)),
+                Some(Ok(bytes)) => {
+                    if let Some(progress) = self.progress.as_mut() {
+                        progress.advance(bytes.len() as u64);
+                    }
+                    return Ok(Some(bytes));
+                }
                 Some(Err(err)) => {
                     return Err(RemoteErr::http_transport("upload_bundle_body", err));
                 }
-                None => return Ok(None),
+                None => {
+                    if let Some(progress) = self.progress.as_mut() {
+                        progress.finish();
+                    }
+                    return Ok(None);
+                }
             }
         }
     }
+}
+
+fn tracked_upload_body(chunks: Vec<Bytes>, total_bytes: u64) -> reqwest::Body {
+    let mut progress = begin_transfer_progress(TransferDirection::Upload, Some(total_bytes));
+    reqwest::Body::wrap_stream(stream::iter(chunks.into_iter().map(move |bytes| {
+        if let Some(progress) = progress.as_mut() {
+            progress.advance(bytes.len() as u64);
+        }
+        Ok::<Bytes, std::io::Error>(bytes)
+    })))
+}
+
+async fn tracked_response_bytes(
+    response: reqwest::Response,
+    operation: &'static str,
+    direction: TransferDirection,
+) -> Result<Bytes> {
+    let total_bytes = response.content_length();
+    let mut progress = begin_transfer_progress(direction, total_bytes);
+    let mut body = response.bytes_stream();
+    let mut output = Vec::new();
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.map_err(|err| RemoteErr::http_transport(operation, err))?;
+        if let Some(progress) = progress.as_mut() {
+            progress.advance(chunk.len() as u64);
+        }
+        output.extend_from_slice(&chunk);
+    }
+    if let Some(progress) = progress.as_mut() {
+        progress.finish();
+    }
+    Ok(Bytes::from(output))
 }
 
 fn upload_bundle_manifest_length(
@@ -2898,6 +2935,12 @@ mod tests {
         .await;
         let remote = RemoteConfig::Http { url, token_env: None }.build().unwrap();
         let destination = tempfile::tempdir().unwrap();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = events.clone();
+        let reporter = crate::repo::TransferProgressReporter::new(move |progress| {
+            captured.lock().unwrap().push(progress);
+        });
+        let _scope = crate::repo::TransferProgressScope::enter(&reporter);
 
         assert!(matches!(
             remote
@@ -2918,6 +2961,10 @@ mod tests {
             fs::read(destination.path().join("objects/pack/example.pack")).unwrap(),
             b"pack"
         );
+        let last = events.lock().unwrap().last().copied().unwrap();
+        assert_eq!(last.direction, TransferDirection::Download);
+        assert_eq!(last.total_bytes, Some(last.transferred_bytes));
+        assert!(last.transferred_bytes > 0);
         assert!(
             request
                 .await
@@ -4039,6 +4086,12 @@ mod tests {
     async fn streamed_http_upload_sends_exact_content_length() {
         let (url, request) = serve_http_response("204 No Content", &["1"]).await;
         let remote = HttpRemote::new(url, None).unwrap();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = events.clone();
+        let reporter = crate::repo::TransferProgressReporter::new(move |progress| {
+            captured.lock().unwrap().push(progress);
+        });
+        let _scope = crate::repo::TransferProgressScope::enter(&reporter);
 
         remote
             .put_raw_if_not_exists_stream(
@@ -4047,6 +4100,10 @@ mod tests {
             )
             .await
             .unwrap();
+        let last = events.lock().unwrap().last().copied().unwrap();
+        assert_eq!(last.direction, TransferDirection::Upload);
+        assert_eq!(last.transferred_bytes, 5);
+        assert_eq!(last.total_bytes, Some(5));
         let request = request.await.unwrap();
         assert!(
             request

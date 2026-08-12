@@ -18,7 +18,7 @@ use tempfile::TempDir;
 use super::*;
 
 const PAGE_HASH_CACHE_MAGIC: &[u8; 16] = b"graft-page-index";
-const PAGE_HASH_CACHE_VERSION: u32 = 3;
+const PAGE_HASH_CACHE_VERSION: u32 = 4;
 const PAGE_HASH_BYTES: usize = 32;
 const PAGE_HASH_CHUNK_PAGES: usize = 64;
 const PAGE_HASH_CHUNK_BYTES: usize = PAGE_HASH_CHUNK_PAGES * PAGESIZE.as_usize();
@@ -28,12 +28,13 @@ const PAGE_SCAN_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 const MIN_PAGE_HASH_CACHE_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_PAGE_HASH_CACHE_ENTRIES: usize = 4;
 const MAX_WORKTREE_DIFF_PROBES: usize = 16;
-const WORKTREE_DIFF_PROBE_VERSION: u32 = 3;
+const WORKTREE_DIFF_PROBE_VERSION: u32 = 4;
 const MAX_PERSISTED_DIFF_PROBE_BYTES: u64 = 64 * 1024;
 const PAGE_OWNERSHIP_CACHE_VERSION: u32 = 1;
 const MAX_PAGE_OWNERSHIP_CACHE_BYTES: u64 = 16 * 1024 * 1024;
 const SQLITE_FILE_CHANGE_COUNTER_OFFSET: usize = 24;
 const SQLITE_VERSION_VALID_FOR_OFFSET: usize = 92;
+const SQLITE_LIBRARY_VERSION_OFFSET: usize = 96;
 const SQLITE_VOLATILE_HEADER_FIELD_BYTES: usize = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -191,14 +192,14 @@ impl SqlitePageHashCache {
 
     fn path_for_state(&self, state: &CommitFileState) -> Result<PathBuf, ErrCtx> {
         let state_hash = sqlite_page_index_state_hash(state)?;
-        Ok(self.directory.join(format!("pages-v3-{state_hash}.bin")))
+        Ok(self.directory.join(format!("pages-v4-{state_hash}.bin")))
     }
 
     fn probe_path_for_state(&self, state: &CommitFileState) -> Result<PathBuf, ErrCtx> {
         let state_hash = sqlite_page_index_state_hash(state)?;
         Ok(self
             .directory
-            .join(format!("worktree-probe-v3-{state_hash}.json")))
+            .join(format!("worktree-probe-v4-{state_hash}.json")))
     }
 
     fn ownership_path_for_state(&self, state: &CommitFileState) -> Result<PathBuf, ErrCtx> {
@@ -300,7 +301,7 @@ impl SqlitePageHashCache {
             )
         })?;
         let final_path = self.probe_path_for_state(state)?;
-        write_atomic_cache_file(&self.directory, &final_path, "worktree-probe-v3", &bytes)
+        write_atomic_cache_file(&self.directory, &final_path, "worktree-probe-v4", &bytes)
     }
 
     fn store_ownership(
@@ -407,7 +408,7 @@ impl SqlitePageHashCache {
         std::fs::create_dir_all(&self.directory)?;
         let final_path = self.path_for_state(state)?;
         let temp_path = self.directory.join(format!(
-            ".pages-v3-{}-{}.tmp",
+            ".pages-v4-{}-{}.tmp",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -530,12 +531,13 @@ fn prune_page_hash_cache(directory: &Path, keep: &Path) {
             if let Some(state_hash) = path
                 .file_name()
                 .and_then(|name| name.to_str())
-                .and_then(|name| name.strip_prefix("pages-v3-"))
+                .and_then(|name| name.strip_prefix("pages-v4-"))
                 .and_then(|name| name.strip_suffix(".bin"))
             {
                 for cache_name in [
                     format!("worktree-probe-v2-{state_hash}.json"),
                     format!("worktree-probe-v3-{state_hash}.json"),
+                    format!("worktree-probe-v4-{state_hash}.json"),
                     format!("page-ownership-v1-{state_hash}.json"),
                 ] {
                     let _ = std::fs::remove_file(directory.join(cache_name));
@@ -552,21 +554,21 @@ fn page_hash_chunk_count(page_count: usize) -> usize {
 
 /// Hash `SQLite` pages using stable database-content semantics.
 ///
-/// `SQLite`'s online backup rewrites two cache-invalidation counters on page 1. They are not
-/// database content, so excluding them keeps page indexes portable between rollback-journal and
-/// online-backup snapshots.
+/// `SQLite`'s online backup rewrites cache-invalidation counters and the version number of the
+/// `SQLite` library that last wrote page 1. They are not database content, so excluding them keeps
+/// page indexes portable between rollback-journal and online-backup snapshots created on different
+/// platforms.
 fn sqlite_page_chunk_hash(first_page: u32, bytes: &[u8]) -> blake3::Hash {
     if first_page != 1 {
         return blake3::hash(bytes);
     }
 
     let change_counter_end = SQLITE_FILE_CHANGE_COUNTER_OFFSET + SQLITE_VOLATILE_HEADER_FIELD_BYTES;
-    let version_valid_for_end =
-        SQLITE_VERSION_VALID_FOR_OFFSET + SQLITE_VOLATILE_HEADER_FIELD_BYTES;
+    let library_version_end = SQLITE_LIBRARY_VERSION_OFFSET + SQLITE_VOLATILE_HEADER_FIELD_BYTES;
     let mut hasher = blake3::Hasher::new();
     hasher.update(&bytes[..SQLITE_FILE_CHANGE_COUNTER_OFFSET]);
     hasher.update(&bytes[change_counter_end..SQLITE_VERSION_VALID_FOR_OFFSET]);
-    hasher.update(&bytes[version_valid_for_end..]);
+    hasher.update(&bytes[library_version_end..]);
     hasher.finalize()
 }
 
@@ -576,12 +578,11 @@ fn sqlite_page_bytes_equal(page_number: u32, left: &[u8], right: &[u8]) -> bool 
     }
 
     let change_counter_end = SQLITE_FILE_CHANGE_COUNTER_OFFSET + SQLITE_VOLATILE_HEADER_FIELD_BYTES;
-    let version_valid_for_end =
-        SQLITE_VERSION_VALID_FOR_OFFSET + SQLITE_VOLATILE_HEADER_FIELD_BYTES;
+    let library_version_end = SQLITE_LIBRARY_VERSION_OFFSET + SQLITE_VOLATILE_HEADER_FIELD_BYTES;
     left[..SQLITE_FILE_CHANGE_COUNTER_OFFSET] == right[..SQLITE_FILE_CHANGE_COUNTER_OFFSET]
         && left[change_counter_end..SQLITE_VERSION_VALID_FOR_OFFSET]
             == right[change_counter_end..SQLITE_VERSION_VALID_FOR_OFFSET]
-        && left[version_valid_for_end..] == right[version_valid_for_end..]
+        && left[library_version_end..] == right[library_version_end..]
 }
 
 /// A stable page reader for a physical `SQLite` worktree file.
@@ -1262,19 +1263,28 @@ fn validate_sqlite_header(path: &Path, header: &[u8; 100]) -> Result<(), ErrCtx>
 
 fn backup_sqlite_source(path: &Path, snapshot_path: &Path) -> Result<(), ErrCtx> {
     const BACKUP_TIMEOUT: Duration = Duration::from_secs(30);
-    const BACKUP_RETRY_DELAY: Duration = Duration::from_millis(10);
-    const PAGES_PER_STEP: i32 = 256;
 
     #[cfg(target_os = "macos")]
     if clone_rollback_journal_snapshot(path, snapshot_path, BACKUP_TIMEOUT)? {
         return Ok(());
     }
 
+    backup_sqlite_source_online(path, snapshot_path, BACKUP_TIMEOUT)
+}
+
+fn backup_sqlite_source_online(
+    path: &Path,
+    snapshot_path: &Path,
+    backup_timeout: Duration,
+) -> Result<(), ErrCtx> {
+    const BACKUP_RETRY_DELAY: Duration = Duration::from_millis(10);
+    const PAGES_PER_STEP: i32 = 256;
+
     let source = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
-    source.busy_timeout(BACKUP_TIMEOUT)?;
+    source.busy_timeout(backup_timeout)?;
     let mut destination = Connection::open_with_flags(
         snapshot_path,
         OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -1282,7 +1292,7 @@ fn backup_sqlite_source(path: &Path, snapshot_path: &Path) -> Result<(), ErrCtx>
             | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
     let backup = Backup::new(&source, &mut destination)?;
-    let deadline = Instant::now() + BACKUP_TIMEOUT;
+    let deadline = Instant::now() + backup_timeout;
     loop {
         match backup.step(PAGES_PER_STEP)? {
             rusqlite::backup::StepResult::Done => break,
@@ -1874,6 +1884,7 @@ pub(super) fn sqlite_page_size_from_header(header: &[u8; 100]) -> u32 {
 mod tests {
     use graft::setup::setup_graft_temporary;
     use rusqlite::params;
+    use std::io::Write;
 
     use super::*;
 
@@ -1958,27 +1969,65 @@ mod tests {
     }
 
     #[test]
-    fn page_index_ignores_only_sqlite_volatile_header_counters() {
+    fn page_index_ignores_sqlite_volatile_header_fields() {
         let original = vec![0_u8; PAGESIZE.as_usize()];
-        let mut counters_changed = original.clone();
-        counters_changed[SQLITE_FILE_CHANGE_COUNTER_OFFSET..SQLITE_FILE_CHANGE_COUNTER_OFFSET + 4]
+        let mut header_changed = original.clone();
+        header_changed[SQLITE_FILE_CHANGE_COUNTER_OFFSET..SQLITE_FILE_CHANGE_COUNTER_OFFSET + 4]
             .copy_from_slice(&17_u32.to_be_bytes());
-        counters_changed[SQLITE_VERSION_VALID_FOR_OFFSET..SQLITE_VERSION_VALID_FOR_OFFSET + 4]
+        header_changed[SQLITE_VERSION_VALID_FOR_OFFSET..SQLITE_VERSION_VALID_FOR_OFFSET + 4]
             .copy_from_slice(&23_u32.to_be_bytes());
+        header_changed[SQLITE_LIBRARY_VERSION_OFFSET..SQLITE_LIBRARY_VERSION_OFFSET + 4]
+            .copy_from_slice(&3_053_001_u32.to_be_bytes());
 
-        assert!(sqlite_page_bytes_equal(1, &original, &counters_changed));
+        assert!(sqlite_page_bytes_equal(1, &original, &header_changed));
         assert_eq!(
             sqlite_page_chunk_hash(1, &original),
-            sqlite_page_chunk_hash(1, &counters_changed)
+            sqlite_page_chunk_hash(1, &header_changed)
         );
 
-        let mut content_changed = counters_changed;
+        let mut content_changed = header_changed;
         content_changed[40] = 1;
         assert!(!sqlite_page_bytes_equal(1, &original, &content_changed));
         assert_ne!(
             sqlite_page_chunk_hash(1, &original),
             sqlite_page_chunk_hash(1, &content_changed)
         );
+    }
+
+    #[test]
+    fn online_backup_library_version_change_does_not_dirty_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_path = temp.path().join("source.sqlite");
+        let snapshot_path = temp.path().join("snapshot.sqlite");
+        drop(create_database(&source_path, "delete"));
+
+        let mut source = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&source_path)
+            .unwrap();
+        source
+            .seek(SeekFrom::Start(SQLITE_LIBRARY_VERSION_OFFSET as u64))
+            .unwrap();
+        source.write_all(&1_u32.to_be_bytes()).unwrap();
+        source.sync_all().unwrap();
+        drop(source);
+
+        backup_sqlite_source_online(&source_path, &snapshot_path, Duration::from_secs(5)).unwrap();
+
+        let source = std::fs::read(&source_path).unwrap();
+        let snapshot = std::fs::read(&snapshot_path).unwrap();
+        assert_ne!(
+            &source[SQLITE_LIBRARY_VERSION_OFFSET
+                ..SQLITE_LIBRARY_VERSION_OFFSET + SQLITE_VOLATILE_HEADER_FIELD_BYTES],
+            &snapshot[SQLITE_LIBRARY_VERSION_OFFSET
+                ..SQLITE_LIBRARY_VERSION_OFFSET + SQLITE_VOLATILE_HEADER_FIELD_BYTES]
+        );
+        assert!(sqlite_page_bytes_equal(
+            1,
+            &source[..PAGESIZE.as_usize()],
+            &snapshot[..PAGESIZE.as_usize()]
+        ));
     }
 
     #[test]

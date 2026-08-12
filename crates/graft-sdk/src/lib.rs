@@ -13,7 +13,10 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-pub use graft::repo::{CancellationToken, RepoPathContent, RepoPathContentState};
+pub use graft::repo::{
+    CancellationToken, RepoPathContent, RepoPathContentState, TransferDirection, TransferProgress,
+    TransferProgressReporter,
+};
 use graft::repo::{
     CommitArtifactState, CommitFileState, MergeOutcome, MergePlan, RepoPathStorage, RepoStatus,
     RepoTrackedPathKind, Repository,
@@ -132,6 +135,14 @@ pub type Result<T> = std::result::Result<T, SdkError>;
 /// Installs a cancellation token for one synchronous SDK operation on the current worker thread.
 pub fn with_cancellation<T>(token: &CancellationToken, operation: impl FnOnce() -> T) -> T {
     graft::repo::with_cancellation(token, operation)
+}
+
+/// Installs transfer progress reporting for one synchronous SDK operation on the worker thread.
+pub fn with_transfer_progress<T>(
+    reporter: &TransferProgressReporter,
+    operation: impl FnOnce() -> T,
+) -> T {
+    graft::repo::with_transfer_progress(reporter, operation)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
