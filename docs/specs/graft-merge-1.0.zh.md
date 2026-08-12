@@ -54,8 +54,8 @@ Unborn branch 在允许时可 FF。若没有共同祖先，当前实现返回
 若存在多个不可比较的 best merge base，实现按“到两 head 的较大距离、距离和、
 object ID”依次取最小值，确定性选择一个；1.0 不合成 recursive merge base。
 
-当前 plan token 是精确 serialized immutable merge plan 的 BLAKE3，覆盖 revision/
-target、topology、checkout action、candidate index 与 outcome。它对 client opaque，
+当前 plan token 是精确 serialized immutable merge plan、effective policy token/version
+的 BLAKE3，覆盖 revision/target、topology、checkout action、candidate index 与 outcome。它对 client opaque，
 不是 repository credential 或 global nonce。Apply 在当前状态重新计算 plan 并比较。
 Malformed/mismatched/stale token 必须无副作用失败；unchanged up-to-date no-op 可能仍
 可重复使用，而 state-changing outcome 会因状态变化或 active record 自动失效。
@@ -111,7 +111,29 @@ hook。
 
 Candidate 在隔离 temp DB 构造；受控 replay 时关闭 FK/trigger side effect，排除
 generated/configured column，完成后执行 integrity 与 foreign-key check。验证失败
-不能替换 staged result/worktree，temp 成功失败都要清理。
+不能替换 staged result/worktree 或改变之前的 merge journal，temp 成功失败都要清理。
+Directory repository session 必须规划每个冲突 SQLite path；任何 unmerged path 都必须
+返回结构化 conflict、validation/analysis error、limitation 或明确可执行 action。
+
+同一行字段合并默认关闭。Policy version 1 显式启用 `same_row_merge` 后，update/update
+依据 Base 合并：变更列不重叠则组合，同列值相同则折叠，同列值不同则产生结构化 cell
+conflict；delete/update 仍是 conflict。`resolveMergeCell` 可安全选择字段 side，并继续使用
+state-token CAS、持久 journal、reopen/unresolve/abort 语义。
+
+Semantic key 会检测 insert/insert、insert/update、update/update 的 result collision。
+默认 `BINARY`，可显式配置 SQLite 内建 ASCII `NOCASE`。Conflict 返回双方物理 identity、
+展示用 semantic key 和 collation，不解释业务含义。
+
+Managed-column resolver 是有限集合：`ignore_for_conflict`、`max`、`min`、
+`max_timestamp`、`recompute`，不执行任意应用代码。`recompute` 省略该列、物化其余候选，
+并把 path 保持为待重算。应用完成重算后用 `stageMergeSqliteResult` 捕获精确 worktree
+snapshot，在 private temp DB 重跑 integrity/FK check 后才 stage。旧 `generated_columns`
+会归一化为 `recompute`。
+
+Typed SDK 提供 `getMergePolicy`、`validateMergePolicy`、`setMergePolicy`。每个 effective
+policy 都有稳定 `policy_token`；set 需要前一个 token。`planToken` 绑定 plan、policy token
+和 version。Three-way apply 把 policy/token/version 冻结进 journal，active merge 中必须先
+完成或 abort 才能改 policy 并 replan。
 
 ## 6. Durable merge state
 
@@ -120,12 +142,14 @@ Three-way apply 持久化：
 - `ORIG_HEAD` 中的 original local commit；
 - `MERGE_HEAD` 中的 target；
 - Base/Ours/Theirs/Normal index stage；
-- 可用时的 row selection/candidate state；
+- `merge-resolution-session.json` 中的原始 conflict stage、whole-path
+  resolution、冻结 policy/token/version、row/cell selection 与逐 path analysis state；
 - 可确定性重建 merge state token 的 status/index/resolution 输入。
 
 当前 state token 前缀为 `graft-merge-v1:`，hash 完整 repository status、index 与可选
-`row-conflict-resolutions.json`。状态不变时跨 close/reopen 稳定；index/status/row
-selection 变化后 token 改变。
+`merge-resolution-session.json`。状态不变时跨 close/reopen 稳定；index/status/path
+resolution/row selection/unresolve 变化后 token 改变。Journal 必须保留到成功
+`continueMerge` 或 `abortMerge`。
 
 Worktree 不是唯一记录。关闭进程和 SDK session 后重开必须恢复相同 unresolved count
 与 versions。Record 缺失/不一致必须作为可恢复 corruption 报告，不能把当前物理
@@ -138,7 +162,25 @@ unresolved count 与 can-continue。List API 按 path 确定排序并 bounded；
 merge path 最大 500、conflict 最大 1000。Result 必须说明 path、category、可用
 version 与 row/schema/opaque detail；截断要显式。
 
+Active merge 中 path 即使已收敛为 Normal/staged result，inspection 仍须返回原始
+conflict 记录以及当前 `status`/`resolution`，使客户端 reopen 后无需猜测 worktree
+bytes 即可重新展示 resolved SQLite table。
+
 `readMergeVersion` 精确读取 `base/ours/theirs/result`；absent side 不能替代。只读。
+
+`diffMergeSqlite(path, from, to, response)` 在 active merge 内比较两个不同的 immutable
+`base`、`ours` 或 `theirs` revision。即使 index 仍有 unresolved conflict 也必须可用；
+必须校验 merge state token、支持 cancellation 与 bounded response，且不得写 worktree、
+index、ref 或 merge journal。通用结果包含 table/row fact、schema entry（`name`、
+`entry_type`、`op`、新 SQL 与可用时的旧 SQL）、opaque change、analysis limitation 和明确
+logical status。Client 通过 Base→Ours 与 Base→Theirs 两次比较组成三方视图。
+
+若一侧与 Base 的物理字节不同，但受支持的 logical diff 为空，且无 schema/row conflict、
+opaque change 或 limitation，engine 可在不执行 SQL 的情况下把 file-level conflict 安全
+收敛到另一侧。Theirs 与 Base 逻辑等价时安全结果为 Ours，从而保留所有受支持的本地
+non-conflicting change，而不是盲选整个文件。对自动处理逻辑上线前已存在的 active merge，
+inspection 必须返回 `auto_resolvable = true` 与 `recommended_result = ours`；任何 opaque
+change 或 limitation 都禁止使用此等价规则。
 
 ## 8. Resolution
 
@@ -152,6 +194,12 @@ client-held token；它获取 repository coordination、重新读取当前 state
   invalid input、token/path mismatch 或写失败要保留原 conflict。
 - `resolveMergeRow` 对 eligible row conflict 选 ours/theirs，并持久化 selection、重建/
   更新 candidate、验证。全部 row resolved 且无 schema/opaque conflict 后 path 收敛。
+- `resolveMergeTable` 对一个 SQLite table 的所有可逐行解决 conflict 原子选择同一 side，
+  保留双方 non-conflicting change，只构造并 materialize 一个 candidate、只发布一个新
+  state；schema/opaque/semantic-key 必须在任何 mutation 前拒绝。之后可整体切换另一 side。
+- `unresolveMergePath` 从 active session journal 恢复原始 Base/Ours/Theirs stage 与 merge
+  worktree candidate，清该 path 的 row/whole-path selection；只允许同一 active merge，
+  stale token 不得产生副作用。
 
 Semantic-key、schema、opaque、malformed 或 unsupported conflict 不能 per-row resolve，
 必须明确要求 whole-path/manual result。
@@ -165,7 +213,7 @@ Resolution 是否写普通 SQLite worktree，以及 WAL/lock/sidecar/replacement
 conflict stage、所有 row/schema/
 opaque resolution 完成、candidate/payload 可用有效、`HEAD` 仍是 ours。它用精确
 staged result 创建两个 parent（ours first、theirs second）的 commit。Commit/ref
-成功后才能清 merge record。失败后必须是 recoverable active merge 或完整 commit，
+成功后才能清 merge record 与 resolution journal。失败后必须是 recoverable active merge 或完整 commit，
 不能 half-state。
 
 `abortMerge` 恢复记录的 original state，清 conflict/index row state，并在恢复成功

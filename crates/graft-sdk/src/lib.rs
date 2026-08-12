@@ -19,6 +19,7 @@ use graft::repo::{
     RepoTrackedPathKind, Repository,
     index::{Index, IndexEntry, IndexStage},
 };
+pub use graft::repo::{ManagedColumnResolver, MergeConfig, SemanticKeyCollation};
 use graft::{
     core::byte_unit::ByteUnit,
     remote::{RemoteConfig, RemoteCredentialErr, RemoteCredentials},
@@ -26,9 +27,11 @@ use graft::{
 use graft_sqlite::{
     error::ErrCtx,
     repo_service::{
-        RepositoryCommand, RepositoryCommandService,
+        RepositoryCommand, RepositoryCommandService, RepositoryMergePolicy as ServiceMergePolicy,
+        RepositoryResolveCellOptions as ServiceResolveCellOptions,
         RepositoryResolveOptions as ServiceResolveOptions,
         RepositoryResolveRow as ServiceResolveRow, RepositoryResolveSide as ServiceResolveSide,
+        RepositoryResolveTableOptions as ServiceResolveTableOptions,
     },
 };
 use parking_lot::Mutex;
@@ -343,13 +346,21 @@ pub enum RepositoryOperation {
     Pull,
     Clone,
     PlanMerge,
+    GetMergePolicy,
+    ValidateMergePolicy,
+    SetMergePolicy,
     ApplyMerge,
     GetMergeStatus,
     ListMergePaths,
     ListMergeConflicts,
     ReadMergeVersion,
+    DiffMergeSqlite,
     SetMergePathResult,
+    UnresolveMergePath,
     ResolveMergeRow,
+    ResolveMergeCell,
+    ResolveMergeTable,
+    StageMergeSqliteResult,
     WriteAndStageTextResult,
     ContinueMerge,
     AbortMerge,
@@ -366,7 +377,10 @@ impl RepositoryOperation {
                 | Self::Clone
                 | Self::ApplyMerge
                 | Self::SetMergePathResult
+                | Self::UnresolveMergePath
                 | Self::ResolveMergeRow
+                | Self::ResolveMergeCell
+                | Self::ResolveMergeTable
                 | Self::WriteAndStageTextResult
                 | Self::ContinueMerge
                 | Self::AbortMerge
@@ -388,6 +402,41 @@ pub struct ApplyMergeOptions {
     pub plan_token: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergePolicyDocument {
+    pub version: u32,
+    #[serde(flatten)]
+    pub config: MergeConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergePolicyResult {
+    pub policy: MergePolicyDocument,
+    pub policy_token: String,
+    pub active_merge: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergePolicyValidationIssue {
+    pub key: String,
+    pub value: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergePolicyValidationResult {
+    pub valid: bool,
+    pub policy: Option<MergePolicyDocument>,
+    pub policy_token: Option<String>,
+    pub errors: Vec<MergePolicyValidationIssue>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SetMergePolicyOptions {
+    pub policy: MergePolicyDocument,
+    pub expected_policy_token: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MergePlanKind {
@@ -405,6 +454,8 @@ pub struct MergePlanResult {
     pub staged_paths: Vec<String>,
     pub conflicted_paths: Vec<String>,
     pub plan_token: String,
+    pub policy_token: String,
+    pub policy_version: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -418,6 +469,8 @@ pub enum MergeStatus {
         staged_count: usize,
         unmerged_count: usize,
         state_token: String,
+        policy_token: String,
+        policy_version: u32,
     },
 }
 
@@ -492,12 +545,44 @@ pub enum MergeVersion {
     Result,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeSqliteVersion {
+    Base,
+    Ours,
+    Theirs,
+}
+
 #[derive(Debug, Clone)]
 pub struct ReadMergeVersionOptions {
     pub path: PathBuf,
     pub version: MergeVersion,
     pub max_bytes: u64,
     pub expected_state_token: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct DiffMergeSqliteOptions {
+    pub path: PathBuf,
+    pub from: MergeSqliteVersion,
+    pub to: MergeSqliteVersion,
+    pub response: SqliteDiffResponse,
+    pub expected_state_token: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergeSqliteDiffEndpoint {
+    pub version: MergeSqliteVersion,
+    pub revision: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergeSqliteDiffResult {
+    pub state_token: String,
+    pub path: String,
+    pub from: MergeSqliteDiffEndpoint,
+    pub to: MergeSqliteDiffEndpoint,
+    pub diff: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -540,6 +625,36 @@ pub struct ResolveMergeRowOptions {
     pub table: String,
     pub identity: Value,
     pub result: MergePathResult,
+    pub expected_state_token: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolveMergeCellOptions {
+    pub path: PathBuf,
+    pub table: String,
+    pub identity: Value,
+    pub column: String,
+    pub result: MergePathResult,
+    pub expected_state_token: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolveMergeTableOptions {
+    pub path: PathBuf,
+    pub table: String,
+    pub result: MergePathResult,
+    pub expected_state_token: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct UnresolveMergePathOptions {
+    pub path: PathBuf,
+    pub expected_state_token: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct StageMergeSqliteResultOptions {
+    pub path: PathBuf,
     pub expected_state_token: String,
 }
 
@@ -1322,7 +1437,12 @@ impl RepositorySession {
             graft::repo::cancellation_checkpoint().map_err(repo_error)?;
             let argument = sqlite_diff_argument(options, Path::new(&path))?;
             let mut diff = self.execute_json("json_diff", Some(&argument))?;
-            if options.staged_fallback && !options.staged {
+            if options.staged_fallback
+                && !options.staged
+                && options.root.is_none()
+                && options.from.is_none()
+                && options.to.is_none()
+            {
                 let mut staged_options = options.clone();
                 staged_options.staged = true;
                 staged_options.staged_fallback = false;
@@ -1803,6 +1923,97 @@ impl RepositorySession {
         self.execute_json_mutating("json_pull", argument.as_deref())
     }
 
+    /// Returns the effective merge policy and its stable compare-and-swap token.
+    pub fn get_merge_policy(&self) -> Result<MergePolicyResult> {
+        self.with_service(|service| {
+            merge_policy_result(service.merge_policy().map_err(repository_command_error)?)
+        })
+    }
+
+    /// Validates and normalizes a policy document without changing repository state.
+    pub fn validate_merge_policy(
+        &self,
+        policy: &MergePolicyDocument,
+    ) -> MergePolicyValidationResult {
+        if policy.version != graft::repo::MERGE_POLICY_VERSION {
+            return MergePolicyValidationResult {
+                valid: false,
+                policy: None,
+                policy_token: None,
+                errors: vec![MergePolicyValidationIssue {
+                    key: "version".to_string(),
+                    value: policy.version.to_string(),
+                    message: format!(
+                        "expected merge policy version {}",
+                        graft::repo::MERGE_POLICY_VERSION
+                    ),
+                }],
+            };
+        }
+        if let Err(error) = policy.config.validate() {
+            let issue = match error {
+                graft::repo::RepoErr::InvalidConfigValue { key, value, message } => {
+                    MergePolicyValidationIssue { key, value, message }
+                }
+                other => MergePolicyValidationIssue {
+                    key: "policy".to_string(),
+                    value: String::new(),
+                    message: other.to_string(),
+                },
+            };
+            return MergePolicyValidationResult {
+                valid: false,
+                policy: None,
+                policy_token: None,
+                errors: vec![issue],
+            };
+        }
+        let config = policy.config.effective();
+        let policy_token = config.policy_token();
+        MergePolicyValidationResult {
+            valid: true,
+            policy: Some(MergePolicyDocument {
+                version: graft::repo::MERGE_POLICY_VERSION,
+                config,
+            }),
+            policy_token: Some(policy_token),
+            errors: Vec::new(),
+        }
+    }
+
+    /// Replaces the merge policy under a policy-token CAS guard.
+    pub fn set_merge_policy(&self, options: &SetMergePolicyOptions) -> Result<MergePolicyResult> {
+        if options.expected_policy_token.trim().is_empty() {
+            return Err(invalid_argument("expected policy token must not be empty"));
+        }
+        let validation = self.validate_merge_policy(&options.policy);
+        let Some(policy) = validation.policy else {
+            let message = validation.errors.first().map_or_else(
+                || "invalid merge policy".to_string(),
+                |issue| format!("{}: {}", issue.key, issue.message),
+            );
+            return Err(invalid_argument(message));
+        };
+        self.with_service(|service| {
+            let observed = service.merge_policy().map_err(repository_command_error)?;
+            if observed.active_merge {
+                return Err(repository_stale_error(
+                    "merge policy is frozen during an active merge; abort or finish the merge first",
+                ));
+            }
+            if observed.token != options.expected_policy_token {
+                return Err(repository_stale_error(
+                    "merge policy changed; read the policy again",
+                ));
+            }
+            let repo = service.repository().map_err(repository_command_error)?;
+            let mut config = repo.config().map_err(repo_error)?;
+            config.merge = policy.config;
+            repo.write_config(&config).map_err(repo_error)?;
+            merge_policy_result(service.merge_policy().map_err(repository_command_error)?)
+        })
+    }
+
     /// Computes merge topology and path conflicts without changing refs, index, or worktree.
     pub fn plan_merge(&self, options: &PlanMergeOptions) -> Result<MergePlanResult> {
         validate_revision(&options.revision)?;
@@ -1810,12 +2021,13 @@ impl RepositorySession {
             validate_revision(expected_head)?;
         }
         self.with_service(|service| {
+            let policy = service.merge_policy().map_err(repository_command_error)?;
             let repo = service.repository().map_err(repository_command_error)?;
             ensure_expected_head(&repo, options.expected_head.as_deref())?;
             let plan = repo
                 .plan_merge_revision(&options.revision)
                 .map_err(repo_error)?;
-            merge_plan_result(&plan)
+            merge_plan_result(&plan, &policy.token, policy.version)
         })
     }
 
@@ -1831,12 +2043,13 @@ impl RepositorySession {
         self.with_state(|state| {
             let SessionState { service, status_cache } = state;
             let service = service.as_mut().ok_or_else(session_closed_error)?;
+            let policy = service.merge_policy().map_err(repository_command_error)?;
             let repo = service.repository().map_err(repository_command_error)?;
             ensure_expected_head(&repo, options.expected_head.as_deref())?;
             let plan = repo
                 .plan_merge_revision(&options.revision)
                 .map_err(repo_error)?;
-            let summary = merge_plan_result(&plan)?;
+            let summary = merge_plan_result(&plan, &policy.token, policy.version)?;
             if summary.plan_token != options.plan_token {
                 return Err(repository_stale_error(
                     "merge plan changed; plan the merge again",
@@ -1998,6 +2211,73 @@ impl RepositorySession {
         })
     }
 
+    /// Returns a bounded, read-only `SQLite` diff between two immutable active-merge versions.
+    pub fn diff_merge_sqlite(
+        &self,
+        options: &DiffMergeSqliteOptions,
+    ) -> Result<MergeSqliteDiffResult> {
+        if options.from == options.to {
+            return Err(invalid_argument(
+                "merge SQLite diff versions must be different",
+            ));
+        }
+        let path = normalize_requested_path(&options.path)?;
+        self.with_state(|state| {
+            let SessionState { service, status_cache } = state;
+            let service = service.as_mut().ok_or_else(session_closed_error)?;
+            let incremental =
+                require_merge_state_token(service, status_cache, &options.expected_state_token)?;
+            let repo = service.repository().map_err(repository_command_error)?;
+            let index = repo.read_index().map_err(repo_error)?;
+            let state_token = durable_merge_state_token(&repo, &incremental.status, &index)?;
+            let (orig_head, merge_head, merge_base) = active_merge_heads(&repo, &incremental)?;
+            let revision_for = |version: MergeSqliteVersion| -> Result<String> {
+                match version {
+                    MergeSqliteVersion::Base => merge_base.clone().ok_or_else(|| {
+                        SdkError::new(
+                            SdkErrorCode::RepositoryCommand,
+                            "active merge has no common base for SQLite inspection",
+                        )
+                    }),
+                    MergeSqliteVersion::Ours => Ok(orig_head.clone()),
+                    MergeSqliteVersion::Theirs => Ok(merge_head.clone()),
+                }
+            };
+            let from_revision = revision_for(options.from)?;
+            let to_revision = revision_for(options.to)?;
+            graft::repo::cancellation_checkpoint().map_err(repo_error)?;
+            let argument = sqlite_diff_argument(
+                &SqliteDiffPathsOptions {
+                    paths: vec![PathBuf::from(&path)],
+                    staged: false,
+                    staged_fallback: false,
+                    root: None,
+                    from: Some(from_revision.clone()),
+                    to: Some(to_revision.clone()),
+                    response: options.response.clone(),
+                    limit: 1,
+                    after: None,
+                },
+                Path::new(&path),
+            )?;
+            let diff = execute_json(service, "json_diff", Some(&argument))?;
+            graft::repo::cancellation_checkpoint().map_err(repo_error)?;
+            Ok(MergeSqliteDiffResult {
+                state_token,
+                path,
+                from: MergeSqliteDiffEndpoint {
+                    version: options.from,
+                    revision: from_revision,
+                },
+                to: MergeSqliteDiffEndpoint {
+                    version: options.to,
+                    revision: to_revision,
+                },
+                diff,
+            })
+        })
+    }
+
     /// Selects stage 2 or stage 3 for one conflicted path and collapses it to stage 0.
     pub fn set_merge_path_result(
         &self,
@@ -2037,6 +2317,143 @@ impl RepositorySession {
         )
     }
 
+    /// Selects ours or theirs for one structured `SQLite` cell conflict.
+    pub fn resolve_merge_cell(
+        &self,
+        options: &ResolveMergeCellOptions,
+    ) -> Result<MergeOperationResult> {
+        if options.table.trim().is_empty() || options.column.trim().is_empty() {
+            return Err(invalid_argument(
+                "merge cell table and column must not be empty",
+            ));
+        }
+        if !matches!(options.identity, Value::Number(_) | Value::Object(_)) {
+            return Err(invalid_argument(
+                "merge cell identity must be a JSON number or object",
+            ));
+        }
+        let path = normalize_requested_path(&options.path)?;
+        self.with_state(|state| {
+            let SessionState { service, status_cache } = state;
+            let service = service.as_mut().ok_or_else(session_closed_error)?;
+            require_merge_state_token(service, status_cache, &options.expected_state_token)?;
+            graft::repo::cancellation_checkpoint().map_err(repo_error)?;
+            let side = match options.result {
+                MergePathResult::Ours => ServiceResolveSide::Ours,
+                MergePathResult::Theirs => ServiceResolveSide::Theirs,
+            };
+            let resolved_path = service
+                .resolve_cell(ServiceResolveCellOptions {
+                    side,
+                    path: PathBuf::from(&path),
+                    table: options.table.clone(),
+                    identity: options.identity.clone(),
+                    column: options.column.clone(),
+                })
+                .map_err(repository_command_error)?;
+            status_cache.invalidate();
+            let incremental = refresh_incremental_status(service, status_cache)?;
+            let merge = merge_status_from_incremental(service, &incremental)?;
+            Ok(MergeOperationResult {
+                output: serde_json::json!({
+                    "operation": "resolve_merge_cell",
+                    "path": resolved_path,
+                    "table": options.table,
+                    "column": options.column,
+                    "resolution": match options.result {
+                        MergePathResult::Ours => "ours",
+                        MergePathResult::Theirs => "theirs",
+                    },
+                }),
+                merge,
+            })
+        })
+    }
+
+    /// Integrity-checks and stages the current `SQLite` worktree candidate.
+    pub fn stage_merge_sqlite_result(
+        &self,
+        options: &StageMergeSqliteResultOptions,
+    ) -> Result<MergeOperationResult> {
+        let path = normalize_requested_path(&options.path)?;
+        self.with_state(|state| {
+            let SessionState { service, status_cache } = state;
+            let service = service.as_mut().ok_or_else(session_closed_error)?;
+            require_merge_state_token(service, status_cache, &options.expected_state_token)?;
+            graft::repo::cancellation_checkpoint().map_err(repo_error)?;
+            let staged_path = service
+                .stage_worktree_sqlite_result(Path::new(&path))
+                .map_err(repository_command_error)?;
+            status_cache.invalidate();
+            let incremental = refresh_incremental_status(service, status_cache)?;
+            let merge = merge_status_from_incremental(service, &incremental)?;
+            Ok(MergeOperationResult {
+                output: serde_json::json!({
+                    "operation": "stage_merge_sqlite_result",
+                    "path": staged_path,
+                    "resolution": "edited",
+                    "integrity_check": "ok",
+                    "foreign_key_check": "ok",
+                }),
+                merge,
+            })
+        })
+    }
+
+    /// Atomically selects one side for every safely row-resolvable conflict in a `SQLite` table.
+    pub fn resolve_merge_table(
+        &self,
+        options: &ResolveMergeTableOptions,
+    ) -> Result<MergeOperationResult> {
+        if options.table.trim().is_empty() {
+            return Err(invalid_argument("merge table must not be empty"));
+        }
+        let path = normalize_requested_path(&options.path)?;
+        self.with_state(|state| {
+            let SessionState { service, status_cache } = state;
+            let service = service.as_mut().ok_or_else(session_closed_error)?;
+            require_merge_state_token(service, status_cache, &options.expected_state_token)?;
+            graft::repo::cancellation_checkpoint().map_err(repo_error)?;
+            let side = match options.result {
+                MergePathResult::Ours => ServiceResolveSide::Ours,
+                MergePathResult::Theirs => ServiceResolveSide::Theirs,
+            };
+            let command = RepositoryCommand::resolve_table(ServiceResolveTableOptions {
+                side,
+                path: PathBuf::from(&path),
+                table: options.table.clone(),
+            });
+            let output = execute_json_command(service, command, "resolve_merge_table")?;
+            status_cache.invalidate();
+            let incremental = refresh_incremental_status(service, status_cache)?;
+            let merge = merge_status_from_incremental(service, &incremental)?;
+            Ok(MergeOperationResult { output, merge })
+        })
+    }
+
+    /// Restores a resolved path to its original Base/Ours/Theirs merge stages and worktree state.
+    pub fn unresolve_merge_path(
+        &self,
+        options: &UnresolveMergePathOptions,
+    ) -> Result<MergeOperationResult> {
+        let path = normalize_requested_path(&options.path)?;
+        self.with_state(|state| {
+            let SessionState { service, status_cache } = state;
+            let service = service.as_mut().ok_or_else(session_closed_error)?;
+            require_merge_state_token(service, status_cache, &options.expected_state_token)?;
+            graft::repo::cancellation_checkpoint().map_err(repo_error)?;
+            let output = execute_json_command(
+                service,
+                RepositoryCommand::unresolve(PathBuf::from(&path)),
+                "unresolve_merge_path",
+            )?;
+            status_cache.invalidate();
+            let incremental = refresh_incremental_status(service, status_cache)?;
+            let merge = merge_status_from_incremental(service, &incremental)?;
+            Ok(MergeOperationResult { output, merge })
+        })
+    }
+
     /// Writes an edited UTF-8 result and stages it as the complete resolution for one text path.
     pub fn write_and_stage_text_result(
         &self,
@@ -2054,11 +2471,17 @@ impl RepositorySession {
             require_merge_state_token(service, status_cache, &options.expected_state_token)?;
             let repo = service.repository().map_err(repository_command_error)?;
             ensure_text_merge_conflict(&repo, &path)?;
+            graft::repo::cancellation_checkpoint().map_err(repo_error)?;
             let physical_path = repo.worktree().join(&path);
             write_merge_text_result(&repo, &physical_path, options.content.as_bytes())?;
             let entry = repo
                 .resolve_artifact_conflict_from_path(&physical_path)
                 .map_err(repo_error)?;
+            execute_json_command(
+                service,
+                RepositoryCommand::record_merge_path_resolution(PathBuf::from(&path), "edited"),
+                "record_merge_path_resolution",
+            )?;
             status_cache.invalidate();
             let incremental = refresh_incremental_status(service, status_cache)?;
             let merge = merge_status_from_incremental(service, &incremental)?;
@@ -2122,6 +2545,7 @@ impl RepositorySession {
             let SessionState { service, status_cache } = state;
             let service = service.as_mut().ok_or_else(session_closed_error)?;
             require_merge_state_token(service, status_cache, expected_state_token)?;
+            graft::repo::cancellation_checkpoint().map_err(repo_error)?;
             let side = match result {
                 MergePathResult::Ours => ServiceResolveSide::Ours,
                 MergePathResult::Theirs => ServiceResolveSide::Theirs,
@@ -3637,8 +4061,29 @@ fn ensure_expected_head(repo: &Repository, expected_head: Option<&str>) -> Resul
     Ok(())
 }
 
-fn merge_plan_result(plan: &MergePlan) -> Result<MergePlanResult> {
-    let encoded = serde_json::to_vec(plan).map_err(|error| {
+fn merge_policy_result(policy: ServiceMergePolicy) -> Result<MergePolicyResult> {
+    if policy.version != graft::repo::MERGE_POLICY_VERSION {
+        return Err(SdkError::new(
+            SdkErrorCode::InvalidResponse,
+            format!("unsupported merge policy version {}", policy.version),
+        ));
+    }
+    Ok(MergePolicyResult {
+        policy: MergePolicyDocument {
+            version: policy.version,
+            config: policy.policy,
+        },
+        policy_token: policy.token,
+        active_merge: policy.active_merge,
+    })
+}
+
+fn merge_plan_result(
+    plan: &MergePlan,
+    policy_token: &str,
+    policy_version: u32,
+) -> Result<MergePlanResult> {
+    let encoded = serde_json::to_vec(&(plan, policy_token, policy_version)).map_err(|error| {
         SdkError::new(
             SdkErrorCode::InvalidResponse,
             format!("failed to encode merge plan: {error}"),
@@ -3676,6 +4121,8 @@ fn merge_plan_result(plan: &MergePlan) -> Result<MergePlanResult> {
         staged_paths,
         conflicted_paths,
         plan_token,
+        policy_token: policy_token.to_string(),
+        policy_version,
     })
 }
 
@@ -3693,6 +4140,7 @@ fn merge_status_from_incremental(
         )
     })?;
     let repo = service.repository().map_err(repository_command_error)?;
+    let policy = service.merge_policy().map_err(repository_command_error)?;
     let merge_base = repo
         .merge_base_between(&orig_head, &merge_head)
         .map_err(repo_error)?;
@@ -3705,6 +4153,8 @@ fn merge_status_from_incremental(
         staged_count: incremental.status.counts.staged,
         unmerged_count: incremental.status.counts.conflicted,
         state_token,
+        policy_token: policy.token,
+        policy_version: policy.version,
     })
 }
 
@@ -3766,7 +4216,7 @@ fn durable_merge_state_token(
     hash_optional_file(
         &mut hasher,
         repo.graft_dir(),
-        &repo.graft_dir().join("row-conflict-resolutions.json"),
+        &repo.graft_dir().join("merge-resolution-session.json"),
     )?;
     Ok(format!("graft-merge-v1:{}", hasher.finalize().to_hex()))
 }
@@ -4160,7 +4610,10 @@ mod tests {
         assert!(RepositoryOperation::Clone.materializes_worktree());
         assert!(RepositoryOperation::ApplyMerge.materializes_worktree());
         assert!(RepositoryOperation::SetMergePathResult.materializes_worktree());
+        assert!(RepositoryOperation::UnresolveMergePath.materializes_worktree());
         assert!(RepositoryOperation::ResolveMergeRow.materializes_worktree());
+        assert!(RepositoryOperation::ResolveMergeCell.materializes_worktree());
+        assert!(RepositoryOperation::ResolveMergeTable.materializes_worktree());
         assert!(RepositoryOperation::WriteAndStageTextResult.materializes_worktree());
         assert!(RepositoryOperation::ContinueMerge.materializes_worktree());
         assert!(RepositoryOperation::AbortMerge.materializes_worktree());
@@ -4190,8 +4643,13 @@ mod tests {
         assert!(!RepositoryOperation::PlanMerge.materializes_worktree());
         assert!(!RepositoryOperation::GetMergeStatus.materializes_worktree());
         assert!(!RepositoryOperation::ListMergePaths.materializes_worktree());
+        assert!(!RepositoryOperation::GetMergePolicy.materializes_worktree());
+        assert!(!RepositoryOperation::ValidateMergePolicy.materializes_worktree());
+        assert!(!RepositoryOperation::SetMergePolicy.materializes_worktree());
+        assert!(!RepositoryOperation::StageMergeSqliteResult.materializes_worktree());
         assert!(!RepositoryOperation::ListMergeConflicts.materializes_worktree());
         assert!(!RepositoryOperation::ReadMergeVersion.materializes_worktree());
+        assert!(!RepositoryOperation::DiffMergeSqlite.materializes_worktree());
     }
 
     #[test]
@@ -4361,6 +4819,12 @@ mod tests {
             })
             .unwrap();
         assert_eq!(completed.merge, MergeStatus::None);
+        assert!(
+            !directory
+                .path()
+                .join(".graft/merge-resolution-session.json")
+                .exists()
+        );
         session.close().unwrap();
 
         let repo = Repository::open(directory.path()).unwrap();
@@ -4443,10 +4907,75 @@ mod tests {
             assert_eq!(paths.items.len(), 1);
             assert_eq!(paths.items[0].state, MergePathState::Resolved);
 
+            let resolved_conflicts = session
+                .list_merge_conflicts(&ListMergeConflictsOptions {
+                    path: PathBuf::from("note.txt"),
+                    limit: 10,
+                    after: None,
+                    expected_state_token: resolved_token.clone(),
+                })
+                .unwrap();
+            assert_eq!(resolved_conflicts.items.len(), 1);
+            assert_eq!(resolved_conflicts.items[0]["status"], "resolved");
+            assert_eq!(
+                resolved_conflicts.items[0]["resolution"],
+                match result {
+                    MergePathResult::Ours => "ours",
+                    MergePathResult::Theirs => "theirs",
+                }
+            );
+
+            let stale = session
+                .unresolve_merge_path(&UnresolveMergePathOptions {
+                    path: PathBuf::from("note.txt"),
+                    expected_state_token: state_token,
+                })
+                .unwrap_err();
+            assert_eq!(stale.code(), SdkErrorCode::RepositoryStale);
+            assert_eq!(fs::read_to_string(&note).unwrap(), expected);
+
+            let unresolved = session
+                .unresolve_merge_path(&UnresolveMergePathOptions {
+                    path: PathBuf::from("note.txt"),
+                    expected_state_token: resolved_token,
+                })
+                .unwrap();
+            let MergeStatus::Merging {
+                unmerged_count,
+                state_token: unresolved_token,
+                ..
+            } = unresolved.merge
+            else {
+                panic!("expected active merge after unresolve");
+            };
+            assert_eq!(unmerged_count, 1);
+            assert_eq!(fs::read_to_string(&note).unwrap(), "local\n");
+            let index = Repository::open(directory.path())
+                .unwrap()
+                .read_index()
+                .unwrap();
+            assert_eq!(index.conflicted_paths(), vec!["note.txt"]);
+            let conflicts = session
+                .list_merge_conflicts(&ListMergeConflictsOptions {
+                    path: PathBuf::from("note.txt"),
+                    limit: 10,
+                    after: None,
+                    expected_state_token: unresolved_token.clone(),
+                })
+                .unwrap();
+            assert_eq!(conflicts.items[0]["status"], "unresolved");
+            assert!(conflicts.items[0].get("resolution").is_none());
+
             session
-                .abort_merge(&AbortMergeOptions { expected_state_token: resolved_token })
+                .abort_merge(&AbortMergeOptions { expected_state_token: unresolved_token })
                 .unwrap();
             assert_eq!(fs::read_to_string(&note).unwrap(), "local\n");
+            assert!(
+                !directory
+                    .path()
+                    .join(".graft/merge-resolution-session.json")
+                    .exists()
+            );
             session.close().unwrap();
         }
     }
@@ -4470,7 +4999,9 @@ mod tests {
             database
                 .execute_batch(
                     "CREATE TABLE docs (id INTEGER PRIMARY KEY, value TEXT NOT NULL);\
-                     INSERT INTO docs VALUES (1, 'base-one'), (2, 'base-two');",
+                     INSERT INTO docs VALUES (1, 'base-one'), (2, 'base-two'), (3, 'base-three');\
+                     CREATE TABLE tasks (id INTEGER PRIMARY KEY, value TEXT NOT NULL);\
+                     INSERT INTO tasks VALUES (1, 'base-task'), (2, 'base-task-two');",
                 )
                 .unwrap();
         }
@@ -4520,7 +5051,9 @@ mod tests {
             database
                 .execute_batch(
                     "UPDATE docs SET value = 'hosted-one' WHERE id = 1;\
-                     UPDATE docs SET value = 'hosted-two' WHERE id = 2;",
+                     UPDATE docs SET value = 'hosted-two' WHERE id = 2;\
+                     UPDATE docs SET value = 'hosted-three' WHERE id = 3;\
+                     UPDATE tasks SET value = 'hosted-task' WHERE id = 1;",
                 )
                 .unwrap();
         }
@@ -4533,7 +5066,9 @@ mod tests {
             database
                 .execute_batch(
                     "UPDATE docs SET value = 'local-one' WHERE id = 1;\
-                     UPDATE docs SET value = 'local-two' WHERE id = 2;",
+                     UPDATE docs SET value = 'local-two' WHERE id = 2;\
+                     UPDATE tasks SET value = 'local-task' WHERE id = 1;\
+                     UPDATE tasks SET value = 'local-task-two' WHERE id = 2;",
                 )
                 .unwrap();
         }
@@ -4572,7 +5107,7 @@ mod tests {
                 expected_state_token: state_token.clone(),
             })
             .unwrap();
-        assert_eq!(conflicts.items.len(), 2);
+        assert_eq!(conflicts.items.len(), 3);
         assert!(conflicts.items.iter().all(|item| item["kind"] == "row"));
         assert!(
             conflicts
@@ -4580,6 +5115,34 @@ mod tests {
                 .iter()
                 .all(|item| item["status"] == "unresolved")
         );
+
+        let stale_table = clone
+            .resolve_merge_table(&ResolveMergeTableOptions {
+                path: PathBuf::from("space.eidos"),
+                table: "docs".to_string(),
+                result: MergePathResult::Ours,
+                expected_state_token: "stale".to_string(),
+            })
+            .unwrap_err();
+        assert_eq!(stale_table.code(), SdkErrorCode::RepositoryStale);
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let cancellation_error = with_cancellation(&cancelled, || {
+            clone.resolve_merge_table(&ResolveMergeTableOptions {
+                path: PathBuf::from("space.eidos"),
+                table: "docs".to_string(),
+                result: MergePathResult::Ours,
+                expected_state_token: state_token.clone(),
+            })
+        })
+        .unwrap_err();
+        assert_eq!(cancellation_error.code(), SdkErrorCode::Cancelled);
+        let MergeStatus::Merging { state_token: unchanged_token, .. } =
+            clone.get_merge_status().unwrap()
+        else {
+            panic!("expected unchanged active merge after cancellation");
+        };
+        assert_eq!(unchanged_token, state_token);
 
         let first = clone
             .resolve_merge_row(&ResolveMergeRowOptions {
@@ -4642,7 +5205,7 @@ mod tests {
         else {
             panic!("expected merge state until continue");
         };
-        assert_eq!(unmerged_count, 0);
+        assert_eq!(unmerged_count, 1);
         {
             let database = Connection::open(&clone_database).unwrap();
             let rows = database
@@ -4656,14 +5219,153 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 rows,
-                vec![(1, "local-one".to_string()), (2, "hosted-two".to_string())]
+                vec![
+                    (1, "local-one".to_string()),
+                    (2, "hosted-two".to_string()),
+                    (3, "hosted-three".to_string()),
+                ]
             );
+        }
+
+        let table_resolved = clone
+            .resolve_merge_table(&ResolveMergeTableOptions {
+                path: PathBuf::from("space.eidos"),
+                table: "tasks".to_string(),
+                result: MergePathResult::Theirs,
+                expected_state_token: resolved_token,
+            })
+            .unwrap();
+        let MergeStatus::Merging {
+            state_token: table_token, unmerged_count, ..
+        } = table_resolved.merge
+        else {
+            panic!("expected merge state after table resolution");
+        };
+        assert_eq!(unmerged_count, 0);
+
+        clone.close().unwrap();
+        clone.open().unwrap();
+        let MergeStatus::Merging { state_token: reopened_final_token, .. } =
+            clone.get_merge_status().unwrap()
+        else {
+            panic!("expected durable fully-resolved merge");
+        };
+        assert_eq!(reopened_final_token, table_token);
+        let resolved_conflicts = clone
+            .list_merge_conflicts(&ListMergeConflictsOptions {
+                path: PathBuf::from("space.eidos"),
+                limit: 10,
+                after: None,
+                expected_state_token: reopened_final_token.clone(),
+            })
+            .unwrap();
+        assert_eq!(resolved_conflicts.items.len(), 3);
+        assert!(
+            resolved_conflicts
+                .items
+                .iter()
+                .all(|item| item["status"] == "resolved")
+        );
+        assert_eq!(
+            resolved_conflicts
+                .items
+                .iter()
+                .find(|item| item["table"] == "tasks")
+                .unwrap()["resolution"],
+            "theirs"
+        );
+
+        let unresolved = clone
+            .unresolve_merge_path(&UnresolveMergePathOptions {
+                path: PathBuf::from("space.eidos"),
+                expected_state_token: reopened_final_token,
+            })
+            .unwrap();
+        let MergeStatus::Merging {
+            state_token: unresolved_token,
+            unmerged_count,
+            ..
+        } = unresolved.merge
+        else {
+            panic!("expected merge state after SQLite unresolve");
+        };
+        assert_eq!(unmerged_count, 1);
+        let reset_conflicts = clone
+            .list_merge_conflicts(&ListMergeConflictsOptions {
+                path: PathBuf::from("space.eidos"),
+                limit: 10,
+                after: None,
+                expected_state_token: unresolved_token.clone(),
+            })
+            .unwrap();
+        assert!(
+            reset_conflicts
+                .items
+                .iter()
+                .all(|item| item["status"] == "unresolved")
+        );
+
+        let docs_ours = clone
+            .resolve_merge_table(&ResolveMergeTableOptions {
+                path: PathBuf::from("space.eidos"),
+                table: "docs".to_string(),
+                result: MergePathResult::Ours,
+                expected_state_token: unresolved_token,
+            })
+            .unwrap();
+        let MergeStatus::Merging { state_token: docs_ours_token, .. } = docs_ours.merge else {
+            panic!("expected tasks conflict to remain");
+        };
+        let docs_theirs = clone
+            .resolve_merge_table(&ResolveMergeTableOptions {
+                path: PathBuf::from("space.eidos"),
+                table: "docs".to_string(),
+                result: MergePathResult::Theirs,
+                expected_state_token: docs_ours_token,
+            })
+            .unwrap();
+        let MergeStatus::Merging { state_token: docs_theirs_token, .. } = docs_theirs.merge else {
+            panic!("expected tasks conflict to remain after switching docs");
+        };
+        let tasks_ours = clone
+            .resolve_merge_table(&ResolveMergeTableOptions {
+                path: PathBuf::from("space.eidos"),
+                table: "tasks".to_string(),
+                result: MergePathResult::Ours,
+                expected_state_token: docs_theirs_token,
+            })
+            .unwrap();
+        let MergeStatus::Merging {
+            state_token: final_token, unmerged_count, ..
+        } = tasks_ours.merge
+        else {
+            panic!("expected active fully-resolved merge");
+        };
+        assert_eq!(unmerged_count, 0);
+        {
+            let database = Connection::open(&clone_database).unwrap();
+            let docs = database
+                .prepare("SELECT value FROM docs ORDER BY id")
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            let tasks = database
+                .prepare("SELECT value FROM tasks ORDER BY id")
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(docs, vec!["hosted-one", "hosted-two", "hosted-three"]);
+            assert_eq!(tasks, vec!["local-task", "local-task-two"]);
         }
 
         let completed = clone
             .continue_merge(&ContinueMergeOptions {
                 message: "merge selected rows".to_string(),
-                expected_state_token: resolved_token,
+                expected_state_token: final_token,
             })
             .unwrap();
         assert_eq!(completed.merge, MergeStatus::None);
@@ -4675,8 +5377,391 @@ mod tests {
                 .len(),
             2
         );
+        assert!(
+            !clone_directory
+                .join(".graft/merge-resolution-session.json")
+                .exists()
+        );
         clone.close().unwrap();
         source.close().unwrap();
+    }
+
+    #[test]
+    fn physical_only_sqlite_side_auto_resolves_to_ours_and_remains_inspectable() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("space.eidos");
+        {
+            let database = Connection::open(&database_path).unwrap();
+            database
+                .execute_batch(
+                    "CREATE TABLE docs (id INTEGER PRIMARY KEY, value TEXT NOT NULL);\
+                     WITH RECURSIVE seq(id) AS (VALUES(1) UNION ALL SELECT id + 1 FROM seq WHERE id < 1000)\
+                     INSERT INTO docs SELECT id, printf('%08d-%s', id, hex(zeroblob(512))) FROM seq;\
+                     DELETE FROM docs WHERE id % 2 = 0;",
+                )
+                .unwrap();
+        }
+
+        let session = RepositorySession::new(directory.path());
+        session.open().unwrap();
+        session.init().unwrap();
+        session.add_all().unwrap();
+        let base = session.commit("fragmented base").unwrap()["commit"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        session.close().unwrap();
+
+        let repo = Repository::open(directory.path()).unwrap();
+        repo.switch_new_branch("hosted", None).unwrap();
+        drop(repo);
+        {
+            let database = Connection::open(&database_path).unwrap();
+            database.execute_batch("VACUUM;").unwrap();
+        }
+        session.open().unwrap();
+        session.add_all().unwrap();
+        let theirs = session.commit("physical compaction").unwrap()["commit"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        session.close().unwrap();
+
+        let repo = Repository::open(directory.path()).unwrap();
+        repo.switch_branch("main").unwrap();
+        drop(repo);
+        {
+            let database = Connection::open(&database_path).unwrap();
+            database
+                .execute("UPDATE docs SET value = 'local' WHERE id = 1", [])
+                .unwrap();
+        }
+        session.open().unwrap();
+        session.add_all().unwrap();
+        let ours = session.commit("local row").unwrap()["commit"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let plan = session
+            .plan_merge(&PlanMergeOptions {
+                revision: theirs.clone(),
+                expected_head: Some(ours.clone()),
+            })
+            .unwrap();
+        assert_eq!(plan.merge_base.as_deref(), Some(base.as_str()));
+        assert_eq!(plan.conflicted_paths, vec!["space.eidos"]);
+        let applied = session
+            .apply_merge(&ApplyMergeOptions {
+                revision: theirs,
+                expected_head: Some(ours),
+                plan_token: plan.plan_token,
+            })
+            .unwrap();
+        let MergeStatus::Merging { unmerged_count, state_token, .. } = applied.merge else {
+            panic!("expected active merge");
+        };
+        assert_eq!(unmerged_count, 0);
+        assert_eq!(
+            Connection::open(&database_path)
+                .unwrap()
+                .query_row("SELECT value FROM docs WHERE id = 1", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            "local"
+        );
+
+        let unresolved = session
+            .unresolve_merge_path(&UnresolveMergePathOptions {
+                path: PathBuf::from("space.eidos"),
+                expected_state_token: state_token,
+            })
+            .unwrap();
+        let MergeStatus::Merging {
+            unmerged_count,
+            state_token: unresolved_token,
+            ..
+        } = unresolved.merge
+        else {
+            panic!("expected unresolved merge");
+        };
+        assert_eq!(unmerged_count, 1);
+        let conflicts = session
+            .list_merge_conflicts(&ListMergeConflictsOptions {
+                path: PathBuf::from("space.eidos"),
+                limit: 10,
+                after: None,
+                expected_state_token: unresolved_token.clone(),
+            })
+            .unwrap();
+        assert_eq!(conflicts.items.len(), 1);
+        assert_eq!(
+            conflicts.items[0]["reason"],
+            "theirs_logically_equivalent_to_base"
+        );
+        assert_eq!(conflicts.items[0]["auto_resolvable"], true);
+        assert_eq!(conflicts.items[0]["recommended_result"], "ours");
+
+        let diff = session
+            .diff_merge_sqlite(&DiffMergeSqliteOptions {
+                path: PathBuf::from("space.eidos"),
+                from: MergeSqliteVersion::Base,
+                to: MergeSqliteVersion::Theirs,
+                response: SqliteDiffResponse::Summary,
+                expected_state_token: unresolved_token.clone(),
+            })
+            .unwrap();
+        assert_eq!(diff.state_token, unresolved_token);
+        assert_eq!(diff.from.version, MergeSqliteVersion::Base);
+        assert_eq!(diff.to.version, MergeSqliteVersion::Theirs);
+        assert_eq!(
+            diff.diff["files"][0]["logical_status"],
+            "file_changed_no_supported_logical_changes"
+        );
+        assert!(diff.diff["files"][0].get("schema_changes").is_none());
+
+        let stale = session
+            .diff_merge_sqlite(&DiffMergeSqliteOptions {
+                path: PathBuf::from("space.eidos"),
+                from: MergeSqliteVersion::Base,
+                to: MergeSqliteVersion::Ours,
+                response: SqliteDiffResponse::Summary,
+                expected_state_token: "stale".to_string(),
+            })
+            .unwrap_err();
+        assert_eq!(stale.code(), SdkErrorCode::RepositoryStale);
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let error = with_cancellation(&cancelled, || {
+            session.diff_merge_sqlite(&DiffMergeSqliteOptions {
+                path: PathBuf::from("space.eidos"),
+                from: MergeSqliteVersion::Base,
+                to: MergeSqliteVersion::Ours,
+                response: SqliteDiffResponse::Summary,
+                expected_state_token: unresolved_token.clone(),
+            })
+        })
+        .unwrap_err();
+        assert_eq!(error.code(), SdkErrorCode::Cancelled);
+        let MergeStatus::Merging { state_token: unchanged, .. } =
+            session.get_merge_status().unwrap()
+        else {
+            panic!("expected unchanged merge");
+        };
+        assert_eq!(unchanged, unresolved_token);
+
+        session
+            .abort_merge(&AbortMergeOptions { expected_state_token: unresolved_token })
+            .unwrap();
+        session.close().unwrap();
+    }
+
+    #[test]
+    fn table_resolution_rejects_schema_opaque_and_semantic_key_conflicts_without_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let schema_database = directory.path().join("schema.eidos");
+        let opaque_database = directory.path().join("opaque.eidos");
+        let semantic_database = directory.path().join("semantic.eidos");
+        let rewrite = |path: &Path, sql: &str| {
+            for candidate in [
+                path.to_path_buf(),
+                PathBuf::from(format!("{}-wal", path.display())),
+                PathBuf::from(format!("{}-shm", path.display())),
+            ] {
+                let _ = fs::remove_file(candidate);
+            }
+            let database = Connection::open(path).unwrap();
+            database.execute_batch(sql).unwrap();
+        };
+
+        rewrite(
+            &schema_database,
+            "CREATE TABLE docs (id INTEGER PRIMARY KEY, value TEXT NOT NULL);",
+        );
+        rewrite(
+            &opaque_database,
+            "CREATE VIRTUAL TABLE search USING fts5(content);\
+             INSERT INTO search VALUES ('base');",
+        );
+        rewrite(
+            &semantic_database,
+            "CREATE TABLE docs (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, value TEXT NOT NULL);",
+        );
+
+        let session = RepositorySession::new(directory.path());
+        session.open().unwrap();
+        session.init().unwrap();
+        session.add_all().unwrap();
+        session.commit("base").unwrap();
+        session.close().unwrap();
+        let repo = Repository::open(directory.path()).unwrap();
+        repo.config_set("merge.semantic_keys.docs", "slug").unwrap();
+        repo.switch_new_branch("hosted", None).unwrap();
+        drop(repo);
+
+        rewrite(
+            &schema_database,
+            "CREATE TABLE docs (id INTEGER PRIMARY KEY, value TEXT NOT NULL, branch TEXT);",
+        );
+        rewrite(
+            &opaque_database,
+            "CREATE VIRTUAL TABLE search USING fts5(content);\
+             INSERT INTO search VALUES ('hosted');",
+        );
+        rewrite(
+            &semantic_database,
+            "CREATE TABLE docs (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, value TEXT NOT NULL);\
+             INSERT INTO docs VALUES (1, 'same', 'hosted');",
+        );
+        session.open().unwrap();
+        session.add_all().unwrap();
+        let hosted = session.commit("hosted conflicts").unwrap()["commit"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        session.close().unwrap();
+        let repo = Repository::open(directory.path()).unwrap();
+        repo.switch_branch("main").unwrap();
+        drop(repo);
+
+        rewrite(
+            &schema_database,
+            "CREATE TABLE docs (id INTEGER PRIMARY KEY, value TEXT NOT NULL, branch INTEGER);",
+        );
+        rewrite(
+            &opaque_database,
+            "CREATE VIRTUAL TABLE search USING fts5(content);\
+             INSERT INTO search VALUES ('local');",
+        );
+        rewrite(
+            &semantic_database,
+            "CREATE TABLE docs (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, value TEXT NOT NULL);\
+             INSERT INTO docs VALUES (2, 'same', 'local');",
+        );
+        session.open().unwrap();
+        session.add_all().unwrap();
+        let local = session.commit("local conflicts").unwrap()["commit"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let plan = session
+            .plan_merge(&PlanMergeOptions {
+                revision: hosted.clone(),
+                expected_head: Some(local.clone()),
+            })
+            .unwrap();
+        let applied = session
+            .apply_merge(&ApplyMergeOptions {
+                revision: hosted,
+                expected_head: Some(local),
+                plan_token: plan.plan_token,
+            })
+            .unwrap();
+        let MergeStatus::Merging { state_token, .. } = applied.merge else {
+            panic!("expected active merge");
+        };
+        let before = [
+            fs::read(&schema_database).unwrap(),
+            fs::read(&opaque_database).unwrap(),
+            fs::read(&semantic_database).unwrap(),
+        ];
+
+        let schema_conflicts = session
+            .list_merge_conflicts(&ListMergeConflictsOptions {
+                path: PathBuf::from("schema.eidos"),
+                limit: 10,
+                after: None,
+                expected_state_token: state_token.clone(),
+            })
+            .unwrap();
+        assert_eq!(schema_conflicts.items.len(), 1);
+        assert_eq!(schema_conflicts.items[0]["kind"], "schema");
+        assert_eq!(schema_conflicts.items[0]["name"], "docs");
+        assert_eq!(schema_conflicts.items[0]["entry_type"], "table");
+        assert_eq!(schema_conflicts.items[0]["ours_op"], "modified");
+        assert_eq!(schema_conflicts.items[0]["theirs_op"], "modified");
+        assert!(
+            !schema_conflicts.items[0]["column_changes"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+
+        let schema_diff = session
+            .diff_merge_sqlite(&DiffMergeSqliteOptions {
+                path: PathBuf::from("schema.eidos"),
+                from: MergeSqliteVersion::Base,
+                to: MergeSqliteVersion::Ours,
+                response: SqliteDiffResponse::Summary,
+                expected_state_token: state_token.clone(),
+            })
+            .unwrap();
+        assert_eq!(schema_diff.state_token, state_token);
+        assert_eq!(
+            schema_diff.diff["files"][0]["schema_changes"][0]["name"],
+            "docs"
+        );
+        assert_eq!(
+            schema_diff.diff["files"][0]["schema_changes"][0]["entry_type"],
+            "table"
+        );
+        assert_eq!(
+            schema_diff.diff["files"][0]["schema_changes"][0]["op"],
+            "modified"
+        );
+        assert!(
+            schema_diff.diff["files"][0]["schema_changes"][0]["sql"]
+                .as_str()
+                .unwrap()
+                .contains("branch INTEGER")
+        );
+
+        for (path, table, expected_message) in [
+            ("schema.eidos", "docs", "schema conflicts"),
+            ("opaque.eidos", "search", "opaque conflicts"),
+            ("semantic.eidos", "docs", "semantic key conflict"),
+        ] {
+            let error = session
+                .resolve_merge_table(&ResolveMergeTableOptions {
+                    path: PathBuf::from(path),
+                    table: table.to_string(),
+                    result: MergePathResult::Ours,
+                    expected_state_token: state_token.clone(),
+                })
+                .unwrap_err();
+            assert_eq!(error.code(), SdkErrorCode::RepositoryCommand);
+            assert!(
+                error.message().contains(expected_message),
+                "{}",
+                error.message()
+            );
+            let MergeStatus::Merging { state_token: unchanged, .. } =
+                session.get_merge_status().unwrap()
+            else {
+                panic!("expected rejected table resolution to preserve merge");
+            };
+            assert_eq!(unchanged, state_token);
+        }
+        assert_eq!(
+            before,
+            [
+                fs::read(&schema_database).unwrap(),
+                fs::read(&opaque_database).unwrap(),
+                fs::read(&semantic_database).unwrap(),
+            ]
+        );
+
+        session
+            .abort_merge(&AbortMergeOptions { expected_state_token: state_token })
+            .unwrap();
+        assert!(
+            !directory
+                .path()
+                .join(".graft/merge-resolution-session.json")
+                .exists()
+        );
+        session.close().unwrap();
     }
 
     #[test]
@@ -5933,6 +7018,1154 @@ mod tests {
                 .unwrap(),
             "three"
         );
+    }
+
+    #[test]
+    fn merge_policy_is_typed_cas_bound_to_plans_and_frozen_during_merge() {
+        let directory = tempfile::tempdir().unwrap();
+        let note = directory.path().join("note.txt");
+        let session = RepositorySession::new(directory.path());
+        session.open().unwrap();
+        session.init().unwrap();
+        fs::write(&note, "base\n").unwrap();
+        session.add_all().unwrap();
+        session.commit("base").unwrap();
+
+        let initial = session.get_merge_policy().unwrap();
+        assert_eq!(initial.policy.version, graft::repo::MERGE_POLICY_VERSION);
+        assert!(!initial.active_merge);
+        let invalid = session.validate_merge_policy(&MergePolicyDocument {
+            version: 999,
+            config: MergeConfig::default(),
+        });
+        assert!(!invalid.valid);
+        assert_eq!(invalid.errors[0].key, "version");
+
+        let enabled = MergeConfig {
+            same_row_merge: true,
+            ..Default::default()
+        };
+        let enabled = session
+            .set_merge_policy(&SetMergePolicyOptions {
+                policy: MergePolicyDocument { version: 1, config: enabled },
+                expected_policy_token: initial.policy_token.clone(),
+            })
+            .unwrap();
+        assert_ne!(enabled.policy_token, initial.policy_token);
+        let stale = session
+            .set_merge_policy(&SetMergePolicyOptions {
+                policy: MergePolicyDocument {
+                    version: 1,
+                    config: MergeConfig::default(),
+                },
+                expected_policy_token: initial.policy_token,
+            })
+            .unwrap_err();
+        assert_eq!(stale.code(), SdkErrorCode::RepositoryStale);
+
+        session.close().unwrap();
+        let repo = Repository::open(directory.path()).unwrap();
+        repo.switch_new_branch("hosted", None).unwrap();
+        fs::write(&note, "hosted\n").unwrap();
+        repo.stage_artifact_path(&note).unwrap();
+        let hosted = repo.commit_staged("hosted").unwrap();
+        repo.switch_branch("main").unwrap();
+        fs::write(&note, "local\n").unwrap();
+        repo.stage_artifact_path(&note).unwrap();
+        let local = repo.commit_staged("local").unwrap();
+        drop(repo);
+        session.open().unwrap();
+
+        let stale_plan = session
+            .plan_merge(&PlanMergeOptions {
+                revision: hosted.id.clone(),
+                expected_head: Some(local.id.clone()),
+            })
+            .unwrap();
+        assert_eq!(stale_plan.policy_token, enabled.policy_token);
+        let changed = session
+            .set_merge_policy(&SetMergePolicyOptions {
+                policy: MergePolicyDocument {
+                    version: 1,
+                    config: MergeConfig::default(),
+                },
+                expected_policy_token: enabled.policy_token,
+            })
+            .unwrap();
+        let error = session
+            .apply_merge(&ApplyMergeOptions {
+                revision: hosted.id.clone(),
+                expected_head: Some(local.id.clone()),
+                plan_token: stale_plan.plan_token,
+            })
+            .unwrap_err();
+        assert_eq!(error.code(), SdkErrorCode::RepositoryStale);
+
+        let plan = session
+            .plan_merge(&PlanMergeOptions {
+                revision: hosted.id.clone(),
+                expected_head: Some(local.id.clone()),
+            })
+            .unwrap();
+        assert_eq!(plan.policy_token, changed.policy_token);
+        let applied = session
+            .apply_merge(&ApplyMergeOptions {
+                revision: hosted.id,
+                expected_head: Some(local.id),
+                plan_token: plan.plan_token,
+            })
+            .unwrap();
+        let MergeStatus::Merging {
+            state_token,
+            policy_token,
+            policy_version,
+            ..
+        } = applied.merge
+        else {
+            panic!("expected active merge");
+        };
+        assert_eq!(policy_token, changed.policy_token);
+        assert_eq!(policy_version, 1);
+        let frozen = session.get_merge_policy().unwrap();
+        assert!(frozen.active_merge);
+        assert_eq!(frozen.policy_token, policy_token);
+        let error = session
+            .set_merge_policy(&SetMergePolicyOptions {
+                policy: frozen.policy,
+                expected_policy_token: policy_token,
+            })
+            .unwrap_err();
+        assert_eq!(error.code(), SdkErrorCode::RepositoryStale);
+        session
+            .abort_merge(&AbortMergeOptions { expected_state_token: state_token })
+            .unwrap();
+        session.close().unwrap();
+    }
+
+    #[test]
+    fn directory_session_auto_materializes_every_conflict_free_sqlite_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = [
+            directory.path().join("one.eidos"),
+            directory.path().join("two.db"),
+        ];
+        let rewrite = |path: &Path, first: &str, second: &str| {
+            for candidate in [
+                path.to_path_buf(),
+                PathBuf::from(format!("{}-wal", path.display())),
+                PathBuf::from(format!("{}-shm", path.display())),
+            ] {
+                let _ = fs::remove_file(candidate);
+            }
+            let database = Connection::open(path).unwrap();
+            database
+                .execute_batch(&format!(
+                    "CREATE TABLE docs (id INTEGER PRIMARY KEY, value TEXT NOT NULL);\
+                     INSERT INTO docs VALUES (1, '{first}'), (2, '{second}');"
+                ))
+                .unwrap();
+        };
+        for path in &paths {
+            rewrite(path, "base-one", "base-two");
+        }
+
+        let session = RepositorySession::new(directory.path());
+        session.open().unwrap();
+        session.init().unwrap();
+        session.add_all().unwrap();
+        session.commit("base").unwrap();
+        session.close().unwrap();
+
+        let repo = Repository::open(directory.path()).unwrap();
+        repo.switch_new_branch("hosted", None).unwrap();
+        drop(repo);
+        for path in &paths {
+            let database = Connection::open(path).unwrap();
+            database
+                .execute("UPDATE docs SET value = 'hosted-two' WHERE id = 2", [])
+                .unwrap();
+        }
+        session.open().unwrap();
+        session.add_all().unwrap();
+        let hosted = session.commit("hosted rows").unwrap()["commit"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        session.close().unwrap();
+
+        let repo = Repository::open(directory.path()).unwrap();
+        repo.switch_branch("main").unwrap();
+        drop(repo);
+        for path in &paths {
+            rewrite(path, "local-one", "base-two");
+        }
+        session.open().unwrap();
+        session.add_all().unwrap();
+        let local = session.commit("local rows").unwrap()["commit"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let plan = session
+            .plan_merge(&PlanMergeOptions {
+                revision: hosted.clone(),
+                expected_head: Some(local.clone()),
+            })
+            .unwrap();
+        assert_eq!(plan.conflicted_paths, vec!["one.eidos", "two.db"]);
+        let applied = session
+            .apply_merge(&ApplyMergeOptions {
+                revision: hosted,
+                expected_head: Some(local),
+                plan_token: plan.plan_token,
+            })
+            .unwrap();
+        let MergeStatus::Merging { unmerged_count, state_token, .. } = applied.merge else {
+            panic!("expected active merge");
+        };
+        assert_eq!(unmerged_count, 0);
+        for path in &paths {
+            let database = Connection::open(path).unwrap();
+            let rows = database
+                .prepare("SELECT value FROM docs ORDER BY id")
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(rows, vec!["local-one", "hosted-two"]);
+        }
+        session
+            .abort_merge(&AbortMergeOptions { expected_state_token: state_token })
+            .unwrap();
+        session.close().unwrap();
+    }
+
+    #[test]
+    fn explicit_same_row_policy_combines_fields_resolves_cells_and_requires_recompute_validation() {
+        let directory = tempfile::tempdir().unwrap();
+        let disjoint = directory.path().join("disjoint.db");
+        let equal = directory.path().join("equal.db");
+        let cell = directory.path().join("cell.db");
+        let managed = directory.path().join("managed.db");
+        let derived = directory.path().join("derived.db");
+        for path in [&disjoint, &equal, &cell] {
+            let database = Connection::open(path).unwrap();
+            database
+                .execute_batch(
+                    "CREATE TABLE records (id INTEGER PRIMARY KEY, a TEXT NOT NULL, b TEXT NOT NULL);\
+                     INSERT INTO records VALUES (1, 'base-a', 'base-b');",
+                )
+                .unwrap();
+        }
+        {
+            let database = Connection::open(&managed).unwrap();
+            database
+                .execute_batch(
+                    "CREATE TABLE records (id INTEGER PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL);\
+                     INSERT INTO records VALUES (1, 'base', 0);",
+                )
+                .unwrap();
+        }
+        {
+            let database = Connection::open(&derived).unwrap();
+            database
+                .execute_batch(
+                    "CREATE TABLE records (id INTEGER PRIMARY KEY, left_value TEXT NOT NULL, right_value TEXT NOT NULL, derived TEXT NOT NULL);\
+                     INSERT INTO records VALUES (1, 'base-left', 'base-right', 'base-derived');",
+                )
+                .unwrap();
+        }
+
+        let session = RepositorySession::new(directory.path());
+        session.open().unwrap();
+        session.init().unwrap();
+        session.add_all().unwrap();
+        session.commit("base").unwrap();
+        let initial_policy = session.get_merge_policy().unwrap();
+        let mut policy = MergeConfig {
+            same_row_merge: true,
+            ..Default::default()
+        };
+        policy.column_resolvers.insert(
+            "records".to_string(),
+            BTreeMap::from([
+                (
+                    "updated_at".to_string(),
+                    ManagedColumnResolver::MaxTimestamp,
+                ),
+                ("derived".to_string(), ManagedColumnResolver::Recompute),
+            ]),
+        );
+        session
+            .set_merge_policy(&SetMergePolicyOptions {
+                policy: MergePolicyDocument { version: 1, config: policy },
+                expected_policy_token: initial_policy.policy_token,
+            })
+            .unwrap();
+        session.close().unwrap();
+
+        let repo = Repository::open(directory.path()).unwrap();
+        repo.switch_new_branch("hosted", None).unwrap();
+        drop(repo);
+        Connection::open(&disjoint)
+            .unwrap()
+            .execute("UPDATE records SET b = 'hosted-b' WHERE id = 1", [])
+            .unwrap();
+        Connection::open(&cell)
+            .unwrap()
+            .execute("UPDATE records SET a = 'hosted-a' WHERE id = 1", [])
+            .unwrap();
+        Connection::open(&equal)
+            .unwrap()
+            .execute("UPDATE records SET a = 'shared-a' WHERE id = 1", [])
+            .unwrap();
+        Connection::open(&managed)
+            .unwrap()
+            .execute(
+                "UPDATE records SET value = 'hosted', updated_at = 20 WHERE id = 1",
+                [],
+            )
+            .unwrap();
+        Connection::open(&derived)
+            .unwrap()
+            .execute(
+                "UPDATE records SET right_value = 'hosted-right' WHERE id = 1",
+                [],
+            )
+            .unwrap();
+        session.open().unwrap();
+        session.add_all().unwrap();
+        let hosted = session.commit("hosted").unwrap()["commit"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        session.close().unwrap();
+
+        let repo = Repository::open(directory.path()).unwrap();
+        repo.switch_branch("main").unwrap();
+        drop(repo);
+        Connection::open(&disjoint)
+            .unwrap()
+            .execute(
+                "UPDATE records SET a = 'local-a', b = 'base-b' WHERE id = 1",
+                [],
+            )
+            .unwrap();
+        Connection::open(&cell)
+            .unwrap()
+            .execute(
+                "UPDATE records SET a = 'local-a', b = 'base-b' WHERE id = 1",
+                [],
+            )
+            .unwrap();
+        Connection::open(&equal)
+            .unwrap()
+            .execute("UPDATE records SET a = 'shared-a' WHERE id = 1", [])
+            .unwrap();
+        Connection::open(&managed)
+            .unwrap()
+            .execute(
+                "UPDATE records SET value = 'base', updated_at = 10 WHERE id = 1",
+                [],
+            )
+            .unwrap();
+        Connection::open(&derived)
+            .unwrap()
+            .execute(
+                "UPDATE records SET left_value = 'local-left', right_value = 'base-right', derived = 'base-derived' WHERE id = 1",
+                [],
+            )
+            .unwrap();
+        session.open().unwrap();
+        session.add_all().unwrap();
+        let local = session.commit("local").unwrap()["commit"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let plan = session
+            .plan_merge(&PlanMergeOptions {
+                revision: hosted.clone(),
+                expected_head: Some(local.clone()),
+            })
+            .unwrap();
+        let applied = session
+            .apply_merge(&ApplyMergeOptions {
+                revision: hosted,
+                expected_head: Some(local),
+                plan_token: plan.plan_token,
+            })
+            .unwrap();
+        let MergeStatus::Merging { unmerged_count, state_token, .. } = applied.merge else {
+            panic!("expected active merge");
+        };
+        assert_eq!(unmerged_count, 2);
+
+        assert_eq!(
+            Connection::open(&disjoint)
+                .unwrap()
+                .query_row("SELECT a || ':' || b FROM records", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            "local-a:hosted-b"
+        );
+        assert_eq!(
+            Connection::open(&managed)
+                .unwrap()
+                .query_row(
+                    "SELECT value || ':' || updated_at FROM records",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "hosted:20"
+        );
+        assert_eq!(
+            Connection::open(&equal)
+                .unwrap()
+                .query_row("SELECT a FROM records", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "shared-a"
+        );
+        assert_eq!(
+            Connection::open(&derived)
+                .unwrap()
+                .query_row(
+                    "SELECT left_value || ':' || right_value || ':' || derived FROM records",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "local-left:hosted-right:base-derived"
+        );
+
+        let cell_conflicts = session
+            .list_merge_conflicts(&ListMergeConflictsOptions {
+                path: PathBuf::from("cell.db"),
+                limit: 10,
+                after: None,
+                expected_state_token: state_token.clone(),
+            })
+            .unwrap();
+        assert_eq!(cell_conflicts.items.len(), 1);
+        assert_eq!(cell_conflicts.items[0]["reason"], "cell_conflict");
+        assert_eq!(cell_conflicts.items[0]["cells"][0]["column"], "a");
+        assert_eq!(cell_conflicts.items[0]["cells"][0]["base"], "base-a");
+        assert_eq!(cell_conflicts.items[0]["cells"][0]["ours"], "local-a");
+        assert_eq!(cell_conflicts.items[0]["cells"][0]["theirs"], "hosted-a");
+        let recompute = session
+            .list_merge_conflicts(&ListMergeConflictsOptions {
+                path: PathBuf::from("derived.db"),
+                limit: 10,
+                after: None,
+                expected_state_token: state_token.clone(),
+            })
+            .unwrap();
+        assert_eq!(recompute.items.len(), 1);
+        assert_eq!(recompute.items[0]["kind"], "validation");
+        assert_eq!(recompute.items[0]["reason"], "recompute_required");
+        assert_eq!(recompute.items[0]["columns"], json!(["derived"]));
+        assert_eq!(
+            recompute.items[0]["recommended_action"],
+            "stage_worktree_result"
+        );
+
+        let stale = session
+            .resolve_merge_cell(&ResolveMergeCellOptions {
+                path: PathBuf::from("cell.db"),
+                table: "records".to_string(),
+                identity: json!(1),
+                column: "a".to_string(),
+                result: MergePathResult::Ours,
+                expected_state_token: "stale".to_string(),
+            })
+            .unwrap_err();
+        assert_eq!(stale.code(), SdkErrorCode::RepositoryStale);
+        let resolved = session
+            .resolve_merge_cell(&ResolveMergeCellOptions {
+                path: PathBuf::from("cell.db"),
+                table: "records".to_string(),
+                identity: json!(1),
+                column: "a".to_string(),
+                result: MergePathResult::Ours,
+                expected_state_token: state_token,
+            })
+            .unwrap();
+        let MergeStatus::Merging {
+            unmerged_count, state_token: cell_token, ..
+        } = resolved.merge
+        else {
+            panic!("expected recompute validation to remain");
+        };
+        assert_eq!(unmerged_count, 1);
+        assert_eq!(
+            Connection::open(&cell)
+                .unwrap()
+                .query_row("SELECT a FROM records", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "local-a"
+        );
+
+        session.close().unwrap();
+        session.open().unwrap();
+        let MergeStatus::Merging { state_token: reopened, .. } =
+            session.get_merge_status().unwrap()
+        else {
+            panic!("expected durable cell resolution");
+        };
+        assert_eq!(reopened, cell_token);
+        let repeated = session
+            .resolve_merge_cell(&ResolveMergeCellOptions {
+                path: PathBuf::from("cell.db"),
+                table: "records".to_string(),
+                identity: json!(1),
+                column: "a".to_string(),
+                result: MergePathResult::Ours,
+                expected_state_token: reopened,
+            })
+            .unwrap();
+        let MergeStatus::Merging { state_token: repeated_token, .. } = repeated.merge else {
+            panic!("expected active merge");
+        };
+        assert_eq!(repeated_token, cell_token);
+
+        Connection::open(&derived)
+            .unwrap()
+            .execute(
+                "UPDATE records SET derived = left_value || '|' || right_value WHERE id = 1",
+                [],
+            )
+            .unwrap();
+        let staged = session
+            .stage_merge_sqlite_result(&StageMergeSqliteResultOptions {
+                path: PathBuf::from("derived.db"),
+                expected_state_token: repeated_token,
+            })
+            .unwrap();
+        let MergeStatus::Merging {
+            unmerged_count, state_token: final_token, ..
+        } = staged.merge
+        else {
+            panic!("expected active fully resolved merge");
+        };
+        assert_eq!(unmerged_count, 0);
+        assert_eq!(
+            Connection::open(&derived)
+                .unwrap()
+                .query_row("SELECT derived FROM records", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            "local-left|hosted-right"
+        );
+
+        session
+            .abort_merge(&AbortMergeOptions { expected_state_token: final_token })
+            .unwrap();
+        assert_eq!(
+            Connection::open(&disjoint)
+                .unwrap()
+                .query_row("SELECT a || ':' || b FROM records", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            "local-a:base-b"
+        );
+        assert_eq!(
+            Connection::open(&equal)
+                .unwrap()
+                .query_row("SELECT a FROM records", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "shared-a"
+        );
+        session.close().unwrap();
+    }
+
+    #[test]
+    fn semantic_key_nocase_reports_insert_update_and_update_update_collisions() {
+        let directory = tempfile::tempdir().unwrap();
+        let insert_update = directory.path().join("insert-update.db");
+        let update_update = directory.path().join("update-update.db");
+        for path in [&insert_update, &update_update] {
+            let database = Connection::open(path).unwrap();
+            database
+                .execute_batch(
+                    "CREATE TABLE docs (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, value TEXT NOT NULL);\
+                     INSERT INTO docs VALUES (1, 'alpha', 'one'), (2, 'beta', 'two');",
+                )
+                .unwrap();
+        }
+
+        let session = RepositorySession::new(directory.path());
+        session.open().unwrap();
+        session.init().unwrap();
+        session.add_all().unwrap();
+        session.commit("base").unwrap();
+        let initial = session.get_merge_policy().unwrap();
+        let mut policy = MergeConfig::default();
+        policy
+            .semantic_keys
+            .insert("docs".to_string(), vec!["slug".to_string()]);
+        policy.semantic_key_collations.insert(
+            "docs".to_string(),
+            BTreeMap::from([("slug".to_string(), SemanticKeyCollation::NoCase)]),
+        );
+        session
+            .set_merge_policy(&SetMergePolicyOptions {
+                policy: MergePolicyDocument { version: 1, config: policy },
+                expected_policy_token: initial.policy_token,
+            })
+            .unwrap();
+        session.close().unwrap();
+
+        let repo = Repository::open(directory.path()).unwrap();
+        repo.switch_new_branch("hosted", None).unwrap();
+        drop(repo);
+        Connection::open(&insert_update)
+            .unwrap()
+            .execute(
+                "UPDATE docs SET slug = 'GAMMA', value = 'hosted-update' WHERE id = 1",
+                [],
+            )
+            .unwrap();
+        Connection::open(&update_update)
+            .unwrap()
+            .execute(
+                "UPDATE docs SET slug = 'SHARED', value = 'hosted-update' WHERE id = 1",
+                [],
+            )
+            .unwrap();
+        session.open().unwrap();
+        session.add_all().unwrap();
+        let hosted = session.commit("hosted").unwrap()["commit"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        session.close().unwrap();
+
+        let repo = Repository::open(directory.path()).unwrap();
+        repo.switch_branch("main").unwrap();
+        drop(repo);
+        {
+            let database = Connection::open(&insert_update).unwrap();
+            database
+                .execute_batch(
+                    "UPDATE docs SET slug = 'alpha', value = 'one' WHERE id = 1;\
+                     INSERT INTO docs VALUES (3, 'gamma', 'local-insert');",
+                )
+                .unwrap();
+        }
+        {
+            let database = Connection::open(&update_update).unwrap();
+            database
+                .execute_batch(
+                    "UPDATE docs SET slug = 'alpha', value = 'one' WHERE id = 1;\
+                     UPDATE docs SET slug = 'shared', value = 'local-update' WHERE id = 2;",
+                )
+                .unwrap();
+        }
+        session.open().unwrap();
+        session.add_all().unwrap();
+        let local = session.commit("local").unwrap()["commit"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let plan = session
+            .plan_merge(&PlanMergeOptions {
+                revision: hosted.clone(),
+                expected_head: Some(local.clone()),
+            })
+            .unwrap();
+        let applied = session
+            .apply_merge(&ApplyMergeOptions {
+                revision: hosted,
+                expected_head: Some(local),
+                plan_token: plan.plan_token,
+            })
+            .unwrap();
+        let MergeStatus::Merging { state_token, .. } = applied.merge else {
+            panic!("expected semantic conflicts");
+        };
+
+        for (path, expected_ours, expected_theirs, expected_ops) in [
+            ("insert-update.db", 3, 1, ("insert", "update")),
+            ("update-update.db", 2, 1, ("update", "update")),
+        ] {
+            let conflicts = session
+                .list_merge_conflicts(&ListMergeConflictsOptions {
+                    path: PathBuf::from(path),
+                    limit: 10,
+                    after: None,
+                    expected_state_token: state_token.clone(),
+                })
+                .unwrap();
+            assert_eq!(conflicts.items.len(), 1);
+            let conflict = &conflicts.items[0];
+            assert_eq!(conflict["reason"], "semantic_key_conflict");
+            assert_eq!(conflict["ours_rowid"], expected_ours);
+            assert_eq!(conflict["theirs_rowid"], expected_theirs);
+            assert_eq!(conflict["semantic_key_collations"], json!(["nocase"]));
+            assert!(
+                conflict["semantic_key"][0]
+                    .as_str()
+                    .unwrap()
+                    .eq_ignore_ascii_case(if path == "insert-update.db" {
+                        "t:gamma"
+                    } else {
+                        "t:shared"
+                    })
+            );
+            assert_eq!(conflict["ours_op"], expected_ops.0);
+            assert_eq!(conflict["theirs_op"], expected_ops.1);
+        }
+
+        session
+            .abort_merge(&AbortMergeOptions { expected_state_token: state_token })
+            .unwrap();
+        session.close().unwrap();
+    }
+
+    #[test]
+    fn invalid_sqlite_auto_merge_candidate_preserves_prior_merge_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("constraints.db");
+        {
+            let database = Connection::open(&database_path).unwrap();
+            database
+                .execute_batch(
+                    "PRAGMA foreign_keys = ON;\
+                     CREATE TABLE parents (id INTEGER PRIMARY KEY);\
+                     CREATE TABLE children (id INTEGER PRIMARY KEY, parent_id INTEGER NOT NULL REFERENCES parents(id));\
+                     INSERT INTO parents VALUES (1), (2);\
+                     INSERT INTO children VALUES (1, 1);",
+                )
+                .unwrap();
+        }
+
+        let session = RepositorySession::new(directory.path());
+        session.open().unwrap();
+        session.init().unwrap();
+        session.add_all().unwrap();
+        session.commit("base").unwrap();
+        session.close().unwrap();
+
+        let repo = Repository::open(directory.path()).unwrap();
+        repo.switch_new_branch("hosted", None).unwrap();
+        drop(repo);
+        Connection::open(&database_path)
+            .unwrap()
+            .execute("DELETE FROM parents WHERE id = 2", [])
+            .unwrap();
+        session.open().unwrap();
+        session.add_all().unwrap();
+        let hosted = session.commit("hosted delete").unwrap()["commit"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        session.close().unwrap();
+
+        let repo = Repository::open(directory.path()).unwrap();
+        repo.switch_branch("main").unwrap();
+        drop(repo);
+        {
+            let database = Connection::open(&database_path).unwrap();
+            database
+                .execute_batch(
+                    "INSERT OR IGNORE INTO parents VALUES (2);\
+                     UPDATE children SET parent_id = 2 WHERE id = 1;",
+                )
+                .unwrap();
+        }
+        session.open().unwrap();
+        session.add_all().unwrap();
+        let local = session.commit("local child update").unwrap()["commit"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let plan = session
+            .plan_merge(&PlanMergeOptions {
+                revision: hosted.clone(),
+                expected_head: Some(local.clone()),
+            })
+            .unwrap();
+        let applied = session
+            .apply_merge(&ApplyMergeOptions {
+                revision: hosted,
+                expected_head: Some(local),
+                plan_token: plan.plan_token,
+            })
+            .unwrap();
+        let MergeStatus::Merging { unmerged_count, state_token, .. } = applied.merge else {
+            panic!("expected validation failure to retain merge state");
+        };
+        assert_eq!(unmerged_count, 1);
+        let conflicts = session
+            .list_merge_conflicts(&ListMergeConflictsOptions {
+                path: PathBuf::from("constraints.db"),
+                limit: 10,
+                after: None,
+                expected_state_token: state_token.clone(),
+            })
+            .unwrap();
+        assert_eq!(conflicts.items.len(), 1);
+        assert_eq!(conflicts.items[0]["kind"], "validation");
+        assert_eq!(conflicts.items[0]["reason"], "candidate_validation_failed");
+        assert_eq!(
+            conflicts.items[0]["recommended_action"],
+            "inspect_candidate_constraints"
+        );
+        assert!(
+            conflicts.items[0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("foreign_key_check")
+        );
+        assert_eq!(
+            Connection::open(&database_path)
+                .unwrap()
+                .query_row("SELECT parent_id FROM children WHERE id = 1", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            Connection::open(&database_path)
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM parents WHERE id = 2", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            1
+        );
+
+        let index_path = directory.path().join(".graft/index/state.toml");
+        let index_before = fs::read(&index_path).unwrap();
+        let journal_path = directory
+            .path()
+            .join(".graft/merge-resolution-session.json");
+        let journal_before = fs::read(&journal_path).unwrap();
+        let database_before = fs::read(&database_path).unwrap();
+        let error = session
+            .continue_merge(&ContinueMergeOptions {
+                message: "must not commit".to_string(),
+                expected_state_token: state_token.clone(),
+            })
+            .unwrap_err();
+        assert_eq!(error.code(), SdkErrorCode::RepositoryCommand);
+        assert_eq!(fs::read(&index_path).unwrap(), index_before);
+        assert_eq!(fs::read(&journal_path).unwrap(), journal_before);
+        assert_eq!(fs::read(&database_path).unwrap(), database_before);
+        let MergeStatus::Merging { state_token: unchanged, .. } =
+            session.get_merge_status().unwrap()
+        else {
+            panic!("expected failed retry to preserve merge state");
+        };
+        assert_eq!(unchanged, state_token);
+
+        session
+            .abort_merge(&AbortMergeOptions { expected_state_token: state_token })
+            .unwrap();
+        session.close().unwrap();
+    }
+
+    #[test]
+    fn table_view_name_conflicts_can_select_both_directions_without_btree_reads() {
+        let directory = tempfile::tempdir().unwrap();
+        let hosted_view = directory.path().join("hosted-view.db");
+        let hosted_table = directory.path().join("hosted-table.db");
+        let rewrite = |path: &Path, object_sql: &str| {
+            for candidate in [
+                path.to_path_buf(),
+                PathBuf::from(format!("{}-wal", path.display())),
+                PathBuf::from(format!("{}-shm", path.display())),
+            ] {
+                let _ = fs::remove_file(candidate);
+            }
+            let database = Connection::open(path).unwrap();
+            database
+                .execute_batch(&format!(
+                    "CREATE TABLE seed (id INTEGER PRIMARY KEY, value TEXT NOT NULL);\
+                     INSERT INTO seed VALUES (1, 'base');\
+                     {object_sql}"
+                ))
+                .unwrap();
+        };
+        rewrite(&hosted_view, "");
+        rewrite(&hosted_table, "");
+
+        let session = RepositorySession::new(directory.path());
+        session.open().unwrap();
+        session.init().unwrap();
+        session.add_all().unwrap();
+        session.commit("base").unwrap();
+        session.close().unwrap();
+
+        let repo = Repository::open(directory.path()).unwrap();
+        repo.switch_new_branch("hosted", None).unwrap();
+        drop(repo);
+        rewrite(
+            &hosted_view,
+            "CREATE VIEW shared AS SELECT id, value FROM seed;",
+        );
+        rewrite(
+            &hosted_table,
+            "CREATE TABLE shared (id INTEGER PRIMARY KEY, value TEXT NOT NULL); INSERT INTO shared VALUES (1, 'hosted');",
+        );
+        session.open().unwrap();
+        session.add_all().unwrap();
+        let hosted = session.commit("hosted objects").unwrap()["commit"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        session.close().unwrap();
+
+        let repo = Repository::open(directory.path()).unwrap();
+        repo.switch_branch("main").unwrap();
+        drop(repo);
+        rewrite(
+            &hosted_view,
+            "CREATE TABLE shared (id INTEGER PRIMARY KEY, value TEXT NOT NULL); INSERT INTO shared VALUES (1, 'local');",
+        );
+        rewrite(
+            &hosted_table,
+            "CREATE VIEW shared AS SELECT id, value FROM seed;",
+        );
+        session.open().unwrap();
+        session.add_all().unwrap();
+        let local = session.commit("local objects").unwrap()["commit"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let plan = session
+            .plan_merge(&PlanMergeOptions {
+                revision: hosted.clone(),
+                expected_head: Some(local.clone()),
+            })
+            .unwrap();
+        let applied = session
+            .apply_merge(&ApplyMergeOptions {
+                revision: hosted,
+                expected_head: Some(local),
+                plan_token: plan.plan_token,
+            })
+            .unwrap();
+        let MergeStatus::Merging { state_token, .. } = applied.merge else {
+            panic!("expected object type conflicts");
+        };
+
+        let first = session
+            .set_merge_path_result(&SetMergePathResultOptions {
+                path: PathBuf::from("hosted-view.db"),
+                result: MergePathResult::Theirs,
+                expected_state_token: state_token,
+            })
+            .unwrap();
+        let MergeStatus::Merging { state_token: second_token, .. } = first.merge else {
+            panic!("expected second path conflict");
+        };
+        let second = session
+            .set_merge_path_result(&SetMergePathResultOptions {
+                path: PathBuf::from("hosted-table.db"),
+                result: MergePathResult::Theirs,
+                expected_state_token: second_token,
+            })
+            .unwrap();
+        let MergeStatus::Merging {
+            unmerged_count, state_token: final_token, ..
+        } = second.merge
+        else {
+            panic!("expected fully resolved active merge");
+        };
+        assert_eq!(unmerged_count, 0);
+        let completed = session
+            .continue_merge(&ContinueMergeOptions {
+                message: "select hosted object types".to_string(),
+                expected_state_token: final_token,
+            })
+            .unwrap();
+        assert_eq!(completed.merge, MergeStatus::None);
+        for (path, expected) in [(&hosted_view, "view"), (&hosted_table, "table")] {
+            assert_eq!(
+                Connection::open(path)
+                    .unwrap()
+                    .query_row(
+                        "SELECT type FROM sqlite_schema WHERE name = 'shared'",
+                        [],
+                        |row| row.get::<_, String>(0)
+                    )
+                    .unwrap(),
+                expected
+            );
+        }
+        session.close().unwrap();
+    }
+
+    #[test]
+    fn compatible_column_table_index_view_and_trigger_additions_form_one_union() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("schema-union.db");
+        let rewrite = |branch_sql: &str| {
+            for candidate in [
+                database_path.clone(),
+                PathBuf::from(format!("{}-wal", database_path.display())),
+                PathBuf::from(format!("{}-shm", database_path.display())),
+            ] {
+                let _ = fs::remove_file(candidate);
+            }
+            Connection::open(&database_path)
+                .unwrap()
+                .execute_batch(&format!(
+                    "CREATE TABLE records (id INTEGER PRIMARY KEY, value TEXT NOT NULL);\
+                     CREATE TABLE audit (id INTEGER PRIMARY KEY, source TEXT NOT NULL);\
+                     INSERT INTO records VALUES (1, 'base');\
+                     {branch_sql}"
+                ))
+                .unwrap();
+        };
+        rewrite("");
+
+        let session = RepositorySession::new(directory.path());
+        session.open().unwrap();
+        session.init().unwrap();
+        session.add_all().unwrap();
+        session.commit("base").unwrap();
+        session.close().unwrap();
+
+        let repo = Repository::open(directory.path()).unwrap();
+        repo.switch_new_branch("hosted", None).unwrap();
+        drop(repo);
+        rewrite(
+            "ALTER TABLE records ADD COLUMN hosted_note TEXT;\
+             CREATE TABLE hosted_table (id INTEGER PRIMARY KEY);\
+             CREATE INDEX hosted_index ON records(value);\
+             CREATE VIEW hosted_view AS SELECT id, value FROM records;\
+             CREATE TRIGGER hosted_trigger AFTER INSERT ON records BEGIN INSERT INTO audit(source) VALUES ('hosted'); END;",
+        );
+        session.open().unwrap();
+        session.add_all().unwrap();
+        let hosted = session.commit("hosted schema").unwrap()["commit"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        session.close().unwrap();
+
+        let repo = Repository::open(directory.path()).unwrap();
+        repo.switch_branch("main").unwrap();
+        drop(repo);
+        rewrite(
+            "ALTER TABLE records ADD COLUMN local_note INTEGER;\
+             CREATE TABLE local_table (id INTEGER PRIMARY KEY);\
+             CREATE INDEX local_index ON records(id, value);\
+             CREATE VIEW local_view AS SELECT value FROM records;\
+             CREATE TRIGGER local_trigger AFTER DELETE ON records BEGIN INSERT INTO audit(source) VALUES ('local'); END;",
+        );
+        session.open().unwrap();
+        session.add_all().unwrap();
+        let local = session.commit("local schema").unwrap()["commit"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let plan = session
+            .plan_merge(&PlanMergeOptions {
+                revision: hosted.clone(),
+                expected_head: Some(local.clone()),
+            })
+            .unwrap();
+        let applied = session
+            .apply_merge(&ApplyMergeOptions {
+                revision: hosted,
+                expected_head: Some(local),
+                plan_token: plan.plan_token,
+            })
+            .unwrap();
+        let MergeStatus::Merging { unmerged_count, state_token, .. } = applied.merge else {
+            panic!("expected active merge with staged union");
+        };
+        assert_eq!(unmerged_count, 0);
+        let database = Connection::open(&database_path).unwrap();
+        let columns = database
+            .prepare("SELECT name FROM pragma_table_info('records') ORDER BY cid")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(columns, vec!["id", "value", "local_note", "hosted_note"]);
+        let objects = database
+            .prepare(
+                "SELECT type, name FROM sqlite_schema WHERE name LIKE 'local_%' OR name LIKE 'hosted_%' ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(objects.len(), 8);
+        assert!(objects.contains(&("table".to_string(), "hosted_table".to_string())));
+        assert!(objects.contains(&("index".to_string(), "hosted_index".to_string())));
+        assert!(objects.contains(&("view".to_string(), "hosted_view".to_string())));
+        assert!(objects.contains(&("trigger".to_string(), "hosted_trigger".to_string())));
+        drop(database);
+        let completed = session
+            .continue_merge(&ContinueMergeOptions {
+                message: "merge compatible schema".to_string(),
+                expected_state_token: state_token,
+            })
+            .unwrap();
+        assert_eq!(completed.merge, MergeStatus::None);
+        session.close().unwrap();
+    }
+
+    #[test]
+    fn malformed_tracked_sqlite_is_dirty_diagnostic_and_cannot_be_silently_committed() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("tracked.db");
+        Connection::open(&database_path)
+            .unwrap()
+            .execute("CREATE TABLE docs (id INTEGER PRIMARY KEY)", [])
+            .unwrap();
+        let session = RepositorySession::new(directory.path());
+        session.open().unwrap();
+        session.init().unwrap();
+        session.add_all().unwrap();
+        let base = session.commit("base").unwrap()["commit"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        fs::write(&database_path, b"not a sqlite database").unwrap();
+        let status = session.status_incremental().unwrap().status;
+        assert!(status.dirty);
+        assert!(status.has_unstaged_changes);
+        assert_eq!(status.unstaged, vec!["tracked.db"]);
+        assert_eq!(status.path_diagnostics.len(), 1);
+        assert_eq!(status.path_diagnostics[0].path, "tracked.db");
+        assert_eq!(
+            status.path_diagnostics[0].status,
+            graft::repo::RepoPathDiagnosticStatus::Corrupt
+        );
+        assert_eq!(status.path_diagnostics[0].operation, "sqlite_status");
+        assert!(!status.path_diagnostics[0].protected_by_index);
+
+        let add_error = session.add_all().unwrap_err();
+        assert_eq!(add_error.code(), SdkErrorCode::RepositoryCommand);
+        assert!(add_error.message().contains("sqlite-analysis-failed"));
+        let commit_error = session.commit("must not commit").unwrap_err();
+        assert_eq!(commit_error.code(), SdkErrorCode::RepositoryCommand);
+        assert!(commit_error.message().contains("no-staged-changes"));
+        assert_eq!(
+            session
+                .repository_metadata()
+                .unwrap()
+                .current_head
+                .as_deref(),
+            Some(base.as_str())
+        );
+        assert!(session.status_incremental().unwrap().status.dirty);
+        session.close().unwrap();
     }
 
     #[test]

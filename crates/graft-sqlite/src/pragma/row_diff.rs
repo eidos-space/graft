@@ -14,6 +14,21 @@ pub(super) fn json_opaque_changes(
         .collect()
 }
 
+pub(super) fn json_schema_changes(
+    changes: &[crate::row_level_diff::SchemaChange],
+) -> Vec<crate::json::JsonSchemaChange> {
+    changes
+        .iter()
+        .map(|change| crate::json::JsonSchemaChange {
+            name: change.name.clone(),
+            entry_type: change.entry_type.clone(),
+            op: change.kind.as_str().to_string(),
+            sql: change.sql.clone(),
+            old_sql: change.old_sql.clone(),
+        })
+        .collect()
+}
+
 pub(super) fn json_diff_capabilities(diff: &crate::row_level_diff::RowLevelDiff) -> Vec<String> {
     diff.analysis
         .capabilities
@@ -76,6 +91,7 @@ pub(super) fn json_repo_row_diff(
                     capabilities: json_diff_capabilities(&row_diff),
                     limitations: json_diff_limitations(&row_diff),
                     message: None,
+                    schema_changes: json_schema_changes(&row_diff.schema_changes),
                     tables: json_table_changes(&row_diff.table_changes),
                     opaque_changes: json_opaque_changes(&row_diff.opaque_changes),
                     telemetry: crate::json::JsonRowDiffTelemetry {
@@ -97,6 +113,7 @@ pub(super) fn json_repo_row_diff(
                     message: Some(format!(
                         "row diff unavailable for {change} database snapshots"
                     )),
+                    schema_changes: Vec::new(),
                     tables: Vec::new(),
                     opaque_changes: Vec::new(),
                     telemetry: crate::json::JsonRowDiffTelemetry::default(),
@@ -114,6 +131,7 @@ pub(super) fn json_repo_row_diff(
                     message: Some(format!(
                         "row diff unavailable for {change} database snapshots: {err}"
                     )),
+                    schema_changes: Vec::new(),
                     tables: Vec::new(),
                     opaque_changes: Vec::new(),
                     telemetry: crate::json::JsonRowDiffTelemetry::default(),
@@ -218,6 +236,7 @@ pub(super) fn json_repo_bounded_diff(
                             updates: summary.updates,
                         })
                         .collect(),
+                    schema_changes: json_schema_changes(&row_diff.schema_changes),
                     tables: json_table_changes(&row_diff.table_changes),
                     opaque_changes: json_opaque_changes(&row_diff.opaque_changes),
                     has_more: row_diff.has_more,
@@ -287,6 +306,7 @@ fn unavailable_bounded_file(
         limitations: Vec::new(),
         message: Some(message),
         summaries: Vec::new(),
+        schema_changes: Vec::new(),
         tables: Vec::new(),
         opaque_changes: Vec::new(),
         has_more: false,

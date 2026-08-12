@@ -34,7 +34,10 @@ test("exposes ABI-stable SDK metadata and materialization contract", () => {
     "cloneRepository",
     "applyMerge",
     "setMergePathResult",
+    "unresolveMergePath",
     "resolveMergeRow",
+    "resolveMergeCell",
+    "resolveMergeTable",
     "writeAndStageTextResult",
     "continueMerge",
     "abortMerge",
@@ -70,9 +73,85 @@ test("exposes ABI-stable SDK metadata and materialization contract", () => {
     "listMergePaths",
     "listMergeConflicts",
     "readMergeVersion",
+    "diffMergeSqlite",
+    "getMergePolicy",
+    "validateMergePolicy",
+    "setMergePolicy",
+    "stageMergeSqliteResult",
   ]) {
     assert.equal(operationMaterializesWorktree(operation), false)
   }
+})
+
+test("merge policy SDK is versioned, CAS guarded, and cancellable", async () => {
+  await withTemporaryDirectory("graft-sdk-merge-policy-", async (root) => {
+    const session = await RepositorySession.open(root)
+    await session.init()
+
+    const initial = await session.getMergePolicy()
+    assert.equal(initial.policy.version, 1)
+    assert.equal(initial.policy.same_row_merge, undefined)
+    assert.match(initial.policy_token, /^merge-policy-v1:/)
+    assert.equal(initial.active_merge, false)
+
+    const invalid = await session.validateMergePolicy({
+      policy: { version: 2 },
+    })
+    assert.equal(invalid.valid, false)
+    assert.equal(invalid.errors[0].key, "version")
+
+    for (const operation of [
+      (signal) => session.getMergePolicy({ signal }),
+      (signal) =>
+        session.validateMergePolicy({ policy: { version: 1 }, signal }),
+      (signal) =>
+        session.setMergePolicy({
+          policy: { version: 1, same_row_merge: true },
+          expectedPolicyToken: initial.policy_token,
+          signal,
+        }),
+    ]) {
+      const controller = new AbortController()
+      controller.abort()
+      await assert.rejects(operation(controller.signal), (error) => {
+        assert.equal(error.name, "AbortError")
+        return true
+      })
+    }
+
+    const updated = await session.setMergePolicy({
+      policy: {
+        version: 1,
+        same_row_merge: true,
+        semantic_keys: { records: ["external_id"] },
+        semantic_key_collations: {
+          records: { external_id: "nocase" },
+        },
+        column_resolvers: {
+          records: { updated_at: "max_timestamp" },
+        },
+      },
+      expectedPolicyToken: initial.policy_token,
+    })
+    assert.notEqual(updated.policy_token, initial.policy_token)
+    assert.equal(updated.policy.same_row_merge, true)
+    assert.equal(
+      updated.policy.semantic_key_collations.records.external_id,
+      "nocase"
+    )
+    assert.equal(
+      updated.policy.column_resolvers.records.updated_at,
+      "max_timestamp"
+    )
+    await assert.rejects(
+      session.setMergePolicy({
+        policy: { version: 1 },
+        expectedPolicyToken: initial.policy_token,
+      }),
+      (error) => error.code === "GRAFT_SDK_REPOSITORY_STALE"
+    )
+    await session.close()
+  })
 })
 
 test("reads bounded revision path content without materializing", async () => {
@@ -1112,6 +1191,78 @@ test(
       assert.equal(conflicts.items[0].kind, "row")
       assert.equal(conflicts.items[0].rowid, 1)
 
+      const mergeDiff = await cloneSession.diffMergeSqlite({
+        path: "space.eidos",
+        from: "base",
+        to: "theirs",
+        mode: "summary",
+        expectedStateToken: applied.merge.state_token,
+      })
+      assert.equal(mergeDiff.state_token, applied.merge.state_token)
+      assert.equal(mergeDiff.from.version, "base")
+      assert.equal(mergeDiff.to.version, "theirs")
+      assert.equal(mergeDiff.diff.files[0].summaries[0].name, "docs")
+      assert.equal(mergeDiff.diff.files[0].summaries[0].updates, 1)
+      await assert.rejects(
+        cloneSession.diffMergeSqlite({
+          path: "space.eidos",
+          from: "base",
+          to: "ours",
+          mode: "summary",
+          expectedStateToken: "stale",
+        }),
+        (error) => {
+          assert.equal(error.code, "GRAFT_SDK_REPOSITORY_STALE")
+          return true
+        }
+      )
+      const cancelledDiffController = new AbortController()
+      const diffBlockers = Array.from({ length: 8 }, () =>
+        cloneSession.listMergeConflicts({
+          path: "space.eidos",
+          expectedStateToken: applied.merge.state_token,
+        })
+      )
+      const cancelledDiff = cloneSession.diffMergeSqlite({
+        path: "space.eidos",
+        from: "base",
+        to: "ours",
+        mode: "summary",
+        expectedStateToken: applied.merge.state_token,
+        signal: cancelledDiffController.signal,
+      })
+      cancelledDiffController.abort()
+      await assert.rejects(
+        cancelledDiff,
+        (error) => error.name === "AbortError"
+      )
+      await Promise.all(diffBlockers)
+
+      const controller = new AbortController()
+      const blockers = Array.from({ length: 8 }, () =>
+        cloneSession.listMergeConflicts({
+          path: "space.eidos",
+          expectedStateToken: applied.merge.state_token,
+        })
+      )
+      const cancelledTable = cloneSession.resolveMergeTable({
+        path: "space.eidos",
+        table: "docs",
+        result: "ours",
+        expectedStateToken: applied.merge.state_token,
+        signal: controller.signal,
+      })
+      controller.abort()
+      await assert.rejects(
+        cancelledTable,
+        (error) => error.name === "AbortError"
+      )
+      await Promise.all(blockers)
+      assert.equal(
+        (await cloneSession.getMergeStatus()).state_token,
+        applied.merge.state_token
+      )
+
       const resolved = await cloneSession.resolveMergeRow({
         path: "space.eidos",
         table: "docs",
@@ -1121,11 +1272,47 @@ test(
       })
       assert.equal(resolved.merge.state, "merging")
       assert.equal(resolved.merge.unmerged_count, 0)
+
+      await cloneSession.close()
+      await cloneSession.open()
+      const reopened = await cloneSession.getMergeStatus()
+      const resolvedConflicts = await cloneSession.listMergeConflicts({
+        path: "space.eidos",
+        expectedStateToken: reopened.state_token,
+      })
+      assert.equal(resolvedConflicts.items[0].status, "resolved")
+      assert.equal(resolvedConflicts.items[0].resolution, "theirs")
+
+      const unresolved = await cloneSession.unresolveMergePath({
+        path: "space.eidos",
+        expectedStateToken: reopened.state_token,
+      })
+      assert.equal(unresolved.merge.unmerged_count, 1)
+      const resetConflicts = await cloneSession.listMergeConflicts({
+        path: "space.eidos",
+        expectedStateToken: unresolved.merge.state_token,
+      })
+      assert.equal(resetConflicts.items[0].status, "unresolved")
+
+      const tableResolved = await cloneSession.resolveMergeTable({
+        path: "space.eidos",
+        table: "docs",
+        result: "theirs",
+        expectedStateToken: unresolved.merge.state_token,
+      })
+      assert.equal(tableResolved.merge.unmerged_count, 0)
       const completed = await cloneSession.continueMerge({
         message: "merge hosted row",
-        expectedStateToken: resolved.merge.state_token,
+        expectedStateToken: tableResolved.merge.state_token,
       })
       assert.equal(completed.merge.state, "none")
+      await assert.rejects(
+        cloneSession.listMergeConflicts({
+          path: "space.eidos",
+          expectedStateToken: tableResolved.merge.state_token,
+        }),
+        /no merge in progress/
+      )
 
       const merged = new DatabaseSync(cloneDatabasePath, { readOnly: true })
       assert.equal(

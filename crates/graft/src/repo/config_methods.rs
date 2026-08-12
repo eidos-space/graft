@@ -7,8 +7,12 @@ impl Repository {
     }
 
     pub fn write_config(&self, config: &RepoConfig) -> Result<()> {
+        config.merge.validate()?;
         let raw = toml::to_string_pretty(config)?;
-        fs::write(self.config_path(), raw)?;
+        let path = self.config_path();
+        let temporary = path.with_extension("toml.tmp");
+        fs::write(&temporary, raw)?;
+        fs::rename(temporary, path)?;
         Ok(())
     }
 

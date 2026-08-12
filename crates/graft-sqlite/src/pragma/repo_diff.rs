@@ -417,27 +417,55 @@ pub(crate) fn repo_status_for_file(
             continue;
         }
 
-        if status
-            .unstaged_changes
-            .iter()
-            .any(|change| change.path == key)
-        {
-            continue;
-        }
-
         let physical_path = repo.worktree().join(&key);
         let change = match std::fs::symlink_metadata(&physical_path) {
             Ok(metadata) => {
                 if !metadata.file_type().is_file() {
                     continue;
                 }
-                if !is_sqlite_database_path(&physical_path)? {
-                    continue;
-                }
-                if physical_sqlite_file_matches_state(runtime, &physical_path, &expected_state)? {
-                    None
-                } else {
-                    Some(RepoWorktreeChangeKind::Modified)
+                match is_sqlite_database_path(&physical_path) {
+                    Ok(false) => {
+                        status.path_diagnostics.push(graft::repo::RepoPathDiagnostic {
+                            path: key.clone(),
+                            status: graft::repo::RepoPathDiagnosticStatus::Corrupt,
+                            operation: "sqlite_status".to_string(),
+                            protected_by_index: false,
+                            message: "tracked SQLite worktree file is missing the SQLite header or was replaced by non-SQLite content".to_string(),
+                        });
+                        Some(RepoWorktreeChangeKind::Modified)
+                    }
+                    Err(error) => {
+                        status
+                            .path_diagnostics
+                            .push(graft::repo::RepoPathDiagnostic {
+                                path: key.clone(),
+                                status: graft::repo::RepoPathDiagnosticStatus::AnalysisFailed,
+                                operation: "sqlite_status".to_string(),
+                                protected_by_index: false,
+                                message: error.to_string(),
+                            });
+                        Some(RepoWorktreeChangeKind::Modified)
+                    }
+                    Ok(true) => match physical_sqlite_file_matches_state(
+                        runtime,
+                        &physical_path,
+                        &expected_state,
+                    ) {
+                        Ok(true) => None,
+                        Ok(false) => Some(RepoWorktreeChangeKind::Modified),
+                        Err(error) => {
+                            status
+                                .path_diagnostics
+                                .push(graft::repo::RepoPathDiagnostic {
+                                    path: key.clone(),
+                                    status: graft::repo::RepoPathDiagnosticStatus::AnalysisFailed,
+                                    operation: "sqlite_status".to_string(),
+                                    protected_by_index: false,
+                                    message: error.to_string(),
+                                });
+                            Some(RepoWorktreeChangeKind::Modified)
+                        }
+                    },
                 }
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -446,7 +474,12 @@ pub(crate) fn repo_status_for_file(
             Err(err) => return Err(err.into()),
         };
 
-        if let Some(change) = change {
+        if let Some(change) = change
+            && !status
+                .unstaged_changes
+                .iter()
+                .any(|existing| existing.path == key)
+        {
             status
                 .unstaged_changes
                 .push(graft::repo::RepoWorktreeChange {

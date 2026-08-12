@@ -19,11 +19,15 @@ pub enum RowMergeSide {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RowMergePolicy {
+    pub same_row_merge: bool,
     pub internal_resolvers: BTreeMap<String, RowMergeInternalResolver>,
     pub schema_resolvers: BTreeMap<String, RowMergeSchemaResolver>,
     pub default_semantic_keys: Vec<String>,
     pub semantic_keys: BTreeMap<String, Vec<String>>,
+    pub semantic_key_collations:
+        BTreeMap<String, BTreeMap<String, graft::repo::SemanticKeyCollation>>,
     pub generated_columns: BTreeMap<String, Vec<String>>,
+    pub column_resolvers: BTreeMap<String, BTreeMap<String, graft::repo::ManagedColumnResolver>>,
 }
 
 impl Default for RowMergePolicy {
@@ -48,11 +52,14 @@ impl Default for RowMergePolicy {
             RowMergeSchemaResolver::AlterTableAddColumn,
         );
         Self {
+            same_row_merge: false,
             internal_resolvers,
             schema_resolvers,
             default_semantic_keys: Vec::new(),
             semantic_keys: BTreeMap::new(),
+            semantic_key_collations: BTreeMap::new(),
             generated_columns: BTreeMap::new(),
+            column_resolvers: BTreeMap::new(),
         }
     }
 }
@@ -151,6 +158,8 @@ pub struct RowMergeConflict {
     pub ours_identity: RowIdentity,
     pub theirs_identity: RowIdentity,
     pub semantic_key: Option<Vec<String>>,
+    pub semantic_key_collations: Option<Vec<graft::repo::SemanticKeyCollation>>,
+    pub cell_conflicts: Vec<RowMergeCellConflict>,
     pub ours: RowChangeKind,
     pub theirs: RowChangeKind,
     pub base_row: Option<Record>,
@@ -158,10 +167,26 @@ pub struct RowMergeConflict {
     pub theirs_row: Option<Record>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct RowMergeCellConflict {
+    pub column: String,
+    pub base: Value,
+    pub ours: Value,
+    pub theirs: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowMergePendingRecomputation {
+    pub table: String,
+    pub identity: RowIdentity,
+    pub columns: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowMergeConflictReason {
     RowIdentity,
     SemanticKey,
+    Cell,
 }
 
 impl RowMergeConflictReason {
@@ -169,6 +194,7 @@ impl RowMergeConflictReason {
         match self {
             Self::RowIdentity => "row_conflict",
             Self::SemanticKey => "semantic_key_conflict",
+            Self::Cell => "cell_conflict",
         }
     }
 }
@@ -279,6 +305,9 @@ pub struct RowMergePlan {
     theirs_diff: RowLevelDiff,
     identical_touches: BTreeSet<RowKey>,
     omitted_theirs_insert_rowids: BTreeSet<RowKey>,
+    merged_rows: BTreeMap<RowKey, Record>,
+    cell_merge_rows: BTreeMap<RowKey, Record>,
+    pending_recomputations: Vec<RowMergePendingRecomputation>,
     ours_schema_additions: Vec<SchemaApplyChange>,
     schema_additions: Vec<SchemaApplyChange>,
     schema_conflicts: Vec<SchemaMergeConflict>,
@@ -333,8 +362,32 @@ impl RowMergePlan {
         &self.schema_conflicts
     }
 
+    pub fn pending_recomputations(&self) -> &[RowMergePendingRecomputation] {
+        &self.pending_recomputations
+    }
+
+    pub fn requires_validation(&self) -> bool {
+        !self.pending_recomputations.is_empty()
+    }
+
     pub fn apply_change_count(&self) -> usize {
         self.source_apply_change_count(&self.theirs_diff, &self.schema_additions)
+    }
+
+    /// Whether the merge result already represented by `ours` is complete without applying SQL.
+    ///
+    /// This covers physical-only snapshot changes and identical logical changes made on both
+    /// sides. Unsupported surfaces and incomplete analysis remain conservative conflicts.
+    pub fn can_resolve_to_ours_without_apply(&self) -> bool {
+        self.apply_change_count() == 0
+            && !self.has_conflicts()
+            && !self.has_opaque_changes()
+            && self.limitations().is_empty()
+            && !self.requires_validation()
+    }
+
+    pub fn theirs_logical_status(&self) -> crate::row_level_diff::LogicalDiffStatus {
+        self.theirs_diff.logical_status()
     }
 
     pub fn theirs_apply_sql(&self) -> String {
@@ -358,6 +411,55 @@ impl RowMergePlan {
         self.source_row_apply_sql(diff, table_name, identity)
     }
 
+    pub fn cell_resolution_apply_sql(
+        &self,
+        table_name: &str,
+        identity: &RowIdentity,
+        selections: &BTreeMap<String, RowMergeSide>,
+    ) -> Option<String> {
+        let key = RowKey {
+            table: table_name.to_string(),
+            identity: identity.clone(),
+        };
+        let conflict = self.analysis.conflicts.iter().find(|conflict| {
+            conflict.reason == RowMergeConflictReason::Cell
+                && conflict.table == table_name
+                && conflict.identity == *identity
+        })?;
+        if conflict
+            .cell_conflicts
+            .iter()
+            .any(|cell| !selections.contains_key(&cell.column))
+        {
+            return None;
+        }
+        let mut row = self.cell_merge_rows.get(&key)?.clone();
+        let table = self
+            .ours_diff
+            .table_changes
+            .iter()
+            .find(|table| table.table_name == table_name)?;
+        for cell in &conflict.cell_conflicts {
+            let side = selections.get(&cell.column)?;
+            let index = table
+                .columns
+                .iter()
+                .position(|column| column.eq_ignore_ascii_case(&cell.column))?;
+            row.values[index] = match side {
+                RowMergeSide::Ours => cell.ours.clone(),
+                RowMergeSide::Theirs => cell.theirs.clone(),
+            };
+        }
+        let sql = table.format_record_update(&self.apply_generated_columns(table), identity, &row);
+        if sql.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "BEGIN TRANSACTION;\n\n-- Table: {}\n{}\nCOMMIT;\n",
+            table.table_name, sql
+        ))
+    }
+
     fn source_apply_change_count(
         &self,
         diff: &RowLevelDiff,
@@ -373,9 +475,18 @@ impl RowMergePlan {
                     .iter()
                     .map(|change| RowKey::from_change(&table.table_name, change))
             })
-            .filter(|row| !self.identical_touches.contains(row) && !conflict_rows.contains(row))
+            .filter(|row| {
+                !self.identical_touches.contains(row)
+                    && !conflict_rows.contains(row)
+                    && !self.merged_rows.contains_key(row)
+            })
             .count();
+        // A combined row must always be written. Even when it equals the selected source
+        // side's result, that source row was filtered from the normal apply stream and the
+        // candidate starts from the opposite side.
+        let merged_rows = self.merged_rows.len();
         row_changes
+            + merged_rows
             + schema_additions.len()
             + usize::from(self.rebuilds_sqlite_stats())
             + self.reindexed_sqlite_indexes().count()
@@ -403,11 +514,13 @@ impl RowMergePlan {
         let conflict_rows = self.conflict_rows();
         for table in &diff.table_changes {
             let generated_columns = self.apply_generated_columns(table);
-            let table_sql = table.to_sql_filtered_with_insert_rowid_and_generated(
+            let mut table_sql = table.to_sql_filtered_with_insert_rowid_and_generated(
                 &generated_columns,
                 |change| {
                     let row = RowKey::from_change(&table.table_name, change);
-                    !self.identical_touches.contains(&row) && !conflict_rows.contains(&row)
+                    !self.identical_touches.contains(&row)
+                        && !conflict_rows.contains(&row)
+                        && !self.merged_rows.contains_key(&row)
                 },
                 |change| {
                     let row = RowKey::from_change(&table.table_name, change);
@@ -418,6 +531,17 @@ impl RowMergePlan {
                     }
                 },
             );
+            for (row, merged) in self
+                .merged_rows
+                .iter()
+                .filter(|(row, _)| row.table == table.table_name)
+            {
+                let update = table.format_record_update(&generated_columns, &row.identity, merged);
+                if !update.is_empty() {
+                    table_sql.push_str(&update);
+                    table_sql.push('\n');
+                }
+            }
             if table_sql.is_empty() {
                 continue;
             }
@@ -498,6 +622,15 @@ impl RowMergePlan {
                     .or_insert(GeneratedColumnKind::Stored);
             }
         }
+        if let Some(resolvers) = self.policy.column_resolvers.get(&table.table_name) {
+            for (column, resolver) in resolvers {
+                if *resolver == graft::repo::ManagedColumnResolver::Recompute {
+                    generated_columns
+                        .entry(column.clone())
+                        .or_insert(GeneratedColumnKind::Stored);
+                }
+            }
+        }
         generated_columns
     }
 
@@ -573,11 +706,62 @@ pub fn plan_snapshot_merge_with_policy(
     let mut conflicts = Vec::new();
     let mut identical_touches = BTreeSet::new();
     let mut omitted_theirs_insert_rowids = BTreeSet::new();
+    let mut merged_rows = BTreeMap::new();
+    let mut cell_merge_rows = BTreeMap::new();
+    let mut pending_recomputations = Vec::new();
 
     for (row, ours_change) in &ours_touches {
         let Some(theirs_change) = theirs_touches.get(row) else {
             continue;
         };
+        if policy.same_row_merge
+            && let Some(merged) = merge_same_row_updates(
+                policy,
+                &row.table,
+                &ours_change.columns,
+                &ours_change.change,
+                &theirs_change.change,
+            )
+        {
+            if !merged.pending_recomputations.is_empty() {
+                pending_recomputations.push(RowMergePendingRecomputation {
+                    table: row.table.clone(),
+                    identity: row.identity.clone(),
+                    columns: merged.pending_recomputations.clone(),
+                });
+            }
+            if merged.cell_conflicts.is_empty() {
+                merged_rows.insert(row.clone(), merged.row);
+                continue;
+            }
+            conflicts.push(RowMergeConflict {
+                reason: RowMergeConflictReason::Cell,
+                table: row.table.clone(),
+                columns: merged
+                    .cell_conflicts
+                    .iter()
+                    .map(|conflict| conflict.column.clone())
+                    .collect(),
+                identity: row.identity.clone(),
+                ours_identity: row.identity.clone(),
+                theirs_identity: row.identity.clone(),
+                semantic_key: ours_change
+                    .semantic_key_display
+                    .clone()
+                    .or_else(|| theirs_change.semantic_key_display.clone()),
+                semantic_key_collations: Some(ours_change.semantic_key_collations.clone())
+                    .filter(|collations| !collations.is_empty()),
+                cell_conflicts: merged.cell_conflicts,
+                ours: ours_change.kind,
+                theirs: theirs_change.kind,
+                base_row: change_base_row(&ours_change.change)
+                    .or_else(|| change_base_row(&theirs_change.change)),
+                ours_row: change_result_row(&ours_change.change),
+                theirs_row: change_result_row(&theirs_change.change),
+            });
+            cell_merge_rows.insert(row.clone(), merged.row);
+            continue;
+        }
         if ours_change.change == theirs_change.change {
             identical_touches.insert(row.clone());
             continue;
@@ -598,9 +782,12 @@ pub fn plan_snapshot_merge_with_policy(
             ours_identity: row.identity.clone(),
             theirs_identity: row.identity.clone(),
             semantic_key: ours_change
-                .semantic_key
+                .semantic_key_display
                 .clone()
-                .or_else(|| theirs_change.semantic_key.clone()),
+                .or_else(|| theirs_change.semantic_key_display.clone()),
+            semantic_key_collations: Some(ours_change.semantic_key_collations.clone())
+                .filter(|collations| !collations.is_empty()),
+            cell_conflicts: Vec::new(),
             ours: ours_change.kind,
             theirs: theirs_change.kind,
             base_row: change_base_row(&ours_change.change)
@@ -630,6 +817,9 @@ pub fn plan_snapshot_merge_with_policy(
         theirs_diff,
         identical_touches,
         omitted_theirs_insert_rowids,
+        merged_rows,
+        cell_merge_rows,
+        pending_recomputations,
         ours_schema_additions,
         schema_additions,
         schema_conflicts,
@@ -666,6 +856,150 @@ fn classify_opaque_changes(
     (unresolved, resolved)
 }
 
+#[derive(Debug)]
+struct SameRowMerge {
+    row: Record,
+    cell_conflicts: Vec<RowMergeCellConflict>,
+    pending_recomputations: Vec<String>,
+}
+
+fn merge_same_row_updates(
+    policy: &RowMergePolicy,
+    table: &str,
+    columns: &[String],
+    ours: &RowChange,
+    theirs: &RowChange,
+) -> Option<SameRowMerge> {
+    let (ours_base, ours_row) = match ours {
+        RowChange::Update { old_row, new_row, .. }
+        | RowChange::PrimaryKeyUpdate { old_row, new_row, .. } => (old_row, new_row),
+        _ => return None,
+    };
+    let (theirs_base, theirs_row) = match theirs {
+        RowChange::Update { old_row, new_row, .. }
+        | RowChange::PrimaryKeyUpdate { old_row, new_row, .. } => (old_row, new_row),
+        _ => return None,
+    };
+    if ours_base != theirs_base
+        || columns.len() != ours_base.values.len()
+        || columns.len() != ours_row.values.len()
+        || columns.len() != theirs_row.values.len()
+    {
+        return None;
+    }
+
+    let mut values = Vec::with_capacity(columns.len());
+    let mut cell_conflicts = Vec::new();
+    let mut pending_recomputations = Vec::new();
+    for (index, column) in columns.iter().enumerate() {
+        let base = &ours_base.values[index];
+        let ours = &ours_row.values[index];
+        let theirs = &theirs_row.values[index];
+        let ours_changed = ours != base;
+        let theirs_changed = theirs != base;
+        let resolver = managed_column_resolver(policy, table, column);
+
+        if resolver == Some(graft::repo::ManagedColumnResolver::Recompute) {
+            values.push(ours.clone());
+            pending_recomputations.push(column.clone());
+            continue;
+        }
+        if !ours_changed {
+            values.push(theirs.clone());
+            continue;
+        }
+        if !theirs_changed || ours == theirs {
+            values.push(ours.clone());
+            continue;
+        }
+
+        let resolved = match resolver {
+            Some(graft::repo::ManagedColumnResolver::IgnoreForConflict) => Some(ours.clone()),
+            Some(graft::repo::ManagedColumnResolver::Max) => {
+                resolve_ordered_values(ours, theirs, true, false)
+            }
+            Some(graft::repo::ManagedColumnResolver::Min) => {
+                resolve_ordered_values(ours, theirs, false, false)
+            }
+            Some(graft::repo::ManagedColumnResolver::MaxTimestamp) => {
+                resolve_ordered_values(ours, theirs, true, true)
+            }
+            Some(graft::repo::ManagedColumnResolver::Recompute) => unreachable!(),
+            None => None,
+        };
+        if let Some(value) = resolved {
+            values.push(value);
+        } else {
+            values.push(ours.clone());
+            cell_conflicts.push(RowMergeCellConflict {
+                column: column.clone(),
+                base: base.clone(),
+                ours: ours.clone(),
+                theirs: theirs.clone(),
+            });
+        }
+    }
+
+    Some(SameRowMerge {
+        row: Record { values },
+        cell_conflicts,
+        pending_recomputations,
+    })
+}
+
+fn managed_column_resolver(
+    policy: &RowMergePolicy,
+    table: &str,
+    column: &str,
+) -> Option<graft::repo::ManagedColumnResolver> {
+    policy
+        .column_resolvers
+        .iter()
+        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(table))
+        .and_then(|(_, resolvers)| {
+            resolvers
+                .iter()
+                .find(|(candidate, _)| candidate.eq_ignore_ascii_case(column))
+                .map(|(_, resolver)| *resolver)
+        })
+}
+
+fn resolve_ordered_values(
+    ours: &Value,
+    theirs: &Value,
+    use_max: bool,
+    timestamp_only: bool,
+) -> Option<Value> {
+    use std::cmp::Ordering;
+
+    let ordering = match (ours, theirs) {
+        (Value::Null, Value::Null) => Ordering::Equal,
+        (Value::Null, _) => Ordering::Less,
+        (_, Value::Null) => Ordering::Greater,
+        (Value::Integer(left), Value::Integer(right)) => left.cmp(right),
+        (Value::Integer(left), Value::Real(right)) if !timestamp_only => {
+            (*left as f64).partial_cmp(right)?
+        }
+        (Value::Real(left), Value::Integer(right)) if !timestamp_only => {
+            left.partial_cmp(&(*right as f64))?
+        }
+        (Value::Real(left), Value::Real(right)) if !timestamp_only => left.partial_cmp(right)?,
+        (Value::Text(left), Value::Text(right)) => left.cmp(right),
+        (Value::Blob(left), Value::Blob(right)) if !timestamp_only => left.cmp(right),
+        _ => return None,
+    };
+    let choose_ours = if use_max {
+        ordering != Ordering::Less
+    } else {
+        ordering != Ordering::Greater
+    };
+    Some(if choose_ours {
+        ours.clone()
+    } else {
+        theirs.clone()
+    })
+}
+
 fn row_touches(
     changes: &[crate::row_level_diff::TableChanges],
     policy: &RowMergePolicy,
@@ -680,7 +1014,17 @@ fn row_touches(
         let semantic_key_columns = configured_semantic_key_columns
             .as_deref()
             .unwrap_or(&table.semantic_key_columns);
+        let semantic_key_collations = semantic_key_columns
+            .iter()
+            .map(|column| semantic_key_collation(policy, &table.table_name, column))
+            .collect::<Vec<_>>();
         for change in &table.changes {
+            let semantic_key = semantic_change_key(
+                &table.columns,
+                semantic_key_columns,
+                &semantic_key_collations,
+                change,
+            );
             touches.insert(
                 RowKey {
                     table: table.table_name.clone(),
@@ -690,7 +1034,9 @@ fn row_touches(
                     kind: change.kind(),
                     change: change.clone(),
                     columns: table.columns.clone(),
-                    semantic_key: semantic_change_key(&table.columns, semantic_key_columns, change),
+                    semantic_key: semantic_key.as_ref().map(|key| key.normalized.clone()),
+                    semantic_key_display: semantic_key.map(|key| key.display),
+                    semantic_key_collations: semantic_key_collations.clone(),
                     can_omit_insert_rowid: change.rowid().is_some() && table.rowid_alias.is_none(),
                 },
             );
@@ -737,10 +1083,10 @@ fn add_semantic_key_conflicts(
             ]
         })
         .collect();
-    let theirs_by_semantic_key = semantic_insert_touches(theirs_touches);
+    let theirs_by_semantic_key = semantic_result_touches(theirs_touches);
 
     for (ours_row, ours_touch) in ours_touches {
-        if existing_conflict_rows.contains(ours_row) || ours_touch.kind != RowChangeKind::Insert {
+        if existing_conflict_rows.contains(ours_row) || ours_touch.kind == RowChangeKind::Delete {
             continue;
         }
         let Some(semantic_key) = ours_touch.semantic_key.as_ref() else {
@@ -767,7 +1113,12 @@ fn add_semantic_key_conflicts(
             identity: ours_row.identity.clone(),
             ours_identity: ours_row.identity.clone(),
             theirs_identity: theirs_row.identity.clone(),
-            semantic_key: Some(semantic_key.clone()),
+            semantic_key: ours_touch
+                .semantic_key_display
+                .clone()
+                .or_else(|| theirs_touch.semantic_key_display.clone()),
+            semantic_key_collations: Some(ours_touch.semantic_key_collations.clone()),
+            cell_conflicts: Vec::new(),
             ours: ours_touch.kind,
             theirs: theirs_touch.kind,
             base_row: None,
@@ -779,13 +1130,13 @@ fn add_semantic_key_conflicts(
     }
 }
 
-fn semantic_insert_touches(
+fn semantic_result_touches(
     touches: &BTreeMap<RowKey, RowTouch>,
 ) -> BTreeMap<SemanticRowKey, (RowKey, RowTouch)> {
     touches
         .iter()
         .filter_map(|(row, touch)| {
-            if touch.kind != RowChangeKind::Insert {
+            if touch.kind == RowChangeKind::Delete {
                 return None;
             }
             let semantic_key = touch.semantic_key.clone()?;
@@ -1212,38 +1563,69 @@ fn quote_identifier(id: &str) -> String {
     crate::row_level_diff::quote_identifier(id)
 }
 
+#[derive(Debug)]
+struct SemanticKeyValue {
+    normalized: Vec<String>,
+    display: Vec<String>,
+}
+
 fn semantic_change_key(
     columns: &[String],
     key_columns: &[String],
+    collations: &[graft::repo::SemanticKeyCollation],
     change: &RowChange,
-) -> Option<Vec<String>> {
-    let preferred = match change {
+) -> Option<SemanticKeyValue> {
+    let result = match change {
         RowChange::Insert { row, .. } | RowChange::PrimaryKeyInsert { row, .. } => row,
-        RowChange::Delete { row, .. } | RowChange::PrimaryKeyDelete { row, .. } => row,
-        RowChange::Update { old_row, .. } | RowChange::PrimaryKeyUpdate { old_row, .. } => old_row,
+        RowChange::Update { new_row, .. } | RowChange::PrimaryKeyUpdate { new_row, .. } => new_row,
+        RowChange::Delete { .. } | RowChange::PrimaryKeyDelete { .. } => return None,
     };
-    if key_columns.is_empty() {
+    if key_columns.is_empty() || collations.len() != key_columns.len() {
         return None;
     }
-    semantic_record_key(columns, key_columns, preferred).or_else(|| match change {
-        RowChange::Update { new_row, .. } | RowChange::PrimaryKeyUpdate { new_row, .. } => {
-            semantic_record_key(columns, key_columns, new_row)
-        }
-        _ => None,
-    })
+    semantic_record_key(columns, key_columns, collations, result)
 }
 
 fn semantic_record_key(
     columns: &[String],
     key_columns: &[String],
+    collations: &[graft::repo::SemanticKeyCollation],
     row: &Record,
-) -> Option<Vec<String>> {
-    let mut key = Vec::with_capacity(key_columns.len());
-    for column in key_columns {
-        let index = columns.iter().position(|candidate| candidate == column)?;
-        key.push(semantic_value_key(row, index)?);
+) -> Option<SemanticKeyValue> {
+    let mut normalized = Vec::with_capacity(key_columns.len());
+    let mut display = Vec::with_capacity(key_columns.len());
+    for (column, collation) in key_columns.iter().zip(collations) {
+        let index = columns
+            .iter()
+            .position(|candidate| candidate.eq_ignore_ascii_case(column))?;
+        let value = semantic_value_key(row, index)?;
+        display.push(value.clone());
+        normalized.push(match (collation, value.strip_prefix("t:")) {
+            (graft::repo::SemanticKeyCollation::NoCase, Some(text)) => {
+                format!("t:{}", text.to_ascii_lowercase())
+            }
+            _ => value,
+        });
     }
-    Some(key)
+    Some(SemanticKeyValue { normalized, display })
+}
+
+fn semantic_key_collation(
+    policy: &RowMergePolicy,
+    table: &str,
+    column: &str,
+) -> graft::repo::SemanticKeyCollation {
+    policy
+        .semantic_key_collations
+        .iter()
+        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(table))
+        .and_then(|(_, columns)| {
+            columns
+                .iter()
+                .find(|(candidate, _)| candidate.eq_ignore_ascii_case(column))
+                .map(|(_, collation)| *collation)
+        })
+        .unwrap_or_default()
 }
 
 fn semantic_value_key(row: &Record, index: usize) -> Option<String> {
@@ -1287,6 +1669,8 @@ struct RowTouch {
     change: RowChange,
     columns: Vec<String>,
     semantic_key: Option<Vec<String>>,
+    semantic_key_display: Option<Vec<String>>,
+    semantic_key_collations: Vec<graft::repo::SemanticKeyCollation>,
     can_omit_insert_rowid: bool,
 }
 

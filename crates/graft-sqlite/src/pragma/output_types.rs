@@ -596,12 +596,21 @@ pub(super) struct JsonRowMergeApplyPolicy {
     pub(super) foreign_keys: &'static str,
     pub(super) triggers: &'static str,
     pub(super) validation: Vec<&'static str>,
+    pub(super) same_row_merge: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(super) default_semantic_keys: Vec<String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub(super) semantic_keys: BTreeMap<String, Vec<String>>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub(super) semantic_key_collations:
+        BTreeMap<String, BTreeMap<String, graft::repo::SemanticKeyCollation>>,
     pub(super) internal_resolvers: Vec<JsonRowMergeInternalResolver>,
     pub(super) schema_resolvers: Vec<JsonRowMergeSchemaResolver>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(super) generated_columns: Vec<JsonRowMergeGeneratedColumns>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub(super) column_resolvers:
+        BTreeMap<String, BTreeMap<String, graft::repo::ManagedColumnResolver>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -642,6 +651,10 @@ pub(super) struct JsonRowMergeConflict {
     pub(super) theirs_key: Option<BTreeMap<String, serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) semantic_key: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) semantic_key_collations: Option<Vec<&'static str>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(super) cells: Vec<JsonCellConflict>,
     pub(super) ours: &'static str,
     pub(super) theirs: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -711,6 +724,12 @@ pub(super) struct JsonConflictArtifact {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) resolution: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) auto_resolvable: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) recommended_result: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) recommended_action: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) table: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) columns: Option<Vec<String>>,
@@ -728,6 +747,10 @@ pub(super) struct JsonConflictArtifact {
     pub(super) theirs_key: Option<BTreeMap<String, serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) semantic_key: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) semantic_key_collations: Option<Vec<&'static str>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(super) cells: Vec<JsonCellConflict>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -750,6 +773,16 @@ pub(super) struct JsonConflictArtifact {
     pub(super) theirs_row: Option<Vec<serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct JsonCellConflict {
+    pub(super) column: String,
+    pub(super) base: serde_json::Value,
+    pub(super) ours: serde_json::Value,
+    pub(super) theirs: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) resolution: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Serialize)]

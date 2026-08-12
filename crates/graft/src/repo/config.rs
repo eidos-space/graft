@@ -29,6 +29,7 @@ const DEFAULT_INTERNAL_RESOLVERS: &[(&str, &str)] = &[
     ("sqlite_stat4", "rebuild"),
 ];
 const DEFAULT_SCHEMA_RESOLVERS: &[(&str, &str)] = &[("add_column", "alter_table_add_column")];
+pub const MERGE_POLICY_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RepoConfigEntry {
@@ -452,26 +453,173 @@ pub(super) fn parse_config_schema_resolver_value(
     Ok(value.to_string())
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticKeyCollation {
+    #[default]
+    Binary,
+    #[serde(rename = "nocase", alias = "no_case")]
+    NoCase,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedColumnResolver {
+    IgnoreForConflict,
+    Max,
+    Min,
+    MaxTimestamp,
+    Recompute,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MergeConfig {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub same_row_merge: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub default_semantic_keys: Vec<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub semantic_keys: BTreeMap<String, Vec<String>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub semantic_key_collations: BTreeMap<String, BTreeMap<String, SemanticKeyCollation>>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub internal_resolvers: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub schema_resolvers: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub generated_columns: BTreeMap<String, Vec<String>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub column_resolvers: BTreeMap<String, BTreeMap<String, ManagedColumnResolver>>,
 }
 
 impl MergeConfig {
     fn is_empty(&self) -> bool {
-        self.default_semantic_keys.is_empty()
+        !self.same_row_merge
+            && self.default_semantic_keys.is_empty()
             && self.semantic_keys.is_empty()
+            && self.semantic_key_collations.is_empty()
             && self.internal_resolvers.is_empty()
             && self.schema_resolvers.is_empty()
             && self.generated_columns.is_empty()
+            && self.column_resolvers.is_empty()
+    }
+
+    /// Returns the complete policy used by merge planning, including built-in safe defaults.
+    pub fn effective(&self) -> Self {
+        let mut effective = self.clone();
+        for (subject, resolver) in DEFAULT_INTERNAL_RESOLVERS {
+            effective
+                .internal_resolvers
+                .entry((*subject).to_string())
+                .or_insert_with(|| (*resolver).to_string());
+        }
+        for (operation, resolver) in DEFAULT_SCHEMA_RESOLVERS {
+            effective
+                .schema_resolvers
+                .entry((*operation).to_string())
+                .or_insert_with(|| (*resolver).to_string());
+        }
+        for (table, columns) in &effective.generated_columns {
+            let resolvers = effective.column_resolvers.entry(table.clone()).or_default();
+            for column in columns {
+                resolvers
+                    .entry(column.clone())
+                    .or_insert(ManagedColumnResolver::Recompute);
+            }
+        }
+        effective
+    }
+
+    /// Stable token for the effective policy used by merge planning.
+    pub fn policy_token(&self) -> String {
+        let encoded = serde_json::to_vec(&(MERGE_POLICY_VERSION, self.effective()))
+            .expect("merge policy contains only serializable values");
+        format!(
+            "merge-policy-v{MERGE_POLICY_VERSION}:{}",
+            blake3::hash(&encoded).to_hex()
+        )
+    }
+
+    /// Validates the finite built-in policy vocabulary and cross-field references.
+    pub fn validate(&self) -> Result<()> {
+        for (subject, resolver) in &self.internal_resolvers {
+            if default_internal_resolver(subject) != Some(resolver.as_str()) {
+                return Err(invalid_merge_policy(
+                    format!("merge.internal_resolvers.{subject}"),
+                    resolver,
+                    "unsupported resolver for this internal subject",
+                ));
+            }
+        }
+        for (operation, resolver) in &self.schema_resolvers {
+            if default_schema_resolver(operation) != Some(resolver.as_str()) {
+                return Err(invalid_merge_policy(
+                    format!("merge.schema_resolvers.{operation}"),
+                    resolver,
+                    "unsupported resolver for this schema operation",
+                ));
+            }
+        }
+        for (table, collations) in &self.semantic_key_collations {
+            let keys = self.semantic_keys.get(table).ok_or_else(|| {
+                invalid_merge_policy(
+                    format!("merge.semantic_key_collations.{table}"),
+                    "",
+                    "collations require semantic_keys for the same table",
+                )
+            })?;
+            for column in collations.keys() {
+                if !keys.iter().any(|key| key.eq_ignore_ascii_case(column)) {
+                    return Err(invalid_merge_policy(
+                        format!("merge.semantic_key_collations.{table}.{column}"),
+                        column,
+                        "collation column is not part of the table semantic key",
+                    ));
+                }
+            }
+        }
+        for (table, resolvers) in &self.column_resolvers {
+            if table.trim().is_empty() {
+                return Err(invalid_merge_policy(
+                    "merge.column_resolvers",
+                    table,
+                    "table name must not be empty",
+                ));
+            }
+            if let Some(columns) = self.generated_columns.get(table) {
+                for column in columns {
+                    if resolvers
+                        .get(column)
+                        .is_some_and(|resolver| *resolver != ManagedColumnResolver::Recompute)
+                    {
+                        return Err(invalid_merge_policy(
+                            format!("merge.column_resolvers.{table}.{column}"),
+                            column,
+                            "legacy generated_columns may only map to recompute",
+                        ));
+                    }
+                }
+            }
+            if resolvers.keys().any(|column| column.trim().is_empty()) {
+                return Err(invalid_merge_policy(
+                    format!("merge.column_resolvers.{table}"),
+                    "",
+                    "column name must not be empty",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn invalid_merge_policy(
+    key: impl Into<String>,
+    value: impl Into<String>,
+    message: impl Into<String>,
+) -> RepoErr {
+    RepoErr::InvalidConfigValue {
+        key: key.into(),
+        value: value.into(),
+        message: message.into(),
     }
 }

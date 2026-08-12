@@ -25,6 +25,17 @@ pub struct JsonOpaqueChange {
     pub owner: Option<String>,
 }
 
+/// One generic `sqlite_schema` entry change between two snapshots.
+#[derive(Debug, Clone, Serialize)]
+pub struct JsonSchemaChange {
+    pub name: String,
+    pub entry_type: String,
+    pub op: String,
+    pub sql: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_sql: Option<String>,
+}
+
 /// A row-diff semantic limitation or unsupported `SQLite` surface.
 #[derive(Debug, Clone, Serialize)]
 pub struct JsonDiffLimitation {
@@ -94,6 +105,8 @@ pub struct JsonRepoBoundedDiffFile {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub summaries: Vec<JsonTableSummary>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub schema_changes: Vec<JsonSchemaChange>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tables: Vec<JsonTableChanges>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub opaque_changes: Vec<JsonOpaqueChange>,
@@ -141,6 +154,8 @@ pub struct JsonRepoRowDiffFile {
     pub limitations: Vec<JsonDiffLimitation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub schema_changes: Vec<JsonSchemaChange>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tables: Vec<JsonTableChanges>,
     #[serde(skip_serializing_if = "Vec::is_empty")]

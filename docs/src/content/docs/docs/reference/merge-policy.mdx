@@ -99,12 +99,14 @@ Merge policy lives in `.graft/config.toml` under `[merge]`.
 
 ```toml
 [merge]
-default_semantic_keys = ["_id"]
+same_row_merge = true
+default_semantic_keys = ["external_id"]
 
 [merge.semantic_keys]
-eidos__tree = ["id"]
-eidos__kv = ["key"]
-eidos__messages = ["chat_id", "id"]
+records = ["external_id"]
+
+[merge.semantic_key_collations.records]
+external_id = "nocase"
 
 [merge.internal_resolvers]
 sqlite_sequence = "sequence_max"
@@ -116,7 +118,11 @@ index_btree = "reindex"
 add_column = "alter_table_add_column"
 
 [merge.generated_columns]
-eidos__references = ["display_text"]
+legacy_records = ["search_text"]
+
+[merge.column_resolvers.records]
+updated_at = "max_timestamp"
+search_text = "recompute"
 ```
 
 Applications should generate this config from their own schema policy. Graft's
@@ -173,8 +179,8 @@ though the rowids do not collide.
 default_semantic_keys = ["_id"]
 
 [merge.semantic_keys]
-eidos__kv = ["key"]
-eidos__messages = ["chat_id", "id"]
+settings = ["key"]
+messages = ["thread_id", "external_id"]
 ```
 
 Table-specific keys override the default for that table. The default applies
@@ -183,7 +189,48 @@ only to tables that contain all configured columns.
 Row conflict reasons include:
 
 - `row_conflict`: both sides touched the same row identity incompatibly
-- `semantic_key_conflict`: both sides inserted or touched rows with the same configured semantic identity
+- `cell_conflict`: an explicitly enabled same-row merge found different values
+  for the same column
+- `semantic_key_conflict`: insert/insert, insert/update, or update/update
+  results have the same configured semantic identity
+
+`BINARY` is the default semantic-key collation. A table/column may opt into
+SQLite's built-in ASCII `NOCASE` behavior:
+
+```toml
+[merge.semantic_key_collations.records]
+external_id = "nocase"
+```
+
+Conflict output includes both physical identities, the display semantic key,
+and the selected collation.
+
+## Same-Row And Managed Columns
+
+Same-row field merging is intentionally opt-in:
+
+```toml
+[merge]
+same_row_merge = true
+```
+
+When enabled, disjoint changed columns combine, equal values for the same
+column collapse, and different values for the same column remain structured
+cell conflicts. Delete/update remains a conflict.
+
+Managed columns use only Graft's finite resolvers:
+
+| Resolver | Meaning |
+| --- | --- |
+| `ignore_for_conflict` | Prefer Ours only when both sides changed the managed value; a one-sided change is retained. |
+| `max`, `min` | Select the ordered maximum or minimum supported SQLite value. |
+| `max_timestamp` | Select the maximum integer or normalized sortable text timestamp. |
+| `recompute` | Omit the column from replay and require application-owned recomputation and validation. |
+
+`recompute` never runs application code. It returns a `recompute_required`
+validation artifact and a candidate containing the other merged fields. After
+recomputing, call `stageMergeSqliteResult`; Graft captures that exact database,
+runs integrity and foreign-key checks in private storage, then stages it.
 
 ## Generated Columns
 
@@ -197,7 +244,21 @@ my_table = ["search_text", "computed_total"]
 ```
 
 This is an application schema policy. It should match the schema that the
-application actually creates.
+application actually creates. This legacy setting is normalized to the
+`recompute` managed-column resolver.
+
+## Typed SDK And Policy Freezing
+
+The Node/Electron SDK exposes `getMergePolicy`, `validateMergePolicy`, and
+`setMergePolicy`. Version 1 is a data-only ABI with finite resolvers. Every
+effective policy has a stable `policy_token`; setting requires
+`expectedPolicyToken`. Merge plans bind this token and version into
+`plan_token`.
+
+Three-way apply freezes the effective policy in the active merge journal.
+`getMergeStatus` reports that actual token/version, and policy changes are
+rejected until the merge is completed or aborted and replanned. All async SDK
+policy calls accept `AbortSignal`.
 
 ## Apply Policy And Validation
 
@@ -219,7 +280,8 @@ The apply policy appears in conflict analysis JSON:
   "apply_policy": {
     "foreign_keys": "disabled_during_apply_checked_after",
     "triggers": "disabled_during_apply",
-    "validation": ["integrity_check", "foreign_key_check"]
+    "validation": ["integrity_check", "foreign_key_check"],
+    "same_row_merge": true
   }
 }
 ```

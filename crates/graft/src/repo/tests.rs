@@ -454,6 +454,68 @@ fn config_get_set_manages_remaining_merge_policy_keys() {
 }
 
 #[test]
+fn versioned_merge_policy_is_normalized_validated_and_tokenized() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = Repository::init(tmp.path()).unwrap();
+    let initial_raw = fs::read(repo.graft_dir().join(CONFIG_FILE)).unwrap();
+    let initial = repo.config().unwrap().merge.effective();
+    assert_eq!(
+        initial.internal_resolvers["sqlite_sequence"],
+        "sequence_max"
+    );
+    assert_eq!(
+        initial.schema_resolvers["add_column"],
+        "alter_table_add_column"
+    );
+    let initial_token = initial.policy_token();
+
+    let mut config = repo.config().unwrap();
+    config.merge.same_row_merge = true;
+    config
+        .merge
+        .semantic_keys
+        .insert("records".into(), vec!["external_id".into()]);
+    config.merge.semantic_key_collations.insert(
+        "records".into(),
+        BTreeMap::from([("external_id".into(), SemanticKeyCollation::NoCase)]),
+    );
+    config
+        .merge
+        .generated_columns
+        .insert("records".into(), vec!["search_text".into()]);
+    config.merge.column_resolvers.insert(
+        "records".into(),
+        BTreeMap::from([("updated_at".into(), ManagedColumnResolver::MaxTimestamp)]),
+    );
+    repo.write_config(&config).unwrap();
+    let effective = repo.config().unwrap().merge.effective();
+    assert_eq!(
+        effective.column_resolvers["records"]["search_text"],
+        ManagedColumnResolver::Recompute
+    );
+    assert_ne!(effective.policy_token(), initial_token);
+
+    let before_invalid = fs::read(repo.graft_dir().join(CONFIG_FILE)).unwrap();
+    let mut invalid = repo.config().unwrap();
+    invalid
+        .merge
+        .semantic_key_collations
+        .get_mut("records")
+        .unwrap()
+        .insert("missing".into(), SemanticKeyCollation::Binary);
+    assert!(matches!(
+        repo.write_config(&invalid),
+        Err(RepoErr::InvalidConfigValue { key, .. })
+            if key == "merge.semantic_key_collations.records.missing"
+    ));
+    assert_eq!(
+        fs::read(repo.graft_dir().join(CONFIG_FILE)).unwrap(),
+        before_invalid
+    );
+    assert_ne!(before_invalid, initial_raw);
+}
+
+#[test]
 fn config_list_reports_effective_supported_entries() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = Repository::init(tmp.path()).unwrap();

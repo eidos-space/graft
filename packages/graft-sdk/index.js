@@ -180,6 +180,31 @@ class RepositorySession {
     return callJson(() => this.#native.pull(remote, branch, signal))
   }
 
+  async getMergePolicy({ signal } = {}) {
+    signal?.throwIfAborted()
+    return callJson(() => this.#native.getMergePolicy(signal))
+  }
+
+  async validateMergePolicy({ policy, signal }) {
+    signal?.throwIfAborted()
+    return callJson(() =>
+      this.#native.validateMergePolicy(JSON.stringify(policy), signal)
+    )
+  }
+
+  async setMergePolicy({ policy, expectedPolicyToken, signal }) {
+    signal?.throwIfAborted()
+    return callJson(() =>
+      this.#native.setMergePolicy(
+        {
+          policyJson: JSON.stringify(policy),
+          expectedPolicyToken,
+        },
+        signal
+      )
+    )
+  }
+
   async planMerge(options) {
     const { signal, ...mergeOptions } = options
     return callJson(() => this.#native.planMerge(mergeOptions, signal))
@@ -243,6 +268,13 @@ class RepositorySession {
     )
   }
 
+  async diffMergeSqlite(options) {
+    const { signal, ...diffOptions } = options
+    return callJson(() =>
+      this.#native.diffMergeSqlite(diffOptions, signal)
+    )
+  }
+
   async setMergePathResult(options) {
     const { signal, ...resultOptions } = options
     return callJson(() =>
@@ -260,6 +292,40 @@ class RepositorySession {
         },
         signal
       )
+    )
+  }
+
+  async resolveMergeCell(options) {
+    const { signal, identity, ...cellOptions } = options
+    return callJson(() =>
+      this.#native.resolveMergeCell(
+        {
+          ...cellOptions,
+          identity: JSON.stringify(identity),
+        },
+        signal
+      )
+    )
+  }
+
+  async resolveMergeTable(options) {
+    const { signal, ...tableOptions } = options
+    return callJson(() =>
+      this.#native.resolveMergeTable(tableOptions, signal)
+    )
+  }
+
+  async stageMergeSqliteResult(options) {
+    const { signal, ...resultOptions } = options
+    return callJson(() =>
+      this.#native.stageMergeSqliteResult(resultOptions, signal)
+    )
+  }
+
+  async unresolveMergePath(options) {
+    const { signal, ...pathOptions } = options
+    return callJson(() =>
+      this.#native.unresolveMergePath(pathOptions, signal)
     )
   }
 

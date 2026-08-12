@@ -155,6 +155,59 @@ export interface ApplyMergeOptions extends OperationOptions {
   planToken: string
 }
 
+export type SemanticKeyCollation = "binary" | "nocase"
+export type ManagedColumnResolver =
+  | "ignore_for_conflict"
+  | "max"
+  | "min"
+  | "max_timestamp"
+  | "recompute"
+
+/** Versioned policy with only Graft's finite built-in merge resolvers. */
+export interface MergePolicy {
+  version: 1
+  same_row_merge?: boolean
+  default_semantic_keys?: string[]
+  semantic_keys?: Record<string, string[]>
+  semantic_key_collations?: Record<
+    string,
+    Record<string, SemanticKeyCollation>
+  >
+  internal_resolvers?: Record<string, string>
+  schema_resolvers?: Record<string, string>
+  /** Backward-compatible entries normalized to the recompute resolver. */
+  generated_columns?: Record<string, string[]>
+  column_resolvers?: Record<string, Record<string, ManagedColumnResolver>>
+}
+
+export interface MergePolicyResult {
+  policy: MergePolicy
+  policy_token: string
+  active_merge: boolean
+}
+
+export interface MergePolicyValidationIssue {
+  key: string
+  value: string
+  message: string
+}
+
+export interface MergePolicyValidationResult {
+  valid: boolean
+  policy: MergePolicy | null
+  policy_token: string | null
+  errors: MergePolicyValidationIssue[]
+}
+
+export interface ValidateMergePolicyOptions extends OperationOptions {
+  policy: MergePolicy
+}
+
+export interface SetMergePolicyOptions extends OperationOptions {
+  policy: MergePolicy
+  expectedPolicyToken: string
+}
+
 export interface MergePlanResult {
   kind: MergePlanKind
   expected_head: string | null
@@ -163,6 +216,8 @@ export interface MergePlanResult {
   staged_paths: string[]
   conflicted_paths: string[]
   plan_token: string
+  policy_token: string
+  policy_version: number
 }
 
 export type MergeStatus =
@@ -175,6 +230,8 @@ export type MergeStatus =
       staged_count: number
       unmerged_count: number
       state_token: string
+      policy_token: string
+      policy_version: number
     }
 
 export interface MergeApplyResult {
@@ -223,6 +280,14 @@ export interface MergeSchemaColumnChange {
   to?: string
 }
 
+export interface MergeCellConflict {
+  column: string
+  base: unknown
+  ours: unknown
+  theirs: unknown
+  resolution?: "ours" | "theirs"
+}
+
 export interface MergeConflict {
   id: string
   path: string
@@ -231,7 +296,10 @@ export interface MergeConflict {
   kind: "row" | "schema" | "opaque" | "file" | string
   reason: string
   status: "resolved" | "unresolved"
-  resolution?: "ours" | "theirs"
+  resolution?: "ours" | "theirs" | "manual" | "edited" | "cells"
+  auto_resolvable?: boolean
+  recommended_result?: "ours" | "theirs" | "merged"
+  recommended_action?: "apply_merge" | "stage_worktree_result" | string
   table?: string
   columns?: string[]
   rowid?: number
@@ -241,6 +309,8 @@ export interface MergeConflict {
   ours_key?: Record<string, unknown>
   theirs_key?: Record<string, unknown>
   semantic_key?: string[]
+  semantic_key_collations?: SemanticKeyCollation[]
+  cells?: MergeCellConflict[]
   name?: string
   entry_type?: string
   column_changes?: MergeSchemaColumnChange[]
@@ -289,6 +359,37 @@ export interface MergeContent {
   state_token: string
 }
 
+export type MergeSqliteVersion = "base" | "ours" | "theirs"
+
+interface DiffMergeSqliteBase extends OperationOptions {
+  path: string
+  from: MergeSqliteVersion
+  to: MergeSqliteVersion
+  expectedStateToken: string
+}
+
+export type DiffMergeSqliteOptions =
+  | (DiffMergeSqliteBase & {
+      mode: "summary"
+      table?: never
+      rowLimit?: never
+      rowAfter?: never
+    })
+  | (DiffMergeSqliteBase & {
+      mode: "rows"
+      table: string
+      rowLimit?: number
+      rowAfter?: string
+    })
+
+export interface MergeSqliteDiffResult {
+  state_token: string
+  path: string
+  from: { version: MergeSqliteVersion; revision: string }
+  to: { version: MergeSqliteVersion; revision: string }
+  diff: BoundedSqliteRepositoryDiff
+}
+
 export type MergePathResult = "ours" | "theirs"
 
 export interface SetMergePathResultOptions extends OperationOptions {
@@ -303,6 +404,33 @@ export interface ResolveMergeRowOptions extends OperationOptions {
   /** Integer rowid or an object containing every declared primary-key field. */
   identity: number | Record<string, unknown>
   result: MergePathResult
+  expectedStateToken: string
+}
+
+export interface ResolveMergeCellOptions extends OperationOptions {
+  path: string
+  table: string
+  /** Integer rowid or an object containing every declared primary-key field. */
+  identity: number | Record<string, unknown>
+  column: string
+  result: MergePathResult
+  expectedStateToken: string
+}
+
+export interface ResolveMergeTableOptions extends OperationOptions {
+  path: string
+  table: string
+  result: MergePathResult
+  expectedStateToken: string
+}
+
+export interface UnresolveMergePathOptions extends OperationOptions {
+  path: string
+  expectedStateToken: string
+}
+
+export interface StageMergeSqliteResultOptions extends OperationOptions {
+  path: string
   expectedStateToken: string
 }
 
@@ -358,6 +486,15 @@ export interface RepositoryStatusPath {
   [key: string]: unknown
 }
 
+export interface RepositoryPathDiagnostic {
+  path: string
+  status: "skipped" | "corrupt" | "analysis_failed"
+  operation: string
+  /** False when the current worktree bytes have not been captured in the index. */
+  protected_by_index: boolean
+  message: string
+}
+
 export type RepositoryUpstreamState =
   | "up_to_date"
   | "ahead"
@@ -393,6 +530,7 @@ export interface RepositoryStatus {
   unstaged: string[]
   staged: string[]
   conflicted: string[]
+  path_diagnostics?: RepositoryPathDiagnostic[]
   upstream: { remote: string; branch: string } | null
   upstream_status?: RepositoryUpstreamStatus
   ahead: number
@@ -587,6 +725,13 @@ export interface BoundedSqliteDiffFile {
   limitations: Array<{ kind: string; subject?: string }>
   message?: string
   summaries?: SqliteTableSummary[]
+  schema_changes?: Array<{
+    name: string
+    entry_type: string
+    op: "added" | "deleted" | "modified"
+    sql: string
+    old_sql?: string
+  }>
   tables?: SqliteRowChangeTable[]
   opaque_changes?: unknown[]
   has_more: boolean
@@ -801,6 +946,11 @@ export class RepositorySession {
   push(options?: RemoteOperationOptions): Promise<GraftJson>
   fetch(options?: RemoteOperationOptions): Promise<GraftJson>
   pull(options?: RemoteOperationOptions): Promise<GraftJson>
+  getMergePolicy(options?: OperationOptions): Promise<MergePolicyResult>
+  validateMergePolicy(
+    options: ValidateMergePolicyOptions
+  ): Promise<MergePolicyValidationResult>
+  setMergePolicy(options: SetMergePolicyOptions): Promise<MergePolicyResult>
   planMerge(options: PlanMergeOptions): Promise<MergePlanResult>
   applyMerge(options: ApplyMergeOptions): Promise<MergeApplyResult>
   getMergeStatus(options?: OperationOptions): Promise<MergeStatus>
@@ -809,11 +959,26 @@ export class RepositorySession {
     options: ListMergeConflictsOptions
   ): Promise<MergeConflictPage>
   readMergeVersion(options: ReadMergeVersionOptions): Promise<MergeContent>
+  diffMergeSqlite(
+    options: DiffMergeSqliteOptions
+  ): Promise<MergeSqliteDiffResult>
   setMergePathResult(
     options: SetMergePathResultOptions
   ): Promise<MergeOperationResult>
   resolveMergeRow(
     options: ResolveMergeRowOptions
+  ): Promise<MergeOperationResult>
+  resolveMergeCell(
+    options: ResolveMergeCellOptions
+  ): Promise<MergeOperationResult>
+  resolveMergeTable(
+    options: ResolveMergeTableOptions
+  ): Promise<MergeOperationResult>
+  stageMergeSqliteResult(
+    options: StageMergeSqliteResultOptions
+  ): Promise<MergeOperationResult>
+  unresolveMergePath(
+    options: UnresolveMergePathOptions
   ): Promise<MergeOperationResult>
   writeAndStageTextResult(
     options: WriteAndStageTextResultOptions

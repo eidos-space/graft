@@ -3,6 +3,41 @@
 This changelog covers the independently versioned `@eidos.space/graft` package. Core Graft CLI and
 SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
 
+## Graft SDK 0.3.10 — 2026-08-12
+
+### Added
+
+- Added versioned, compare-and-swap merge policies with explicit same-row merging, semantic-key
+  collations, and data-only managed-column resolvers. Plans bind the exact policy token and active
+  merges freeze that policy until continue or abort.
+- Added durable cell and safe table resolution, reversible path resolution, and validated staging
+  of an application-owned SQLite result. Every new asynchronous SDK operation accepts an
+  `AbortSignal`.
+- Added directory-wide multi-SQLite schema union, validated table rebuilds, SQLite internal-state
+  resolvers, and structured diagnostics for skipped, corrupt, or analysis-failed tracked paths.
+
+### Changed
+
+- Merge inspection now retains resolved and unresolved conflict detail across session reopen and
+  reports structured cell values, resolution state, recommendations, and current policy metadata.
+- Worktree materialization declarations now cover every merge apply, resolution, unresolve,
+  edited-text, continue, and abort operation so hosts can close and restore live SQLite handles.
+
+### Fixed
+
+- Compatible column, table, index, view, and trigger changes now form one validated result across
+  every SQLite database in a directory-backed repository.
+- Complete-file table/view collision choices no longer read the wrong object as a table B-tree, and
+  malformed tracked SQLite files remain dirty with a precise non-destructive diagnostic.
+
+### Compatibility
+
+- Existing repository and Remote object formats are unchanged. Policy v1 defaults
+  `same_row_merge` to false, so applications must opt in explicitly for formats that support it.
+- Policy resolvers remain generic and data-only; application-specific recomputation and domain
+  validation stay with the host before `stageMergeSqliteResult`.
+- Node.js 20 remains the minimum supported runtime.
+
 ## Graft SDK 0.3.9 — 2026-08-11
 
 ### Added

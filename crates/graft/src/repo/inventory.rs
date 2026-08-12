@@ -97,6 +97,7 @@ impl Repository {
             staged_changes,
             conflicted,
             conflicted_changes,
+            path_diagnostics: Vec::new(),
             branches,
             remotes,
             upstream,

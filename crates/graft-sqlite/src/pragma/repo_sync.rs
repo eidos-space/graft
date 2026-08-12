@@ -124,7 +124,19 @@ pub(super) fn run_repo_pull(
         &previous_artifacts,
         Some(checkout_remote.clone()),
     )?;
+    initialize_merge_resolution_state(&repo)?;
     if let Ok(Some(row_auto_merge)) = try_row_auto_merge_current_file_conflict(
+        runtime,
+        file,
+        &repo,
+        &outcome.merge,
+        Some(checkout_remote.clone()),
+        true,
+    ) && row_auto_merge.resolved
+    {
+        outcome.merge = merge_outcome_with_row_auto_merge(&outcome.merge, &row_auto_merge.key);
+    }
+    match try_row_auto_merge_conflicts(
         runtime,
         file,
         &repo,
@@ -132,7 +144,14 @@ pub(super) fn run_repo_pull(
         Some(checkout_remote),
         true,
     ) {
-        outcome.merge = merge_outcome_with_row_auto_merge(&outcome.merge, &row_auto_merge.key);
+        Ok(results) => {
+            for result in results {
+                if result.resolved {
+                    outcome.merge = merge_outcome_with_row_auto_merge(&outcome.merge, &result.key);
+                }
+            }
+        }
+        Err(err) => tracing::warn!("SQLite auto-merge unavailable: {err}"),
     }
     let paths = merge_path_actions(
         &repo,
