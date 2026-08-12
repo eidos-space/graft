@@ -3,6 +3,27 @@
 This changelog covers the independently versioned `@eidos.space/graft` package. Core Graft CLI and
 SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
 
+## Unreleased
+
+## Graft SDK 0.3.11 — 2026-08-13
+
+### Added
+
+- Added real HTTP upload/download byte progress for `push`, `fetch`, `pull`, and
+  `cloneRepository`, including optional totals and rate-limited final events for indeterminate
+  response bodies.
+
+### Fixed
+
+- Freshly cloned SQLite worktrees no longer appear modified when the source and destination were
+  written by different SQLite library versions; volatile page-one header metadata is ignored while
+  actual database-content changes remain detectable.
+
+### Compatibility
+
+- Existing repository and Remote formats are unchanged. Transfer progress callbacks are optional
+  and additive, and Node.js 20 remains the minimum supported runtime.
+
 ## Graft SDK 0.3.10 — 2026-08-12
 
 ### Added

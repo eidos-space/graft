@@ -511,6 +511,26 @@ index, and matcher cache hits; a hot cached page examines zero tracked paths.
 Telemetry contains only durations, counts, and cache/object-read facts. It never contains bearer
 tokens or absolute user paths.
 
+## Remote transfer progress
+
+`push`, `fetch`, `pull`, and `cloneRepository` accept an `onProgress` callback:
+
+```js
+await session.push({
+  onProgress({ direction, transferredBytes, totalBytes }) {
+    const percent = totalBytes
+      ? Math.round((transferredBytes / totalBytes) * 100)
+      : undefined
+    renderTransfer({ direction, transferredBytes, totalBytes, percent })
+  },
+})
+```
+
+Events count cumulative HTTP body bytes for the current operation. `totalBytes` is omitted when
+the server does not provide a trustworthy length, so hosts should keep the progress indicator
+indeterminate while still showing transferred bytes and a locally calculated speed. Multiple
+requests and retries are cumulative; command phases are not transfer percentages.
+
 ## Cancellation, conflicts, and errors
 
 Every asynchronous method accepts `{ signal }`. Aborting still cancels queued Node/libuv work and

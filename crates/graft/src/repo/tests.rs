@@ -998,6 +998,41 @@ fn cancellation_scope_returns_cancelled_without_poisoning_repository() {
 }
 
 #[test]
+fn transfer_progress_reports_known_and_unknown_body_lengths() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let captured = events.clone();
+    let reporter = TransferProgressReporter::new(move |progress| {
+        captured.lock().unwrap().push(progress);
+    });
+
+    with_transfer_progress(&reporter, || {
+        let mut upload = begin_transfer_progress(TransferDirection::Upload, Some(5)).unwrap();
+        upload.advance(2);
+        upload.advance(3);
+
+        let mut download = begin_transfer_progress(TransferDirection::Download, None).unwrap();
+        download.advance(7);
+        download.finish();
+    });
+
+    let events = events.lock().unwrap();
+    assert!(events.contains(&TransferProgress {
+        direction: TransferDirection::Upload,
+        transferred_bytes: 5,
+        total_bytes: Some(5),
+    }));
+    assert_eq!(
+        events.last(),
+        Some(&TransferProgress {
+            direction: TransferDirection::Download,
+            transferred_bytes: 7,
+            total_bytes: None,
+        })
+    );
+    assert!(begin_transfer_progress(TransferDirection::Upload, Some(1)).is_none());
+}
+
+#[test]
 fn remote_wait_is_cancelled_without_a_wall_clock_request_timeout() {
     let token = CancellationToken::new();
     let canceller = token.clone();

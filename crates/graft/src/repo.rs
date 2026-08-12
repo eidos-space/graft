@@ -9,7 +9,7 @@ use std::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(unix)]
@@ -86,6 +86,176 @@ const ARTIFACT_STAT_CACHE_MAX_ENTRIES: usize = 100_000;
 
 thread_local! {
     static ACTIVE_CANCELLATION: RefCell<Option<CancellationToken>> = const { RefCell::new(None) };
+    static ACTIVE_TRANSFER_PROGRESS: RefCell<Option<TransferProgressReporter>> = const { RefCell::new(None) };
+}
+
+const TRANSFER_PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(100);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferDirection {
+    Upload,
+    Download,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransferProgress {
+    pub direction: TransferDirection,
+    pub transferred_bytes: u64,
+    pub total_bytes: Option<u64>,
+}
+
+#[derive(Default)]
+struct TransferProgressCounters {
+    upload: TransferProgressDirectionCounters,
+    download: TransferProgressDirectionCounters,
+}
+
+#[derive(Default)]
+struct TransferProgressDirectionCounters {
+    transferred_bytes: u64,
+    total_bytes: u64,
+    indeterminate: bool,
+    last_emit: Option<Instant>,
+}
+
+struct TransferProgressReporterInner {
+    callback: Arc<dyn Fn(TransferProgress) + Send + Sync>,
+    counters: Mutex<TransferProgressCounters>,
+}
+
+#[derive(Clone)]
+pub struct TransferProgressReporter {
+    inner: Arc<TransferProgressReporterInner>,
+}
+
+impl TransferProgressReporter {
+    pub fn new(callback: impl Fn(TransferProgress) + Send + Sync + 'static) -> Self {
+        Self {
+            inner: Arc::new(TransferProgressReporterInner {
+                callback: Arc::new(callback),
+                counters: Mutex::new(TransferProgressCounters::default()),
+            }),
+        }
+    }
+
+    fn begin(&self, direction: TransferDirection, total_bytes: Option<u64>) {
+        let progress = {
+            let mut counters = self.inner.counters.lock().unwrap();
+            let counters = direction_counters(&mut counters, direction);
+            match total_bytes {
+                Some(total_bytes) => {
+                    counters.total_bytes = counters.total_bytes.saturating_add(total_bytes);
+                }
+                None => counters.indeterminate = true,
+            }
+            counters.last_emit = Some(Instant::now());
+            transfer_progress(direction, counters)
+        };
+        (self.inner.callback)(progress);
+    }
+
+    fn advance(&self, direction: TransferDirection, bytes: u64, force: bool) {
+        let progress = {
+            let mut counters = self.inner.counters.lock().unwrap();
+            let counters = direction_counters(&mut counters, direction);
+            counters.transferred_bytes = counters.transferred_bytes.saturating_add(bytes);
+            let now = Instant::now();
+            if !force
+                && counters.last_emit.is_some_and(|last_emit| {
+                    now.duration_since(last_emit) < TRANSFER_PROGRESS_EMIT_INTERVAL
+                })
+            {
+                return;
+            }
+            counters.last_emit = Some(now);
+            transfer_progress(direction, counters)
+        };
+        (self.inner.callback)(progress);
+    }
+}
+
+fn direction_counters(
+    counters: &mut TransferProgressCounters,
+    direction: TransferDirection,
+) -> &mut TransferProgressDirectionCounters {
+    match direction {
+        TransferDirection::Upload => &mut counters.upload,
+        TransferDirection::Download => &mut counters.download,
+    }
+}
+
+fn transfer_progress(
+    direction: TransferDirection,
+    counters: &TransferProgressDirectionCounters,
+) -> TransferProgress {
+    TransferProgress {
+        direction,
+        transferred_bytes: counters.transferred_bytes,
+        total_bytes: (!counters.indeterminate).then_some(counters.total_bytes),
+    }
+}
+
+pub(crate) struct TransferProgressHandle {
+    reporter: TransferProgressReporter,
+    direction: TransferDirection,
+    expected_bytes: Option<u64>,
+    transferred_bytes: u64,
+}
+
+impl TransferProgressHandle {
+    pub(crate) fn advance(&mut self, bytes: u64) {
+        self.transferred_bytes = self.transferred_bytes.saturating_add(bytes);
+        self.reporter.advance(
+            self.direction,
+            bytes,
+            self.expected_bytes
+                .is_some_and(|expected| self.transferred_bytes >= expected),
+        );
+    }
+
+    pub(crate) fn finish(&mut self) {
+        self.reporter.advance(self.direction, 0, true);
+    }
+}
+
+pub(crate) fn begin_transfer_progress(
+    direction: TransferDirection,
+    total_bytes: Option<u64>,
+) -> Option<TransferProgressHandle> {
+    ACTIVE_TRANSFER_PROGRESS.with(|active| {
+        let reporter = active.borrow().clone()?;
+        reporter.begin(direction, total_bytes);
+        Some(TransferProgressHandle {
+            reporter,
+            direction,
+            expected_bytes: total_bytes,
+            transferred_bytes: 0,
+        })
+    })
+}
+
+pub struct TransferProgressScope(Option<TransferProgressReporter>);
+
+impl TransferProgressScope {
+    pub fn enter(reporter: &TransferProgressReporter) -> Self {
+        Self(ACTIVE_TRANSFER_PROGRESS.with(|active| active.replace(Some(reporter.clone()))))
+    }
+}
+
+impl Drop for TransferProgressScope {
+    fn drop(&mut self) {
+        ACTIVE_TRANSFER_PROGRESS.with(|active| {
+            active.replace(self.0.take());
+        });
+    }
+}
+
+pub fn with_transfer_progress<T>(
+    reporter: &TransferProgressReporter,
+    operation: impl FnOnce() -> T,
+) -> T {
+    let _scope = TransferProgressScope::enter(reporter);
+    operation()
 }
 
 /// A cheap cooperative cancellation flag for repository operations.

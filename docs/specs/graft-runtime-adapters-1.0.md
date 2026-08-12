@@ -171,6 +171,12 @@ as the typed bounded SQLite-diff specialization and `cloneRepository` avoiding
 the reserved/general meaning of `clone`. `packages/graft-sdk/index.d.ts` is the
 canonical JavaScript type contract for exact option and result fields.
 
+`push`, `fetch`, `pull`, and `cloneRepository` accept an optional
+`onProgress` callback. Its events report cumulative HTTP body bytes for the
+current operation, a direction of `upload` or `download`, and `totalBytes` when
+the transport provides a trustworthy length. A host MUST treat an absent total
+as indeterminate and MUST NOT derive a percentage from command phases.
+
 Inputs use JavaScript camelCase. Parsed JSON results preserve repository
 snake_case field names, including `expected_head`, `plan_token`, `state_token`,
 `materializes_worktree`, and telemetry fields. Bindings MUST NOT silently rename
@@ -287,6 +293,16 @@ have an uncertain outcome and follows Remote Sync recovery semantics.
 Cancellation does not poison the retained session. JavaScript maps the stable
 SDK cancellation code to an `AbortError`.
 
+### 9.1 Transfer progress
+
+Progress counts bytes consumed by an HTTP upload body or received from an HTTP
+download body. Multiple requests and retries in one operation are cumulative;
+the total grows as their lengths become known. Events are rate-limited during
+transfer and include a final event for a successfully consumed body. Progress
+is observational: callbacks do not change publication, recovery, cancellation,
+or error semantics, and callback delivery does not make an uncertain remote
+publication certain.
+
 ## 10. Stable errors
 
 Rust and Node expose these codes:
@@ -380,9 +396,10 @@ repository behavior.
 7. cache hit equivalence, invalidation, atomic persistence, and redaction;
 8. path-race stale errors and retry bounds;
 9. cancellation before/after safe mutation boundaries;
-10. stable error mapping and credential redaction;
-11. conservative materialization classification; and
-12. Node async execution and native-package selection.
+10. cumulative known/unknown-length HTTP transfer progress and final events;
+11. stable error mapping and credential redaction;
+12. conservative materialization classification; and
+13. Node async execution and native-package selection.
 
 `GRAFT-Browser-1.0` additionally tests the real WASM command, OPFS persistence,
 memory-backed temporary storage, worker restart/reopen, merge recovery, version

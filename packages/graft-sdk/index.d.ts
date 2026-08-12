@@ -131,12 +131,20 @@ export interface RemoteConfigureOptions extends OperationOptions {
 export interface RemoteOperationOptions extends OperationOptions {
   remote?: string
   branch?: string
+  onProgress?: (progress: TransferProgress) => void
 }
 
 export interface CloneOptions extends OperationOptions {
   remoteUrl: string
   branch?: string
   bearerToken?: string
+  onProgress?: (progress: TransferProgress) => void
+}
+
+export interface TransferProgress {
+  direction: "upload" | "download"
+  transferredBytes: number
+  totalBytes?: number
 }
 
 export type MergePlanKind = "up_to_date" | "fast_forward" | "three_way"

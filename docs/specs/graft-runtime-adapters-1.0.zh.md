@@ -118,6 +118,11 @@ JavaScript 使用 camelCase method；`diffSqlitePaths` 是 typed bounded SQLite 
 Input camelCase，JSON result 保持 snake_case，如 `expected_head`、`plan_token`、
 `state_token`、`materializes_worktree`。Binding 不能私自改 field。
 
+`push`、`fetch`、`pull` 与 `cloneRepository` 可接收 `onProgress` callback。事件报告
+当前操作累计的 HTTP body bytes、`upload`/`download` direction，以及 transport 能可靠
+提供长度时的 `totalBytes`。总量缺失表示 indeterminate；host 不能用 command phase
+伪造 percentage。
+
 会竞争的 mutation 使用 `expectedHead`、plan token 或 state token。Typed result
 包括 status/history/diff/inventory/metadata/merge page、legacy/general `GraftJson`，
 或 lifecycle primitive。Batch 要标识 affected path；pagination 要有 continuation；
@@ -180,6 +185,14 @@ Durable boundary 前取消无效果；multi-path 可能完成合法 prefix，后
 Remote in-flight publication 可能 outcome unknown。取消不 poison session；JS 映射为
 `AbortError`。
 
+### 9.1 Transfer progress
+
+Progress 统计 HTTP upload body 被消费的 bytes，或 HTTP download body 实际收到的
+bytes。同一 operation 的多个 request 与 retry 累计计算；已知 request length 加入时
+total 随之增长。传输中事件会限频，成功消费完 body 后发送 final event。Progress 只
+用于观察，不改变 publication、recovery、cancellation 或 error semantics，也不能把
+uncertain remote publication 变成确定结果。
+
 ## 10. Stable error
 
 ```text
@@ -232,9 +245,10 @@ presentation，不能作为 core conformance。
 
 至少测试 CLI/SDK shared operation 等价、无 PRAGMA control-plane、lifecycle/reopen、
 serialization/busy、TypeScript option/result、JSON field、cache、stale retry、cancel、
-error/redaction、materialization gate 与 Node async/package selection。Browser 还要测
-real WASM、OPFS persistence、memory temp、worker restart、merge recovery、version
-manifest 与 unavailable capability。
+known/unknown-length HTTP transfer progress 与 final event、error/redaction、
+materialization gate 与 Node async/package selection。Browser 还要测 real WASM、
+OPFS persistence、memory temp、worker restart、merge recovery、version manifest 与
+unavailable capability。
 
 当前证据位于 `repo_service.rs`、`graft-sdk`、`graft-sdk-node`、`packages/graft-sdk`、
 CLI test 与 `web-demo` worker/unit/Playwright test。
