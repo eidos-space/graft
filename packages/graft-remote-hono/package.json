@@ -1,6 +1,6 @@
 {
   "name": "@eidos.space/graft-remote-hono",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Hono adapter for @eidos.space/graft-remote",
   "type": "module",
   "license": "MIT",

@@ -24,6 +24,7 @@ export const RECEIVE_PACK_HEADER_PACK_BYTES = "x-graft-pack-bytes";
 export const RECEIVE_PACK_HEADER_INDEX_BYTES = "x-graft-index-bytes";
 export const RECEIVE_PACK_HEADER_REPLACEMENT_HEX = "x-graft-ref-replacement-hex";
 export const RECEIVE_BUNDLE_HEADER_MANIFEST_BYTES = "x-graft-bundle-manifest-bytes";
+export const UPLOAD_BUNDLE_HEADER_TOTAL_BYTES = "x-graft-bundle-total-bytes";
 export const MULTIPART_HEADER_OBJECT_BYTES = "x-graft-object-bytes";
 export const MULTIPART_HEADER_UPLOAD_ID = "x-graft-upload-id";
 export const MULTIPART_HEADER_PART_NUMBER = "x-graft-part-number";

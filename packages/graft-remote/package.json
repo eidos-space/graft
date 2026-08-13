@@ -1,6 +1,6 @@
 {
   "name": "@eidos.space/graft-remote",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Framework-neutral types and protocol engine for Graft remote services",
   "type": "module",
   "license": "MIT",

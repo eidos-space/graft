@@ -114,7 +114,11 @@ Upload-bundle 在 enumerate 前后两次读 ref；变化则 `409`。Stable respo
 Response 使用 `application/vnd.graft.upload-bundle` 与
 `x-graft-bundle-manifest-bytes`。Manifest 记录 version、reference path/value_hex、
 object count；每 frame 是 4-byte path length、8-byte object length、UTF-8 path、body，
-最后一个 frame 后必须立即结束。
+最后一个 frame 后必须立即结束。Response 必须通过
+`x-graft-bundle-total-bytes` 声明完整 framed body 的精确字节数；host 允许为 stream
+指定长度时，`Content-Length` 应为同一值。Client 必须优先使用 Graft total header
+显示传输总大小，可为旧 service fallback 到 `Content-Length`；两者同时存在但不一致时
+必须拒绝 response。
 
 Receive-pack 先 immutable 创建 pack/index，最后 ref CAS；malformed/truncated body
 不能更新 ref。Header 包含 64 位 lowercase pack ID、pack/index byte length、replacement

@@ -183,6 +183,8 @@ describe("graft remote protocol", () => {
     const manifestBytes = Number(response.headers.get("x-graft-bundle-manifest-bytes"));
     expect(manifestBytes).toBeGreaterThan(0);
     const bytes = new Uint8Array(await response.arrayBuffer());
+    expect(Number(response.headers.get("x-graft-bundle-total-bytes"))).toBe(bytes.byteLength);
+    expect(Number(response.headers.get("content-length"))).toBe(bytes.byteLength);
     expect(decodeUploadBundle(bytes, manifestBytes)).toEqual([
       ["objects/pack/one.idx", "index"],
       ["objects/pack/one.pack", "pack"],

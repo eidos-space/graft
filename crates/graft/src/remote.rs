@@ -43,6 +43,7 @@ const RECEIVE_PACK_HEADER_PACK_BYTES: &str = "x-graft-pack-bytes";
 const RECEIVE_PACK_HEADER_INDEX_BYTES: &str = "x-graft-index-bytes";
 const RECEIVE_PACK_HEADER_REPLACEMENT_HEX: &str = "x-graft-ref-replacement-hex";
 const RECEIVE_BUNDLE_HEADER_MANIFEST_BYTES: &str = "x-graft-bundle-manifest-bytes";
+const UPLOAD_BUNDLE_HEADER_TOTAL_BYTES: &str = "x-graft-bundle-total-bytes";
 const MULTIPART_HEADER_OBJECT_BYTES: &str = "x-graft-object-bytes";
 const MULTIPART_HEADER_UPLOAD_ID: &str = "x-graft-upload-id";
 const MULTIPART_HEADER_PART_NUMBER: &str = "x-graft-part-number";
@@ -1802,7 +1803,16 @@ impl HttpRemote {
         }
         let response = Self::check_response(response, ref_path).await?;
         let manifest_bytes = upload_bundle_manifest_length(response.headers(), ref_path)?;
-        let total_bytes = response.content_length();
+        let declared_total = upload_bundle_total_length(response.headers(), ref_path)?;
+        let content_length = response.content_length();
+        if declared_total.is_some() && content_length.is_some() && declared_total != content_length
+        {
+            return Err(upload_bundle_error(
+                ref_path,
+                "upload-bundle total length does not match Content-Length",
+            ));
+        }
+        let total_bytes = declared_total.or(content_length);
         let mut body = HttpDownloadBody::new(response.bytes_stream(), total_bytes);
         let manifest = body.read_exact(manifest_bytes, ref_path).await?;
         let manifest = decode_upload_bundle_manifest(&manifest, ref_path)?;
@@ -2395,6 +2405,22 @@ fn upload_bundle_manifest_length(
     value.ok_or_else(|| upload_bundle_error(path, "invalid upload-bundle manifest length"))
 }
 
+fn upload_bundle_total_length(
+    headers: &reqwest::header::HeaderMap,
+    path: &str,
+) -> Result<Option<u64>> {
+    let Some(value) = headers.get(UPLOAD_BUNDLE_HEADER_TOTAL_BYTES) else {
+        return Ok(None);
+    };
+    let length = value
+        .to_str()
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|length| *length > 0)
+        .ok_or_else(|| upload_bundle_error(path, "invalid upload-bundle total length"))?;
+    Ok(Some(length))
+}
+
 fn decode_upload_bundle_manifest(bytes: &[u8], path: &str) -> Result<UploadBundleManifest> {
     serde_json::from_slice(bytes)
         .map_err(|err| upload_bundle_error(path, format!("invalid upload-bundle manifest: {err}")))
@@ -2841,6 +2867,15 @@ mod tests {
         manifest: serde_json::Value,
         objects: &[(&str, &[u8])],
     ) -> (String, tokio::task::JoinHandle<Vec<u8>>) {
+        serve_upload_bundle_with_total_header(manifest, objects, UPLOAD_BUNDLE_HEADER_TOTAL_BYTES)
+            .await
+    }
+
+    async fn serve_upload_bundle_with_total_header(
+        manifest: serde_json::Value,
+        objects: &[(&str, &[u8])],
+        total_header: &'static str,
+    ) -> (String, tokio::task::JoinHandle<Vec<u8>>) {
         let manifest = serde_json::to_vec(&manifest).unwrap();
         let body = encode_test_upload_bundle(&manifest, objects);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2849,7 +2884,7 @@ mod tests {
             let (mut stream, _) = listener.accept().await.unwrap();
             let request = read_http_request(&mut stream).await;
             let headers = format!(
-                "HTTP/1.1 200 OK\r\nGraft-Protocol: 1\r\n{RECEIVE_BUNDLE_HEADER_MANIFEST_BYTES}: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nGraft-Protocol: 1\r\n{RECEIVE_BUNDLE_HEADER_MANIFEST_BYTES}: {}\r\n{total_header}: {}\r\nConnection: close\r\n\r\n",
                 manifest.len(),
                 body.len(),
             );
@@ -2971,6 +3006,39 @@ mod tests {
                 .unwrap()
                 .starts_with(b"POST /org/repo/upload-bundle/refs/heads/main ")
         );
+    }
+
+    #[tokio::test]
+    async fn upload_bundle_uses_content_length_from_an_older_remote() {
+        let manifest = serde_json::json!({
+            "version": 1,
+            "reference": {
+                "path": "refs/heads/main",
+                "value_hex": hex_encode(b"commit-one\n"),
+            },
+            "objects": 0,
+        });
+        let (url, request) =
+            serve_upload_bundle_with_total_header(manifest, &[], "Content-Length").await;
+        let remote = RemoteConfig::Http { url, token_env: None }.build().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = events.clone();
+        let reporter = crate::repo::TransferProgressReporter::new(move |progress| {
+            captured.lock().unwrap().push(progress);
+        });
+        let _scope = crate::repo::TransferProgressScope::enter(&reporter);
+
+        assert!(matches!(
+            remote
+                .download_upload_bundle("refs/heads/main", destination.path())
+                .await
+                .unwrap(),
+            UploadBundleOutcome::Downloaded
+        ));
+        let last = events.lock().unwrap().last().copied().unwrap();
+        assert_eq!(last.total_bytes, Some(last.transferred_bytes));
+        request.await.unwrap();
     }
 
     #[tokio::test]

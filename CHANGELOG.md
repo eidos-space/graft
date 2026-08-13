@@ -4,6 +4,10 @@
 
 ### Changed
 
+- Clone upload bundles now declare their exact encoded byte length so clients can report total
+  download size, percentage, and estimated time remaining while streaming a repository.
+- Remote backends may return object metadata with list results to avoid per-object metadata reads
+  when calculating an upload bundle's total size; existing path-only backends remain supported.
 - Renamed the Rust CLI package and crate directory from `graft-tool` to `graft-cli`. The installed
   executable remains `graft`.
 - Repository commands now retain repository-scoped session state directly instead of reusing a
@@ -18,6 +22,8 @@
 
 ### Compatibility
 
+- New clients prefer the `X-Graft-Bundle-Total-Bytes` response header and fall back to
+  `Content-Length` for older servers. Existing clients can ignore the additive header.
 - Repository objects, snapshots, remotes, CLI commands, the `graft` executable name, and the SDK
   repository model are unchanged. Applications that load `libgraft_ext` or open databases with
   `vfs=graft` must migrate to physical SQLite worktree files.

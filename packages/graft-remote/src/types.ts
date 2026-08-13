@@ -38,6 +38,11 @@ export interface GraftListQuery {
 export interface GraftListResult {
   paths: string[];
   hasMore: boolean;
+  entries?: GraftListEntry[];
+}
+
+export interface GraftListEntry extends GraftObjectMetadata {
+  path: string;
 }
 
 export interface GraftMultipartPart {

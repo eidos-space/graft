@@ -5,6 +5,19 @@ SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
 
 ## Unreleased
 
+## Graft SDK 0.3.14 — 2026-08-13
+
+### Changed
+
+- Clone transfer progress now uses the exact framed upload-bundle size declared by newer Graft
+  Remote services, allowing hosts to show total download size, percentage, and estimated time
+  remaining from the start of the streamed response.
+
+### Compatibility
+
+- Older Remote services remain supported through their HTTP `Content-Length`. New clients reject a
+  response only when the Graft total-size header and `Content-Length` are both present but disagree.
+
 ## Graft SDK 0.3.13 — 2026-08-13
 
 ### Added

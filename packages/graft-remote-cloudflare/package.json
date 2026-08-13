@@ -1,6 +1,6 @@
 {
   "name": "@eidos.space/graft-remote-cloudflare",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Cloudflare storage and authentication adapters for @eidos.space/graft-remote",
   "type": "module",
   "license": "MIT",

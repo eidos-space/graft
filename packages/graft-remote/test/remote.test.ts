@@ -7,6 +7,7 @@ import {
   createGraftRemoteHandler,
   type GraftByteRange,
   type GraftListQuery,
+  type GraftListResult,
   type GraftMultipartBackend,
   type GraftObject,
   type GraftObjectMetadata,
@@ -136,7 +137,7 @@ class MemoryRepository implements GraftRepositoryBackend {
     return true;
   }
 
-  list(query: GraftListQuery): { paths: string[]; hasMore: boolean } {
+  list(query: GraftListQuery): GraftListResult {
     const matching = [...this.objects.keys()]
       .filter(
         (path) =>
@@ -144,9 +145,11 @@ class MemoryRepository implements GraftRepositoryBackend {
           (query.after === undefined || bytewiseCompare(path, query.after) > 0),
       )
       .sort(bytewiseCompare);
+    const paths = matching.slice(0, query.limit);
     return {
-      paths: matching.slice(0, query.limit),
+      paths,
       hasMore: matching.length > query.limit,
+      entries: paths.map((path) => ({ path, size: this.objects.get(path)!.byteLength })),
     };
   }
 }
@@ -476,6 +479,8 @@ describe("createGraftRemoteHandler", () => {
     expect(response.status, await response.clone().text()).toBe(200);
     expect(response.headers.get("content-type")).toBe("application/vnd.graft.upload-bundle");
     const bytes = new Uint8Array(await response.arrayBuffer());
+    expect(Number(response.headers.get("content-length"))).toBe(bytes.byteLength);
+    expect(Number(response.headers.get("x-graft-bundle-total-bytes"))).toBe(bytes.byteLength);
     const manifestBytes = Number(response.headers.get("x-graft-bundle-manifest-bytes"));
     const manifest = JSON.parse(new TextDecoder().decode(bytes.subarray(0, manifestBytes))) as {
       version: number;
@@ -492,6 +497,36 @@ describe("createGraftRemoteHandler", () => {
       ["objects/pack/one.pack", "pack-data"],
       ["segments/one", "segment"],
     ]);
+  });
+
+  it("calculates an exact upload-bundle size for path-only list backends", async () => {
+    class PathOnlyListRepository extends MemoryRepository {
+      headCalls = 0;
+
+      override head(path: string): GraftObjectMetadata | null {
+        this.headCalls += 1;
+        return super.head(path);
+      }
+
+      override list(query: GraftListQuery): GraftListResult {
+        const { paths, hasMore } = super.list(query);
+        return { paths, hasMore };
+      }
+    }
+
+    const backend = new PathOnlyListRepository();
+    backend.put("refs/heads/main", new TextEncoder().encode("commit-1\n"));
+    backend.put("objects/pack/one.idx", new TextEncoder().encode("index"));
+    backend.put("objects/pack/one.pack", new TextEncoder().encode("pack-data"));
+    const app = createGraftRemoteHandler({ backend: () => backend });
+
+    const response = await remoteFetch(app, "/legacy/repo/upload-bundle/refs/heads/main", {
+      method: "POST",
+    });
+    expect(response.status, await response.clone().text()).toBe(200);
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    expect(Number(response.headers.get("x-graft-bundle-total-bytes"))).toBe(bytes.byteLength);
+    expect(backend.headCalls).toBe(2);
   });
 
   it("prefetches upload-bundle objects with a bounded concurrency window", async () => {

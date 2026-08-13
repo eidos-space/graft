@@ -399,7 +399,8 @@ repository behavior.
 7. cache hit equivalence, invalidation, atomic persistence, and redaction;
 8. path-race stale errors and retry bounds;
 9. cancellation before/after safe mutation boundaries;
-10. cumulative known/unknown-length HTTP transfer progress and final events;
+10. cumulative known/unknown-length HTTP transfer progress, upload-bundle
+    declared totals, and final events;
 11. stable error mapping and credential redaction;
 12. conservative materialization classification; and
 13. Node async execution and native-package selection.

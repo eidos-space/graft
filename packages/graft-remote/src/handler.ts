@@ -9,6 +9,7 @@ import {
   PROTOCOL_HEADER,
   PROTOCOL_VERSION,
   RECEIVE_BUNDLE_HEADER_MANIFEST_BYTES,
+  UPLOAD_BUNDLE_HEADER_TOTAL_BYTES,
   GraftProtocolError,
   bytewiseCompare,
   bytesEqual,
@@ -460,7 +461,7 @@ async function uploadBundle(
   requireTransactionalPath(refPath);
   const reference = await readMetadataObject(backend, refPath);
   if (reference === null) throw objectNotFound();
-  const paths = await listImmutablePaths(backend);
+  const objects = await listImmutableObjects(backend);
   const confirmed = await readMetadataObject(backend, refPath);
   if (confirmed === null || !bytesEqual(reference, confirmed)) {
     throw new GraftProtocolError(
@@ -474,40 +475,110 @@ async function uploadBundle(
     JSON.stringify({
       version: 1,
       reference: { path: refPath, value_hex: encodeLowerHex(reference) },
-      objects: paths.length,
+      objects: objects.length,
     }),
   );
+  const totalBytes = uploadBundleTotalBytes(manifest, objects);
   const headers = protocolHeaders({
+    "Content-Length": totalBytes.toString(),
     "Content-Type": "application/vnd.graft.upload-bundle",
     [RECEIVE_BUNDLE_HEADER_MANIFEST_BYTES]: manifest.byteLength.toString(),
+    [UPLOAD_BUNDLE_HEADER_TOTAL_BYTES]: totalBytes.toString(),
   });
-  return new Response(new UploadBundleBody(backend, manifest, paths).stream, { headers });
+  return new Response(new UploadBundleBody(backend, manifest, objects).stream, { headers });
 }
 
-async function listImmutablePaths(backend: GraftRepositoryBackend): Promise<string[]> {
-  const paths: string[] = [];
+interface UploadBundleObject {
+  path: string;
+  size: number;
+}
+
+async function listImmutableObjects(
+  backend: GraftRepositoryBackend,
+): Promise<UploadBundleObject[]> {
+  const objects: UploadBundleObject[] = [];
   let after: string | undefined;
   for (;;) {
     const result = await backend.list({ prefix: "", after, limit: MAX_LIST_LIMIT });
     if (result.paths.length > MAX_LIST_LIMIT) {
       throw backendContractError("List backend returned more paths than requested");
     }
+    const listedEntries = new Map<string, number>();
+    for (const entry of result.entries ?? []) {
+      const path = validateObjectPath(entry.path);
+      validateMetadata(entry);
+      if (listedEntries.has(path)) {
+        throw backendContractError("List backend returned duplicate object metadata");
+      }
+      listedEntries.set(path, entry.size);
+    }
+    const immutablePaths: string[] = [];
     for (const path of result.paths) {
       validateObjectPath(path);
       if (after !== undefined && bytewiseCompare(path, after) <= 0) {
         throw backendContractError("List backend returned unsorted paths");
       }
       after = path;
-      if (isImmutablePath(path)) paths.push(path);
-      if (paths.length > MAX_UPLOAD_BUNDLE_OBJECTS) {
+      if (isImmutablePath(path)) immutablePaths.push(path);
+      if (objects.length + immutablePaths.length > MAX_UPLOAD_BUNDLE_OBJECTS) {
         throw new GraftProtocolError(413, "upload_bundle_too_large", "Too many bundled objects");
       }
     }
-    if (!result.hasMore) return paths;
+    const missingPaths = immutablePaths.filter((path) => !listedEntries.has(path));
+    const resolved = await resolveObjectSizes(backend, missingPaths);
+    for (const path of immutablePaths) {
+      const size = listedEntries.get(path) ?? resolved.get(path);
+      if (size === undefined) {
+        throw backendContractError("Bundled immutable object disappeared");
+      }
+      objects.push({ path, size });
+    }
+    if (!result.hasMore) return objects;
     if (result.paths.length === 0) {
       throw backendContractError("List backend cannot advance the upload-bundle cursor");
     }
   }
+}
+
+async function resolveObjectSizes(
+  backend: GraftRepositoryBackend,
+  paths: string[],
+): Promise<Map<string, number>> {
+  const resolved = new Map<string, number>();
+  let next = 0;
+  const workers = Array.from(
+    { length: Math.min(UPLOAD_BUNDLE_PREFETCH_OBJECTS, paths.length) },
+    async () => {
+      for (;;) {
+        const index = next;
+        next += 1;
+        const path = paths[index];
+        if (path === undefined) return;
+        const metadata = await backend.head(path);
+        if (metadata === null) continue;
+        validateMetadata(metadata);
+        resolved.set(path, metadata.size);
+      }
+    },
+  );
+  await Promise.all(workers);
+  return resolved;
+}
+
+function uploadBundleTotalBytes(
+  manifest: Uint8Array,
+  objects: UploadBundleObject[],
+): number {
+  let total = manifest.byteLength;
+  const encoder = new TextEncoder();
+  for (const object of objects) {
+    const frameBytes = 12 + encoder.encode(object.path).byteLength + object.size;
+    total += frameBytes;
+    if (!Number.isSafeInteger(total)) {
+      throw backendContractError("Upload bundle is too large to declare its byte length");
+    }
+  }
+  return total;
 }
 
 async function readMetadataObject(
@@ -574,7 +645,7 @@ function objectBodyStream(object: GraftObject): ReadableStream<Uint8Array> {
 class UploadBundleBody {
   readonly stream: ReadableStream<Uint8Array>;
   readonly #backend: GraftRepositoryBackend;
-  readonly #paths: string[];
+  readonly #objects: UploadBundleObject[];
   readonly #pending: Uint8Array[];
   readonly #prefetched = new Map<number, Promise<PrefetchedObject>>();
   #index = 0;
@@ -582,9 +653,13 @@ class UploadBundleBody {
   #reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
   #remaining = 0;
 
-  constructor(backend: GraftRepositoryBackend, manifest: Uint8Array, paths: string[]) {
+  constructor(
+    backend: GraftRepositoryBackend,
+    manifest: Uint8Array,
+    objects: UploadBundleObject[],
+  ) {
     this.#backend = backend;
-    this.#paths = paths;
+    this.#objects = objects;
     this.#pending = [manifest];
     this.stream = new ReadableStream({
       pull: async (controller) => {
@@ -610,7 +685,7 @@ class UploadBundleBody {
         if (await this.pullObject(controller)) return;
         continue;
       }
-      if (this.#index === this.#paths.length) {
+      if (this.#index === this.#objects.length) {
         controller.close();
         return;
       }
@@ -620,13 +695,17 @@ class UploadBundleBody {
 
   private async openObject(): Promise<void> {
     this.fillPrefetch();
-    const path = this.#paths[this.#index]!;
+    const expected = this.#objects[this.#index]!;
+    const path = expected.path;
     const prefetched = await this.#prefetched.get(this.#index)!;
     this.#prefetched.delete(this.#index);
     if (!prefetched.ok) throw prefetched.error;
     const object = prefetched.object;
     if (object === null) throw backendContractError("Bundled immutable object disappeared");
     validateMetadata(object);
+    if (object.size !== expected.size) {
+      throw backendContractError("Bundled immutable object size changed after listing");
+    }
     this.#remaining = object.size;
     this.#reader = objectBodyStream(object).getReader();
     this.#pending.push(uploadBundleFrameHeader(path, object.size));
@@ -634,12 +713,12 @@ class UploadBundleBody {
 
   private fillPrefetch(): void {
     const end = Math.min(
-      this.#paths.length,
+      this.#objects.length,
       this.#index + UPLOAD_BUNDLE_PREFETCH_OBJECTS,
     );
     while (this.#nextPrefetch < end) {
       const index = this.#nextPrefetch;
-      const path = this.#paths[index]!;
+      const path = this.#objects[index]!.path;
       const object = Promise.resolve(this.#backend.get(path)).then(
         (value): PrefetchedObject => ({ ok: true, object: value }),
         (error: unknown): PrefetchedObject => ({ ok: false, error }),
@@ -684,7 +763,7 @@ class UploadBundleBody {
 
     const prefetched = [...this.#prefetched.values()];
     this.#prefetched.clear();
-    this.#nextPrefetch = this.#paths.length;
+    this.#nextPrefetch = this.#objects.length;
     const objects = await Promise.all(prefetched);
     await Promise.all(
       objects.map(async (result) => {

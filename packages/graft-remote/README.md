@@ -119,10 +119,15 @@ Backend guarantees:
 - `compareAndSwap` and `compareAndDelete` are atomic.
 - `putIfAbsent` atomically creates only when the path is absent.
 - `list` returns at most `query.limit` paths, sorted by UTF-8 byte order, after
-  `query.after`, and restricted to `query.prefix`.
+  `query.after`, and restricted to `query.prefix`. It may also return matching
+  `entries` with object sizes so aggregate downloads can declare their exact
+  transfer length without a second metadata lookup.
 - Immutable request bodies remain streams when the adapter storage supports it.
 - `upload-bundle` lists immutable keys and streams each `get` body into one
-  clone response without buffering the repository in memory.
+  clone response without buffering the repository in memory. Its exact framed
+  length is exposed through `Content-Length` and
+  `x-graft-bundle-total-bytes`, allowing clone clients to report total size,
+  percentage, and estimated time remaining before the body finishes.
 - `options.contentLength` is the exact length of a framed immutable body, such
   as each object in a `receive-pack` or `receive-bundle` request.
 - `multipart` optionally stores one logical immutable object through resumable

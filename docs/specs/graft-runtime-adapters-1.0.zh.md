@@ -245,7 +245,8 @@ presentation，不能作为 core conformance。
 
 至少测试 CLI/SDK shared operation 等价、无 PRAGMA control-plane、lifecycle/reopen、
 serialization/busy、TypeScript option/result、JSON field、cache、stale retry、cancel、
-known/unknown-length HTTP transfer progress 与 final event、error/redaction、
+known/unknown-length HTTP transfer progress、upload-bundle declared total 与 final
+event、error/redaction、
 materialization gate 与 Node async/package selection。Browser 还要测 real WASM、
 OPFS persistence、memory temp、worker restart、merge recovery、version manifest 与
 unavailable capability。

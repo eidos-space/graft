@@ -128,13 +128,28 @@ export class CloudflareRepositoryBackend implements GraftRepositoryBackend {
       }),
     ]);
     const objectKeyPrefix = this.r2Key("");
-    const immutable = immutablePage.objects
-      .map((object) => object.key.slice(objectKeyPrefix.length))
-      .filter((path) => path.startsWith(query.prefix) && bytewiseCompare(path, after) > 0);
+    const immutableEntries = immutablePage.objects
+      .map((object) => ({
+        path: object.key.slice(objectKeyPrefix.length),
+        size: object.size,
+        etag: object.etag,
+        contentType: object.httpMetadata?.contentType,
+      }))
+      .filter(
+        (entry) =>
+          entry.path.startsWith(query.prefix) && bytewiseCompare(entry.path, after) > 0,
+      );
+    const immutableByPath = new Map(immutableEntries.map((entry) => [entry.path, entry]));
+    const immutable = immutableEntries.map((entry) => entry.path);
     const candidates = [...new Set([...metadata.paths, ...immutable])].sort(bytewiseCompare);
+    const paths = candidates.slice(0, query.limit);
     return {
-      paths: candidates.slice(0, query.limit),
+      paths,
       hasMore: candidates.length > query.limit || metadata.hasMore || immutablePage.truncated,
+      entries: paths.flatMap((path) => {
+        const entry = immutableByPath.get(path);
+        return entry === undefined ? [] : [entry];
+      }),
     };
   }
 

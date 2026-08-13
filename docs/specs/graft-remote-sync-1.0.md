@@ -197,7 +197,12 @@ frames `(path length, object length, path, bytes)` in network byte order.
 
 The response uses
 `Content-Type: application/vnd.graft.upload-bundle` and
-`x-graft-bundle-manifest-bytes`. Its manifest is exactly:
+`x-graft-bundle-manifest-bytes`. It MUST also declare the exact complete framed
+body length in `x-graft-bundle-total-bytes`; `Content-Length` SHOULD carry the
+same value when the host permits an explicit length on a streaming response.
+Clients MUST prefer the Graft total-length header for transfer progress, MAY
+fall back to `Content-Length` for older services, and MUST reject the response
+when both are present but disagree. Its manifest is exactly:
 
 ```json
 {
