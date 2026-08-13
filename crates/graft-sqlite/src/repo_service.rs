@@ -19,10 +19,16 @@ use crate::{
     pragma::{
         GraftCommand,
         parse::parse_row_identity,
-        repo_conflicts::{resolve_repo_cell_conflict, stage_repo_worktree_sqlite_result},
+        repo_checkout::export_repo_path,
+        repo_conflicts::{
+            prepare_repo_semantic_merge_seed, resolve_repo_cell_conflict,
+            stage_repo_external_sqlite_result, stage_repo_worktree_sqlite_result,
+        },
         repo_core::repo_for_file,
         repo_diff::repo_status_for_file,
-        spec::{RepoResolveCellSpec, RepoResolveRowSpec, RepoResolveSpec, ResolveSide},
+        spec::{
+            RepoExportSpec, RepoResolveCellSpec, RepoResolveRowSpec, RepoResolveSpec, ResolveSide,
+        },
         sqlite_worktree::physical_sqlite_file_matches_state,
     },
     session::{RepoRuntimeRegistry, RepositorySessionContext},
@@ -81,6 +87,12 @@ pub struct RepositoryResolveCellOptions {
 pub struct RepositoryResolveOutcome {
     pub path: String,
     pub materialized: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositorySemanticMergeSeed {
+    pub applied_sql: bool,
+    pub managed_conflicts: usize,
 }
 
 /// The effective, versioned merge policy observed by an embedded repository session.
@@ -310,6 +322,58 @@ impl RepositoryCommandService {
         let runtime = self.file.runtime().clone();
         let repo = repo_for_file(&mut self.file)?;
         stage_repo_worktree_sqlite_result(&runtime, &repo, path)
+    }
+
+    /// Exports one immutable revision path to a standalone physical `SQLite` file.
+    pub fn export_revision_sqlite_path(
+        &mut self,
+        revision: &str,
+        path: &Path,
+        output: &Path,
+    ) -> Result<String, ErrCtx> {
+        let runtime = self.file.runtime().clone();
+        let repo = repo_for_file(&mut self.file)?;
+        export_repo_path(
+            &runtime,
+            &self.file,
+            &repo,
+            &RepoExportSpec {
+                source: Some(revision.to_string()),
+                path: Some(repo.worktree().join(path)),
+                output: output.to_path_buf(),
+            },
+        )
+    }
+
+    /// Validates a provider-owned candidate, materializes it, and stages it as one merge result.
+    pub fn stage_external_sqlite_result(
+        &mut self,
+        path: &Path,
+        candidate_path: &Path,
+    ) -> Result<String, ErrCtx> {
+        let runtime = self.file.runtime().clone();
+        let repo = repo_for_file(&mut self.file)?;
+        stage_repo_external_sqlite_result(&runtime, &repo, path, candidate_path)
+    }
+
+    /// Builds an Ours-derived private candidate containing every safe non-provider row change.
+    pub fn prepare_semantic_merge_seed(
+        &mut self,
+        path: &Path,
+        candidate_path: &Path,
+        managed_tables: &std::collections::BTreeSet<String>,
+    ) -> Result<RepositorySemanticMergeSeed, ErrCtx> {
+        let runtime = self.file.runtime().clone();
+        let repo = repo_for_file(&mut self.file)?;
+        let (applied_sql, managed_conflicts) = prepare_repo_semantic_merge_seed(
+            &runtime,
+            &self.file,
+            &repo,
+            path,
+            candidate_path,
+            managed_tables,
+        )?;
+        Ok(RepositorySemanticMergeSeed { applied_sql, managed_conflicts })
     }
 
     /// Lists commit metadata without hydrating any commit trees or blobs.

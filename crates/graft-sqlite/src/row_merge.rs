@@ -394,6 +394,31 @@ impl RowMergePlan {
         self.source_apply_sql(&self.theirs_diff, &self.schema_additions)
     }
 
+    /// SQL for the safe Theirs projection while leaving provider-owned tables at Ours.
+    pub fn theirs_apply_sql_excluding(&self, excluded_tables: &BTreeSet<String>) -> String {
+        self.source_apply_sql_excluding(&self.theirs_diff, &self.schema_additions, excluded_tables)
+    }
+
+    pub fn conflict_count_outside(&self, excluded_tables: &BTreeSet<String>) -> usize {
+        self.analysis
+            .conflicts
+            .iter()
+            .filter(|conflict| !excluded_tables.contains(&conflict.table))
+            .count()
+    }
+
+    pub fn conflict_count_inside(&self, included_tables: &BTreeSet<String>) -> usize {
+        self.analysis
+            .conflicts
+            .iter()
+            .filter(|conflict| included_tables.contains(&conflict.table))
+            .count()
+    }
+
+    pub fn has_schema_additions(&self) -> bool {
+        !self.schema_additions.is_empty()
+    }
+
     pub fn ours_apply_sql(&self) -> String {
         self.source_apply_sql(&self.ours_diff, &self.ours_schema_additions)
     }
@@ -497,6 +522,15 @@ impl RowMergePlan {
         diff: &RowLevelDiff,
         schema_additions: &[SchemaApplyChange],
     ) -> String {
+        self.source_apply_sql_excluding(diff, schema_additions, &BTreeSet::new())
+    }
+
+    fn source_apply_sql_excluding(
+        &self,
+        diff: &RowLevelDiff,
+        schema_additions: &[SchemaApplyChange],
+        excluded_tables: &BTreeSet<String>,
+    ) -> String {
         let mut sql = String::from("BEGIN TRANSACTION;\n\n");
         let mut has_changes = false;
 
@@ -515,6 +549,9 @@ impl RowMergePlan {
 
         let conflict_rows = self.conflict_rows();
         for table in &diff.table_changes {
+            if excluded_tables.contains(&table.table_name) {
+                continue;
+            }
             let generated_columns = self.apply_generated_columns(table);
             let mut table_sql = table.to_sql_filtered_with_insert_rowid_and_generated(
                 &generated_columns,

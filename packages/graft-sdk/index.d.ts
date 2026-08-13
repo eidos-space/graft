@@ -444,6 +444,73 @@ export interface StageMergeSqliteResultOptions extends OperationOptions {
   expectedStateToken: string
 }
 
+export interface PrepareSemanticMergeOptions extends OperationOptions {
+  path: string
+  /** Stable application-owned provider/profile identifier. */
+  provider: string
+  /** Tables whose row semantics are owned by the provider. */
+  managedTables: string[]
+  expectedStateToken: string
+}
+
+export type SemanticMergeProviderRecord =
+  | { state: "pending" }
+  | {
+      state: "conflict"
+      conflicts: unknown[]
+      automatic_resolutions: unknown[]
+    }
+  | {
+      state: "merged"
+      validation: unknown
+      automatic_resolutions: unknown[]
+    }
+
+export interface SemanticMergeInput {
+  version: MergeSqliteVersion
+  revision: string | null
+  /** Absolute read-only path, or null when this merge side has no file. */
+  file_path: string | null
+  size: number | null
+}
+
+export interface SemanticMergeWorkspace {
+  provider_token: string
+  provider: string
+  path: string
+  workspace_path: string
+  /** Fixed private Ours-derived output path pre-merged outside managed_tables. */
+  result_path: string
+  managed_tables: string[]
+  seed_applied_sql: boolean
+  managed_conflicts: number
+  /** Host clock frozen once for this durable provider plan. */
+  prepared_at_unix_ms: number
+  state_token: string
+  policy_token: string
+  policy_version: number
+  orig_head: string
+  merge_head: string
+  merge_base: string | null
+  inputs: SemanticMergeInput[]
+  record: SemanticMergeProviderRecord
+}
+
+export interface RecordSemanticMergeConflictsOptions
+  extends OperationOptions {
+  providerToken: string
+  conflicts: unknown[]
+  automaticResolutions?: unknown[]
+  expectedStateToken: string
+}
+
+export interface AcceptSemanticMergeResultOptions extends OperationOptions {
+  providerToken: string
+  validation: unknown
+  automaticResolutions?: unknown[]
+  expectedStateToken: string
+}
+
 export interface WriteAndStageTextResultOptions extends OperationOptions {
   path: string
   content: string
@@ -988,6 +1055,15 @@ export class RepositorySession {
   ): Promise<MergeOperationResult>
   stageMergeSqliteResult(
     options: StageMergeSqliteResultOptions
+  ): Promise<MergeOperationResult>
+  prepareSemanticMerge(
+    options: PrepareSemanticMergeOptions
+  ): Promise<SemanticMergeWorkspace>
+  recordSemanticMergeConflicts(
+    options: RecordSemanticMergeConflictsOptions
+  ): Promise<SemanticMergeWorkspace>
+  acceptSemanticMergeResult(
+    options: AcceptSemanticMergeResultOptions
   ): Promise<MergeOperationResult>
   unresolveMergePath(
     options: UnresolveMergePathOptions

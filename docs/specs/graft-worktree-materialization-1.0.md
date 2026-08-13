@@ -265,6 +265,8 @@ conservative gate; “actual” describes the normal path for the operation.
 | CLI / SDK | `setMergePathResult` / `resolve` whole path | Yes | Writes the selected path result and collapses its conflict stage |
 | CLI / SDK | `resolveMergeRow`, `resolveMergeCell`, `resolveMergeTable` | Yes | Writes the current row/cell/table resolution candidate; may materialize a merged SQLite result |
 | SDK | `stageMergeSqliteResult` | No | Captures and validates the existing application-edited worktree file, then changes index/journal only |
+| SDK | `prepareSemanticMerge`, `recordSemanticMergeConflicts` | No | Writes only Graft-owned private provider workspace/records under `.graft` |
+| SDK | `acceptSemanticMergeResult` | Yes | Validates a private provider result, replaces the tracked SQLite path, and stages it |
 | CLI / SDK | `writeAndStageTextResult` / `resolve --manual` | Yes | Writes and stages the edited physical result |
 | CLI / SDK | `continueMerge` / `merge --continue` | Yes | Commits the resolved merge and the current CLI path materialization step may rewrite SQLite snapshots |
 | CLI / SDK | `abortMerge` / `merge --abort` | Yes | Restores `ORIG_HEAD` and applies the abort checkout plan |

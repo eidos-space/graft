@@ -1,8 +1,10 @@
 use std::{path::PathBuf, sync::Arc};
 
 use graft_sdk::{
-    AbortMergeOptions as CoreAbortMergeOptions, ApplyMergeOptions as CoreApplyMergeOptions,
-    CancellationToken, CommitChangedPathsOptions as CoreCommitChangedPathsOptions,
+    AbortMergeOptions as CoreAbortMergeOptions,
+    AcceptSemanticMergeResultOptions as CoreAcceptSemanticMergeResultOptions,
+    ApplyMergeOptions as CoreApplyMergeOptions, CancellationToken,
+    CommitChangedPathsOptions as CoreCommitChangedPathsOptions,
     ContinueMergeOptions as CoreContinueMergeOptions,
     DiffMergeSqliteOptions as CoreDiffMergeSqliteOptions, DiffOptions as CoreDiffOptions,
     DiffPathsOptions as CoreDiffPathsOptions, IgnoredPathsOptions as CoreIgnoredPathsOptions,
@@ -12,9 +14,11 @@ use graft_sdk::{
     MergePathResult as CoreMergePathResult, MergePolicyDocument as CoreMergePolicyDocument,
     MergeSqliteVersion as CoreMergeSqliteVersion, MergeVersion as CoreMergeVersion,
     PlanMergeOptions as CorePlanMergeOptions,
+    PrepareSemanticMergeOptions as CorePrepareSemanticMergeOptions,
     ReadMergeVersionOptions as CoreReadMergeVersionOptions,
     ReadPathContentOptions as CoreReadPathContentOptions,
     RecordPathMoveOptions as CoreRecordPathMoveOptions,
+    RecordSemanticMergeConflictsOptions as CoreRecordSemanticMergeConflictsOptions,
     RemoteConfigureOptions as CoreRemoteConfigureOptions, RepositoryOperation,
     RepositorySession as CoreRepositorySession,
     ResolveMergeCellOptions as CoreResolveMergeCellOptions,
@@ -272,6 +276,30 @@ pub struct StageMergeSqliteResultOptions {
 }
 
 #[napi(object)]
+pub struct PrepareSemanticMergeOptions {
+    pub path: String,
+    pub provider: String,
+    pub managed_tables: Vec<String>,
+    pub expected_state_token: String,
+}
+
+#[napi(object)]
+pub struct RecordSemanticMergeConflictsOptions {
+    pub provider_token: String,
+    pub conflicts_json: String,
+    pub automatic_resolutions_json: String,
+    pub expected_state_token: String,
+}
+
+#[napi(object)]
+pub struct AcceptSemanticMergeResultOptions {
+    pub provider_token: String,
+    pub validation_json: String,
+    pub automatic_resolutions_json: String,
+    pub expected_state_token: String,
+}
+
+#[napi(object)]
 pub struct WriteAndStageTextResultOptions {
     pub path: String,
     pub content: String,
@@ -410,6 +438,15 @@ enum JsonOperation {
     },
     StageMergeSqliteResult {
         options: CoreStageMergeSqliteResultOptions,
+    },
+    PrepareSemanticMerge {
+        options: CorePrepareSemanticMergeOptions,
+    },
+    RecordSemanticMergeConflicts {
+        options: CoreRecordSemanticMergeConflictsOptions,
+    },
+    AcceptSemanticMergeResult {
+        options: CoreAcceptSemanticMergeResultOptions,
     },
     UnresolveMergePath {
         options: CoreUnresolveMergePathOptions,
@@ -657,6 +694,30 @@ impl JsonTask {
                 return serde_json::to_string(&value)
                     .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
             }
+            JsonOperation::PrepareSemanticMerge { options } => {
+                let value = self
+                    .session
+                    .prepare_semantic_merge(options)
+                    .map_err(napi_error)?;
+                return serde_json::to_string(&value)
+                    .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
+            }
+            JsonOperation::RecordSemanticMergeConflicts { options } => {
+                let value = self
+                    .session
+                    .record_semantic_merge_conflicts(options)
+                    .map_err(napi_error)?;
+                return serde_json::to_string(&value)
+                    .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
+            }
+            JsonOperation::AcceptSemanticMergeResult { options } => {
+                let value = self
+                    .session
+                    .accept_semantic_merge_result(options)
+                    .map_err(napi_error)?;
+                return serde_json::to_string(&value)
+                    .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
+            }
             JsonOperation::UnresolveMergePath { options } => {
                 let value = self
                     .session
@@ -757,6 +818,9 @@ impl JsonTask {
             | JsonOperation::ResolveMergeCell { .. }
             | JsonOperation::ResolveMergeTable { .. }
             | JsonOperation::StageMergeSqliteResult { .. }
+            | JsonOperation::PrepareSemanticMerge { .. }
+            | JsonOperation::RecordSemanticMergeConflicts { .. }
+            | JsonOperation::AcceptSemanticMergeResult { .. }
             | JsonOperation::UnresolveMergePath { .. }
             | JsonOperation::WriteAndStageTextResult { .. }
             | JsonOperation::ContinueMerge { .. }
@@ -1571,6 +1635,100 @@ impl NodeRepositorySession {
         )
     }
 
+    #[napi(js_name = "prepareSemanticMerge")]
+    pub fn prepare_semantic_merge(
+        &self,
+        options: PrepareSemanticMergeOptions,
+        signal: Option<AbortSignal>,
+    ) -> AsyncTask<JsonTask> {
+        json_task(
+            self,
+            JsonOperation::PrepareSemanticMerge {
+                options: CorePrepareSemanticMergeOptions {
+                    path: PathBuf::from(options.path),
+                    provider: options.provider,
+                    managed_tables: options.managed_tables,
+                    expected_state_token: options.expected_state_token,
+                },
+            },
+            signal,
+        )
+    }
+
+    #[napi(js_name = "recordSemanticMergeConflicts")]
+    pub fn record_semantic_merge_conflicts(
+        &self,
+        options: RecordSemanticMergeConflictsOptions,
+        signal: Option<AbortSignal>,
+    ) -> Result<AsyncTask<JsonTask>> {
+        let conflicts = serde_json::from_str::<Vec<serde_json::Value>>(&options.conflicts_json)
+            .map_err(|error| {
+                Error::new(
+                    Status::InvalidArg,
+                    format!("semantic merge conflicts must be a JSON array: {error}"),
+                )
+            })?;
+        let automatic_resolutions =
+            serde_json::from_str::<Vec<serde_json::Value>>(&options.automatic_resolutions_json)
+                .map_err(|error| {
+                    Error::new(
+                        Status::InvalidArg,
+                        format!(
+                            "semantic merge automatic resolutions must be a JSON array: {error}"
+                        ),
+                    )
+                })?;
+        Ok(json_task(
+            self,
+            JsonOperation::RecordSemanticMergeConflicts {
+                options: CoreRecordSemanticMergeConflictsOptions {
+                    provider_token: options.provider_token,
+                    conflicts,
+                    automatic_resolutions,
+                    expected_state_token: options.expected_state_token,
+                },
+            },
+            signal,
+        ))
+    }
+
+    #[napi(js_name = "acceptSemanticMergeResult")]
+    pub fn accept_semantic_merge_result(
+        &self,
+        options: AcceptSemanticMergeResultOptions,
+        signal: Option<AbortSignal>,
+    ) -> Result<AsyncTask<JsonTask>> {
+        let validation = serde_json::from_str::<serde_json::Value>(&options.validation_json)
+            .map_err(|error| {
+                Error::new(
+                    Status::InvalidArg,
+                    format!("semantic merge validation must be valid JSON: {error}"),
+                )
+            })?;
+        let automatic_resolutions =
+            serde_json::from_str::<Vec<serde_json::Value>>(&options.automatic_resolutions_json)
+                .map_err(|error| {
+                    Error::new(
+                        Status::InvalidArg,
+                        format!(
+                            "semantic merge automatic resolutions must be a JSON array: {error}"
+                        ),
+                    )
+                })?;
+        Ok(json_task(
+            self,
+            JsonOperation::AcceptSemanticMergeResult {
+                options: CoreAcceptSemanticMergeResultOptions {
+                    provider_token: options.provider_token,
+                    validation,
+                    automatic_resolutions,
+                    expected_state_token: options.expected_state_token,
+                },
+            },
+            signal,
+        ))
+    }
+
     #[napi(js_name = "unresolveMergePath")]
     pub fn unresolve_merge_path(
         &self,
@@ -1710,6 +1868,15 @@ pub fn operation_materializes_worktree(operation: String) -> Result<bool> {
         "resolve_merge_table" | "resolveMergeTable" => RepositoryOperation::ResolveMergeTable,
         "stage_merge_sqlite_result" | "stageMergeSqliteResult" => {
             RepositoryOperation::StageMergeSqliteResult
+        }
+        "prepare_semantic_merge" | "prepareSemanticMerge" => {
+            RepositoryOperation::PrepareSemanticMerge
+        }
+        "record_semantic_merge_conflicts" | "recordSemanticMergeConflicts" => {
+            RepositoryOperation::RecordSemanticMergeConflicts
+        }
+        "accept_semantic_merge_result" | "acceptSemanticMergeResult" => {
+            RepositoryOperation::AcceptSemanticMergeResult
         }
         "unresolve_merge_path" | "unresolveMergePath" => RepositoryOperation::UnresolveMergePath,
         "write_and_stage_text_result" | "writeAndStageTextResult" => {

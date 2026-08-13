@@ -150,7 +150,7 @@ current contract, not a second implementation.
 | `remote add/set-url` subset | `configureRemote` | local config/upstream outcome |
 | `fetch`, `push`, `pull` | same method names | remote/ref plus merge outcome where applicable |
 | `clone` | `cloneRepository` | new repository/checkout outcome |
-| `merge` + `conflicts` + `resolve` | `planMerge`, `applyMerge`, merge status/list/version, path/row/text resolution, `continueMerge`, `abortMerge` | typed plan/state tokens plus command outcome |
+| `merge` + `conflicts` + `resolve` | `planMerge`, `applyMerge`, merge status/list/version, path/row/text/provider resolution, `continueMerge`, `abortMerge` | typed plan/state/provider tokens plus command outcome |
 | branch/tag/switch/reset/export/audit/payload/GC/SQL/low-level remote commands | — | CLI-only 1.0 surface |
 
 The stable operation classification is:
@@ -162,8 +162,11 @@ HistorySummaries, CommitDetails, CommitChangedPaths, IsIgnoredPath,
 IsIgnoredPaths, Inventory, RepositoryMetadata, ListRemotes, Restore,
 RestorePaths, RemoteConfigure, Push, Fetch, Pull, Clone, PlanMerge,
 ApplyMerge, GetMergeStatus, ListMergePaths, ListMergeConflicts,
-ReadMergeVersion, SetMergePathResult, ResolveMergeRow,
-WriteAndStageTextResult, ContinueMerge, AbortMerge
+ReadMergeVersion, DiffMergeSqlite, SetMergePathResult, ResolveMergeRow,
+ResolveMergeCell, ResolveMergeTable, StageMergeSqliteResult,
+PrepareSemanticMerge, RecordSemanticMergeConflicts,
+AcceptSemanticMergeResult, UnresolveMergePath, WriteAndStageTextResult,
+ContinueMerge, AbortMerge
 ```
 
 The JavaScript class maps these to camelCase methods, with `diffSqlitePaths`

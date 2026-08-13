@@ -39,6 +39,7 @@ test("exposes ABI-stable SDK metadata and materialization contract", () => {
     "resolveMergeRow",
     "resolveMergeCell",
     "resolveMergeTable",
+    "acceptSemanticMergeResult",
     "writeAndStageTextResult",
     "continueMerge",
     "abortMerge",
@@ -79,6 +80,8 @@ test("exposes ABI-stable SDK metadata and materialization contract", () => {
     "validateMergePolicy",
     "setMergePolicy",
     "stageMergeSqliteResult",
+    "prepareSemanticMerge",
+    "recordSemanticMergeConflicts",
   ]) {
     assert.equal(operationMaterializesWorktree(operation), false)
   }

@@ -56,6 +56,11 @@ const MAX_INVENTORY_PAGE_SIZE: usize = 1_000;
 const MAX_IGNORE_QUERY_PATHS: usize = 1_000;
 const MAX_MERGE_PATH_PAGE_SIZE: usize = 500;
 const MAX_MERGE_CONFLICT_PAGE_SIZE: usize = 1_000;
+const SEMANTIC_MERGE_WORKSPACE_VERSION: u32 = 1;
+const MAX_SEMANTIC_MANAGED_TABLES: usize = 256;
+const SEMANTIC_MERGE_WORKSPACE_DIRECTORY: &str = "semantic-merge";
+const MAX_SEMANTIC_PROVIDER_NAME_BYTES: usize = 128;
+const MAX_SEMANTIC_MERGE_RECORD_BYTES: usize = 1024 * 1024;
 // Bump whenever persisted path classification semantics change.
 const STATUS_SNAPSHOT_SCHEMA_VERSION: u32 = 3;
 const MAX_STATUS_SNAPSHOTS: usize = 4;
@@ -372,6 +377,9 @@ pub enum RepositoryOperation {
     ResolveMergeCell,
     ResolveMergeTable,
     StageMergeSqliteResult,
+    PrepareSemanticMerge,
+    RecordSemanticMergeConflicts,
+    AcceptSemanticMergeResult,
     WriteAndStageTextResult,
     ContinueMerge,
     AbortMerge,
@@ -392,6 +400,7 @@ impl RepositoryOperation {
                 | Self::ResolveMergeRow
                 | Self::ResolveMergeCell
                 | Self::ResolveMergeTable
+                | Self::AcceptSemanticMergeResult
                 | Self::WriteAndStageTextResult
                 | Self::ContinueMerge
                 | Self::AbortMerge
@@ -669,6 +678,84 @@ pub struct UnresolveMergePathOptions {
 pub struct StageMergeSqliteResultOptions {
     pub path: PathBuf,
     pub expected_state_token: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PrepareSemanticMergeOptions {
+    pub path: PathBuf,
+    pub provider: String,
+    pub managed_tables: Vec<String>,
+    pub expected_state_token: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecordSemanticMergeConflictsOptions {
+    pub provider_token: String,
+    pub conflicts: Vec<Value>,
+    pub automatic_resolutions: Vec<Value>,
+    pub expected_state_token: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct AcceptSemanticMergeResultOptions {
+    pub provider_token: String,
+    pub validation: Value,
+    pub automatic_resolutions: Vec<Value>,
+    pub expected_state_token: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticMergeInput {
+    pub version: MergeSqliteVersion,
+    pub revision: Option<String>,
+    pub file_path: Option<String>,
+    pub size: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum SemanticMergeProviderRecord {
+    Pending,
+    Conflict {
+        conflicts: Vec<Value>,
+        automatic_resolutions: Vec<Value>,
+    },
+    Merged {
+        validation: Value,
+        automatic_resolutions: Vec<Value>,
+    },
+}
+
+impl Eq for SemanticMergeProviderRecord {}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SemanticMergeWorkspace {
+    pub provider_token: String,
+    pub provider: String,
+    pub path: String,
+    pub workspace_path: String,
+    pub result_path: String,
+    pub managed_tables: Vec<String>,
+    pub seed_applied_sql: bool,
+    pub managed_conflicts: usize,
+    /// Host clock sampled once when this durable provider plan is created.
+    pub prepared_at_unix_ms: u64,
+    pub state_token: String,
+    pub policy_token: String,
+    pub policy_version: u32,
+    pub orig_head: String,
+    pub merge_head: String,
+    pub merge_base: Option<String>,
+    pub inputs: Vec<SemanticMergeInput>,
+    pub record: SemanticMergeProviderRecord,
+}
+
+impl Eq for SemanticMergeWorkspace {}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct SemanticMergeWorkspaceManifest {
+    version: u32,
+    workspace: SemanticMergeWorkspace,
 }
 
 #[derive(Debug, Clone)]
@@ -2429,6 +2516,239 @@ impl RepositorySession {
         })
     }
 
+    /// Creates or reopens a durable private Base/Ours/Theirs workspace for an application merge
+    /// provider. Preparing the workspace does not change the index, merge journal, or worktree.
+    pub fn prepare_semantic_merge(
+        &self,
+        options: &PrepareSemanticMergeOptions,
+    ) -> Result<SemanticMergeWorkspace> {
+        validate_semantic_provider_name(&options.provider)?;
+        let managed_tables = validate_semantic_managed_tables(&options.managed_tables)?;
+        let managed_table_set = managed_tables.iter().cloned().collect::<BTreeSet<_>>();
+        let path = normalize_requested_path(&options.path)?;
+        self.with_state(|state| {
+            let SessionState { service, status_cache } = state;
+            let service = service.as_mut().ok_or_else(session_closed_error)?;
+            let incremental =
+                require_merge_state_token(service, status_cache, &options.expected_state_token)?;
+            let repo = service.repository().map_err(repository_command_error)?;
+            let index = repo.read_index().map_err(repo_error)?;
+            let merge_path = merge_paths_for_index(&index)
+                .into_iter()
+                .find(|item| item.path == path)
+                .ok_or_else(|| {
+                    invalid_argument(format!("path `{path}` is not part of the active merge"))
+                })?;
+            if merge_path.state != MergePathState::Unmerged
+                || merge_path.kind != RepoTrackedPathKind::SqliteDatabase
+            {
+                return Err(invalid_argument(format!(
+                    "path `{path}` is not an unresolved SQLite merge path"
+                )));
+            }
+            let state_token = durable_merge_state_token(&repo, &incremental.status, &index)?;
+            let policy = service.merge_policy().map_err(repository_command_error)?;
+            let (orig_head, merge_head, merge_base) = active_merge_heads(&repo, &incremental)?;
+            let provider_token = semantic_merge_provider_token(
+                &options.provider,
+                &path,
+                &state_token,
+                &policy.token,
+                policy.version,
+                &orig_head,
+                &merge_head,
+                merge_base.as_deref(),
+                &managed_tables,
+            )?;
+            let workspace_path = semantic_merge_workspace_path(&repo, &provider_token)?;
+            let manifest_path = workspace_path.join("manifest.json");
+            if manifest_path.is_file() {
+                let manifest = read_semantic_merge_manifest(&manifest_path)?;
+                validate_semantic_merge_workspace_paths(&manifest, &workspace_path)?;
+                validate_semantic_merge_manifest(
+                    &manifest,
+                    &provider_token,
+                    &options.provider,
+                    &path,
+                    &state_token,
+                    &managed_tables,
+                )?;
+                return Ok(manifest.workspace);
+            }
+            if workspace_path.exists() {
+                return Err(SdkError::new(
+                    SdkErrorCode::InvalidResponse,
+                    "semantic merge workspace exists without a valid manifest",
+                ));
+            }
+            fs::create_dir_all(&workspace_path)
+                .map_err(|error| repository_command_error(ErrCtx::IoErr(error)))?;
+
+            let creation = (|| -> Result<SemanticMergeWorkspace> {
+                let mut inputs = Vec::with_capacity(3);
+                for (version, revision, file_name) in [
+                    (
+                        MergeSqliteVersion::Base,
+                        merge_base.as_deref(),
+                        "base.sqlite",
+                    ),
+                    (
+                        MergeSqliteVersion::Ours,
+                        Some(orig_head.as_str()),
+                        "ours.sqlite",
+                    ),
+                    (
+                        MergeSqliteVersion::Theirs,
+                        Some(merge_head.as_str()),
+                        "theirs.sqlite",
+                    ),
+                ] {
+                    inputs.push(export_semantic_merge_input(
+                        service,
+                        &path,
+                        version,
+                        revision,
+                        &workspace_path.join(file_name),
+                    )?);
+                }
+                let result_path = workspace_path.join("result.sqlite");
+                let seed = service
+                    .prepare_semantic_merge_seed(Path::new(&path), &result_path, &managed_table_set)
+                    .map_err(repository_command_error)?;
+                let workspace = SemanticMergeWorkspace {
+                    provider_token: provider_token.clone(),
+                    provider: options.provider.clone(),
+                    path: path.clone(),
+                    workspace_path: workspace_path.to_string_lossy().into_owned(),
+                    result_path: result_path.to_string_lossy().into_owned(),
+                    managed_tables: managed_tables.clone(),
+                    seed_applied_sql: seed.applied_sql,
+                    managed_conflicts: seed.managed_conflicts,
+                    prepared_at_unix_ms: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map_err(|_| invalid_argument("system clock is before the Unix epoch"))?
+                        .as_millis()
+                        .try_into()
+                        .map_err(|_| {
+                            invalid_argument("system clock exceeds the supported range")
+                        })?,
+                    state_token,
+                    policy_token: policy.token,
+                    policy_version: policy.version,
+                    orig_head,
+                    merge_head,
+                    merge_base,
+                    inputs,
+                    record: SemanticMergeProviderRecord::Pending,
+                };
+                write_semantic_merge_manifest(
+                    &manifest_path,
+                    &SemanticMergeWorkspaceManifest {
+                        version: SEMANTIC_MERGE_WORKSPACE_VERSION,
+                        workspace: workspace.clone(),
+                    },
+                )?;
+                Ok(workspace)
+            })();
+            if creation.is_err() {
+                let _ = fs::remove_dir_all(&workspace_path);
+            }
+            creation
+        })
+    }
+
+    /// Persists application-domain conflicts without resolving the underlying Graft path.
+    pub fn record_semantic_merge_conflicts(
+        &self,
+        options: &RecordSemanticMergeConflictsOptions,
+    ) -> Result<SemanticMergeWorkspace> {
+        self.with_state(|state| {
+            let SessionState { service, status_cache } = state;
+            let service = service.as_mut().ok_or_else(session_closed_error)?;
+            require_merge_state_token(service, status_cache, &options.expected_state_token)?;
+            let repo = service.repository().map_err(repository_command_error)?;
+            let workspace_path = semantic_merge_workspace_path(&repo, &options.provider_token)?;
+            let manifest_path = workspace_path.join("manifest.json");
+            let mut manifest = read_semantic_merge_manifest(&manifest_path)?;
+            validate_semantic_merge_workspace_paths(&manifest, &workspace_path)?;
+            validate_semantic_merge_record_state(
+                &manifest,
+                &options.provider_token,
+                &options.expected_state_token,
+            )?;
+            manifest.workspace.record = SemanticMergeProviderRecord::Conflict {
+                conflicts: options.conflicts.clone(),
+                automatic_resolutions: options.automatic_resolutions.clone(),
+            };
+            ensure_semantic_merge_record_bounded(&manifest.workspace.record)?;
+            write_semantic_merge_manifest(&manifest_path, &manifest)?;
+            Ok(manifest.workspace)
+        })
+    }
+
+    /// Accepts the fixed provider result, validates it as `SQLite`, materializes it through the
+    /// normal checkout boundary, and stages the path under the current merge-state token.
+    pub fn accept_semantic_merge_result(
+        &self,
+        options: &AcceptSemanticMergeResultOptions,
+    ) -> Result<MergeOperationResult> {
+        self.with_state(|state| {
+            let SessionState { service, status_cache } = state;
+            let service = service.as_mut().ok_or_else(session_closed_error)?;
+            require_merge_state_token(service, status_cache, &options.expected_state_token)?;
+            let repo = service.repository().map_err(repository_command_error)?;
+            let workspace_path = semantic_merge_workspace_path(&repo, &options.provider_token)?;
+            let manifest_path = workspace_path.join("manifest.json");
+            let mut manifest = read_semantic_merge_manifest(&manifest_path)?;
+            validate_semantic_merge_workspace_paths(&manifest, &workspace_path)?;
+            validate_semantic_merge_record_state(
+                &manifest,
+                &options.provider_token,
+                &options.expected_state_token,
+            )?;
+            let record = SemanticMergeProviderRecord::Merged {
+                validation: options.validation.clone(),
+                automatic_resolutions: options.automatic_resolutions.clone(),
+            };
+            ensure_semantic_merge_record_bounded(&record)?;
+            graft::repo::cancellation_checkpoint().map_err(repo_error)?;
+            let previous_record = manifest.workspace.record.clone();
+            manifest.workspace.record = record;
+            // Persist the audit record first. A crash after this point remains
+            // retryable because the underlying conflict stages are still
+            // present until the materialization succeeds.
+            write_semantic_merge_manifest(&manifest_path, &manifest)?;
+            let staged_path = match service.stage_external_sqlite_result(
+                Path::new(&manifest.workspace.path),
+                Path::new(&manifest.workspace.result_path),
+            ) {
+                Ok(staged_path) => staged_path,
+                Err(error) => {
+                    manifest.workspace.record = previous_record;
+                    let _ = write_semantic_merge_manifest(&manifest_path, &manifest);
+                    return Err(repository_command_error(error));
+                }
+            };
+            status_cache.invalidate();
+            let incremental = refresh_incremental_status(service, status_cache)?;
+            let merge = merge_status_from_incremental(service, &incremental)?;
+            Ok(MergeOperationResult {
+                output: serde_json::json!({
+                    "operation": "accept_semantic_merge_result",
+                    "path": staged_path,
+                    "provider": manifest.workspace.provider,
+                    "provider_token": manifest.workspace.provider_token,
+                    "resolution": "semantic_provider",
+                    "integrity_check": "ok",
+                    "foreign_key_check": "ok",
+                    "materialized": true,
+                }),
+                merge,
+                worktree_paths: vec![staged_path],
+            })
+        })
+    }
+
     /// Atomically selects one side for every safely row-resolvable conflict in a `SQLite` table.
     pub fn resolve_merge_table(
         &self,
@@ -2540,6 +2860,11 @@ impl RepositorySession {
             let SessionState { service, status_cache } = state;
             let service = service.as_mut().ok_or_else(session_closed_error)?;
             require_merge_state_token(service, status_cache, &options.expected_state_token)?;
+            let semantic_workspaces = service
+                .repository()
+                .map_err(repository_command_error)?
+                .graft_dir()
+                .join(SEMANTIC_MERGE_WORKSPACE_DIRECTORY);
             let output = execute_json_command(
                 service,
                 RepositoryCommand::merge_continue(options.message.clone()),
@@ -2549,6 +2874,7 @@ impl RepositorySession {
             let incremental = refresh_incremental_status(service, status_cache)?;
             let merge = merge_status_from_incremental(service, &incremental)?;
             let worktree_paths = merge_worktree_paths_from_output(&output);
+            let _ = fs::remove_dir_all(semantic_workspaces);
             Ok(MergeOperationResult { output, merge, worktree_paths })
         })
     }
@@ -2559,12 +2885,18 @@ impl RepositorySession {
             let SessionState { service, status_cache } = state;
             let service = service.as_mut().ok_or_else(session_closed_error)?;
             require_merge_state_token(service, status_cache, &options.expected_state_token)?;
+            let semantic_workspaces = service
+                .repository()
+                .map_err(repository_command_error)?
+                .graft_dir()
+                .join(SEMANTIC_MERGE_WORKSPACE_DIRECTORY);
             let output =
                 execute_json_command(service, RepositoryCommand::merge_abort(), "merge_abort")?;
             status_cache.invalidate();
             let incremental = refresh_incremental_status(service, status_cache)?;
             let merge = merge_status_from_incremental(service, &incremental)?;
             let worktree_paths = merge_worktree_paths_from_output(&output);
+            let _ = fs::remove_dir_all(semantic_workspaces);
             Ok(MergeOperationResult { output, merge, worktree_paths })
         })
     }
@@ -4294,6 +4626,325 @@ fn durable_merge_state_token(
     Ok(format!("graft-merge-v1:{}", hasher.finalize().to_hex()))
 }
 
+fn validate_semantic_provider_name(provider: &str) -> Result<()> {
+    if provider.is_empty() || provider.len() > MAX_SEMANTIC_PROVIDER_NAME_BYTES {
+        return Err(invalid_argument(format!(
+            "semantic merge provider must contain between 1 and {MAX_SEMANTIC_PROVIDER_NAME_BYTES} bytes"
+        )));
+    }
+    if !provider
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+    {
+        return Err(invalid_argument(
+            "semantic merge provider may contain only ASCII letters, digits, '.', '_', ':', and '-'",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_semantic_managed_tables(tables: &[String]) -> Result<Vec<String>> {
+    if tables.is_empty() || tables.len() > MAX_SEMANTIC_MANAGED_TABLES {
+        return Err(invalid_argument(format!(
+            "semantic merge managed tables must contain between 1 and {MAX_SEMANTIC_MANAGED_TABLES} entries"
+        )));
+    }
+    let mut normalized = BTreeSet::new();
+    for table in tables {
+        if table.is_empty() || table.len() > 1_024 || table.contains('\0') {
+            return Err(invalid_argument(
+                "semantic merge managed table names must contain between 1 and 1,024 bytes and no NUL",
+            ));
+        }
+        if !normalized.insert(table.clone()) {
+            return Err(invalid_argument(
+                "semantic merge managed table names must be unique",
+            ));
+        }
+    }
+    Ok(normalized.into_iter().collect())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn semantic_merge_provider_token(
+    provider: &str,
+    path: &str,
+    state_token: &str,
+    policy_token: &str,
+    policy_version: u32,
+    orig_head: &str,
+    merge_head: &str,
+    merge_base: Option<&str>,
+    managed_tables: &[String],
+) -> Result<String> {
+    let encoded = serde_json::to_vec(&(
+        SEMANTIC_MERGE_WORKSPACE_VERSION,
+        provider,
+        path,
+        state_token,
+        policy_token,
+        policy_version,
+        orig_head,
+        merge_head,
+        merge_base,
+        managed_tables,
+    ))
+    .map_err(status_encode_error)?;
+    Ok(format!(
+        "graft-semantic-v1:{}",
+        blake3::hash(&encoded).to_hex()
+    ))
+}
+
+fn semantic_merge_workspace_path(repo: &Repository, provider_token: &str) -> Result<PathBuf> {
+    let Some(digest) = provider_token.strip_prefix("graft-semantic-v1:") else {
+        return Err(invalid_argument("invalid semantic merge provider token"));
+    };
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(invalid_argument("invalid semantic merge provider token"));
+    }
+    Ok(repo
+        .graft_dir()
+        .join(SEMANTIC_MERGE_WORKSPACE_DIRECTORY)
+        .join(digest))
+}
+
+fn export_semantic_merge_input(
+    service: &mut RepositoryCommandService,
+    path: &str,
+    version: MergeSqliteVersion,
+    revision: Option<&str>,
+    output: &Path,
+) -> Result<SemanticMergeInput> {
+    let Some(revision) = revision else {
+        return Ok(SemanticMergeInput {
+            version,
+            revision: None,
+            file_path: None,
+            size: None,
+        });
+    };
+    let repo = service.repository().map_err(repository_command_error)?;
+    let physical_path = repo.worktree().join(path);
+    let has_sqlite = repo
+        .file_from_revision(revision, &physical_path)
+        .map_err(repo_error)?
+        .is_some();
+    if !has_sqlite {
+        if repo
+            .artifact_from_revision(revision, &physical_path)
+            .map_err(repo_error)?
+            .is_some()
+        {
+            return Err(invalid_argument(format!(
+                "merge {version:?} path `{path}` is not a SQLite database"
+            )));
+        }
+        return Ok(SemanticMergeInput {
+            version,
+            revision: Some(revision.to_string()),
+            file_path: None,
+            size: None,
+        });
+    }
+    service
+        .export_revision_sqlite_path(revision, &physical_path, output)
+        .map_err(repository_command_error)?;
+    let metadata =
+        fs::metadata(output).map_err(|error| repository_command_error(ErrCtx::IoErr(error)))?;
+    let mut permissions = metadata.permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(output, permissions)
+        .map_err(|error| repository_command_error(ErrCtx::IoErr(error)))?;
+    Ok(SemanticMergeInput {
+        version,
+        revision: Some(revision.to_string()),
+        file_path: Some(output.to_string_lossy().into_owned()),
+        size: Some(metadata.len()),
+    })
+}
+
+fn read_semantic_merge_manifest(path: &Path) -> Result<SemanticMergeWorkspaceManifest> {
+    let bytes = fs::read(path).map_err(|error| repository_command_error(ErrCtx::IoErr(error)))?;
+    if bytes.len() > MAX_SEMANTIC_MERGE_RECORD_BYTES {
+        return Err(SdkError::new(
+            SdkErrorCode::InvalidResponse,
+            "semantic merge manifest exceeds the supported size",
+        ));
+    }
+    let manifest =
+        serde_json::from_slice::<SemanticMergeWorkspaceManifest>(&bytes).map_err(|error| {
+            SdkError::new(
+                SdkErrorCode::InvalidResponse,
+                format!("invalid semantic merge manifest: {error}"),
+            )
+        })?;
+    if manifest.version != SEMANTIC_MERGE_WORKSPACE_VERSION {
+        return Err(SdkError::new(
+            SdkErrorCode::InvalidResponse,
+            format!(
+                "unsupported semantic merge workspace version {}",
+                manifest.version
+            ),
+        ));
+    }
+    Ok(manifest)
+}
+
+fn write_semantic_merge_manifest(
+    path: &Path,
+    manifest: &SemanticMergeWorkspaceManifest,
+) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(manifest).map_err(status_encode_error)?;
+    if bytes.len() > MAX_SEMANTIC_MERGE_RECORD_BYTES {
+        return Err(invalid_argument(
+            "semantic merge manifest exceeds the supported size",
+        ));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid_argument("semantic merge manifest path has no parent directory"))?;
+    fs::create_dir_all(parent).map_err(|error| repository_command_error(ErrCtx::IoErr(error)))?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary = parent.join(format!(".manifest-{}-{nonce}.tmp", std::process::id()));
+    let backup = parent.join(format!(".manifest-{}-{nonce}.backup", std::process::id()));
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)
+        .map_err(|error| repository_command_error(ErrCtx::IoErr(error)))?;
+    if let Err(error) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
+        let _ = fs::remove_file(&temporary);
+        return Err(repository_command_error(ErrCtx::IoErr(error)));
+    }
+    drop(file);
+    let had_original = path.is_file();
+    if had_original && let Err(error) = fs::rename(path, &backup) {
+        let _ = fs::remove_file(&temporary);
+        return Err(repository_command_error(ErrCtx::IoErr(error)));
+    }
+    if let Err(error) = fs::rename(&temporary, path) {
+        if had_original {
+            let _ = fs::rename(&backup, path);
+        }
+        let _ = fs::remove_file(&temporary);
+        return Err(repository_command_error(ErrCtx::IoErr(error)));
+    }
+    if had_original {
+        let _ = fs::remove_file(backup);
+    }
+    let _ = fs::File::open(parent).and_then(|directory| directory.sync_all());
+    Ok(())
+}
+
+fn validate_semantic_merge_manifest(
+    manifest: &SemanticMergeWorkspaceManifest,
+    provider_token: &str,
+    provider: &str,
+    path: &str,
+    state_token: &str,
+    managed_tables: &[String],
+) -> Result<()> {
+    validate_semantic_merge_record_state(manifest, provider_token, state_token)?;
+    if manifest.workspace.provider_token != provider_token
+        || manifest.workspace.provider != provider
+        || manifest.workspace.path != path
+        || manifest.workspace.state_token != state_token
+        || manifest.workspace.managed_tables != managed_tables
+    {
+        return Err(repository_stale_error(
+            "semantic merge workspace does not match the active merge state",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_semantic_merge_workspace_paths(
+    manifest: &SemanticMergeWorkspaceManifest,
+    workspace_path: &Path,
+) -> Result<()> {
+    if Path::new(&manifest.workspace.workspace_path) != workspace_path
+        || Path::new(&manifest.workspace.result_path) != workspace_path.join("result.sqlite")
+        || !Path::new(&manifest.workspace.result_path).is_file()
+    {
+        return Err(SdkError::new(
+            SdkErrorCode::InvalidResponse,
+            "semantic merge manifest contains invalid workspace paths",
+        ));
+    }
+    if manifest.workspace.inputs.len() != 3 {
+        return Err(SdkError::new(
+            SdkErrorCode::InvalidResponse,
+            "semantic merge manifest must contain exactly three input descriptors",
+        ));
+    }
+    let mut seen = [false; 3];
+    for input in &manifest.workspace.inputs {
+        let (index, expected_name) = match input.version {
+            MergeSqliteVersion::Base => (0, "base.sqlite"),
+            MergeSqliteVersion::Ours => (1, "ours.sqlite"),
+            MergeSqliteVersion::Theirs => (2, "theirs.sqlite"),
+        };
+        if seen[index] {
+            return Err(SdkError::new(
+                SdkErrorCode::InvalidResponse,
+                "semantic merge manifest contains duplicate input versions",
+            ));
+        }
+        seen[index] = true;
+        if let Some(file_path) = &input.file_path
+            && (Path::new(file_path) != workspace_path.join(expected_name)
+                || !Path::new(file_path).is_file())
+        {
+            return Err(SdkError::new(
+                SdkErrorCode::InvalidResponse,
+                "semantic merge manifest contains an invalid input path",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_semantic_merge_record_state(
+    manifest: &SemanticMergeWorkspaceManifest,
+    provider_token: &str,
+    state_token: &str,
+) -> Result<()> {
+    let expected_provider_token = semantic_merge_provider_token(
+        &manifest.workspace.provider,
+        &manifest.workspace.path,
+        &manifest.workspace.state_token,
+        &manifest.workspace.policy_token,
+        manifest.workspace.policy_version,
+        &manifest.workspace.orig_head,
+        &manifest.workspace.merge_head,
+        manifest.workspace.merge_base.as_deref(),
+        &manifest.workspace.managed_tables,
+    )?;
+    if manifest.workspace.provider_token != provider_token
+        || expected_provider_token != provider_token
+        || manifest.workspace.state_token != state_token
+    {
+        return Err(repository_stale_error(
+            "semantic merge workspace is stale; prepare it again",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_semantic_merge_record_bounded(record: &SemanticMergeProviderRecord) -> Result<()> {
+    let bytes = serde_json::to_vec(record).map_err(status_encode_error)?;
+    if bytes.len() > MAX_SEMANTIC_MERGE_RECORD_BYTES {
+        return Err(invalid_argument(
+            "semantic merge provider record exceeds the supported size",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_page_limit(limit: usize, maximum: usize, label: &str) -> Result<()> {
     if limit == 0 || limit > maximum {
         return Err(invalid_argument(format!(
@@ -5158,6 +5809,231 @@ mod tests {
             "selecting an unchanged first-parent SQLite result must not create a history-only modification: {:?}",
             changed.paths
         );
+        session.close().unwrap();
+    }
+
+    #[test]
+    fn semantic_merge_workspace_survives_reopen_and_stages_validated_result() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("space.eidos");
+        {
+            let database = Connection::open(&database_path).unwrap();
+            database
+                .execute_batch(
+                    "CREATE TABLE docs (id INTEGER PRIMARY KEY, value TEXT NOT NULL);\
+                     INSERT INTO docs VALUES (1, 'base');\
+                     CREATE TABLE user_rows (id INTEGER PRIMARY KEY, value TEXT NOT NULL);\
+                     INSERT INTO user_rows VALUES (1, 'base');",
+                )
+                .unwrap();
+        }
+
+        let session = RepositorySession::new(directory.path());
+        session.open().unwrap();
+        session.init().unwrap();
+        session.add_all().unwrap();
+        session.commit("base").unwrap();
+        session.close().unwrap();
+
+        let repo = Repository::open(directory.path()).unwrap();
+        repo.switch_new_branch("hosted", None).unwrap();
+        drop(repo);
+        Connection::open(&database_path)
+            .unwrap()
+            .execute_batch(
+                "UPDATE docs SET value = 'hosted' WHERE id = 1;\
+                 UPDATE user_rows SET value = 'hosted' WHERE id = 1;",
+            )
+            .unwrap();
+        session.open().unwrap();
+        session.add_all().unwrap();
+        let hosted = session.commit("hosted row").unwrap()["commit"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        session.close().unwrap();
+
+        let repo = Repository::open(directory.path()).unwrap();
+        repo.switch_branch("main").unwrap();
+        drop(repo);
+        Connection::open(&database_path)
+            .unwrap()
+            .execute_batch(
+                "UPDATE docs SET value = 'local' WHERE id = 1;\
+                 UPDATE user_rows SET value = 'base' WHERE id = 1;",
+            )
+            .unwrap();
+        session.open().unwrap();
+        session.add_all().unwrap();
+        let local = session.commit("local row").unwrap()["commit"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let plan = session
+            .plan_merge(&PlanMergeOptions {
+                revision: hosted.clone(),
+                expected_head: Some(local.clone()),
+            })
+            .unwrap();
+        let applied = session
+            .apply_merge(&ApplyMergeOptions {
+                revision: hosted,
+                expected_head: Some(local),
+                plan_token: plan.plan_token,
+            })
+            .unwrap();
+        let MergeStatus::Merging { state_token, .. } = applied.merge else {
+            panic!("expected SQLite merge conflict");
+        };
+
+        let prepared = session
+            .prepare_semantic_merge(&PrepareSemanticMergeOptions {
+                path: PathBuf::from("space.eidos"),
+                provider: "test.system-merge-1.0".to_string(),
+                managed_tables: vec!["docs".to_string()],
+                expected_state_token: state_token.clone(),
+            })
+            .unwrap();
+        assert_eq!(prepared.inputs.len(), 3);
+        assert!(
+            prepared
+                .inputs
+                .iter()
+                .all(|input| input.file_path.is_some())
+        );
+        assert!(matches!(
+            prepared.record,
+            SemanticMergeProviderRecord::Pending
+        ));
+        assert!(Path::new(&prepared.result_path).is_file());
+        assert_eq!(prepared.managed_tables, vec!["docs"]);
+        assert_eq!(prepared.managed_conflicts, 1);
+        assert!(prepared.prepared_at_unix_ms > 0);
+        assert!(prepared.seed_applied_sql);
+        let seed = Connection::open(&prepared.result_path).unwrap();
+        assert_eq!(
+            seed.query_row("SELECT value FROM docs WHERE id = 1", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+            "local"
+        );
+        assert_eq!(
+            seed.query_row("SELECT value FROM user_rows WHERE id = 1", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+            "hosted"
+        );
+        drop(seed);
+        let seeded_result = fs::read(&prepared.result_path).unwrap();
+
+        let recorded = session
+            .record_semantic_merge_conflicts(&RecordSemanticMergeConflictsOptions {
+                provider_token: prepared.provider_token.clone(),
+                conflicts: vec![json!({"code": "domain-conflict", "object": "docs/1"})],
+                automatic_resolutions: vec![json!({"group": "metadata-clock"})],
+                expected_state_token: state_token.clone(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recorded.record,
+            SemanticMergeProviderRecord::Conflict { ref conflicts, .. } if conflicts.len() == 1
+        ));
+
+        session.close().unwrap();
+        session.open().unwrap();
+        let reopened = session
+            .prepare_semantic_merge(&PrepareSemanticMergeOptions {
+                path: PathBuf::from("space.eidos"),
+                provider: "test.system-merge-1.0".to_string(),
+                managed_tables: vec!["docs".to_string()],
+                expected_state_token: state_token.clone(),
+            })
+            .unwrap();
+        assert_eq!(reopened.provider_token, prepared.provider_token);
+        assert!(matches!(
+            reopened.record,
+            SemanticMergeProviderRecord::Conflict { .. }
+        ));
+
+        let ours = reopened
+            .inputs
+            .iter()
+            .find(|input| input.version == MergeSqliteVersion::Ours)
+            .and_then(|input| input.file_path.as_deref())
+            .unwrap();
+        assert!(Path::new(ours).is_file());
+        fs::write(&reopened.result_path, b"not a sqlite database").unwrap();
+        assert!(
+            session
+                .accept_semantic_merge_result(&AcceptSemanticMergeResultOptions {
+                    provider_token: reopened.provider_token.clone(),
+                    validation: json!({"profile": "test", "valid": true}),
+                    automatic_resolutions: Vec::new(),
+                    expected_state_token: state_token.clone(),
+                })
+                .is_err()
+        );
+        let after_failed_accept = session
+            .prepare_semantic_merge(&PrepareSemanticMergeOptions {
+                path: PathBuf::from("space.eidos"),
+                provider: "test.system-merge-1.0".to_string(),
+                managed_tables: vec!["docs".to_string()],
+                expected_state_token: state_token.clone(),
+            })
+            .unwrap();
+        assert!(matches!(
+            after_failed_accept.record,
+            SemanticMergeProviderRecord::Conflict { .. }
+        ));
+        assert!(matches!(
+            session.get_merge_status().unwrap(),
+            MergeStatus::Merging { unmerged_count: 1, .. }
+        ));
+        fs::write(&reopened.result_path, seeded_result).unwrap();
+        Connection::open(&reopened.result_path)
+            .unwrap()
+            .execute("UPDATE docs SET value = 'semantic' WHERE id = 1", [])
+            .unwrap();
+
+        let accepted = session
+            .accept_semantic_merge_result(&AcceptSemanticMergeResultOptions {
+                provider_token: reopened.provider_token,
+                validation: json!({"profile": "test", "valid": true}),
+                automatic_resolutions: vec![json!({"group": "docs/1"})],
+                expected_state_token: state_token,
+            })
+            .unwrap();
+        assert_eq!(accepted.worktree_paths, vec!["space.eidos"]);
+        let MergeStatus::Merging {
+            state_token: accepted_token,
+            unmerged_count,
+            ..
+        } = accepted.merge
+        else {
+            panic!("expected resolved merge pending continue");
+        };
+        assert_eq!(unmerged_count, 0);
+        assert_eq!(
+            Connection::open(&database_path)
+                .unwrap()
+                .query_row("SELECT value FROM docs WHERE id = 1", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            "semantic"
+        );
+
+        let completed = session
+            .continue_merge(&ContinueMergeOptions {
+                message: "semantic merge".to_string(),
+                expected_state_token: accepted_token,
+            })
+            .unwrap();
+        assert_eq!(completed.merge, MergeStatus::None);
+        assert!(!directory.path().join(".graft/semantic-merge").exists());
         session.close().unwrap();
     }
 

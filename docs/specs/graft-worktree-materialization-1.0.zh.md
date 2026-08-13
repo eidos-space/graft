@@ -234,6 +234,8 @@ Graft session。
 | SDK / 隐藏 CLI `merge-api` | `applyMerge` | 是 | up-to-date 通常不写；fast-forward checkout；three-way 写 merge state/index 并按 policy 物化 clean path |
 | CLI / SDK | `setMergePathResult` / 整路径 `resolve` | 是 | 写选定 path result，合并冲突 stage |
 | CLI / SDK | `resolveMergeRow` | 是 | 写当前 row-resolution candidate；可能物化 merged SQLite result |
+| SDK | `prepareSemanticMerge`、`recordSemanticMergeConflicts` | 否 | 只在 `.graft` 下写 Graft-owned private provider workspace/record |
+| SDK | `acceptSemanticMergeResult` | 是 | 验证 private provider result、替换 tracked SQLite path 并 stage |
 | CLI / SDK | `writeAndStageTextResult` / `resolve --manual` | 是 | 写并 staging 编辑后的物理结果 |
 | CLI / SDK | `continueMerge` / `merge --continue` | 是 | commit 已解决 merge；当前 CLI path 可能再次写 SQLite snapshot |
 | CLI / SDK | `abortMerge` / `merge --abort` | 是 | 恢复 `ORIG_HEAD` 并应用 abort checkout plan |

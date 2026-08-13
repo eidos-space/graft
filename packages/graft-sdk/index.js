@@ -322,6 +322,58 @@ class RepositorySession {
     )
   }
 
+  async prepareSemanticMerge(options) {
+    const { signal, managedTables = [], ...providerOptions } = options
+    return callJson(() =>
+      this.#native.prepareSemanticMerge(
+        { ...providerOptions, managedTables },
+        signal
+      )
+    )
+  }
+
+  async recordSemanticMergeConflicts(options) {
+    const {
+      signal,
+      providerToken,
+      conflicts,
+      automaticResolutions = [],
+      expectedStateToken,
+    } = options
+    return callJson(() =>
+      this.#native.recordSemanticMergeConflicts(
+        {
+          providerToken,
+          conflictsJson: JSON.stringify(conflicts),
+          automaticResolutionsJson: JSON.stringify(automaticResolutions),
+          expectedStateToken,
+        },
+        signal
+      )
+    )
+  }
+
+  async acceptSemanticMergeResult(options) {
+    const {
+      signal,
+      providerToken,
+      validation,
+      automaticResolutions = [],
+      expectedStateToken,
+    } = options
+    return callJson(() =>
+      this.#native.acceptSemanticMergeResult(
+        {
+          providerToken,
+          validationJson: JSON.stringify(validation),
+          automaticResolutionsJson: JSON.stringify(automaticResolutions),
+          expectedStateToken,
+        },
+        signal
+      )
+    )
+  }
+
   async unresolveMergePath(options) {
     const { signal, ...pathOptions } = options
     return callJson(() =>

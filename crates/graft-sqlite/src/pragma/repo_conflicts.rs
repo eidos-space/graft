@@ -1,5 +1,59 @@
 use super::*;
 
+pub(crate) fn prepare_repo_semantic_merge_seed(
+    runtime: &Runtime,
+    file: &RepositorySessionContext,
+    repo: &Repository,
+    path: &Path,
+    candidate_path: &Path,
+    managed_tables: &BTreeSet<String>,
+) -> Result<(bool, usize), ErrCtx> {
+    let (key, _) = repo_physical_path_arg(repo, path)?;
+    let Some((base, ours, theirs)) = current_file_conflict_states(repo, &key)? else {
+        return Err(ErrCtx::InvalidCommand(
+            format!("path `{key}` has no three-way SQLite conflict state").into(),
+        ));
+    };
+    let remote = repo_default_remote_store(repo);
+    hydrate_repo_file_state_for(runtime, &base, None, RepoSnapshotPurpose::Merge)?;
+    hydrate_repo_file_state_for(runtime, &ours, None, RepoSnapshotPurpose::Merge)?;
+    hydrate_repo_file_state_for(runtime, &theirs, remote, RepoSnapshotPurpose::Merge)?;
+    let plan = plan_repo_snapshot_merge(runtime, file, repo, &base, &ours, &theirs)?;
+    if !plan.schema_conflicts().is_empty()
+        || plan.has_schema_additions()
+        || plan.has_opaque_changes()
+        || !plan.limitations().is_empty()
+        || plan.requires_validation()
+    {
+        return Err(ErrCtx::InvalidCommand(
+            "semantic provider seed is blocked by schema, opaque, limited, or recomputation-required SQLite changes"
+                .into(),
+        ));
+    }
+    let unmanaged_conflicts = plan.conflict_count_outside(managed_tables);
+    if unmanaged_conflicts > 0 {
+        return Err(ErrCtx::InvalidCommand(
+            format!(
+                "semantic provider seed has {unmanaged_conflicts} unresolved conflict(s) outside provider-managed tables"
+            )
+            .into(),
+        ));
+    }
+    if candidate_path.exists() {
+        return Err(ErrCtx::InvalidCommand(
+            "semantic provider result path already exists before seed construction".into(),
+        ));
+    }
+    write_repo_file_state_to_path(runtime, &ours, candidate_path)?;
+    let sql = plan.theirs_apply_sql_excluding(managed_tables);
+    let applied_sql = !sql.trim().is_empty();
+    if applied_sql && let Err(error) = apply_row_merge_sql_to_path(candidate_path, &sql) {
+        let _ = std::fs::remove_file(candidate_path);
+        return Err(error);
+    }
+    Ok((applied_sql, plan.conflict_count_inside(managed_tables)))
+}
+
 pub(super) fn conflict_side_state(
     repo: &Repository,
     key: &str,
@@ -406,6 +460,52 @@ pub(crate) fn stage_repo_worktree_sqlite_result(
     )?;
     stage_resolved_file_state(repo, &physical_path, validated)?;
     set_merge_path_resolution(repo, &key, Some("edited"))?;
+    Ok(key)
+}
+
+pub(crate) fn stage_repo_external_sqlite_result(
+    runtime: &Runtime,
+    repo: &Repository,
+    path: &Path,
+    candidate_path: &Path,
+) -> Result<String, ErrCtx> {
+    let (key, physical_path) = repo_physical_path_arg(repo, path)?;
+    let status = repo.status()?;
+    let resolution_state = read_row_conflict_resolution_state(repo, &status)?;
+    if !resolution_state.paths.contains_key(&key) {
+        return Err(ErrCtx::Repo(graft::repo::RepoErr::PathNotConflicted(key)));
+    }
+    let entries = original_conflict_entries(repo, &resolution_state, &key)?;
+    if !entries.iter().any(|entry| entry.file.is_some()) {
+        return Err(ErrCtx::InvalidCommand(
+            format!("path `{key}` is not a tracked SQLite merge path").into(),
+        ));
+    }
+    if !candidate_path.is_file() || !is_sqlite_database_path(candidate_path)? {
+        return Err(ErrCtx::InvalidCommand(
+            format!(
+                "semantic merge result `{}` is not a readable SQLite database",
+                candidate_path.display()
+            )
+            .into(),
+        ));
+    }
+
+    // Capture and validate the provider-owned file before touching the application worktree.
+    let captured = import_physical_sqlite_file_state(runtime, candidate_path, None)?;
+    let validated = materialize_row_auto_merge_state(
+        runtime,
+        repo,
+        &key,
+        &captured,
+        "BEGIN TRANSACTION;\nCOMMIT;\n",
+    )?;
+
+    // Replacement uses the normal SQLite checkout boundary: it writes a private temporary file,
+    // validates the destination kind, and renames only after the complete snapshot is available.
+    checkout_repo_file_state_to_path(runtime, repo, &validated, &physical_path, None)?;
+    stage_resolved_file_state(repo, &physical_path, validated)?;
+    set_merge_path_resolution(repo, &key, Some("semantic_provider"))?;
     Ok(key)
 }
 

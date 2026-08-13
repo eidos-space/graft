@@ -249,6 +249,14 @@ versions from durable repository state. Missing or inconsistent merge records
 MUST be reported as recoverable corruption; implementations MUST NOT assume the
 worktree's current bytes are the intended result.
 
+Application semantic providers use a separate `.graft/semantic-merge`
+workspace. It is not part of the merge-state-token hash and MUST NOT itself
+resolve a path. Each workspace manifest is instead bound to the exact active
+state token, frozen policy token/version, Base/Ours/Theirs revisions, provider
+identifier, and repository path. The workspace and any recorded domain
+conflicts survive SDK close/reopen and remain until the merge successfully
+continues or aborts.
+
 ## 7. Status and bounded conflict inspection
 
 `getMergeStatus` reports at least active/inactive state, ours/theirs/base when
@@ -353,6 +361,48 @@ locks, sidecars, replacement, and rollback work, is defined exclusively by the
 materialization specification. Canonical index/merge-state success MUST not be
 claimed if a required projection fails without a valid recovery record.
 
+### 8.7 Application semantic provider
+
+`prepareSemanticMerge` is a non-materializing, token-guarded handoff for an
+unresolved SQLite path. The application MUST declare a non-empty bounded list
+of provider-managed table names. Graft exports present Base/Ours/Theirs
+snapshots as standalone, read-only physical files inside a Graft-owned private
+workspace. It also creates a fixed `result.sqlite` candidate from Ours and
+applies conflict-free Theirs row changes outside the declared managed tables.
+The provider token is bound to the provider name, path, active merge-state
+token, frozen policy token/version, three immutable merge revisions, and the
+canonical managed-table set. Graft MUST NOT invoke application code or
+interpret the business meaning of managed tables.
+
+Seed construction MUST fail before publishing a workspace when the physical
+plan contains schema additions or conflicts, opaque or limited changes,
+recomputation-required changes, or unresolved row conflicts outside the
+managed tables. Failure MUST NOT change the index, worktree, conflict stages,
+or merge-state token. `seed_applied_sql` reports whether the safe unmanaged
+Theirs projection changed the candidate; `managed_conflicts` reports the
+number of row conflicts inside the provider-managed set. These values are
+diagnostic and do not replace application validation.
+
+Re-preparing the same unchanged handoff returns the same workspace and provider
+record. `recordSemanticMergeConflicts` durably records bounded application
+domain conflicts and automatic-resolution audit data without changing the
+index, worktree, conflict stages, or merge-state token. Graft treats those
+records as opaque JSON and MUST NOT promote them to built-in row/schema rules.
+
+After the application updates and validates the seeded `result.sqlite`,
+`acceptSemanticMergeResult` requires both the provider token and current merge
+state token. It captures and runs SQLite integrity/foreign-key validation on
+the exact result before replacing the application worktree through the normal
+materialization boundary and staging one Normal path result. A missing,
+non-SQLite, stale, or invalid result MUST leave the original conflict stages
+recoverable. The application validation proof and automatic-resolution audit
+are bounded opaque records; their business meaning remains owned by the
+provider.
+
+This interface is generic. A provider may implement an Eidos metadata policy,
+another application's schema policy, or no provider at all. Graft MUST NOT
+contain provider-specific table names, clocks, LWW rules, or dependency logic.
+
 ## 9. Continue and abort
 
 ### 9.1 Continue
@@ -431,9 +481,12 @@ A conforming merge implementation MUST test:
 7. candidate integrity/foreign-key validation and rollback on failure;
 8. whole-path, text, and row resolution with stale-token protection;
 9. close/reopen persistence of status, conflict details, selections, and result;
-10. continue creating the exact two-parent commit;
-11. abort restoring the original repository state; and
-12. crash/failure behavior at durable and physical-projection boundaries.
+10. semantic-provider prepare/reopen, stale provider/state tokens, bounded
+    conflict records, invalid result rejection, validated result acceptance,
+    and continue/abort cleanup;
+11. continue creating the exact two-parent commit;
+12. abort restoring the original repository state; and
+13. crash/failure behavior at durable and physical-projection boundaries.
 
 Current evidence lives in `crates/graft/src/repo/merge.rs`, repository merge
 tests, SQLite row-merge tests in `crates/graft-sqlite/src/`, command-service

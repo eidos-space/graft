@@ -54,7 +54,7 @@ mod jobs;
 mod json;
 mod output_types;
 pub(crate) mod parse;
-mod repo_checkout;
+pub(crate) mod repo_checkout;
 pub(crate) mod repo_conflicts;
 pub(crate) mod repo_core;
 pub(crate) mod repo_diff;

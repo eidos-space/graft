@@ -1714,7 +1714,7 @@ pub(super) fn format_repo_path_list(count: usize, paths: Vec<String>) -> String 
     }
 }
 
-pub(super) fn export_repo_path(
+pub(crate) fn export_repo_path(
     runtime: &Runtime,
     file: &RepositorySessionContext,
     repo: &Repository,

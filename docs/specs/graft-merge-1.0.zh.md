@@ -155,6 +155,12 @@ Worktree 不是唯一记录。关闭进程和 SDK session 后重开必须恢复�
 与 versions。Record 缺失/不一致必须作为可恢复 corruption 报告，不能把当前物理
 bytes 猜成 intended result。
 
+Application semantic provider 使用单独的 `.graft/semantic-merge` workspace。它不进入
+merge-state-token hash，也不能自行 resolve path。每个 manifest 绑定精确 active state
+token、冻结 policy token/version、Base/Ours/Theirs revision、provider 标识与 repository
+path。Workspace 和已记录 domain conflict 在 SDK close/reopen 后继续存在，直到 merge
+成功 continue 或 abort。
+
 ## 7. Status 与 conflict inspection
 
 `getMergeStatus` 至少报告 active、ours/theirs/base、current token/state identity、
@@ -207,6 +213,40 @@ Semantic-key、schema、opaque、malformed 或 unsupported conflict 不能 per-r
 Resolution 是否写普通 SQLite worktree，以及 WAL/lock/sidecar/replacement/rollback，
 只由 Materialization 规格定义。
 
+### 8.7 Application semantic provider
+
+`prepareSemanticMerge` 是 unresolved SQLite path 的 non-materializing、token-guarded
+handoff。Application 必须声明一组非空且有界的 provider-managed table name。Graft 在
+Graft-owned private workspace 中导出存在的 Base/Ours/Theirs standalone read-only
+physical file；同时从 Ours 创建固定 `result.sqlite` candidate，并在其中应用 declared
+managed table 之外无冲突的 Theirs row change。返回的 provider token 绑定 provider
+name、path、active merge-state token、冻结 policy token/version、三个 immutable
+revision 与 canonical managed-table set。Graft 不调用 application code，也不解释
+managed table 的业务含义。
+
+若 physical plan 含 schema addition/conflict、opaque/limited change、需要 recomputation
+的 change，或 managed table 之外仍有 unresolved row conflict，seed construction 必须在
+发布 workspace 前失败。失败不能改 index、worktree、conflict stage 或 merge-state
+token。`seed_applied_sql` 表示 safe unmanaged Theirs projection 是否修改 candidate；
+`managed_conflicts` 表示 provider-managed set 内的 row conflict 数量。这些值只用于诊断，
+不能替代 application validation。
+
+相同且未变化的 handoff 再次 prepare 时返回同一 workspace 与 provider record。
+`recordSemanticMergeConflicts` 持久记录 bounded application domain conflict 与自动决策
+audit，但不改 index、worktree、conflict stage 或 merge-state token。Graft 把记录视为
+opaque JSON，不能提升成 built-in row/schema rule。
+
+Application 更新并验证 seeded `result.sqlite` 后，`acceptSemanticMergeResult` 同时校验 provider
+token 与 current merge-state token。它先捕获精确 result 并执行 SQLite integrity/FK
+validation，再通过正常 materialization boundary 替换 application worktree，并 stage 一条
+Normal path result。Missing、非 SQLite、stale 或 invalid result 必须保留可恢复的原始
+conflict stage。Application validation proof 与自动决策 audit 是 bounded opaque record；
+业务含义仍由 provider 拥有。
+
+此接口是 generic 的。Provider 可以实现 Eidos metadata policy、其他应用 schema policy，
+也可以完全不配置。Graft 不能包含 provider-specific table name、clock、LWW rule 或
+dependency logic。
+
 ## 9. Continue 与 abort
 
 `continueMerge` 必须验证 active，且 token-based adapter 的 token current；同时无
@@ -246,7 +286,9 @@ Startup 不能为了清 conflict 自动选 ours/theirs。
 至少测试：三种 topology、plan 只读与 stale token、所有 path 关系、SQLite 独立/
 冲突 row、composite key/rowid remap/semantic key、schema/opaque resolver、candidate
 validation rollback、whole-path/text/row resolution、关闭重开、continue 双 parent、
-abort 恢复，以及 durable/physical boundary 的 crash/failure。
+semantic-provider prepare/reopen、stale provider/state token、bounded conflict record、invalid
+result rejection、validated result acceptance、continue/abort cleanup、abort 恢复，以及
+durable/physical boundary 的 crash/failure。
 
 当前证据位于 `crates/graft/src/repo/merge.rs`、repository merge test、
 `crates/graft-sqlite/src/` row-merge test、command service、Rust/Node SDK test 和

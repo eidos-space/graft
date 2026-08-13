@@ -97,7 +97,7 @@ CLI 与 SDK 主要映射如下；SDK 空白表示当前 CLI-only，不是另一�
 | remote config subset | `configureRemote` | local config/upstream |
 | `fetch/push/pull` | 同名 method | remote/ref/merge outcome |
 | `clone` | `cloneRepository` | new repository/checkout |
-| merge/conflicts/resolve | plan/apply/status/list/version/path/row/text/continue/abort | typed token 与 outcome |
+| merge/conflicts/resolve | plan/apply/status/list/version/path/row/text/provider/continue/abort | typed plan/state/provider token 与 outcome |
 | branch/tag/switch/reset/export/audit/payload/GC/SQL/low-level remote | — | CLI-only 1.0 |
 
 稳定分类：

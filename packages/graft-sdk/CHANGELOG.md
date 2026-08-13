@@ -5,6 +5,27 @@ SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
 
 ## Unreleased
 
+## Graft SDK 0.3.13 — 2026-08-13
+
+### Added
+
+- Added a generic, durable semantic-merge provider handoff for application-owned SQLite rules.
+  Providers receive immutable Base/Ours/Theirs snapshots plus a private Ours-derived candidate
+  containing safe non-managed Theirs changes, and may persist bounded domain conflicts or accept a
+  validated result under exact provider and merge-state tokens.
+
+### Fixed
+
+- Semantic result acceptance now records its validation audit before worktree materialization, so a
+  process interruption remains retryable instead of leaving an apparently failed but already staged
+  path.
+
+### Compatibility
+
+- Repository, snapshot, merge-journal, and Remote formats are unchanged. The provider APIs are
+  additive, provider workspaces stay private under `.graft`, and Node.js 20 remains the minimum
+  supported runtime.
+
 ## Graft SDK 0.3.12 — 2026-08-13
 
 ### Changed

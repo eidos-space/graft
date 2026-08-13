@@ -153,9 +153,9 @@ pub(crate) struct RepoRestoreSpec {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RepoExportSpec {
-    pub(super) source: Option<String>,
-    pub(super) path: Option<PathBuf>,
-    pub(super) output: PathBuf,
+    pub(crate) source: Option<String>,
+    pub(crate) path: Option<PathBuf>,
+    pub(crate) output: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

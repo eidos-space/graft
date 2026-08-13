@@ -185,6 +185,8 @@ files in the Space. Changes confined to `.graft` are not counted.
 | `setMergePathResult`, `resolveMergeRow`, `resolveMergeCell`, `resolveMergeTable` | Select ours/theirs for a path, SQLite row, cell, or table | **Yes** |
 | `unresolveMergePath` | Restore a resolved path to its original merge conflict stages | **Yes** |
 | `stageMergeSqliteResult` | Validate and stage an application-edited SQLite candidate without replacing the worktree | No |
+| `prepareSemanticMerge`, `recordSemanticMergeConflicts` | Prepare/reopen a durable private provider workspace and persist opaque domain conflicts | No |
+| `acceptSemanticMergeResult` | Validate, materialize, and stage a provider-owned SQLite result | **Yes** |
 | `writeAndStageTextResult` | Atomically replace and stage an edited UTF-8 result | **Yes** |
 | `continueMerge`, `abortMerge` | Commit or restore a guarded active merge | **Yes** |
 
@@ -439,6 +441,47 @@ Detailed SQLite results are exposed as bounded pages for the selected path. The 
 the repository conflict set before filtering that page; path-scoped streaming analysis is follow-up
 work. The host must validate Eidos File semantics before calling `continueMerge`, then pass the
 exact token that was validated.
+
+Applications that own merge semantics beyond Graft's finite resolvers use the generic provider
+handoff. Graft exports read-only immutable inputs and never loads application code:
+
+```js
+const workspace = await session.prepareSemanticMerge({
+  path: "space.eidos",
+  provider: "eidos.er-system-merge-1.0",
+  managedTables: ["eidos__meta", "eidos__tables", "eidos__fields"],
+  expectedStateToken: merge.state_token,
+})
+
+// Graft has already seeded result_path from Ours and applied safe Theirs
+// changes outside managedTables. The provider reads the immutable inputs and
+// updates the application-owned tables in this private candidate.
+const outcome = await eidosRuntime.mergeSystemMetadata(workspace)
+if (outcome.state === "conflict") {
+  await session.recordSemanticMergeConflicts({
+    providerToken: workspace.provider_token,
+    conflicts: outcome.conflicts,
+    automaticResolutions: outcome.automaticResolutions,
+    expectedStateToken: merge.state_token,
+  })
+} else {
+  const accepted = await session.acceptSemanticMergeResult({
+    providerToken: workspace.provider_token,
+    validation: outcome.validation,
+    automaticResolutions: outcome.automaticResolutions,
+    expectedStateToken: merge.state_token,
+  })
+  merge = accepted.merge
+}
+```
+
+The workspace and a recorded conflict outcome survive `close()`/`open()`. The provider token is
+bound to the current merge state, frozen policy, immutable revisions, and canonical managed-table
+declaration, so a stale or differently scoped result cannot be applied to a changed merge. Graft
+refuses to construct the seed when schema/opaque/limited/recomputation-required changes are present
+or an unresolved row conflict falls outside `managedTables`; the active merge remains recoverable.
+`continueMerge` and `abortMerge` remove the private provider workspace only after their durable
+operation succeeds.
 
 Merge policy is a versioned, data-only SDK contract:
 
