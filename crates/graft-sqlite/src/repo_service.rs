@@ -76,6 +76,13 @@ pub struct RepositoryResolveCellOptions {
     pub column: String,
 }
 
+/// The worktree effect of one structured conflict resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryResolveOutcome {
+    pub path: String,
+    pub materialized: bool,
+}
+
 /// The effective, versioned merge policy observed by an embedded repository session.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RepositoryMergePolicy {
@@ -271,7 +278,7 @@ impl RepositoryCommandService {
     pub fn resolve_cell(
         &mut self,
         options: RepositoryResolveCellOptions,
-    ) -> Result<String, ErrCtx> {
+    ) -> Result<RepositoryResolveOutcome, ErrCtx> {
         let side = match options.side {
             RepositoryResolveSide::Ours => ResolveSide::Ours,
             RepositoryResolveSide::Theirs => ResolveSide::Theirs,
@@ -283,7 +290,7 @@ impl RepositoryCommandService {
         })?;
         let runtime = self.file.runtime().clone();
         let repo = repo_for_file(&mut self.file)?;
-        resolve_repo_cell_conflict(
+        let (path, materialized) = resolve_repo_cell_conflict(
             &runtime,
             &mut self.file,
             &repo,
@@ -294,7 +301,8 @@ impl RepositoryCommandService {
                 identity,
                 column: options.column,
             },
-        )
+        )?;
+        Ok(RepositoryResolveOutcome { path, materialized })
     }
 
     /// Validates and stages the current physical `SQLite` file as the resolved merge result.

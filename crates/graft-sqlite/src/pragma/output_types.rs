@@ -796,6 +796,7 @@ pub(super) struct JsonResolveConflictOutcome {
     pub(super) path_kind: &'static str,
     pub(super) storage: &'static str,
     pub(super) resolution: &'static str,
+    pub(super) materialized: bool,
     pub(super) remaining_conflicts: usize,
 }
 
@@ -804,6 +805,7 @@ pub(super) struct RepoResolveConflictOutcome {
     pub(super) path: String,
     pub(super) path_kind: RepoTrackedPathKind,
     pub(super) path_storage: RepoPathStorage,
+    pub(super) materialized: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

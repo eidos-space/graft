@@ -498,8 +498,10 @@ impl RowMergePlan {
         schema_additions: &[SchemaApplyChange],
     ) -> String {
         let mut sql = String::from("BEGIN TRANSACTION;\n\n");
+        let mut has_changes = false;
 
         for change in schema_additions {
+            has_changes = true;
             sql.push_str(&change.sql);
             if !change.sql.trim_end().ends_with(';') {
                 sql.push(';');
@@ -545,18 +547,21 @@ impl RowMergePlan {
             if table_sql.is_empty() {
                 continue;
             }
+            has_changes = true;
             sql.push_str(&format!("-- Table: {}\n", table.table_name));
             sql.push_str(&table_sql);
             sql.push('\n');
         }
 
         if self.rebuilds_sqlite_stats() {
+            has_changes = true;
             sql.push_str("-- Internal resolver: rebuild SQLite statistics\n");
             sql.push_str("ANALYZE;\n\n");
         }
 
         let reindexed: Vec<_> = self.reindexed_sqlite_indexes().collect();
         if !reindexed.is_empty() {
+            has_changes = true;
             sql.push_str("-- Internal resolver: rebuild SQLite indexes\n");
             for index_name in reindexed {
                 sql.push_str(&format!("REINDEX {};\n", quote_identifier(index_name)));
@@ -564,6 +569,9 @@ impl RowMergePlan {
             sql.push('\n');
         }
 
+        if !has_changes {
+            return String::new();
+        }
         sql.push_str("COMMIT;\n");
         sql
     }

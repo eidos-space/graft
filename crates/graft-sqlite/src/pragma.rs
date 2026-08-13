@@ -1408,7 +1408,7 @@ impl GraftCommand {
                 let repo = repo_for_file(file)?;
                 let remote = repo_default_remote_store(&repo);
                 Ok(Some(to_json(&repo_conflict_artifacts(
-                    &runtime, &repo, remote,
+                    &runtime, file, &repo, remote,
                 )?)?))
             }
 
@@ -1435,7 +1435,7 @@ impl GraftCommand {
                 let outcome = resolve_repo_conflict_for_file(&runtime, file, &repo, spec)?;
                 let remote = repo_default_remote_store(&repo);
                 let remaining_conflicts =
-                    unresolved_conflict_artifact_count(&runtime, &repo, remote)?;
+                    unresolved_conflict_artifact_count(&runtime, file, &repo, remote)?;
                 let (current_head, current_branch) = repo_head_and_branch(&repo)?;
                 Ok(Some(to_json(&JsonResolveConflictOutcome {
                     operation: "resolve_conflict",
@@ -1445,6 +1445,7 @@ impl GraftCommand {
                     path_kind: repo_tracked_path_kind_json_label(outcome.path_kind),
                     storage: repo_path_storage_json_label(outcome.path_storage),
                     resolution: side.label(),
+                    materialized: outcome.materialized,
                     remaining_conflicts,
                 })?))
             }
@@ -1458,7 +1459,7 @@ impl GraftCommand {
                     resolve_repo_table_conflicts(&runtime, file, &repo, &path, &table, side)?;
                 let remote = repo_default_remote_store(&repo);
                 let remaining_conflicts =
-                    unresolved_conflict_artifact_count(&runtime, &repo, remote)?;
+                    unresolved_conflict_artifact_count(&runtime, file, &repo, remote)?;
                 let (current_head, current_branch) = repo_head_and_branch(&repo)?;
                 Ok(Some(to_json(&serde_json::json!({
                     "operation": "resolve_merge_table",
@@ -1469,6 +1470,7 @@ impl GraftCommand {
                     "storage": repo_path_storage_json_label(outcome.path_storage),
                     "table": table,
                     "resolution": side.label(),
+                    "materialized": outcome.materialized,
                     "remaining_conflicts": remaining_conflicts,
                 }))?))
             }
@@ -1488,6 +1490,7 @@ impl GraftCommand {
                     "path_kind": repo_tracked_path_kind_json_label(outcome.path_kind),
                     "storage": repo_path_storage_json_label(outcome.path_storage),
                     "resolution": "unresolved",
+                    "materialized": outcome.materialized,
                 }))?))
             }
 

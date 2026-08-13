@@ -5,6 +5,26 @@ SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
 
 ## Unreleased
 
+## Graft SDK 0.3.12 — 2026-08-13
+
+### Changed
+
+- Row, cell, and table conflict choices now update the durable resolution journal without
+  rebuilding the SQLite candidate until the path is complete, and retained sessions reuse the
+  immutable merge plan between choices.
+- Merge operations report only the paths actually materialized, allowing hosts to skip redundant
+  validation and reopen work after journal-only choices.
+
+### Fixed
+
+- Resolving SQLite conflicts entirely to the existing Ours result now reuses the parent snapshot
+  instead of recording a physical-only merge modification with no schema or row changes.
+
+### Compatibility
+
+- Existing repository, snapshot, merge-journal, and Remote formats are unchanged. The new
+  `worktree_paths` fields are additive, and Node.js 20 remains the minimum supported runtime.
+
 ## Graft SDK 0.3.11 — 2026-08-13
 
 ### Added

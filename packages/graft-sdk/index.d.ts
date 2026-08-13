@@ -246,6 +246,8 @@ export interface MergeApplyResult {
   plan: MergePlanResult
   output: GraftJson
   merge: MergeStatus
+  /** Repository-relative paths actually created, replaced, or removed in the worktree. */
+  worktree_paths: string[]
 }
 
 export type MergePathFilter = "all" | "unmerged" | "resolved"
@@ -460,6 +462,8 @@ export interface AbortMergeOptions extends OperationOptions {
 export interface MergeOperationResult {
   output: GraftJson
   merge: MergeStatus
+  /** Repository-relative paths actually created, replaced, or removed in the worktree. */
+  worktree_paths: string[]
 }
 
 export type GraftJson = Record<string, unknown> | unknown[]

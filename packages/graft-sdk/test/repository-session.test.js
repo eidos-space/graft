@@ -1142,7 +1142,7 @@ test(
       const database = new DatabaseSync(sourceDatabasePath)
       database.exec(`
         CREATE TABLE docs (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
-        INSERT INTO docs VALUES (1, 'base');
+        INSERT INTO docs VALUES (1, 'base'), (2, 'base');
       `)
       database.close()
 
@@ -1161,14 +1161,14 @@ test(
       await cloneSession.cloneRepository({ remoteUrl: `fs://${remote}` })
 
       const hosted = new DatabaseSync(sourceDatabasePath)
-      hosted.exec("UPDATE docs SET value = 'hosted' WHERE id = 1")
+      hosted.exec("UPDATE docs SET value = 'hosted'")
       hosted.close()
       await sourceSession.addAll()
       await sourceSession.commit("hosted row")
       await sourceSession.push()
 
       const local = new DatabaseSync(cloneDatabasePath)
-      local.exec("UPDATE docs SET value = 'local' WHERE id = 1")
+      local.exec("UPDATE docs SET value = 'local'")
       local.close()
       await cloneSession.addAll()
       const localCommit = await cloneSession.commit("local row")
@@ -1184,11 +1184,12 @@ test(
         planToken: plan.plan_token,
       })
       assert.equal(applied.merge.state, "merging")
+      assert.deepEqual(applied.worktree_paths, [])
       const conflicts = await cloneSession.listMergeConflicts({
         path: "space.eidos",
         expectedStateToken: applied.merge.state_token,
       })
-      assert.equal(conflicts.items.length, 1)
+      assert.equal(conflicts.items.length, 2)
       assert.equal(conflicts.items[0].kind, "row")
       assert.equal(conflicts.items[0].rowid, 1)
 
@@ -1203,7 +1204,7 @@ test(
       assert.equal(mergeDiff.from.version, "base")
       assert.equal(mergeDiff.to.version, "theirs")
       assert.equal(mergeDiff.diff.files[0].summaries[0].name, "docs")
-      assert.equal(mergeDiff.diff.files[0].summaries[0].updates, 1)
+      assert.equal(mergeDiff.diff.files[0].summaries[0].updates, 2)
       await assert.rejects(
         cloneSession.diffMergeSqlite({
           path: "space.eidos",
@@ -1264,15 +1265,25 @@ test(
         applied.merge.state_token
       )
 
-      const resolved = await cloneSession.resolveMergeRow({
+      const firstResolved = await cloneSession.resolveMergeRow({
         path: "space.eidos",
         table: "docs",
         identity: 1,
         result: "theirs",
         expectedStateToken: applied.merge.state_token,
       })
-      assert.equal(resolved.merge.state, "merging")
-      assert.equal(resolved.merge.unmerged_count, 0)
+      assert.equal(firstResolved.merge.state, "merging")
+      assert.equal(firstResolved.merge.unmerged_count, 1)
+      assert.deepEqual(firstResolved.worktree_paths, [])
+      const intermediate = new DatabaseSync(cloneDatabasePath, {
+        readOnly: true,
+      })
+      assert.equal(
+        intermediate.prepare("SELECT value FROM docs WHERE id = 1").get()
+          .value,
+        "local"
+      )
+      intermediate.close()
 
       await cloneSession.close()
       await cloneSession.open()
@@ -1283,12 +1294,36 @@ test(
       })
       assert.equal(resolvedConflicts.items[0].status, "resolved")
       assert.equal(resolvedConflicts.items[0].resolution, "theirs")
+      assert.equal(resolvedConflicts.items[1].status, "unresolved")
+
+      const resolved = await cloneSession.resolveMergeRow({
+        path: "space.eidos",
+        table: "docs",
+        identity: 2,
+        result: "theirs",
+        expectedStateToken: reopened.state_token,
+      })
+      assert.equal(resolved.merge.state, "merging")
+      assert.equal(resolved.merge.unmerged_count, 0)
+      assert.deepEqual(resolved.worktree_paths, ["space.eidos"])
+      const materialized = new DatabaseSync(cloneDatabasePath, {
+        readOnly: true,
+      })
+      assert.deepEqual(
+        materialized
+          .prepare("SELECT value FROM docs ORDER BY id")
+          .all()
+          .map((row) => row.value),
+        ["hosted", "hosted"]
+      )
+      materialized.close()
 
       const unresolved = await cloneSession.unresolveMergePath({
         path: "space.eidos",
-        expectedStateToken: reopened.state_token,
+        expectedStateToken: resolved.merge.state_token,
       })
       assert.equal(unresolved.merge.unmerged_count, 1)
+      assert.deepEqual(unresolved.worktree_paths, ["space.eidos"])
       const resetConflicts = await cloneSession.listMergeConflicts({
         path: "space.eidos",
         expectedStateToken: unresolved.merge.state_token,
@@ -1302,11 +1337,13 @@ test(
         expectedStateToken: unresolved.merge.state_token,
       })
       assert.equal(tableResolved.merge.unmerged_count, 0)
+      assert.deepEqual(tableResolved.worktree_paths, ["space.eidos"])
       const completed = await cloneSession.continueMerge({
         message: "merge hosted row",
         expectedStateToken: tableResolved.merge.state_token,
       })
       assert.equal(completed.merge.state, "none")
+      assert.deepEqual(completed.worktree_paths, ["space.eidos"])
       await assert.rejects(
         cloneSession.listMergeConflicts({
           path: "space.eidos",

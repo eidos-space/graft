@@ -5,7 +5,7 @@
 //! reimplementing repository or remote protocols.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -490,6 +490,8 @@ pub struct MergeApplyResult {
     pub plan: MergePlanResult,
     pub output: Value,
     pub merge: MergeStatus,
+    #[serde(default)]
+    pub worktree_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -691,6 +693,8 @@ pub struct AbortMergeOptions {
 pub struct MergeOperationResult {
     pub output: Value,
     pub merge: MergeStatus,
+    #[serde(default)]
+    pub worktree_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2074,7 +2078,13 @@ impl RepositorySession {
             status_cache.invalidate();
             let incremental = refresh_incremental_status(service, status_cache)?;
             let merge = merge_status_from_incremental(service, &incremental)?;
-            Ok(MergeApplyResult { plan: summary, output, merge })
+            let worktree_paths = merge_worktree_paths_from_output(&output);
+            Ok(MergeApplyResult {
+                plan: summary,
+                output,
+                merge,
+                worktree_paths,
+            })
         })
     }
 
@@ -2353,7 +2363,7 @@ impl RepositorySession {
                 MergePathResult::Ours => ServiceResolveSide::Ours,
                 MergePathResult::Theirs => ServiceResolveSide::Theirs,
             };
-            let resolved_path = service
+            let resolved = service
                 .resolve_cell(ServiceResolveCellOptions {
                     side,
                     path: PathBuf::from(&path),
@@ -2368,15 +2378,21 @@ impl RepositorySession {
             Ok(MergeOperationResult {
                 output: serde_json::json!({
                     "operation": "resolve_merge_cell",
-                    "path": resolved_path,
+                    "path": resolved.path,
                     "table": options.table,
                     "column": options.column,
+                    "materialized": resolved.materialized,
                     "resolution": match options.result {
                         MergePathResult::Ours => "ours",
                         MergePathResult::Theirs => "theirs",
                     },
                 }),
                 merge,
+                worktree_paths: if resolved.materialized {
+                    vec![resolved.path]
+                } else {
+                    Vec::new()
+                },
             })
         })
     }
@@ -2405,8 +2421,10 @@ impl RepositorySession {
                     "resolution": "edited",
                     "integrity_check": "ok",
                     "foreign_key_check": "ok",
+                    "materialized": false,
                 }),
                 merge,
+                worktree_paths: Vec::new(),
             })
         })
     }
@@ -2438,7 +2456,8 @@ impl RepositorySession {
             status_cache.invalidate();
             let incremental = refresh_incremental_status(service, status_cache)?;
             let merge = merge_status_from_incremental(service, &incremental)?;
-            Ok(MergeOperationResult { output, merge })
+            let worktree_paths = merge_worktree_paths_from_output(&output);
+            Ok(MergeOperationResult { output, merge, worktree_paths })
         })
     }
 
@@ -2461,7 +2480,8 @@ impl RepositorySession {
             status_cache.invalidate();
             let incremental = refresh_incremental_status(service, status_cache)?;
             let merge = merge_status_from_incremental(service, &incremental)?;
-            Ok(MergeOperationResult { output, merge })
+            let worktree_paths = merge_worktree_paths_from_output(&output);
+            Ok(MergeOperationResult { output, merge, worktree_paths })
         })
     }
 
@@ -2501,8 +2521,10 @@ impl RepositorySession {
                     "operation": "write_and_stage_text_result",
                     "path": entry.path,
                     "resolution": "edited",
+                    "materialized": true,
                 }),
                 merge,
+                worktree_paths: vec![entry.path],
             })
         })
     }
@@ -2526,7 +2548,8 @@ impl RepositorySession {
             status_cache.invalidate();
             let incremental = refresh_incremental_status(service, status_cache)?;
             let merge = merge_status_from_incremental(service, &incremental)?;
-            Ok(MergeOperationResult { output, merge })
+            let worktree_paths = merge_worktree_paths_from_output(&output);
+            Ok(MergeOperationResult { output, merge, worktree_paths })
         })
     }
 
@@ -2541,7 +2564,8 @@ impl RepositorySession {
             status_cache.invalidate();
             let incremental = refresh_incremental_status(service, status_cache)?;
             let merge = merge_status_from_incremental(service, &incremental)?;
-            Ok(MergeOperationResult { output, merge })
+            let worktree_paths = merge_worktree_paths_from_output(&output);
+            Ok(MergeOperationResult { output, merge, worktree_paths })
         })
     }
 
@@ -2571,7 +2595,8 @@ impl RepositorySession {
             status_cache.invalidate();
             let incremental = refresh_incremental_status(service, status_cache)?;
             let merge = merge_status_from_incremental(service, &incremental)?;
-            Ok(MergeOperationResult { output, merge })
+            let worktree_paths = merge_worktree_paths_from_output(&output);
+            Ok(MergeOperationResult { output, merge, worktree_paths })
         })
     }
 
@@ -4169,6 +4194,43 @@ fn merge_status_from_incremental(
     })
 }
 
+fn merge_worktree_paths_from_output(output: &Value) -> Vec<String> {
+    let mut paths = BTreeSet::new();
+    let Some(object) = output.as_object() else {
+        return Vec::new();
+    };
+
+    match object.get("materialized") {
+        Some(Value::Bool(true)) => {
+            if let Some(path) = object.get("path").and_then(Value::as_str) {
+                paths.insert(path.to_string());
+            }
+        }
+        Some(Value::Array(actions)) => {
+            for action in actions {
+                if let Some(path) = action.get("path").and_then(Value::as_str) {
+                    paths.insert(path.to_string());
+                }
+            }
+        }
+        _ => {}
+    }
+
+    if let Some(actions) = object.get("paths").and_then(Value::as_array) {
+        for action in actions {
+            let materializes = action
+                .get("action")
+                .and_then(Value::as_str)
+                .is_some_and(|action| matches!(action, "checked_out" | "materialized" | "removed"));
+            if materializes && let Some(path) = action.get("path").and_then(Value::as_str) {
+                paths.insert(path.to_string());
+            }
+        }
+    }
+
+    paths.into_iter().collect()
+}
+
 fn active_merge_heads(
     repo: &Repository,
     incremental: &IncrementalStatusResult,
@@ -4992,6 +5054,114 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_merge_selecting_ours_does_not_record_a_physical_only_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("space.eidos");
+        {
+            let database = Connection::open(&database_path).unwrap();
+            database
+                .execute_batch(
+                    "CREATE TABLE docs (id INTEGER PRIMARY KEY, value TEXT NOT NULL);\
+                     INSERT INTO docs VALUES (1, 'base');",
+                )
+                .unwrap();
+        }
+
+        let session = RepositorySession::new(directory.path());
+        session.open().unwrap();
+        session.init().unwrap();
+        session.add_all().unwrap();
+        session.commit("base").unwrap();
+        session.close().unwrap();
+
+        let repo = Repository::open(directory.path()).unwrap();
+        repo.switch_new_branch("hosted", None).unwrap();
+        drop(repo);
+        Connection::open(&database_path)
+            .unwrap()
+            .execute("UPDATE docs SET value = 'hosted' WHERE id = 1", [])
+            .unwrap();
+        session.open().unwrap();
+        session.add_all().unwrap();
+        let hosted = session.commit("hosted row").unwrap()["commit"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        session.close().unwrap();
+
+        let repo = Repository::open(directory.path()).unwrap();
+        repo.switch_branch("main").unwrap();
+        drop(repo);
+        Connection::open(&database_path)
+            .unwrap()
+            .execute("UPDATE docs SET value = 'local' WHERE id = 1", [])
+            .unwrap();
+        session.open().unwrap();
+        session.add_all().unwrap();
+        let local = session.commit("local row").unwrap()["commit"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let plan = session
+            .plan_merge(&PlanMergeOptions {
+                revision: hosted.clone(),
+                expected_head: Some(local.clone()),
+            })
+            .unwrap();
+        let applied = session
+            .apply_merge(&ApplyMergeOptions {
+                revision: hosted,
+                expected_head: Some(local),
+                plan_token: plan.plan_token,
+            })
+            .unwrap();
+        let MergeStatus::Merging { state_token, .. } = applied.merge else {
+            panic!("expected SQLite merge conflict");
+        };
+        let resolved = session
+            .resolve_merge_row(&ResolveMergeRowOptions {
+                path: PathBuf::from("space.eidos"),
+                table: "docs".to_string(),
+                identity: json!(1),
+                result: MergePathResult::Ours,
+                expected_state_token: state_token,
+            })
+            .unwrap();
+        let MergeStatus::Merging {
+            unmerged_count,
+            state_token: resolved_token,
+            ..
+        } = resolved.merge
+        else {
+            panic!("expected resolved active merge");
+        };
+        assert_eq!(unmerged_count, 0);
+        assert!(resolved.worktree_paths.is_empty());
+
+        let completed = session
+            .continue_merge(&ContinueMergeOptions {
+                message: "merge hosted".to_string(),
+                expected_state_token: resolved_token,
+            })
+            .unwrap();
+        let merge_commit = completed.output["commit"]["id"].as_str().unwrap();
+        let changed = session
+            .commit_changed_paths(&CommitChangedPathsOptions {
+                revision: merge_commit.to_string(),
+                limit: 100,
+                after: None,
+            })
+            .unwrap();
+        assert!(
+            changed.paths.is_empty(),
+            "selecting an unchanged first-parent SQLite result must not create a history-only modification: {:?}",
+            changed.paths
+        );
+        session.close().unwrap();
+    }
+
+    #[test]
     fn sqlite_row_resolutions_survive_reopen_and_keep_both_selected_sides() {
         let root = tempfile::tempdir().unwrap();
         let source_directory = root.path().join("source");
@@ -5173,6 +5343,7 @@ mod tests {
             panic!("expected the second row conflict to remain");
         };
         assert_eq!(unmerged_count, 1);
+        assert!(first.worktree_paths.is_empty());
 
         clone.close().unwrap();
         clone.open().unwrap();
@@ -5217,6 +5388,7 @@ mod tests {
             panic!("expected merge state until continue");
         };
         assert_eq!(unmerged_count, 1);
+        assert!(second.worktree_paths.is_empty());
         {
             let database = Connection::open(&clone_database).unwrap();
             let rows = database
@@ -5232,8 +5404,8 @@ mod tests {
                 rows,
                 vec![
                     (1, "local-one".to_string()),
-                    (2, "hosted-two".to_string()),
-                    (3, "hosted-three".to_string()),
+                    (2, "local-two".to_string()),
+                    (3, "base-three".to_string()),
                 ]
             );
         }
@@ -5253,6 +5425,7 @@ mod tests {
             panic!("expected merge state after table resolution");
         };
         assert_eq!(unmerged_count, 0);
+        assert_eq!(table_resolved.worktree_paths, vec!["space.eidos"]);
 
         clone.close().unwrap();
         clone.open().unwrap();

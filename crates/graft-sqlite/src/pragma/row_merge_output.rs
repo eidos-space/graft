@@ -21,7 +21,7 @@ pub(super) fn append_row_merge_analysis(
     if !output.ends_with('\n') {
         output.push('\n');
     }
-    match format_current_file_row_merge_analysis(runtime, repo, &key, remote) {
+    match format_current_file_row_merge_analysis(runtime, file, repo, &key, remote) {
         Ok(Some(analysis)) => output.push_str(&analysis),
         Ok(None) => {}
         Err(err) => {
@@ -33,6 +33,7 @@ pub(super) fn append_row_merge_analysis(
 
 pub(super) fn format_current_file_row_merge_analysis(
     runtime: &Runtime,
+    file: &RepositorySessionContext,
     repo: &Repository,
     key: &str,
     remote: Option<Arc<Remote>>,
@@ -63,7 +64,7 @@ pub(super) fn format_current_file_row_merge_analysis(
     hydrate_repo_file_state_for(runtime, base, None, RepoSnapshotPurpose::Merge)?;
     hydrate_repo_file_state_for(runtime, ours, None, RepoSnapshotPurpose::Merge)?;
     hydrate_repo_file_state_for(runtime, theirs, remote, RepoSnapshotPurpose::Merge)?;
-    let plan = plan_repo_snapshot_merge(runtime, repo, base, ours, theirs)?;
+    let plan = plan_repo_snapshot_merge(runtime, file, repo, base, ours, theirs)?;
     let analysis = &plan.analysis;
     let mut f = String::new();
     writeln!(&mut f, "Row-level analysis for {key}:")?;
@@ -126,7 +127,7 @@ pub(super) fn current_file_status_row_merge_analysis(
     let Some(key) = selected_repository_database_key(file, repo)? else {
         return Ok(None);
     };
-    current_file_row_merge_analysis(runtime, repo, &key, remote)
+    current_file_row_merge_analysis(runtime, file, repo, &key, remote)
 }
 
 pub(super) fn current_file_status_row_merge_analysis_lossy(
@@ -165,6 +166,7 @@ pub(super) fn current_file_status_row_merge_analysis_lossy(
 
 pub(super) fn current_file_row_merge_analysis(
     runtime: &Runtime,
+    file: &RepositorySessionContext,
     repo: &Repository,
     key: &str,
     remote: Option<Arc<Remote>>,
@@ -198,7 +200,7 @@ pub(super) fn current_file_row_merge_analysis(
     hydrate_repo_file_state_for(runtime, &ours, None, RepoSnapshotPurpose::Merge)?;
     hydrate_repo_file_state_for(runtime, &theirs, remote, RepoSnapshotPurpose::Merge)?;
 
-    let plan = plan_repo_snapshot_merge(runtime, repo, &base, &ours, &theirs)?;
+    let plan = plan_repo_snapshot_merge(runtime, file, repo, &base, &ours, &theirs)?;
     let row_conflicts: Vec<JsonRowMergeConflict> = plan
         .analysis
         .conflicts
@@ -330,6 +332,7 @@ pub(super) fn json_internal_resolvers(
 
 pub(super) fn repo_conflict_artifacts(
     runtime: &Runtime,
+    file: &RepositorySessionContext,
     repo: &Repository,
     remote: Option<Arc<Remote>>,
 ) -> Result<JsonConflictList, ErrCtx> {
@@ -341,6 +344,7 @@ pub(super) fn repo_conflict_artifacts(
     for path in &conflict_paths {
         conflicts.extend(repo_path_conflict_artifacts(
             runtime,
+            file,
             repo,
             path,
             remote.clone(),
@@ -408,10 +412,11 @@ pub(super) fn json_conflict_paths(conflicts: &[JsonConflictArtifact]) -> Vec<Jso
 
 pub(super) fn unresolved_conflict_artifact_count(
     runtime: &Runtime,
+    file: &RepositorySessionContext,
     repo: &Repository,
     remote: Option<Arc<Remote>>,
 ) -> Result<usize, ErrCtx> {
-    Ok(repo_conflict_artifacts(runtime, repo, remote)?
+    Ok(repo_conflict_artifacts(runtime, file, repo, remote)?
         .conflicts
         .iter()
         .filter(|conflict| conflict.status == "unresolved")
@@ -456,6 +461,7 @@ pub(super) fn conflict_path_descriptor(
 
 pub(super) fn repo_path_conflict_artifacts(
     runtime: &Runtime,
+    file: &RepositorySessionContext,
     repo: &Repository,
     key: &str,
     remote: Option<Arc<Remote>>,
@@ -506,7 +512,7 @@ pub(super) fn repo_path_conflict_artifacts(
         hydrate_repo_file_state_for(runtime, &base, None, RepoSnapshotPurpose::Merge)?;
         hydrate_repo_file_state_for(runtime, &ours, None, RepoSnapshotPurpose::Merge)?;
         hydrate_repo_file_state_for(runtime, &theirs, remote, RepoSnapshotPurpose::Merge)?;
-        let plan = plan_repo_snapshot_merge(runtime, repo, &base, &ours, &theirs)?;
+        let plan = plan_repo_snapshot_merge(runtime, file, repo, &base, &ours, &theirs)?;
         let mut artifacts = Vec::new();
 
         for conflict in &plan.analysis.conflicts {
@@ -1087,7 +1093,7 @@ pub(super) fn try_row_auto_merge_paths(
                 remote.clone(),
                 RepoSnapshotPurpose::Merge,
             )?;
-            let plan = plan_repo_snapshot_merge(runtime, repo, &base, &ours, &theirs)?;
+            let plan = plan_repo_snapshot_merge(runtime, file, repo, &base, &ours, &theirs)?;
             if plan.has_conflicts() || plan.has_opaque_changes() || !plan.limitations().is_empty() {
                 return Ok(None);
             }
@@ -1216,7 +1222,7 @@ pub(super) fn try_row_merge_current_file_status_conflict(
     hydrate_repo_file_state_for(runtime, &ours, None, RepoSnapshotPurpose::Merge)?;
     hydrate_repo_file_state_for(runtime, &theirs, remote, RepoSnapshotPurpose::Merge)?;
 
-    let plan = plan_repo_snapshot_merge(runtime, repo, &base, &ours, &theirs)?;
+    let plan = plan_repo_snapshot_merge(runtime, file, repo, &base, &ours, &theirs)?;
     if plan.has_opaque_changes()
         || !plan.schema_conflicts().is_empty()
         || !plan.limitations().is_empty()
@@ -1335,6 +1341,9 @@ pub(super) fn materialize_row_auto_merge_state(
     ours: &CommitFileState,
     sql: &str,
 ) -> Result<CommitFileState, ErrCtx> {
+    if sql.trim().is_empty() {
+        return Ok(ours.clone());
+    }
     let temp_path = row_auto_merge_temp_path(repo, key)?;
     let result = (|| {
         write_repo_file_state_to_path(runtime, ours, &temp_path)?;

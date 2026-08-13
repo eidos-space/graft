@@ -321,20 +321,30 @@ merge 或 token 不匹配，必须失败，不能应用候选 plan。
 
 整路径 ours/theirs 选择会把选定的 SQLite snapshot 或 file artifact 写到物理 path，
 更新 volume binding，并把该 path 折叠为 stage 0。若选定一侧是 deleted，则删除
-对应物理 path。按行 ours/theirs resolution 根据 three-way row plan 计算新的
-SQLite snapshot，把当前 candidate 写到物理 path，并在文件的所有 row conflict
-解决前保留 durable row-resolution state。文本编辑会把提供的 UTF-8 bytes 写到
-物理 path 并 staging。
+对应物理 path。按 row、cell、table 选择 ours/theirs 时，首先把选择写入 durable
+merge-resolution journal；只要同一 SQLite path 仍有未解决的 row conflict，就不得
+重写物理 candidate。解决最后一个 row conflict 的操作才根据完整 journal 计算一次
+SQLite snapshot，并在无需 application validation 时 staging。若结果与现有 Ours
+snapshot 完全相同，adapter 必须复用该 snapshot，不得重写物理 path；否则才把新结果
+写入物理 path。这与 Git 先写 index、完成 path resolution 后再更新 worktree 的模型
+一致。文本编辑会把提供的 UTF-8 bytes 写到物理 path 并 staging。
 
-即使某个 path 已经等于选定结果，这些操作仍标记为可能物化。host 必须使用 merge
-inspection 返回的 state token；stale token 必须作为“重新读取 status 后重试”处理。
+长生命周期 repository session 应当对相同 Base/Ours/Theirs snapshot 与冻结 merge
+policy 复用不可变 SQLite merge plan。仅 resolution journal 更新时，conflict choice
+不得重复扫描未变化 snapshot；新 session 可以从 durable repository state 重新计算。
+
+这些操作仍保守地标记为可能物化，因为 host 在调用前不知道当前选择是否会解决最后
+一个 conflict，仍需先关闭 handle。返回的 `worktree_paths` 是调用后的精确范围：
+中间 row/cell/table 选择返回空数组；若最后一次选择得到的 snapshot 仍是未变化的
+Ours，也返回空数组，否则返回完成的 path。host 必须使用 merge inspection 返回的
+state token；stale token 必须作为“重新读取 status 后重试”处理。
 
 ### 7.4 Continue 与 abort
 
 `continueMerge` 要求没有未解决 conflict 且 state token 有效。当前 command path
 会 commit 已解决 merge；当 `materialize_sqlite=true` 时，可能把已 commit 的
-SQLite snapshot 写回 tracked path。它返回 merge/commit output 和 affected path
-actions，但 SDK 结果目前没有独立字段证明某次物理 rewrite 实际发生。
+SQLite snapshot 写回 tracked path。它返回 merge/commit output，以及列出本次实际
+创建、替换或删除 path 的标准化 `worktree_paths`。
 
 `abortMerge` 要求存在 active durable merge state 且 token 有效。它回到 `ORIG_HEAD`，
 清理 merge/index conflict state，并应用 abort checkout plan。即使实际 path set
@@ -351,9 +361,9 @@ actions，但 SDK 结果目前没有独立字段证明某次物理 rewrite 实�
 使用的同一组 SDK merge 方法。
 
 CLI JSON 的 materializing command 会在对应 command 支持时返回 `paths` 或
-`path_details`。当前 commit 的 `materialized` 数组为空。merge continue 可能
-返回 `materialized` 数组；merge apply/abort 返回 path actions，但没有统一的
-actual-materialized boolean。
+`path_details`。结构化 merge resolution output 还会返回 `materialized` boolean；
+merge continue 返回 `materialized` 数组，merge apply/abort 返回 path actions。
+SDK 把这些 operation-specific projection 标准化为 `worktree_paths`。
 
 ### 8.2 Rust 与 Node SDK
 
@@ -366,11 +376,17 @@ options 转成 Rust 类型；发布的 JS package 负责 camelCase options、JSO
 true：
 
 `restore`、`restorePaths`、`pull`、`cloneRepository`、`applyMerge`、
-`setMergePathResult`、`resolveMergeRow`、`writeAndStageTextResult`、
+`setMergePathResult`、`resolveMergeRow`、`resolveMergeCell`、
+`resolveMergeTable`、`unresolveMergePath`、`writeAndStageTextResult`、
 `continueMerge`、`abortMerge`。
 
 对 read、stage、commit、fetch、plan、merge inspection、history、diff 和 path-move
 API 必须返回 false。
+
+`operationMaterializesWorktree(name)` 是调用前的保守 gate；
+`MergeApplyResult.worktree_paths` 与 `MergeOperationResult.worktree_paths` 是调用后的
+精确范围。host 必须先用 gate 安全关闭 handle，再用 `worktree_paths` 限定 validation、
+refresh 与 reopen 的范围。
 
 ### 8.3 Browser/WASM profile
 
@@ -392,15 +408,17 @@ conformance 测试。
 paths / path_details：repository-relative path actions
 materialized：旧 CLI 路径明确报告的 SQLite/file actions
 materializes_worktree：SDK batch result 上的保守 capability bit
+worktree_paths：merge operation 实际物化的标准化 repository-relative paths
 merge：merge operation 之后的 durable merge status
 output：底层 typed command JSON
 ```
 
 Path action 可以包含 path、kind/storage 和 `checked_out`、`staged`、`conflicted`、
 `removed`、`materialized` 等 action。它描述 command 的 state transition，不证明
-host filesystem 已经 flush 每一个 byte。当前 SDK 还没有为所有 materializing
-operation 提供统一的 `affected_paths` 加 `actual_materialized`；需要精确证明时，
-caller 必须使用各操作的 documented output，并用 status reconcile。
+host filesystem 已经 flush 每一个 byte。merge apply 与 mutation result 必须包含
+已排序并去重的 `worktree_paths`，且只能列出本次完成的 operation 实际创建、替换或
+删除的 path。空数组证明该 merge operation 没有物化 worktree path，但不证明 OS
+write 已经到达 durable storage。
 
 错误不得被静默重试。重要错误类别包括：
 

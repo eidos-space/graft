@@ -192,6 +192,10 @@ files in the Space. Changes confined to `.graft` are not counted.
 marked **Yes**, Eidos must checkpoint and close application SQLite handles for paths that can be
 replaced. `stagePaths` and merge inspection methods never materialize the worktree. Reopen
 application handles after the SDK promise settles; the Graft repository session itself stays open.
+Merge apply and mutation results also return `worktree_paths`, a sorted, deduplicated list of the
+repository-relative paths actually created, replaced, or removed by that completed operation. Use
+the conservative gate before the call and this exact list to bound validation and refresh work
+afterward.
 
 `addAll` reads SQLite files and their committed/WAL state but does not replace them. Eidos should
 still checkpoint its application databases before snapshotting when it needs a deterministic
@@ -425,6 +429,12 @@ schema, opaque, and semantic-key conflicts are rejected. `unresolveMergePath` re
 original stages and worktree conflict candidate for any staged path resolution. Application-edited
 SQLite candidates close through the validated `stageMergeSqliteResult` operation. Resolved and
 unresolved conflicts remain queryable from the durable merge-session journal until continue or abort.
+Like Git's index-first conflict workflow, intermediate row/cell/table choices update only that
+journal. They return `worktree_paths: []`; the choice that resolves the final conflict for the path
+materializes and stages one complete SQLite candidate and returns that path.
+The retained `RepositorySession` caches an immutable SQLite merge plan by Base/Ours/Theirs snapshot
+and frozen merge policy. Conflict inspection computes that plan once; later row, cell, and table
+choices in the same session reuse it instead of rescanning the complete database.
 Detailed SQLite results are exposed as bounded pages for the selected path. The analyzer computes
 the repository conflict set before filtering that page; path-scoped streaming analysis is follow-up
 work. The host must validate Eidos File semantics before calling `continueMerge`, then pass the

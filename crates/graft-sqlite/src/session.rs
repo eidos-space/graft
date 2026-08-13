@@ -10,7 +10,7 @@ use graft::{
 };
 use parking_lot::Mutex;
 
-use crate::{error::ErrCtx, pragma::sqlite_worktree::PreparedSqliteStage};
+use crate::{error::ErrCtx, pragma::sqlite_worktree::PreparedSqliteStage, row_merge::RowMergePlan};
 
 #[derive(Debug)]
 pub(crate) struct RepoRuntimeRegistry {
@@ -51,6 +51,7 @@ pub(crate) struct RepositorySessionContext {
     repo_runtimes: Arc<RepoRuntimeRegistry>,
     repository_database: Option<PathBuf>,
     prepared_sqlite_stages: Mutex<BTreeMap<String, Arc<PreparedSqliteStage>>>,
+    row_merge_plans: Mutex<BTreeMap<String, Arc<RowMergePlan>>>,
 }
 
 impl RepositorySessionContext {
@@ -71,6 +72,7 @@ impl RepositorySessionContext {
             repo_runtimes,
             repository_database,
             prepared_sqlite_stages: Mutex::new(BTreeMap::new()),
+            row_merge_plans: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -90,6 +92,18 @@ impl RepositorySessionContext {
 
     pub(crate) fn clear_prepared_sqlite_stages(&self) {
         self.prepared_sqlite_stages.lock().clear();
+    }
+
+    pub(crate) fn row_merge_plan(&self, key: &str) -> Option<Arc<RowMergePlan>> {
+        self.row_merge_plans.lock().get(key).cloned()
+    }
+
+    pub(crate) fn cache_row_merge_plan(&self, key: String, plan: Arc<RowMergePlan>) {
+        let mut plans = self.row_merge_plans.lock();
+        if plans.len() >= 32 {
+            plans.clear();
+        }
+        plans.insert(key, plan);
     }
 
     pub(crate) fn repository_database_path(&self) -> Option<&Path> {

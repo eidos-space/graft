@@ -365,17 +365,32 @@ active merge, or token mismatch MUST fail without applying the candidate plan.
 Whole-path ours/theirs selection writes the selected SQLite snapshot or file
 artifact to the physical path, updates the volume binding, and collapses the
 path to stage 0. A deleted side removes the corresponding materialized path.
-Row- and table-level ours/theirs resolution computes a new SQLite snapshot from
-the three-way row plan, writes the current candidate to the physical path, and
-keeps the durable merge-resolution journal until continue or abort. Table
-selection materializes one validated candidate for the complete atomic
-operation. Text editing writes the supplied UTF-8 bytes to the physical path
-and stages the result. Path resolve-undo restores the original conflict stages
-and conflict worktree candidate from that journal.
+Row-, cell-, and table-level ours/theirs resolution first records the choice in
+the durable merge-resolution journal. While the same SQLite path still has
+unresolved row conflicts, it MUST NOT rewrite the physical candidate. The
+operation that resolves the final row conflict computes one SQLite snapshot
+from the complete journal and stages it when no application validation remains.
+If that result is exactly the existing Ours snapshot, the adapter MUST reuse
+that snapshot and MUST NOT rewrite the physical path. Otherwise it writes the
+new result to the physical path. This mirrors Git's index-first conflict
+workflow and bounds physical work to the completed path resolution.
+Text editing writes the supplied UTF-8 bytes to the physical path and stages
+the result. Path resolve-undo restores the original conflict stages and
+conflict worktree candidate from that journal.
 
-These operations are marked materializing even when a specific path is already
-equal to the selected result. The host MUST use the state token returned by
-merge inspection and MUST treat a stale token as a retry-from-status event.
+A retained repository session SHOULD reuse an immutable SQLite merge plan for
+the same Base/Ours/Theirs snapshots and frozen merge policy. Conflict choices
+MUST NOT rescan unchanged snapshots merely because the resolution journal was
+updated; a new session MAY recompute the plan from durable repository state.
+
+These operations remain conservatively marked materializing because the host
+must close handles before it can know whether the selected conflict is final.
+Their returned `worktree_paths` array is the exact post-operation scope: an
+intermediate row/cell/table choice returns an empty array. A final choice also
+returns an empty array when its completed snapshot is the unchanged Ours state;
+otherwise it returns the completed path. The host MUST use the state token
+returned by merge inspection and MUST treat a stale token as a
+retry-from-status event.
 
 Active-merge SQLite inspection (`diffMergeSqlite`) compares immutable
 Base/Ours/Theirs revisions and is non-materializing. It remains valid with
@@ -387,9 +402,8 @@ closed.
 `continueMerge` requires no unresolved conflicts and a valid state token. The
 current command path commits the resolved merge and may write the committed
 SQLite snapshots back to their tracked paths when `materialize_sqlite=true`.
-It returns merge/commit output and affected path actions, but the SDK result
-does not yet expose one separate boolean proving that a physical rewrite
-occurred.
+It returns merge/commit output and a normalized `worktree_paths` array naming
+the paths created, replaced, or removed by the operation.
 
 `abortMerge` requires an active durable merge state and a valid token. It moves
 back to `ORIG_HEAD`, clears merge/index conflict state, and applies the abort
@@ -408,10 +422,10 @@ subcommand additionally opens `graft_sdk::RepositorySession` and calls the
 same SDK merge methods used by Node and Playground.
 
 CLI JSON materializing commands expose `paths` or `path_details` where the
-command has that projection. Commit's `materialized` array is empty in the
-current implementation. Merge continuation may expose a `materialized` array;
-merge apply and abort expose path actions but do not expose a universal actual-
-materialized boolean.
+command has that projection. Structured merge resolution output also exposes a
+`materialized` boolean. Merge continuation exposes a `materialized` array;
+merge apply and abort expose path actions. The SDK normalizes those operation-
+specific projections into `worktree_paths`.
 
 ### 8.2 Rust and Node SDK
 
@@ -423,9 +437,15 @@ None of these layers reimplements snapshot merge or SQLite replacement.
 
 `operationMaterializesWorktree(name)` is the stable host gate. It MUST return
 true for `restore`, `restorePaths`, `pull`, `cloneRepository`, `applyMerge`,
-`setMergePathResult`, `resolveMergeRow`, `writeAndStageTextResult`,
+`setMergePathResult`, `resolveMergeRow`, `resolveMergeCell`,
+`resolveMergeTable`, `unresolveMergePath`, `writeAndStageTextResult`,
 `continueMerge`, and `abortMerge`; it MUST return false for read, stage,
 commit, fetch, plan, merge inspection, history, diff, and path-move APIs.
+
+`operationMaterializesWorktree(name)` is a before-call conservative gate.
+`MergeApplyResult.worktree_paths` and `MergeOperationResult.worktree_paths` are
+after-call exact scopes. Hosts MUST use the gate to close handles safely, then
+use `worktree_paths` to bound validation, refresh, and reopen work.
 
 ### 8.3 Browser/WASM profile
 
@@ -448,6 +468,7 @@ An operation result MAY contain:
 paths / path_details: repository-relative path actions
 materialized: SQLite or file actions explicitly reported by a legacy CLI path
 materializes_worktree: conservative capability bit on batch SDK results
+worktree_paths: normalized repository-relative paths actually materialized by a merge operation
 merge: durable merge status after a merge operation
 output: the underlying typed command JSON
 ```
@@ -455,10 +476,11 @@ output: the underlying typed command JSON
 Path actions identify the path, kind/storage where available, and an action
 such as `checked_out`, `staged`, `conflicted`, `removed`, or `materialized`.
 They describe the command's state transition, not a proof that the host's
-filesystem has already flushed every byte. The current SDK contract does not
-yet provide a single normalized `affected_paths` plus `actual_materialized`
-field for every materializing operation; callers MUST use the operation's
-documented output and reconcile with status when exact proof is required.
+filesystem has already flushed every byte. Merge apply and mutation results
+MUST include `worktree_paths`, sorted and deduplicated, containing only paths
+the completed operation created, replaced, or removed. An empty array proves
+that the merge operation did not materialize a worktree path. It does not prove
+that an operating-system write has reached durable storage.
 
 Errors MUST be surfaced without silently retrying a materializing operation.
 Important classes are:
