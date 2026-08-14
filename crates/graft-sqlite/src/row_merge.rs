@@ -744,8 +744,22 @@ pub fn plan_snapshot_merge_with_policy(
     let base_snapshot = base.snapshot.to_snapshot();
     let ours_snapshot = ours.snapshot.to_snapshot();
     let theirs_snapshot = theirs.snapshot.to_snapshot();
-    let ours_diff = row_level_diff_snapshots(runtime, &base_snapshot, &ours_snapshot)?;
-    let theirs_diff = row_level_diff_snapshots(runtime, &base_snapshot, &theirs_snapshot)?;
+    // Both sides are independent reads of the same immutable base snapshot. Running them
+    // together avoids serially scanning large databases during merge planning.
+    let (ours_diff, theirs_diff) = std::thread::scope(|scope| {
+        let ours = scope.spawn(|| {
+            row_level_diff_snapshots(runtime, &base_snapshot, &ours_snapshot)
+        });
+        let theirs = scope.spawn(|| {
+            row_level_diff_snapshots(runtime, &base_snapshot, &theirs_snapshot)
+        });
+        (
+            ours.join().expect("ours row diff worker panicked"),
+            theirs.join().expect("theirs row diff worker panicked"),
+        )
+    });
+    let ours_diff = ours_diff?;
+    let theirs_diff = theirs_diff?;
     let ours_touches = row_touches(&ours_diff.table_changes, policy);
     let theirs_touches = row_touches(&theirs_diff.table_changes, policy);
     let mut conflicts = Vec::new();
