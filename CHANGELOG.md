@@ -7,6 +7,10 @@
 - SQLite row merge now reuses proven segment page sets across immutable snapshots, targets
   `WITHOUT ROWID` analysis to changed B-tree pages, and installs an already validated merge
   candidate directly instead of serializing the database again during completion.
+- Candidate construction performs a complete integrity proof once for an exact immutable Ours
+  state before mutation, then relies on SQLite's transactional constraint/index maintenance,
+  touched-cell checks, and a complete post-apply foreign-key check instead of cold-scanning every
+  inherited page again.
 - Exact-token SDK merge continuation commits an already installed, clean SQLite candidate without
   rewriting it or immediately rescanning the complete worktree; its exact `worktree_paths` result
   is empty when no file was physically changed.

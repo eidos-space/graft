@@ -1584,3 +1584,86 @@ pub(super) fn row_auto_merge_sqlite_err(
 ) -> ErrCtx {
     ErrCtx::InvalidCommand(format!("could not {action} for row-level auto-merge: {err}").into())
 }
+
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+
+    fn test_state() -> CommitFileState {
+        CommitFileState {
+            volume: VolumeId::random(),
+            snapshot: RepoSnapshot {
+                page_count: PageCount::new(4),
+                ranges: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn immutable_integrity_proofs_are_exact_and_corrupt_states_still_fail() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("integrity.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "PRAGMA page_size = 4096;\
+             CREATE TABLE items(id INTEGER PRIMARY KEY, payload BLOB NOT NULL);\
+             INSERT INTO items VALUES(1, zeroblob(12000));",
+        )
+        .unwrap();
+        drop(conn);
+
+        validate_row_merge_base_integrity(&path, &test_state()).unwrap();
+
+        let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(4096)).unwrap();
+        std::io::Write::write_all(&mut file, &[0; 4096]).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let error = validate_row_merge_base_integrity(&path, &test_state()).unwrap_err();
+        assert!(error.to_string().contains("integrity_check"));
+    }
+
+    #[test]
+    fn row_merge_delta_keeps_sqlite_constraints_enabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("constraints.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);\
+             INSERT INTO items VALUES(1, 'existing');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = apply_row_merge_sql_to_path(
+            &path,
+            "BEGIN TRANSACTION; INSERT INTO items VALUES(2, 'existing'); COMMIT;",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("UNIQUE constraint failed"));
+    }
+
+    #[test]
+    fn row_merge_delta_checks_foreign_keys_after_the_transaction() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("foreign-keys.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE parents(id INTEGER PRIMARY KEY);\
+             CREATE TABLE children(\
+               id INTEGER PRIMARY KEY,\
+               parent_id INTEGER NOT NULL REFERENCES parents(id)\
+             );",
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = apply_row_merge_sql_to_path(
+            &path,
+            "BEGIN TRANSACTION; INSERT INTO children VALUES(1, 99); COMMIT;",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("failed foreign_key_check"));
+    }
+}

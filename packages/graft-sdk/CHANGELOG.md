@@ -14,7 +14,9 @@ SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
 
 - SQLite merge preparation reuses proven segment page sets across immutable snapshots and targets
   `WITHOUT ROWID` analysis to changed B-tree pages instead of repeatedly materializing complete
-  database pairs.
+  database pairs. Candidate construction also establishes one full integrity proof for an exact
+  immutable Ours state before mutation, then validates SQLite's transactional delta instead of
+  cold-scanning every inherited page again.
 - A validated final SQLite merge candidate is installed directly and exact-token
   `continueMerge()` commits that staged state without a second database rewrite. When completion
   does not physically change a path, its exact `worktree_paths` result is empty.

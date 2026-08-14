@@ -443,6 +443,10 @@ materializes and stages one complete SQLite candidate and returns that path.
 The retained `RepositorySession` caches an immutable SQLite merge plan by Base/Ours/Theirs snapshot
 and frozen merge policy. Conflict inspection computes that plan once; later row, cell, and table
 choices in the same session reuse it instead of rescanning the complete database.
+Candidate construction likewise proves the exact immutable Ours state with a full SQLite
+`integrity_check` once per process. Exact content-state hits reuse only that non-forgeable memory
+proof; SQLite then applies and validates the transactional delta with native constraints,
+`cell_size_check`, index maintenance, and a complete `foreign_key_check`.
 After the final choice installs and stages a validated SQLite candidate, an exact-token
 `continueMerge` commits that state directly. It does not serialize or replace the same database a
 second time, and therefore reports `worktree_paths: []` for that completion.

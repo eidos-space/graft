@@ -191,10 +191,20 @@ names are validated repository configuration, not arbitrary SQL hooks.
 ### 5.6 Candidate database construction
 
 The engine builds every SQLite candidate in an isolated temporary database. It
-applies supported row/schema/internal resolutions with foreign-key and trigger
-side effects disabled for controlled replay, excludes configured/generated
-columns from writes, then validates the candidate with SQLite integrity and
-foreign-key checks before accepting it.
+first establishes an authoritative full SQLite `integrity_check` proof for the
+exact immutable Ours `(VolumeId, RepoSnapshot)` before mutation. A process MAY
+reuse that proof only for the identical content-addressed state; the proof MUST
+remain outside repository-controlled files, and a cache miss or eviction MUST
+rerun the complete check.
+
+It then applies supported row/schema/internal resolutions through one SQLite
+transaction with foreign-key and trigger side effects disabled for controlled
+replay, `cell_size_check` enabled, native constraints and index maintenance
+enabled, and configured/generated columns excluded from writes. A complete
+`foreign_key_check` runs after replay. Because the source has a full immutable
+integrity proof and only SQLite's transactional engine mutates it, validation
+work after that proof is proportional to the delta except for required
+cross-row foreign-key checks.
 
 A candidate that fails validation MUST NOT replace the staged result or
 worktree or change the prior merge journal. Temporary databases are cleaned on
@@ -478,7 +488,8 @@ A conforming merge implementation MUST test:
 4. independent and conflicting SQLite row changes;
 5. composite keys, safe rowid remap, and semantic-key conflicts;
 6. supported/unsupported schema and opaque resolver paths;
-7. candidate integrity/foreign-key validation and rollback on failure;
+7. exact immutable-base integrity proof/reuse, transactional candidate
+   constraints, post-apply foreign-key validation, and rollback on failure;
 8. whole-path, text, and row resolution with stale-token protection;
 9. close/reopen persistence of status, conflict details, selections, and result;
 10. semantic-provider prepare/reopen, stale provider/state tokens, bounded
