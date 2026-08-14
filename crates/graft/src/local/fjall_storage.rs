@@ -301,6 +301,11 @@ impl FjallStorage {
     }
 
     pub fn volume_from_snapshot(&self, snapshot: &Snapshot) -> Result<Volume, FjallStorageErr> {
+        // A rebound Volume references the exact same immutable Segments. Transfer an existing
+        // completeness proof to the rewritten commit graph instead of making the first merge,
+        // diff, or push rediscover every resident frame. Missing proofs remain conservative and
+        // take the normal hydration path.
+        let source_is_fully_hydrated = self.snapshot_hydration_cached(snapshot)?;
         let volume = Volume::new_random();
         let commits: Vec<_> = self
             .read()
@@ -314,6 +319,10 @@ impl FjallStorage {
         }
         batch.write_volume(volume.clone());
         batch.commit()?;
+        if source_is_fully_hydrated {
+            let rebound = self.read().snapshot(&volume.vid)?;
+            self.mark_snapshot_hydrated(&rebound)?;
+        }
         Ok(volume)
     }
 

@@ -957,6 +957,35 @@ mod tests {
     }
 
     #[test]
+    fn rebinding_a_hydrated_snapshot_transfers_its_completeness_proof() {
+        let tokio_rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let remote = Arc::new(RemoteConfig::Memory.build().unwrap());
+        let storage = Arc::new(FjallStorage::open_temporary().unwrap());
+        let runtime = Runtime::new(tokio_rt.handle().clone(), remote, storage, None);
+        let source = runtime.volume_open(None, None, None).unwrap();
+        let mut writer = runtime.volume_writer(source.vid).unwrap();
+        for pageidx in 1..=7 {
+            writer
+                .write_page(PageIdx::must_new(pageidx), Page::test_filled(pageidx as u8))
+                .unwrap();
+        }
+        let source = writer.commit().unwrap();
+        assert!(
+            runtime
+                .snapshot_hydration_cached(source.snapshot())
+                .unwrap()
+        );
+
+        let rebound = runtime.volume_from_snapshot(source.snapshot()).unwrap();
+        let rebound = runtime.volume_snapshot(&rebound.vid).unwrap();
+
+        assert!(runtime.snapshot_hydration_cached(&rebound).unwrap());
+    }
+
+    #[test]
     fn runtime_sanity() {
         let tokio_rt = tokio::runtime::Builder::new_current_thread()
             .start_paused(true)
