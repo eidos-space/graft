@@ -64,7 +64,8 @@ pub(super) fn run_repo_merge(
         return pragma_err!("cannot merge while there is an open transaction");
     }
     let repo = repo_for_file(file)?;
-    if repo_has_work_in_progress_for_file(runtime, file, &repo)? {
+    let status = repo_status_for_file(runtime, file, &repo)?;
+    if repo_status_has_work_in_progress_for_file(file, &repo, &status)? {
         return pragma_err!("cannot merge with staged or unstaged changes");
     }
     clear_row_conflict_resolution_state(&repo)?;
@@ -75,7 +76,12 @@ pub(super) fn run_repo_merge(
     // for missing target commits, keeping ordinary local-branch merges offline-capable.
     let remote = repo_merge_remote_store(&repo, rev, &plan.target)?;
     let plan = prepare_repo_merge_plan(runtime, &plan, remote)?;
-    ensure_checkout_plan_preserves_untracked_paths(runtime, file, &repo, &plan.checkout)?;
+    ensure_checkout_plan_preserves_untracked_paths_with_status(
+        file,
+        &repo,
+        &plan.checkout,
+        &status,
+    )?;
     let previous_files = current_repo_files_for_checkout(&repo)?;
     let previous_artifacts = current_repo_artifacts_for_checkout(&repo)?;
     let mut _sqlite_replacement_guards =

@@ -592,6 +592,14 @@ pub(super) fn repo_has_work_in_progress_for_file(
     repo: &Repository,
 ) -> Result<bool, ErrCtx> {
     let status = repo_status_for_file(runtime, file, repo)?;
+    repo_status_has_work_in_progress_for_file(file, repo, &status)
+}
+
+pub(super) fn repo_status_has_work_in_progress_for_file(
+    file: &RepositorySessionContext,
+    repo: &Repository,
+    status: &RepoStatus,
+) -> Result<bool, ErrCtx> {
     let current_key = repo.file_key(&file.tag)?;
     let has_blocking_unstaged = status.unstaged_changes.iter().any(|change| {
         change.change != RepoWorktreeChangeKind::Untracked || change.path == current_key
@@ -608,13 +616,23 @@ pub(super) fn ensure_checkout_plan_preserves_untracked_paths(
     repo: &Repository,
     plan: &CheckoutPlan,
 ) -> Result<(), ErrCtx> {
+    let status = repo_status_for_file(runtime, file, repo)?;
+    ensure_checkout_plan_preserves_untracked_paths_with_status(file, repo, plan, &status)
+}
+
+pub(super) fn ensure_checkout_plan_preserves_untracked_paths_with_status(
+    file: &RepositorySessionContext,
+    repo: &Repository,
+    plan: &CheckoutPlan,
+    status: &RepoStatus,
+) -> Result<(), ErrCtx> {
     let keys = plan
         .files
         .keys()
         .chain(plan.artifacts.keys())
         .cloned()
         .collect::<BTreeSet<_>>();
-    ensure_checkout_keys_preserve_untracked_paths(runtime, file, repo, &keys)
+    ensure_checkout_keys_preserve_untracked_paths_with_status(file, repo, &keys, status)
 }
 
 pub(super) fn ensure_checkout_key_preserves_untracked_path(
@@ -637,6 +655,18 @@ pub(super) fn ensure_checkout_keys_preserve_untracked_paths(
         return Ok(());
     }
     let status = repo_status_for_file(runtime, file, repo)?;
+    ensure_checkout_keys_preserve_untracked_paths_with_status(file, repo, keys, &status)
+}
+
+fn ensure_checkout_keys_preserve_untracked_paths_with_status(
+    file: &RepositorySessionContext,
+    repo: &Repository,
+    keys: &BTreeSet<String>,
+    status: &RepoStatus,
+) -> Result<(), ErrCtx> {
+    if keys.is_empty() {
+        return Ok(());
+    }
     let current_key = repo.file_key(&file.tag)?;
     let overwritten = status
         .unstaged_changes
