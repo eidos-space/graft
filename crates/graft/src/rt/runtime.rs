@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     ops::RangeInclusive,
     path::Path,
     sync::{
@@ -166,6 +166,39 @@ impl Runtime {
         } else {
             Ok(Page::EMPTY)
         }
+    }
+
+    /// Resolves the immutable segment that currently owns each visible page.
+    ///
+    /// Sequential snapshot consumers can build this manifest once instead of
+    /// searching the page-version index independently for every page.
+    pub(crate) fn snapshot_page_origins(
+        &self,
+        snapshot: &Snapshot,
+    ) -> Result<BTreeMap<PageIdx, SegmentId>> {
+        let mut origins = BTreeMap::new();
+        let storage = self.storage().read();
+        let mut visible = storage.iter_visible_pages(snapshot);
+        while let Some((segment, pages)) = visible.next().transpose()? {
+            for pageidx in pages.iter() {
+                origins.insert(pageidx, segment.sid.clone());
+            }
+        }
+        Ok(origins)
+    }
+
+    pub(crate) fn read_page_from_origin(
+        &self,
+        snapshot: &Snapshot,
+        pageidx: PageIdx,
+        segment: &SegmentId,
+    ) -> Result<Page> {
+        if let Some(page) = self.storage().read().read_page(segment.clone(), pageidx)? {
+            return Ok(page);
+        }
+        // A manifest also covers remotely backed frames. Preserve the existing
+        // hydration/fetch behavior when the page is not resident locally.
+        self.read_page(snapshot, pageidx)
     }
 
     fn run_action<A: Action>(&self, action: A) -> Result<()> {

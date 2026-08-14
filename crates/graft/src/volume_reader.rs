@@ -1,6 +1,10 @@
-use std::borrow::Cow;
+use std::{
+    borrow::Cow,
+    collections::BTreeMap,
+    sync::{Arc, OnceLock},
+};
 
-use crate::core::{PageCount, PageIdx, VolumeId, page::Page};
+use crate::core::{PageCount, PageIdx, SegmentId, VolumeId, page::Page};
 
 use crate::{GraftErr, rt::runtime::Runtime, snapshot::Snapshot, volume_writer::VolumeWriter};
 
@@ -16,11 +20,17 @@ pub struct VolumeReader {
     runtime: Runtime,
     vid: VolumeId,
     snapshot: Snapshot,
+    page_origins: Arc<OnceLock<BTreeMap<PageIdx, SegmentId>>>,
 }
 
 impl VolumeReader {
     pub(crate) fn new(runtime: Runtime, vid: VolumeId, snapshot: Snapshot) -> Self {
-        Self { runtime, vid, snapshot }
+        Self {
+            runtime,
+            vid,
+            snapshot,
+            page_origins: Arc::new(OnceLock::new()),
+        }
     }
 }
 
@@ -40,7 +50,23 @@ impl VolumeRead for VolumeReader {
     }
 
     fn read_page(&self, pageidx: PageIdx) -> Result<Page, GraftErr> {
-        self.runtime.read_page(&self.snapshot, pageidx)
+        if !self.snapshot.page_count.contains(pageidx) {
+            return Ok(Page::EMPTY);
+        }
+        if self.page_origins.get().is_none() {
+            let origins = self.runtime.snapshot_page_origins(&self.snapshot)?;
+            let _ = self.page_origins.set(origins);
+        }
+        let Some(segment) = self
+            .page_origins
+            .get()
+            .expect("page origin manifest initialized")
+            .get(&pageidx)
+        else {
+            return Ok(Page::EMPTY);
+        };
+        self.runtime
+            .read_page_from_origin(&self.snapshot, pageidx, segment)
     }
 }
 
