@@ -2880,13 +2880,24 @@ impl RepositorySession {
                 RepositoryCommand::merge_continue_validated(options.message.clone())
             };
             let output = execute_json_command(service, command, "merge_continue")?;
-            status_cache.invalidate();
-            // A successful merge-continue command atomically removes MERGE_HEAD. Refreshing the
-            // entire worktree here only rediscovers that deterministic postcondition; leave the
-            // cache invalidated so the next independent status request still performs its normal
-            // freshness checks.
             let merge = MergeStatus::None;
             let worktree_paths = merge_worktree_paths_from_output(&output);
+            let can_seed_clean_cache = !validated.status.has_unstaged_changes
+                && validated.status.path_diagnostics.is_empty()
+                && worktree_paths.is_empty();
+            if !can_seed_clean_cache
+                || seed_validated_merge_completion_status_cache(
+                    service,
+                    status_cache,
+                    validated.status,
+                )
+                .is_err()
+            {
+                // Completion is already durable. A cache-seeding failure must never turn that
+                // success into an apparent command failure; invalidate and let the next status
+                // request reconstruct authoritative state.
+                status_cache.invalidate();
+            }
             let _ = fs::remove_dir_all(semantic_workspaces);
             Ok(MergeOperationResult { output, merge, worktree_paths })
         })
@@ -3078,6 +3089,43 @@ fn refresh_incremental_status(
         }
     }
     unreachable!("bounded status stability loop always returns")
+}
+
+/// Carries an exact pre-continue worktree proof across a non-materializing merge commit.
+///
+/// The command changes repository refs and index metadata but not physical files. Retaining the
+/// old fingerprints is equivalent to Git updating its index after commit: the next status call
+/// still stats every tracked path, and any external write forces the ordinary authoritative scan.
+fn seed_validated_merge_completion_status_cache(
+    service: &mut RepositoryCommandService,
+    cache: &mut IncrementalStatusCache,
+    mut status: RepoStatus,
+) -> Result<()> {
+    let repo = service.repository().map_err(repository_command_error)?;
+    status.merge_head = None;
+    status.orig_head = None;
+    status.unstaged.clear();
+    status.unstaged_changes.clear();
+    status.staged.clear();
+    status.staged_changes.clear();
+    status.conflicted.clear();
+    status.conflicted_changes.clear();
+    status.path_diagnostics.clear();
+    status.refresh_summary_flags();
+    repo.refresh_status_repository_projection(&mut status)
+        .map_err(repo_error)?;
+
+    cache.head_target = repo.head_target().map_err(repo_error)?;
+    cache.index = repo.read_index().map_err(repo_error)?;
+    cache.files = repo.index_files().map_err(repo_error)?;
+    cache.artifacts = repo.index_artifacts().map_err(repo_error)?;
+    cache.index_metadata_initialized = true;
+    cache.initialized = true;
+    cache.generation = cache.generation.saturating_add(1).max(1);
+    cache.status = Some(status);
+    cache.persistent_snapshot_attempted = true;
+    let _ = persist_status_snapshot(&repo, cache);
+    Ok(())
 }
 
 fn refresh_incremental_status_once(
@@ -6050,6 +6098,10 @@ mod tests {
             completed.worktree_paths.is_empty(),
             "a token-validated merge candidate must not be rewritten after it is committed"
         );
+        let completed_status = session.status_incremental().unwrap();
+        assert!(completed_status.telemetry.status_cache_hit);
+        assert!(!completed_status.status.dirty);
+        assert!(completed_status.status.merge_head.is_none());
         assert_eq!(session.get_merge_status().unwrap(), MergeStatus::None);
         assert!(!directory.path().join(".graft/semantic-merge").exists());
         session.close().unwrap();
