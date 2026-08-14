@@ -16,7 +16,9 @@
   retain authoritative snapshot materialization.
 - Exact-token SDK merge continuation commits an already installed, clean SQLite candidate without
   rewriting it or immediately rescanning the complete worktree; its exact `worktree_paths` result
-  is empty when no file was physically changed.
+  is empty when no file was physically changed. Validated file fingerprints survive that
+  ref/index-only commit, so the next status refresh is metadata-only and still invalidates on an
+  external write.
 - Clone upload bundles now declare their exact encoded byte length so clients can report total
   download size, percentage, and estimated time remaining while streaming a repository.
 - Remote backends may return object metadata with list results to avoid per-object metadata reads

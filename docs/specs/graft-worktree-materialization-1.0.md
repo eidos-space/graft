@@ -414,6 +414,13 @@ paths actually created, replaced, or removed by that operation.
 conservative before-call host gate, whereas `worktree_paths` is the exact
 after-call result.
 
+After a non-materializing exact-token completion, an SDK MAY carry the already
+validated worktree fingerprints across the ref/index update and synthesize the
+known clean post-commit status. The next status request MUST still stat tracked
+paths; any fingerprint change MUST invalidate the proof and run authoritative
+classification. Cache/proof persistence failure MUST NOT turn a successfully
+committed merge into an operation error.
+
 `abortMerge` requires an active durable merge state and a valid token. It moves
 back to `ORIG_HEAD`, clears merge/index conflict state, and applies the abort
 checkout plan. It is conservatively materializing even when the target path

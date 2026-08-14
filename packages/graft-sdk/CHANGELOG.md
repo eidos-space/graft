@@ -22,7 +22,9 @@ SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
   the authoritative snapshot-materialization fallback.
 - A validated final SQLite merge candidate is installed directly and exact-token
   `continueMerge()` commits that staged state without a second database rewrite. When completion
-  does not physically change a path, its exact `worktree_paths` result is empty.
+  does not physically change a path, its exact `worktree_paths` result is empty. The SDK also
+  carries validated file fingerprints across that ref/index-only commit, avoiding an immediate
+  full status scan while preserving stat-based invalidation for external writes.
 
 ### Fixed
 

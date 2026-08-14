@@ -353,6 +353,11 @@ command path 在 `materialize_sqlite=true` 时仍可能把已 commit 的 SQLite 
 `operationMaterializesWorktree("continueMerge")` 仍返回 `true`：它是调用前的保守
 host gate，而 `worktree_paths` 是调用后的精确结果。
 
+非物化的精确 token completion 之后，SDK 可以把已验证的 worktree fingerprint 跨
+ref/index 更新保留下来，并生成已知 clean 的 post-commit status。下一次 status 请求仍
+必须 stat tracked path；任意 fingerprint 变化都必须使证明失效并执行权威分类。
+cache/proof 持久化失败不能把已经成功 commit 的 merge 变成 operation error。
+
 `abortMerge` 要求存在 active durable merge state 且 token 有效。它回到 `ORIG_HEAD`，
 清理 merge/index conflict state，并应用 abort checkout plan。即使实际 path set
 为空，它仍保守地归类为可能物化。

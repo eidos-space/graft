@@ -452,7 +452,10 @@ with an APFS copy-on-write clone. Clone failure and other platforms use the auth
 path, so this optimization does not change repository or merge semantics.
 After the final choice installs and stages a validated SQLite candidate, an exact-token
 `continueMerge` commits that state directly. It does not serialize or replace the same database a
-second time, and therefore reports `worktree_paths: []` for that completion.
+second time, and therefore reports `worktree_paths: []` for that completion. The SDK carries the
+validated file fingerprints across that ref/index-only commit, so the following status refresh is
+metadata-only. It still stats every tracked path and falls back to authoritative classification
+after any external write.
 Detailed SQLite results are exposed as bounded pages for the selected path. The analyzer computes
 the repository conflict set before filtering that page; path-scoped streaming analysis is follow-up
 work. The host must validate Eidos File semantics before calling `continueMerge`, then pass the

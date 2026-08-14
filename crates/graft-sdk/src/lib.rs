@@ -6104,6 +6104,14 @@ mod tests {
         assert!(completed_status.status.merge_head.is_none());
         assert_eq!(session.get_merge_status().unwrap(), MergeStatus::None);
         assert!(!directory.path().join(".graft/semantic-merge").exists());
+
+        Connection::open(&database_path)
+            .unwrap()
+            .execute("UPDATE docs SET value = 'external' WHERE id = 1", [])
+            .unwrap();
+        let externally_changed = session.status_incremental().unwrap();
+        assert!(!externally_changed.telemetry.status_cache_hit);
+        assert!(externally_changed.status.dirty);
         session.close().unwrap();
     }
 
