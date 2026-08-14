@@ -2374,9 +2374,13 @@ fn row_level_diff_from_readers(
         );
         let generated_columns = generated_columns(&column_infos);
         let parsed_columns: Vec<String> = column_infos.into_iter().map(|c| c.name).collect();
-        let needs_sqlite_rows = needs_materialized_schema
-            || from_entry.is_some_and(is_without_rowid_table)
+        let without_rowid = from_entry.is_some_and(is_without_rowid_table)
             || to_entry.is_some_and(is_without_rowid_table);
+        let direct_without_rowid_layouts = (!needs_materialized_schema && without_rowid)
+            .then(|| compatible_without_rowid_layouts(from_entry, to_entry))
+            .flatten();
+        let needs_sqlite_rows =
+            needs_materialized_schema || (without_rowid && direct_without_rowid_layouts.is_none());
 
         let (columns, primary_key_columns, changes) = if needs_sqlite_rows {
             if materialized.is_none() {
@@ -2405,6 +2409,29 @@ fn row_level_diff_from_readers(
                 to_rows.map(|rows| rows.rows).unwrap_or_default(),
             );
             (columns, primary_key_columns, changes)
+        } else if let (Some(from), Some(to), Some(layouts)) =
+            (from_entry, to_entry, direct_without_rowid_layouts.as_ref())
+        {
+            // Merge needs the complete logical change set, but it does not need to
+            // materialize and SELECT the complete table. The direct decoder finds
+            // changed B-tree pages and decodes only the primary-key records on them.
+            let page = bounded_without_rowid_changed_pages(
+                from_reader,
+                to_reader,
+                from,
+                to,
+                layouts,
+                &BoundedRowDiffMode::Rows {
+                    table: table_name.clone(),
+                    limit: usize::MAX,
+                    offset: 0,
+                },
+            )?;
+            (
+                layouts.output_columns.clone(),
+                page.primary_key_columns,
+                page.changes,
+            )
         } else {
             let changes = match (from_entry, to_entry) {
                 (Some(from), Some(to)) => {
