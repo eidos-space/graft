@@ -1466,7 +1466,6 @@ test("reports real HTTP response bytes through the JavaScript progress callback"
       await assert.rejects(
         session.fetch({ onProgress: (event) => progress.push(event) })
       )
-      await new Promise((resolve) => setImmediate(resolve))
 
       assert.ok(
         progress.some(

@@ -13,6 +13,12 @@
 - Repository commands now retain repository-scoped session state directly instead of reusing a
   live SQLite VFS file handle.
 
+### Fixed
+
+- Transfer progress now coalesces short request bodies into 100 ms aggregate updates and flushes
+  one final value per direction, preventing large SQLite pushes from flooding host callback queues
+  after the Remote ref is already published.
+
 ### Removed
 
 - Removed the dynamic/static SQLite extension, custom Graft VFS, debug Volume PRAGMAs, vendored

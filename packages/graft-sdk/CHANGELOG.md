@@ -15,6 +15,9 @@ SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
 - Multi-request pushes now declare their complete known upload payload before transfer starts.
   Progress no longer reports each completed request as a misleading new `100%` total; fallback
   retries add their remaining payload as one planned unit.
+- Progress callbacks are rate-limited across short request bodies, and the JavaScript operation
+  waits one event-loop turn before settling so hosts receive the exact final byte count without a
+  large callback backlog making a completed push appear stuck.
 
 ### Compatibility
 

@@ -3018,7 +3018,7 @@ mod tests {
         let reporter = crate::repo::TransferProgressReporter::new(move |progress| {
             captured.lock().unwrap().push(progress);
         });
-        let _scope = crate::repo::TransferProgressScope::enter(&reporter);
+        let scope = crate::repo::TransferProgressScope::enter(&reporter);
 
         assert!(matches!(
             remote
@@ -3039,6 +3039,7 @@ mod tests {
             fs::read(destination.path().join("objects/pack/example.pack")).unwrap(),
             b"pack"
         );
+        drop(scope);
         let last = events.lock().unwrap().last().copied().unwrap();
         assert_eq!(last.direction, TransferDirection::Download);
         assert_eq!(last.total_bytes, Some(last.transferred_bytes));
@@ -3070,7 +3071,7 @@ mod tests {
         let reporter = crate::repo::TransferProgressReporter::new(move |progress| {
             captured.lock().unwrap().push(progress);
         });
-        let _scope = crate::repo::TransferProgressScope::enter(&reporter);
+        let scope = crate::repo::TransferProgressScope::enter(&reporter);
 
         assert!(matches!(
             remote
@@ -3079,6 +3080,7 @@ mod tests {
                 .unwrap(),
             UploadBundleOutcome::Downloaded
         ));
+        drop(scope);
         let last = events.lock().unwrap().last().copied().unwrap();
         assert_eq!(last.total_bytes, Some(last.transferred_bytes));
         request.await.unwrap();
@@ -3181,7 +3183,7 @@ mod tests {
         let reporter = crate::repo::TransferProgressReporter::new(move |progress| {
             captured.lock().unwrap().push(progress);
         });
-        let _scope = crate::repo::TransferProgressScope::enter(&reporter);
+        let scope = crate::repo::TransferProgressScope::enter(&reporter);
         let pack_id = "b".repeat(64);
         remote
             .publish_object_pack_and_ref(
@@ -3197,6 +3199,7 @@ mod tests {
             .await
             .unwrap();
 
+        drop(scope);
         let requests = requests.await.unwrap();
         let request_lines = requests
             .iter()
@@ -3357,7 +3360,7 @@ mod tests {
         let reporter = crate::repo::TransferProgressReporter::new(move |progress| {
             captured.lock().unwrap().push(progress);
         });
-        let _scope = crate::repo::TransferProgressScope::enter(&reporter);
+        let scope = crate::repo::TransferProgressScope::enter(&reporter);
 
         remote
             .publish_object_bundle_and_ref(
@@ -3383,6 +3386,7 @@ mod tests {
             .await
             .unwrap();
 
+        drop(scope);
         let events = events.lock().unwrap();
         assert!(!events.is_empty());
         assert!(events.iter().all(|event| {
@@ -3390,11 +3394,7 @@ mod tests {
         }));
         assert_eq!(events.first().unwrap().transferred_bytes, 0);
         assert_eq!(events.last().unwrap().transferred_bytes, 13);
-        assert!(
-            events
-                .iter()
-                .any(|event| { event.transferred_bytes == 7 && event.total_bytes == Some(13) })
-        );
+        assert!(events.len() <= 3);
         assert_eq!(requests.await.unwrap().len(), 3);
     }
 
@@ -3741,7 +3741,7 @@ mod tests {
         let reporter = crate::repo::TransferProgressReporter::new(move |progress| {
             captured.lock().unwrap().push(progress);
         });
-        let _scope = crate::repo::TransferProgressScope::enter(&reporter);
+        let scope = crate::repo::TransferProgressScope::enter(&reporter);
         remote
             .publish_object_bundle_and_ref(
                 vec![
@@ -3764,6 +3764,7 @@ mod tests {
             .await
             .unwrap();
 
+        drop(scope);
         let request_lines = requests
             .await
             .unwrap()
@@ -4281,7 +4282,7 @@ mod tests {
         let reporter = crate::repo::TransferProgressReporter::new(move |progress| {
             captured.lock().unwrap().push(progress);
         });
-        let _scope = crate::repo::TransferProgressScope::enter(&reporter);
+        let scope = crate::repo::TransferProgressScope::enter(&reporter);
 
         remote
             .put_raw_if_not_exists_stream(
@@ -4290,6 +4291,7 @@ mod tests {
             )
             .await
             .unwrap();
+        drop(scope);
         let last = events.lock().unwrap().last().copied().unwrap();
         assert_eq!(last.direction, TransferDirection::Upload);
         assert_eq!(last.transferred_bytes, 5);
