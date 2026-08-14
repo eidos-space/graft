@@ -43,6 +43,7 @@
     "bench:matrix": "node benchmark/performance-matrix.mjs",
     "bench:real-eidos": "node benchmark/real-eidos.mjs",
     "bench:sqlite-diff": "node benchmark/sqlite-diff.mjs",
+    "bench:sync-merge": "node benchmark/sync-merge.mjs",
     "bench:push": "node benchmark/push.mjs",
     "release:create-packages": "napi create-npm-dirs --npm-dir npm",
     "release:collect": "napi artifacts --output-dir artifacts --npm-dir npm",
