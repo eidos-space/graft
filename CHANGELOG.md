@@ -4,6 +4,12 @@
 
 ### Changed
 
+- SQLite row merge now reuses proven segment page sets across immutable snapshots, targets
+  `WITHOUT ROWID` analysis to changed B-tree pages, and installs an already validated merge
+  candidate directly instead of serializing the database again during completion.
+- Exact-token SDK merge continuation commits an already installed, clean SQLite candidate without
+  rewriting it or immediately rescanning the complete worktree; its exact `worktree_paths` result
+  is empty when no file was physically changed.
 - Clone upload bundles now declare their exact encoded byte length so clients can report total
   download size, percentage, and estimated time remaining while streaming a repository.
 - Remote backends may return object metadata with list results to avoid per-object metadata reads
@@ -28,6 +34,9 @@
 
 ### Compatibility
 
+- Merge, repository, snapshot, and Remote formats are unchanged. Continue remains conservatively
+  classified as worktree-materializing before a call even though its validated fast path may
+  return an empty exact path set afterward.
 - New clients prefer the `X-Graft-Bundle-Total-Bytes` response header and fall back to
   `Content-Length` for older servers. Existing clients can ignore the additive header.
 - Repository objects, snapshots, remotes, CLI commands, the `graft` executable name, and the SDK

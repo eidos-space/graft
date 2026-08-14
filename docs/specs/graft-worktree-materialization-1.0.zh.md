@@ -237,7 +237,7 @@ Graft session。
 | SDK | `prepareSemanticMerge`、`recordSemanticMergeConflicts` | 否 | 只在 `.graft` 下写 Graft-owned private provider workspace/record |
 | SDK | `acceptSemanticMergeResult` | 是 | 验证 private provider result、替换 tracked SQLite path 并 stage |
 | CLI / SDK | `writeAndStageTextResult` / `resolve --manual` | 是 | 写并 staging 编辑后的物理结果 |
-| CLI / SDK | `continueMerge` / `merge --continue` | 是 | commit 已解决 merge；当前 CLI path 可能再次写 SQLite snapshot |
+| CLI / SDK | `continueMerge` / `merge --continue` | 是 | commit 已解决 merge；SDK 的已验证快路径保留已安装的 SQLite candidate，其他路径可能再次写 SQLite snapshot |
 | CLI / SDK | `abortMerge` / `merge --abort` | 是 | 恢复 `ORIG_HEAD` 并应用 abort checkout plan |
 | CLI | `export` | 否（输出到独立目标） | 只写 caller 选择的 export destination |
 | CLI / SDK | `sql`、应用 SQLite transaction | 否（对 Graft 而言） | caller 直接创建或编辑物理 worktree 文件 |
@@ -343,10 +343,15 @@ state token；stale token 必须作为“重新读取 status 后重试”处理�
 
 ### 7.4 Continue 与 abort
 
-`continueMerge` 要求没有未解决 conflict 且 state token 有效。当前 command path
-会 commit 已解决 merge；当 `materialize_sqlite=true` 时，可能把已 commit 的
-SQLite snapshot 写回 tracked path。它返回 merge/commit output，以及列出本次实际
-创建、替换或删除 path 的标准化 `worktree_paths`。
+`continueMerge` 要求没有未解决 conflict 且 state token 有效。若 SDK 重新验证了精确
+token、确认 worktree clean，且最终 SQLite candidate 已安装并 staging，则它可以直接
+commit 该状态，不再重写 tracked file；此路径必须返回 `worktree_paths: []`。其他
+command path 在 `materialize_sqlite=true` 时仍可能把已 commit 的 SQLite snapshot
+写回 tracked path。所有路径都返回 merge/commit output，以及只列出本次实际创建、
+替换或删除 path 的标准化 `worktree_paths`。
+
+`operationMaterializesWorktree("continueMerge")` 仍返回 `true`：它是调用前的保守
+host gate，而 `worktree_paths` 是调用后的精确结果。
 
 `abortMerge` 要求存在 active durable merge state 且 token 有效。它回到 `ORIG_HEAD`，
 清理 merge/index conflict state，并应用 abort checkout plan。即使实际 path set

@@ -1347,7 +1347,9 @@ test(
         expectedStateToken: tableResolved.merge.state_token,
       })
       assert.equal(completed.merge.state, "none")
-      assert.deepEqual(completed.worktree_paths, ["space.eidos"])
+      // The final row-resolution call already installed the validated candidate.
+      // Continue commits that exact staged state without rewriting the worktree.
+      assert.deepEqual(completed.worktree_paths, [])
       await assert.rejects(
         cloneSession.listMergeConflicts({
           path: "space.eidos",

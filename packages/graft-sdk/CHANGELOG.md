@@ -10,6 +10,15 @@ SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
 - `repositoryMetadata()` now reports the last locally known upstream target so history UIs can
   decorate a diverged Remote tip without fetching or scanning the worktree.
 
+### Changed
+
+- SQLite merge preparation reuses proven segment page sets across immutable snapshots and targets
+  `WITHOUT ROWID` analysis to changed B-tree pages instead of repeatedly materializing complete
+  database pairs.
+- A validated final SQLite merge candidate is installed directly and exact-token
+  `continueMerge()` commits that staged state without a second database rewrite. When completion
+  does not physically change a path, its exact `worktree_paths` result is empty.
+
 ### Fixed
 
 - Multi-request pushes now declare their complete known upload payload before transfer starts.
@@ -22,7 +31,8 @@ SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
 ### Compatibility
 
 - `upstream_target` is additive and nullable. Repository, snapshot, merge, and Remote formats are
-  unchanged.
+  unchanged. `operationMaterializesWorktree("continueMerge")` remains a conservative `true` host
+  gate even when the validated completion fast path returns no changed worktree paths.
 
 ## Graft SDK 0.3.14 — 2026-08-13
 

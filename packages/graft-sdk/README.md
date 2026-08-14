@@ -197,7 +197,9 @@ application handles after the SDK promise settles; the Graft repository session 
 Merge apply and mutation results also return `worktree_paths`, a sorted, deduplicated list of the
 repository-relative paths actually created, replaced, or removed by that completed operation. Use
 the conservative gate before the call and this exact list to bound validation and refresh work
-afterward.
+afterward. In particular, an exact-token `continueMerge` may return `worktree_paths: []` when the
+validated final SQLite candidate was already installed by the resolving operation; the conservative
+before-call gate remains **Yes** because callers cannot assume that fast path in advance.
 
 `addAll` reads SQLite files and their committed/WAL state but does not replace them. Eidos should
 still checkpoint its application databases before snapshotting when it needs a deterministic
@@ -441,6 +443,9 @@ materializes and stages one complete SQLite candidate and returns that path.
 The retained `RepositorySession` caches an immutable SQLite merge plan by Base/Ours/Theirs snapshot
 and frozen merge policy. Conflict inspection computes that plan once; later row, cell, and table
 choices in the same session reuse it instead of rescanning the complete database.
+After the final choice installs and stages a validated SQLite candidate, an exact-token
+`continueMerge` commits that state directly. It does not serialize or replace the same database a
+second time, and therefore reports `worktree_paths: []` for that completion.
 Detailed SQLite results are exposed as bounded pages for the selected path. The analyzer computes
 the repository conflict set before filtering that page; path-scoped streaming analysis is follow-up
 work. The host must validate Eidos File semantics before calling `continueMerge`, then pass the
