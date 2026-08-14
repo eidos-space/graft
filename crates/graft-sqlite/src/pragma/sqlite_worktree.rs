@@ -2169,7 +2169,7 @@ mod tests {
         let mut connection = create_randomized_without_rowid_database(&path);
         let runtime = test_runtime();
         let mut previous = import_physical_sqlite_file_state(&runtime, &path, None).unwrap();
-        let mut seed = 0xA11C_E5E1_5AFE_2026_u64;
+        let mut seed = 0xA11C_E5E1_5A7E_2026_u64;
 
         for round in 0..6_u32 {
             let transaction = connection.transaction().unwrap();
