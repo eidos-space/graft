@@ -1720,4 +1720,19 @@ mod validation_tests {
         .unwrap_err();
         assert!(error.to_string().contains("failed foreign_key_check"));
     }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_merge_seed_clone_is_an_independent_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.db");
+        let destination = temp.path().join("candidate.db");
+        std::fs::write(&source, b"immutable source").unwrap();
+
+        assert!(try_clone_sqlite_merge_seed(&source, &destination).unwrap());
+        std::fs::write(&destination, b"changed candidate").unwrap();
+
+        assert_eq!(std::fs::read(&source).unwrap(), b"immutable source");
+        assert_eq!(std::fs::read(&destination).unwrap(), b"changed candidate");
+    }
 }

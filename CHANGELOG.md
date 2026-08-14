@@ -11,6 +11,9 @@
   state before mutation, then relies on SQLite's transactional constraint/index maintenance,
   touched-cell checks, and a complete post-apply foreign-key check instead of cold-scanning every
   inherited page again.
+- macOS reuses an already-proven, clean, exclusively locked Ours worktree through an APFS
+  copy-on-write clone when seeding the private merge candidate; clone failure and other platforms
+  retain authoritative snapshot materialization.
 - Exact-token SDK merge continuation commits an already installed, clean SQLite candidate without
   rewriting it or immediately rescanning the complete worktree; its exact `worktree_paths` result
   is empty when no file was physically changed.

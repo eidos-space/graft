@@ -447,6 +447,9 @@ Candidate construction likewise proves the exact immutable Ours state with a ful
 `integrity_check` once per process. Exact content-state hits reuse only that non-forgeable memory
 proof; SQLite then applies and validates the transactional delta with native constraints,
 `cell_size_check`, index maintenance, and a complete `foreign_key_check`.
+On macOS, a proof-backed clean and exclusively locked Ours worktree can seed the private candidate
+with an APFS copy-on-write clone. Clone failure and other platforms use the authoritative snapshot
+path, so this optimization does not change repository or merge semantics.
 After the final choice installs and stages a validated SQLite candidate, an exact-token
 `continueMerge` commits that state directly. It does not serialize or replace the same database a
 second time, and therefore reports `worktree_paths: []` for that completion.

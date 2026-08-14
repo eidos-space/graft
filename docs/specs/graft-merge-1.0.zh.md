@@ -120,6 +120,11 @@ generated/configured column；完成后执行完整 `foreign_key_check`。由于
 不可变 integrity proof，且后续只有 SQLite transaction 修改它，证明后的验证除必要的
 跨行 FK 检查外可与 delta 成正比。验证失败不能替换 staged result/worktree 或改变之前的
 merge journal，temp 成功失败都要清理。
+
+若精确 integrity proof 已在进程内，且 preflight 已证明 worktree file clean、被独占锁定
+并等于 Ours，实现可以用 filesystem copy-on-write clone 作为 private candidate seed。
+clone 失败或平台不支持时必须回退到权威 Graft snapshot 物化；filesystem clone 本身
+永远不能作为 integrity 或 identity proof。
 Directory repository session 必须规划每个冲突 SQLite path；任何 unmerged path 都必须
 返回结构化 conflict、validation/analysis error、limitation 或明确可执行 action。
 

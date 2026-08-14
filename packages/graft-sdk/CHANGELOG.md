@@ -17,6 +17,9 @@ SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
   database pairs. Candidate construction also establishes one full integrity proof for an exact
   immutable Ours state before mutation, then validates SQLite's transactional delta instead of
   cold-scanning every inherited page again.
+- On macOS, an already-proven, clean, exclusively locked Ours worktree seeds private merge
+  candidates with an APFS copy-on-write clone. Unsupported filesystems and other platforms retain
+  the authoritative snapshot-materialization fallback.
 - A validated final SQLite merge candidate is installed directly and exact-token
   `continueMerge()` commits that staged state without a second database rewrite. When completion
   does not physically change a path, its exact `worktree_paths` result is empty.

@@ -206,6 +206,13 @@ integrity proof and only SQLite's transactional engine mutates it, validation
 work after that proof is proportional to the delta except for required
 cross-row foreign-key checks.
 
+When that exact integrity proof is already resident and preflight has proven a
+clean, exclusively locked worktree file equal to Ours, an implementation MAY
+use a filesystem copy-on-write clone as the private candidate seed. Clone
+failure or unsupported platforms MUST fall back to materializing the
+authoritative Graft snapshot. A filesystem clone is never itself an integrity
+or identity proof.
+
 A candidate that fails validation MUST NOT replace the staged result or
 worktree or change the prior merge journal. Temporary databases are cleaned on
 success and failure. Directory repository sessions MUST plan every conflicted
