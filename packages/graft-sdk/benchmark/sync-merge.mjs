@@ -68,7 +68,7 @@ const scenarios = [
     ],
   },
 ]
-const selectedScenarios =
+const profileScenarios =
   profile === "ci"
     ? scenarios.filter(({ name }) =>
         ["text-clean", "text-conflict", "sqlite-small", "sqlite-large"].includes(
@@ -76,6 +76,18 @@ const selectedScenarios =
         )
       )
     : scenarios
+const requestedScenarios = new Set(
+  (process.env.GRAFT_MERGE_BENCH_SCENARIOS ?? "")
+    .split(",")
+    .map((name) => name.trim())
+    .filter(Boolean)
+)
+const selectedScenarios = requestedScenarios.size
+  ? profileScenarios.filter(({ name }) => requestedScenarios.has(name))
+  : profileScenarios
+if (requestedScenarios.size && selectedScenarios.length !== requestedScenarios.size) {
+  throw new Error("GRAFT_MERGE_BENCH_SCENARIOS contains an unknown or unavailable scenario")
+}
 
 try {
   const templates = new Map()
@@ -128,7 +140,11 @@ try {
   }
   process.stdout.write(`${JSON.stringify(report, null, 2)}\n`)
 } finally {
-  await fs.rm(temporaryRoot, { recursive: true, force: true })
+  if (process.env.GRAFT_MERGE_BENCH_KEEP_TEMP === "1") {
+    process.stderr.write(`graft-sync-merge-temp ${temporaryRoot}\n`)
+  } else {
+    await fs.rm(temporaryRoot, { recursive: true, force: true })
+  }
 }
 
 async function prepareScenarioTemplate(scenario, root) {
@@ -265,7 +281,12 @@ async function measureScenario(template, scenario, run) {
     })
     const continueMs = performance.now() - continueStartedAt
     assert.equal(completed.merge.state, "none")
-    assert.equal((await session.status()).dirty, false)
+    const finalStatus = await session.status()
+    assert.equal(
+      finalStatus.dirty,
+      false,
+      `merge left a dirty worktree: ${JSON.stringify(finalStatus)}`
+    )
 
     return {
       scenario: scenario.name,
@@ -282,7 +303,9 @@ async function measureScenario(template, scenario, run) {
     }
   } finally {
     await session.close()
-    await fs.rm(sampleRoot, { recursive: true, force: true })
+    if (process.env.GRAFT_MERGE_BENCH_KEEP_TEMP !== "1") {
+      await fs.rm(sampleRoot, { recursive: true, force: true })
+    }
   }
 }
 
