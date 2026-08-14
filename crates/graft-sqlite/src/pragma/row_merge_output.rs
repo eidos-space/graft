@@ -1008,6 +1008,17 @@ pub(super) struct RowAutoMergeResult {
     pub(super) requires_validation: bool,
 }
 
+#[derive(Debug)]
+struct PreparedRowMergeFile {
+    path: PathBuf,
+}
+
+impl Drop for PreparedRowMergeFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 pub(super) fn try_row_auto_merge_current_file_conflict(
     runtime: &Runtime,
     file: &mut RepositorySessionContext,
@@ -1075,7 +1086,14 @@ pub(super) fn try_row_auto_merge_paths(
     remote: Option<Arc<Remote>>,
     physical_replacement_prepared: bool,
 ) -> Result<Vec<RowAutoMergeResult>, ErrCtx> {
-    type PreparedCandidate = (CommitFileState, usize, usize, usize, bool);
+    type PreparedCandidate = (
+        CommitFileState,
+        Option<PreparedRowMergeFile>,
+        usize,
+        usize,
+        usize,
+        bool,
+    );
 
     let mut candidates = Vec::new();
     let mut analyzed = BTreeSet::new();
@@ -1106,22 +1124,24 @@ pub(super) fn try_row_auto_merge_paths(
                 })
                 .collect::<Vec<_>>();
             let summary_from = ours.clone();
-            let merged = if plan.can_resolve_to_ours_without_apply() {
-                ours
+            let (merged, materialized) = if plan.can_resolve_to_ours_without_apply() {
+                (ours, None)
             } else if applied_changes > 0 {
-                materialize_row_auto_merge_state(
+                let (merged, path) = materialize_row_auto_merge_candidate(
                     runtime,
                     repo,
                     key,
                     &ours,
                     &plan.theirs_apply_sql(),
-                )?
+                )?;
+                (merged, Some(PreparedRowMergeFile { path }))
             } else {
                 return Ok(None);
             };
             file.cache_row_merge_table_summaries(key.clone(), summary_from, merged.clone(), tables);
             Ok(Some((
                 merged,
+                materialized,
                 applied_changes,
                 plan.analysis.ours_changes,
                 plan.analysis.theirs_changes,
@@ -1131,6 +1151,7 @@ pub(super) fn try_row_auto_merge_paths(
         match prepared {
             Ok(Some((
                 merged,
+                materialized,
                 applied_changes,
                 ours_changes,
                 theirs_changes,
@@ -1140,6 +1161,7 @@ pub(super) fn try_row_auto_merge_paths(
                 candidates.push((
                     key.clone(),
                     merged,
+                    materialized,
                     applied_changes,
                     ours_changes,
                     theirs_changes,
@@ -1172,17 +1194,37 @@ pub(super) fn try_row_auto_merge_paths(
     }
 
     let mut resolved = Vec::new();
-    for (key, merged, applied_changes, ours_changes, theirs_changes, requires_validation) in
-        candidates
+    for (
+        key,
+        merged,
+        materialized,
+        applied_changes,
+        ours_changes,
+        theirs_changes,
+        requires_validation,
+    ) in candidates
     {
-        checkout_selected_repository_database(
-            runtime,
-            file,
-            repo,
-            &key,
-            &merged,
-            physical_replacement_prepared,
-        )?;
+        if let Some(materialized) = materialized
+            && repo.file_key(&file.tag)? != key
+        {
+            install_materialized_repo_file_state(
+                runtime,
+                repo,
+                &key,
+                &merged,
+                &materialized.path,
+                physical_replacement_prepared,
+            )?;
+        } else {
+            checkout_selected_repository_database(
+                runtime,
+                file,
+                repo,
+                &key,
+                &merged,
+                physical_replacement_prepared,
+            )?;
+        }
         if !requires_validation {
             repo.resolve_file_conflict(repo.worktree().join(&key), Some(merged))?;
         }
