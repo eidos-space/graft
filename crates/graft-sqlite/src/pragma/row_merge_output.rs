@@ -1143,6 +1143,9 @@ pub(super) fn try_row_auto_merge_paths(
                     key,
                     &ours,
                     &plan.theirs_apply_sql(),
+                    physical_replacement_prepared
+                        .then(|| repo.worktree().join(key))
+                        .as_deref(),
                 )?;
                 (merged, Some(PreparedRowMergeFile { path }))
             } else {
@@ -1319,7 +1322,7 @@ pub(super) fn try_row_merge_current_file_status_conflict(
     }
     let sql = plan.theirs_apply_sql();
     let (merged, materialized) =
-        materialize_row_auto_merge_candidate(runtime, repo, &key, &ours, &sql)?;
+        materialize_row_auto_merge_candidate(runtime, repo, &key, &ours, &sql, None)?;
     let checkout = if repo.file_key(&file.tag)? == key {
         checkout_repo_file_state(runtime, file, &merged, None)
     } else {
@@ -1415,7 +1418,7 @@ pub(super) fn materialize_row_auto_merge_state(
     if sql.trim().is_empty() {
         return Ok(ours.clone());
     }
-    let (state, path) = materialize_row_auto_merge_candidate(runtime, repo, key, ours, sql)?;
+    let (state, path) = materialize_row_auto_merge_candidate(runtime, repo, key, ours, sql, None)?;
     let cleanup = std::fs::remove_file(path);
     match cleanup {
         Ok(()) | Err(_) => Ok(state),
@@ -1428,6 +1431,7 @@ fn materialize_row_auto_merge_candidate(
     key: &str,
     ours: &CommitFileState,
     sql: &str,
+    worktree_seed: Option<&Path>,
 ) -> Result<(CommitFileState, PathBuf), ErrCtx> {
     if sql.trim().is_empty() {
         return Err(ErrCtx::InvalidCommand(
@@ -1436,7 +1440,17 @@ fn materialize_row_auto_merge_candidate(
     }
     let temp_path = row_auto_merge_temp_path(repo, key)?;
     let result = (|| {
-        write_repo_file_state_to_path(runtime, ours, &temp_path)?;
+        let cloned = if row_merge_integrity_proven(ours) {
+            worktree_seed
+                .map(|seed| try_clone_sqlite_merge_seed(seed, &temp_path))
+                .transpose()?
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        if !cloned {
+            write_repo_file_state_to_path(runtime, ours, &temp_path)?;
+        }
         validate_row_merge_base_integrity(&temp_path, ours)?;
         apply_row_merge_sql_to_path(&temp_path, sql)?;
         // Keep the merged snapshot in the ancestry of ours. A row merge changes
@@ -1452,6 +1466,39 @@ fn materialize_row_auto_merge_candidate(
             Err(error)
         }
     }
+}
+
+/// Clone a proof-backed, exclusively locked worktree seed without copying its data blocks.
+///
+/// Failure is an ordinary cache miss: callers fall back to materializing the authoritative Graft
+/// state. Other platforms intentionally return `false` instead of paying for a full byte copy.
+fn try_clone_sqlite_merge_seed(source: &Path, destination: &Path) -> Result<bool, ErrCtx> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+        if let (Ok(source_c), Ok(destination_c)) = (
+            CString::new(source.as_os_str().as_bytes()),
+            CString::new(destination.as_os_str().as_bytes()),
+        ) {
+            // SAFETY: both C strings live through the call and are NUL-terminated. The private
+            // destination does not exist; clonefile either creates an independent CoW file or
+            // reports failure without changing the authoritative source.
+            if unsafe { libc::clonefile(source_c.as_ptr(), destination_c.as_ptr(), 0) } == 0 {
+                return Ok(true);
+            }
+            match std::fs::remove_file(destination) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    let _ = (source, destination);
+
+    Ok(false)
 }
 
 pub(super) fn row_auto_merge_temp_path(repo: &Repository, key: &str) -> Result<PathBuf, ErrCtx> {
@@ -1520,6 +1567,13 @@ pub(super) fn validate_row_merge_base_integrity(
     }
     proofs.insert(key);
     Ok(())
+}
+
+fn row_merge_integrity_proven(state: &CommitFileState) -> bool {
+    let key = (state.volume.clone(), state.snapshot.clone());
+    ROW_MERGE_INTEGRITY_PROOFS
+        .get()
+        .is_some_and(|proofs| proofs.lock().contains(&key))
 }
 
 fn validate_row_merge_integrity(path: &Path, conn: &rusqlite::Connection) -> Result<(), ErrCtx> {
