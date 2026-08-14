@@ -14,6 +14,9 @@
 - macOS reuses an already-proven, clean, exclusively locked Ours worktree through an APFS
   copy-on-write clone when seeding the private merge candidate; clone failure and other platforms
   retain authoritative snapshot materialization.
+- Transactional SQLite merge replay now captures committed WAL page numbers and, after a successful
+  checkpoint and validation, imports only pages that differ from Ours. Missing, malformed, or
+  partial WAL data safely falls back to an authoritative full candidate import.
 - Exact-token SDK merge continuation commits an already installed, clean SQLite candidate without
   rewriting it or immediately rescanning the complete worktree; its exact `worktree_paths` result
   is empty when no file was physically changed. Validated file fingerprints survive that

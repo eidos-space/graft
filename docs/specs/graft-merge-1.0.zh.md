@@ -125,6 +125,14 @@ merge journal，temp 成功失败都要清理。
 并等于 Ours，实现可以用 filesystem copy-on-write clone 作为 private candidate seed。
 clone 失败或平台不支持时必须回退到权威 Graft snapshot 物化；filesystem clone 本身
 永远不能作为 integrity 或 identity proof。
+
+若 SQLite WAL mode 可用，实现可以在应用 transactional delta 时保留截至最后一个已提交
+frame 的全部 page number。只有 SQLite 成功 checkpoint 同一个 WAL，且结果 database
+通过必要验证后，才可用该集合做 sparse repository import。Page number 只是保守候选：
+每个候选页仍必须与不可变 Ours snapshot 比较，page-count 变化必须显式处理。WAL 缺失、
+格式错误、不完整、未提交或不一致时，必须回退到权威 full candidate import。WAL frame
+只能定位 output page，不能跨 branch 合并，也不能定义 row conflict 语义。
+
 Directory repository session 必须规划每个冲突 SQLite path；任何 unmerged path 都必须
 返回结构化 conflict、validation/analysis error、limitation 或明确可执行 action。
 

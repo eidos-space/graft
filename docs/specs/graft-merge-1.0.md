@@ -213,6 +213,17 @@ failure or unsupported platforms MUST fall back to materializing the
 authoritative Graft snapshot. A filesystem clone is never itself an integrity
 or identity proof.
 
+When SQLite WAL mode is available, an implementation MAY retain the page
+numbers from every frame through the final committed frame while applying the
+transactional delta. It MAY use that set for sparse repository import only
+after SQLite successfully checkpoints the same WAL and the resulting database
+passes the required validation. Page numbers are conservative candidates:
+each candidate page MUST still be compared with the immutable Ours snapshot,
+and page-count changes MUST be handled explicitly. Missing, malformed,
+partial, uncommitted, or inconsistent WAL data MUST fall back to an
+authoritative full candidate import. WAL frames locate output pages only; they
+MUST NOT be merged across branches or used as row-conflict semantics.
+
 A candidate that fails validation MUST NOT replace the staged result or
 worktree or change the prior merge journal. Temporary databases are cleaned on
 success and failure. Directory repository sessions MUST plan every conflicted

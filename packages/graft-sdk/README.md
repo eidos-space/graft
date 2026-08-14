@@ -450,6 +450,10 @@ proof; SQLite then applies and validates the transactional delta with native con
 On macOS, a proof-backed clean and exclusively locked Ours worktree can seed the private candidate
 with an APFS copy-on-write clone. Clone failure and other platforms use the authoritative snapshot
 path, so this optimization does not change repository or merge semantics.
+When SQLite WAL mode is available, candidate replay retains the committed WAL page numbers and,
+after SQLite successfully checkpoints and validates that same WAL, imports only pages that differ
+from Ours. Missing, partial, or inconsistent WAL data falls back to the authoritative full import;
+WAL pages are never merged across branches or treated as row-conflict semantics.
 After the final choice installs and stages a validated SQLite candidate, an exact-token
 `continueMerge` commits that state directly. It does not serialize or replace the same database a
 second time, and therefore reports `worktree_paths: []` for that completion. The SDK carries the

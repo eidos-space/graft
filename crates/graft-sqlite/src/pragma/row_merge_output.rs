@@ -1856,6 +1856,22 @@ mod validation_tests {
     }
 
     #[test]
+    fn malformed_or_partial_wal_never_produces_a_sparse_import_hint() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("malformed.db");
+        let wal_path = sqlite_sidecar_path(&path, "-wal");
+
+        std::fs::write(&wal_path, [0_u8; SQLITE_WAL_HEADER_BYTES - 1]).unwrap();
+        assert_eq!(read_committed_wal_changed_pages(&path).unwrap(), None);
+
+        let mut header = [0_u8; SQLITE_WAL_HEADER_BYTES];
+        header[..4].copy_from_slice(&SQLITE_WAL_MAGIC_BIG_ENDIAN_CHECKSUM.to_be_bytes());
+        header[8..12].copy_from_slice(&(PAGESIZE.as_usize() as u32).to_be_bytes());
+        std::fs::write(&wal_path, header).unwrap();
+        assert_eq!(read_committed_wal_changed_pages(&path).unwrap(), None);
+    }
+
+    #[test]
     fn committed_wal_hint_covers_every_physically_changed_page() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("wal-pages.db");
