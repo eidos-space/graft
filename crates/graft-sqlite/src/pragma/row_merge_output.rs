@@ -1266,15 +1266,25 @@ pub(super) fn try_row_merge_current_file_status_conflict(
         return Ok(None);
     }
     let sql = plan.theirs_apply_sql();
-    let merged = materialize_row_auto_merge_state(runtime, repo, &key, &ours, &sql)?;
-    checkout_selected_repository_database(
-        runtime,
-        file,
-        repo,
-        &key,
-        &merged,
-        physical_replacement_prepared,
-    )?;
+    let (merged, materialized) =
+        materialize_row_auto_merge_candidate(runtime, repo, &key, &ours, &sql)?;
+    let checkout = if repo.file_key(&file.tag)? == key {
+        checkout_repo_file_state(runtime, file, &merged, None)
+    } else {
+        install_materialized_repo_file_state(
+            runtime,
+            repo,
+            &key,
+            &merged,
+            &materialized,
+            physical_replacement_prepared,
+        )
+    };
+    let cleanup = std::fs::remove_file(&materialized);
+    match (checkout, cleanup) {
+        (Err(error), _) => return Err(error),
+        (Ok(()), Ok(()) | Err(_)) => {}
+    }
     if plan.analysis.has_conflicts() {
         return Ok(None);
     }
@@ -1353,6 +1363,25 @@ pub(super) fn materialize_row_auto_merge_state(
     if sql.trim().is_empty() {
         return Ok(ours.clone());
     }
+    let (state, path) = materialize_row_auto_merge_candidate(runtime, repo, key, ours, sql)?;
+    let cleanup = std::fs::remove_file(path);
+    match cleanup {
+        Ok(()) | Err(_) => Ok(state),
+    }
+}
+
+fn materialize_row_auto_merge_candidate(
+    runtime: &Runtime,
+    repo: &Repository,
+    key: &str,
+    ours: &CommitFileState,
+    sql: &str,
+) -> Result<(CommitFileState, PathBuf), ErrCtx> {
+    if sql.trim().is_empty() {
+        return Err(ErrCtx::InvalidCommand(
+            "cannot materialize an empty row merge candidate".into(),
+        ));
+    }
     let temp_path = row_auto_merge_temp_path(repo, key)?;
     let result = (|| {
         write_repo_file_state_to_path(runtime, ours, &temp_path)?;
@@ -1363,10 +1392,12 @@ pub(super) fn materialize_row_auto_merge_state(
         // compressed database again.
         import_stable_sqlite_file_state(runtime, &temp_path, Some(ours))
     })();
-    let cleanup = std::fs::remove_file(&temp_path);
-    match (result, cleanup) {
-        (Ok(state), Ok(()) | Err(_)) => Ok(state),
-        (Err(err), Ok(()) | Err(_)) => Err(err),
+    match result {
+        Ok(state) => Ok((state, temp_path)),
+        Err(error) => {
+            let _ = std::fs::remove_file(&temp_path);
+            Err(error)
+        }
     }
 }
 
