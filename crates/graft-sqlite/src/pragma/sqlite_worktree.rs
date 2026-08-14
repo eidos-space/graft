@@ -1562,7 +1562,7 @@ pub(super) fn prepare_sqlite_path_for_replacement(
     }
 }
 
-fn remove_sqlite_sidecars(path: &Path) -> Result<(), ErrCtx> {
+pub(super) fn remove_sqlite_sidecars(path: &Path) -> Result<(), ErrCtx> {
     for suffix in ["-wal", "-shm", "-journal"] {
         let mut sidecar = path.as_os_str().to_os_string();
         sidecar.push(suffix);
@@ -1704,6 +1704,61 @@ pub(super) fn import_stable_sqlite_file_state(
     let physical = PhysicalSqliteReader::open_stable(path)?;
     import_sqlite_reader_state(runtime, path, base, &physical, None, None)
         .map(|(state, _, _)| state)
+}
+
+/// Imports a stable SQLite candidate from a conservative set of physically changed pages.
+///
+/// Callers must derive `changed_pages` from SQLite's committed WAL frames. Every listed page is
+/// still compared with the immutable base before writing, so false positives are harmless. WAL
+/// validation failure must use [`import_stable_sqlite_file_state`] instead of calling this helper.
+pub(super) fn import_stable_sqlite_file_state_from_changed_pages(
+    runtime: &Runtime,
+    path: &Path,
+    base: &CommitFileState,
+    changed_pages: &BTreeSet<u32>,
+) -> Result<CommitFileState, ErrCtx> {
+    let physical = PhysicalSqliteReader::open_stable(path)?;
+    let base_reader = runtime.snapshot_reader(base.snapshot.to_snapshot());
+    let mut target = None;
+    for &page_number in changed_pages {
+        graft::repo::cancellation_checkpoint()?;
+        if page_number == 0 || page_number > physical.page_count().to_u32() {
+            continue;
+        }
+        let pageidx = PageIdx::try_from(page_number).map_err(|error| {
+            ErrCtx::InvalidCommand(
+                format!(
+                    "invalid SQLite WAL page index in `{}`: {error}",
+                    path.display()
+                )
+                .into(),
+            )
+        })?;
+        let page = physical.read_page(pageidx)?;
+        let unchanged = base_reader.page_count().contains(pageidx)
+            && sqlite_page_bytes_equal(
+                page_number,
+                base_reader.read_page(pageidx)?.as_ref(),
+                page.as_ref(),
+            );
+        if unchanged {
+            continue;
+        }
+        ensure_import_target(runtime, Some(base), &mut target)?
+            .writer
+            .write_page(pageidx, page)?;
+    }
+
+    if base.snapshot.page_count != physical.page_count() {
+        ensure_import_target(runtime, Some(base), &mut target)?
+            .writer
+            .soft_truncate(physical.page_count())?;
+    }
+
+    match target {
+        Some(target) => target.commit(runtime),
+        None => Ok(base.clone()),
+    }
 }
 
 fn import_sqlite_reader_state(

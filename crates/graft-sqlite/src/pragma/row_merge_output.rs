@@ -1452,16 +1452,25 @@ fn materialize_row_auto_merge_candidate(
             write_repo_file_state_to_path(runtime, ours, &temp_path)?;
         }
         validate_row_merge_base_integrity(&temp_path, ours)?;
-        apply_row_merge_sql_to_path(&temp_path, sql)?;
+        let changed_pages = apply_row_merge_sql_to_path_with_changed_pages(&temp_path, sql)?;
         // Keep the merged snapshot in the ancestry of ours. A row merge changes
         // only a handful of SQLite pages; importing with no base turned every
         // candidate into a new full-size Volume and made the next push upload the
         // compressed database again.
-        import_stable_sqlite_file_state(runtime, &temp_path, Some(ours))
+        match changed_pages {
+            Some(changed_pages) => import_stable_sqlite_file_state_from_changed_pages(
+                runtime,
+                &temp_path,
+                ours,
+                &changed_pages,
+            ),
+            None => import_stable_sqlite_file_state(runtime, &temp_path, Some(ours)),
+        }
     })();
     match result {
         Ok(state) => Ok((state, temp_path)),
         Err(error) => {
+            let _ = remove_sqlite_sidecars(&temp_path);
             let _ = std::fs::remove_file(&temp_path);
             Err(error)
         }
@@ -1519,6 +1528,13 @@ pub(super) fn row_auto_merge_temp_path(repo: &Repository, key: &str) -> Result<P
 }
 
 pub(super) fn apply_row_merge_sql_to_path(path: &Path, sql: &str) -> Result<(), ErrCtx> {
+    apply_row_merge_sql_to_path_with_changed_pages(path, sql).map(|_| ())
+}
+
+fn apply_row_merge_sql_to_path_with_changed_pages(
+    path: &Path,
+    sql: &str,
+) -> Result<Option<BTreeSet<u32>>, ErrCtx> {
     let conn = rusqlite::Connection::open_with_flags(
         path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -1531,10 +1547,128 @@ pub(super) fn apply_row_merge_sql_to_path(path: &Path, sql: &str) -> Result<(), 
         .map_err(|err| row_auto_merge_sqlite_err(path, "configure merge validation", err))?;
     conn.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, false)
         .map_err(|err| row_auto_merge_sqlite_err(path, "disable triggers", err))?;
+    let wal_enabled = conn
+        .query_row("PRAGMA journal_mode = WAL;", [], |row| {
+            row.get::<_, String>(0)
+        })
+        .map(|mode| mode.eq_ignore_ascii_case("wal"))
+        .unwrap_or(false);
+    if wal_enabled {
+        conn.execute_batch("PRAGMA wal_autocheckpoint = 0;")
+            .map_err(|err| row_auto_merge_sqlite_err(path, "disable WAL autocheckpoint", err))?;
+    }
     conn.execute_batch(sql)
         .map_err(|err| row_auto_merge_sqlite_err(path, "apply row changes", err))?;
     validate_row_merge_sqlite(path, &conn)?;
-    Ok(())
+    let changed_pages = wal_enabled
+        .then(|| read_committed_wal_changed_pages(path))
+        .transpose()?
+        .flatten();
+    if wal_enabled {
+        let (busy, frames, checkpointed) = conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(|err| row_auto_merge_sqlite_err(path, "checkpoint merge WAL", err))?;
+        if busy != 0 || checkpointed != frames {
+            return Err(ErrCtx::InvalidCommand(
+                format!(
+                    "could not checkpoint row-level auto-merge WAL: busy={busy}, frames={frames}, checkpointed={checkpointed}"
+                )
+                .into(),
+            ));
+        }
+        let mode = conn
+            .query_row("PRAGMA journal_mode = DELETE;", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|err| row_auto_merge_sqlite_err(path, "restore delete journal mode", err))?;
+        if !mode.eq_ignore_ascii_case("delete") {
+            return Err(ErrCtx::InvalidCommand(
+                format!("row-level auto-merge could not restore delete journal mode: {mode}")
+                    .into(),
+            ));
+        }
+    }
+    drop(conn);
+    remove_sqlite_sidecars(path)?;
+    Ok(changed_pages)
+}
+
+const SQLITE_WAL_HEADER_BYTES: usize = 32;
+const SQLITE_WAL_FRAME_HEADER_BYTES: usize = 24;
+const SQLITE_WAL_MAGIC_BIG_ENDIAN_CHECKSUM: u32 = 0x377f_0682;
+const SQLITE_WAL_MAGIC_LITTLE_ENDIAN_CHECKSUM: u32 = 0x377f_0683;
+
+/// Returns every page in committed WAL frames, or `None` when the WAL cannot be proven complete.
+///
+/// The hint is consumed only after SQLite successfully checkpoints the same WAL. Header/frame
+/// salts prevent combining frames from different WAL generations; malformed or partial input
+/// falls back to the authoritative full candidate import.
+fn read_committed_wal_changed_pages(path: &Path) -> Result<Option<BTreeSet<u32>>, ErrCtx> {
+    let wal_path = sqlite_sidecar_path(path, "-wal");
+    let bytes = match std::fs::read(&wal_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if bytes.len() < SQLITE_WAL_HEADER_BYTES {
+        return Ok(None);
+    }
+    let magic = u32::from_be_bytes(bytes[0..4].try_into().expect("WAL magic width"));
+    if !matches!(
+        magic,
+        SQLITE_WAL_MAGIC_BIG_ENDIAN_CHECKSUM | SQLITE_WAL_MAGIC_LITTLE_ENDIAN_CHECKSUM
+    ) {
+        return Ok(None);
+    }
+    let page_size = u32::from_be_bytes(bytes[8..12].try_into().expect("WAL page-size width"));
+    if page_size as usize != PAGESIZE.as_usize() {
+        return Ok(None);
+    }
+    let salt = &bytes[16..24];
+    let frame_size = SQLITE_WAL_FRAME_HEADER_BYTES + page_size as usize;
+    let frames_bytes = &bytes[SQLITE_WAL_HEADER_BYTES..];
+    if frames_bytes.is_empty() || !frames_bytes.len().is_multiple_of(frame_size) {
+        return Ok(None);
+    }
+
+    let mut frames = Vec::with_capacity(frames_bytes.len() / frame_size);
+    for frame in frames_bytes.chunks_exact(frame_size) {
+        if &frame[8..16] != salt {
+            return Ok(None);
+        }
+        let page_number = u32::from_be_bytes(frame[0..4].try_into().expect("WAL page width"));
+        let committed_page_count =
+            u32::from_be_bytes(frame[4..8].try_into().expect("WAL commit width"));
+        if page_number == 0 {
+            return Ok(None);
+        }
+        frames.push((page_number, committed_page_count));
+    }
+    let Some(last_commit) = frames.iter().rposition(|(_, page_count)| *page_count != 0) else {
+        return Ok(None);
+    };
+    if last_commit + 1 != frames.len() {
+        return Ok(None);
+    }
+    let mut changed_pages = frames[..=last_commit]
+        .iter()
+        .map(|(page_number, _)| *page_number)
+        .collect::<BTreeSet<_>>();
+    // Changing WAL mode can update the journal bytes in page one outside the transaction frames.
+    changed_pages.insert(1);
+    Ok(Some(changed_pages))
+}
+
+fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut sidecar = path.as_os_str().to_os_string();
+    sidecar.push(suffix);
+    PathBuf::from(sidecar)
 }
 
 pub(super) fn validate_row_merge_sqlite(
@@ -1719,6 +1853,54 @@ mod validation_tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("failed foreign_key_check"));
+    }
+
+    #[test]
+    fn committed_wal_hint_covers_every_physically_changed_page() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("wal-pages.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "PRAGMA page_size = 4096;\
+             PRAGMA journal_mode = DELETE;\
+             CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT NOT NULL);\
+             WITH RECURSIVE ids(id) AS (\
+               VALUES(1) UNION ALL SELECT id + 1 FROM ids WHERE id < 1000\
+             )\
+             INSERT INTO items SELECT id, printf('%01000d', id) FROM ids;",
+        )
+        .unwrap();
+        drop(conn);
+        let before = std::fs::read(&path).unwrap();
+
+        let changed_pages = apply_row_merge_sql_to_path_with_changed_pages(
+            &path,
+            "BEGIN TRANSACTION;\
+             UPDATE items SET value = printf('%01000d', 9999) WHERE id = 500;\
+             COMMIT;",
+        )
+        .unwrap()
+        .expect("ordinary local SQLite files support a committed WAL hint");
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(before.len(), after.len());
+        let physical_changes = before
+            .chunks_exact(PAGESIZE.as_usize())
+            .zip(after.chunks_exact(PAGESIZE.as_usize()))
+            .enumerate()
+            .filter_map(|(index, (before, after))| (before != after).then_some(index as u32 + 1))
+            .collect::<BTreeSet<_>>();
+        assert!(!physical_changes.is_empty());
+        assert!(physical_changes.is_subset(&changed_pages));
+        assert!(changed_pages.len() * 4 < before.len() / PAGESIZE.as_usize());
+        assert!(!sqlite_sidecar_path(&path, "-wal").exists());
+        assert!(!sqlite_sidecar_path(&path, "-shm").exists());
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA integrity_check;", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
     }
 
     #[cfg(target_os = "macos")]
