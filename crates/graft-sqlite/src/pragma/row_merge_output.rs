@@ -1357,7 +1357,11 @@ pub(super) fn materialize_row_auto_merge_state(
     let result = (|| {
         write_repo_file_state_to_path(runtime, ours, &temp_path)?;
         apply_row_merge_sql_to_path(&temp_path, sql)?;
-        import_stable_sqlite_file_state(runtime, &temp_path)
+        // Keep the merged snapshot in the ancestry of ours. A row merge changes
+        // only a handful of SQLite pages; importing with no base turned every
+        // candidate into a new full-size Volume and made the next push upload the
+        // compressed database again.
+        import_stable_sqlite_file_state(runtime, &temp_path, Some(ours))
     })();
     let cleanup = std::fs::remove_file(&temp_path);
     match (result, cleanup) {

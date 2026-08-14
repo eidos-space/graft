@@ -1699,9 +1699,10 @@ fn prepare_physical_sqlite_file_state_with_cache(
 pub(super) fn import_stable_sqlite_file_state(
     runtime: &Runtime,
     path: &Path,
+    base: Option<&CommitFileState>,
 ) -> Result<CommitFileState, ErrCtx> {
     let physical = PhysicalSqliteReader::open_stable(path)?;
-    import_sqlite_reader_state(runtime, path, None, &physical, None, None)
+    import_sqlite_reader_state(runtime, path, base, &physical, None, None)
         .map(|(state, _, _)| state)
 }
 
