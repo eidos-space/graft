@@ -47,9 +47,13 @@ pub(crate) fn prepare_repo_semantic_merge_seed(
     write_repo_file_state_to_path(runtime, &ours, candidate_path)?;
     let sql = plan.theirs_apply_sql_excluding(managed_tables);
     let applied_sql = !sql.trim().is_empty();
-    if applied_sql && let Err(error) = apply_row_merge_sql_to_path(candidate_path, &sql) {
-        let _ = std::fs::remove_file(candidate_path);
-        return Err(error);
+    if applied_sql {
+        let apply = validate_row_merge_base_integrity(candidate_path, &ours)
+            .and_then(|()| apply_row_merge_sql_to_path(candidate_path, &sql));
+        if let Err(error) = apply {
+            let _ = std::fs::remove_file(candidate_path);
+            return Err(error);
+        }
     }
     Ok((applied_sql, plan.conflict_count_inside(managed_tables)))
 }

@@ -1013,6 +1013,16 @@ struct PreparedRowMergeFile {
     path: PathBuf,
 }
 
+const MAX_ROW_MERGE_INTEGRITY_PROOFS: usize = 256;
+
+/// Successful full-database checks for immutable Graft states in this process.
+///
+/// The cache is only a performance proof: clearing it causes another authoritative
+/// `integrity_check`, and entries cannot be supplied by repository-controlled files.
+static ROW_MERGE_INTEGRITY_PROOFS: OnceLock<
+    Mutex<std::collections::HashSet<(VolumeId, RepoSnapshot)>>,
+> = OnceLock::new();
+
 impl Drop for PreparedRowMergeFile {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
@@ -1427,6 +1437,7 @@ fn materialize_row_auto_merge_candidate(
     let temp_path = row_auto_merge_temp_path(repo, key)?;
     let result = (|| {
         write_repo_file_state_to_path(runtime, ours, &temp_path)?;
+        validate_row_merge_base_integrity(&temp_path, ours)?;
         apply_row_merge_sql_to_path(&temp_path, sql)?;
         // Keep the merged snapshot in the ancestry of ours. A row merge changes
         // only a handful of SQLite pages; importing with no base turned every
@@ -1466,8 +1477,11 @@ pub(super) fn apply_row_merge_sql_to_path(path: &Path, sql: &str) -> Result<(), 
         rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|err| row_auto_merge_sqlite_err(path, "open temporary database", err))?;
-    conn.execute_batch("PRAGMA foreign_keys = OFF;")
-        .map_err(|err| row_auto_merge_sqlite_err(path, "disable foreign keys", err))?;
+    // A full integrity proof for this immutable source state was established
+    // before mutation. Let SQLite validate every B-tree cell touched by the
+    // delta while it transactionally maintains indexes and constraints.
+    conn.execute_batch("PRAGMA cell_size_check = ON; PRAGMA foreign_keys = OFF;")
+        .map_err(|err| row_auto_merge_sqlite_err(path, "configure merge validation", err))?;
     conn.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, false)
         .map_err(|err| row_auto_merge_sqlite_err(path, "disable triggers", err))?;
     conn.execute_batch(sql)
@@ -1480,6 +1494,35 @@ pub(super) fn validate_row_merge_sqlite(
     path: &Path,
     conn: &rusqlite::Connection,
 ) -> Result<(), ErrCtx> {
+    validate_row_merge_foreign_keys(path, conn)
+}
+
+pub(super) fn validate_row_merge_base_integrity(
+    path: &Path,
+    state: &CommitFileState,
+) -> Result<(), ErrCtx> {
+    let key = (state.volume.clone(), state.snapshot.clone());
+    let proofs = ROW_MERGE_INTEGRITY_PROOFS.get_or_init(Default::default);
+    if proofs.lock().contains(&key) {
+        return Ok(());
+    }
+
+    let conn = rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|err| row_auto_merge_sqlite_err(path, "open merge base for validation", err))?;
+    validate_row_merge_integrity(path, &conn)?;
+
+    let mut proofs = proofs.lock();
+    if proofs.len() >= MAX_ROW_MERGE_INTEGRITY_PROOFS {
+        proofs.clear();
+    }
+    proofs.insert(key);
+    Ok(())
+}
+
+fn validate_row_merge_integrity(path: &Path, conn: &rusqlite::Connection) -> Result<(), ErrCtx> {
     let mut integrity_stmt = conn
         .prepare("PRAGMA integrity_check;")
         .map_err(|err| row_auto_merge_sqlite_err(path, "prepare integrity_check", err))?;
@@ -1498,6 +1541,10 @@ pub(super) fn validate_row_merge_sqlite(
         ));
     }
 
+    Ok(())
+}
+
+fn validate_row_merge_foreign_keys(path: &Path, conn: &rusqlite::Connection) -> Result<(), ErrCtx> {
     let mut fk_stmt = conn
         .prepare("PRAGMA foreign_key_check;")
         .map_err(|err| row_auto_merge_sqlite_err(path, "prepare foreign_key_check", err))?;
