@@ -2139,18 +2139,21 @@ pub(super) fn checkout_merge_outcome(
                 checkout_repo_head(runtime, file, repo, remote)?;
             }
         }
-        MergeOutcome::Merged { staged, conflicted, .. } if conflicted.is_empty() => {
-            checkout_merged_repo_paths(
-                runtime,
-                file,
-                repo,
-                staged,
-                previous_files,
-                previous_artifacts,
-                remote,
-            )?;
-        }
-        MergeOutcome::Merged { conflicted, .. } => {
+        MergeOutcome::Merged { staged, conflicted, .. } => {
+            // A conflicted merge can still contain paths whose three-way result is already
+            // clean. Materialize those stage-0 entries immediately, just like Git, so finishing
+            // the merge cannot leave their older worktree contents dirty against the merge commit.
+            if !staged.is_empty() {
+                checkout_merged_repo_paths(
+                    runtime,
+                    file,
+                    repo,
+                    staged,
+                    previous_files,
+                    previous_artifacts,
+                    remote,
+                )?;
+            }
             for key in conflicted {
                 // The conflict index establishes the current worktree (ours) as the new
                 // comparison baseline. Drop markers retained by earlier non-materializing
