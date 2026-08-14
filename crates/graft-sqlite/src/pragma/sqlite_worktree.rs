@@ -1958,6 +1958,51 @@ mod tests {
         connection
     }
 
+    fn next_random(seed: &mut u64) -> u64 {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        *seed
+    }
+
+    fn create_randomized_without_rowid_database(path: &Path) -> Connection {
+        let mut connection = Connection::open(path).unwrap();
+        connection
+            .pragma_update(None, "page_size", PAGESIZE.as_u32())
+            .unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE records(
+                    id TEXT PRIMARY KEY COLLATE BINARY,
+                    payload BLOB NOT NULL,
+                    marker INTEGER NOT NULL
+                 ) STRICT, WITHOUT ROWID;",
+            )
+            .unwrap();
+
+        let mut seed = 0x5EED_CAFE_F00D_BAAD_u64;
+        let transaction = connection.transaction().unwrap();
+        for index in 0..768_u32 {
+            let payload_len = if index % 41 == 0 {
+                9_000
+            } else {
+                128 + (next_random(&mut seed) % 1_700) as usize
+            };
+            transaction
+                .execute(
+                    "INSERT INTO records(id, payload, marker) VALUES (?1, ?2, ?3)",
+                    params![
+                        format!("base-{index:04}"),
+                        vec![(next_random(&mut seed) & 0xff) as u8; payload_len],
+                        next_random(&mut seed) as i64,
+                    ],
+                )
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+        connection
+    }
+
     fn prepare_with_forced_page_cache(
         runtime: &Runtime,
         repo: &Repository,
@@ -2060,6 +2105,106 @@ mod tests {
         let latest = runtime.volume_log(&updated.volume).unwrap().remove(0);
         assert!(latest.changed_pages > 0);
         assert!(latest.changed_pages < updated.snapshot.page_count.to_u32() as usize);
+    }
+
+    #[test]
+    fn sparse_page_candidates_match_authoritative_diff_across_randomized_btree_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("randomized-without-rowid.sqlite");
+        let mut connection = create_randomized_without_rowid_database(&path);
+        let runtime = test_runtime();
+        let mut previous = import_physical_sqlite_file_state(&runtime, &path, None).unwrap();
+        let mut seed = 0xA11C_E5E1_5AFE_2026_u64;
+
+        for round in 0..6_u32 {
+            let transaction = connection.transaction().unwrap();
+
+            // Update stable keys with both inline and overflow payloads.
+            for update in 0..48_u32 {
+                let index = 256 + (next_random(&mut seed) % 384) as u32;
+                let payload_len = if update % 7 == 0 {
+                    12_000 + (next_random(&mut seed) % 4_000) as usize
+                } else {
+                    64 + (next_random(&mut seed) % 2_400) as usize
+                };
+                transaction
+                    .execute(
+                        "UPDATE records SET payload = ?1, marker = ?2 WHERE id = ?3",
+                        params![
+                            vec![(next_random(&mut seed) & 0xff) as u8; payload_len],
+                            next_random(&mut seed) as i64,
+                            format!("base-{index:04}"),
+                        ],
+                    )
+                    .unwrap();
+            }
+
+            // Delete a disjoint key range while inserts force repeated page splits.
+            for deletion in 0..20_u32 {
+                let index = round * 20 + deletion;
+                transaction
+                    .execute(
+                        "DELETE FROM records WHERE id = ?1",
+                        [format!("base-{index:04}")],
+                    )
+                    .unwrap();
+            }
+            for insertion in 0..96_u32 {
+                let payload_len = if insertion % 11 == 0 {
+                    10_000
+                } else {
+                    96 + (next_random(&mut seed) % 2_000) as usize
+                };
+                transaction
+                    .execute(
+                        "INSERT INTO records(id, payload, marker) VALUES (?1, ?2, ?3)",
+                        params![
+                            format!("round-{round:02}-{insertion:04}"),
+                            vec![(next_random(&mut seed) & 0xff) as u8; payload_len],
+                            next_random(&mut seed) as i64,
+                        ],
+                    )
+                    .unwrap();
+            }
+            transaction.commit().unwrap();
+
+            let current =
+                import_physical_sqlite_file_state(&runtime, &path, Some(&previous)).unwrap();
+            let from = previous.snapshot.to_snapshot();
+            let to = current.snapshot.to_snapshot();
+            let candidates = runtime
+                .snapshot_changed_page_candidates(&from, &to)
+                .unwrap();
+            assert!(
+                !candidates.is_empty(),
+                "round {round} produced no candidates"
+            );
+
+            let authoritative =
+                crate::row_level_diff::row_level_diff_snapshots(&runtime, &from, &to).unwrap();
+            let sparse = crate::row_level_diff::row_level_diff_snapshots_with_page_candidates(
+                &runtime,
+                &from,
+                &to,
+                &candidates,
+            )
+            .unwrap();
+
+            assert_eq!(sparse.analysis, authoritative.analysis, "round {round}");
+            assert_eq!(
+                sparse.schema_changes, authoritative.schema_changes,
+                "round {round}"
+            );
+            assert_eq!(
+                sparse.table_changes, authoritative.table_changes,
+                "round {round}"
+            );
+            assert_eq!(
+                sparse.opaque_changes, authoritative.opaque_changes,
+                "round {round}"
+            );
+            previous = current;
+        }
     }
 
     #[test]
