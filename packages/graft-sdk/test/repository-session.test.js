@@ -673,6 +673,7 @@ test("metadata and remotes avoid worktree classification and credentials", async
     const metadata = await session.repositoryMetadata()
     assert.equal(metadata.current_head, committed.commit.id)
     assert.equal(metadata.current_branch, "main")
+    assert.equal(metadata.upstream_target, null)
     assert.equal(metadata.telemetry.paths_examined, 0)
     const remotes = await session.listRemotes()
     assert.equal(remotes.telemetry.paths_examined, 0)

@@ -651,6 +651,8 @@ export interface RepositoryMetadataResult {
   current_head: string | null
   current_branch: string | null
   upstream: { remote: string; branch: string } | null
+  /** Last locally known target of the configured upstream; reading it never fetches. */
+  upstream_target: string | null
   repository_format_version: number
   object_format: string
   telemetry: RepositoryMetadataTelemetry

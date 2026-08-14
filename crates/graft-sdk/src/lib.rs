@@ -304,6 +304,7 @@ pub struct RepositoryMetadataResult {
     pub current_head: Option<String>,
     pub current_branch: Option<String>,
     pub upstream: Option<graft::repo::BranchUpstream>,
+    pub upstream_target: Option<String>,
     pub repository_format_version: u32,
     pub object_format: String,
     pub telemetry: RepositoryMetadataTelemetry,
@@ -1202,12 +1203,19 @@ impl RepositorySession {
                 .transpose()
                 .map_err(repo_error)?
                 .flatten();
+            let upstream_target = upstream
+                .as_ref()
+                .map(|upstream| repo.remote_tracking_ref(&upstream.remote, &upstream.branch))
+                .transpose()
+                .map_err(repo_error)?
+                .flatten();
             let config = repo.config().map_err(repo_error)?;
             graft::repo::cancellation_checkpoint().map_err(repo_error)?;
             Ok(RepositoryMetadataResult {
                 current_head,
                 current_branch,
                 upstream,
+                upstream_target,
                 repository_format_version: config.core.repository_format_version,
                 object_format: config.extensions.object_format,
                 telemetry: RepositoryMetadataTelemetry {
@@ -7134,6 +7142,14 @@ mod tests {
             .unwrap();
         let initial = session.status_incremental().unwrap();
         assert_eq!(initial.status.ahead, 0);
+        assert_eq!(
+            session
+                .repository_metadata()
+                .unwrap()
+                .upstream_target
+                .as_deref(),
+            Some(first.as_str())
+        );
 
         fs::write(&note, "two\n").unwrap();
         session.add_all().unwrap();
@@ -7153,6 +7169,14 @@ mod tests {
         assert_eq!(hot_synced.status.ahead, 0);
         assert_eq!(hot_synced.status.behind, 0);
         assert!(hot_synced.generation > ahead.generation);
+        assert_eq!(
+            session
+                .repository_metadata()
+                .unwrap()
+                .upstream_target
+                .as_deref(),
+            Some(second.as_str())
+        );
 
         session.close().unwrap();
         writer

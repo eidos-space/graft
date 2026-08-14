@@ -13,7 +13,10 @@ use std::{
 };
 
 use crate::core::{LogId, SegmentId, cbe::CBE64, commit::Commit, lsn::LSN};
-use crate::repo::{TransferDirection, TransferProgressHandle, begin_transfer_progress};
+use crate::repo::{
+    TransferDirection, TransferProgressHandle, begin_transfer_progress,
+    declare_transfer_progress_total,
+};
 use bilrost::{Message, OwnedMessage};
 use bytes::Bytes;
 use futures::{
@@ -1051,7 +1054,12 @@ impl Remote {
                 Ok(HttpReceivePackResult::Published) => return Ok(()),
                 Ok(
                     HttpReceivePackResult::Unsupported | HttpReceivePackResult::RetryIndividually,
-                ) => {}
+                ) => {
+                    declare_transfer_progress_total(
+                        TransferDirection::Upload,
+                        planned_bundle_upload_bytes(&[], Some(pack), ref_path)?,
+                    );
+                }
                 Err(err) => {
                     return self
                         .reconcile_publication_error(err, ref_path, expected, &replacement)
@@ -1098,13 +1106,23 @@ impl Remote {
                 Ok(HttpReceivePackResult::Published) => return Ok(()),
                 Ok(
                     HttpReceivePackResult::Unsupported | HttpReceivePackResult::RetryIndividually,
-                ) => {}
+                ) => {
+                    declare_transfer_progress_total(
+                        TransferDirection::Upload,
+                        planned_bundle_upload_bytes(&objects, Some(pack), ref_path)?,
+                    );
+                }
                 Err(err) => {
                     return self
                         .reconcile_publication_error(err, ref_path, expected, &replacement)
                         .await;
                 }
             }
+        } else if matches!(&self.backend, RemoteBackend::Http(_)) {
+            declare_transfer_progress_total(
+                TransferDirection::Upload,
+                planned_bundle_upload_bytes(&objects, None, ref_path)?,
+            );
         }
 
         self.put_bundle_objects(&objects).await?;
@@ -2371,6 +2389,31 @@ fn tracked_upload_body(chunks: Vec<Bytes>, total_bytes: u64) -> reqwest::Body {
     })))
 }
 
+fn planned_bundle_upload_bytes(
+    objects: &[RemoteBundleObject],
+    pack: Option<&RemoteObjectPack>,
+    path: &str,
+) -> Result<u64> {
+    let mut total = 0_u64;
+    for bytes in objects.iter().map(|object| object.content_length).chain(
+        pack.into_iter()
+            .flat_map(|pack| [pack.pack.len(), pack.index.len()]),
+    ) {
+        total = total
+            .checked_add(u64::try_from(bytes).map_err(|_| RemoteErr::HttpStatus {
+                status: 413,
+                path: path.to_string(),
+                message: "planned upload length exceeds u64".to_string(),
+            })?)
+            .ok_or_else(|| RemoteErr::HttpStatus {
+                status: 413,
+                path: path.to_string(),
+                message: "planned upload length exceeds u64".to_string(),
+            })?;
+    }
+    Ok(total)
+}
+
 async fn tracked_response_bytes(
     response: reqwest::Response,
     operation: &'static str,
@@ -3133,6 +3176,12 @@ mod tests {
         ])
         .await;
         let remote = RemoteConfig::Http { url, token_env: None }.build().unwrap();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = events.clone();
+        let reporter = crate::repo::TransferProgressReporter::new(move |progress| {
+            captured.lock().unwrap().push(progress);
+        });
+        let _scope = crate::repo::TransferProgressScope::enter(&reporter);
         let pack_id = "b".repeat(64);
         remote
             .publish_object_pack_and_ref(
@@ -3163,6 +3212,14 @@ mod tests {
         assert!(request_lines[1].starts_with("PUT /org/repo/raw-if-not-exists/objects/pack/"));
         assert!(request_lines[2].starts_with("PUT /org/repo/raw-if-not-exists/objects/pack/"));
         assert!(request_lines[3].starts_with("POST /org/repo/cas/refs/heads/main "));
+        let events = events.lock().unwrap();
+        assert!(
+            events
+                .windows(2)
+                .all(|pair| { pair[0].total_bytes.unwrap() <= pair[1].total_bytes.unwrap() })
+        );
+        assert_eq!(events.last().unwrap().transferred_bytes, 14);
+        assert_eq!(events.last().unwrap().total_bytes, Some(14));
     }
 
     #[tokio::test]
@@ -3288,6 +3345,57 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&requests[4]).starts_with("GET /org/repo/raw/refs/heads/main ")
         );
+    }
+
+    #[tokio::test]
+    async fn sequential_bundle_uploads_report_one_stable_total() {
+        let (url, requests) =
+            serve_http_exchanges(&["204 No Content", "204 No Content", "204 No Content"]).await;
+        let remote = RemoteConfig::Http { url, token_env: None }.build().unwrap();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = events.clone();
+        let reporter = crate::repo::TransferProgressReporter::new(move |progress| {
+            captured.lock().unwrap().push(progress);
+        });
+        let _scope = crate::repo::TransferProgressScope::enter(&reporter);
+
+        remote
+            .publish_object_bundle_and_ref(
+                vec![
+                    RemoteBundleObject::new(
+                        "segments/example".to_string(),
+                        [Bytes::from_static(b"segment")],
+                        true,
+                    )
+                    .unwrap(),
+                    RemoteBundleObject::new(
+                        "logs/example/commits/0000000000000001".to_string(),
+                        [Bytes::from_static(b"commit")],
+                        false,
+                    )
+                    .unwrap(),
+                ],
+                None,
+                "refs/heads/main",
+                None,
+                "new\n",
+            )
+            .await
+            .unwrap();
+
+        let events = events.lock().unwrap();
+        assert!(!events.is_empty());
+        assert!(events.iter().all(|event| {
+            event.direction == TransferDirection::Upload && event.total_bytes == Some(13)
+        }));
+        assert_eq!(events.first().unwrap().transferred_bytes, 0);
+        assert_eq!(events.last().unwrap().transferred_bytes, 13);
+        assert!(
+            events
+                .iter()
+                .any(|event| { event.transferred_bytes == 7 && event.total_bytes == Some(13) })
+        );
+        assert_eq!(requests.await.unwrap().len(), 3);
     }
 
     #[tokio::test]
@@ -3628,6 +3736,12 @@ mod tests {
         let (url, requests) =
             serve_http_exchanges(&["404 Not Found", "204 No Content", "204 No Content"]).await;
         let remote = RemoteConfig::Http { url, token_env: None }.build().unwrap();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = events.clone();
+        let reporter = crate::repo::TransferProgressReporter::new(move |progress| {
+            captured.lock().unwrap().push(progress);
+        });
+        let _scope = crate::repo::TransferProgressScope::enter(&reporter);
         remote
             .publish_object_bundle_and_ref(
                 vec![
@@ -3665,6 +3779,14 @@ mod tests {
         assert!(request_lines[0].starts_with("POST /org/repo/receive-bundle/"));
         assert!(request_lines[1].starts_with("PUT /org/repo/raw-if-not-exists/segments/example"));
         assert!(request_lines[2].starts_with("POST /org/repo/receive-pack/"));
+        let events = events.lock().unwrap();
+        assert!(
+            events
+                .windows(2)
+                .all(|pair| { pair[0].total_bytes.unwrap() <= pair[1].total_bytes.unwrap() })
+        );
+        let last = events.last().unwrap();
+        assert_eq!(last.transferred_bytes, last.total_bytes.unwrap());
     }
 
     #[tokio::test]

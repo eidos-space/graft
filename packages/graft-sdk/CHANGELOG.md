@@ -5,6 +5,22 @@ SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
 
 ## Unreleased
 
+### Added
+
+- `repositoryMetadata()` now reports the last locally known upstream target so history UIs can
+  decorate a diverged Remote tip without fetching or scanning the worktree.
+
+### Fixed
+
+- Multi-request pushes now declare their complete known upload payload before transfer starts.
+  Progress no longer reports each completed request as a misleading new `100%` total; fallback
+  retries add their remaining payload as one planned unit.
+
+### Compatibility
+
+- `upstream_target` is additive and nullable. Repository, snapshot, merge, and Remote formats are
+  unchanged.
+
 ## Graft SDK 0.3.14 — 2026-08-13
 
 ### Changed

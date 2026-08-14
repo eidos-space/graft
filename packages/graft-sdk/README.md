@@ -267,10 +267,14 @@ rewrite the recorded kind of an existing checkpoint.
 History and remote UI code should not call status merely to obtain repository metadata:
 
 ```js
-const { current_head, current_branch, upstream } =
+const { current_head, current_branch, upstream, upstream_target } =
   await session.repositoryMetadata({ signal })
 const { remotes } = await session.listRemotes({ signal })
 ```
+
+`upstream_target` is the last locally known remote-tracking commit for the
+configured upstream. It lets history UIs decorate the Remote/Cloud tip even
+after histories diverge, without fetching.
 
 Both calls read only refs/config metadata, never classify or materialize worktree paths, and report
 `telemetry.paths_examined: 0`. Remote entries contain `name`, typed `kind`, and a configured `url`;

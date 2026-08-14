@@ -115,6 +115,7 @@ struct TransferProgressDirectionCounters {
     transferred_bytes: u64,
     total_bytes: u64,
     indeterminate: bool,
+    declared_remaining_bytes: u64,
     last_emit: Option<Instant>,
 }
 
@@ -144,10 +145,27 @@ impl TransferProgressReporter {
             let counters = direction_counters(&mut counters, direction);
             match total_bytes {
                 Some(total_bytes) => {
-                    counters.total_bytes = counters.total_bytes.saturating_add(total_bytes);
+                    let declared = counters.declared_remaining_bytes.min(total_bytes);
+                    counters.declared_remaining_bytes -= declared;
+                    counters.total_bytes =
+                        counters.total_bytes.saturating_add(total_bytes - declared);
                 }
                 None => counters.indeterminate = true,
             }
+            counters.last_emit = Some(Instant::now());
+            transfer_progress(direction, counters)
+        };
+        (self.inner.callback)(progress);
+    }
+
+    fn declare_aggregate_total(&self, direction: TransferDirection, total_bytes: u64) {
+        let progress = {
+            let mut counters = self.inner.counters.lock().unwrap();
+            let counters = direction_counters(&mut counters, direction);
+            counters.total_bytes = counters.total_bytes.saturating_add(total_bytes);
+            counters.declared_remaining_bytes = counters
+                .declared_remaining_bytes
+                .saturating_add(total_bytes);
             counters.last_emit = Some(Instant::now());
             transfer_progress(direction, counters)
         };
@@ -232,6 +250,14 @@ pub(crate) fn begin_transfer_progress(
             transferred_bytes: 0,
         })
     })
+}
+
+pub(crate) fn declare_transfer_progress_total(direction: TransferDirection, total_bytes: u64) {
+    ACTIVE_TRANSFER_PROGRESS.with(|active| {
+        if let Some(reporter) = active.borrow().as_ref() {
+            reporter.declare_aggregate_total(direction, total_bytes);
+        }
+    });
 }
 
 pub struct TransferProgressScope(Option<TransferProgressReporter>);
