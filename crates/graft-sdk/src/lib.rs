@@ -304,6 +304,7 @@ pub struct RepositoryMetadataResult {
     pub current_head: Option<String>,
     pub current_branch: Option<String>,
     pub upstream: Option<graft::repo::BranchUpstream>,
+    pub upstream_target: Option<String>,
     pub repository_format_version: u32,
     pub object_format: String,
     pub telemetry: RepositoryMetadataTelemetry,
@@ -1202,12 +1203,19 @@ impl RepositorySession {
                 .transpose()
                 .map_err(repo_error)?
                 .flatten();
+            let upstream_target = upstream
+                .as_ref()
+                .map(|upstream| repo.remote_tracking_ref(&upstream.remote, &upstream.branch))
+                .transpose()
+                .map_err(repo_error)?
+                .flatten();
             let config = repo.config().map_err(repo_error)?;
             graft::repo::cancellation_checkpoint().map_err(repo_error)?;
             Ok(RepositoryMetadataResult {
                 current_head,
                 current_branch,
                 upstream,
+                upstream_target,
                 repository_format_version: config.core.repository_format_version,
                 object_format: config.extensions.object_format,
                 telemetry: RepositoryMetadataTelemetry {
@@ -2859,21 +2867,37 @@ impl RepositorySession {
         self.with_state(|state| {
             let SessionState { service, status_cache } = state;
             let service = service.as_mut().ok_or_else(session_closed_error)?;
-            require_merge_state_token(service, status_cache, &options.expected_state_token)?;
+            let validated =
+                require_merge_state_token(service, status_cache, &options.expected_state_token)?;
             let semantic_workspaces = service
                 .repository()
                 .map_err(repository_command_error)?
                 .graft_dir()
                 .join(SEMANTIC_MERGE_WORKSPACE_DIRECTORY);
-            let output = execute_json_command(
-                service,
-                RepositoryCommand::merge_continue(options.message.clone()),
-                "merge_continue",
-            )?;
-            status_cache.invalidate();
-            let incremental = refresh_incremental_status(service, status_cache)?;
-            let merge = merge_status_from_incremental(service, &incremental)?;
+            let command = if validated.status.has_unstaged_changes {
+                RepositoryCommand::merge_continue(options.message.clone())
+            } else {
+                RepositoryCommand::merge_continue_validated(options.message.clone())
+            };
+            let output = execute_json_command(service, command, "merge_continue")?;
+            let merge = MergeStatus::None;
             let worktree_paths = merge_worktree_paths_from_output(&output);
+            let can_seed_clean_cache = !validated.status.has_unstaged_changes
+                && validated.status.path_diagnostics.is_empty()
+                && worktree_paths.is_empty();
+            if !can_seed_clean_cache
+                || seed_validated_merge_completion_status_cache(
+                    service,
+                    status_cache,
+                    validated.status,
+                )
+                .is_err()
+            {
+                // Completion is already durable. A cache-seeding failure must never turn that
+                // success into an apparent command failure; invalidate and let the next status
+                // request reconstruct authoritative state.
+                status_cache.invalidate();
+            }
             let _ = fs::remove_dir_all(semantic_workspaces);
             Ok(MergeOperationResult { output, merge, worktree_paths })
         })
@@ -3065,6 +3089,43 @@ fn refresh_incremental_status(
         }
     }
     unreachable!("bounded status stability loop always returns")
+}
+
+/// Carries an exact pre-continue worktree proof across a non-materializing merge commit.
+///
+/// The command changes repository refs and index metadata but not physical files. Retaining the
+/// old fingerprints is equivalent to Git updating its index after commit: the next status call
+/// still stats every tracked path, and any external write forces the ordinary authoritative scan.
+fn seed_validated_merge_completion_status_cache(
+    service: &mut RepositoryCommandService,
+    cache: &mut IncrementalStatusCache,
+    mut status: RepoStatus,
+) -> Result<()> {
+    let repo = service.repository().map_err(repository_command_error)?;
+    status.merge_head = None;
+    status.orig_head = None;
+    status.unstaged.clear();
+    status.unstaged_changes.clear();
+    status.staged.clear();
+    status.staged_changes.clear();
+    status.conflicted.clear();
+    status.conflicted_changes.clear();
+    status.path_diagnostics.clear();
+    status.refresh_summary_flags();
+    repo.refresh_status_repository_projection(&mut status)
+        .map_err(repo_error)?;
+
+    cache.head_target = repo.head_target().map_err(repo_error)?;
+    cache.index = repo.read_index().map_err(repo_error)?;
+    cache.files = repo.index_files().map_err(repo_error)?;
+    cache.artifacts = repo.index_artifacts().map_err(repo_error)?;
+    cache.index_metadata_initialized = true;
+    cache.initialized = true;
+    cache.generation = cache.generation.saturating_add(1).max(1);
+    cache.status = Some(status);
+    cache.persistent_snapshot_attempted = true;
+    let _ = persist_status_snapshot(&repo, cache);
+    Ok(())
 }
 
 fn refresh_incremental_status_once(
@@ -6033,7 +6094,24 @@ mod tests {
             })
             .unwrap();
         assert_eq!(completed.merge, MergeStatus::None);
+        assert!(
+            completed.worktree_paths.is_empty(),
+            "a token-validated merge candidate must not be rewritten after it is committed"
+        );
+        let completed_status = session.status_incremental().unwrap();
+        assert!(completed_status.telemetry.status_cache_hit);
+        assert!(!completed_status.status.dirty);
+        assert!(completed_status.status.merge_head.is_none());
+        assert_eq!(session.get_merge_status().unwrap(), MergeStatus::None);
         assert!(!directory.path().join(".graft/semantic-merge").exists());
+
+        Connection::open(&database_path)
+            .unwrap()
+            .execute("UPDATE docs SET value = 'external' WHERE id = 1", [])
+            .unwrap();
+        let externally_changed = session.status_incremental().unwrap();
+        assert!(!externally_changed.telemetry.status_cache_hit);
+        assert!(externally_changed.status.dirty);
         session.close().unwrap();
     }
 
@@ -7134,6 +7212,14 @@ mod tests {
             .unwrap();
         let initial = session.status_incremental().unwrap();
         assert_eq!(initial.status.ahead, 0);
+        assert_eq!(
+            session
+                .repository_metadata()
+                .unwrap()
+                .upstream_target
+                .as_deref(),
+            Some(first.as_str())
+        );
 
         fs::write(&note, "two\n").unwrap();
         session.add_all().unwrap();
@@ -7153,6 +7239,14 @@ mod tests {
         assert_eq!(hot_synced.status.ahead, 0);
         assert_eq!(hot_synced.status.behind, 0);
         assert!(hot_synced.generation > ahead.generation);
+        assert_eq!(
+            session
+                .repository_metadata()
+                .unwrap()
+                .upstream_target
+                .as_deref(),
+            Some(second.as_str())
+        );
 
         session.close().unwrap();
         writer

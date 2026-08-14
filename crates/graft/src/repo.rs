@@ -115,6 +115,7 @@ struct TransferProgressDirectionCounters {
     transferred_bytes: u64,
     total_bytes: u64,
     indeterminate: bool,
+    declared_remaining_bytes: u64,
     last_emit: Option<Instant>,
 }
 
@@ -144,34 +145,81 @@ impl TransferProgressReporter {
             let counters = direction_counters(&mut counters, direction);
             match total_bytes {
                 Some(total_bytes) => {
-                    counters.total_bytes = counters.total_bytes.saturating_add(total_bytes);
+                    let declared = counters.declared_remaining_bytes.min(total_bytes);
+                    counters.declared_remaining_bytes -= declared;
+                    counters.total_bytes =
+                        counters.total_bytes.saturating_add(total_bytes - declared);
                 }
                 None => counters.indeterminate = true,
             }
-            counters.last_emit = Some(Instant::now());
-            transfer_progress(direction, counters)
+            due_transfer_progress(direction, counters)
         };
-        (self.inner.callback)(progress);
+        if let Some(progress) = progress {
+            (self.inner.callback)(progress);
+        }
     }
 
-    fn advance(&self, direction: TransferDirection, bytes: u64, force: bool) {
+    fn declare_aggregate_total(&self, direction: TransferDirection, total_bytes: u64) {
+        let progress = {
+            let mut counters = self.inner.counters.lock().unwrap();
+            let counters = direction_counters(&mut counters, direction);
+            counters.total_bytes = counters.total_bytes.saturating_add(total_bytes);
+            counters.declared_remaining_bytes = counters
+                .declared_remaining_bytes
+                .saturating_add(total_bytes);
+            due_transfer_progress(direction, counters)
+        };
+        if let Some(progress) = progress {
+            (self.inner.callback)(progress);
+        }
+    }
+
+    fn advance(&self, direction: TransferDirection, bytes: u64) {
         let progress = {
             let mut counters = self.inner.counters.lock().unwrap();
             let counters = direction_counters(&mut counters, direction);
             counters.transferred_bytes = counters.transferred_bytes.saturating_add(bytes);
-            let now = Instant::now();
-            if !force
-                && counters.last_emit.is_some_and(|last_emit| {
-                    now.duration_since(last_emit) < TRANSFER_PROGRESS_EMIT_INTERVAL
-                })
-            {
-                return;
-            }
-            counters.last_emit = Some(now);
-            transfer_progress(direction, counters)
+            due_transfer_progress(direction, counters)
         };
-        (self.inner.callback)(progress);
+        if let Some(progress) = progress {
+            (self.inner.callback)(progress);
+        }
     }
+
+    fn finish(&self) {
+        let progress =
+            {
+                let counters = self.inner.counters.lock().unwrap();
+                [
+                    counters
+                        .upload
+                        .last_emit
+                        .is_some()
+                        .then(|| transfer_progress(TransferDirection::Upload, &counters.upload)),
+                    counters.download.last_emit.is_some().then(|| {
+                        transfer_progress(TransferDirection::Download, &counters.download)
+                    }),
+                ]
+            };
+        for progress in progress.into_iter().flatten() {
+            (self.inner.callback)(progress);
+        }
+    }
+}
+
+fn due_transfer_progress(
+    direction: TransferDirection,
+    counters: &mut TransferProgressDirectionCounters,
+) -> Option<TransferProgress> {
+    let now = Instant::now();
+    if counters
+        .last_emit
+        .is_some_and(|last_emit| now.duration_since(last_emit) < TRANSFER_PROGRESS_EMIT_INTERVAL)
+    {
+        return None;
+    }
+    counters.last_emit = Some(now);
+    Some(transfer_progress(direction, counters))
 }
 
 fn direction_counters(
@@ -198,23 +246,15 @@ fn transfer_progress(
 pub(crate) struct TransferProgressHandle {
     reporter: TransferProgressReporter,
     direction: TransferDirection,
-    expected_bytes: Option<u64>,
-    transferred_bytes: u64,
 }
 
 impl TransferProgressHandle {
     pub(crate) fn advance(&mut self, bytes: u64) {
-        self.transferred_bytes = self.transferred_bytes.saturating_add(bytes);
-        self.reporter.advance(
-            self.direction,
-            bytes,
-            self.expected_bytes
-                .is_some_and(|expected| self.transferred_bytes >= expected),
-        );
+        self.reporter.advance(self.direction, bytes);
     }
 
     pub(crate) fn finish(&mut self) {
-        self.reporter.advance(self.direction, 0, true);
+        self.reporter.advance(self.direction, 0);
     }
 }
 
@@ -225,13 +265,16 @@ pub(crate) fn begin_transfer_progress(
     ACTIVE_TRANSFER_PROGRESS.with(|active| {
         let reporter = active.borrow().clone()?;
         reporter.begin(direction, total_bytes);
-        Some(TransferProgressHandle {
-            reporter,
-            direction,
-            expected_bytes: total_bytes,
-            transferred_bytes: 0,
-        })
+        Some(TransferProgressHandle { reporter, direction })
     })
+}
+
+pub(crate) fn declare_transfer_progress_total(direction: TransferDirection, total_bytes: u64) {
+    ACTIVE_TRANSFER_PROGRESS.with(|active| {
+        if let Some(reporter) = active.borrow().as_ref() {
+            reporter.declare_aggregate_total(direction, total_bytes);
+        }
+    });
 }
 
 pub struct TransferProgressScope(Option<TransferProgressReporter>);
@@ -245,7 +288,10 @@ impl TransferProgressScope {
 impl Drop for TransferProgressScope {
     fn drop(&mut self) {
         ACTIVE_TRANSFER_PROGRESS.with(|active| {
-            active.replace(self.0.take());
+            let current = active.replace(self.0.take());
+            if let Some(reporter) = current {
+                reporter.finish();
+            }
         });
     }
 }

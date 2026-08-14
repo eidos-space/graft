@@ -1008,6 +1008,27 @@ pub(super) struct RowAutoMergeResult {
     pub(super) requires_validation: bool,
 }
 
+#[derive(Debug)]
+struct PreparedRowMergeFile {
+    path: PathBuf,
+}
+
+const MAX_ROW_MERGE_INTEGRITY_PROOFS: usize = 256;
+
+/// Successful full-database checks for immutable Graft states in this process.
+///
+/// The cache is only a performance proof: clearing it causes another authoritative
+/// `integrity_check`, and entries cannot be supplied by repository-controlled files.
+static ROW_MERGE_INTEGRITY_PROOFS: OnceLock<
+    Mutex<std::collections::HashSet<(VolumeId, RepoSnapshot)>>,
+> = OnceLock::new();
+
+impl Drop for PreparedRowMergeFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 pub(super) fn try_row_auto_merge_current_file_conflict(
     runtime: &Runtime,
     file: &mut RepositorySessionContext,
@@ -1075,7 +1096,14 @@ pub(super) fn try_row_auto_merge_paths(
     remote: Option<Arc<Remote>>,
     physical_replacement_prepared: bool,
 ) -> Result<Vec<RowAutoMergeResult>, ErrCtx> {
-    type PreparedCandidate = (CommitFileState, usize, usize, usize, bool);
+    type PreparedCandidate = (
+        CommitFileState,
+        Option<PreparedRowMergeFile>,
+        usize,
+        usize,
+        usize,
+        bool,
+    );
 
     let mut candidates = Vec::new();
     let mut analyzed = BTreeSet::new();
@@ -1098,21 +1126,35 @@ pub(super) fn try_row_auto_merge_paths(
                 return Ok(None);
             }
             let applied_changes = plan.apply_change_count();
-            let merged = if plan.can_resolve_to_ours_without_apply() {
-                ours
+            let tables = plan
+                .theirs_apply_table_summaries()
+                .into_iter()
+                .filter_map(|(name, inserts, deletes, updates)| {
+                    table_summary(name, inserts, deletes, updates)
+                })
+                .collect::<Vec<_>>();
+            let summary_from = ours.clone();
+            let (merged, materialized) = if plan.can_resolve_to_ours_without_apply() {
+                (ours, None)
             } else if applied_changes > 0 {
-                materialize_row_auto_merge_state(
+                let (merged, path) = materialize_row_auto_merge_candidate(
                     runtime,
                     repo,
                     key,
                     &ours,
                     &plan.theirs_apply_sql(),
-                )?
+                    physical_replacement_prepared
+                        .then(|| repo.worktree().join(key))
+                        .as_deref(),
+                )?;
+                (merged, Some(PreparedRowMergeFile { path }))
             } else {
                 return Ok(None);
             };
+            file.cache_row_merge_table_summaries(key.clone(), summary_from, merged.clone(), tables);
             Ok(Some((
                 merged,
+                materialized,
                 applied_changes,
                 plan.analysis.ours_changes,
                 plan.analysis.theirs_changes,
@@ -1122,6 +1164,7 @@ pub(super) fn try_row_auto_merge_paths(
         match prepared {
             Ok(Some((
                 merged,
+                materialized,
                 applied_changes,
                 ours_changes,
                 theirs_changes,
@@ -1131,6 +1174,7 @@ pub(super) fn try_row_auto_merge_paths(
                 candidates.push((
                     key.clone(),
                     merged,
+                    materialized,
                     applied_changes,
                     ours_changes,
                     theirs_changes,
@@ -1163,17 +1207,37 @@ pub(super) fn try_row_auto_merge_paths(
     }
 
     let mut resolved = Vec::new();
-    for (key, merged, applied_changes, ours_changes, theirs_changes, requires_validation) in
-        candidates
+    for (
+        key,
+        merged,
+        materialized,
+        applied_changes,
+        ours_changes,
+        theirs_changes,
+        requires_validation,
+    ) in candidates
     {
-        checkout_selected_repository_database(
-            runtime,
-            file,
-            repo,
-            &key,
-            &merged,
-            physical_replacement_prepared,
-        )?;
+        if let Some(materialized) = materialized
+            && repo.file_key(&file.tag)? != key
+        {
+            install_materialized_repo_file_state(
+                runtime,
+                repo,
+                &key,
+                &merged,
+                &materialized.path,
+                physical_replacement_prepared,
+            )?;
+        } else {
+            checkout_selected_repository_database(
+                runtime,
+                file,
+                repo,
+                &key,
+                &merged,
+                physical_replacement_prepared,
+            )?;
+        }
         if !requires_validation {
             repo.resolve_file_conflict(repo.worktree().join(&key), Some(merged))?;
         }
@@ -1257,15 +1321,25 @@ pub(super) fn try_row_merge_current_file_status_conflict(
         return Ok(None);
     }
     let sql = plan.theirs_apply_sql();
-    let merged = materialize_row_auto_merge_state(runtime, repo, &key, &ours, &sql)?;
-    checkout_selected_repository_database(
-        runtime,
-        file,
-        repo,
-        &key,
-        &merged,
-        physical_replacement_prepared,
-    )?;
+    let (merged, materialized) =
+        materialize_row_auto_merge_candidate(runtime, repo, &key, &ours, &sql, None)?;
+    let checkout = if repo.file_key(&file.tag)? == key {
+        checkout_repo_file_state(runtime, file, &merged, None)
+    } else {
+        install_materialized_repo_file_state(
+            runtime,
+            repo,
+            &key,
+            &merged,
+            &materialized,
+            physical_replacement_prepared,
+        )
+    };
+    let cleanup = std::fs::remove_file(&materialized);
+    match (checkout, cleanup) {
+        (Err(error), _) => return Err(error),
+        (Ok(()), Ok(()) | Err(_)) => {}
+    }
     if plan.analysis.has_conflicts() {
         return Ok(None);
     }
@@ -1344,17 +1418,96 @@ pub(super) fn materialize_row_auto_merge_state(
     if sql.trim().is_empty() {
         return Ok(ours.clone());
     }
+    let (state, path) = materialize_row_auto_merge_candidate(runtime, repo, key, ours, sql, None)?;
+    let cleanup = std::fs::remove_file(path);
+    match cleanup {
+        Ok(()) | Err(_) => Ok(state),
+    }
+}
+
+fn materialize_row_auto_merge_candidate(
+    runtime: &Runtime,
+    repo: &Repository,
+    key: &str,
+    ours: &CommitFileState,
+    sql: &str,
+    worktree_seed: Option<&Path>,
+) -> Result<(CommitFileState, PathBuf), ErrCtx> {
+    if sql.trim().is_empty() {
+        return Err(ErrCtx::InvalidCommand(
+            "cannot materialize an empty row merge candidate".into(),
+        ));
+    }
     let temp_path = row_auto_merge_temp_path(repo, key)?;
     let result = (|| {
-        write_repo_file_state_to_path(runtime, ours, &temp_path)?;
-        apply_row_merge_sql_to_path(&temp_path, sql)?;
-        import_stable_sqlite_file_state(runtime, &temp_path)
+        let cloned = if row_merge_integrity_proven(ours) {
+            worktree_seed
+                .map(|seed| try_clone_sqlite_merge_seed(seed, &temp_path))
+                .transpose()?
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        if !cloned {
+            write_repo_file_state_to_path(runtime, ours, &temp_path)?;
+        }
+        validate_row_merge_base_integrity(&temp_path, ours)?;
+        let changed_pages = apply_row_merge_sql_to_path_with_changed_pages(&temp_path, sql)?;
+        // Keep the merged snapshot in the ancestry of ours. A row merge changes
+        // only a handful of SQLite pages; importing with no base turned every
+        // candidate into a new full-size Volume and made the next push upload the
+        // compressed database again.
+        match changed_pages {
+            Some(changed_pages) => import_stable_sqlite_file_state_from_changed_pages(
+                runtime,
+                &temp_path,
+                ours,
+                &changed_pages,
+            ),
+            None => import_stable_sqlite_file_state(runtime, &temp_path, Some(ours)),
+        }
     })();
-    let cleanup = std::fs::remove_file(&temp_path);
-    match (result, cleanup) {
-        (Ok(state), Ok(()) | Err(_)) => Ok(state),
-        (Err(err), Ok(()) | Err(_)) => Err(err),
+    match result {
+        Ok(state) => Ok((state, temp_path)),
+        Err(error) => {
+            let _ = remove_sqlite_sidecars(&temp_path);
+            let _ = std::fs::remove_file(&temp_path);
+            Err(error)
+        }
     }
+}
+
+/// Clone a proof-backed, exclusively locked worktree seed without copying its data blocks.
+///
+/// Failure is an ordinary cache miss: callers fall back to materializing the authoritative Graft
+/// state. Other platforms intentionally return `false` instead of paying for a full byte copy.
+fn try_clone_sqlite_merge_seed(source: &Path, destination: &Path) -> Result<bool, ErrCtx> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+        if let (Ok(source_c), Ok(destination_c)) = (
+            CString::new(source.as_os_str().as_bytes()),
+            CString::new(destination.as_os_str().as_bytes()),
+        ) {
+            // SAFETY: both C strings live through the call and are NUL-terminated. The private
+            // destination does not exist; clonefile either creates an independent CoW file or
+            // reports failure without changing the authoritative source.
+            if unsafe { libc::clonefile(source_c.as_ptr(), destination_c.as_ptr(), 0) } == 0 {
+                return Ok(true);
+            }
+            match std::fs::remove_file(destination) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    let _ = (source, destination);
+
+    Ok(false)
 }
 
 pub(super) fn row_auto_merge_temp_path(repo: &Repository, key: &str) -> Result<PathBuf, ErrCtx> {
@@ -1375,25 +1528,189 @@ pub(super) fn row_auto_merge_temp_path(repo: &Repository, key: &str) -> Result<P
 }
 
 pub(super) fn apply_row_merge_sql_to_path(path: &Path, sql: &str) -> Result<(), ErrCtx> {
+    apply_row_merge_sql_to_path_with_changed_pages(path, sql).map(|_| ())
+}
+
+fn apply_row_merge_sql_to_path_with_changed_pages(
+    path: &Path,
+    sql: &str,
+) -> Result<Option<BTreeSet<u32>>, ErrCtx> {
     let conn = rusqlite::Connection::open_with_flags(
         path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|err| row_auto_merge_sqlite_err(path, "open temporary database", err))?;
-    conn.execute_batch("PRAGMA foreign_keys = OFF;")
-        .map_err(|err| row_auto_merge_sqlite_err(path, "disable foreign keys", err))?;
+    // A full integrity proof for this immutable source state was established
+    // before mutation. Let SQLite validate every B-tree cell touched by the
+    // delta while it transactionally maintains indexes and constraints.
+    conn.execute_batch("PRAGMA cell_size_check = ON; PRAGMA foreign_keys = OFF;")
+        .map_err(|err| row_auto_merge_sqlite_err(path, "configure merge validation", err))?;
     conn.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, false)
         .map_err(|err| row_auto_merge_sqlite_err(path, "disable triggers", err))?;
+    let wal_enabled = conn
+        .query_row("PRAGMA journal_mode = WAL;", [], |row| {
+            row.get::<_, String>(0)
+        })
+        .map(|mode| mode.eq_ignore_ascii_case("wal"))
+        .unwrap_or(false);
+    if wal_enabled {
+        conn.execute_batch("PRAGMA wal_autocheckpoint = 0;")
+            .map_err(|err| row_auto_merge_sqlite_err(path, "disable WAL autocheckpoint", err))?;
+    }
     conn.execute_batch(sql)
         .map_err(|err| row_auto_merge_sqlite_err(path, "apply row changes", err))?;
     validate_row_merge_sqlite(path, &conn)?;
-    Ok(())
+    let changed_pages = wal_enabled
+        .then(|| read_committed_wal_changed_pages(path))
+        .transpose()?
+        .flatten();
+    if wal_enabled {
+        let (busy, frames, checkpointed) = conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(|err| row_auto_merge_sqlite_err(path, "checkpoint merge WAL", err))?;
+        if busy != 0 || checkpointed != frames {
+            return Err(ErrCtx::InvalidCommand(
+                format!(
+                    "could not checkpoint row-level auto-merge WAL: busy={busy}, frames={frames}, checkpointed={checkpointed}"
+                )
+                .into(),
+            ));
+        }
+        let mode = conn
+            .query_row("PRAGMA journal_mode = DELETE;", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|err| row_auto_merge_sqlite_err(path, "restore delete journal mode", err))?;
+        if !mode.eq_ignore_ascii_case("delete") {
+            return Err(ErrCtx::InvalidCommand(
+                format!("row-level auto-merge could not restore delete journal mode: {mode}")
+                    .into(),
+            ));
+        }
+    }
+    drop(conn);
+    remove_sqlite_sidecars(path)?;
+    Ok(changed_pages)
+}
+
+const SQLITE_WAL_HEADER_BYTES: usize = 32;
+const SQLITE_WAL_FRAME_HEADER_BYTES: usize = 24;
+const SQLITE_WAL_MAGIC_BIG_ENDIAN_CHECKSUM: u32 = 0x377f_0682;
+const SQLITE_WAL_MAGIC_LITTLE_ENDIAN_CHECKSUM: u32 = 0x377f_0683;
+
+/// Returns every page in committed WAL frames, or `None` when the WAL cannot be proven complete.
+///
+/// The hint is consumed only after SQLite successfully checkpoints the same WAL. Header/frame
+/// salts prevent combining frames from different WAL generations; malformed or partial input
+/// falls back to the authoritative full candidate import.
+fn read_committed_wal_changed_pages(path: &Path) -> Result<Option<BTreeSet<u32>>, ErrCtx> {
+    let wal_path = sqlite_sidecar_path(path, "-wal");
+    let bytes = match std::fs::read(&wal_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if bytes.len() < SQLITE_WAL_HEADER_BYTES {
+        return Ok(None);
+    }
+    let magic = u32::from_be_bytes(bytes[0..4].try_into().expect("WAL magic width"));
+    if !matches!(
+        magic,
+        SQLITE_WAL_MAGIC_BIG_ENDIAN_CHECKSUM | SQLITE_WAL_MAGIC_LITTLE_ENDIAN_CHECKSUM
+    ) {
+        return Ok(None);
+    }
+    let page_size = u32::from_be_bytes(bytes[8..12].try_into().expect("WAL page-size width"));
+    if page_size as usize != PAGESIZE.as_usize() {
+        return Ok(None);
+    }
+    let salt = &bytes[16..24];
+    let frame_size = SQLITE_WAL_FRAME_HEADER_BYTES + page_size as usize;
+    let frames_bytes = &bytes[SQLITE_WAL_HEADER_BYTES..];
+    if frames_bytes.is_empty() || !frames_bytes.len().is_multiple_of(frame_size) {
+        return Ok(None);
+    }
+
+    let mut frames = Vec::with_capacity(frames_bytes.len() / frame_size);
+    for frame in frames_bytes.chunks_exact(frame_size) {
+        if &frame[8..16] != salt {
+            return Ok(None);
+        }
+        let page_number = u32::from_be_bytes(frame[0..4].try_into().expect("WAL page width"));
+        let committed_page_count =
+            u32::from_be_bytes(frame[4..8].try_into().expect("WAL commit width"));
+        if page_number == 0 {
+            return Ok(None);
+        }
+        frames.push((page_number, committed_page_count));
+    }
+    let Some(last_commit) = frames.iter().rposition(|(_, page_count)| *page_count != 0) else {
+        return Ok(None);
+    };
+    if last_commit + 1 != frames.len() {
+        return Ok(None);
+    }
+    let mut changed_pages = frames[..=last_commit]
+        .iter()
+        .map(|(page_number, _)| *page_number)
+        .collect::<BTreeSet<_>>();
+    // Changing WAL mode can update the journal bytes in page one outside the transaction frames.
+    changed_pages.insert(1);
+    Ok(Some(changed_pages))
+}
+
+fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut sidecar = path.as_os_str().to_os_string();
+    sidecar.push(suffix);
+    PathBuf::from(sidecar)
 }
 
 pub(super) fn validate_row_merge_sqlite(
     path: &Path,
     conn: &rusqlite::Connection,
 ) -> Result<(), ErrCtx> {
+    validate_row_merge_foreign_keys(path, conn)
+}
+
+pub(super) fn validate_row_merge_base_integrity(
+    path: &Path,
+    state: &CommitFileState,
+) -> Result<(), ErrCtx> {
+    let key = (state.volume.clone(), state.snapshot.clone());
+    let proofs = ROW_MERGE_INTEGRITY_PROOFS.get_or_init(Default::default);
+    if proofs.lock().contains(&key) {
+        return Ok(());
+    }
+
+    let conn = rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|err| row_auto_merge_sqlite_err(path, "open merge base for validation", err))?;
+    validate_row_merge_integrity(path, &conn)?;
+
+    let mut proofs = proofs.lock();
+    if proofs.len() >= MAX_ROW_MERGE_INTEGRITY_PROOFS {
+        proofs.clear();
+    }
+    proofs.insert(key);
+    Ok(())
+}
+
+fn row_merge_integrity_proven(state: &CommitFileState) -> bool {
+    let key = (state.volume.clone(), state.snapshot.clone());
+    ROW_MERGE_INTEGRITY_PROOFS
+        .get()
+        .is_some_and(|proofs| proofs.lock().contains(&key))
+}
+
+fn validate_row_merge_integrity(path: &Path, conn: &rusqlite::Connection) -> Result<(), ErrCtx> {
     let mut integrity_stmt = conn
         .prepare("PRAGMA integrity_check;")
         .map_err(|err| row_auto_merge_sqlite_err(path, "prepare integrity_check", err))?;
@@ -1412,6 +1729,10 @@ pub(super) fn validate_row_merge_sqlite(
         ));
     }
 
+    Ok(())
+}
+
+fn validate_row_merge_foreign_keys(path: &Path, conn: &rusqlite::Connection) -> Result<(), ErrCtx> {
     let mut fk_stmt = conn
         .prepare("PRAGMA foreign_key_check;")
         .map_err(|err| row_auto_merge_sqlite_err(path, "prepare foreign_key_check", err))?;
@@ -1450,4 +1771,166 @@ pub(super) fn row_auto_merge_sqlite_err(
     err: rusqlite::Error,
 ) -> ErrCtx {
     ErrCtx::InvalidCommand(format!("could not {action} for row-level auto-merge: {err}").into())
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+
+    fn test_state() -> CommitFileState {
+        CommitFileState {
+            volume: VolumeId::random(),
+            snapshot: RepoSnapshot {
+                page_count: PageCount::new(4),
+                ranges: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn immutable_integrity_proofs_are_exact_and_corrupt_states_still_fail() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("integrity.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "PRAGMA page_size = 4096;\
+             CREATE TABLE items(id INTEGER PRIMARY KEY, payload BLOB NOT NULL);\
+             INSERT INTO items VALUES(1, zeroblob(12000));",
+        )
+        .unwrap();
+        drop(conn);
+
+        validate_row_merge_base_integrity(&path, &test_state()).unwrap();
+
+        let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(4096)).unwrap();
+        std::io::Write::write_all(&mut file, &[0; 4096]).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let error = validate_row_merge_base_integrity(&path, &test_state()).unwrap_err();
+        assert!(error.to_string().contains("integrity_check"));
+    }
+
+    #[test]
+    fn row_merge_delta_keeps_sqlite_constraints_enabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("constraints.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);\
+             INSERT INTO items VALUES(1, 'existing');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = apply_row_merge_sql_to_path(
+            &path,
+            "BEGIN TRANSACTION; INSERT INTO items VALUES(2, 'existing'); COMMIT;",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("UNIQUE constraint failed"));
+    }
+
+    #[test]
+    fn row_merge_delta_checks_foreign_keys_after_the_transaction() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("foreign-keys.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE parents(id INTEGER PRIMARY KEY);\
+             CREATE TABLE children(\
+               id INTEGER PRIMARY KEY,\
+               parent_id INTEGER NOT NULL REFERENCES parents(id)\
+             );",
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = apply_row_merge_sql_to_path(
+            &path,
+            "BEGIN TRANSACTION; INSERT INTO children VALUES(1, 99); COMMIT;",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("failed foreign_key_check"));
+    }
+
+    #[test]
+    fn malformed_or_partial_wal_never_produces_a_sparse_import_hint() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("malformed.db");
+        let wal_path = sqlite_sidecar_path(&path, "-wal");
+
+        std::fs::write(&wal_path, [0_u8; SQLITE_WAL_HEADER_BYTES - 1]).unwrap();
+        assert_eq!(read_committed_wal_changed_pages(&path).unwrap(), None);
+
+        let mut header = [0_u8; SQLITE_WAL_HEADER_BYTES];
+        header[..4].copy_from_slice(&SQLITE_WAL_MAGIC_BIG_ENDIAN_CHECKSUM.to_be_bytes());
+        header[8..12].copy_from_slice(&(PAGESIZE.as_usize() as u32).to_be_bytes());
+        std::fs::write(&wal_path, header).unwrap();
+        assert_eq!(read_committed_wal_changed_pages(&path).unwrap(), None);
+    }
+
+    #[test]
+    fn committed_wal_hint_covers_every_physically_changed_page() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("wal-pages.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "PRAGMA page_size = 4096;\
+             PRAGMA journal_mode = DELETE;\
+             CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT NOT NULL);\
+             WITH RECURSIVE ids(id) AS (\
+               VALUES(1) UNION ALL SELECT id + 1 FROM ids WHERE id < 1000\
+             )\
+             INSERT INTO items SELECT id, printf('%01000d', id) FROM ids;",
+        )
+        .unwrap();
+        drop(conn);
+        let before = std::fs::read(&path).unwrap();
+
+        let changed_pages = apply_row_merge_sql_to_path_with_changed_pages(
+            &path,
+            "BEGIN TRANSACTION;\
+             UPDATE items SET value = printf('%01000d', 9999) WHERE id = 500;\
+             COMMIT;",
+        )
+        .unwrap()
+        .expect("ordinary local SQLite files support a committed WAL hint");
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(before.len(), after.len());
+        let physical_changes = before
+            .chunks_exact(PAGESIZE.as_usize())
+            .zip(after.chunks_exact(PAGESIZE.as_usize()))
+            .enumerate()
+            .filter_map(|(index, (before, after))| (before != after).then_some(index as u32 + 1))
+            .collect::<BTreeSet<_>>();
+        assert!(!physical_changes.is_empty());
+        assert!(physical_changes.is_subset(&changed_pages));
+        assert!(changed_pages.len() * 4 < before.len() / PAGESIZE.as_usize());
+        assert!(!sqlite_sidecar_path(&path, "-wal").exists());
+        assert!(!sqlite_sidecar_path(&path, "-shm").exists());
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA integrity_check;", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_merge_seed_clone_is_an_independent_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.db");
+        let destination = temp.path().join("candidate.db");
+        std::fs::write(&source, b"immutable source").unwrap();
+
+        assert!(try_clone_sqlite_merge_seed(&source, &destination).unwrap());
+        std::fs::write(&destination, b"changed candidate").unwrap();
+
+        assert_eq!(std::fs::read(&source).unwrap(), b"immutable source");
+        assert_eq!(std::fs::read(&destination).unwrap(), b"changed candidate");
+    }
 }

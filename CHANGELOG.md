@@ -4,6 +4,24 @@
 
 ### Changed
 
+- SQLite row merge now reuses proven segment page sets across immutable snapshots, targets
+  `WITHOUT ROWID` analysis to changed B-tree pages, and installs an already validated merge
+  candidate directly instead of serializing the database again during completion.
+- Candidate construction performs a complete integrity proof once for an exact immutable Ours
+  state before mutation, then relies on SQLite's transactional constraint/index maintenance,
+  touched-cell checks, and a complete post-apply foreign-key check instead of cold-scanning every
+  inherited page again.
+- macOS reuses an already-proven, clean, exclusively locked Ours worktree through an APFS
+  copy-on-write clone when seeding the private merge candidate; clone failure and other platforms
+  retain authoritative snapshot materialization.
+- Transactional SQLite merge replay now captures committed WAL page numbers and, after a successful
+  checkpoint and validation, imports only pages that differ from Ours. Missing, malformed, or
+  partial WAL data safely falls back to an authoritative full candidate import.
+- Exact-token SDK merge continuation commits an already installed, clean SQLite candidate without
+  rewriting it or immediately rescanning the complete worktree; its exact `worktree_paths` result
+  is empty when no file was physically changed. Validated file fingerprints survive that
+  ref/index-only commit, so the next status refresh is metadata-only and still invalidates on an
+  external write.
 - Clone upload bundles now declare their exact encoded byte length so clients can report total
   download size, percentage, and estimated time remaining while streaming a repository.
 - Remote backends may return object metadata with list results to avoid per-object metadata reads
@@ -12,6 +30,12 @@
   executable remains `graft`.
 - Repository commands now retain repository-scoped session state directly instead of reusing a
   live SQLite VFS file handle.
+
+### Fixed
+
+- Transfer progress now coalesces short request bodies into 100 ms aggregate updates and flushes
+  one final value per direction, preventing large SQLite pushes from flooding host callback queues
+  after the Remote ref is already published.
 
 ### Removed
 
@@ -22,6 +46,9 @@
 
 ### Compatibility
 
+- Merge, repository, snapshot, and Remote formats are unchanged. Continue remains conservatively
+  classified as worktree-materializing before a call even though its validated fast path may
+  return an empty exact path set afterward.
 - New clients prefer the `X-Graft-Bundle-Total-Bytes` response header and fall back to
   `Content-Length` for older servers. Existing clients can ignore the additive header.
 - Repository objects, snapshots, remotes, CLI commands, the `graft` executable name, and the SDK

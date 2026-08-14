@@ -30,6 +30,9 @@ tracing = { workspace = true }
 tryiter = { workspace = true }
 zerocopy = { workspace = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2.180"
+
 [features]
 default = []
 bundled-sqlite = ["rusqlite/bundled"]

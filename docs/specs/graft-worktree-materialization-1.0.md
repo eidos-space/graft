@@ -268,7 +268,7 @@ conservative gate; “actual” describes the normal path for the operation.
 | SDK | `prepareSemanticMerge`, `recordSemanticMergeConflicts` | No | Writes only Graft-owned private provider workspace/records under `.graft` |
 | SDK | `acceptSemanticMergeResult` | Yes | Validates a private provider result, replaces the tracked SQLite path, and stages it |
 | CLI / SDK | `writeAndStageTextResult` / `resolve --manual` | Yes | Writes and stages the edited physical result |
-| CLI / SDK | `continueMerge` / `merge --continue` | Yes | Commits the resolved merge and the current CLI path materialization step may rewrite SQLite snapshots |
+| CLI / SDK | `continueMerge` / `merge --continue` | Yes | Commits the resolved merge; a validated SDK fast path preserves an already-installed SQLite candidate, while other paths may rewrite SQLite snapshots |
 | CLI / SDK | `abortMerge` / `merge --abort` | Yes | Restores `ORIG_HEAD` and applies the abort checkout plan |
 | CLI | `export` | No (separate output) | Writes only the explicitly selected export destination |
 | CLI / SDK | `sql`, application SQLite transaction | No (Graft operation) | Caller directly creates or edits the physical worktree file |
@@ -401,11 +401,25 @@ closed.
 
 ### 7.4 Continue and abort
 
-`continueMerge` requires no unresolved conflicts and a valid state token. The
-current command path commits the resolved merge and may write the committed
-SQLite snapshots back to their tracked paths when `materialize_sqlite=true`.
-It returns merge/commit output and a normalized `worktree_paths` array naming
-the paths created, replaced, or removed by the operation.
+`continueMerge` requires no unresolved conflicts and a valid state token. When
+the SDK revalidates the exact token, confirms a clean worktree, and the final
+SQLite candidate is already installed and staged, it MAY commit that state
+without rewriting the tracked file. That path MUST return
+`worktree_paths: []`. Other command paths MAY write committed SQLite snapshots
+back to tracked paths when `materialize_sqlite=true`. Every path returns
+merge/commit output and a normalized `worktree_paths` array naming only the
+paths actually created, replaced, or removed by that operation.
+
+`operationMaterializesWorktree("continueMerge")` remains `true`: it is a
+conservative before-call host gate, whereas `worktree_paths` is the exact
+after-call result.
+
+After a non-materializing exact-token completion, an SDK MAY carry the already
+validated worktree fingerprints across the ref/index update and synthesize the
+known clean post-commit status. The next status request MUST still stat tracked
+paths; any fingerprint change MUST invalidate the proof and run authoritative
+classification. Cache/proof persistence failure MUST NOT turn a successfully
+committed merge into an operation error.
 
 `abortMerge` requires an active durable merge state and a valid token. It moves
 back to `ORIG_HEAD`, clears merge/index conflict state, and applies the abort

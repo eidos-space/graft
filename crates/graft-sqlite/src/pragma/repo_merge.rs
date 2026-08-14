@@ -26,6 +26,7 @@ pub(super) fn run_repo_merge_abort(
         None,
     )?;
     clear_row_conflict_resolution_state(&repo)?;
+    file.clear_row_merge_table_summaries();
     let branch = repo.current_branch()?;
     Ok(RepoMergeAbortCommandOutcome { target, branch, paths })
 }
@@ -34,6 +35,7 @@ pub(super) fn run_repo_merge_continue(
     runtime: &Runtime,
     file: &mut RepositorySessionContext,
     message: String,
+    materialize_sqlite: bool,
 ) -> Result<RepoCommitOutcome, ErrCtx> {
     if !file.is_idle() {
         return pragma_err!("cannot continue merge while there is an open transaction");
@@ -45,10 +47,15 @@ pub(super) fn run_repo_merge_continue(
     try_row_auto_merge_current_file_status_conflict(runtime, file, &repo, None)?;
     let conflicted = repo.status()?.conflicted;
     try_row_auto_merge_paths(runtime, file, &repo, &conflicted, None, false)?;
-    let tables = staged_commit_table_summary(runtime, &repo)?;
+    let tables = staged_commit_table_summary_for_file(runtime, file, &repo)?;
     let commit = repo.commit_staged_with_table_summary(message, tables)?;
-    let materialized = materialize_commit_sqlite_files(runtime, &repo, &commit)?;
+    let materialized = if materialize_sqlite {
+        materialize_commit_sqlite_files(runtime, &repo, &commit)?
+    } else {
+        Vec::new()
+    };
     clear_row_conflict_resolution_state(&repo)?;
+    file.clear_row_merge_table_summaries();
     let branch = repo.current_branch()?;
     Ok(RepoCommitOutcome { commit, branch, materialized })
 }
@@ -62,17 +69,24 @@ pub(super) fn run_repo_merge(
         return pragma_err!("cannot merge while there is an open transaction");
     }
     let repo = repo_for_file(file)?;
-    if repo_has_work_in_progress_for_file(runtime, file, &repo)? {
+    let status = repo_status_for_file(runtime, file, &repo)?;
+    if repo_status_has_work_in_progress_for_file(file, &repo, &status)? {
         return pragma_err!("cannot merge with staged or unstaged changes");
     }
     clear_row_conflict_resolution_state(&repo)?;
+    file.clear_row_merge_table_summaries();
     let plan = repo.plan_merge_revision(rev)?;
     // A merge may target a fetched remote-tracking revision whose SQLite storage commits are
     // not hydrated yet. Prefer local storage for base/ours and fall back to the configured remote
     // for missing target commits, keeping ordinary local-branch merges offline-capable.
     let remote = repo_merge_remote_store(&repo, rev, &plan.target)?;
     let plan = prepare_repo_merge_plan(runtime, &plan, remote)?;
-    ensure_checkout_plan_preserves_untracked_paths(runtime, file, &repo, &plan.checkout)?;
+    ensure_checkout_plan_preserves_untracked_paths_with_status(
+        file,
+        &repo,
+        &plan.checkout,
+        &status,
+    )?;
     let previous_files = current_repo_files_for_checkout(&repo)?;
     let previous_artifacts = current_repo_artifacts_for_checkout(&repo)?;
     let mut _sqlite_replacement_guards =

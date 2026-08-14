@@ -4,7 +4,8 @@ use graft::{repo::CommitFileState, rt::runtime::Runtime};
 
 use crate::row_level_diff::{
     InsertRowidMode, OpaqueChange, OpaqueChangeReason, RowChange, RowIdentity, RowLevelDiff,
-    RowLevelDiffLimitation, SchemaChange, SchemaChangeKind, TableChanges, row_level_diff_snapshots,
+    RowLevelDiffLimitation, SchemaChange, SchemaChangeKind, TableChanges,
+    row_level_diff_snapshots_with_page_candidates,
 };
 use crate::sqlite_parse::{
     ColumnDefinition, GeneratedColumnKind, Record, Value, parse_create_table_column_definitions,
@@ -394,6 +395,35 @@ impl RowMergePlan {
         self.source_apply_sql(&self.theirs_diff, &self.schema_additions)
     }
 
+    pub fn theirs_apply_table_summaries(&self) -> Vec<(String, usize, usize, usize)> {
+        let conflict_rows = self.conflict_rows();
+        let mut summaries = BTreeMap::<String, (usize, usize, usize)>::new();
+        for table in &self.theirs_diff.table_changes {
+            for change in &table.changes {
+                let row = RowKey::from_change(&table.table_name, change);
+                if self.identical_touches.contains(&row)
+                    || conflict_rows.contains(&row)
+                    || self.merged_rows.contains_key(&row)
+                {
+                    continue;
+                }
+                let counts = summaries.entry(table.table_name.clone()).or_default();
+                match change {
+                    RowChange::Insert { .. } | RowChange::PrimaryKeyInsert { .. } => counts.0 += 1,
+                    RowChange::Delete { .. } | RowChange::PrimaryKeyDelete { .. } => counts.1 += 1,
+                    RowChange::Update { .. } | RowChange::PrimaryKeyUpdate { .. } => counts.2 += 1,
+                }
+            }
+        }
+        for row in self.merged_rows.keys() {
+            summaries.entry(row.table.clone()).or_default().2 += 1;
+        }
+        summaries
+            .into_iter()
+            .map(|(table, (inserts, deletes, updates))| (table, inserts, deletes, updates))
+            .collect()
+    }
+
     /// SQL for the safe Theirs projection while leaving provider-owned tables at Ours.
     pub fn theirs_apply_sql_excluding(&self, excluded_tables: &BTreeSet<String>) -> String {
         self.source_apply_sql_excluding(&self.theirs_diff, &self.schema_additions, excluded_tables)
@@ -744,8 +774,36 @@ pub fn plan_snapshot_merge_with_policy(
     let base_snapshot = base.snapshot.to_snapshot();
     let ours_snapshot = ours.snapshot.to_snapshot();
     let theirs_snapshot = theirs.snapshot.to_snapshot();
-    let ours_diff = row_level_diff_snapshots(runtime, &base_snapshot, &ours_snapshot)?;
-    let theirs_diff = row_level_diff_snapshots(runtime, &base_snapshot, &theirs_snapshot)?;
+    let ours_page_candidates =
+        runtime.snapshot_changed_page_candidates(&base_snapshot, &ours_snapshot)?;
+    let theirs_page_candidates =
+        runtime.snapshot_changed_page_candidates(&base_snapshot, &theirs_snapshot)?;
+    // Both sides are independent reads of the same immutable base snapshot. Running them
+    // together avoids serially scanning large databases during merge planning.
+    let (ours_diff, theirs_diff) = std::thread::scope(|scope| {
+        let ours = scope.spawn(|| {
+            row_level_diff_snapshots_with_page_candidates(
+                runtime,
+                &base_snapshot,
+                &ours_snapshot,
+                &ours_page_candidates,
+            )
+        });
+        let theirs = scope.spawn(|| {
+            row_level_diff_snapshots_with_page_candidates(
+                runtime,
+                &base_snapshot,
+                &theirs_snapshot,
+                &theirs_page_candidates,
+            )
+        });
+        (
+            ours.join().expect("ours row diff worker panicked"),
+            theirs.join().expect("theirs row diff worker panicked"),
+        )
+    });
+    let ours_diff = ours_diff?;
+    let theirs_diff = theirs_diff?;
     let ours_touches = row_touches(&ours_diff.table_changes, policy);
     let theirs_touches = row_touches(&theirs_diff.table_changes, policy);
     let mut conflicts = Vec::new();

@@ -109,9 +109,30 @@ operation 保持 conflict。
 Unknown/disabled/incompatible opaque change 必须保持 conflict；resolver 不是任意 SQL
 hook。
 
-Candidate 在隔离 temp DB 构造；受控 replay 时关闭 FK/trigger side effect，排除
-generated/configured column，完成后执行 integrity 与 foreign-key check。验证失败
-不能替换 staged result/worktree 或改变之前的 merge journal，temp 成功失败都要清理。
+Candidate 在隔离 temp DB 构造。变更前先为精确、不可变的 Ours
+`(VolumeId, RepoSnapshot)` 执行完整 SQLite `integrity_check` 并建立证明；进程只能为
+相同 content-addressed state 复用该证明，证明不能来自 repository-controlled file，
+cache miss/eviction 必须重跑完整检查。
+
+之后通过单个 SQLite transaction 做受控 replay：关闭 FK/trigger side effect，开启
+`cell_size_check`，保留 SQLite 原生 constraint/index maintenance，并排除
+generated/configured column；完成后执行完整 `foreign_key_check`。由于 source 已有完整
+不可变 integrity proof，且后续只有 SQLite transaction 修改它，证明后的验证除必要的
+跨行 FK 检查外可与 delta 成正比。验证失败不能替换 staged result/worktree 或改变之前的
+merge journal，temp 成功失败都要清理。
+
+若精确 integrity proof 已在进程内，且 preflight 已证明 worktree file clean、被独占锁定
+并等于 Ours，实现可以用 filesystem copy-on-write clone 作为 private candidate seed。
+clone 失败或平台不支持时必须回退到权威 Graft snapshot 物化；filesystem clone 本身
+永远不能作为 integrity 或 identity proof。
+
+若 SQLite WAL mode 可用，实现可以在应用 transactional delta 时保留截至最后一个已提交
+frame 的全部 page number。只有 SQLite 成功 checkpoint 同一个 WAL，且结果 database
+通过必要验证后，才可用该集合做 sparse repository import。Page number 只是保守候选：
+每个候选页仍必须与不可变 Ours snapshot 比较，page-count 变化必须显式处理。WAL 缺失、
+格式错误、不完整、未提交或不一致时，必须回退到权威 full candidate import。WAL frame
+只能定位 output page，不能跨 branch 合并，也不能定义 row conflict 语义。
+
 Directory repository session 必须规划每个冲突 SQLite path；任何 unmerged path 都必须
 返回结构化 conflict、validation/analysis error、limitation 或明确可执行 action。
 
@@ -284,8 +305,9 @@ Startup 不能为了清 conflict 自动选 ours/theirs。
 ## 12. Conformance
 
 至少测试：三种 topology、plan 只读与 stale token、所有 path 关系、SQLite 独立/
-冲突 row、composite key/rowid remap/semantic key、schema/opaque resolver、candidate
-validation rollback、whole-path/text/row resolution、关闭重开、continue 双 parent、
+冲突 row、composite key/rowid remap/semantic key、schema/opaque resolver、精确不可变
+base integrity proof/reuse、transaction constraint、post-apply FK validation 与 rollback、
+whole-path/text/row resolution、关闭重开、continue 双 parent、
 semantic-provider prepare/reopen、stale provider/state token、bounded conflict record、invalid
 result rejection、validated result acceptance、continue/abort cleanup、abort 恢复，以及
 durable/physical boundary 的 crash/failure。

@@ -1033,6 +1033,78 @@ fn transfer_progress_reports_known_and_unknown_body_lengths() {
 }
 
 #[test]
+fn transfer_progress_coalesces_short_transfers_and_flushes_the_aggregate_total() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let captured = events.clone();
+    let reporter = TransferProgressReporter::new(move |progress| {
+        captured.lock().unwrap().push(progress);
+    });
+
+    with_transfer_progress(&reporter, || {
+        declare_transfer_progress_total(TransferDirection::Upload, 100_000);
+        for _ in 0..10_000 {
+            let mut upload = begin_transfer_progress(TransferDirection::Upload, Some(10)).unwrap();
+            upload.advance(10);
+            upload.finish();
+        }
+    });
+
+    let events = events.lock().unwrap();
+    assert!(
+        events.len() <= 8,
+        "short transfers emitted {} progress callbacks",
+        events.len()
+    );
+    assert_eq!(
+        events.first(),
+        Some(&TransferProgress {
+            direction: TransferDirection::Upload,
+            transferred_bytes: 0,
+            total_bytes: Some(100_000),
+        })
+    );
+    assert_eq!(
+        events.last(),
+        Some(&TransferProgress {
+            direction: TransferDirection::Upload,
+            transferred_bytes: 100_000,
+            total_bytes: Some(100_000),
+        })
+    );
+}
+
+#[test]
+fn transfer_progress_retains_periodic_partial_updates() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let captured = events.clone();
+    let reporter = TransferProgressReporter::new(move |progress| {
+        captured.lock().unwrap().push(progress);
+    });
+
+    with_transfer_progress(&reporter, || {
+        let mut upload = begin_transfer_progress(TransferDirection::Upload, Some(100)).unwrap();
+        std::thread::sleep(TRANSFER_PROGRESS_EMIT_INTERVAL + Duration::from_millis(10));
+        upload.advance(40);
+        upload.advance(60);
+    });
+
+    let events = events.lock().unwrap();
+    assert!(events.contains(&TransferProgress {
+        direction: TransferDirection::Upload,
+        transferred_bytes: 40,
+        total_bytes: Some(100),
+    }));
+    assert_eq!(
+        events.last(),
+        Some(&TransferProgress {
+            direction: TransferDirection::Upload,
+            transferred_bytes: 100,
+            total_bytes: Some(100),
+        })
+    );
+}
+
+#[test]
 fn remote_wait_is_cancelled_without_a_wall_clock_request_timeout() {
     let token = CancellationToken::new();
     let canceller = token.clone();

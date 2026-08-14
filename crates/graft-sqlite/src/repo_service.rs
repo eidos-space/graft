@@ -178,6 +178,13 @@ impl RepositoryCommand {
         }
     }
 
+    /// Continues after the caller has just validated an exact merge-state token and worktree.
+    pub fn merge_continue_validated(message: impl Into<String>) -> Self {
+        Self {
+            command: GraftCommand::JsonMergeContinueValidated { message: message.into() },
+        }
+    }
+
     pub fn merge_abort() -> Self {
         Self { command: GraftCommand::JsonMergeAbort }
     }

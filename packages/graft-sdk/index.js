@@ -167,17 +167,26 @@ class RepositorySession {
 
   async push(options = {}) {
     const { remote, branch, signal, onProgress } = options
-    return callJson(() => this.#native.push(remote, branch, signal, onProgress))
+    return callJsonWithProgress(
+      () => this.#native.push(remote, branch, signal, onProgress),
+      onProgress
+    )
   }
 
   async fetch(options = {}) {
     const { remote, branch, signal, onProgress } = options
-    return callJson(() => this.#native.fetch(remote, branch, signal, onProgress))
+    return callJsonWithProgress(
+      () => this.#native.fetch(remote, branch, signal, onProgress),
+      onProgress
+    )
   }
 
   async pull(options = {}) {
     const { remote, branch, signal, onProgress } = options
-    return callJson(() => this.#native.pull(remote, branch, signal, onProgress))
+    return callJsonWithProgress(
+      () => this.#native.pull(remote, branch, signal, onProgress),
+      onProgress
+    )
   }
 
   async getMergePolicy({ signal } = {}) {
@@ -404,8 +413,9 @@ class RepositorySession {
 
   async cloneRepository(options) {
     const { signal, onProgress, ...cloneOptions } = options
-    return callJson(() =>
-      this.#native.cloneRepository(cloneOptions, signal, onProgress)
+    return callJsonWithProgress(
+      () => this.#native.cloneRepository(cloneOptions, signal, onProgress),
+      onProgress
     )
   }
 }
@@ -436,6 +446,16 @@ async function callJson(operation) {
       "GRAFT_SDK_INVALID_RESPONSE",
       error
     )
+  }
+}
+
+async function callJsonWithProgress(operation, onProgress) {
+  try {
+    return await callJson(operation)
+  } finally {
+    if (typeof onProgress === "function") {
+      await new Promise((resolve) => setImmediate(resolve))
+    }
   }
 }
 

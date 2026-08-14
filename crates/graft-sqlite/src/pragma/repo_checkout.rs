@@ -1900,6 +1900,33 @@ pub(super) fn checkout_repo_file_state_to_prepared_key(
     bind_repo_file_state_to_path(runtime, state, &path)
 }
 
+pub(super) fn install_materialized_repo_file_state(
+    runtime: &Runtime,
+    repo: &Repository,
+    key: &str,
+    state: &CommitFileState,
+    materialized: &Path,
+    replacement_prepared: bool,
+) -> Result<(), ErrCtx> {
+    let destination = repo.worktree().join(key);
+    if let Ok(metadata) = std::fs::symlink_metadata(&destination)
+        && !metadata.file_type().is_file()
+    {
+        return Err(ErrCtx::InvalidCommand(
+            format!(
+                "path `{}` is not a regular SQLite database file",
+                destination.display()
+            )
+            .into(),
+        ));
+    }
+    let guard = (!replacement_prepared)
+        .then(|| prepare_sqlite_path_for_replacement(&destination))
+        .transpose()?;
+    replace_prepared_sqlite_file(materialized, &destination, guard)?;
+    bind_repo_file_state_to_path(runtime, state, &destination)
+}
+
 fn bind_repo_file_state_to_path(
     runtime: &Runtime,
     state: &CommitFileState,
@@ -2139,18 +2166,21 @@ pub(super) fn checkout_merge_outcome(
                 checkout_repo_head(runtime, file, repo, remote)?;
             }
         }
-        MergeOutcome::Merged { staged, conflicted, .. } if conflicted.is_empty() => {
-            checkout_merged_repo_paths(
-                runtime,
-                file,
-                repo,
-                staged,
-                previous_files,
-                previous_artifacts,
-                remote,
-            )?;
-        }
-        MergeOutcome::Merged { conflicted, .. } => {
+        MergeOutcome::Merged { staged, conflicted, .. } => {
+            // A conflicted merge can still contain paths whose three-way result is already
+            // clean. Materialize those stage-0 entries immediately, just like Git, so finishing
+            // the merge cannot leave their older worktree contents dirty against the merge commit.
+            if !staged.is_empty() {
+                checkout_merged_repo_paths(
+                    runtime,
+                    file,
+                    repo,
+                    staged,
+                    previous_files,
+                    previous_artifacts,
+                    remote,
+                )?;
+            }
             for key in conflicted {
                 // The conflict index establishes the current worktree (ours) as the new
                 // comparison baseline. Drop markers retained by earlier non-materializing

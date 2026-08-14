@@ -673,6 +673,7 @@ test("metadata and remotes avoid worktree classification and credentials", async
     const metadata = await session.repositoryMetadata()
     assert.equal(metadata.current_head, committed.commit.id)
     assert.equal(metadata.current_branch, "main")
+    assert.equal(metadata.upstream_target, null)
     assert.equal(metadata.telemetry.paths_examined, 0)
     const remotes = await session.listRemotes()
     assert.equal(remotes.telemetry.paths_examined, 0)
@@ -1346,7 +1347,9 @@ test(
         expectedStateToken: tableResolved.merge.state_token,
       })
       assert.equal(completed.merge.state, "none")
-      assert.deepEqual(completed.worktree_paths, ["space.eidos"])
+      // The final row-resolution call already installed the validated candidate.
+      // Continue commits that exact staged state without rewriting the worktree.
+      assert.deepEqual(completed.worktree_paths, [])
       await assert.rejects(
         cloneSession.listMergeConflicts({
           path: "space.eidos",
@@ -1465,7 +1468,6 @@ test("reports real HTTP response bytes through the JavaScript progress callback"
       await assert.rejects(
         session.fetch({ onProgress: (event) => progress.push(event) })
       )
-      await new Promise((resolve) => setImmediate(resolve))
 
       assert.ok(
         progress.some(

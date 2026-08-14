@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     ops::RangeInclusive,
     path::Path,
     sync::{
@@ -166,6 +166,58 @@ impl Runtime {
         } else {
             Ok(Page::EMPTY)
         }
+    }
+
+    /// Resolves the immutable segment that currently owns each visible page.
+    ///
+    /// Sequential snapshot consumers can build this manifest once instead of
+    /// searching the page-version index independently for every page.
+    pub(crate) fn snapshot_page_origins(
+        &self,
+        snapshot: &Snapshot,
+    ) -> Result<BTreeMap<PageIdx, SegmentId>> {
+        let mut origins = BTreeMap::new();
+        let storage = self.storage().read();
+        let mut visible = storage.iter_visible_pages(snapshot);
+        while let Some((segment, pages)) = visible.next().transpose()? {
+            for pageidx in pages.iter() {
+                origins.insert(pageidx, segment.sid.clone());
+            }
+        }
+        Ok(origins)
+    }
+
+    /// Returns a conservative set of pages whose immutable storage origin is
+    /// different between two snapshots. Equal origins prove equal bytes;
+    /// different origins are candidates and may still contain equal bytes.
+    pub fn snapshot_changed_page_candidates(
+        &self,
+        from: &Snapshot,
+        to: &Snapshot,
+    ) -> Result<BTreeSet<u32>> {
+        let from_origins = self.snapshot_page_origins(from)?;
+        let to_origins = self.snapshot_page_origins(to)?;
+        let mut pages = BTreeSet::new();
+        for pageidx in from_origins.keys().chain(to_origins.keys()) {
+            if from_origins.get(pageidx) != to_origins.get(pageidx) {
+                pages.insert(pageidx.to_u32());
+            }
+        }
+        Ok(pages)
+    }
+
+    pub(crate) fn read_page_from_origin(
+        &self,
+        snapshot: &Snapshot,
+        pageidx: PageIdx,
+        segment: &SegmentId,
+    ) -> Result<Page> {
+        if let Some(page) = self.storage().read().read_page(segment.clone(), pageidx)? {
+            return Ok(page);
+        }
+        // A manifest also covers remotely backed frames. Preserve the existing
+        // hydration/fetch behavior when the page is not resident locally.
+        self.read_page(snapshot, pageidx)
     }
 
     fn run_action<A: Action>(&self, action: A) -> Result<()> {
@@ -902,6 +954,35 @@ mod tests {
             .unwrap();
         let second = second.commit().unwrap().snapshot().clone();
         assert!(runtime.snapshot_hydration_cached(&second).unwrap());
+    }
+
+    #[test]
+    fn rebinding_a_hydrated_snapshot_transfers_its_completeness_proof() {
+        let tokio_rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let remote = Arc::new(RemoteConfig::Memory.build().unwrap());
+        let storage = Arc::new(FjallStorage::open_temporary().unwrap());
+        let runtime = Runtime::new(tokio_rt.handle().clone(), remote, storage, None);
+        let source = runtime.volume_open(None, None, None).unwrap();
+        let mut writer = runtime.volume_writer(source.vid).unwrap();
+        for pageidx in 1..=7 {
+            writer
+                .write_page(PageIdx::must_new(pageidx), Page::test_filled(pageidx as u8))
+                .unwrap();
+        }
+        let source = writer.commit().unwrap();
+        assert!(
+            runtime
+                .snapshot_hydration_cached(source.snapshot())
+                .unwrap()
+        );
+
+        let rebound = runtime.volume_from_snapshot(source.snapshot()).unwrap();
+        let rebound = runtime.volume_snapshot(&rebound.vid).unwrap();
+
+        assert!(runtime.snapshot_hydration_cached(&rebound).unwrap());
     }
 
     #[test]

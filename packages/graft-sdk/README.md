@@ -197,7 +197,9 @@ application handles after the SDK promise settles; the Graft repository session 
 Merge apply and mutation results also return `worktree_paths`, a sorted, deduplicated list of the
 repository-relative paths actually created, replaced, or removed by that completed operation. Use
 the conservative gate before the call and this exact list to bound validation and refresh work
-afterward.
+afterward. In particular, an exact-token `continueMerge` may return `worktree_paths: []` when the
+validated final SQLite candidate was already installed by the resolving operation; the conservative
+before-call gate remains **Yes** because callers cannot assume that fast path in advance.
 
 `addAll` reads SQLite files and their committed/WAL state but does not replace them. Eidos should
 still checkpoint its application databases before snapshotting when it needs a deterministic
@@ -267,10 +269,14 @@ rewrite the recorded kind of an existing checkpoint.
 History and remote UI code should not call status merely to obtain repository metadata:
 
 ```js
-const { current_head, current_branch, upstream } =
+const { current_head, current_branch, upstream, upstream_target } =
   await session.repositoryMetadata({ signal })
 const { remotes } = await session.listRemotes({ signal })
 ```
+
+`upstream_target` is the last locally known remote-tracking commit for the
+configured upstream. It lets history UIs decorate the Remote/Cloud tip even
+after histories diverge, without fetching.
 
 Both calls read only refs/config metadata, never classify or materialize worktree paths, and report
 `telemetry.paths_examined: 0`. Remote entries contain `name`, typed `kind`, and a configured `url`;
@@ -437,6 +443,23 @@ materializes and stages one complete SQLite candidate and returns that path.
 The retained `RepositorySession` caches an immutable SQLite merge plan by Base/Ours/Theirs snapshot
 and frozen merge policy. Conflict inspection computes that plan once; later row, cell, and table
 choices in the same session reuse it instead of rescanning the complete database.
+Candidate construction likewise proves the exact immutable Ours state with a full SQLite
+`integrity_check` once per process. Exact content-state hits reuse only that non-forgeable memory
+proof; SQLite then applies and validates the transactional delta with native constraints,
+`cell_size_check`, index maintenance, and a complete `foreign_key_check`.
+On macOS, a proof-backed clean and exclusively locked Ours worktree can seed the private candidate
+with an APFS copy-on-write clone. Clone failure and other platforms use the authoritative snapshot
+path, so this optimization does not change repository or merge semantics.
+When SQLite WAL mode is available, candidate replay retains the committed WAL page numbers and,
+after SQLite successfully checkpoints and validates that same WAL, imports only pages that differ
+from Ours. Missing, partial, or inconsistent WAL data falls back to the authoritative full import;
+WAL pages are never merged across branches or treated as row-conflict semantics.
+After the final choice installs and stages a validated SQLite candidate, an exact-token
+`continueMerge` commits that state directly. It does not serialize or replace the same database a
+second time, and therefore reports `worktree_paths: []` for that completion. The SDK carries the
+validated file fingerprints across that ref/index-only commit, so the following status refresh is
+metadata-only. It still stats every tracked path and falls back to authoritative classification
+after any external write.
 Detailed SQLite results are exposed as bounded pages for the selected path. The analyzer computes
 the repository conflict set before filtering that page; path-scoped streaming analysis is follow-up
 work. The host must validate Eidos File semantics before calling `continueMerge`, then pass the

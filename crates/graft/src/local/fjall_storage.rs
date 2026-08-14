@@ -133,6 +133,8 @@ pub struct FjallStorage {
     /// one never enlarges the database's write set. This is deliberately analogous to Git's
     /// replaceable commit-graph/index helpers: deleting the directory only loses acceleration.
     hydration_cache_dir: PathBuf,
+    /// Process-local proofs for immutable Segment pages covered by hydrated snapshots.
+    hydrated_segment_pages: Mutex<BTreeMap<SegmentId, PageSet>>,
 
     /// Must be held while performing read+write transactions.
     /// Read-only and write-only transactions don't need to hold the lock as
@@ -175,6 +177,7 @@ impl FjallStorage {
             db,
             ks,
             hydration_cache_dir,
+            hydrated_segment_pages: Default::default(),
             lock: Default::default(),
         })
     }
@@ -221,6 +224,8 @@ impl FjallStorage {
                 }
             }
         }
+        drop(reader);
+        self.record_snapshot_hydrated_pages(snapshot)?;
         Ok(true)
     }
 
@@ -232,26 +237,48 @@ impl FjallStorage {
         let final_path = self
             .hydration_cache_dir
             .join(hydrated_snapshot_key(snapshot));
-        if final_path.is_file() {
-            return Ok(());
-        }
-        let temp_path = self.hydration_cache_dir.join(format!(
-            ".hydrated-{}-{}.tmp",
-            std::process::id(),
-            rand::random::<u64>()
-        ));
-        std::fs::write(&temp_path, b"hydrated\n")?;
-        match std::fs::rename(&temp_path, &final_path) {
-            Ok(()) => Ok(()),
-            Err(_error) if final_path.is_file() => {
-                let _ = std::fs::remove_file(temp_path);
-                Ok(())
-            }
-            Err(error) => {
-                let _ = std::fs::remove_file(temp_path);
-                Err(error.into())
+        if !final_path.is_file() {
+            let temp_path = self.hydration_cache_dir.join(format!(
+                ".hydrated-{}-{}.tmp",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
+            std::fs::write(&temp_path, b"hydrated\n")?;
+            match std::fs::rename(&temp_path, &final_path) {
+                Ok(()) => {}
+                Err(_error) if final_path.is_file() => {
+                    let _ = std::fs::remove_file(temp_path);
+                }
+                Err(error) => {
+                    let _ = std::fs::remove_file(temp_path);
+                    return Err(error.into());
+                }
             }
         }
+        self.record_snapshot_hydrated_pages(snapshot)
+    }
+
+    fn record_snapshot_hydrated_pages(&self, snapshot: &Snapshot) -> Result<(), FjallStorageErr> {
+        let reader = self.read();
+        let mut visible = reader.iter_visible_pages(snapshot);
+        let mut additions = BTreeMap::<SegmentId, PageSet>::new();
+        while let Some((segment, pages)) = visible.try_next()? {
+            additions
+                .entry(segment.sid)
+                .and_modify(|known| *known |= pages.clone())
+                .or_insert(pages);
+        }
+        drop(visible);
+        drop(reader);
+
+        let mut known = self.hydrated_segment_pages.lock();
+        for (segment, pages) in additions {
+            known
+                .entry(segment)
+                .and_modify(|existing| *existing |= pages.clone())
+                .or_insert(pages);
+        }
+        Ok(())
     }
 
     pub fn write_page(
@@ -264,6 +291,7 @@ impl FjallStorage {
     }
 
     pub fn remove_page(&self, sid: SegmentId, pageidx: PageIdx) -> Result<(), FjallStorageErr> {
+        self.hydrated_segment_pages.lock().remove(&sid);
         self.ks.pages.remove(PageKey::new(sid, pageidx))
     }
 
@@ -272,6 +300,7 @@ impl FjallStorage {
         sid: &SegmentId,
         pages: RangeInclusive<PageIdx>,
     ) -> Result<(), FjallStorageErr> {
+        self.hydrated_segment_pages.lock().remove(sid);
         // PageKeys are stored in descending order
         let keyrange =
             PageKey::new(sid.clone(), *pages.end())..=PageKey::new(sid.clone(), *pages.start());
@@ -301,6 +330,11 @@ impl FjallStorage {
     }
 
     pub fn volume_from_snapshot(&self, snapshot: &Snapshot) -> Result<Volume, FjallStorageErr> {
+        // A rebound Volume references the exact same immutable Segments. Transfer an existing
+        // completeness proof to the rewritten commit graph instead of making the first merge,
+        // diff, or push rediscover every resident frame. Missing proofs remain conservative and
+        // take the normal hydration path.
+        let source_is_fully_hydrated = self.snapshot_hydration_cached(snapshot)?;
         let volume = Volume::new_random();
         let commits: Vec<_> = self
             .read()
@@ -314,6 +348,10 @@ impl FjallStorage {
         }
         batch.write_volume(volume.clone());
         batch.commit()?;
+        if source_is_fully_hydrated {
+            let rebound = self.read().snapshot(&volume.vid)?;
+            self.mark_snapshot_hydrated(&rebound)?;
+        }
         Ok(volume)
     }
 
@@ -472,6 +510,7 @@ impl FjallStorage {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
+        self.hydrated_segment_pages.lock().clear();
 
         let mut batch = self.db.batch();
         for vid in candidate_volumes {
@@ -811,8 +850,17 @@ impl<'a> ReadGuard<'a> {
         snapshot: &Snapshot,
     ) -> Result<Vec<SegmentRangeRef>, FjallStorageErr> {
         let mut missing_frames = vec![];
+        let hydrated_segment_pages = self.storage.hydrated_segment_pages.lock().clone();
         let mut iter = self.iter_visible_pages(snapshot);
-        while let Some((idx, pageset)) = iter.try_next()? {
+        while let Some((idx, visible_pages)) = iter.try_next()? {
+            let pageset = hydrated_segment_pages
+                .get(&idx.sid)
+                .map_or(visible_pages.clone(), |known| {
+                    visible_pages.difference(known)
+                });
+            if pageset.is_empty() {
+                continue;
+            }
             // find candidate frames (intersects with the visible pageset)
             let frames = idx.iter_frames(|pages| pageset.contains_any(pages));
 

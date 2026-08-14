@@ -1562,7 +1562,7 @@ pub(super) fn prepare_sqlite_path_for_replacement(
     }
 }
 
-fn remove_sqlite_sidecars(path: &Path) -> Result<(), ErrCtx> {
+pub(super) fn remove_sqlite_sidecars(path: &Path) -> Result<(), ErrCtx> {
     for suffix in ["-wal", "-shm", "-journal"] {
         let mut sidecar = path.as_os_str().to_os_string();
         sidecar.push(suffix);
@@ -1699,10 +1699,66 @@ fn prepare_physical_sqlite_file_state_with_cache(
 pub(super) fn import_stable_sqlite_file_state(
     runtime: &Runtime,
     path: &Path,
+    base: Option<&CommitFileState>,
 ) -> Result<CommitFileState, ErrCtx> {
     let physical = PhysicalSqliteReader::open_stable(path)?;
-    import_sqlite_reader_state(runtime, path, None, &physical, None, None)
+    import_sqlite_reader_state(runtime, path, base, &physical, None, None)
         .map(|(state, _, _)| state)
+}
+
+/// Imports a stable SQLite candidate from a conservative set of physically changed pages.
+///
+/// Callers must derive `changed_pages` from SQLite's committed WAL frames. Every listed page is
+/// still compared with the immutable base before writing, so false positives are harmless. WAL
+/// validation failure must use [`import_stable_sqlite_file_state`] instead of calling this helper.
+pub(super) fn import_stable_sqlite_file_state_from_changed_pages(
+    runtime: &Runtime,
+    path: &Path,
+    base: &CommitFileState,
+    changed_pages: &BTreeSet<u32>,
+) -> Result<CommitFileState, ErrCtx> {
+    let physical = PhysicalSqliteReader::open_stable(path)?;
+    let base_reader = runtime.snapshot_reader(base.snapshot.to_snapshot());
+    let mut target = None;
+    for &page_number in changed_pages {
+        graft::repo::cancellation_checkpoint()?;
+        if page_number == 0 || page_number > physical.page_count().to_u32() {
+            continue;
+        }
+        let pageidx = PageIdx::try_from(page_number).map_err(|error| {
+            ErrCtx::InvalidCommand(
+                format!(
+                    "invalid SQLite WAL page index in `{}`: {error}",
+                    path.display()
+                )
+                .into(),
+            )
+        })?;
+        let page = physical.read_page(pageidx)?;
+        let unchanged = base_reader.page_count().contains(pageidx)
+            && sqlite_page_bytes_equal(
+                page_number,
+                base_reader.read_page(pageidx)?.as_ref(),
+                page.as_ref(),
+            );
+        if unchanged {
+            continue;
+        }
+        ensure_import_target(runtime, Some(base), &mut target)?
+            .writer
+            .write_page(pageidx, page)?;
+    }
+
+    if base.snapshot.page_count != physical.page_count() {
+        ensure_import_target(runtime, Some(base), &mut target)?
+            .writer
+            .soft_truncate(physical.page_count())?;
+    }
+
+    match target {
+        Some(target) => target.commit(runtime),
+        None => Ok(base.clone()),
+    }
 }
 
 fn import_sqlite_reader_state(
@@ -1957,6 +2013,51 @@ mod tests {
         connection
     }
 
+    fn next_random(seed: &mut u64) -> u64 {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        *seed
+    }
+
+    fn create_randomized_without_rowid_database(path: &Path) -> Connection {
+        let mut connection = Connection::open(path).unwrap();
+        connection
+            .pragma_update(None, "page_size", PAGESIZE.as_u32())
+            .unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE records(
+                    id TEXT PRIMARY KEY COLLATE BINARY,
+                    payload BLOB NOT NULL,
+                    marker INTEGER NOT NULL
+                 ) STRICT, WITHOUT ROWID;",
+            )
+            .unwrap();
+
+        let mut seed = 0x5EED_CAFE_F00D_BAAD_u64;
+        let transaction = connection.transaction().unwrap();
+        for index in 0..768_u32 {
+            let payload_len = if index % 41 == 0 {
+                9_000
+            } else {
+                128 + (next_random(&mut seed) % 1_700) as usize
+            };
+            transaction
+                .execute(
+                    "INSERT INTO records(id, payload, marker) VALUES (?1, ?2, ?3)",
+                    params![
+                        format!("base-{index:04}"),
+                        vec![(next_random(&mut seed) & 0xff) as u8; payload_len],
+                        next_random(&mut seed) as i64,
+                    ],
+                )
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+        connection
+    }
+
     fn prepare_with_forced_page_cache(
         runtime: &Runtime,
         repo: &Repository,
@@ -2059,6 +2160,106 @@ mod tests {
         let latest = runtime.volume_log(&updated.volume).unwrap().remove(0);
         assert!(latest.changed_pages > 0);
         assert!(latest.changed_pages < updated.snapshot.page_count.to_u32() as usize);
+    }
+
+    #[test]
+    fn sparse_page_candidates_match_authoritative_diff_across_randomized_btree_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("randomized-without-rowid.sqlite");
+        let mut connection = create_randomized_without_rowid_database(&path);
+        let runtime = test_runtime();
+        let mut previous = import_physical_sqlite_file_state(&runtime, &path, None).unwrap();
+        let mut seed = 0xA11C_E5E1_5A7E_2026_u64;
+
+        for round in 0..6_u32 {
+            let transaction = connection.transaction().unwrap();
+
+            // Update stable keys with both inline and overflow payloads.
+            for update in 0..48_u32 {
+                let index = 256 + (next_random(&mut seed) % 384) as u32;
+                let payload_len = if update % 7 == 0 {
+                    12_000 + (next_random(&mut seed) % 4_000) as usize
+                } else {
+                    64 + (next_random(&mut seed) % 2_400) as usize
+                };
+                transaction
+                    .execute(
+                        "UPDATE records SET payload = ?1, marker = ?2 WHERE id = ?3",
+                        params![
+                            vec![(next_random(&mut seed) & 0xff) as u8; payload_len],
+                            next_random(&mut seed) as i64,
+                            format!("base-{index:04}"),
+                        ],
+                    )
+                    .unwrap();
+            }
+
+            // Delete a disjoint key range while inserts force repeated page splits.
+            for deletion in 0..20_u32 {
+                let index = round * 20 + deletion;
+                transaction
+                    .execute(
+                        "DELETE FROM records WHERE id = ?1",
+                        [format!("base-{index:04}")],
+                    )
+                    .unwrap();
+            }
+            for insertion in 0..96_u32 {
+                let payload_len = if insertion % 11 == 0 {
+                    10_000
+                } else {
+                    96 + (next_random(&mut seed) % 2_000) as usize
+                };
+                transaction
+                    .execute(
+                        "INSERT INTO records(id, payload, marker) VALUES (?1, ?2, ?3)",
+                        params![
+                            format!("round-{round:02}-{insertion:04}"),
+                            vec![(next_random(&mut seed) & 0xff) as u8; payload_len],
+                            next_random(&mut seed) as i64,
+                        ],
+                    )
+                    .unwrap();
+            }
+            transaction.commit().unwrap();
+
+            let current =
+                import_physical_sqlite_file_state(&runtime, &path, Some(&previous)).unwrap();
+            let from = previous.snapshot.to_snapshot();
+            let to = current.snapshot.to_snapshot();
+            let candidates = runtime
+                .snapshot_changed_page_candidates(&from, &to)
+                .unwrap();
+            assert!(
+                !candidates.is_empty(),
+                "round {round} produced no candidates"
+            );
+
+            let authoritative =
+                crate::row_level_diff::row_level_diff_snapshots(&runtime, &from, &to).unwrap();
+            let sparse = crate::row_level_diff::row_level_diff_snapshots_with_page_candidates(
+                &runtime,
+                &from,
+                &to,
+                &candidates,
+            )
+            .unwrap();
+
+            assert_eq!(sparse.analysis, authoritative.analysis, "round {round}");
+            assert_eq!(
+                sparse.schema_changes, authoritative.schema_changes,
+                "round {round}"
+            );
+            assert_eq!(
+                sparse.table_changes, authoritative.table_changes,
+                "round {round}"
+            );
+            assert_eq!(
+                sparse.opaque_changes, authoritative.opaque_changes,
+                "round {round}"
+            );
+            previous = current;
+        }
     }
 
     #[test]

@@ -5,8 +5,13 @@ use std::{
 };
 
 use graft::{
-    GraftErr, core::VolumeId, remote::RemoteCredentials, repo::Repository, rt::runtime::Runtime,
-    snapshot::Snapshot, volume_reader::VolumeReadRef,
+    GraftErr,
+    core::VolumeId,
+    remote::RemoteCredentials,
+    repo::{CommitFileState, CommitTableSummary, Repository},
+    rt::runtime::Runtime,
+    snapshot::Snapshot,
+    volume_reader::VolumeReadRef,
 };
 use parking_lot::Mutex;
 
@@ -52,6 +57,14 @@ pub(crate) struct RepositorySessionContext {
     repository_database: Option<PathBuf>,
     prepared_sqlite_stages: Mutex<BTreeMap<String, Arc<PreparedSqliteStage>>>,
     row_merge_plans: Mutex<BTreeMap<String, Arc<RowMergePlan>>>,
+    row_merge_table_summaries: Mutex<BTreeMap<String, CachedRowMergeTableSummaries>>,
+}
+
+#[derive(Clone)]
+struct CachedRowMergeTableSummaries {
+    from: CommitFileState,
+    to: CommitFileState,
+    tables: Vec<CommitTableSummary>,
 }
 
 impl RepositorySessionContext {
@@ -73,6 +86,7 @@ impl RepositorySessionContext {
             repository_database,
             prepared_sqlite_stages: Mutex::new(BTreeMap::new()),
             row_merge_plans: Mutex::new(BTreeMap::new()),
+            row_merge_table_summaries: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -104,6 +118,35 @@ impl RepositorySessionContext {
             plans.clear();
         }
         plans.insert(key, plan);
+    }
+
+    pub(crate) fn cache_row_merge_table_summaries(
+        &self,
+        key: String,
+        from: CommitFileState,
+        to: CommitFileState,
+        tables: Vec<CommitTableSummary>,
+    ) {
+        self.row_merge_table_summaries
+            .lock()
+            .insert(key, CachedRowMergeTableSummaries { from, to, tables });
+    }
+
+    pub(crate) fn row_merge_table_summaries(
+        &self,
+        key: &str,
+        from: &CommitFileState,
+        to: &CommitFileState,
+    ) -> Option<Vec<CommitTableSummary>> {
+        self.row_merge_table_summaries
+            .lock()
+            .get(key)
+            .filter(|cached| &cached.from == from && &cached.to == to)
+            .map(|cached| cached.tables.clone())
+    }
+
+    pub(crate) fn clear_row_merge_table_summaries(&self) {
+        self.row_merge_table_summaries.lock().clear();
     }
 
     pub(crate) fn repository_database_path(&self) -> Option<&Path> {

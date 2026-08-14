@@ -191,10 +191,38 @@ names are validated repository configuration, not arbitrary SQL hooks.
 ### 5.6 Candidate database construction
 
 The engine builds every SQLite candidate in an isolated temporary database. It
-applies supported row/schema/internal resolutions with foreign-key and trigger
-side effects disabled for controlled replay, excludes configured/generated
-columns from writes, then validates the candidate with SQLite integrity and
-foreign-key checks before accepting it.
+first establishes an authoritative full SQLite `integrity_check` proof for the
+exact immutable Ours `(VolumeId, RepoSnapshot)` before mutation. A process MAY
+reuse that proof only for the identical content-addressed state; the proof MUST
+remain outside repository-controlled files, and a cache miss or eviction MUST
+rerun the complete check.
+
+It then applies supported row/schema/internal resolutions through one SQLite
+transaction with foreign-key and trigger side effects disabled for controlled
+replay, `cell_size_check` enabled, native constraints and index maintenance
+enabled, and configured/generated columns excluded from writes. A complete
+`foreign_key_check` runs after replay. Because the source has a full immutable
+integrity proof and only SQLite's transactional engine mutates it, validation
+work after that proof is proportional to the delta except for required
+cross-row foreign-key checks.
+
+When that exact integrity proof is already resident and preflight has proven a
+clean, exclusively locked worktree file equal to Ours, an implementation MAY
+use a filesystem copy-on-write clone as the private candidate seed. Clone
+failure or unsupported platforms MUST fall back to materializing the
+authoritative Graft snapshot. A filesystem clone is never itself an integrity
+or identity proof.
+
+When SQLite WAL mode is available, an implementation MAY retain the page
+numbers from every frame through the final committed frame while applying the
+transactional delta. It MAY use that set for sparse repository import only
+after SQLite successfully checkpoints the same WAL and the resulting database
+passes the required validation. Page numbers are conservative candidates:
+each candidate page MUST still be compared with the immutable Ours snapshot,
+and page-count changes MUST be handled explicitly. Missing, malformed,
+partial, uncommitted, or inconsistent WAL data MUST fall back to an
+authoritative full candidate import. WAL frames locate output pages only; they
+MUST NOT be merged across branches or used as row-conflict semantics.
 
 A candidate that fails validation MUST NOT replace the staged result or
 worktree or change the prior merge journal. Temporary databases are cleaned on
@@ -478,7 +506,8 @@ A conforming merge implementation MUST test:
 4. independent and conflicting SQLite row changes;
 5. composite keys, safe rowid remap, and semantic-key conflicts;
 6. supported/unsupported schema and opaque resolver paths;
-7. candidate integrity/foreign-key validation and rollback on failure;
+7. exact immutable-base integrity proof/reuse, transactional candidate
+   constraints, post-apply foreign-key validation, and rollback on failure;
 8. whole-path, text, and row resolution with stale-token protection;
 9. close/reopen persistence of status, conflict details, selections, and result;
 10. semantic-provider prepare/reopen, stale provider/state tokens, bounded
