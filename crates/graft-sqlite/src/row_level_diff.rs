@@ -768,6 +768,26 @@ pub fn row_level_diff_snapshots(
     row_level_diff_snapshots_for_table(runtime, from_snapshot, to_snapshot, None)
 }
 
+pub fn row_level_diff_snapshots_with_page_candidates(
+    runtime: &Runtime,
+    from_snapshot: &Snapshot,
+    to_snapshot: &Snapshot,
+    page_candidates: &BTreeSet<u32>,
+) -> Result<RowLevelDiff, graft::err::GraftErr> {
+    let from_reader = runtime.snapshot_reader(from_snapshot.clone());
+    let to_reader = runtime.snapshot_reader(to_snapshot.clone());
+    let from_lsn = from_snapshot.head().map_or(LSN::FIRST, |(_, lsn)| lsn);
+    let to_lsn = to_snapshot.head().map_or(LSN::FIRST, |(_, lsn)| lsn);
+    row_level_diff_from_readers(
+        &from_reader,
+        &to_reader,
+        from_lsn,
+        to_lsn,
+        None,
+        Some(page_candidates),
+    )
+}
+
 pub fn row_level_diff_snapshots_for_table(
     runtime: &Runtime,
     from_snapshot: &Snapshot,
@@ -797,7 +817,7 @@ pub fn row_level_diff_readers_for_table(
     to_lsn: LSN,
     table: Option<&str>,
 ) -> Result<RowLevelDiff, graft::err::GraftErr> {
-    row_level_diff_from_readers(from_reader, to_reader, from_lsn, to_lsn, table)
+    row_level_diff_from_readers(from_reader, to_reader, from_lsn, to_lsn, table, None)
 }
 
 /// Compute either an all-table summary or one bounded page of row details.
@@ -1478,6 +1498,7 @@ fn bounded_without_rowid_table(
             from_entry,
             to_entry,
             &layouts,
+            None,
             mode,
         );
     }
@@ -1639,6 +1660,7 @@ fn bounded_without_rowid_changed_pages(
     from_entry: &MasterEntry,
     to_entry: &MasterEntry,
     layouts: &WithoutRowidPairLayout,
+    candidate_pages: Option<(&BTreeSet<u32>, &BTreeSet<u32>)>,
     mode: &BoundedRowDiffMode,
 ) -> Result<BoundedTablePage, graft::err::GraftErr> {
     let from_scanner = TableScanner::new(from_reader).map_err(|error| {
@@ -1651,58 +1673,69 @@ fn bounded_without_rowid_changed_pages(
             "Failed to inspect target WITHOUT ROWID pages: {error}"
         ))
     })?;
-    let from_pages = from_scanner
-        .index_btree_pages(from_entry.root_page)
-        .map_err(|error| {
-            graft::err::LogicalErr::Other(format!(
-                "Failed to enumerate source WITHOUT ROWID pages: {error}"
-            ))
-        })?
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-    let to_pages = to_scanner
-        .index_btree_pages(to_entry.root_page)
-        .map_err(|error| {
-            graft::err::LogicalErr::Other(format!(
-                "Failed to enumerate target WITHOUT ROWID pages: {error}"
-            ))
-        })?
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-    let all_pages = from_pages.union(&to_pages).copied().collect::<Vec<_>>();
-    let mut changed_pages = Vec::new();
-    for (index, page_number) in all_pages.into_iter().enumerate() {
-        if index.is_multiple_of(1_024) {
-            bounded_cancellation_checkpoint()?;
+    let (from_pages, to_pages, changed_pages) = if let Some((from, to)) = candidate_pages {
+        (
+            from.clone(),
+            to.clone(),
+            from.union(to).copied().collect::<Vec<_>>(),
+        )
+    } else {
+        let from_pages = from_scanner
+            .index_btree_pages(from_entry.root_page)
+            .map_err(|error| {
+                graft::err::LogicalErr::Other(format!(
+                    "Failed to enumerate source WITHOUT ROWID pages: {error}"
+                ))
+            })?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let to_pages = to_scanner
+            .index_btree_pages(to_entry.root_page)
+            .map_err(|error| {
+                graft::err::LogicalErr::Other(format!(
+                    "Failed to enumerate target WITHOUT ROWID pages: {error}"
+                ))
+            })?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let all_pages = from_pages.union(&to_pages).copied().collect::<Vec<_>>();
+        let mut changed_pages = Vec::new();
+        for (index, page_number) in all_pages.into_iter().enumerate() {
+            if index.is_multiple_of(1_024) {
+                bounded_cancellation_checkpoint()?;
+            }
+            if !from_pages.contains(&page_number) || !to_pages.contains(&page_number) {
+                changed_pages.push(page_number);
+                continue;
+            }
+            let page_idx = PageIdx::try_new(page_number).ok_or_else(|| {
+                graft::err::LogicalErr::Other(format!(
+                    "Invalid WITHOUT ROWID page index {page_number}"
+                ))
+            })?;
+            let from_page = from_reader.read_page(page_idx)?;
+            let to_page = to_reader.read_page(page_idx)?;
+            if from_page != to_page
+                || from_scanner
+                    .index_page_has_overflow(page_number)
+                    .map_err(|error| {
+                        graft::err::LogicalErr::Other(format!(
+                            "Failed to inspect source WITHOUT ROWID overflow pages: {error}"
+                        ))
+                    })?
+                || to_scanner
+                    .index_page_has_overflow(page_number)
+                    .map_err(|error| {
+                        graft::err::LogicalErr::Other(format!(
+                            "Failed to inspect target WITHOUT ROWID overflow pages: {error}"
+                        ))
+                    })?
+            {
+                changed_pages.push(page_number);
+            }
         }
-        if !from_pages.contains(&page_number) || !to_pages.contains(&page_number) {
-            changed_pages.push(page_number);
-            continue;
-        }
-        let page_idx = PageIdx::try_new(page_number).ok_or_else(|| {
-            graft::err::LogicalErr::Other(format!("Invalid WITHOUT ROWID page index {page_number}"))
-        })?;
-        let from_page = from_reader.read_page(page_idx)?;
-        let to_page = to_reader.read_page(page_idx)?;
-        if from_page != to_page
-            || from_scanner
-                .index_page_has_overflow(page_number)
-                .map_err(|error| {
-                    graft::err::LogicalErr::Other(format!(
-                        "Failed to inspect source WITHOUT ROWID overflow pages: {error}"
-                    ))
-                })?
-            || to_scanner
-                .index_page_has_overflow(page_number)
-                .map_err(|error| {
-                    graft::err::LogicalErr::Other(format!(
-                        "Failed to inspect target WITHOUT ROWID overflow pages: {error}"
-                    ))
-                })?
-        {
-            changed_pages.push(page_number);
-        }
-    }
+        (from_pages, to_pages, changed_pages)
+    };
 
     let from_rows = changed_without_rowid_records(
         &from_scanner,
@@ -2102,7 +2135,65 @@ fn row_level_diff_checked_out(
         graft::err::LogicalErr::Other(format!("Failed to create reader for {to_vid}: {e:?}"))
     })?;
 
-    row_level_diff_from_readers(&from_reader, &to_reader, from_lsn, to_lsn, None)
+    row_level_diff_from_readers(&from_reader, &to_reader, from_lsn, to_lsn, None, None)
+}
+
+struct CandidateTablePages {
+    from: BTreeMap<String, BTreeSet<u32>>,
+    to: BTreeMap<String, BTreeSet<u32>>,
+}
+
+fn direct_candidate_table_pages(
+    from_scanner: &TableScanner<'_>,
+    to_scanner: &TableScanner<'_>,
+    from_master: &[MasterEntry],
+    to_master: &[MasterEntry],
+    ignored_tables: &HashSet<String>,
+    candidates: &BTreeSet<u32>,
+) -> Option<CandidateTablePages> {
+    if from_master
+        .iter()
+        .chain(to_master)
+        .any(|entry| is_diffable_table(entry, ignored_tables) && !is_without_rowid_table(entry))
+    {
+        return None;
+    }
+    let (from, from_covered) =
+        candidate_table_pages_for_side(from_scanner, from_master, ignored_tables, candidates)?;
+    let (to, to_covered) =
+        candidate_table_pages_for_side(to_scanner, to_master, ignored_tables, candidates)?;
+    let mut required = candidates.clone();
+    required.remove(&PageIdx::FIRST.to_u32());
+    let covered = from_covered
+        .union(&to_covered)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    required
+        .is_subset(&covered)
+        .then_some(CandidateTablePages { from, to })
+}
+
+fn candidate_table_pages_for_side(
+    scanner: &TableScanner<'_>,
+    master: &[MasterEntry],
+    ignored_tables: &HashSet<String>,
+    candidates: &BTreeSet<u32>,
+) -> Option<(BTreeMap<String, BTreeSet<u32>>, BTreeSet<u32>)> {
+    let mut tables = BTreeMap::new();
+    let mut covered = BTreeSet::new();
+    for entry in master {
+        if entry.root_page == 0 || !matches!(entry.entry_type.as_str(), "table" | "index") {
+            continue;
+        }
+        let matched = scanner
+            .btree_candidate_pages(entry.root_page, candidates)
+            .ok()?;
+        covered.extend(matched.iter().copied());
+        if is_diffable_table(entry, ignored_tables) && is_without_rowid_table(entry) {
+            tables.insert(entry.name.clone(), matched);
+        }
+    }
+    Some((tables, covered))
 }
 
 pub(crate) struct MaterializedSnapshot {
@@ -2236,6 +2327,7 @@ fn row_level_diff_from_readers(
     from_lsn: LSN,
     to_lsn: LSN,
     table_filter: Option<&str>,
+    page_candidates: Option<&BTreeSet<u32>>,
 ) -> Result<RowLevelDiff, graft::err::GraftErr> {
     let native_page_size = PAGESIZE.as_u32();
     let needs_materialized_schema = sqlite_page_size(from_reader)? != native_page_size
@@ -2307,6 +2399,16 @@ fn row_level_diff_from_readers(
     );
     dedupe_limitations(&mut limitations);
     let ignored_tables: HashSet<String> = ignored_table_infos.keys().cloned().collect();
+    let candidate_table_pages = page_candidates.and_then(|candidates| {
+        direct_candidate_table_pages(
+            &from_scanner,
+            &to_scanner,
+            &from_master,
+            &to_master,
+            &ignored_tables,
+            candidates,
+        )
+    });
     let opaque_changes = diff_opaque_tables(
         from_reader,
         to_reader,
@@ -2415,12 +2517,26 @@ fn row_level_diff_from_readers(
             // Merge needs the complete logical change set, but it does not need to
             // materialize and SELECT the complete table. The direct decoder finds
             // changed B-tree pages and decodes only the primary-key records on them.
+            let from_candidates = candidate_table_pages
+                .as_ref()
+                .and_then(|pages| pages.from.get(&table_name))
+                .cloned()
+                .unwrap_or_default();
+            let to_candidates = candidate_table_pages
+                .as_ref()
+                .and_then(|pages| pages.to.get(&table_name))
+                .cloned()
+                .unwrap_or_default();
+            let candidate_pages = candidate_table_pages
+                .as_ref()
+                .map(|_| (&from_candidates, &to_candidates));
             let page = bounded_without_rowid_changed_pages(
                 from_reader,
                 to_reader,
                 from,
                 to,
                 layouts,
+                candidate_pages,
                 &BoundedRowDiffMode::Rows {
                     table: table_name.clone(),
                     limit: usize::MAX,

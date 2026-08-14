@@ -6,7 +6,7 @@
 //! - Traversing B-tree to read table data
 //! - Serializing/deserializing records
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 
 use graft::core::PageIdx;
 use graft::volume_reader::VolumeRead;
@@ -401,6 +401,21 @@ impl<'a> TableScanner<'a> {
         Ok(pages)
     }
 
+    /// Find candidate pages owned by one B-tree without reading every leaf.
+    ///
+    /// SQLite B-trees are height-balanced. At each interior level we inspect
+    /// one child to learn whether all siblings are leaves; leaf siblings can
+    /// then be matched by page number without loading their payloads.
+    pub fn btree_candidate_pages(
+        &self,
+        root_page: u32,
+        candidates: &BTreeSet<u32>,
+    ) -> Result<BTreeSet<u32>, ParseError> {
+        let mut matched = BTreeSet::new();
+        self.collect_btree_candidate_pages(root_page, candidates, &mut matched)?;
+        Ok(matched)
+    }
+
     /// Decode all records stored directly on one index B-tree page.
     ///
     /// Interior index cells contain complete records as well as child pointers, so they must be
@@ -504,6 +519,65 @@ impl<'a> TableScanner<'a> {
         }
         let right_child = header.right_child_ptr.ok_or(ParseError::InvalidPage)?;
         self.collect_index_btree_pages(right_child, pages)
+    }
+
+    fn collect_btree_candidate_pages(
+        &self,
+        page_num: u32,
+        candidates: &BTreeSet<u32>,
+        matched: &mut BTreeSet<u32>,
+    ) -> Result<(), ParseError> {
+        let (full_page, header_offset, header) = self.read_table_page(page_num)?;
+        if candidates.contains(&page_num) {
+            matched.insert(page_num);
+        }
+        if matches!(header.page_type, 10 | 13) {
+            return Ok(());
+        }
+        if !matches!(header.page_type, 2 | 5) {
+            return Err(ParseError::InvalidPage);
+        }
+        let page_bytes = full_page.as_ref();
+        let mut children = Vec::with_capacity(usize::from(header.num_cells) + 1);
+        for cell_index in 0..header.num_cells {
+            let ptr_offset = header_offset + header.header_size() + usize::from(cell_index) * 2;
+            if ptr_offset + 2 > page_bytes.len() {
+                return Err(ParseError::InvalidCell);
+            }
+            let cell_offset = usize::from(u16::from_be_bytes([
+                page_bytes[ptr_offset],
+                page_bytes[ptr_offset + 1],
+            ]));
+            if cell_offset + 4 > page_bytes.len() {
+                return Err(ParseError::InvalidCell);
+            }
+            children.push(u32::from_be_bytes([
+                page_bytes[cell_offset],
+                page_bytes[cell_offset + 1],
+                page_bytes[cell_offset + 2],
+                page_bytes[cell_offset + 3],
+            ]));
+        }
+        children.push(header.right_child_ptr.ok_or(ParseError::InvalidPage)?);
+        let Some(first_child) = children.first().copied() else {
+            return Err(ParseError::InvalidPage);
+        };
+        let (_, _, first_header) = self.read_table_page(first_child)?;
+        if matches!(first_header.page_type, 10 | 13) {
+            for child in children {
+                if candidates.contains(&child) {
+                    matched.insert(child);
+                }
+            }
+            return Ok(());
+        }
+        if !matches!(first_header.page_type, 2 | 5) {
+            return Err(ParseError::InvalidPage);
+        }
+        for child in children {
+            self.collect_btree_candidate_pages(child, candidates, matched)?;
+        }
+        Ok(())
     }
 
     fn collect_index_stream_items(

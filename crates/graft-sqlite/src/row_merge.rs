@@ -4,7 +4,8 @@ use graft::{repo::CommitFileState, rt::runtime::Runtime};
 
 use crate::row_level_diff::{
     InsertRowidMode, OpaqueChange, OpaqueChangeReason, RowChange, RowIdentity, RowLevelDiff,
-    RowLevelDiffLimitation, SchemaChange, SchemaChangeKind, TableChanges, row_level_diff_snapshots,
+    RowLevelDiffLimitation, SchemaChange, SchemaChangeKind, TableChanges,
+    row_level_diff_snapshots_with_page_candidates,
 };
 use crate::sqlite_parse::{
     ColumnDefinition, GeneratedColumnKind, Record, Value, parse_create_table_column_definitions,
@@ -773,13 +774,29 @@ pub fn plan_snapshot_merge_with_policy(
     let base_snapshot = base.snapshot.to_snapshot();
     let ours_snapshot = ours.snapshot.to_snapshot();
     let theirs_snapshot = theirs.snapshot.to_snapshot();
+    let ours_page_candidates =
+        runtime.snapshot_changed_page_candidates(&base_snapshot, &ours_snapshot)?;
+    let theirs_page_candidates =
+        runtime.snapshot_changed_page_candidates(&base_snapshot, &theirs_snapshot)?;
     // Both sides are independent reads of the same immutable base snapshot. Running them
     // together avoids serially scanning large databases during merge planning.
     let (ours_diff, theirs_diff) = std::thread::scope(|scope| {
-        let ours =
-            scope.spawn(|| row_level_diff_snapshots(runtime, &base_snapshot, &ours_snapshot));
-        let theirs =
-            scope.spawn(|| row_level_diff_snapshots(runtime, &base_snapshot, &theirs_snapshot));
+        let ours = scope.spawn(|| {
+            row_level_diff_snapshots_with_page_candidates(
+                runtime,
+                &base_snapshot,
+                &ours_snapshot,
+                &ours_page_candidates,
+            )
+        });
+        let theirs = scope.spawn(|| {
+            row_level_diff_snapshots_with_page_candidates(
+                runtime,
+                &base_snapshot,
+                &theirs_snapshot,
+                &theirs_page_candidates,
+            )
+        });
         (
             ours.join().expect("ours row diff worker panicked"),
             theirs.join().expect("theirs row diff worker panicked"),

@@ -187,6 +187,25 @@ impl Runtime {
         Ok(origins)
     }
 
+    /// Returns a conservative set of pages whose immutable storage origin is
+    /// different between two snapshots. Equal origins prove equal bytes;
+    /// different origins are candidates and may still contain equal bytes.
+    pub fn snapshot_changed_page_candidates(
+        &self,
+        from: &Snapshot,
+        to: &Snapshot,
+    ) -> Result<BTreeSet<u32>> {
+        let from_origins = self.snapshot_page_origins(from)?;
+        let to_origins = self.snapshot_page_origins(to)?;
+        let mut pages = BTreeSet::new();
+        for pageidx in from_origins.keys().chain(to_origins.keys()) {
+            if from_origins.get(pageidx) != to_origins.get(pageidx) {
+                pages.insert(pageidx.to_u32());
+            }
+        }
+        Ok(pages)
+    }
+
     pub(crate) fn read_page_from_origin(
         &self,
         snapshot: &Snapshot,
