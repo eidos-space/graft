@@ -394,6 +394,35 @@ impl RowMergePlan {
         self.source_apply_sql(&self.theirs_diff, &self.schema_additions)
     }
 
+    pub fn theirs_apply_table_summaries(&self) -> Vec<(String, usize, usize, usize)> {
+        let conflict_rows = self.conflict_rows();
+        let mut summaries = BTreeMap::<String, (usize, usize, usize)>::new();
+        for table in &self.theirs_diff.table_changes {
+            for change in &table.changes {
+                let row = RowKey::from_change(&table.table_name, change);
+                if self.identical_touches.contains(&row)
+                    || conflict_rows.contains(&row)
+                    || self.merged_rows.contains_key(&row)
+                {
+                    continue;
+                }
+                let counts = summaries.entry(table.table_name.clone()).or_default();
+                match change {
+                    RowChange::Insert { .. } | RowChange::PrimaryKeyInsert { .. } => counts.0 += 1,
+                    RowChange::Delete { .. } | RowChange::PrimaryKeyDelete { .. } => counts.1 += 1,
+                    RowChange::Update { .. } | RowChange::PrimaryKeyUpdate { .. } => counts.2 += 1,
+                }
+            }
+        }
+        for row in self.merged_rows.keys() {
+            summaries.entry(row.table.clone()).or_default().2 += 1;
+        }
+        summaries
+            .into_iter()
+            .map(|(table, (inserts, deletes, updates))| (table, inserts, deletes, updates))
+            .collect()
+    }
+
     /// SQL for the safe Theirs projection while leaving provider-owned tables at Ours.
     pub fn theirs_apply_sql_excluding(&self, excluded_tables: &BTreeSet<String>) -> String {
         self.source_apply_sql_excluding(&self.theirs_diff, &self.schema_additions, excluded_tables)
@@ -747,12 +776,10 @@ pub fn plan_snapshot_merge_with_policy(
     // Both sides are independent reads of the same immutable base snapshot. Running them
     // together avoids serially scanning large databases during merge planning.
     let (ours_diff, theirs_diff) = std::thread::scope(|scope| {
-        let ours = scope.spawn(|| {
-            row_level_diff_snapshots(runtime, &base_snapshot, &ours_snapshot)
-        });
-        let theirs = scope.spawn(|| {
-            row_level_diff_snapshots(runtime, &base_snapshot, &theirs_snapshot)
-        });
+        let ours =
+            scope.spawn(|| row_level_diff_snapshots(runtime, &base_snapshot, &ours_snapshot));
+        let theirs =
+            scope.spawn(|| row_level_diff_snapshots(runtime, &base_snapshot, &theirs_snapshot));
         (
             ours.join().expect("ours row diff worker panicked"),
             theirs.join().expect("theirs row diff worker panicked"),

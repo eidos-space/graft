@@ -1098,6 +1098,14 @@ pub(super) fn try_row_auto_merge_paths(
                 return Ok(None);
             }
             let applied_changes = plan.apply_change_count();
+            let tables = plan
+                .theirs_apply_table_summaries()
+                .into_iter()
+                .filter_map(|(name, inserts, deletes, updates)| {
+                    table_summary(name, inserts, deletes, updates)
+                })
+                .collect::<Vec<_>>();
+            let summary_from = ours.clone();
             let merged = if plan.can_resolve_to_ours_without_apply() {
                 ours
             } else if applied_changes > 0 {
@@ -1111,6 +1119,7 @@ pub(super) fn try_row_auto_merge_paths(
             } else {
                 return Ok(None);
             };
+            file.cache_row_merge_table_summaries(key.clone(), summary_from, merged.clone(), tables);
             Ok(Some((
                 merged,
                 applied_changes,

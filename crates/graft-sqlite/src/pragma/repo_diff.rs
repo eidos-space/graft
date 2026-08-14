@@ -672,13 +672,6 @@ pub(super) fn repo_file_state_content_eq(
     Ok(runtime.snapshot_checksum(&left_snapshot)? == runtime.snapshot_checksum(&right_snapshot)?)
 }
 
-pub(super) fn staged_commit_table_summary(
-    runtime: &Runtime,
-    repo: &Repository,
-) -> Result<Vec<CommitTableSummary>, ErrCtx> {
-    staged_commit_table_summary_with_prepared(runtime, repo, None)
-}
-
 pub(super) fn staged_commit_table_summary_for_file(
     runtime: &Runtime,
     file: &RepositorySessionContext,
@@ -711,6 +704,11 @@ fn repo_file_table_summary_with_prepared(
 ) -> Result<Vec<CommitTableSummary>, ErrCtx> {
     match (&file.from, &file.to) {
         (Some(from), Some(to)) => {
+            if let Some(summaries) = prepared_file.and_then(|prepared_file| {
+                prepared_file.row_merge_table_summaries(&file.path, from, to)
+            }) {
+                return Ok(summaries);
+            }
             let from_snapshot = from.snapshot.to_snapshot();
             let to_snapshot = to.snapshot.to_snapshot();
             if from_snapshot.is_empty() {

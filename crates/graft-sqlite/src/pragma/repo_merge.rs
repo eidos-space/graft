@@ -26,6 +26,7 @@ pub(super) fn run_repo_merge_abort(
         None,
     )?;
     clear_row_conflict_resolution_state(&repo)?;
+    file.clear_row_merge_table_summaries();
     let branch = repo.current_branch()?;
     Ok(RepoMergeAbortCommandOutcome { target, branch, paths })
 }
@@ -45,10 +46,11 @@ pub(super) fn run_repo_merge_continue(
     try_row_auto_merge_current_file_status_conflict(runtime, file, &repo, None)?;
     let conflicted = repo.status()?.conflicted;
     try_row_auto_merge_paths(runtime, file, &repo, &conflicted, None, false)?;
-    let tables = staged_commit_table_summary(runtime, &repo)?;
+    let tables = staged_commit_table_summary_for_file(runtime, file, &repo)?;
     let commit = repo.commit_staged_with_table_summary(message, tables)?;
     let materialized = materialize_commit_sqlite_files(runtime, &repo, &commit)?;
     clear_row_conflict_resolution_state(&repo)?;
+    file.clear_row_merge_table_summaries();
     let branch = repo.current_branch()?;
     Ok(RepoCommitOutcome { commit, branch, materialized })
 }
@@ -66,6 +68,7 @@ pub(super) fn run_repo_merge(
         return pragma_err!("cannot merge with staged or unstaged changes");
     }
     clear_row_conflict_resolution_state(&repo)?;
+    file.clear_row_merge_table_summaries();
     let plan = repo.plan_merge_revision(rev)?;
     // A merge may target a fetched remote-tracking revision whose SQLite storage commits are
     // not hydrated yet. Prefer local storage for base/ours and fall back to the configured remote
