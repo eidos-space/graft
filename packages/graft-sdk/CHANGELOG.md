@@ -5,6 +5,8 @@ SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
 
 ## Unreleased
 
+## Graft SDK 0.3.15 — 2026-08-15
+
 ### Added
 
 - `repositoryMetadata()` now reports the last locally known upstream target so history UIs can
@@ -16,7 +18,9 @@ SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
   `WITHOUT ROWID` analysis to changed B-tree pages instead of repeatedly materializing complete
   database pairs. Candidate construction also establishes one full integrity proof for an exact
   immutable Ours state before mutation, then validates SQLite's transactional delta instead of
-  cold-scanning every inherited page again.
+  cold-scanning every inherited page again. On the retained macOS 417 MiB Eidos fixture, warmed
+  merge lifecycle P95 fell from 42.34 seconds to 1.56 seconds; a fresh process completed in 2.93
+  seconds.
 - On macOS, an already-proven, clean, exclusively locked Ours worktree seeds private merge
   candidates with an APFS copy-on-write clone. Unsupported filesystems and other platforms retain
   the authoritative snapshot-materialization fallback.
