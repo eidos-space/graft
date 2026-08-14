@@ -2867,20 +2867,25 @@ impl RepositorySession {
         self.with_state(|state| {
             let SessionState { service, status_cache } = state;
             let service = service.as_mut().ok_or_else(session_closed_error)?;
-            require_merge_state_token(service, status_cache, &options.expected_state_token)?;
+            let validated =
+                require_merge_state_token(service, status_cache, &options.expected_state_token)?;
             let semantic_workspaces = service
                 .repository()
                 .map_err(repository_command_error)?
                 .graft_dir()
                 .join(SEMANTIC_MERGE_WORKSPACE_DIRECTORY);
-            let output = execute_json_command(
-                service,
-                RepositoryCommand::merge_continue(options.message.clone()),
-                "merge_continue",
-            )?;
+            let command = if validated.status.has_unstaged_changes {
+                RepositoryCommand::merge_continue(options.message.clone())
+            } else {
+                RepositoryCommand::merge_continue_validated(options.message.clone())
+            };
+            let output = execute_json_command(service, command, "merge_continue")?;
             status_cache.invalidate();
-            let incremental = refresh_incremental_status(service, status_cache)?;
-            let merge = merge_status_from_incremental(service, &incremental)?;
+            // A successful merge-continue command atomically removes MERGE_HEAD. Refreshing the
+            // entire worktree here only rediscovers that deterministic postcondition; leave the
+            // cache invalidated so the next independent status request still performs its normal
+            // freshness checks.
+            let merge = MergeStatus::None;
             let worktree_paths = merge_worktree_paths_from_output(&output);
             let _ = fs::remove_dir_all(semantic_workspaces);
             Ok(MergeOperationResult { output, merge, worktree_paths })
@@ -6041,6 +6046,11 @@ mod tests {
             })
             .unwrap();
         assert_eq!(completed.merge, MergeStatus::None);
+        assert!(
+            completed.worktree_paths.is_empty(),
+            "a token-validated merge candidate must not be rewritten after it is committed"
+        );
+        assert_eq!(session.get_merge_status().unwrap(), MergeStatus::None);
         assert!(!directory.path().join(".graft/semantic-merge").exists());
         session.close().unwrap();
     }

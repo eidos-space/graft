@@ -326,6 +326,9 @@ pub(crate) enum GraftCommand {
     /// `pragma graft_json_merge_continue = "message";`
     JsonMergeContinue { message: String },
 
+    /// SDK-only continuation after an exact merge-state token proved the worktree unchanged.
+    JsonMergeContinueValidated { message: String },
+
     /// `pragma graft_conflicts;`
     Conflicts,
 
@@ -1373,7 +1376,7 @@ impl GraftCommand {
             }
 
             GraftCommand::MergeContinue { message } => {
-                let outcome = run_repo_merge_continue(&runtime, file, message)?;
+                let outcome = run_repo_merge_continue(&runtime, file, message, true)?;
                 let commit = outcome.commit;
                 Ok(Some(format!(
                     "Merge commit [{}] {}",
@@ -1382,7 +1385,24 @@ impl GraftCommand {
                 )))
             }
             GraftCommand::JsonMergeContinue { message } => {
-                let outcome = run_repo_merge_continue(&runtime, file, message)?;
+                let outcome = run_repo_merge_continue(&runtime, file, message, true)?;
+                let head = outcome.commit.id.clone();
+                let paths = json_commit_path_changes(&outcome.commit);
+                let repo = repo_for_file(file)?;
+                let (current_head, current_branch) = repo_head_and_branch(&repo)?;
+                Ok(Some(to_json(&JsonMergeContinueCommandOutcome {
+                    operation: "merge_continue",
+                    current_head,
+                    current_branch,
+                    head,
+                    branch: outcome.branch,
+                    paths,
+                    materialized: outcome.materialized,
+                    commit: json_commit_summary(outcome.commit),
+                })?))
+            }
+            GraftCommand::JsonMergeContinueValidated { message } => {
+                let outcome = run_repo_merge_continue(&runtime, file, message, false)?;
                 let head = outcome.commit.id.clone();
                 let paths = json_commit_path_changes(&outcome.commit);
                 let repo = repo_for_file(file)?;

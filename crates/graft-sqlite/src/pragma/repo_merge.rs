@@ -35,6 +35,7 @@ pub(super) fn run_repo_merge_continue(
     runtime: &Runtime,
     file: &mut RepositorySessionContext,
     message: String,
+    materialize_sqlite: bool,
 ) -> Result<RepoCommitOutcome, ErrCtx> {
     if !file.is_idle() {
         return pragma_err!("cannot continue merge while there is an open transaction");
@@ -48,7 +49,11 @@ pub(super) fn run_repo_merge_continue(
     try_row_auto_merge_paths(runtime, file, &repo, &conflicted, None, false)?;
     let tables = staged_commit_table_summary_for_file(runtime, file, &repo)?;
     let commit = repo.commit_staged_with_table_summary(message, tables)?;
-    let materialized = materialize_commit_sqlite_files(runtime, &repo, &commit)?;
+    let materialized = if materialize_sqlite {
+        materialize_commit_sqlite_files(runtime, &repo, &commit)?
+    } else {
+        Vec::new()
+    };
     clear_row_conflict_resolution_state(&repo)?;
     file.clear_row_merge_table_summaries();
     let branch = repo.current_branch()?;
