@@ -5,6 +5,8 @@ SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
 
 ## Unreleased
 
+## Graft SDK 0.3.16 — 2026-08-16
+
 ### Fixed
 
 - `applyMerge()` now accepts the same optional transfer-progress callback as fetch and pull. Hosts

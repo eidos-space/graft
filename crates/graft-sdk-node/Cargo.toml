@@ -1,6 +1,6 @@
 [package]
 name = "graft-sdk-node"
-version = "0.3.15"
+version = "0.3.16"
 edition = "2024"
 authors.workspace = true
 license.workspace = true
@@ -18,7 +18,7 @@ crate-type = ["cdylib"]
 workspace = true
 
 [dependencies]
-graft-sdk = { path = "../graft-sdk", version = "0.3.15", features = ["bundled-sqlite"] }
+graft-sdk = { path = "../graft-sdk", version = "0.3.16", features = ["bundled-sqlite"] }
 napi = { workspace = true }
 napi-derive = { workspace = true }
 serde_json = "1.0"
