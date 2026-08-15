@@ -1769,7 +1769,7 @@ fn stage_artifact_path_commits_regular_file_and_status_tracks_changes() {
     let entry = repo.stage_artifact_path(&notes).unwrap();
     assert_eq!(entry.path, "notes.txt");
     assert!(entry.file.is_none());
-    let state = entry.artifact.clone().expect("artifact staged");
+    let state = entry.artifact.expect("artifact staged");
     assert_eq!(state.size(), 15);
     assert_eq!(
         *state.content_hash(),
@@ -1779,7 +1779,7 @@ fn stage_artifact_path_commits_regular_file_and_status_tracks_changes() {
     let commit = repo.commit_staged("track notes").unwrap();
     assert!(commit.files.is_empty());
     assert_eq!(commit.artifacts.get("notes.txt"), Some(&state));
-    assert_eq!(repo.head_artifact(&notes).unwrap(), Some(state.clone()));
+    assert_eq!(repo.head_artifact(&notes).unwrap(), Some(state));
     assert!(!repo.status().unwrap().dirty);
 
     let object::Object::Tree(tree) = repo
@@ -1921,7 +1921,7 @@ fn large_artifact_uses_pointer_blob_and_materializes_content() {
     let entry = repo
         .stage_artifact_path_with_inline_text_threshold(&asset, 4)
         .unwrap();
-    let state = entry.artifact.clone().expect("artifact staged");
+    let state = entry.artifact.expect("artifact staged");
     assert!(state.is_large());
     assert_eq!(state.size(), bytes.len() as u64);
     assert_eq!(*state.content_hash(), object::ObjectId::for_bytes(bytes));

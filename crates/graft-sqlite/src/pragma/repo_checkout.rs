@@ -1504,15 +1504,13 @@ pub(super) fn restore_repo_key(
                 .cloned()
                 .map(RestoredRepoPathState::Artifact)
         }
+    } else if let Some(state) = repo.index_files()?.get(key).cloned() {
+        Some(RestoredRepoPathState::File(state))
     } else {
-        if let Some(state) = repo.index_files()?.get(key).cloned() {
-            Some(RestoredRepoPathState::File(state))
-        } else {
-            repo.index_artifacts()?
-                .get(key)
-                .cloned()
-                .map(RestoredRepoPathState::Artifact)
-        }
+        repo.index_artifacts()?
+            .get(key)
+            .cloned()
+            .map(RestoredRepoPathState::Artifact)
     };
 
     if restored.is_none() {
@@ -1671,16 +1669,16 @@ pub(super) fn restore_keys_for_pathspec(
                 .filter(|key| repo_key_matches_filter(key, filter))
                 .cloned(),
         );
-    } else if spec.staged {
-        if let Ok(head) = repo.show_revision("HEAD") {
-            keys.extend(
-                head.files
-                    .keys()
-                    .chain(head.artifacts.keys())
-                    .filter(|key| repo_key_matches_filter(key, filter))
-                    .cloned(),
-            );
-        }
+    } else if spec.staged
+        && let Ok(head) = repo.show_revision("HEAD")
+    {
+        keys.extend(
+            head.files
+                .keys()
+                .chain(head.artifacts.keys())
+                .filter(|key| repo_key_matches_filter(key, filter))
+                .cloned(),
+        );
     }
 
     keys.extend(
@@ -2140,6 +2138,7 @@ fn write_repo_file_state_to_prepared_path(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn checkout_merge_outcome(
     runtime: &Runtime,
     file: &mut RepositorySessionContext,

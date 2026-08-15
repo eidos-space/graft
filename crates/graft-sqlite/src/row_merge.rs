@@ -100,7 +100,7 @@ impl RowMergeInternalResolver {
         }
     }
 
-    pub fn from_str(value: &str) -> Option<Self> {
+    pub fn parse(value: &str) -> Option<Self> {
         match value {
             "sequence_max" => Some(Self::SequenceMax),
             "rebuild" => Some(Self::Rebuild),
@@ -122,7 +122,7 @@ impl RowMergeSchemaResolver {
         }
     }
 
-    pub fn from_str(value: &str) -> Option<Self> {
+    pub fn parse(value: &str) -> Option<Self> {
         match value {
             "alter_table_add_column" => Some(Self::AlterTableAddColumn),
             _ => None,
@@ -1342,14 +1342,12 @@ fn plan_schema_changes(
                     && theirs.kind == SchemaChangeKind::Modified
                     && ours.entry_type == "table"
                     && theirs.entry_type == "table"
-                {
-                    if let Some((theirs_delta, ours_delta)) =
+                    && let Some((theirs_delta, ours_delta)) =
                         compatible_bidirectional_add_columns(policy, ours, theirs)
-                    {
-                        theirs_apply.extend(theirs_delta);
-                        ours_apply.extend(ours_delta);
-                        continue;
-                    }
+                {
+                    theirs_apply.extend(theirs_delta);
+                    ours_apply.extend(ours_delta);
+                    continue;
                 }
                 conflicts.push(schema_merge_conflict(name, Some(ours), Some(theirs)));
             }
@@ -1658,8 +1656,7 @@ fn strip_leading_identifier(sql: &str) -> &str {
     }
 
     sql.find(char::is_whitespace)
-        .map(|idx| sql[idx..].trim_start())
-        .unwrap_or("")
+        .map_or("", |idx| sql[idx..].trim_start())
 }
 
 fn quote_identifier(id: &str) -> String {

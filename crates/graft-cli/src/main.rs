@@ -156,7 +156,7 @@ enum Command {
 
     /// Compare repository revisions, staged changes, or the worktree
     Diff {
-        /// Emit row-level changes for modified SQLite database snapshots
+        /// Emit row-level changes for modified `SQLite` database snapshots
         #[arg(long)]
         rows: bool,
 
@@ -528,7 +528,7 @@ enum MergeApiCommand {
         #[arg(long)]
         state_token: String,
     },
-    /// Select ours or theirs for one SQLite row conflict
+    /// Select ours or theirs for one `SQLite` row conflict
     Row {
         path: PathBuf,
         table: String,
@@ -793,7 +793,7 @@ enum ConfigCommand {
         #[arg(long)]
         json: bool,
 
-        /// Repository config key, for example files.inline_text_threshold
+        /// Repository config key, for example `files.inline_text_threshold`
         key: String,
     },
 
@@ -810,7 +810,7 @@ enum ConfigCommand {
         #[arg(long)]
         json: bool,
 
-        /// Repository config key, for example files.inline_text_threshold
+        /// Repository config key, for example `files.inline_text_threshold`
         key: String,
 
         /// Repository config value, for example 8 MB
@@ -824,7 +824,7 @@ enum ConfigCommand {
         #[arg(long)]
         json: bool,
 
-        /// Repository config key, for example merge.semantic_keys.documents
+        /// Repository config key, for example `merge.semantic_keys.documents`
         key: String,
     },
 }

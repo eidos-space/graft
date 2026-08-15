@@ -949,8 +949,7 @@ fn artifact_diff_kind(
 ) -> RepoTrackedPathKind {
     after
         .or(before)
-        .map(artifact_tracked_path_kind)
-        .unwrap_or(RepoTrackedPathKind::BinaryFile)
+        .map_or(RepoTrackedPathKind::BinaryFile, artifact_tracked_path_kind)
 }
 
 fn artifact_tracked_path_storage(state: &CommitArtifactState) -> RepoPathStorage {
@@ -966,8 +965,7 @@ fn artifact_diff_storage(
 ) -> RepoPathStorage {
     after
         .or(before)
-        .map(artifact_tracked_path_storage)
-        .unwrap_or(RepoPathStorage::Inline)
+        .map_or(RepoPathStorage::Inline, artifact_tracked_path_storage)
 }
 
 fn default_path_storage(kind: RepoTrackedPathKind) -> RepoPathStorage {
@@ -1475,18 +1473,18 @@ impl RepoStatus {
                     let index_status = if entry.conflicted {
                         RepoStatusPathState::Unmerged
                     } else {
-                        entry
-                            .staged_change
-                            .map(RepoStatusPathState::from_staged_change)
-                            .unwrap_or(RepoStatusPathState::None)
+                        entry.staged_change.map_or(
+                            RepoStatusPathState::None,
+                            RepoStatusPathState::from_staged_change,
+                        )
                     };
                     let worktree_status = if entry.conflicted {
                         RepoStatusPathState::Unmerged
                     } else {
-                        entry
-                            .unstaged_change
-                            .map(RepoStatusPathState::from_worktree_change)
-                            .unwrap_or(RepoStatusPathState::None)
+                        entry.unstaged_change.map_or(
+                            RepoStatusPathState::None,
+                            RepoStatusPathState::from_worktree_change,
+                        )
                     };
                     let code = RepoStatusPathState::code(index_status, worktree_status);
                     RepoStatusPath {

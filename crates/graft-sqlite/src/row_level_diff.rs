@@ -19,7 +19,7 @@ use graft::snapshot::Snapshot;
 use graft::volume_reader::VolumeRead;
 use rusqlite::{Connection, OpenFlags, types::ValueRef};
 
-/// Coarse logical status for a SQLite snapshot diff.
+/// Coarse logical status for a `SQLite` snapshot diff.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogicalDiffStatus {
     LogicalChanges,
@@ -2143,6 +2143,8 @@ struct CandidateTablePages {
     to: BTreeMap<String, BTreeSet<u32>>,
 }
 
+type CandidateTablePageCoverage = (BTreeMap<String, BTreeSet<u32>>, BTreeSet<u32>);
+
 fn direct_candidate_table_pages(
     from_scanner: &TableScanner<'_>,
     to_scanner: &TableScanner<'_>,
@@ -2178,7 +2180,7 @@ fn candidate_table_pages_for_side(
     master: &[MasterEntry],
     ignored_tables: &HashSet<String>,
     candidates: &BTreeSet<u32>,
-) -> Option<(BTreeMap<String, BTreeSet<u32>>, BTreeSet<u32>)> {
+) -> Option<CandidateTablePageCoverage> {
     let mut tables = BTreeMap::new();
     let mut covered = BTreeSet::new();
     for entry in master {
@@ -3368,7 +3370,7 @@ fn resolve_key_columns(
     Some(resolved)
 }
 
-/// Format SQL INSERT while preserving the SQLite rowid.
+/// Format SQL INSERT while preserving the `SQLite` rowid.
 fn format_sql_insert(
     table: &str,
     columns: &[String],

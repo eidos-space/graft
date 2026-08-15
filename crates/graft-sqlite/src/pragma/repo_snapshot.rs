@@ -327,10 +327,8 @@ impl<'a> RepoSnapshotResolver<'a> {
         let cacheable_diff = self.policy.purpose == RepoSnapshotPurpose::Diff
             && self.policy.hash_policy == SnapshotHashPolicy::AllowHydratedMismatch
             && !self.policy.normalize;
-        if cacheable_diff {
-            if let Some(resolved) = cached_diff_snapshot(self.runtime, snapshot) {
-                return Ok(resolved);
-            }
+        if cacheable_diff && let Some(resolved) = cached_diff_snapshot(self.runtime, snapshot) {
+            return Ok(resolved);
         }
 
         let resolved = if self.policy.remote_mode == RepoSnapshotRemoteMode::Remote {
@@ -585,10 +583,8 @@ fn repo_branch_snapshots(
         let commit = repo.read_commit(&next)?;
         let parent_files = repo_commit_parent_file_states(repo, &commit)?;
         for (path, state) in &commit.files {
-            let snapshot = repo_file_delta_snapshot(
-                state,
-                parent_files.get(path).map(Vec::as_slice).unwrap_or(&[]),
-            );
+            let snapshot =
+                repo_file_delta_snapshot(state, parent_files.get(path).map_or(&[], Vec::as_slice));
             let runtime_snapshot = snapshot.to_snapshot();
             if runtime_snapshot.is_empty() {
                 continue;
@@ -667,7 +663,7 @@ pub(super) fn repo_file_delta_snapshot(
     let coverage = repo_file_parent_coverage(state, parent_states);
     let mut ranges = Vec::new();
     for range in &state.snapshot.ranges {
-        let intervals = coverage.get(&range.log).map(Vec::as_slice).unwrap_or(&[]);
+        let intervals = coverage.get(&range.log).map_or(&[][..], Vec::as_slice);
         append_uncovered_repo_log_ranges(&mut ranges, range, intervals);
     }
 
@@ -698,13 +694,13 @@ pub(super) fn repo_file_parent_coverage(
         intervals.sort_by_key(|(start, _)| *start);
         let mut merged = Vec::<(LSN, LSN)>::new();
         for (start, end) in intervals.drain(..) {
-            if let Some((_, current_end)) = merged.last_mut() {
-                if current_end.checked_next().is_none_or(|next| start <= next) {
-                    if end > *current_end {
-                        *current_end = end;
-                    }
-                    continue;
+            if let Some((_, current_end)) = merged.last_mut()
+                && current_end.checked_next().is_none_or(|next| start <= next)
+            {
+                if end > *current_end {
+                    *current_end = end;
                 }
+                continue;
             }
             merged.push((start, end));
         }
@@ -747,10 +743,10 @@ pub(super) fn append_uncovered_repo_log_ranges(
         cursor = covered_end.checked_next();
     }
 
-    if let Some(start) = cursor {
-        if start <= range.end {
-            push_repo_log_range(ranges, range, start, range.end);
-        }
+    if let Some(start) = cursor
+        && start <= range.end
+    {
+        push_repo_log_range(ranges, range, start, range.end);
     }
 }
 

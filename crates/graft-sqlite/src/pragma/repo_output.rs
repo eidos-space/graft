@@ -153,8 +153,7 @@ pub(super) fn format_repo_row_diff(
         let Some(row_diff) = repo_file_row_diff(runtime, repo, file, table)? else {
             writeln!(
                 &mut f,
-                "  Row diff unavailable for {} database snapshots.",
-                change
+                "  Row diff unavailable for {change} database snapshots."
             )?;
             continue;
         };
@@ -833,8 +832,7 @@ pub(super) fn format_repo_path_inventory(
                         path.path,
                         repo_path_storage_label(path.storage),
                         path.size
-                            .map(|size| size.to_string())
-                            .unwrap_or_else(|| "?".to_string())
+                            .map_or_else(|| "?".to_string(), |size| size.to_string())
                     )?;
                 }
             }
@@ -845,8 +843,7 @@ pub(super) fn format_repo_path_inventory(
                 repo_tracked_path_kind_label(path.kind),
                 repo_path_storage_label(path.storage),
                 path.size
-                    .map(|size| size.to_string())
-                    .unwrap_or_else(|| "?".to_string())
+                    .map_or_else(|| "?".to_string(), |size| size.to_string())
             )?,
         }
     }
@@ -869,8 +866,7 @@ pub(super) fn format_repo_tracked_path_details(
                 path.path,
                 repo_path_storage_label(path.storage),
                 path.page_count
-                    .map(|count| count.to_string())
-                    .unwrap_or_else(|| "?".to_string())
+                    .map_or_else(|| "?".to_string(), |count| count.to_string())
             )?,
             RepoTrackedPathKind::TextFile | RepoTrackedPathKind::BinaryFile
                 if path.storage == RepoPathStorage::External =>
@@ -882,8 +878,7 @@ pub(super) fn format_repo_tracked_path_details(
                     repo_tracked_path_kind_label(path.kind),
                     repo_path_storage_label(path.storage),
                     path.size
-                        .map(|size| size.to_string())
-                        .unwrap_or_else(|| "?".to_string()),
+                        .map_or_else(|| "?".to_string(), |size| size.to_string()),
                     option_object_id_label(path.oid.as_ref()),
                     option_object_id_label(path.content_hash.as_ref()),
                     presence_label(path.object_present),
@@ -897,8 +892,7 @@ pub(super) fn format_repo_tracked_path_details(
                 repo_tracked_path_kind_label(path.kind),
                 repo_path_storage_label(path.storage),
                 path.size
-                    .map(|size| size.to_string())
-                    .unwrap_or_else(|| "?".to_string()),
+                    .map_or_else(|| "?".to_string(), |size| size.to_string()),
                 option_object_id_label(path.oid.as_ref()),
                 option_object_id_label(path.content_hash.as_ref()),
                 presence_label(path.object_present)
@@ -909,8 +903,7 @@ pub(super) fn format_repo_tracked_path_details(
 }
 
 pub(super) fn option_object_id_label(id: Option<&graft::repo::object::ObjectId>) -> String {
-    id.map(ToString::to_string)
-        .unwrap_or_else(|| "?".to_string())
+    id.map_or_else(|| "?".to_string(), ToString::to_string)
 }
 
 pub(super) fn presence_label(value: Option<bool>) -> &'static str {
@@ -932,13 +925,8 @@ pub(super) fn format_repo_tracked_path_entries(
     for path in paths {
         let mode = path
             .mode
-            .map(|mode| mode.to_string())
-            .unwrap_or_else(|| "------".to_string());
-        let oid = path
-            .oid
-            .as_ref()
-            .map(|oid| oid.short())
-            .unwrap_or("------------");
+            .map_or_else(|| "------".to_string(), |mode| mode.to_string());
+        let oid = path.oid.as_ref().map_or("------------", |oid| oid.short());
         match path.kind {
             RepoTrackedPathKind::SqliteDatabase => writeln!(
                 &mut f,
@@ -947,8 +935,7 @@ pub(super) fn format_repo_tracked_path_entries(
                 path.path,
                 repo_path_storage_label(path.storage),
                 path.page_count
-                    .map(|count| count.to_string())
-                    .unwrap_or_else(|| "?".to_string())
+                    .map_or_else(|| "?".to_string(), |count| count.to_string())
             )?,
             RepoTrackedPathKind::TextFile | RepoTrackedPathKind::BinaryFile => writeln!(
                 &mut f,
@@ -958,8 +945,7 @@ pub(super) fn format_repo_tracked_path_entries(
                 repo_tracked_path_kind_label(path.kind),
                 repo_path_storage_label(path.storage),
                 path.size
-                    .map(|size| size.to_string())
-                    .unwrap_or_else(|| "?".to_string())
+                    .map_or_else(|| "?".to_string(), |size| size.to_string())
             )?,
         }
     }
@@ -1254,10 +1240,10 @@ pub(super) fn format_merge_outcome_with_row_auto_merge(
     row_auto_merge: Option<&RowAutoMergeResult>,
     remote: Option<Arc<Remote>>,
 ) -> Result<String, ErrCtx> {
-    let display_outcome = row_auto_merge
-        .filter(|result| result.resolved)
-        .map(|result| merge_outcome_with_row_auto_merge(outcome, &result.key))
-        .unwrap_or_else(|| outcome.clone());
+    let display_outcome = row_auto_merge.filter(|result| result.resolved).map_or_else(
+        || outcome.clone(),
+        |result| merge_outcome_with_row_auto_merge(outcome, &result.key),
+    );
     let mut f = format_merge_outcome(&display_outcome)?;
     if let Some(result) = row_auto_merge {
         append_row_auto_merge_result(&mut f, result)?;

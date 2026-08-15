@@ -1685,8 +1685,8 @@ fn parse_checkout_and_switch_force_args() {
                 output,
             }
         } if source == "HEAD"
-            && path == PathBuf::from("app.db")
-            && output == PathBuf::from("snapshot.db")
+            && path.as_path() == std::path::Path::new("app.db")
+            && output.as_path() == std::path::Path::new("snapshot.db")
     ));
 
     assert_eq!(

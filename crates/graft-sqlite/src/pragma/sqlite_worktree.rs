@@ -1706,9 +1706,9 @@ pub(super) fn import_stable_sqlite_file_state(
         .map(|(state, _, _)| state)
 }
 
-/// Imports a stable SQLite candidate from a conservative set of physically changed pages.
+/// Imports a stable `SQLite` candidate from a conservative set of physically changed pages.
 ///
-/// Callers must derive `changed_pages` from SQLite's committed WAL frames. Every listed page is
+/// Callers must derive `changed_pages` from `SQLite`'s committed WAL frames. Every listed page is
 /// still compared with the immutable base before writing, so false positives are harmless. WAL
 /// validation failure must use [`import_stable_sqlite_file_state`] instead of calling this helper.
 pub(super) fn import_stable_sqlite_file_state_from_changed_pages(

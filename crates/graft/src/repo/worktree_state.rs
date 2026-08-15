@@ -948,8 +948,6 @@ impl Repository {
         for entry in index.stage0_entries() {
             if let Some(file) = &entry.file {
                 files.insert(entry.path.clone(), file.clone());
-            } else if entry.artifact.is_some() {
-                files.remove(&entry.path);
             } else {
                 files.remove(&entry.path);
             }
@@ -967,8 +965,6 @@ impl Repository {
         for entry in index.stage0_entries() {
             if let Some(artifact) = &entry.artifact {
                 artifacts.insert(entry.path.clone(), artifact.clone());
-            } else if entry.file.is_some() {
-                artifacts.remove(&entry.path);
             } else {
                 artifacts.remove(&entry.path);
             }
@@ -984,8 +980,6 @@ impl Repository {
         for entry in index.stage0_entries() {
             if let Some(file) = &entry.file {
                 files.insert(entry.path.clone(), file.clone());
-            } else if entry.artifact.is_some() {
-                files.remove(&entry.path);
             } else {
                 files.remove(&entry.path);
             }
@@ -1001,8 +995,6 @@ impl Repository {
         for entry in index.stage0_entries() {
             if let Some(artifact) = &entry.artifact {
                 artifacts.insert(entry.path.clone(), artifact.clone());
-            } else if entry.file.is_some() {
-                artifacts.remove(&entry.path);
             } else {
                 artifacts.remove(&entry.path);
             }
@@ -1148,7 +1140,7 @@ impl Repository {
             if changes.contains_key(path) {
                 continue;
             }
-            let physical_path = self.worktree.join(&path);
+            let physical_path = self.worktree.join(path);
             if fs::symlink_metadata(&physical_path)
                 .is_ok_and(|metadata| !metadata.file_type().is_file())
             {

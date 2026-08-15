@@ -226,6 +226,7 @@ pub(super) fn resolve_repo_conflict_for_file(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn resolve_repo_row_conflict(
     runtime: &Runtime,
     file: &mut RepositorySessionContext,
@@ -1008,7 +1009,7 @@ fn row_merge_policy_from_config(
         ..Default::default()
     };
     for (subject, resolver) in &merge.internal_resolvers {
-        let Some(resolver) = crate::row_merge::RowMergeInternalResolver::from_str(resolver) else {
+        let Some(resolver) = crate::row_merge::RowMergeInternalResolver::parse(resolver) else {
             continue;
         };
         if internal_resolver_allowed_for_subject(subject, resolver) {
@@ -1016,7 +1017,7 @@ fn row_merge_policy_from_config(
         }
     }
     for (operation, resolver) in &merge.schema_resolvers {
-        if let Some(resolver) = crate::row_merge::RowMergeSchemaResolver::from_str(resolver) {
+        if let Some(resolver) = crate::row_merge::RowMergeSchemaResolver::parse(resolver) {
             policy.schema_resolvers.insert(operation.clone(), resolver);
         }
     }

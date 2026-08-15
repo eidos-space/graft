@@ -1736,7 +1736,7 @@ impl GraftCommand {
             GraftCommand::RepoAudit { spec } => {
                 let repo = repo_for_file(file)?;
                 if spec.repair {
-                    let remote = repo_default_remote(&repo, spec.remote.clone())?;
+                    let remote = repo_default_remote(&repo, spec.remote)?;
                     let outcome = repo.repair_artifacts_from_remote(&remote)?;
                     Ok(Some(format_repo_artifact_repair(&outcome)?))
                 } else {
@@ -1747,7 +1747,7 @@ impl GraftCommand {
                 let repo = repo_for_file(file)?;
                 let (current_head, current_branch) = repo_head_and_branch(&repo)?;
                 if spec.repair {
-                    let remote = repo_default_remote(&repo, spec.remote.clone())?;
+                    let remote = repo_default_remote(&repo, spec.remote)?;
                     let outcome = repo.repair_artifacts_from_remote(&remote)?;
                     Ok(Some(to_json(&JsonRepoArtifactRepair {
                         operation: "audit_repair",

@@ -403,7 +403,7 @@ impl<'a> TableScanner<'a> {
 
     /// Find candidate pages owned by one B-tree without reading every leaf.
     ///
-    /// SQLite B-trees are height-balanced. At each interior level we inspect
+    /// `SQLite` B-trees are height-balanced. At each interior level we inspect
     /// one child to learn whether all siblings are leaves; leaf siblings can
     /// then be matched by page number without loading their payloads.
     pub fn btree_candidate_pages(

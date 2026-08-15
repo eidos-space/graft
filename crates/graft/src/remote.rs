@@ -3387,14 +3387,16 @@ mod tests {
             .unwrap();
 
         drop(scope);
-        let events = events.lock().unwrap();
-        assert!(!events.is_empty());
-        assert!(events.iter().all(|event| {
-            event.direction == TransferDirection::Upload && event.total_bytes == Some(13)
-        }));
-        assert_eq!(events.first().unwrap().transferred_bytes, 0);
-        assert_eq!(events.last().unwrap().transferred_bytes, 13);
-        assert!(events.len() <= 3);
+        {
+            let events = events.lock().unwrap();
+            assert!(!events.is_empty());
+            assert!(events.iter().all(|event| {
+                event.direction == TransferDirection::Upload && event.total_bytes == Some(13)
+            }));
+            assert_eq!(events.first().unwrap().transferred_bytes, 0);
+            assert_eq!(events.last().unwrap().transferred_bytes, 13);
+            assert!(events.len() <= 3);
+        }
         assert_eq!(requests.await.unwrap().len(), 3);
     }
 

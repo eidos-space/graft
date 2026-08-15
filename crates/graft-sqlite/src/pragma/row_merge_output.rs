@@ -1606,7 +1606,7 @@ const SQLITE_WAL_MAGIC_LITTLE_ENDIAN_CHECKSUM: u32 = 0x377f_0683;
 
 /// Returns every page in committed WAL frames, or `None` when the WAL cannot be proven complete.
 ///
-/// The hint is consumed only after SQLite successfully checkpoints the same WAL. Header/frame
+/// The hint is consumed only after `SQLite` successfully checkpoints the same WAL. Header/frame
 /// salts prevent combining frames from different WAL generations; malformed or partial input
 /// falls back to the authoritative full candidate import.
 fn read_committed_wal_changed_pages(path: &Path) -> Result<Option<BTreeSet<u32>>, ErrCtx> {
@@ -1755,8 +1755,7 @@ fn validate_row_merge_foreign_keys(path: &Path, conn: &rusqlite::Connection) -> 
             format!(
                 "row-level auto-merge failed foreign_key_check: table={table}, rowid={}, parent={parent}, fkid={fkid}",
                 rowid
-                    .map(|rowid| rowid.to_string())
-                    .unwrap_or_else(|| "NULL".to_string())
+                    .map_or_else(|| "NULL".to_string(), |rowid| rowid.to_string())
             )
             .into(),
         ));
