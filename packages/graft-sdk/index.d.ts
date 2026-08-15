@@ -161,6 +161,8 @@ export interface ApplyMergeOptions extends OperationOptions {
   expectedHead?: string
   /** Opaque token returned by planMerge for this exact immutable plan. */
   planToken: string
+  /** Reports bytes fetched while materializing snapshots required by the plan. */
+  onProgress?: (progress: TransferProgress) => void
 }
 
 export type SemanticKeyCollation = "binary" | "nocase"

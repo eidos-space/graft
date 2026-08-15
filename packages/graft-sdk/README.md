@@ -391,6 +391,7 @@ const applied = await session.applyMerge({
   revision: "origin/main",
   ...(head ? { expectedHead: head } : {}),
   planToken: plan.plan_token,
+  onProgress: renderTransfer,
 })
 ```
 
@@ -589,7 +590,7 @@ tokens or absolute user paths.
 
 ## Remote transfer progress
 
-`push`, `fetch`, `pull`, and `cloneRepository` accept an `onProgress` callback:
+`push`, `fetch`, `pull`, `cloneRepository`, and `applyMerge` accept an `onProgress` callback:
 
 ```js
 await session.push({
@@ -606,6 +607,8 @@ Events count cumulative HTTP body bytes for the current operation. `totalBytes` 
 the server does not provide a trustworthy length, so hosts should keep the progress indicator
 indeterminate while still showing transferred bytes and a locally calculated speed. Multiple
 requests and retries are cumulative; command phases are not transfer percentages.
+For `applyMerge`, events cover only snapshot bytes that still need hydration while materializing
+the guarded plan. A fully hydrated plan can complete without emitting a transfer event.
 
 ## Cancellation, conflicts, and errors
 

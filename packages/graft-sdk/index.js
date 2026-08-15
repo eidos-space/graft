@@ -220,8 +220,11 @@ class RepositorySession {
   }
 
   async applyMerge(options) {
-    const { signal, ...mergeOptions } = options
-    return callJson(() => this.#native.applyMerge(mergeOptions, signal))
+    const { signal, onProgress, ...mergeOptions } = options
+    return callJsonWithProgress(
+      () => this.#native.applyMerge(mergeOptions, signal, onProgress),
+      onProgress
+    )
   }
 
   async getMergeStatus({ signal } = {}) {

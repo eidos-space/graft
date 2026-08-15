@@ -174,11 +174,13 @@ as the typed bounded SQLite-diff specialization and `cloneRepository` avoiding
 the reserved/general meaning of `clone`. `packages/graft-sdk/index.d.ts` is the
 canonical JavaScript type contract for exact option and result fields.
 
-`push`, `fetch`, `pull`, and `cloneRepository` accept an optional
+`push`, `fetch`, `pull`, `cloneRepository`, and `applyMerge` accept an optional
 `onProgress` callback. Its events report cumulative HTTP body bytes for the
 current operation, a direction of `upload` or `download`, and `totalBytes` when
 the transport provides a trustworthy length. A host MUST treat an absent total
 as indeterminate and MUST NOT derive a percentage from command phases.
+For `applyMerge`, events cover only snapshot hydration required by the guarded
+plan; an already hydrated plan may emit no transfer event.
 
 Inputs use JavaScript camelCase. Parsed JSON results preserve repository
 snake_case field names, including `expected_head`, `plan_token`, `state_token`,

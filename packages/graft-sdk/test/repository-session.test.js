@@ -994,17 +994,47 @@ test(
       await sourceSession.commit("remote update")
       await sourceSession.push()
 
+      const cloneHead = (await cloneSession.status()).current_head
       const fetched = await cloneSession.fetch()
       assert.equal(fetched.operation, "fetch")
       assert.equal(
         await fs.readFile(path.join(clone, "notes.txt"), "utf8"),
         "whole Space\n"
       )
+      const plan = await cloneSession.planMerge({
+        revision: "origin/main",
+        expectedHead: cloneHead,
+      })
+      assert.equal(plan.kind, "fast_forward")
+      const applied = await cloneSession.applyMerge({
+        revision: "origin/main",
+        expectedHead: cloneHead,
+        planToken: plan.plan_token,
+        onProgress: () => undefined,
+      })
+      assert.equal(applied.merge.state, "none")
+      assert.deepEqual(applied.worktree_paths, [
+        "crm.eidos",
+        "notes.txt",
+        "project.eidos",
+      ])
+      assert.equal(
+        await fs.readFile(path.join(clone, "notes.txt"), "utf8"),
+        "whole Space\nupdated\n"
+      )
+
+      await fs.writeFile(
+        path.join(source, "notes.txt"),
+        "whole Space\nupdated again\n"
+      )
+      await sourceSession.addAll()
+      await sourceSession.commit("second remote update")
+      await sourceSession.push()
       const pulled = await cloneSession.pull()
       assert.equal(pulled.operation, "pull")
       assert.equal(
         await fs.readFile(path.join(clone, "notes.txt"), "utf8"),
-        "whole Space\nupdated\n"
+        "whole Space\nupdated again\n"
       )
 
       await Promise.all([sourceSession.close(), cloneSession.close()])

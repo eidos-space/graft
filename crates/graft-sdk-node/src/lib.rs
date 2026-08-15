@@ -1397,8 +1397,9 @@ impl NodeRepositorySession {
         &self,
         options: ApplyMergeOptions,
         signal: Option<AbortSignal>,
+        progress: Option<TransferProgressCallback>,
     ) -> AsyncTask<JsonTask> {
-        json_task(
+        json_task_with_progress(
             self,
             JsonOperation::ApplyMerge {
                 options: CoreApplyMergeOptions {
@@ -1408,6 +1409,7 @@ impl NodeRepositorySession {
                 },
             },
             signal,
+            progress,
         )
     }
 

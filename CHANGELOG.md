@@ -33,6 +33,9 @@
 
 ### Fixed
 
+- Node SDK `applyMerge()` can now report snapshot hydration bytes, allowing hosts to fetch a Remote
+  ref once and then apply the guarded fetched plan without invoking `pull()` and fetching the ref a
+  second time.
 - Transfer progress now coalesces short request bodies into 100 ms aggregate updates and flushes
   one final value per direction, preventing large SQLite pushes from flooding host callback queues
   after the Remote ref is already published.

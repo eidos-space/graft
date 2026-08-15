@@ -118,10 +118,12 @@ JavaScript 使用 camelCase method；`diffSqlitePaths` 是 typed bounded SQLite 
 Input camelCase，JSON result 保持 snake_case，如 `expected_head`、`plan_token`、
 `state_token`、`materializes_worktree`。Binding 不能私自改 field。
 
-`push`、`fetch`、`pull` 与 `cloneRepository` 可接收 `onProgress` callback。事件报告
+`push`、`fetch`、`pull`、`cloneRepository` 与 `applyMerge` 可接收 `onProgress`
+callback。事件报告
 当前操作累计的 HTTP body bytes、`upload`/`download` direction，以及 transport 能可靠
 提供长度时的 `totalBytes`。总量缺失表示 indeterminate；host 不能用 command phase
-伪造 percentage。
+伪造 percentage。`applyMerge` 只报告 guarded plan 在 materialize 时仍需 hydration 的
+snapshot bytes；若 plan 已完整 hydration，可以不产生 transfer event。
 
 会竞争的 mutation 使用 `expectedHead`、plan token 或 state token。Typed result
 包括 status/history/diff/inventory/metadata/merge page、legacy/general `GraftJson`，

@@ -5,6 +5,12 @@ SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
 
 ## Unreleased
 
+### Fixed
+
+- `applyMerge()` now accepts the same optional transfer-progress callback as fetch and pull. Hosts
+  can fetch once, plan against the Remote-tracking ref, and display any snapshot hydration bytes
+  while atomically applying that immutable plan without a redundant Remote-ref fetch.
+
 ## Graft SDK 0.3.15 — 2026-08-15
 
 ### Added
