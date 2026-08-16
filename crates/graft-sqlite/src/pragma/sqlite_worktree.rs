@@ -992,6 +992,35 @@ impl PhysicalSqliteReader {
             .map(|probe| probe.matches)
     }
 
+    /// Compares against an exact persisted page index without falling back to random snapshot
+    /// reads. `None` means the disposable index is unavailable and the caller should use its
+    /// authoritative non-cache path.
+    fn matches_indexed_state(
+        &self,
+        repo: &Repository,
+        key: &str,
+        expected: &CommitFileState,
+    ) -> Result<Option<bool>, ErrCtx> {
+        if self.page_count() != expected.snapshot.page_count {
+            return Ok(Some(false));
+        }
+        let cache = SqlitePageHashCache::new(repo, key);
+        let Some(expected_hashes) = cache.load(expected)? else {
+            return Ok(None);
+        };
+        let mut matches = true;
+        self.visit_page_chunks(|first_page, chunk_bytes| {
+            let chunk_index = (first_page - 1) as usize / PAGE_HASH_CHUNK_PAGES;
+            matches &= expected_hashes
+                .get(chunk_index)
+                .is_some_and(|expected_hash| {
+                    expected_hash == sqlite_page_chunk_hash(first_page, chunk_bytes).as_bytes()
+                });
+            Ok(())
+        })?;
+        Ok(Some(matches))
+    }
+
     fn cached_diff_probe(
         &self,
         runtime: &Runtime,
@@ -1424,6 +1453,21 @@ pub(crate) fn physical_sqlite_file_matches_state(
 ) -> Result<bool, ErrCtx> {
     let physical = PhysicalSqliteReader::open(path)?;
     physical.matches_state(runtime, expected)
+}
+
+/// Verifies an internally copied, stable worktree candidate against an immutable Graft state.
+///
+/// The content-addressed page index turns the common path into one sequential candidate read.
+/// Missing or invalid index data returns `None`, so the caller can discard the copy and retain
+/// authoritative snapshot materialization without making this cache a correctness dependency.
+pub(super) fn stable_physical_sqlite_matches_indexed_state(
+    repo: &Repository,
+    key: &str,
+    path: &Path,
+    expected: &CommitFileState,
+) -> Result<Option<bool>, ErrCtx> {
+    let physical = PhysicalSqliteReader::open_stable(path)?;
+    physical.matches_indexed_state(repo, key, expected)
 }
 
 /// Prepares an existing worktree database for atomic replacement.

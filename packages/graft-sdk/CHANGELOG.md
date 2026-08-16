@@ -13,8 +13,10 @@ SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
   service limit.
 - Pack indexes are cached locally as repairable performance hints, so unchanged immutable indexes
   are not downloaded again after reopening the application.
-- Windows row auto-merge can seed a proven private candidate from the locked Ours worktree instead
-  of reconstructing the complete SQLite file from page storage.
+- macOS and Windows row auto-merge can seed the first private candidate from the Ours worktree
+  instead of reconstructing the complete SQLite file from page storage. The private copy must
+  match Ours' exact content-addressed page index before use; a missing index, changed worktree, or
+  copy mismatch retains authoritative snapshot materialization.
 
 ### Compatibility
 

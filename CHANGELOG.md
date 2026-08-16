@@ -12,9 +12,10 @@
   changing repository truth.
 - Snapshot hydration collects missing commits across every log range before writing one local
   batch, instead of walking each range through its own Remote request loop.
-- On Windows, a proven clean and exclusively locked SQLite worktree seeds the private merge
-  candidate through the kernel file-copy path instead of reconstructing every page from Graft
-  storage. Copy failure retains authoritative snapshot materialization.
+- On Windows, an indexed clean SQLite worktree can seed the first private merge candidate through
+  the kernel file-copy path instead of reconstructing every page from Graft storage. The private
+  copy is verified against Ours' exact content-addressed page index; a missing index, changed
+  worktree, or copy mismatch retains authoritative snapshot materialization.
 - SQLite row merge now reuses proven segment page sets across immutable snapshots, targets
   `WITHOUT ROWID` analysis to changed B-tree pages, and installs an already validated merge
   candidate directly instead of serializing the database again during completion.
@@ -22,9 +23,9 @@
   state before mutation, then relies on SQLite's transactional constraint/index maintenance,
   touched-cell checks, and a complete post-apply foreign-key check instead of cold-scanning every
   inherited page again.
-- macOS reuses an already-proven, clean, exclusively locked Ours worktree through an APFS
-  copy-on-write clone when seeding the private merge candidate; clone failure and other platforms
-  retain authoritative snapshot materialization.
+- macOS can seed the first private merge candidate from an indexed clean Ours worktree through an
+  APFS copy-on-write clone. The clone is verified against Ours before mutation; clone failure,
+  missing proof data, and other platforms retain authoritative snapshot materialization.
 - Transactional SQLite merge replay now captures committed WAL page numbers and, after a successful
   checkpoint and validation, imports only pages that differ from Ours. Missing, malformed, or
   partial WAL data safely falls back to an authoritative full candidate import.

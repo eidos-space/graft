@@ -1441,14 +1441,10 @@ fn materialize_row_auto_merge_candidate(
     let temp_path = row_auto_merge_temp_path(repo, key)?;
     let result = (|| {
         let seed_trace = graft::trace::PushTraceSpan::new("sqlite_merge_seed");
-        let cloned = if row_merge_integrity_proven(ours) {
-            worktree_seed
-                .map(|seed| try_clone_sqlite_merge_seed(seed, &temp_path))
-                .transpose()?
-                .unwrap_or(false)
-        } else {
-            false
-        };
+        let cloned = worktree_seed
+            .map(|seed| try_clone_verified_sqlite_merge_seed(repo, key, ours, seed, &temp_path))
+            .transpose()?
+            .unwrap_or(false);
         if !cloned {
             write_repo_file_state_to_path(runtime, ours, &temp_path)?;
         }
@@ -1494,7 +1490,37 @@ fn materialize_row_auto_merge_candidate(
     }
 }
 
-/// Seed a private candidate from a proof-backed, exclusively locked worktree database.
+/// Copies a worktree seed only when the resulting private file exactly matches Ours.
+///
+/// Worktree cleanliness is checked before merge planning, but an ordinary physical file is not
+/// itself an immutable Graft object. Verify the copied bytes against Ours before using them so a
+/// stale binding, external writer, or interrupted copy can only disable this optimization. This
+/// verification also lets the first merge use the fast path instead of waiting for a previous
+/// full-database integrity proof.
+fn try_clone_verified_sqlite_merge_seed(
+    repo: &Repository,
+    key: &str,
+    ours: &CommitFileState,
+    source: &Path,
+    destination: &Path,
+) -> Result<bool, ErrCtx> {
+    if !try_clone_sqlite_merge_seed(source, destination)? {
+        return Ok(false);
+    }
+    match stable_physical_sqlite_matches_indexed_state(repo, key, destination, ours) {
+        Ok(Some(true)) => Ok(true),
+        Ok(Some(false) | None) => {
+            std::fs::remove_file(destination)?;
+            Ok(false)
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(destination);
+            Err(error)
+        }
+    }
+}
+
+/// Seed a private candidate from a worktree database; the caller verifies the private copy.
 ///
 /// Failure is an ordinary cache miss: callers fall back to materializing the authoritative Graft
 /// state. APFS uses a block clone. Windows uses the kernel file-copy path because a sequential
@@ -1735,13 +1761,6 @@ pub(super) fn validate_row_merge_base_integrity(
     Ok(())
 }
 
-fn row_merge_integrity_proven(state: &CommitFileState) -> bool {
-    let key = (state.volume.clone(), state.snapshot.clone());
-    ROW_MERGE_INTEGRITY_PROOFS
-        .get()
-        .is_some_and(|proofs| proofs.lock().contains(&key))
-}
-
 fn validate_row_merge_integrity(path: &Path, conn: &rusqlite::Connection) -> Result<(), ErrCtx> {
     let mut integrity_stmt = conn
         .prepare("PRAGMA integrity_check;")
@@ -1948,6 +1967,85 @@ mod validation_tests {
                 .unwrap(),
             "ok"
         );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn worktree_seed_copy_is_used_only_when_it_matches_ours() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+        let source = temp.path().join("source.db");
+        let conn = rusqlite::Connection::open(&source).unwrap();
+        conn.execute_batch(
+            "PRAGMA page_size = 4096;\
+             CREATE TABLE items(\
+               id INTEGER PRIMARY KEY,\
+               value TEXT NOT NULL,\
+               padding BLOB NOT NULL\
+             );\
+             INSERT INTO items VALUES(1, 'ours', zeroblob(17000000));",
+        )
+        .unwrap();
+        drop(conn);
+        let runtime = graft::setup::setup_graft_temporary(RemoteConfig::Memory, None).unwrap();
+        let (ours, _) =
+            prepare_cached_physical_sqlite_file_state(&runtime, &repo, "source.db", &source, None)
+                .unwrap();
+
+        let exact_candidate = temp.path().join("exact-candidate.db");
+        assert!(
+            try_clone_verified_sqlite_merge_seed(
+                &repo,
+                "source.db",
+                &ours,
+                &source,
+                &exact_candidate,
+            )
+            .unwrap()
+        );
+        assert!(exact_candidate.is_file());
+
+        let conn = rusqlite::Connection::open(&source).unwrap();
+        conn.execute("UPDATE items SET value = 'unexpected' WHERE id = 1", [])
+            .unwrap();
+        drop(conn);
+        let stale_candidate = temp.path().join("stale-candidate.db");
+        assert!(
+            !try_clone_verified_sqlite_merge_seed(
+                &repo,
+                "source.db",
+                &ours,
+                &source,
+                &stale_candidate,
+            )
+            .unwrap()
+        );
+        assert!(!stale_candidate.exists());
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn worktree_seed_copy_falls_back_without_an_exact_page_index() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+        let source = temp.path().join("small.db");
+        let conn = rusqlite::Connection::open(&source).unwrap();
+        conn.execute_batch(
+            "PRAGMA page_size = 4096;\
+             CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT NOT NULL);\
+             INSERT INTO items VALUES(1, 'ours');",
+        )
+        .unwrap();
+        drop(conn);
+        let runtime = graft::setup::setup_graft_temporary(RemoteConfig::Memory, None).unwrap();
+        let ours = import_physical_sqlite_file_state(&runtime, &source, None).unwrap();
+        let candidate = temp.path().join("candidate.db");
+
+        assert!(
+            !try_clone_verified_sqlite_merge_seed(&repo, "small.db", &ours, &source, &candidate,)
+                .unwrap()
+        );
+        assert!(!candidate.exists());
     }
 
     #[cfg(target_os = "macos")]
