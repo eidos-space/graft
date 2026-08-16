@@ -104,6 +104,7 @@ export type GraftRemoteOperation =
   | "descriptor"
   | "raw"
   | "raw-if-not-exists"
+  | "read-bundle"
   | "upload-bundle"
   | "receive-pack"
   | "receive-bundle"

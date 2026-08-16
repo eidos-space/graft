@@ -127,7 +127,9 @@ impl Repository {
         let before = self.audit_artifacts()?;
         let remote_store = self.remote_store(remote)?;
         let artifacts = self.index_artifacts()?;
-        let mut pack_cache = RemoteObjectPackCache::default();
+        let mut pack_cache = RemoteObjectPackCache::persistent(
+            self.graft_dir.join(DIR_CACHE_REMOTE_OBJECT_PACK_INDEXES),
+        );
         let mut fetched_objects = BTreeSet::new();
         let mut fetched_external_payloads = BTreeSet::new();
 

@@ -68,7 +68,9 @@ use crate::{
         LogId, VolumeId, byte_unit::ByteUnit, commit_hash::CommitHash, lsn::LSN, lsn::LSNRangeExt,
         page_count::PageCount,
     },
-    remote::{Remote, RemoteConfig, RemoteCredentials, RemoteErr, UploadBundleOutcome},
+    remote::{
+        ReadBundleOutcome, Remote, RemoteConfig, RemoteCredentials, RemoteErr, UploadBundleOutcome,
+    },
     snapshot::Snapshot,
 };
 
@@ -377,6 +379,7 @@ const DIR_STORE_FILES: &str = "store/files";
 const DIR_INDEX: &str = "index";
 const DIR_LOCKS: &str = "locks";
 const DIR_TMP: &str = "tmp";
+const DIR_CACHE_REMOTE_OBJECT_PACK_INDEXES: &str = "cache/remote-object-pack-indexes";
 const DIR_LOGS_REFS: &str = "logs/refs";
 const DIR_LOGS_HEAD: &str = "logs/HEAD";
 const SQLITE_DATABASE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
@@ -733,12 +736,23 @@ struct RemoteObjectPackEntry {
 struct RemoteObjectPackCache {
     indexes: Option<Vec<RemoteObjectPackIndex>>,
     packs: BTreeMap<String, Bytes>,
+    index_cache_dir: Option<PathBuf>,
 }
 
 impl RemoteObjectPackCache {
+    fn persistent(index_cache_dir: PathBuf) -> Self {
+        Self {
+            index_cache_dir: Some(index_cache_dir),
+            ..Self::default()
+        }
+    }
+
     fn indexes(&mut self, remote: &crate::remote::Remote) -> Result<&[RemoteObjectPackIndex]> {
         if self.indexes.is_none() {
-            self.indexes = Some(fetch_remote_object_pack_indexes(remote)?);
+            self.indexes = Some(fetch_remote_object_pack_indexes(
+                remote,
+                self.index_cache_dir.as_deref(),
+            )?);
         }
         Ok(self.indexes.as_deref().expect("pack indexes initialized"))
     }
@@ -2523,18 +2537,85 @@ fn remote_loose_object_id(path: &str) -> Result<Option<object::ObjectId>> {
 
 fn fetch_remote_object_pack_indexes(
     remote: &crate::remote::Remote,
+    cache_dir: Option<&Path>,
 ) -> Result<Vec<RemoteObjectPackIndex>> {
-    let mut indexes = Vec::new();
-    for path in block_on_remote(remote.list_raw(DIR_OBJECTS_PACK))? {
-        if !path.ends_with(".idx") {
-            continue;
+    let fetch_trace = crate::trace::PushTraceSpan::new("remote_pack_index_fetch");
+    let paths = block_on_remote(remote.list_raw(DIR_OBJECTS_PACK))?
+        .into_iter()
+        .filter(|path| path.ends_with(".idx"))
+        .collect::<Vec<_>>();
+    let listed_indexes = paths.len() as u64;
+
+    let mut loaded = Vec::new();
+    let mut missing = Vec::new();
+    for path in paths {
+        let cache_path =
+            cache_dir.and_then(|cache_dir| remote_object_pack_index_cache_path(cache_dir, &path));
+        if let Some(cache_path) = cache_path.as_deref()
+            && let Ok(bytes) = fs::read(cache_path)
+            && decode_remote_object_pack_index(&path, &bytes).is_ok()
+        {
+            loaded.push((path, Bytes::from(bytes), false, cache_path.to_path_buf()));
+        } else {
+            missing.push((path, cache_path));
         }
-        let Some(bytes) = block_on_remote(remote.get_raw(&path))? else {
-            continue;
-        };
-        indexes.push(decode_remote_object_pack_index(&path, &bytes)?);
     }
+    let cache_hits = loaded.len() as u64;
+    let fetched_indexes = missing.len() as u64;
+
+    let missing_paths = missing
+        .iter()
+        .map(|(path, _)| path.clone())
+        .collect::<Vec<_>>();
+    let mut fetched = match block_on_remote(remote.get_raw_bundle(&missing_paths))? {
+        ReadBundleOutcome::Downloaded(objects) => objects,
+        ReadBundleOutcome::Unsupported => block_on_remote(async {
+            stream::iter(missing_paths)
+                .map(|path| async move {
+                    Ok::<_, RemoteErr>((path.clone(), remote.get_raw(&path).await?))
+                })
+                .buffered(REMOTE_REF_READ_CONCURRENCY)
+                .try_filter_map(|(path, bytes)| async move { Ok(bytes.map(|bytes| (path, bytes))) })
+                .try_collect::<BTreeMap<_, _>>()
+                .await
+        })?,
+    };
+    for (path, cache_path) in missing {
+        if let Some(bytes) = fetched.remove(&path) {
+            loaded.push((path, bytes, true, cache_path.unwrap_or_default()));
+        }
+    }
+
+    let indexes = loaded
+        .into_iter()
+        .map(|(path, bytes, fetched, cache_path)| {
+            let index = decode_remote_object_pack_index(&path, &bytes)?;
+            if fetched && !cache_path.as_os_str().is_empty() {
+                // This is a disposable performance hint. A partial or corrupt cache entry is
+                // ignored and repaired from the immutable remote index on the next fetch.
+                if let Some(parent) = cache_path.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                let _ = fs::write(cache_path, &bytes);
+            }
+            Ok(index)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    fetch_trace.finish(&[
+        ("listed_indexes", listed_indexes),
+        ("cache_hits", cache_hits),
+        ("fetched_indexes", fetched_indexes),
+    ]);
     Ok(indexes)
+}
+
+fn remote_object_pack_index_cache_path(cache_dir: &Path, remote_path: &str) -> Option<PathBuf> {
+    let name = remote_path.strip_prefix(&format!("{DIR_OBJECTS_PACK}/"))?;
+    let stem = name.strip_suffix(".idx")?;
+    if stem.len() != 64 || !stem.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(cache_dir.join(name))
 }
 
 fn decode_remote_object_pack_index(path: &str, bytes: &[u8]) -> Result<RemoteObjectPackIndex> {

@@ -10,6 +10,7 @@ export const GRAFT_REMOTE_CAPABILITIES = [
   "list",
   "list-cursor",
   "put-if-absent",
+  "read-bundle",
   "upload-bundle",
   "receive-pack",
   "receive-bundle",
@@ -25,10 +26,12 @@ export const RECEIVE_PACK_HEADER_INDEX_BYTES = "x-graft-index-bytes";
 export const RECEIVE_PACK_HEADER_REPLACEMENT_HEX = "x-graft-ref-replacement-hex";
 export const RECEIVE_BUNDLE_HEADER_MANIFEST_BYTES = "x-graft-bundle-manifest-bytes";
 export const UPLOAD_BUNDLE_HEADER_TOTAL_BYTES = "x-graft-bundle-total-bytes";
+export const READ_BUNDLE_HEADER_OBJECTS = "x-graft-bundle-objects";
 export const MULTIPART_HEADER_OBJECT_BYTES = "x-graft-object-bytes";
 export const MULTIPART_HEADER_UPLOAD_ID = "x-graft-upload-id";
 export const MULTIPART_HEADER_PART_NUMBER = "x-graft-part-number";
 export const MAX_RECEIVE_BUNDLE_OBJECTS = 256;
+export const MAX_READ_BUNDLE_OBJECTS = 256;
 export const MAX_UPLOAD_BUNDLE_OBJECTS = 65_536;
 const REPOSITORY_SEGMENT = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,62}[A-Za-z0-9])?$/;
 const encoder = new TextEncoder();

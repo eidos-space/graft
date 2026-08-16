@@ -5107,6 +5107,180 @@ fn pull_plan_starts_snapshot_checkout_with_fresh_http_pool() {
 }
 
 #[test]
+fn remote_pack_indexes_are_persisted_and_repaired_as_disposable_hints() {
+    let remote_dir = tempfile::tempdir().unwrap();
+    let pack_dir = remote_dir.path().join(DIR_OBJECTS_PACK);
+    fs::create_dir_all(&pack_dir).unwrap();
+    let cache_dir = tempfile::tempdir().unwrap();
+
+    let mut paths = Vec::new();
+    for value in 1_u8..=7 {
+        let pack_id = format!("{value:064x}");
+        let path = format!("{DIR_OBJECTS_PACK}/{pack_id}.idx");
+        let index = RemoteObjectPackIndex {
+            version: REMOTE_OBJECT_PACK_VERSION,
+            pack: format!("{DIR_OBJECTS_PACK}/{pack_id}.pack"),
+            objects: Vec::new(),
+        };
+        fs::write(
+            remote_dir.path().join(&path),
+            serde_json::to_vec(&index).unwrap(),
+        )
+        .unwrap();
+        paths.push(path);
+    }
+
+    let remote = RemoteConfig::Fs {
+        root: remote_dir.path().to_string_lossy().into_owned(),
+    }
+    .build()
+    .unwrap();
+    let indexes = fetch_remote_object_pack_indexes(&remote, Some(cache_dir.path())).unwrap();
+    assert_eq!(indexes.len(), paths.len());
+    for path in &paths {
+        let cache_path = remote_object_pack_index_cache_path(cache_dir.path(), path).unwrap();
+        assert!(cache_path.is_file());
+    }
+
+    // A cached immutable index is sufficient even if the remote read later returns junk.
+    fs::write(remote_dir.path().join(&paths[0]), b"invalid remote index").unwrap();
+    assert_eq!(
+        fetch_remote_object_pack_indexes(&remote, Some(cache_dir.path()))
+            .unwrap()
+            .len(),
+        paths.len()
+    );
+
+    // A corrupt local hint never becomes truth: it is fetched again and repaired.
+    let repaired_path = &paths[1];
+    let repaired_cache =
+        remote_object_pack_index_cache_path(cache_dir.path(), repaired_path).unwrap();
+    fs::write(&repaired_cache, b"invalid cached index").unwrap();
+    assert_eq!(
+        fetch_remote_object_pack_indexes(&remote, Some(cache_dir.path()))
+            .unwrap()
+            .len(),
+        paths.len()
+    );
+    decode_remote_object_pack_index(repaired_path, &fs::read(repaired_cache).unwrap()).unwrap();
+}
+
+#[test]
+fn remote_pack_index_cache_rejects_non_content_addressed_paths() {
+    let cache = Path::new("cache");
+    assert!(remote_object_pack_index_cache_path(cache, "objects/pack/../escape.idx").is_none());
+    assert!(remote_object_pack_index_cache_path(cache, "objects/pack/not-a-hash.idx").is_none());
+    assert!(
+        remote_object_pack_index_cache_path(
+            cache,
+            &format!("objects/pack/{}.idx", "a".repeat(64)),
+        )
+        .is_some()
+    );
+}
+
+#[test]
+fn remote_pack_indexes_use_one_read_bundle_after_listing() {
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        thread,
+    };
+
+    fn read_request(stream: &mut std::net::TcpStream) -> (String, Vec<u8>) {
+        let mut headers = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !headers.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).unwrap();
+            headers.push(byte[0]);
+        }
+        let headers = String::from_utf8(headers).unwrap();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length: ")
+                    .map(str::parse::<usize>)
+            })
+            .transpose()
+            .unwrap()
+            .unwrap_or(0);
+        let mut body = vec![0; content_length];
+        stream.read_exact(&mut body).unwrap();
+        (headers, body)
+    }
+
+    let mut indexes = Vec::new();
+    for value in 1_u8..=15 {
+        let pack_id = format!("{value:064x}");
+        let path = format!("{DIR_OBJECTS_PACK}/{pack_id}.idx");
+        let index = RemoteObjectPackIndex {
+            version: REMOTE_OBJECT_PACK_VERSION,
+            pack: format!("{DIR_OBJECTS_PACK}/{pack_id}.pack"),
+            objects: Vec::new(),
+        };
+        indexes.push((path, serde_json::to_vec(&index).unwrap()));
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut list, _) = listener.accept().unwrap();
+        let (request, _) = read_request(&mut list);
+        assert!(request.starts_with("GET /repo/list?prefix=objects%2Fpack HTTP/1.1"));
+        let list_body = serde_json::to_vec(&serde_json::json!({
+            "paths": indexes.iter().map(|(path, _)| path).collect::<Vec<_>>()
+        }))
+        .unwrap();
+        write!(
+            list,
+            "HTTP/1.1 200 OK\r\nGraft-Protocol: 1\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+            list_body.len()
+        )
+        .unwrap();
+        list.write_all(&list_body).unwrap();
+        list.flush().unwrap();
+        drop(list);
+
+        let (mut bundle, _) = listener.accept().unwrap();
+        let (request, manifest) = read_request(&mut bundle);
+        assert!(request.starts_with("POST /repo/read-bundle HTTP/1.1"));
+        let manifest: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
+        assert_eq!(manifest["paths"].as_array().unwrap().len(), indexes.len());
+        let mut body = Vec::new();
+        for (path, bytes) in &indexes {
+            body.extend_from_slice(&(path.len() as u32).to_be_bytes());
+            body.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+            body.extend_from_slice(path.as_bytes());
+            body.extend_from_slice(bytes);
+        }
+        write!(
+            bundle,
+            "HTTP/1.1 200 OK\r\nGraft-Protocol: 1\r\nConnection: close\r\nX-Graft-Bundle-Objects: {}\r\nX-Graft-Bundle-Total-Bytes: {}\r\nContent-Length: {}\r\n\r\n",
+            indexes.len(),
+            body.len(),
+            body.len()
+        )
+        .unwrap();
+        bundle.write_all(&body).unwrap();
+        bundle.flush().unwrap();
+    });
+
+    let remote = RemoteConfig::Http {
+        url: format!("http://{address}/repo"),
+        token_env: None,
+    }
+    .build()
+    .unwrap();
+    assert_eq!(
+        fetch_remote_object_pack_indexes(&remote, None)
+            .unwrap()
+            .len(),
+        15
+    );
+    server.join().unwrap();
+}
+
+#[test]
 fn discover_from_nested_path() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = Repository::init(tmp.path()).unwrap();

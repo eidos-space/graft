@@ -11,6 +11,7 @@ macro_rules! action {
 
 action!(fetch_segment, FetchSegment);
 action!(fetch_log, FetchLog);
+action!(fetch_snapshot, FetchSnapshot);
 action!(hydrate_snapshot, HydrateSnapshot);
 action!(remote_commit, RemoteCommit);
 action!(snapshot_push, PreparedSnapshotPush);

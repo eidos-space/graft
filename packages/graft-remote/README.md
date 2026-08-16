@@ -123,6 +123,9 @@ Backend guarantees:
   `entries` with object sizes so aggregate downloads can declare their exact
   transfer length without a second metadata lookup.
 - Immutable request bodies remain streams when the adapter storage supports it.
+- `read-bundle` batches up to 256 explicit immutable reads behind one
+  authentication/authorization round and streams sorted, length-delimited
+  frames without buffering object bodies in memory.
 - `upload-bundle` lists immutable keys and streams each `get` body into one
   clone response without buffering the repository in memory. Its exact framed
   length is exposed through `Content-Length` and

@@ -211,6 +211,7 @@ describe("createGraftRemoteHandler", () => {
       capabilities: expect.arrayContaining([
         "range",
         "list",
+        "read-bundle",
         "upload-bundle",
         "receive-pack",
         "receive-bundle",
@@ -497,6 +498,58 @@ describe("createGraftRemoteHandler", () => {
       ["objects/pack/one.pack", "pack-data"],
       ["segments/one", "segment"],
     ]);
+  });
+
+  it("reads an explicit set of objects through one read-bundle request", async () => {
+    const app = createTestApp();
+    for (const [path, body] of [
+      ["objects/pack/one.idx", "index"],
+      ["logs/example/commits/0000000000000001", "commit"],
+    ] as const) {
+      expect(
+        (
+          await remoteFetch(app, `/batch/repo/raw-if-not-exists/${path}`, {
+            method: "PUT",
+            body,
+          })
+        ).status,
+      ).toBe(204);
+    }
+
+    const paths = [
+      "logs/example/commits/0000000000000001",
+      "objects/pack/one.idx",
+    ];
+    const response = await remoteFetch(app, "/batch/repo/read-bundle", {
+      method: "POST",
+      body: JSON.stringify({ version: 1, paths }),
+    });
+    expect(response.status, await response.clone().text()).toBe(200);
+    expect(response.headers.get("content-type")).toBe("application/vnd.graft.read-bundle");
+    expect(response.headers.get("x-graft-bundle-objects")).toBe("2");
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    expect(Number(response.headers.get("content-length"))).toBe(bytes.byteLength);
+    expect(decodeUploadBundleFrames(bytes, paths.length)).toEqual([
+      [paths[0], "commit"],
+      [paths[1], "index"],
+    ]);
+
+    const missing = await remoteFetch(app, "/batch/repo/read-bundle", {
+      method: "POST",
+      body: JSON.stringify({ version: 1, paths: ["objects/missing"] }),
+    });
+    expect(missing.status).toBe(404);
+
+    for (const paths of [
+      ["objects/pack/one.idx", "objects/pack/one.idx"],
+      ["refs/heads/main"],
+    ]) {
+      const invalid = await remoteFetch(app, "/batch/repo/read-bundle", {
+        method: "POST",
+        body: JSON.stringify({ version: 1, paths }),
+      });
+      expect(invalid.status).toBe(400);
+    }
   });
 
   it("calculates an exact upload-bundle size for path-only list backends", async () => {

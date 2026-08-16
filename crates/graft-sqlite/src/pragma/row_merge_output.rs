@@ -1440,6 +1440,7 @@ fn materialize_row_auto_merge_candidate(
     }
     let temp_path = row_auto_merge_temp_path(repo, key)?;
     let result = (|| {
+        let seed_trace = graft::trace::PushTraceSpan::new("sqlite_merge_seed");
         let cloned = if row_merge_integrity_proven(ours) {
             worktree_seed
                 .map(|seed| try_clone_sqlite_merge_seed(seed, &temp_path))
@@ -1451,13 +1452,24 @@ fn materialize_row_auto_merge_candidate(
         if !cloned {
             write_repo_file_state_to_path(runtime, ours, &temp_path)?;
         }
+        seed_trace.finish(&[("worktree_seed", u64::from(cloned))]);
+
+        let integrity_trace = graft::trace::PushTraceSpan::new("sqlite_merge_integrity");
         validate_row_merge_base_integrity(&temp_path, ours)?;
+        integrity_trace.finish(&[]);
+
+        let apply_trace = graft::trace::PushTraceSpan::new("sqlite_merge_apply");
         let changed_pages = apply_row_merge_sql_to_path_with_changed_pages(&temp_path, sql)?;
+        let changed_page_count = changed_pages.as_ref().map_or(0, |pages| pages.len() as u64);
+        apply_trace.finish(&[("changed_pages", changed_page_count)]);
+
         // Keep the merged snapshot in the ancestry of ours. A row merge changes
         // only a handful of SQLite pages; importing with no base turned every
         // candidate into a new full-size Volume and made the next push upload the
         // compressed database again.
-        match changed_pages {
+        let import_trace = graft::trace::PushTraceSpan::new("sqlite_merge_import");
+        let sparse_import = u64::from(changed_pages.is_some());
+        let state = match changed_pages {
             Some(changed_pages) => import_stable_sqlite_file_state_from_changed_pages(
                 runtime,
                 &temp_path,
@@ -1465,7 +1477,12 @@ fn materialize_row_auto_merge_candidate(
                 &changed_pages,
             ),
             None => import_stable_sqlite_file_state(runtime, &temp_path, Some(ours)),
-        }
+        }?;
+        import_trace.finish(&[
+            ("sparse_import", sparse_import),
+            ("changed_pages", changed_page_count),
+        ]);
+        Ok(state)
     })();
     match result {
         Ok(state) => Ok((state, temp_path)),
@@ -1477,10 +1494,11 @@ fn materialize_row_auto_merge_candidate(
     }
 }
 
-/// Clone a proof-backed, exclusively locked worktree seed without copying its data blocks.
+/// Seed a private candidate from a proof-backed, exclusively locked worktree database.
 ///
 /// Failure is an ordinary cache miss: callers fall back to materializing the authoritative Graft
-/// state. Other platforms intentionally return `false` instead of paying for a full byte copy.
+/// state. APFS uses a block clone. Windows uses the kernel file-copy path because a sequential
+/// copy is still substantially cheaper than decoding and rewriting every page from Graft storage.
 fn try_clone_sqlite_merge_seed(source: &Path, destination: &Path) -> Result<bool, ErrCtx> {
     #[cfg(target_os = "macos")]
     {
@@ -1504,7 +1522,21 @@ fn try_clone_sqlite_merge_seed(source: &Path, destination: &Path) -> Result<bool
         }
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(source_bytes) = std::fs::metadata(source).map(|metadata| metadata.len()) {
+            match std::fs::copy(source, destination) {
+                Ok(copied_bytes) if copied_bytes == source_bytes => return Ok(true),
+                Ok(_) | Err(_) => match std::fs::remove_file(destination) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                },
+            }
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let _ = (source, destination);
 
     Ok(false)
@@ -1921,6 +1953,21 @@ mod validation_tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_merge_seed_clone_is_an_independent_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.db");
+        let destination = temp.path().join("candidate.db");
+        std::fs::write(&source, b"immutable source").unwrap();
+
+        assert!(try_clone_sqlite_merge_seed(&source, &destination).unwrap());
+        std::fs::write(&destination, b"changed candidate").unwrap();
+
+        assert_eq!(std::fs::read(&source).unwrap(), b"immutable source");
+        assert_eq!(std::fs::read(&destination).unwrap(), b"changed candidate");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_merge_seed_copy_is_an_independent_file() {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("source.db");
         let destination = temp.path().join("candidate.db");

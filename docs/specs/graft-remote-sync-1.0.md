@@ -97,6 +97,7 @@ range
 list
 list-cursor
 put-if-absent
+read-bundle
 upload-bundle
 receive-pack
 receive-bundle
@@ -149,6 +150,7 @@ All routes are relative to the repository base:
 | `DELETE /raw/<key>` | delete transactional metadata | `204` |
 | `PUT /raw-if-not-exists/<key>` | create immutable object | `204` |
 | `GET /list?prefix=...` | sorted recursive key listing | `200` |
+| `POST /read-bundle` | explicit immutable object batch read | `200` |
 | `POST /cas/<key>` | compare and replace metadata | `204` |
 | `POST /cad/<key>` | compare and delete metadata | `204` |
 | `POST /upload-bundle/<ref-key>` | stable clone snapshot stream | `200` |
@@ -188,7 +190,28 @@ metadata writes are not a safe push publication primitive.
 
 ## 8. Aggregate and multipart transport
 
-### 8.1 Upload bundle
+### 8.1 Read bundle
+
+`read-bundle` collapses a finite set of immutable object reads into one
+authenticated request. The request is UTF-8 JSON with one through 256 unique,
+valid immutable paths:
+
+```json
+{ "version": 1, "paths": ["logs/example/commits/0000000000000001"] }
+```
+
+The service sorts paths bytewise and returns one frame per path using the same
+`(path length, object length, path, bytes)` network-byte-order framing as
+`upload-bundle`. The response uses
+`Content-Type: application/vnd.graft.read-bundle`, declares the exact frame
+count in `x-graft-bundle-objects`, and declares the exact complete length in
+`x-graft-bundle-total-bytes` and `Content-Length`. Missing objects fail the
+aggregate request. The current service caps the complete response at 64 MiB.
+Clients MUST validate unique expected paths, lengths, final framing, and object
+contents before use. They fall back to bounded individual reads on `404`,
+`405`, or `413`.
+
+### 8.2 Upload bundle
 
 `upload-bundle` reads the requested ref, enumerates immutable keys, reads the
 ref again, and returns `409` if it changed. A stable response contains a
@@ -224,7 +247,7 @@ opaque. The client validates every frame in a temporary local remote before
 resolving/checkout. The current service caps a bundle at 65,536 objects.
 Clients fall back to raw/list on `404` or `405`.
 
-### 8.2 Receive pack and receive bundle
+### 8.3 Receive pack and receive bundle
 
 `receive-pack` streams one repository object pack and index, creates both
 immutably, then performs the ref CAS. A malformed/truncated body MUST NOT update
@@ -266,7 +289,7 @@ The body is exactly `manifest || each object in manifest order || pack ||
 index`. `allow_existing: false` returns `412` on collision so the client can
 read/verify and use the individual fallback.
 
-### 8.3 Multipart immutable objects
+### 8.4 Multipart immutable objects
 
 Multipart transfer is optional and changes only transport, not object identity.
 Start/resume binds an opaque upload ID, target key, total length, and part size.

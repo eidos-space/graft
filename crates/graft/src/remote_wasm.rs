@@ -302,6 +302,11 @@ pub struct Remote {
     objects: Arc<Mutex<BTreeMap<String, Bytes>>>,
 }
 
+pub(crate) enum ReadBundleOutcome {
+    Downloaded(BTreeMap<String, Bytes>),
+    Unsupported,
+}
+
 impl Remote {
     pub(crate) fn snapshot_upload_concurrency(&self) -> usize {
         5
@@ -346,6 +351,16 @@ impl Remote {
             .map(Commit::decode)
             .transpose()
             .map_err(Into::into)
+    }
+
+    pub(crate) async fn get_raw_bundle(&self, paths: &[String]) -> Result<ReadBundleOutcome> {
+        let mut objects = BTreeMap::new();
+        for path in paths {
+            if let Some(bytes) = self.get_raw(path).await? {
+                objects.insert(path.clone(), bytes);
+            }
+        }
+        Ok(ReadBundleOutcome::Downloaded(objects))
     }
 
     pub async fn put_commit(&self, commit: &Commit) -> Result<()> {

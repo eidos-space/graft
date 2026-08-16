@@ -28,7 +28,8 @@ use crate::{
     remote::Remote,
     rt::{
         action::{
-            Action, FetchLog, FetchSegment, HydrateSnapshot, PreparedSnapshotPush, RemoteCommit,
+            Action, FetchLog, FetchSegment, FetchSnapshot, HydrateSnapshot, PreparedSnapshotPush,
+            RemoteCommit,
         },
         task::{autosync::AutosyncTask, supervise},
     },
@@ -396,23 +397,6 @@ impl Runtime {
         self.run_action_with_remote(FetchLog { log, min_lsn: None, max_lsn }, remote)
     }
 
-    fn fetch_log_range_from(
-        &self,
-        log: LogId,
-        min_lsn: LSN,
-        max_lsn: LSN,
-        remote: Arc<Remote>,
-    ) -> Result<()> {
-        self.run_action_with_remote(
-            FetchLog {
-                log,
-                min_lsn: Some(min_lsn),
-                max_lsn: Some(max_lsn),
-            },
-            remote,
-        )
-    }
-
     pub fn get_commit(&self, log: &LogId, lsn: LSN) -> Result<Option<Commit>> {
         Ok(self.storage().read().get_commit(log, lsn)?)
     }
@@ -544,14 +528,7 @@ impl Runtime {
     }
 
     pub fn snapshot_fetch_from(&self, snapshot: &Snapshot, remote: Arc<Remote>) -> Result<()> {
-        for range in snapshot.iter() {
-            self.fetch_log_range_from(
-                range.log.clone(),
-                *range.lsns.start(),
-                *range.lsns.end(),
-                remote.clone(),
-            )?;
-        }
+        self.run_action_with_remote(FetchSnapshot { snapshot: snapshot.clone() }, remote)?;
         self.ensure_snapshot_commits(snapshot)
     }
 

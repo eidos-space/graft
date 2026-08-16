@@ -58,7 +58,7 @@ backend 另有 storage-layer retry。
 返回 `graft-remote` descriptor、version、capability 与 limit。Capability 可包括：
 
 ```text
-range list list-cursor put-if-absent upload-bundle
+range list list-cursor put-if-absent read-bundle upload-bundle
 receive-pack receive-bundle multipart-object cas cad
 ```
 
@@ -85,6 +85,7 @@ CAD、sorted recursive list 与可选 multipart；必须 repository isolation。
 | `PUT/DELETE /raw/<key>` | transactional metadata |
 | `PUT /raw-if-not-exists/<key>` | immutable create |
 | `GET /list?prefix=...` | sorted recursive list |
+| `POST /read-bundle` | 显式 immutable object 批量读取 |
 | `POST /cas`, `POST /cad` | atomic ref replace/delete |
 | `POST /upload-bundle` | stable clone stream |
 | `POST /receive-pack` | pack/index then ref CAS |
@@ -105,6 +106,16 @@ CAS/CAD 用 expected-present 与 expected-hex，absence 与 present empty bytes 
 publication 必须 CAS/CAD。
 
 ## 8. Aggregate 与 multipart
+
+Read-bundle 把有限个 immutable object read 合并为一次 authenticated request。Request
+是 UTF-8 JSON：`{"version":1,"paths":[...]}`，包含 1 到 256 个 unique、valid
+immutable path。Service 按 bytewise 顺序返回与 upload-bundle 相同的 `(path length,
+object length, path, bytes)` network-byte-order frame。Response 使用
+`application/vnd.graft.read-bundle`，以 `x-graft-bundle-objects` 声明精确 frame
+数量，并通过 `x-graft-bundle-total-bytes` 与 `Content-Length` 声明完整精确长度。
+任一 object missing 会使 aggregate request 失败；当前完整 response 上限 64 MiB。
+Client 使用前必须验证 expected path、unique、length、final framing 与 object content；
+`404/405/413` 时 fallback 到 bounded individual read。
 
 Upload-bundle 在 enumerate 前后两次读 ref；变化则 `409`。Stable response 是 manifest
 加按 network byte order 编码、严格排序、唯一的 binary frame。V1 因 service opaque

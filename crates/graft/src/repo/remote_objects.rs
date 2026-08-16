@@ -91,7 +91,10 @@ impl Repository {
             }
         }
 
-        for index in fetch_remote_object_pack_indexes(remote)? {
+        for index in fetch_remote_object_pack_indexes(
+            remote,
+            Some(&self.graft_dir.join(DIR_CACHE_REMOTE_OBJECT_PACK_INDEXES)),
+        )? {
             for entry in index.objects {
                 objects.insert(entry.id);
             }
@@ -148,7 +151,9 @@ impl Repository {
         let mut count = 0;
         let mut stack = vec![head.to_string()];
         let mut seen = BTreeMap::<String, ()>::new();
-        let mut pack_cache = RemoteObjectPackCache::default();
+        let mut pack_cache = RemoteObjectPackCache::persistent(
+            self.graft_dir.join(DIR_CACHE_REMOTE_OBJECT_PACK_INDEXES),
+        );
         while let Some(id) = stack.pop() {
             if seen.insert(id.clone(), ()).is_some() {
                 continue;

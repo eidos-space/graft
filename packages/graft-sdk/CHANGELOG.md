@@ -5,6 +5,22 @@ SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
 
 ## Unreleased
 
+### Changed
+
+- Fetch coalesces immutable pack-index reads and missing SQLite snapshot commits into bounded
+  Remote read bundles. In the retained Windows trace with 15 pack indexes, the index phase changes
+  from 15 authenticated HTTP GETs to one request; longer histories are split automatically at the
+  service limit.
+- Pack indexes are cached locally as repairable performance hints, so unchanged immutable indexes
+  are not downloaded again after reopening the application.
+- Windows row auto-merge can seed a proven private candidate from the locked Ours worktree instead
+  of reconstructing the complete SQLite file from page storage.
+
+### Compatibility
+
+- Repository and snapshot formats are unchanged. SDK clients fall back to bounded individual reads
+  against Remote services that do not advertise or accept `read-bundle`.
+
 ## Graft SDK 0.3.17 — 2026-08-17
 
 ### Fixed

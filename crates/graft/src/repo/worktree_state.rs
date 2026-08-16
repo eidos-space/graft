@@ -431,6 +431,7 @@ impl Repository {
             DIR_INDEX,
             DIR_LOCKS,
             DIR_TMP,
+            DIR_CACHE_REMOTE_OBJECT_PACK_INDEXES,
             DIR_LOGS_REFS,
             DIR_LOGS_HEAD,
         ] {

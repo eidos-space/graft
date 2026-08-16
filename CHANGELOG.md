@@ -4,6 +4,17 @@
 
 ### Changed
 
+- HTTP Remotes support an additive, bounded `read-bundle` operation for immutable objects. Pack
+  indexes and snapshot commits are fetched in sorted batches, requests above the 256-object server
+  limit are split automatically, and older services fall back to bounded individual reads.
+- Remote pack indexes now use a disposable persistent cache. The Remote listing remains
+  authoritative, while missing or corrupt cache entries are fetched once and repaired without
+  changing repository truth.
+- Snapshot hydration collects missing commits across every log range before writing one local
+  batch, instead of walking each range through its own Remote request loop.
+- On Windows, a proven clean and exclusively locked SQLite worktree seeds the private merge
+  candidate through the kernel file-copy path instead of reconstructing every page from Graft
+  storage. Copy failure retains authoritative snapshot materialization.
 - SQLite row merge now reuses proven segment page sets across immutable snapshots, targets
   `WITHOUT ROWID` analysis to changed B-tree pages, and installs an already validated merge
   candidate directly instead of serializing the database again during completion.
@@ -49,6 +60,9 @@
 
 ### Compatibility
 
+- `read-bundle` is an additive Remote capability. New clients transparently use individual GETs
+  when a service returns protocol-aware 404, 405, or 413 responses; existing clients continue to
+  use the unchanged raw-object endpoints.
 - Merge, repository, snapshot, and Remote formats are unchanged. Continue remains conservatively
   classified as worktree-materializing before a call even though its validated fast path may
   return an empty exact path set afterward.

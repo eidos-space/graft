@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     env, fmt, fs, future,
     io::Write,
     ops::Range,
@@ -47,12 +47,15 @@ const RECEIVE_PACK_HEADER_INDEX_BYTES: &str = "x-graft-index-bytes";
 const RECEIVE_PACK_HEADER_REPLACEMENT_HEX: &str = "x-graft-ref-replacement-hex";
 const RECEIVE_BUNDLE_HEADER_MANIFEST_BYTES: &str = "x-graft-bundle-manifest-bytes";
 const UPLOAD_BUNDLE_HEADER_TOTAL_BYTES: &str = "x-graft-bundle-total-bytes";
+const READ_BUNDLE_HEADER_OBJECTS: &str = "x-graft-bundle-objects";
 const MULTIPART_HEADER_OBJECT_BYTES: &str = "x-graft-object-bytes";
 const MULTIPART_HEADER_UPLOAD_ID: &str = "x-graft-upload-id";
 const MULTIPART_HEADER_PART_NUMBER: &str = "x-graft-part-number";
 const MAX_UPLOAD_BUNDLE_MANIFEST_BYTES: usize = 64 * 1024;
 const MAX_UPLOAD_BUNDLE_OBJECTS: usize = 65_536;
 const MAX_UPLOAD_BUNDLE_PATH_BYTES: usize = 768;
+const MAX_READ_BUNDLE_OBJECTS: usize = 256;
+const MAX_READ_BUNDLE_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MULTIPART_DISCOVERY_THRESHOLD_BYTES: usize = 64 * 1024 * 1024;
 const MAX_MULTIPART_PARTS: usize = 10_000;
@@ -656,6 +659,11 @@ pub(crate) enum UploadBundleOutcome {
     Unsupported,
 }
 
+pub(crate) enum ReadBundleOutcome {
+    Downloaded(BTreeMap<String, Bytes>),
+    Unsupported,
+}
+
 impl RemoteObjectPack {
     pub(crate) fn new(id: String, pack: Bytes, index: Bytes) -> Self {
         Self {
@@ -933,6 +941,42 @@ impl Remote {
                 .map(|entry| entry.path().to_string())
                 .collect()),
             RemoteBackend::Http(remote) => remote.list_raw(prefix).await,
+        }
+    }
+
+    pub(crate) async fn get_raw_bundle(&self, paths: &[String]) -> Result<ReadBundleOutcome> {
+        if paths.is_empty() {
+            return Ok(ReadBundleOutcome::Downloaded(BTreeMap::new()));
+        }
+        let mut paths = paths.to_vec();
+        paths.sort();
+        paths.dedup();
+        match &self.backend {
+            RemoteBackend::Http(remote) => {
+                let mut objects = BTreeMap::new();
+                for paths in paths.chunks(MAX_READ_BUNDLE_OBJECTS) {
+                    match remote.get_raw_bundle(paths).await? {
+                        ReadBundleOutcome::Downloaded(batch) => objects.extend(batch),
+                        ReadBundleOutcome::Unsupported => {
+                            return Ok(ReadBundleOutcome::Unsupported);
+                        }
+                    }
+                }
+                Ok(ReadBundleOutcome::Downloaded(objects))
+            }
+            RemoteBackend::ObjectStore(_) => {
+                let objects = stream::iter(paths)
+                    .map(|path| async move {
+                        Ok::<_, RemoteErr>((path.clone(), self.get_raw(&path).await?))
+                    })
+                    .buffered(REMOTE_CONCURRENCY)
+                    .try_filter_map(
+                        |(path, bytes)| async move { Ok(bytes.map(|bytes| (path, bytes))) },
+                    )
+                    .try_collect::<BTreeMap<_, _>>()
+                    .await?;
+                Ok(ReadBundleOutcome::Downloaded(objects))
+            }
         }
     }
 
@@ -1245,7 +1289,6 @@ impl Remote {
     #[cfg(test)]
     pub async fn testonly_format_tree(&self) -> String {
         use itertools::Itertools;
-        use std::collections::BTreeMap;
         use text_trees::{
             AnchorPosition, FormatCharacters, TreeFormatting, TreeNode, TreeOrientation,
         };
@@ -1862,6 +1905,102 @@ impl HttpRemote {
         body.require_end(ref_path).await?;
         write_upload_bundle_ref(root, &manifest.reference, ref_path)?;
         Ok(UploadBundleOutcome::Downloaded)
+    }
+
+    async fn get_raw_bundle(&self, paths: &[String]) -> Result<ReadBundleOutcome> {
+        if paths.len() > MAX_READ_BUNDLE_OBJECTS {
+            return Err(RemoteErr::HttpStatus {
+                status: 413,
+                path: "read-bundle".to_string(),
+                message: format!("read-bundle exceeds {MAX_READ_BUNDLE_OBJECTS} objects"),
+            });
+        }
+        let mut paths = paths.to_vec();
+        paths.sort();
+        paths.dedup();
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "paths": paths,
+        }))
+        .map_err(|err| RemoteErr::HttpStatus {
+            status: 500,
+            path: "read-bundle".to_string(),
+            message: format!("failed to encode read-bundle manifest: {err}"),
+        })?;
+        let manifest_bytes = manifest.len() as u64;
+        let response = self
+            .send(
+                self.request(reqwest::Method::POST, format!("{}/read-bundle", self.url))
+                    .header(reqwest::header::CONTENT_LENGTH, manifest.len())
+                    .body(manifest),
+                "read_bundle",
+                Some(manifest_bytes),
+            )
+            .await?;
+        if matches!(response.status().as_u16(), 404 | 405 | 413)
+            && Self::check_protocol(&response, "read-bundle").is_ok()
+        {
+            Self::drain_response(response).await?;
+            return Ok(ReadBundleOutcome::Unsupported);
+        }
+        let response = Self::check_response(response, "read-bundle").await?;
+        let objects = response
+            .headers()
+            .get(READ_BUNDLE_HEADER_OBJECTS)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|objects| *objects == paths.len())
+            .ok_or_else(|| upload_bundle_error("read-bundle", "invalid object count"))?;
+        let declared_total = upload_bundle_total_length(response.headers(), "read-bundle")?;
+        let content_length = response.content_length();
+        if declared_total.is_some() && content_length.is_some() && declared_total != content_length
+        {
+            return Err(upload_bundle_error(
+                "read-bundle",
+                "read-bundle total length does not match Content-Length",
+            ));
+        }
+        let total_bytes = declared_total.or(content_length);
+        if total_bytes.is_some_and(|bytes| bytes > MAX_READ_BUNDLE_RESPONSE_BYTES) {
+            return Err(upload_bundle_error(
+                "read-bundle",
+                "read-bundle response exceeds the client limit",
+            ));
+        }
+        let mut body = HttpDownloadBody::new(response.bytes_stream(), total_bytes);
+        let expected = paths.into_iter().collect::<BTreeSet<_>>();
+        let mut decoded = BTreeMap::new();
+        let mut previous_path: Option<String> = None;
+        for _ in 0..objects {
+            let header = body.read_exact(12, "read-bundle").await?;
+            let path_bytes = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
+            let object_bytes = u64::from_be_bytes(header[4..12].try_into().unwrap());
+            if !(1..=MAX_UPLOAD_BUNDLE_PATH_BYTES).contains(&path_bytes)
+                || object_bytes > MAX_READ_BUNDLE_RESPONSE_BYTES
+            {
+                return Err(upload_bundle_error("read-bundle", "invalid object frame"));
+            }
+            let path = body.read_exact(path_bytes, "read-bundle").await?;
+            let path = decode_upload_bundle_path(&path, previous_path.as_deref(), "read-bundle")?;
+            let object_bytes = usize::try_from(object_bytes)
+                .map_err(|_| upload_bundle_error("read-bundle", "object is too large"))?;
+            let bytes = Bytes::from(body.read_exact(object_bytes, "read-bundle").await?);
+            if !expected.contains(&path) || decoded.insert(path.clone(), bytes).is_some() {
+                return Err(upload_bundle_error(
+                    "read-bundle",
+                    "response contains an unexpected object",
+                ));
+            }
+            previous_path = Some(path);
+        }
+        body.require_end("read-bundle").await?;
+        if decoded.len() != expected.len() {
+            return Err(upload_bundle_error(
+                "read-bundle",
+                "response is missing a requested object",
+            ));
+        }
+        Ok(ReadBundleOutcome::Downloaded(decoded))
     }
 
     async fn put_raw(&self, path: &str, bytes: Bytes) -> Result<()> {
@@ -2785,6 +2924,63 @@ mod tests {
             panic!("expected HTTP remote");
         };
         assert!(http.token.is_none());
+    }
+
+    #[tokio::test]
+    async fn read_bundle_chunks_requests_above_the_server_object_limit() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut requested = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut stream).await;
+                let header_end = request
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .unwrap()
+                    + 4;
+                let manifest: serde_json::Value =
+                    serde_json::from_slice(&request[header_end..]).unwrap();
+                let paths = manifest["paths"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|path| path.as_str().unwrap().to_string())
+                    .collect::<Vec<_>>();
+                let objects = paths
+                    .iter()
+                    .map(|path| (path.as_str(), b"x".as_slice()))
+                    .collect::<Vec<_>>();
+                let body = encode_test_upload_bundle(&[], &objects);
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nGraft-Protocol: 1\r\n{READ_BUNDLE_HEADER_OBJECTS}: {}\r\n{UPLOAD_BUNDLE_HEADER_TOTAL_BYTES}: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    paths.len(),
+                    body.len(),
+                    body.len()
+                );
+                stream.write_all(headers.as_bytes()).await.unwrap();
+                stream.write_all(&body).await.unwrap();
+                requested.push(paths.len());
+            }
+            requested
+        });
+
+        let remote = RemoteConfig::Http {
+            url: format!("http://{address}/org/repo"),
+            token_env: None,
+        }
+        .build()
+        .unwrap();
+        let paths = (0..=MAX_READ_BUNDLE_OBJECTS)
+            .map(|index| format!("objects/{index:04}"))
+            .collect::<Vec<_>>();
+        let ReadBundleOutcome::Downloaded(objects) = remote.get_raw_bundle(&paths).await.unwrap()
+        else {
+            panic!("read-bundle unexpectedly fell back");
+        };
+        assert_eq!(objects.len(), paths.len());
+        assert_eq!(server.await.unwrap(), vec![MAX_READ_BUNDLE_OBJECTS, 1]);
     }
 
     async fn serve_http_response(

@@ -2,6 +2,7 @@ import {
   GRAFT_REMOTE_CAPABILITIES,
   MAX_LIST_LIMIT,
   MAX_METADATA_BYTES,
+  MAX_READ_BUNDLE_OBJECTS,
   MAX_UPLOAD_BUNDLE_OBJECTS,
   MULTIPART_HEADER_OBJECT_BYTES,
   MULTIPART_HEADER_PART_NUMBER,
@@ -9,6 +10,7 @@ import {
   PROTOCOL_HEADER,
   PROTOCOL_VERSION,
   RECEIVE_BUNDLE_HEADER_MANIFEST_BYTES,
+  READ_BUNDLE_HEADER_OBJECTS,
   UPLOAD_BUNDLE_HEADER_TOTAL_BYTES,
   GraftProtocolError,
   bytewiseCompare,
@@ -49,6 +51,7 @@ import type {
 const OPERATIONS = new Set<GraftRemoteOperation>([
   "raw",
   "raw-if-not-exists",
+  "read-bundle",
   "upload-bundle",
   "receive-pack",
   "receive-bundle",
@@ -171,8 +174,11 @@ async function handleRequest<AdapterContext, Principal>(
   }
 
   rejectUnexpectedQuery(url);
-  const path = objectPath!;
   enforceRequestLimit(input.request.headers, limits.maxRequestBytes);
+  if (operation === "read-bundle") {
+    return readBundle(input.request, backend);
+  }
+  const path = objectPath!;
   switch (operation) {
     case "raw":
       return raw(input.request, backend, path);
@@ -213,7 +219,7 @@ function parseObjectPath(
   operation: GraftRemoteOperation,
   value: string | undefined,
 ): string | undefined {
-  if (operation === "descriptor" || operation === "list") {
+  if (operation === "descriptor" || operation === "list" || operation === "read-bundle") {
     if (value !== undefined) {
       throw new GraftProtocolError(400, "invalid_list_path", "The operation has no path suffix");
     }
@@ -239,6 +245,9 @@ function validateMethodAndAction(
       return "discover";
     case "list":
       requireMethod(method, "GET");
+      return "read";
+    case "read-bundle":
+      requireMethod(method, "POST");
       return "read";
     case "raw":
       if (method === "GET" || method === "HEAD") {
@@ -486,6 +495,71 @@ async function uploadBundle(
     [UPLOAD_BUNDLE_HEADER_TOTAL_BYTES]: totalBytes.toString(),
   });
   return new Response(new UploadBundleBody(backend, manifest, objects).stream, { headers });
+}
+
+const MAX_READ_BUNDLE_MANIFEST_BYTES = 256 * 1024;
+const MAX_READ_BUNDLE_RESPONSE_BYTES = 64 * 1024 * 1024;
+
+async function readBundle(
+  request: Request,
+  backend: GraftRepositoryBackend,
+): Promise<Response> {
+  const manifest = await readLimitedBody(request, MAX_READ_BUNDLE_MANIFEST_BYTES);
+  let value: unknown;
+  try {
+    value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(manifest));
+  } catch {
+    throw new GraftProtocolError(400, "invalid_read_bundle", "Invalid read-bundle manifest");
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new GraftProtocolError(400, "invalid_read_bundle", "Invalid read-bundle manifest");
+  }
+  const record = value as Record<string, unknown>;
+  if (
+    Object.keys(record).some((key) => key !== "version" && key !== "paths") ||
+    record.version !== 1 ||
+    !Array.isArray(record.paths) ||
+    record.paths.length === 0 ||
+    record.paths.length > MAX_READ_BUNDLE_OBJECTS
+  ) {
+    throw new GraftProtocolError(400, "invalid_read_bundle", "Invalid read-bundle manifest");
+  }
+  const seen = new Set<string>();
+  const paths = record.paths.map((path) => {
+    if (typeof path !== "string") {
+      throw new GraftProtocolError(400, "invalid_read_bundle", "Invalid read-bundle path");
+    }
+    const validated = validateObjectPath(path);
+    requireImmutablePath(validated);
+    if (seen.has(validated)) {
+      throw new GraftProtocolError(400, "invalid_read_bundle", "Duplicate read-bundle path");
+    }
+    seen.add(validated);
+    return validated;
+  });
+  paths.sort(bytewiseCompare);
+  const sizes = await resolveObjectSizes(backend, paths);
+  const objects = paths.map((path): UploadBundleObject => {
+    const size = sizes.get(path);
+    if (size === undefined) throw objectNotFound();
+    return { path, size };
+  });
+  const totalBytes = uploadBundleTotalBytes(new Uint8Array(), objects);
+  if (totalBytes > MAX_READ_BUNDLE_RESPONSE_BYTES) {
+    throw new GraftProtocolError(
+      413,
+      "read_bundle_too_large",
+      "Read-bundle response exceeds the aggregate size limit",
+    );
+  }
+  return new Response(new UploadBundleBody(backend, new Uint8Array(), objects).stream, {
+    headers: protocolHeaders({
+      "Content-Length": totalBytes.toString(),
+      "Content-Type": "application/vnd.graft.read-bundle",
+      [READ_BUNDLE_HEADER_OBJECTS]: objects.length.toString(),
+      [UPLOAD_BUNDLE_HEADER_TOTAL_BYTES]: totalBytes.toString(),
+    }),
+  });
 }
 
 interface UploadBundleObject {
