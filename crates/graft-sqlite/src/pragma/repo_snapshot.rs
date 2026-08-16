@@ -132,15 +132,24 @@ pub(super) fn hydrate_repo_file_state_for(
 pub(super) fn prepare_repo_snapshot_for_push(
     runtime: &Runtime,
     snapshot: &RepoSnapshot,
+    remote: Option<Arc<Remote>>,
 ) -> Result<(), ErrCtx> {
-    RepoSnapshotResolver::normalizing(
-        runtime,
-        None,
-        RepoSnapshotPurpose::Push,
-        SnapshotHashPolicy::AllowHydratedMismatch,
-    )
-    .resolve_snapshot(snapshot)
-    .map(|_| ())
+    let resolver = if remote.is_some() {
+        RepoSnapshotResolver::normalizing_local_then_remote(
+            runtime,
+            remote,
+            RepoSnapshotPurpose::Push,
+            SnapshotHashPolicy::AllowHydratedMismatch,
+        )
+    } else {
+        RepoSnapshotResolver::normalizing(
+            runtime,
+            None,
+            RepoSnapshotPurpose::Push,
+            SnapshotHashPolicy::AllowHydratedMismatch,
+        )
+    };
+    resolver.resolve_snapshot(snapshot).map(|_| ())
 }
 
 pub(super) fn verify_repo_checkout_plan(
@@ -533,7 +542,8 @@ pub(super) fn publish_repo_branch_snapshots(
     stop_at: Option<&str>,
 ) -> Result<(), ErrCtx> {
     let remote_store = Arc::new(repo.remote_store(remote)?);
-    let snapshots = repo_branch_snapshots(runtime, repo, remote, branch, stop_at)?;
+    let snapshots =
+        repo_branch_snapshots(runtime, repo, remote, branch, stop_at, remote_store.clone())?;
     runtime.snapshots_push_to(snapshots, remote_store)?;
 
     Ok(())
@@ -547,7 +557,8 @@ pub(super) fn prepare_repo_branch_snapshot_push(
     stop_at: Option<&str>,
     remote_store: Arc<Remote>,
 ) -> Result<graft::PreparedSnapshotPush, ErrCtx> {
-    let snapshots = repo_branch_snapshots(runtime, repo, remote, branch, stop_at)?;
+    let snapshots =
+        repo_branch_snapshots(runtime, repo, remote, branch, stop_at, remote_store.clone())?;
     runtime
         .snapshots_prepare_push_to(snapshots, remote_store)
         .map_err(ErrCtx::from)
@@ -559,6 +570,7 @@ fn repo_branch_snapshots(
     remote: &str,
     branch: &str,
     stop_at: Option<&str>,
+    remote_store: Arc<Remote>,
 ) -> Result<Vec<graft::snapshot::Snapshot>, ErrCtx> {
     let mut stop_commits = BTreeSet::<String>::new();
     if let Some(stop_at) = stop_at {
@@ -589,7 +601,7 @@ fn repo_branch_snapshots(
             if runtime_snapshot.is_empty() {
                 continue;
             }
-            prepare_repo_snapshot_for_push(runtime, &snapshot)?;
+            prepare_repo_snapshot_for_push(runtime, &snapshot, Some(remote_store.clone()))?;
             snapshots.push(runtime_snapshot);
         }
 
@@ -800,4 +812,50 @@ pub(super) fn publish_repo_refspec_snapshots(
         )?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use graft::setup::setup_graft_temporary;
+
+    use super::*;
+
+    #[test]
+    fn push_snapshot_preflight_hydrates_a_remote_commit_missing_locally() {
+        let remote_directory = tempfile::tempdir().unwrap();
+        let remote_config = RemoteConfig::Fs {
+            root: remote_directory.path().to_string_lossy().into_owned(),
+        };
+        let remote = Arc::new(remote_config.clone().build().unwrap());
+        let source = setup_graft_temporary(remote_config.clone(), None).unwrap();
+        let volume = source.volume_open(None, None, None).unwrap();
+        let mut writer = source.volume_writer(volume.vid).unwrap();
+        writer
+            .write_page(
+                PageIdx::try_new(1).unwrap(),
+                Page::from_buf(bytes::Bytes::from(vec![7_u8; PAGESIZE.as_usize()])).unwrap(),
+            )
+            .unwrap();
+        let snapshot = writer.commit().unwrap().snapshot().clone();
+        let repo_snapshot = repo_snapshot_with_commit_hashes(&source, &snapshot).unwrap();
+        source
+            .snapshot_push_to(snapshot.clone(), remote.clone())
+            .unwrap();
+
+        let target = setup_graft_temporary(remote_config, None).unwrap();
+        assert!(
+            verify_repo_snapshot_commit_hashes(
+                &target,
+                &repo_snapshot,
+                SnapshotHashPolicy::Strict,
+            )
+            .is_err()
+        );
+
+        prepare_repo_snapshot_for_push(&target, &repo_snapshot, Some(remote)).unwrap();
+
+        verify_repo_snapshot_commit_hashes(&target, &repo_snapshot, SnapshotHashPolicy::Strict)
+            .unwrap();
+        assert!(target.snapshot_hydration_cached(&snapshot).unwrap());
+    }
 }

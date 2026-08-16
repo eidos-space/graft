@@ -41,12 +41,15 @@ pub(super) fn run_repo_merge_continue(
         return pragma_err!("cannot continue merge while there is an open transaction");
     }
     let repo = repo_for_file(file)?;
-    if repo.status()?.merge_head.is_none() {
+    let status = repo.status()?;
+    let Some(merge_head) = status.merge_head else {
         return pragma_err!("no merge in progress");
-    }
-    try_row_auto_merge_current_file_status_conflict(runtime, file, &repo, None)?;
+    };
+    let remote = repo_merge_remote_store(&repo, &merge_head, &merge_head)?;
+    try_row_auto_merge_current_file_status_conflict(runtime, file, &repo, remote.clone())?;
     let conflicted = repo.status()?.conflicted;
-    try_row_auto_merge_paths(runtime, file, &repo, &conflicted, None, false)?;
+    try_row_auto_merge_paths(runtime, file, &repo, &conflicted, remote.clone(), false)?;
+    verify_staged_merge_file_states(runtime, &repo, remote)?;
     let tables = staged_commit_table_summary_for_file(runtime, file, &repo)?;
     let commit = repo.commit_staged_with_table_summary(message, tables)?;
     let materialized = if materialize_sqlite {
@@ -58,6 +61,27 @@ pub(super) fn run_repo_merge_continue(
     file.clear_row_merge_table_summaries();
     let branch = repo.current_branch()?;
     Ok(RepoCommitOutcome { commit, branch, materialized })
+}
+
+fn verify_staged_merge_file_states(
+    runtime: &Runtime,
+    repo: &Repository,
+    remote: Option<Arc<Remote>>,
+) -> Result<(), ErrCtx> {
+    let index = repo.read_index()?;
+    for entry in index.stage0_entries() {
+        let Some(state) = &entry.file else {
+            continue;
+        };
+        RepoSnapshotResolver::local_then_remote(
+            runtime,
+            remote.clone(),
+            RepoSnapshotPurpose::Merge,
+            SnapshotHashPolicy::Strict,
+        )
+        .resolve_file_state(state)?;
+    }
+    Ok(())
 }
 
 pub(super) fn run_repo_merge(

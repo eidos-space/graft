@@ -5,6 +5,22 @@ SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
 
 ## Unreleased
 
+## Graft SDK 0.3.17 — 2026-08-17
+
+### Fixed
+
+- Merge completion now resolves and verifies every staged SQLite snapshot from the configured
+  Remote before recording the two-parent commit, preventing an incomplete local snapshot from
+  becoming history that cannot be pushed.
+- Push preflight now hydrates referenced storage commits from the destination Remote when the local
+  repository no longer has them. Valid Remote-backed history can recover and publish instead of
+  entering a repeated missing-storage failure loop.
+
+### Compatibility
+
+- Repository, snapshot, merge, and Remote formats are unchanged. If the referenced storage is
+  absent both locally and remotely, the operation still fails without publishing partial history.
+
 ## Graft SDK 0.3.16 — 2026-08-16
 
 ### Fixed
