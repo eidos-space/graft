@@ -5039,6 +5039,19 @@ fn pull_plan_starts_snapshot_checkout_with_fresh_http_pool() {
     let address = listener.local_addr().unwrap();
     let head = format!("{}\n", commit.id);
     let server = thread::spawn(move || {
+        let (mut bundle, _) = listener.accept().unwrap();
+        assert!(
+            String::from_utf8_lossy(&read_headers(&mut bundle))
+                .starts_with("POST /org/repo/fetch-bundle/refs/heads/main ")
+        );
+        bundle
+            .write_all(
+                b"HTTP/1.1 404 Not Found\r\nGraft-Protocol: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+        bundle.flush().unwrap();
+        drop(bundle);
+
         let (mut first, _) = listener.accept().unwrap();
         assert!(
             String::from_utf8_lossy(&read_headers(&mut first))
@@ -5313,27 +5326,27 @@ fn fetch_prefetches_a_multi_push_pack_chain_in_one_bundle() {
         (headers, body)
     }
 
-    fn write_response(stream: &mut std::net::TcpStream, content_type: &str, body: &[u8]) {
-        write!(
-            stream,
-            "HTTP/1.1 200 OK\r\nGraft-Protocol: 1\r\nConnection: close\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\r\n",
-            body.len()
-        )
-        .unwrap();
-        stream.write_all(body).unwrap();
-        stream.flush().unwrap();
-    }
-
-    fn write_bundle(stream: &mut std::net::TcpStream, root: &Path, manifest: &[u8]) -> Vec<String> {
-        let manifest: serde_json::Value = serde_json::from_slice(manifest).unwrap();
-        let paths = manifest["paths"]
-            .as_array()
-            .unwrap()
+    fn write_fetch_bundle(
+        stream: &mut std::net::TcpStream,
+        root: &Path,
+        ref_path: &str,
+        head: &str,
+        paths: &[String],
+    ) {
+        let reference = format!("{head}\n");
+        let value_hex = reference
+            .as_bytes()
             .iter()
-            .map(|path| path.as_str().unwrap().to_string())
-            .collect::<Vec<_>>();
-        let mut body = Vec::new();
-        for path in &paths {
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "reference": { "path": ref_path, "value_hex": value_hex },
+            "objects": paths.len(),
+        }))
+        .unwrap();
+        let mut body = manifest.clone();
+        for path in paths {
             let bytes = fs::read(root.join(path)).unwrap();
             body.extend_from_slice(&(path.len() as u32).to_be_bytes());
             body.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
@@ -5342,15 +5355,14 @@ fn fetch_prefetches_a_multi_push_pack_chain_in_one_bundle() {
         }
         write!(
             stream,
-            "HTTP/1.1 200 OK\r\nGraft-Protocol: 1\r\nConnection: close\r\nX-Graft-Bundle-Objects: {}\r\nX-Graft-Bundle-Total-Bytes: {}\r\nContent-Length: {}\r\n\r\n",
-            paths.len(),
+            "HTTP/1.1 200 OK\r\nGraft-Protocol: 1\r\nConnection: close\r\nContent-Type: application/vnd.graft.fetch-bundle\r\nX-Graft-Bundle-Manifest-Bytes: {}\r\nX-Graft-Bundle-Total-Bytes: {}\r\nContent-Length: {}\r\n\r\n",
+            manifest.len(),
             body.len(),
             body.len()
         )
         .unwrap();
         stream.write_all(&body).unwrap();
         stream.flush().unwrap();
-        paths
     }
 
     let remote_dir = tempfile::tempdir().unwrap();
@@ -5423,44 +5435,33 @@ fn fetch_prefetches_a_multi_push_pack_chain_in_one_bundle() {
     let address = listener.local_addr().unwrap();
     let remote_root = remote_dir.path().to_path_buf();
     let served_head = expected_head.clone();
-    let expected_indexes = index_paths.clone();
-    let expected_packs = pack_paths.clone();
+    let mut expected_paths = index_paths
+        .into_iter()
+        .filter(|path| {
+            let index = decode_remote_object_pack_index(
+                path,
+                &fs::read(remote_dir.path().join(path)).unwrap(),
+            )
+            .unwrap();
+            main_commits.contains(&index.commits[0].id.to_string())
+        })
+        .chain(pack_paths)
+        .collect::<Vec<_>>();
+    expected_paths.sort();
     let server = thread::spawn(move || {
-        let (mut head, _) = listener.accept().unwrap();
-        let (request, _) = read_request(&mut head);
-        assert!(request.starts_with("GET /repo/raw/refs/heads/main HTTP/1.1"));
-        write_response(
-            &mut head,
-            "application/octet-stream",
-            format!("{served_head}\n").as_bytes(),
-        );
-
-        let (mut list, _) = listener.accept().unwrap();
-        let (request, _) = read_request(&mut list);
-        assert!(request.starts_with("GET /repo/list?prefix=objects%2Fpack HTTP/1.1"));
-        let list_body = serde_json::to_vec(&serde_json::json!({
-            "paths": expected_indexes
-                .iter()
-                .chain(expected_packs.iter())
-                .collect::<Vec<_>>()
-        }))
-        .unwrap();
-        write_response(&mut list, "application/json", &list_body);
-
-        let (mut indexes, _) = listener.accept().unwrap();
-        let (request, manifest) = read_request(&mut indexes);
-        assert!(request.starts_with("POST /repo/read-bundle HTTP/1.1"));
+        let (mut bundle, _) = listener.accept().unwrap();
+        let (request, manifest) = read_request(&mut bundle);
+        assert!(request.starts_with("POST /repo/fetch-bundle/refs/heads/main HTTP/1.1"));
         assert_eq!(
-            write_bundle(&mut indexes, &remote_root, &manifest),
-            expected_indexes
+            serde_json::from_slice::<serde_json::Value>(&manifest).unwrap(),
+            serde_json::json!({ "version": 1, "have": null })
         );
-
-        let (mut packs, _) = listener.accept().unwrap();
-        let (request, manifest) = read_request(&mut packs);
-        assert!(request.starts_with("POST /repo/read-bundle HTTP/1.1"));
-        assert_eq!(
-            write_bundle(&mut packs, &remote_root, &manifest),
-            expected_packs
+        write_fetch_bundle(
+            &mut bundle,
+            &remote_root,
+            "refs/heads/main",
+            &served_head,
+            &expected_paths,
         );
     });
 

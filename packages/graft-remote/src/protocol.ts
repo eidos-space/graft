@@ -11,6 +11,7 @@ export const GRAFT_REMOTE_CAPABILITIES = [
   "list-cursor",
   "put-if-absent",
   "read-bundle",
+  "fetch-bundle",
   "upload-bundle",
   "receive-pack",
   "receive-bundle",

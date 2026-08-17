@@ -52,6 +52,7 @@ const OPERATIONS = new Set<GraftRemoteOperation>([
   "raw",
   "raw-if-not-exists",
   "read-bundle",
+  "fetch-bundle",
   "upload-bundle",
   "receive-pack",
   "receive-bundle",
@@ -64,6 +65,9 @@ const OPERATIONS = new Set<GraftRemoteOperation>([
   "list",
 ]);
 const UPLOAD_BUNDLE_PREFETCH_OBJECTS = 8;
+const MAX_FETCH_BUNDLE_PACKS = 128;
+const MAX_FETCH_BUNDLE_INDEX_BYTES = 8 * 1024 * 1024;
+const MAX_FETCH_BUNDLE_RESPONSE_BYTES = 48 * 1024 * 1024;
 const DEFAULT_MULTIPART_PART_BYTES = 16 * 1024 * 1024;
 const MAX_MULTIPART_PARTS = 10_000;
 
@@ -184,6 +188,8 @@ async function handleRequest<AdapterContext, Principal>(
       return raw(input.request, backend, path);
     case "raw-if-not-exists":
       return putIfAbsent(input.request, backend, path);
+    case "fetch-bundle":
+      return fetchBundle(input.request, backend, path);
     case "upload-bundle":
       return uploadBundle(backend, path);
     case "receive-pack":
@@ -260,6 +266,7 @@ function validateMethodAndAction(
     case "raw-if-not-exists":
       requireMethod(method, "PUT");
       return "write";
+    case "fetch-bundle":
     case "upload-bundle":
       requireMethod(method, "POST");
       return "read";
@@ -495,6 +502,234 @@ async function uploadBundle(
     [UPLOAD_BUNDLE_HEADER_TOTAL_BYTES]: totalBytes.toString(),
   });
   return new Response(new UploadBundleBody(backend, manifest, objects).stream, { headers });
+}
+
+interface FetchBundlePackIndex {
+  path: string;
+  pack: string;
+  commits: Array<{ id: string; parents: string[] }>;
+}
+
+async function fetchBundle(
+  request: Request,
+  backend: GraftRepositoryBackend,
+  refPath: string,
+): Promise<Response> {
+  requireTransactionalPath(refPath);
+  const have = await parseFetchBundleRequest(request);
+  const reference = await readMetadataObject(backend, refPath);
+  if (reference === null) throw objectNotFound();
+  const head = decodeFetchBundleObjectId(reference, "reference");
+
+  const selectedPaths = new Set<string>();
+  if (have !== head) {
+    const indexes = await readFetchBundlePackIndexes(backend);
+    const advertised = new Map<string, { pack: string; parents: string[] }>();
+    for (const index of indexes) {
+      for (const commit of index.commits) {
+        if (advertised.has(commit.id)) {
+          throw fetchBundleUnavailable("Pack ancestry advertises a commit more than once");
+        }
+        advertised.set(commit.id, { pack: index.pack, parents: commit.parents });
+      }
+    }
+
+    const selectedPacks = new Set<string>();
+    const stack = [head];
+    const seen = new Set<string>();
+    while (stack.length > 0) {
+      const id = stack.pop()!;
+      if (id === have || seen.has(id)) continue;
+      seen.add(id);
+      const commit = advertised.get(id);
+      if (commit === undefined) {
+        throw fetchBundleUnavailable("Pack ancestry does not cover the requested history");
+      }
+      selectedPacks.add(commit.pack);
+      if (selectedPacks.size > MAX_FETCH_BUNDLE_PACKS) {
+        throw fetchBundleUnavailable("Requested history spans too many packs");
+      }
+      stack.push(...commit.parents);
+    }
+
+    for (const index of indexes) {
+      if (!selectedPacks.has(index.pack)) continue;
+      selectedPaths.add(index.path);
+      selectedPaths.add(index.pack);
+    }
+  }
+
+  const paths = [...selectedPaths].sort(bytewiseCompare);
+  const sizes = await resolveObjectSizes(backend, paths);
+  const objects = paths.map((path): UploadBundleObject => {
+    const size = sizes.get(path);
+    if (size === undefined) throw fetchBundleUnavailable("Selected pack disappeared");
+    return { path, size };
+  });
+  const manifest = new TextEncoder().encode(
+    JSON.stringify({
+      version: 1,
+      reference: { path: refPath, value_hex: encodeLowerHex(reference) },
+      objects: objects.length,
+    }),
+  );
+  const totalBytes = uploadBundleTotalBytes(manifest, objects);
+  if (totalBytes > MAX_FETCH_BUNDLE_RESPONSE_BYTES) {
+    throw fetchBundleUnavailable("Fetch bundle exceeds the aggregate size limit");
+  }
+
+  const confirmed = await readMetadataObject(backend, refPath);
+  if (confirmed === null || !bytesEqual(reference, confirmed)) {
+    throw new GraftProtocolError(
+      409,
+      "snapshot_changed",
+      "Reference changed while preparing the fetch bundle",
+    );
+  }
+  const headers = protocolHeaders({
+    "Content-Length": totalBytes.toString(),
+    "Content-Type": "application/vnd.graft.fetch-bundle",
+    [RECEIVE_BUNDLE_HEADER_MANIFEST_BYTES]: manifest.byteLength.toString(),
+    [UPLOAD_BUNDLE_HEADER_TOTAL_BYTES]: totalBytes.toString(),
+  });
+  return new Response(new UploadBundleBody(backend, manifest, objects).stream, { headers });
+}
+
+async function parseFetchBundleRequest(request: Request): Promise<string | undefined> {
+  const bytes = await readLimitedBody(request, MAX_METADATA_BYTES);
+  let value: unknown;
+  try {
+    value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+  } catch {
+    throw new GraftProtocolError(400, "invalid_fetch_bundle", "Invalid fetch-bundle manifest");
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new GraftProtocolError(400, "invalid_fetch_bundle", "Invalid fetch-bundle manifest");
+  }
+  const record = value as Record<string, unknown>;
+  if (
+    Object.keys(record).some((key) => key !== "version" && key !== "have") ||
+    record.version !== 1 ||
+    !(record.have === null || isObjectId(record.have))
+  ) {
+    throw new GraftProtocolError(400, "invalid_fetch_bundle", "Invalid fetch-bundle manifest");
+  }
+  return record.have === null ? undefined : record.have;
+}
+
+async function readFetchBundlePackIndexes(
+  backend: GraftRepositoryBackend,
+): Promise<FetchBundlePackIndex[]> {
+  const paths = await listPathsWithPrefix(backend, "objects/pack/");
+  const indexPaths = paths.filter((path) => path.endsWith(".idx"));
+  if (indexPaths.length > MAX_UPLOAD_BUNDLE_OBJECTS) {
+    throw fetchBundleUnavailable("Repository contains too many pack indexes");
+  }
+  let next = 0;
+  const indexes: FetchBundlePackIndex[] = [];
+  const workers = Array.from(
+    { length: Math.min(UPLOAD_BUNDLE_PREFETCH_OBJECTS, indexPaths.length) },
+    async () => {
+      for (;;) {
+        const path = indexPaths[next];
+        next += 1;
+        if (path === undefined) return;
+        const object = await backend.get(path);
+        if (object === null) throw fetchBundleUnavailable("Pack index disappeared");
+        validateMetadata(object);
+        if (object.size > MAX_FETCH_BUNDLE_INDEX_BYTES) {
+          throw fetchBundleUnavailable("Pack index exceeds the fetch-bundle limit");
+        }
+        const bytes = await readObjectBody(object, MAX_FETCH_BUNDLE_INDEX_BYTES);
+        if (bytes.byteLength !== object.size) {
+          throw backendContractError("Backend pack index does not match its declared size");
+        }
+        indexes.push(decodeFetchBundlePackIndex(path, bytes));
+      }
+    },
+  );
+  await Promise.all(workers);
+  indexes.sort((left, right) => bytewiseCompare(left.path, right.path));
+  return indexes;
+}
+
+async function listPathsWithPrefix(
+  backend: GraftRepositoryBackend,
+  prefix: string,
+): Promise<string[]> {
+  const paths: string[] = [];
+  let after: string | undefined;
+  for (;;) {
+    const result = await backend.list({ prefix, after, limit: MAX_LIST_LIMIT });
+    if (result.paths.length > MAX_LIST_LIMIT) {
+      throw backendContractError("List backend returned more paths than requested");
+    }
+    for (const path of result.paths) {
+      validateObjectPath(path);
+      if (!path.startsWith(prefix) || (after !== undefined && bytewiseCompare(path, after) <= 0)) {
+        throw backendContractError("List backend returned unsorted paths outside the prefix");
+      }
+      paths.push(path);
+      after = path;
+    }
+    if (!result.hasMore) return paths;
+    if (result.paths.length === 0) {
+      throw backendContractError("List backend cannot advance the fetch-bundle cursor");
+    }
+  }
+}
+
+function decodeFetchBundlePackIndex(path: string, bytes: Uint8Array): FetchBundlePackIndex {
+  let value: unknown;
+  try {
+    value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+  } catch {
+    throw fetchBundleUnavailable("Pack index is not valid JSON");
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw fetchBundleUnavailable("Pack index has an invalid shape");
+  }
+  const record = value as Record<string, unknown>;
+  if (
+    record.version !== 1 ||
+    typeof record.pack !== "string" ||
+    !record.pack.startsWith("objects/pack/") ||
+    !record.pack.endsWith(".pack") ||
+    !Array.isArray(record.commits)
+  ) {
+    throw fetchBundleUnavailable("Pack index does not advertise compatible ancestry");
+  }
+  validateObjectPath(record.pack);
+  const commits = record.commits.map((value) => {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      throw fetchBundleUnavailable("Pack ancestry entry has an invalid shape");
+    }
+    const commit = value as Record<string, unknown>;
+    if (!isObjectId(commit.id) || !Array.isArray(commit.parents) || !commit.parents.every(isObjectId)) {
+      throw fetchBundleUnavailable("Pack ancestry entry contains an invalid object id");
+    }
+    return { id: commit.id, parents: commit.parents };
+  });
+  return { path, pack: record.pack, commits };
+}
+
+function decodeFetchBundleObjectId(bytes: Uint8Array, source: string): string {
+  let value: string;
+  try {
+    value = new TextDecoder("utf-8", { fatal: true }).decode(bytes).trim();
+  } catch {
+    throw fetchBundleUnavailable(`The ${source} is not UTF-8`);
+  }
+  if (!isObjectId(value)) throw fetchBundleUnavailable(`The ${source} is not an object id`);
+  return value;
+}
+
+function isObjectId(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
+}
+
+function fetchBundleUnavailable(message: string): GraftProtocolError {
+  return new GraftProtocolError(422, "fetch_bundle_unavailable", message);
 }
 
 const MAX_READ_BUNDLE_MANIFEST_BYTES = 256 * 1024;

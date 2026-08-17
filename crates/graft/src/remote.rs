@@ -659,6 +659,11 @@ pub(crate) enum UploadBundleOutcome {
     Unsupported,
 }
 
+pub(crate) enum FetchBundleOutcome {
+    Downloaded,
+    Unsupported,
+}
+
 pub(crate) enum ReadBundleOutcome {
     Downloaded(BTreeMap<String, Bytes>),
     Unsupported,
@@ -988,6 +993,18 @@ impl Remote {
         match &self.backend {
             RemoteBackend::Http(remote) => remote.download_upload_bundle(ref_path, root).await,
             RemoteBackend::ObjectStore(_) => Ok(UploadBundleOutcome::Unsupported),
+        }
+    }
+
+    pub(crate) async fn download_fetch_bundle(
+        &self,
+        ref_path: &str,
+        have: Option<&str>,
+        root: &Path,
+    ) -> Result<FetchBundleOutcome> {
+        match &self.backend {
+            RemoteBackend::Http(remote) => remote.download_fetch_bundle(ref_path, have, root).await,
+            RemoteBackend::ObjectStore(_) => Ok(FetchBundleOutcome::Unsupported),
         }
     }
 
@@ -1863,6 +1880,58 @@ impl HttpRemote {
             return Ok(UploadBundleOutcome::Unsupported);
         }
         let response = Self::check_response(response, ref_path).await?;
+        self.download_ref_bundle_response(response, ref_path, root)
+            .await?;
+        Ok(UploadBundleOutcome::Downloaded)
+    }
+
+    async fn download_fetch_bundle(
+        &self,
+        ref_path: &str,
+        have: Option<&str>,
+        root: &Path,
+    ) -> Result<FetchBundleOutcome> {
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "have": have,
+        }))
+        .map_err(|err| RemoteErr::HttpStatus {
+            status: 500,
+            path: ref_path.to_string(),
+            message: format!("failed to encode fetch-bundle manifest: {err}"),
+        })?;
+        let request_bytes = manifest.len() as u64;
+        let response = self
+            .send(
+                self.request(
+                    reqwest::Method::POST,
+                    self.raw_url("fetch-bundle", ref_path),
+                )
+                .header(reqwest::header::CONTENT_LENGTH, manifest.len())
+                .body(manifest)
+                .timeout(Duration::from_secs(30 * 60)),
+                "fetch_bundle",
+                Some(request_bytes),
+            )
+            .await?;
+        if matches!(response.status().as_u16(), 404 | 405 | 409 | 413 | 422)
+            && Self::check_protocol(&response, ref_path).is_ok()
+        {
+            Self::drain_response(response).await?;
+            return Ok(FetchBundleOutcome::Unsupported);
+        }
+        let response = Self::check_response(response, ref_path).await?;
+        self.download_ref_bundle_response(response, ref_path, root)
+            .await?;
+        Ok(FetchBundleOutcome::Downloaded)
+    }
+
+    async fn download_ref_bundle_response(
+        &self,
+        response: reqwest::Response,
+        ref_path: &str,
+        root: &Path,
+    ) -> Result<()> {
         let manifest_bytes = upload_bundle_manifest_length(response.headers(), ref_path)?;
         let declared_total = upload_bundle_total_length(response.headers(), ref_path)?;
         let content_length = response.content_length();
@@ -1904,7 +1973,7 @@ impl HttpRemote {
         }
         body.require_end(ref_path).await?;
         write_upload_bundle_ref(root, &manifest.reference, ref_path)?;
-        Ok(UploadBundleOutcome::Downloaded)
+        Ok(())
     }
 
     async fn get_raw_bundle(&self, paths: &[String]) -> Result<ReadBundleOutcome> {
@@ -3280,6 +3349,68 @@ mod tests {
         let last = events.lock().unwrap().last().copied().unwrap();
         assert_eq!(last.total_bytes, Some(last.transferred_bytes));
         request.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fetch_bundle_sends_have_and_downloads_one_stream() {
+        let head = "a".repeat(64);
+        let have = "b".repeat(64);
+        let reference = format!("{head}\n");
+        let manifest = serde_json::json!({
+            "version": 1,
+            "reference": {
+                "path": "refs/heads/main",
+                "value_hex": hex_encode(reference.as_bytes()),
+            },
+            "objects": 1,
+        });
+        let (url, request) =
+            serve_upload_bundle(manifest, &[("objects/pack/example.pack", b"pack")]).await;
+        let remote = RemoteConfig::Http { url, token_env: None }.build().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+
+        assert!(matches!(
+            remote
+                .download_fetch_bundle("refs/heads/main", Some(&have), destination.path())
+                .await
+                .unwrap(),
+            FetchBundleOutcome::Downloaded
+        ));
+        assert_eq!(
+            fs::read(destination.path().join("refs/heads/main")).unwrap(),
+            reference.as_bytes()
+        );
+        assert_eq!(
+            fs::read(destination.path().join("objects/pack/example.pack")).unwrap(),
+            b"pack"
+        );
+        let request = request.await.unwrap();
+        assert!(request.starts_with(b"POST /org/repo/fetch-bundle/refs/heads/main "));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(http_request_body(&request)).unwrap(),
+            serde_json::json!({ "version": 1, "have": have })
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_bundle_falls_back_when_the_remote_does_not_support_it() {
+        let (url, request) = serve_http_response("404 Not Found", &["1"]).await;
+        let remote = RemoteConfig::Http { url, token_env: None }.build().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+
+        assert!(matches!(
+            remote
+                .download_fetch_bundle("refs/heads/main", None, destination.path())
+                .await
+                .unwrap(),
+            FetchBundleOutcome::Unsupported
+        ));
+        assert!(
+            request
+                .await
+                .unwrap()
+                .starts_with("POST /org/repo/fetch-bundle/refs/heads/main ")
+        );
     }
 
     #[tokio::test]

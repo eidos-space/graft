@@ -190,6 +190,93 @@ impl Repository {
         Ok(count)
     }
 
+    /// Imports repository packs from a verified fetch-bundle into the loose object store.
+    ///
+    /// The bundle's ancestry is only a transport hint. Every entry is decoded and hashed before
+    /// it becomes visible locally, preserving the same trust boundary as ordinary lazy fetches.
+    pub(super) fn import_remote_object_pack_bundle(&self, root: &Path) -> Result<BTreeSet<String>> {
+        let pack_root = root.join(DIR_OBJECTS_PACK);
+        if !pack_root.is_dir() {
+            return Ok(BTreeSet::new());
+        }
+        let mut index_paths = fs::read_dir(&pack_root)?
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "idx"))
+            .collect::<Vec<_>>();
+        index_paths.sort();
+
+        let mut imported_commits = BTreeSet::new();
+        for index_path in index_paths {
+            let index_bytes = fs::read(&index_path)?;
+            let name = index_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| RepoErr::InvalidRemoteObject {
+                    path: index_path.display().to_string(),
+                    message: "pack index path is not UTF-8".to_string(),
+                })?;
+            let remote_index_path = format!("{DIR_OBJECTS_PACK}/{name}");
+            let index = decode_remote_object_pack_index(&remote_index_path, &index_bytes)?;
+            let expected_pack = format!(
+                "{DIR_OBJECTS_PACK}/{}.pack",
+                name.strip_suffix(".idx")
+                    .expect("index paths are filtered by extension")
+            );
+            if index.pack != expected_pack {
+                return Err(RepoErr::InvalidRemoteObject {
+                    path: remote_index_path,
+                    message: "pack index points to a different bundle member".to_string(),
+                });
+            }
+            let pack_bytes = fs::read(root.join(&index.pack))?;
+            if !pack_bytes.starts_with(REMOTE_OBJECT_PACK_MAGIC) {
+                return Err(RepoErr::InvalidRemoteObject {
+                    path: index.pack,
+                    message: "pack header is invalid".to_string(),
+                });
+            }
+
+            for commit in &index.commits {
+                if self.object_store().read_raw(&commit.id)?.is_none() {
+                    imported_commits.insert(commit.id.to_string());
+                }
+            }
+            for entry in &index.objects {
+                let start =
+                    usize::try_from(entry.offset).map_err(|_| RepoErr::InvalidRemoteObject {
+                        path: index.pack.clone(),
+                        message: format!(
+                            "pack offset for object {} does not fit in usize",
+                            entry.id
+                        ),
+                    })?;
+                let end = entry
+                    .offset
+                    .checked_add(entry.len)
+                    .and_then(|end| usize::try_from(end).ok())
+                    .filter(|end| *end <= pack_bytes.len())
+                    .ok_or_else(|| RepoErr::InvalidRemoteObject {
+                        path: index.pack.clone(),
+                        message: format!("pack entry for object {} is out of bounds", entry.id),
+                    })?;
+                self.object_store()
+                    .write_raw_validated(&entry.id, &pack_bytes[start..end])?;
+            }
+
+            if let Some(cache_path) = remote_object_pack_index_cache_path(
+                &self.graft_dir.join(DIR_CACHE_REMOTE_OBJECT_PACK_INDEXES),
+                &remote_index_path,
+            ) {
+                if let Some(parent) = cache_path.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                let _ = fs::write(cache_path, &index_bytes);
+            }
+        }
+        Ok(imported_commits)
+    }
+
     /// Prefetches every immutable object pack on the advertised commit path from `head` to an
     /// already-local ancestor in one remote read bundle.
     ///

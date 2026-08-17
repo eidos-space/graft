@@ -105,6 +105,7 @@ export type GraftRemoteOperation =
   | "raw"
   | "raw-if-not-exists"
   | "read-bundle"
+  | "fetch-bundle"
   | "upload-bundle"
   | "receive-pack"
   | "receive-bundle"

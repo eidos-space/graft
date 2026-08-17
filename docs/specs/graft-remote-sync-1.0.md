@@ -98,6 +98,7 @@ list
 list-cursor
 put-if-absent
 read-bundle
+fetch-bundle
 upload-bundle
 receive-pack
 receive-bundle
@@ -161,6 +162,7 @@ All routes are relative to the repository base:
 | `PUT /raw-if-not-exists/<key>` | create immutable object | `204` |
 | `GET /list?prefix=...` | sorted recursive key listing | `200` |
 | `POST /read-bundle` | explicit immutable object batch read | `200` |
+| `POST /fetch-bundle/<ref-key>` | bounded reachable pack stream for fetch | `200` |
 | `POST /cas/<key>` | compare and replace metadata | `204` |
 | `POST /cad/<key>` | compare and delete metadata | `204` |
 | `POST /upload-bundle/<ref-key>` | stable clone snapshot stream | `200` |
@@ -221,7 +223,30 @@ Clients MUST validate unique expected paths, lengths, final framing, and object
 contents before use. They fall back to bounded individual reads on `404`,
 `405`, or `413`.
 
-### 8.2 Upload bundle
+### 8.2 Fetch bundle
+
+`fetch-bundle` collapses ref discovery, pack-index discovery, and reachable pack
+reads into one authenticated request. The request is UTF-8 JSON containing the
+client's last fetched commit, or `null` when it has none:
+
+```json
+{ "version": 1, "have": "<64-byte lowercase object ID or null>" }
+```
+
+The service reads the requested ref and uses pack-index `commits` ancestry only
+as a bounded selection hint. It streams the selected `.idx` and `.pack` objects
+with the same manifest and frame format as `upload-bundle`, then confirms that
+the ref did not change. The response uses
+`Content-Type: application/vnd.graft.fetch-bundle`. The current service caps a
+response at 128 packs and 48 MiB.
+
+Clients MUST decode and content-hash every imported object, MUST complete
+ordinary verified graph discovery after import, and MUST NOT treat the pack
+ancestry hint as repository truth. They fall back to ordinary fetch on `404`,
+`405`, `409`, `413`, or `422`; authentication, transport, malformed framing,
+and object-integrity errors MUST NOT silently fall back.
+
+### 8.3 Upload bundle
 
 `upload-bundle` reads the requested ref, enumerates immutable keys, reads the
 ref again, and returns `409` if it changed. A stable response contains a
@@ -257,7 +282,7 @@ opaque. The client validates every frame in a temporary local remote before
 resolving/checkout. The current service caps a bundle at 65,536 objects.
 Clients fall back to raw/list on `404` or `405`.
 
-### 8.3 Receive pack and receive bundle
+### 8.4 Receive pack and receive bundle
 
 `receive-pack` streams one repository object pack and index, creates both
 immutably, then performs the ref CAS. A malformed/truncated body MUST NOT update
@@ -299,7 +324,7 @@ The body is exactly `manifest || each object in manifest order || pack ||
 index`. `allow_existing: false` returns `412` on collision so the client can
 read/verify and use the individual fallback.
 
-### 8.4 Multipart immutable objects
+### 8.5 Multipart immutable objects
 
 Multipart transfer is optional and changes only transport, not object identity.
 Start/resume binds an opaque upload ID, target key, total length, and part size.

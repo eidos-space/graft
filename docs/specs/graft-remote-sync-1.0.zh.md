@@ -58,7 +58,7 @@ backend 另有 storage-layer retry。
 返回 `graft-remote` descriptor、version、capability 与 limit。Capability 可包括：
 
 ```text
-range list list-cursor put-if-absent read-bundle upload-bundle
+range list list-cursor put-if-absent read-bundle fetch-bundle upload-bundle
 receive-pack receive-bundle multipart-object cas cad
 ```
 
@@ -93,6 +93,7 @@ CAD、sorted recursive list 与可选 multipart；必须 repository isolation。
 | `PUT /raw-if-not-exists/<key>` | immutable create |
 | `GET /list?prefix=...` | sorted recursive list |
 | `POST /read-bundle` | 显式 immutable object 批量读取 |
+| `POST /fetch-bundle/<ref-key>` | fetch 所需的 bounded reachable pack stream |
 | `POST /cas`, `POST /cad` | atomic ref replace/delete |
 | `POST /upload-bundle` | stable clone stream |
 | `POST /receive-pack` | pack/index then ref CAS |
@@ -123,6 +124,16 @@ object length, path, bytes)` network-byte-order frame。Response 使用
 任一 object missing 会使 aggregate request 失败；当前完整 response 上限 64 MiB。
 Client 使用前必须验证 expected path、unique、length、final framing 与 object content；
 `404/405/413` 时 fallback 到 bounded individual read。
+
+Fetch-bundle 把 ref discovery、pack-index discovery 与 reachable pack read 合并为一次
+authenticated request。Request 是 UTF-8 JSON：`{"version":1,"have":"<64-byte
+lowercase object ID or null>"}`。Service 只把 pack index 的 `commits` ancestry 当作
+bounded selection hint，以 upload-bundle 相同的 manifest/frame 格式 stream 选中的
+`.idx` 与 `.pack`，并在返回前确认 ref 没有变化。Response 使用
+`application/vnd.graft.fetch-bundle`；当前最多 128 packs、48 MiB。Client 必须 decode
+并 content-hash 每个 imported object，之后仍完成普通 verified graph discovery，不能把
+ancestry hint 当作 repository truth。`404/405/409/413/422` 时 fallback 普通 fetch；
+auth、transport、malformed framing 与 object-integrity error 不能静默 fallback。
 
 Upload-bundle 在 enumerate 前后两次读 ref；变化则 `409`。Stable response 是 manifest
 加按 network byte order 编码、严格排序、唯一的 binary frame。V1 因 service opaque

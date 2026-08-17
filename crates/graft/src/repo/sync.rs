@@ -5,7 +5,7 @@ impl Repository {
         validate_remote_name(remote)?;
         validate_ref_name(branch)?;
         let remote_store = self.remote_store(remote)?;
-        self.fetch_with_store(remote, branch, &remote_store)
+        self.fetch_with_bundle_or_store(remote, branch, &remote_store)
     }
 
     pub fn fetch_for_clone(&self, remote: &str, branch: &str) -> Result<CloneFetch> {
@@ -65,6 +65,56 @@ impl Repository {
             head,
             commits,
         })
+    }
+
+    fn fetch_with_bundle_or_store(
+        &self,
+        remote: &str,
+        branch: &str,
+        remote_store: &Remote,
+    ) -> Result<FetchOutcome> {
+        let trace = crate::trace::PushTraceSpan::new("remote_fetch_bundle");
+        let head_path = format!("refs/heads/{branch}");
+        let have = self.remote_tracking_ref(remote, branch)?;
+        let bundle = tempfile::tempdir()?;
+        let outcome = block_on_remote(remote_store.download_fetch_bundle(
+            &head_path,
+            have.as_deref(),
+            bundle.path(),
+        ))?;
+        match outcome {
+            FetchBundleOutcome::Downloaded => {
+                let root = bundle.path().to_string_lossy().into_owned();
+                let bundle_store = RemoteConfig::Fs { root }.build()?;
+                let Some(head) = block_on_remote(bundle_store.get_raw(&head_path))? else {
+                    return Err(RepoErr::InvalidRemoteObject {
+                        path: head_path,
+                        message: "fetch-bundle omitted its reference".to_string(),
+                    });
+                };
+                let head = parse_remote_ref(&format!("refs/heads/{branch}"), head)?;
+                let imported = self.import_remote_object_pack_bundle(bundle.path())?;
+                let fetched = self.fetch_commit_chain(remote_store, &head)?;
+                let reachable = self.commit_ancestors_inclusive(&head)?;
+                let imported = imported.intersection(&reachable).count();
+                self.set_remote_tracking_ref(remote, branch, &head)?;
+                trace.finish(&[
+                    ("supported", 1),
+                    ("imported_commits", imported as u64),
+                    ("fallback_commits", fetched as u64),
+                ]);
+                Ok(FetchOutcome {
+                    remote: remote.to_string(),
+                    branch: branch.to_string(),
+                    head,
+                    commits: imported + fetched,
+                })
+            }
+            FetchBundleOutcome::Unsupported => {
+                trace.finish(&[("supported", 0)]);
+                self.fetch_with_store(remote, branch, remote_store)
+            }
+        }
     }
 
     pub fn fetch_all(&self, remote: &str) -> Result<FetchAllOutcome> {

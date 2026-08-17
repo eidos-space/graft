@@ -126,6 +126,10 @@ Backend guarantees:
 - `read-bundle` batches up to 256 explicit immutable reads behind one
   authentication/authorization round and streams sorted, length-delimited
   frames without buffering object bodies in memory.
+- `fetch-bundle` resolves one branch ref and streams only the bounded pack/index
+  set reachable after the client's `have` commit. Pack ancestry remains a hint;
+  clients still verify every content-addressed object and retain ordinary fetch
+  as the compatibility and completeness fallback.
 - `upload-bundle` lists immutable keys and streams each `get` body into one
   clone response without buffering the repository in memory. Its exact framed
   length is exposed through `Content-Length` and

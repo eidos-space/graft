@@ -69,7 +69,8 @@ use crate::{
         page_count::PageCount,
     },
     remote::{
-        ReadBundleOutcome, Remote, RemoteConfig, RemoteCredentials, RemoteErr, UploadBundleOutcome,
+        FetchBundleOutcome, ReadBundleOutcome, Remote, RemoteConfig, RemoteCredentials, RemoteErr,
+        UploadBundleOutcome,
     },
     snapshot::Snapshot,
 };

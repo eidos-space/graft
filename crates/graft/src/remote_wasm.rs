@@ -297,6 +297,11 @@ pub(crate) enum UploadBundleOutcome {
     Unsupported,
 }
 
+pub(crate) enum FetchBundleOutcome {
+    Downloaded,
+    Unsupported,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Remote {
     objects: Arc<Mutex<BTreeMap<String, Bytes>>>,
@@ -420,6 +425,15 @@ impl Remote {
         _root: &Path,
     ) -> Result<UploadBundleOutcome> {
         Ok(UploadBundleOutcome::Unsupported)
+    }
+
+    pub(crate) async fn download_fetch_bundle(
+        &self,
+        _ref_path: &str,
+        _have: Option<&str>,
+        _root: &Path,
+    ) -> Result<FetchBundleOutcome> {
+        Ok(FetchBundleOutcome::Unsupported)
     }
 
     pub async fn get_raw_range(&self, path: &str, bytes: Range<u64>) -> Result<Bytes> {

@@ -212,6 +212,7 @@ describe("createGraftRemoteHandler", () => {
         "range",
         "list",
         "read-bundle",
+        "fetch-bundle",
         "upload-bundle",
         "receive-pack",
         "receive-bundle",
@@ -550,6 +551,105 @@ describe("createGraftRemoteHandler", () => {
       });
       expect(invalid.status).toBe(400);
     }
+  });
+
+  it("streams only packs reachable between have and the ref in one fetch-bundle request", async () => {
+    const app = createTestApp();
+    const base = "1".repeat(64);
+    const middle = "2".repeat(64);
+    const head = "3".repeat(64);
+    const unrelated = "4".repeat(64);
+    const indexes = [
+      ["base", base, []],
+      ["middle", middle, [base]],
+      ["head", head, [middle]],
+      ["side", unrelated, []],
+    ] as const;
+    expect(
+      (
+        await remoteFetch(app, "/fetch/repo/raw/refs/heads/main", {
+          method: "PUT",
+          body: `${head}\n`,
+        })
+      ).status,
+    ).toBe(204);
+    for (const [name, id, parents] of indexes) {
+      const index = JSON.stringify({
+        version: 1,
+        pack: `objects/pack/${name}.pack`,
+        objects: [{ id, offset: 21, len: 1 }],
+        commits: [{ id, parents }],
+      });
+      for (const [path, body] of [
+        [`objects/pack/${name}.idx`, index],
+        [`objects/pack/${name}.pack`, `pack-${name}`],
+      ] as const) {
+        expect(
+          (
+            await remoteFetch(app, `/fetch/repo/raw-if-not-exists/${path}`, {
+              method: "PUT",
+              body,
+            })
+          ).status,
+        ).toBe(204);
+      }
+    }
+
+    const response = await remoteFetch(app, "/fetch/repo/fetch-bundle/refs/heads/main", {
+      method: "POST",
+      body: JSON.stringify({ version: 1, have: base }),
+    });
+    expect(response.status, await response.clone().text()).toBe(200);
+    expect(response.headers.get("content-type")).toBe("application/vnd.graft.fetch-bundle");
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    const manifestBytes = Number(response.headers.get("x-graft-bundle-manifest-bytes"));
+    const manifest = JSON.parse(new TextDecoder().decode(bytes.subarray(0, manifestBytes))) as {
+      reference: { path: string; value_hex: string };
+      objects: number;
+    };
+    expect(manifest.reference).toEqual({
+      path: "refs/heads/main",
+      value_hex: textHex(`${head}\n`),
+    });
+    expect(decodeUploadBundleFrames(bytes.subarray(manifestBytes), manifest.objects)).toEqual([
+      ["objects/pack/head.idx", expect.any(String)],
+      ["objects/pack/head.pack", "pack-head"],
+      ["objects/pack/middle.idx", expect.any(String)],
+      ["objects/pack/middle.pack", "pack-middle"],
+    ]);
+  });
+
+  it("falls back when fetch-bundle ancestry hints are unavailable", async () => {
+    const app = createTestApp();
+    const head = "3".repeat(64);
+    expect(
+      (
+        await remoteFetch(app, "/legacy-fetch/repo/raw/refs/heads/main", {
+          method: "PUT",
+          body: `${head}\n`,
+        })
+      ).status,
+    ).toBe(204);
+    expect(
+      (
+        await remoteFetch(app, "/legacy-fetch/repo/raw-if-not-exists/objects/pack/old.idx", {
+          method: "PUT",
+          body: JSON.stringify({
+            version: 1,
+            pack: "objects/pack/old.pack",
+            objects: [],
+          }),
+        })
+      ).status,
+    ).toBe(204);
+
+    const response = await remoteFetch(
+      app,
+      "/legacy-fetch/repo/fetch-bundle/refs/heads/main",
+      { method: "POST", body: JSON.stringify({ version: 1, have: null }) },
+    );
+    expect(response.status).toBe(422);
+    expect(await response.json()).toMatchObject({ title: "fetch_bundle_unavailable" });
   });
 
   it("calculates an exact upload-bundle size for path-only list backends", async () => {
