@@ -2171,8 +2171,18 @@ impl RepositorySession {
                 "merge",
             )?;
             status_cache.invalidate();
-            let incremental = refresh_incremental_status(service, status_cache)?;
-            let merge = merge_status_from_incremental(service, &incremental)?;
+            let completed_fast_forward = summary.kind == MergePlanKind::FastForward
+                && output.get("status").and_then(Value::as_str) == Some("fast_forward");
+            let merge = if completed_fast_forward {
+                // A successful fast-forward cannot leave an active merge. Avoid immediately
+                // rescanning the materialized worktree just to rediscover that fact. The cache
+                // remains invalidated, so the next explicit status request is authoritative and
+                // still detects concurrent external writes.
+                MergeStatus::None
+            } else {
+                let incremental = refresh_incremental_status(service, status_cache)?;
+                merge_status_from_incremental(service, &incremental)?
+            };
             let worktree_paths = merge_worktree_paths_from_output(&output);
             Ok(MergeApplyResult {
                 plan: summary,
@@ -5469,6 +5479,10 @@ mod tests {
             })
             .unwrap();
         assert_eq!(applied.merge, MergeStatus::None);
+        assert!(
+            !session.state.lock().status_cache.initialized,
+            "fast-forward apply must not rescan or seed an unverified clean worktree cache"
+        );
         assert_eq!(fs::read_to_string(&note).unwrap(), "target\n");
         assert_eq!(
             session.repository_metadata().unwrap().current_head,
