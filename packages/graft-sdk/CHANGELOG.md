@@ -5,6 +5,8 @@ SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
 
 ## Unreleased
 
+## Graft SDK 0.3.18 — 2026-08-17
+
 ### Changed
 
 - Fetch records commit ancestry in new object-pack indexes and uses it to prefetch the complete
@@ -16,6 +18,9 @@ SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
   Remote read bundles. In the retained Windows trace with 15 pack indexes, the index phase changes
   from 15 authenticated HTTP GETs to one request; longer histories are split automatically at the
   service limit.
+- A completed fast-forward pull no longer performs an immediate full worktree status scan merely
+  to confirm that no merge remains. The next explicit status request remains authoritative and
+  still detects concurrent external writes.
 - Pack indexes are cached locally as repairable performance hints, so unchanged immutable indexes
   are not downloaded again after reopening the application.
 - macOS and Windows row auto-merge can seed the first private candidate from the Ours worktree

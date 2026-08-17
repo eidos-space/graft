@@ -1475,7 +1475,18 @@ test("keeps HTTP credentials in memory and redacts command errors", async () => 
 test("reports real HTTP response bytes through the JavaScript progress callback", async () => {
   await withTemporaryDirectory("graft-sdk-http-progress-", async (root) => {
     const body = Buffer.from("invalid-remote-head\n")
-    const server = http.createServer((_request, response) => {
+    const server = http.createServer((request, response) => {
+      if (
+        request.method === "POST" &&
+        request.url?.includes("/fetch-bundle/")
+      ) {
+        response.writeHead(404, {
+          "content-length": 0,
+          "graft-protocol": "1",
+        })
+        response.end()
+        return
+      }
       response.writeHead(200, {
         "content-length": body.length,
         "graft-protocol": "1",
