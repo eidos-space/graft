@@ -17,6 +17,12 @@ SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
   instead of reconstructing the complete SQLite file from page storage. The private copy must
   match Ours' exact content-addressed page index before use; a missing index, changed worktree, or
   copy mismatch retains authoritative snapshot materialization.
+- Verified candidate construction and the complete immutable-Ours integrity check now overlap row
+  merge analysis. Unused candidates are cancelled and removed, while a required candidate is not
+  published until exact page-index verification and the full check both succeed.
+- New local storage commits retain the hash computed from their already-resident segment pages;
+  legacy commits are backfilled after their first hash calculation. Sparse merge imports no longer
+  rescan a historical full-database segment to rebuild hashes that were already established.
 
 ### Compatibility
 

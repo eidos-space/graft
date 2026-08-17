@@ -10,7 +10,7 @@ use crate::{
         LogId, PageCount, PageIdx, SegmentId, VolumeId,
         checksum::{Checksum, ChecksumBuilder},
         commit::{Commit, SegmentIdx, SegmentRangeRef},
-        commit_hash::CommitHash,
+        commit_hash::{CommitHash, CommitHashBuilder},
         logref::LogRef,
         lsn::{LSN, LSNRangeExt, LSNSet},
         page::{PAGESIZE, Page},
@@ -1021,6 +1021,33 @@ impl<'a> ReadWriteGuard<'a> {
         Ok(volume)
     }
 
+    /// Persists a derived hash on one immutable local commit without rebuilding its secondary
+    /// page-version index. Remote commits already carry hashes; local commits acquire one the
+    /// first time a repository snapshot needs to address them by content.
+    pub fn cache_commit_hash(
+        self,
+        log: &LogId,
+        lsn: LSN,
+        hash: CommitHash,
+    ) -> Result<Option<CommitHash>, FjallStorageErr> {
+        let Some(commit) = self.read.get_commit(log, lsn)? else {
+            return Ok(None);
+        };
+        if let Some(existing) = commit.commit_hash() {
+            if existing != &hash {
+                return Err(LogicalErr::Other(format!(
+                    "commit hash mismatch while caching {log:?}/{lsn}"
+                ))
+                .into());
+            }
+            return Ok(Some(existing.clone()));
+        }
+        self.ks()
+            .log
+            .insert(commit.logref(), commit.with_commit_hash(Some(hash.clone())))?;
+        Ok(Some(hash))
+    }
+
     /// Attempt to execute a local commit to the specified Volume's local Log.
     ///
     /// Returns the resulting `Snapshot` on success
@@ -1070,12 +1097,26 @@ impl<'a> ReadWriteGuard<'a> {
         let sid = SegmentId::random();
         let segment = SegmentIdx::new(sid.clone(), pageset);
 
+        // The complete segment is already resident here. Hash it once before moving its pages
+        // into Fjall so later repository snapshots never reread a large checkpoint merely to
+        // recover the identity of a commit Graft itself just created.
+        let mut commit_hash = CommitHashBuilder::new(
+            volume.local.clone(),
+            commit_lsn,
+            page_count,
+            segment.page_count(),
+        );
+        for (&pageidx, page) in &pages {
+            commit_hash.write_page(pageidx, page);
+        }
+
         // build the commit
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
         let commit = Commit::new(volume.local.clone(), commit_lsn, page_count)
+            .with_commit_hash(Some(commit_hash.build()))
             .with_checkpoints(maybe_checkpoint)
             .with_segment_idx(Some(segment))
             .with_timestamp(now)

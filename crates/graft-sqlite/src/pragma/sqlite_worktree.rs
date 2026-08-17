@@ -1470,6 +1470,19 @@ pub(super) fn stable_physical_sqlite_matches_indexed_state(
     physical.matches_indexed_state(repo, key, expected)
 }
 
+/// Returns whether the disposable exact page index needed to verify a speculative worktree seed
+/// is present and valid. A miss keeps candidate construction on the ordinary post-plan path so a
+/// rejected merge plan never starts a full snapshot materialization in the background.
+pub(super) fn sqlite_page_index_available(
+    repo: &Repository,
+    key: &str,
+    expected: &CommitFileState,
+) -> Result<bool, ErrCtx> {
+    SqlitePageHashCache::new(repo, key)
+        .load(expected)
+        .map(|index| index.is_some())
+}
+
 /// Prepares an existing worktree database for atomic replacement.
 ///
 /// Physical `SQLite` files are outside Graft's VFS lock manager. We therefore ask `SQLite` for an

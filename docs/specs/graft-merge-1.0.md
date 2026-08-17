@@ -206,12 +206,20 @@ integrity proof and only SQLite's transactional engine mutates it, validation
 work after that proof is proportional to the delta except for required
 cross-row foreign-key checks.
 
-When that exact integrity proof is already resident and preflight has proven a
-clean, exclusively locked worktree file equal to Ours, an implementation MAY
-use a filesystem copy-on-write clone as the private candidate seed. Clone
-failure or unsupported platforms MUST fall back to materializing the
-authoritative Graft snapshot. A filesystem clone is never itself an integrity
-or identity proof.
+When preflight has stabilized a clean worktree file, an implementation MAY use
+a private filesystem clone or kernel copy as the candidate seed only after the
+private copy matches Ours' exact content-addressed page index. A missing index,
+copy mismatch, clone failure, or unsupported platform MUST fall back to
+materializing the authoritative Graft snapshot. A filesystem clone is never
+itself an integrity or identity proof, so a first-use candidate still requires
+the complete check above.
+
+Candidate copy, exact-identity verification, and the complete check MAY overlap
+independent immutable row-diff planning. If planning does not require that
+candidate, the validation MUST be cancelled, the private file MUST be removed,
+and no proof may be recorded unless the complete check already succeeded. An
+implementation MUST NOT start speculative full-snapshot materialization merely
+because the disposable exact page index is absent.
 
 When SQLite WAL mode is available, an implementation MAY retain the page
 numbers from every frame through the final committed frame while applying the

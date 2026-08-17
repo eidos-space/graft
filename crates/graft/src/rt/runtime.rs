@@ -406,16 +406,22 @@ impl Runtime {
         let Some(commit) = reader.get_commit(log, lsn)? else {
             return Ok(None);
         };
+        if let Some(hash) = commit.commit_hash().cloned() {
+            return Ok(Some(hash));
+        }
         let Some(segment_idx) = commit.segment_idx().cloned() else {
-            return Ok(Some(
-                CommitHashBuilder::new(
-                    commit.log.clone(),
-                    commit.lsn,
-                    commit.page_count,
-                    PageCount::ZERO,
-                )
-                .build(),
-            ));
+            let hash = CommitHashBuilder::new(
+                commit.log.clone(),
+                commit.lsn,
+                commit.page_count,
+                PageCount::ZERO,
+            )
+            .build();
+            drop(reader);
+            return Ok(self
+                .storage()
+                .read_write()
+                .cache_commit_hash(log, lsn, hash)?);
         };
 
         let mut hash_builder = CommitHashBuilder::new(
@@ -436,7 +442,12 @@ impl Runtime {
             hash_builder.write_page(pageidx, &page);
         }
 
-        Ok(Some(hash_builder.build()))
+        let hash = hash_builder.build();
+        drop(reader);
+        Ok(self
+            .storage()
+            .read_write()
+            .cache_commit_hash(log, lsn, hash)?)
     }
 }
 
@@ -882,6 +893,49 @@ mod tests {
 
         runtime.storage_gc(&BTreeSet::new(), &[], false).unwrap();
         assert!(!runtime.snapshot_hydration_cached(&snapshot).unwrap());
+    }
+
+    #[test]
+    fn local_commit_hash_is_recorded_and_legacy_hash_is_backfilled() {
+        let tokio_rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let remote = Arc::new(RemoteConfig::Memory.build().unwrap());
+        let storage = Arc::new(FjallStorage::open_temporary().unwrap());
+        let runtime = Runtime::new(tokio_rt.handle().clone(), remote, storage.clone(), None);
+        let vid = runtime.volume_open(None, None, None).unwrap().vid;
+        let mut writer = runtime.volume_writer(vid).unwrap();
+        let pageidx = PageIdx::must_new(1);
+        writer.write_page(pageidx, Page::test_filled(7)).unwrap();
+        let reader = writer.commit().unwrap();
+        let (log, lsn) = reader.snapshot().head().unwrap();
+        let commit = runtime.get_commit(log, lsn).unwrap().unwrap();
+        let expected = commit
+            .commit_hash()
+            .cloned()
+            .expect("new local commits carry their content hash");
+
+        let mut batch = storage.batch();
+        batch.write_commit(commit.with_commit_hash(None));
+        batch.commit().unwrap();
+        assert!(
+            runtime
+                .get_commit(log, lsn)
+                .unwrap()
+                .unwrap()
+                .commit_hash()
+                .is_none()
+        );
+
+        let hash = runtime.commit_hash(log, lsn).unwrap().unwrap();
+        assert_eq!(hash, expected);
+        let persisted = runtime.get_commit(log, lsn).unwrap().unwrap();
+        assert_eq!(persisted.commit_hash(), Some(&hash));
+
+        let segment = persisted.segment_idx().unwrap();
+        storage.remove_page(segment.sid.clone(), pageidx).unwrap();
+        assert_eq!(runtime.commit_hash(log, lsn).unwrap(), Some(hash));
     }
 
     #[test]

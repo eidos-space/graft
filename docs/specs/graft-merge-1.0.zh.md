@@ -121,10 +121,16 @@ generated/configured column；完成后执行完整 `foreign_key_check`。由于
 跨行 FK 检查外可与 delta 成正比。验证失败不能替换 staged result/worktree 或改变之前的
 merge journal，temp 成功失败都要清理。
 
-若精确 integrity proof 已在进程内，且 preflight 已证明 worktree file clean、被独占锁定
-并等于 Ours，实现可以用 filesystem copy-on-write clone 作为 private candidate seed。
-clone 失败或平台不支持时必须回退到权威 Graft snapshot 物化；filesystem clone 本身
-永远不能作为 integrity 或 identity proof。
+若 preflight 已稳定一个 clean worktree file，实现只有在 private copy 与 Ours 的精确
+content-addressed page index 匹配后，才能用 filesystem clone 或 kernel copy 作为
+candidate seed。Page index 缺失、copy 不匹配、clone 失败或平台不支持时，必须回退到权威
+Graft snapshot 物化。Filesystem clone 本身永远不能作为 integrity 或 identity proof，
+所以首次使用的 candidate 仍须执行上文的完整检查。
+
+Candidate copy、精确 identity 验证与完整检查可以和彼此独立的 immutable row-diff planning
+重叠。若 planning 不需要该 candidate，必须取消 validation、删除 private file；除非完整
+检查已经成功，否则不能记录 proof。实现不能仅因 disposable 精确 page index 缺失，就在
+后台推测性启动 full-snapshot materialization。
 
 若 SQLite WAL mode 可用，实现可以在应用 transactional delta 时保留截至最后一个已提交
 frame 的全部 page number。只有 SQLite 成功 checkpoint 同一个 WAL，且结果 database

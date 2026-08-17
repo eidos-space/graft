@@ -1013,6 +1013,17 @@ struct PreparedRowMergeFile {
     path: PathBuf,
 }
 
+/// A private Ours candidate prepared while the independent row-diff plan is running.
+///
+/// Dropping the task means the plan did not need a materialized candidate. The `SQLite` progress
+/// handler then interrupts an in-flight integrity check and the worker removes its private file.
+/// A candidate is never published until `finish` receives the complete, validated result.
+struct SpeculativeRowMergeCandidate {
+    receiver: std::sync::mpsc::Receiver<Result<PathBuf, ErrCtx>>,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    finished: bool,
+}
+
 const MAX_ROW_MERGE_INTEGRITY_PROOFS: usize = 256;
 
 /// Successful full-database checks for immutable Graft states in this process.
@@ -1026,6 +1037,72 @@ static ROW_MERGE_INTEGRITY_PROOFS: OnceLock<
 impl Drop for PreparedRowMergeFile {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+impl SpeculativeRowMergeCandidate {
+    fn start(
+        runtime: Runtime,
+        repo: Repository,
+        key: String,
+        ours: CommitFileState,
+        worktree_seed: PathBuf,
+    ) -> Result<Self, ErrCtx> {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        std::thread::Builder::new()
+            .name("graft-sqlite-merge-candidate".into())
+            .spawn(move || {
+                let result = prepare_row_auto_merge_candidate(
+                    &runtime,
+                    &repo,
+                    &key,
+                    &ours,
+                    Some(&worktree_seed),
+                    Some(&worker_cancelled),
+                );
+                match result {
+                    Ok(Some(path)) => {
+                        if let Err(error) = sender.send(Ok(path))
+                            && let Ok(path) = error.0
+                        {
+                            cleanup_row_auto_merge_candidate(&path);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        let _ = sender.send(Err(error));
+                    }
+                }
+            })?;
+        Ok(Self { receiver, cancelled, finished: false })
+    }
+
+    fn finish(mut self) -> Result<PathBuf, ErrCtx> {
+        self.finished = true;
+        self.receiver.recv().map_err(|_| {
+            ErrCtx::InvalidCommand("SQLite merge-candidate worker stopped unexpectedly".into())
+        })?
+    }
+
+    #[cfg(test)]
+    fn cancel_and_wait(mut self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.finished = true;
+        if let Ok(Ok(path)) = self.receiver.recv() {
+            cleanup_row_auto_merge_candidate(&path);
+        }
+    }
+}
+
+impl Drop for SpeculativeRowMergeCandidate {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.cancelled
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
     }
 }
 
@@ -1121,6 +1198,22 @@ pub(super) fn try_row_auto_merge_paths(
                 remote.clone(),
                 RepoSnapshotPurpose::Merge,
             )?;
+            // The candidate is private and Ours is already held stable by checkout preflight.
+            // Preparing it overlaps the two independent base-to-side row diffs. If the plan finds
+            // a real conflict or no applicable delta, dropping the task cancels any in-flight
+            // integrity check and the worker removes the unused file.
+            let speculative_candidate = (physical_replacement_prepared
+                && sqlite_page_index_available(repo, key, &ours)?)
+            .then(|| {
+                SpeculativeRowMergeCandidate::start(
+                    runtime.clone(),
+                    repo.clone(),
+                    key.clone(),
+                    ours.clone(),
+                    repo.worktree().join(key),
+                )
+            })
+            .transpose()?;
             let plan = plan_repo_snapshot_merge(runtime, file, repo, &base, &ours, &theirs)?;
             if plan.has_conflicts() || plan.has_opaque_changes() || !plan.limitations().is_empty() {
                 return Ok(None);
@@ -1137,16 +1230,22 @@ pub(super) fn try_row_auto_merge_paths(
             let (merged, materialized) = if plan.can_resolve_to_ours_without_apply() {
                 (ours, None)
             } else if applied_changes > 0 {
-                let (merged, path) = materialize_row_auto_merge_candidate(
-                    runtime,
-                    repo,
-                    key,
-                    &ours,
-                    &plan.theirs_apply_sql(),
-                    physical_replacement_prepared
-                        .then(|| repo.worktree().join(key))
-                        .as_deref(),
-                )?;
+                let sql = plan.theirs_apply_sql();
+                let (merged, path) = if let Some(candidate) = speculative_candidate {
+                    let path = candidate.finish()?;
+                    let merged = match apply_prepared_row_auto_merge_candidate(
+                        runtime, &ours, &sql, &path,
+                    ) {
+                        Ok(merged) => merged,
+                        Err(error) => {
+                            cleanup_row_auto_merge_candidate(&path);
+                            return Err(error);
+                        }
+                    };
+                    (merged, path)
+                } else {
+                    materialize_row_auto_merge_candidate(runtime, repo, key, &ours, &sql, None)?
+                };
                 (merged, Some(PreparedRowMergeFile { path }))
             } else {
                 return Ok(None);
@@ -1438,6 +1537,30 @@ fn materialize_row_auto_merge_candidate(
             "cannot materialize an empty row merge candidate".into(),
         ));
     }
+    let Some(temp_path) =
+        prepare_row_auto_merge_candidate(runtime, repo, key, ours, worktree_seed, None)?
+    else {
+        return Err(ErrCtx::InvalidCommand(
+            "SQLite merge-candidate preparation was cancelled unexpectedly".into(),
+        ));
+    };
+    match apply_prepared_row_auto_merge_candidate(runtime, ours, sql, &temp_path) {
+        Ok(state) => Ok((state, temp_path)),
+        Err(error) => {
+            cleanup_row_auto_merge_candidate(&temp_path);
+            Err(error)
+        }
+    }
+}
+
+fn prepare_row_auto_merge_candidate(
+    runtime: &Runtime,
+    repo: &Repository,
+    key: &str,
+    ours: &CommitFileState,
+    worktree_seed: Option<&Path>,
+    cancelled: Option<&Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<Option<PathBuf>, ErrCtx> {
     let temp_path = row_auto_merge_temp_path(repo, key)?;
     let result = (|| {
         let seed_trace = graft::trace::PushTraceSpan::new("sqlite_merge_seed");
@@ -1445,49 +1568,82 @@ fn materialize_row_auto_merge_candidate(
             .map(|seed| try_clone_verified_sqlite_merge_seed(repo, key, ours, seed, &temp_path))
             .transpose()?
             .unwrap_or(false);
+        if candidate_preparation_cancelled(cancelled) {
+            return Ok(None);
+        }
         if !cloned {
             write_repo_file_state_to_path(runtime, ours, &temp_path)?;
         }
         seed_trace.finish(&[("worktree_seed", u64::from(cloned))]);
+        if candidate_preparation_cancelled(cancelled) {
+            return Ok(None);
+        }
 
         let integrity_trace = graft::trace::PushTraceSpan::new("sqlite_merge_integrity");
-        validate_row_merge_base_integrity(&temp_path, ours)?;
+        match validate_row_merge_base_integrity_cancellable(&temp_path, ours, cancelled) {
+            Ok(()) => {}
+            Err(_) if candidate_preparation_cancelled(cancelled) => return Ok(None),
+            Err(error) => return Err(error),
+        }
         integrity_trace.finish(&[]);
-
-        let apply_trace = graft::trace::PushTraceSpan::new("sqlite_merge_apply");
-        let changed_pages = apply_row_merge_sql_to_path_with_changed_pages(&temp_path, sql)?;
-        let changed_page_count = changed_pages.as_ref().map_or(0, |pages| pages.len() as u64);
-        apply_trace.finish(&[("changed_pages", changed_page_count)]);
-
-        // Keep the merged snapshot in the ancestry of ours. A row merge changes
-        // only a handful of SQLite pages; importing with no base turned every
-        // candidate into a new full-size Volume and made the next push upload the
-        // compressed database again.
-        let import_trace = graft::trace::PushTraceSpan::new("sqlite_merge_import");
-        let sparse_import = u64::from(changed_pages.is_some());
-        let state = match changed_pages {
-            Some(changed_pages) => import_stable_sqlite_file_state_from_changed_pages(
-                runtime,
-                &temp_path,
-                ours,
-                &changed_pages,
-            ),
-            None => import_stable_sqlite_file_state(runtime, &temp_path, Some(ours)),
-        }?;
-        import_trace.finish(&[
-            ("sparse_import", sparse_import),
-            ("changed_pages", changed_page_count),
-        ]);
-        Ok(state)
+        if candidate_preparation_cancelled(cancelled) {
+            return Ok(None);
+        }
+        Ok(Some(temp_path.clone()))
     })();
     match result {
-        Ok(state) => Ok((state, temp_path)),
+        Ok(Some(path)) => Ok(Some(path)),
+        Ok(None) => {
+            cleanup_row_auto_merge_candidate(&temp_path);
+            Ok(None)
+        }
         Err(error) => {
-            let _ = remove_sqlite_sidecars(&temp_path);
-            let _ = std::fs::remove_file(&temp_path);
+            cleanup_row_auto_merge_candidate(&temp_path);
             Err(error)
         }
     }
+}
+
+fn apply_prepared_row_auto_merge_candidate(
+    runtime: &Runtime,
+    ours: &CommitFileState,
+    sql: &str,
+    temp_path: &Path,
+) -> Result<CommitFileState, ErrCtx> {
+    let apply_trace = graft::trace::PushTraceSpan::new("sqlite_merge_apply");
+    let changed_pages = apply_row_merge_sql_to_path_with_changed_pages(temp_path, sql)?;
+    let changed_page_count = changed_pages.as_ref().map_or(0, |pages| pages.len() as u64);
+    apply_trace.finish(&[("changed_pages", changed_page_count)]);
+
+    // Keep the merged snapshot in the ancestry of ours. A row merge changes
+    // only a handful of SQLite pages; importing with no base turned every
+    // candidate into a new full-size Volume and made the next push upload the
+    // compressed database again.
+    let import_trace = graft::trace::PushTraceSpan::new("sqlite_merge_import");
+    let sparse_import = u64::from(changed_pages.is_some());
+    let state = match changed_pages {
+        Some(changed_pages) => import_stable_sqlite_file_state_from_changed_pages(
+            runtime,
+            temp_path,
+            ours,
+            &changed_pages,
+        ),
+        None => import_stable_sqlite_file_state(runtime, temp_path, Some(ours)),
+    }?;
+    import_trace.finish(&[
+        ("sparse_import", sparse_import),
+        ("changed_pages", changed_page_count),
+    ]);
+    Ok(state)
+}
+
+fn candidate_preparation_cancelled(cancelled: Option<&Arc<std::sync::atomic::AtomicBool>>) -> bool {
+    cancelled.is_some_and(|cancelled| cancelled.load(std::sync::atomic::Ordering::Acquire))
+}
+
+fn cleanup_row_auto_merge_candidate(path: &Path) {
+    let _ = remove_sqlite_sidecars(path);
+    let _ = std::fs::remove_file(path);
 }
 
 /// Copies a worktree seed only when the resulting private file exactly matches Ours.
@@ -1740,6 +1896,14 @@ pub(super) fn validate_row_merge_base_integrity(
     path: &Path,
     state: &CommitFileState,
 ) -> Result<(), ErrCtx> {
+    validate_row_merge_base_integrity_cancellable(path, state, None)
+}
+
+fn validate_row_merge_base_integrity_cancellable(
+    path: &Path,
+    state: &CommitFileState,
+    cancelled: Option<&Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<(), ErrCtx> {
     let key = (state.volume.clone(), state.snapshot.clone());
     let proofs = ROW_MERGE_INTEGRITY_PROOFS.get_or_init(Default::default);
     if proofs.lock().contains(&key) {
@@ -1751,6 +1915,14 @@ pub(super) fn validate_row_merge_base_integrity(
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|err| row_auto_merge_sqlite_err(path, "open merge base for validation", err))?;
+    if let Some(cancelled) = cancelled {
+        let cancelled = Arc::clone(cancelled);
+        conn.progress_handler(
+            2_000,
+            Some(move || cancelled.load(std::sync::atomic::Ordering::Acquire)),
+        )
+        .map_err(|err| row_auto_merge_sqlite_err(path, "install validation cancellation", err))?;
+    }
     validate_row_merge_integrity(path, &conn)?;
 
     let mut proofs = proofs.lock();
@@ -1860,6 +2032,36 @@ mod validation_tests {
 
         let error = validate_row_merge_base_integrity(&path, &test_state()).unwrap_err();
         assert!(error.to_string().contains("integrity_check"));
+    }
+
+    #[test]
+    fn cancelled_integrity_check_never_records_a_proof() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cancelled-integrity.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "PRAGMA page_size = 4096;\
+             CREATE TABLE items(id INTEGER PRIMARY KEY, payload BLOB NOT NULL);\
+             WITH RECURSIVE ids(id) AS (\
+               VALUES(1) UNION ALL SELECT id + 1 FROM ids WHERE id < 1000\
+             )\
+             INSERT INTO items SELECT id, zeroblob(12000) FROM ids;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let state = test_state();
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let error = validate_row_merge_base_integrity_cancellable(&path, &state, Some(&cancelled))
+            .unwrap_err();
+        assert!(error.to_string().contains("interrupted"));
+
+        let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(4096)).unwrap();
+        std::io::Write::write_all(&mut file, &[0; 4096]).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        assert!(validate_row_merge_base_integrity(&path, &state).is_err());
     }
 
     #[test]
@@ -2021,6 +2223,80 @@ mod validation_tests {
             .unwrap()
         );
         assert!(!stale_candidate.exists());
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn speculative_candidate_is_delivered_only_after_exact_validation() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+        let source = temp.path().join("source.db");
+        let conn = rusqlite::Connection::open(&source).unwrap();
+        conn.execute_batch(
+            "PRAGMA page_size = 4096;\
+             CREATE TABLE items(\
+               id INTEGER PRIMARY KEY,\
+               value TEXT NOT NULL,\
+               padding BLOB NOT NULL\
+             );\
+             INSERT INTO items VALUES(1, 'ours', zeroblob(17000000));",
+        )
+        .unwrap();
+        drop(conn);
+        let runtime = graft::setup::setup_graft_temporary(RemoteConfig::Memory, None).unwrap();
+        let (ours, _) =
+            prepare_cached_physical_sqlite_file_state(&runtime, &repo, "source.db", &source, None)
+                .unwrap();
+        assert!(sqlite_page_index_available(&repo, "source.db", &ours).unwrap());
+
+        let candidate = SpeculativeRowMergeCandidate::start(
+            runtime,
+            repo.clone(),
+            "source.db".into(),
+            ours.clone(),
+            source,
+        )
+        .unwrap()
+        .finish()
+        .unwrap();
+        assert_eq!(
+            stable_physical_sqlite_matches_indexed_state(&repo, "source.db", &candidate, &ours,)
+                .unwrap(),
+            Some(true)
+        );
+        cleanup_row_auto_merge_candidate(&candidate);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn cancelled_speculative_candidate_removes_its_private_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+        let source = temp.path().join("source.db");
+        let conn = rusqlite::Connection::open(&source).unwrap();
+        conn.execute_batch(
+            "PRAGMA page_size = 4096;\
+             CREATE TABLE items(id INTEGER PRIMARY KEY, padding BLOB NOT NULL);\
+             INSERT INTO items VALUES(1, zeroblob(17000000));",
+        )
+        .unwrap();
+        drop(conn);
+        let runtime = graft::setup::setup_graft_temporary(RemoteConfig::Memory, None).unwrap();
+        let (ours, _) =
+            prepare_cached_physical_sqlite_file_state(&runtime, &repo, "source.db", &source, None)
+                .unwrap();
+
+        SpeculativeRowMergeCandidate::start(
+            runtime,
+            repo.clone(),
+            "source.db".into(),
+            ours,
+            source,
+        )
+        .unwrap()
+        .cancel_and_wait();
+        let merge_tmp = repo.graft_dir().join("tmp");
+        assert!(!merge_tmp.exists() || std::fs::read_dir(merge_tmp).unwrap().next().is_none());
     }
 
     #[cfg(any(target_os = "macos", target_os = "windows"))]

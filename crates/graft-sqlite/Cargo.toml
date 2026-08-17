@@ -23,7 +23,7 @@ bytes = { workspace = true }
 indoc = { workspace = true }
 itertools = { workspace = true }
 parking_lot = { workspace = true }
-rusqlite = { workspace = true, features = ["backup"] }
+rusqlite = { workspace = true, features = ["backup", "hooks"] }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

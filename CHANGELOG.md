@@ -16,6 +16,14 @@
   the kernel file-copy path instead of reconstructing every page from Graft storage. The private
   copy is verified against Ours' exact content-addressed page index; a missing index, changed
   worktree, or copy mismatch retains authoritative snapshot materialization.
+- SQLite merge planning now overlaps a verified private Ours candidate and its complete
+  `integrity_check` with the independent Base-to-Ours/Base-to-Theirs row analysis. Rejected plans
+  cancel the validation worker and remove its private file; missing exact page indexes retain the
+  ordinary post-plan path rather than speculating with a full snapshot materialization.
+- Local storage commits record their content hash while the complete changed segment is already in
+  memory. Legacy local commits are hashed once and backfilled in place without rebuilding their
+  page-version index, preventing later sparse merge imports from rereading an old full-database
+  checkpoint merely to reconstruct repository snapshot identity.
 - SQLite row merge now reuses proven segment page sets across immutable snapshots, targets
   `WITHOUT ROWID` analysis to changed B-tree pages, and installs an already validated merge
   candidate directly instead of serializing the database again during completion.
