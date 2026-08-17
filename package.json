@@ -6,6 +6,7 @@
     "build:remote": "pnpm --filter @eidos.space/graft-remote build && pnpm --filter @eidos.space/graft-remote-hono build && pnpm --filter @eidos.space/graft-remote-cloudflare build",
     "check:remote": "pnpm --filter @eidos.space/graft-remote check && pnpm --filter @eidos.space/graft-remote build && pnpm --filter @eidos.space/graft-remote-hono check && pnpm --filter @eidos.space/graft-remote-hono build && pnpm --filter @eidos.space/graft-remote-cloudflare check && pnpm --filter @eidos.space/graft-remote-cloudflare build && pnpm --filter graft-remote-cloudflare-verification check",
     "test:remote": "pnpm --filter @eidos.space/graft-remote test && pnpm --filter @eidos.space/graft-remote build && pnpm --filter @eidos.space/graft-remote-hono test && pnpm --filter @eidos.space/graft-remote-hono build && pnpm --filter @eidos.space/graft-remote-cloudflare check && pnpm --filter @eidos.space/graft-remote-cloudflare build && pnpm --filter graft-remote-cloudflare-verification test",
+    "benchmark:staging-fetch-pull": "pnpm --filter @eidos.space/graft build:native && node scripts/staging-fetch-pull-benchmark.mjs",
     "test:remote-release": "node --test scripts/remote-release.test.mjs"
   }
 }
