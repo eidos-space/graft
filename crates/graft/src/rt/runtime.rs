@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     ops::RangeInclusive,
     path::Path,
     sync::{
@@ -35,7 +35,7 @@ use crate::{
     },
     snapshot::Snapshot,
     volume::{Volume, VolumeStatus},
-    volume_reader::VolumeReader,
+    volume_reader::{PageOriginManifest, VolumeReader},
     volume_writer::VolumeWriter,
 };
 
@@ -173,16 +173,13 @@ impl Runtime {
     ///
     /// Sequential snapshot consumers can build this manifest once instead of
     /// searching the page-version index independently for every page.
-    pub(crate) fn snapshot_page_origins(
-        &self,
-        snapshot: &Snapshot,
-    ) -> Result<BTreeMap<PageIdx, SegmentId>> {
-        let mut origins = BTreeMap::new();
+    pub(crate) fn snapshot_page_origins(&self, snapshot: &Snapshot) -> Result<PageOriginManifest> {
+        let mut origins = vec![None; snapshot.page_count.to_usize()];
         let storage = self.storage().read();
         let mut visible = storage.iter_visible_pages(snapshot);
         while let Some((segment, pages)) = visible.next().transpose()? {
             for pageidx in pages.iter() {
-                origins.insert(pageidx, segment.sid.clone());
+                origins[pageidx.to_u32() as usize - 1] = Some(segment.sid.clone());
             }
         }
         Ok(origins)
@@ -196,15 +193,8 @@ impl Runtime {
         from: &Snapshot,
         to: &Snapshot,
     ) -> Result<BTreeSet<u32>> {
-        let from_origins = self.snapshot_page_origins(from)?;
-        let to_origins = self.snapshot_page_origins(to)?;
-        let mut pages = BTreeSet::new();
-        for pageidx in from_origins.keys().chain(to_origins.keys()) {
-            if from_origins.get(pageidx) != to_origins.get(pageidx) {
-                pages.insert(pageidx.to_u32());
-            }
-        }
-        Ok(pages)
+        self.snapshot_reader(from.clone())
+            .changed_page_candidates(&self.snapshot_reader(to.clone()))
     }
 
     pub(crate) fn read_page_from_origin(

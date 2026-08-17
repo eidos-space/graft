@@ -776,11 +776,25 @@ pub fn row_level_diff_snapshots_with_page_candidates(
 ) -> Result<RowLevelDiff, graft::err::GraftErr> {
     let from_reader = runtime.snapshot_reader(from_snapshot.clone());
     let to_reader = runtime.snapshot_reader(to_snapshot.clone());
-    let from_lsn = from_snapshot.head().map_or(LSN::FIRST, |(_, lsn)| lsn);
-    let to_lsn = to_snapshot.head().map_or(LSN::FIRST, |(_, lsn)| lsn);
+    row_level_diff_readers_with_page_candidates(&from_reader, &to_reader, page_candidates)
+}
+
+pub fn row_level_diff_readers_with_page_candidates(
+    from_reader: &dyn VolumeRead,
+    to_reader: &dyn VolumeRead,
+    page_candidates: &BTreeSet<u32>,
+) -> Result<RowLevelDiff, graft::err::GraftErr> {
+    let from_lsn = from_reader
+        .snapshot()
+        .head()
+        .map_or(LSN::FIRST, |(_, lsn)| lsn);
+    let to_lsn = to_reader
+        .snapshot()
+        .head()
+        .map_or(LSN::FIRST, |(_, lsn)| lsn);
     row_level_diff_from_readers(
-        &from_reader,
-        &to_reader,
+        from_reader,
+        to_reader,
         from_lsn,
         to_lsn,
         None,

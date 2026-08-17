@@ -5,7 +5,7 @@ use graft::{repo::CommitFileState, rt::runtime::Runtime};
 use crate::row_level_diff::{
     InsertRowidMode, OpaqueChange, OpaqueChangeReason, RowChange, RowIdentity, RowLevelDiff,
     RowLevelDiffLimitation, SchemaChange, SchemaChangeKind, TableChanges,
-    row_level_diff_snapshots_with_page_candidates,
+    row_level_diff_readers_with_page_candidates,
 };
 use crate::sqlite_parse::{
     ColumnDefinition, GeneratedColumnKind, Record, Value, parse_create_table_column_definitions,
@@ -774,26 +774,34 @@ pub fn plan_snapshot_merge_with_policy(
     let base_snapshot = base.snapshot.to_snapshot();
     let ours_snapshot = ours.snapshot.to_snapshot();
     let theirs_snapshot = theirs.snapshot.to_snapshot();
-    let ours_page_candidates =
-        runtime.snapshot_changed_page_candidates(&base_snapshot, &ours_snapshot)?;
-    let theirs_page_candidates =
-        runtime.snapshot_changed_page_candidates(&base_snapshot, &theirs_snapshot)?;
+    let base_reader = runtime.snapshot_reader(base_snapshot);
+    let ours_reader = runtime.snapshot_reader(ours_snapshot);
+    let theirs_reader = runtime.snapshot_reader(theirs_snapshot);
+
+    let candidate_trace = graft::trace::PushTraceSpan::new("sqlite_merge_page_candidates");
+    let ours_page_candidates = base_reader.changed_page_candidates(&ours_reader)?;
+    let theirs_page_candidates = base_reader.changed_page_candidates(&theirs_reader)?;
+    candidate_trace.finish(&[
+        ("ours_pages", ours_page_candidates.len() as u64),
+        ("theirs_pages", theirs_page_candidates.len() as u64),
+    ]);
+
     // Both sides are independent reads of the same immutable base snapshot. Running them
-    // together avoids serially scanning large databases during merge planning.
+    // together avoids serially scanning large databases during merge planning. The readers also
+    // retain the page-origin manifests computed above, so both row diffs reuse the same Base map.
+    let row_diff_trace = graft::trace::PushTraceSpan::new("sqlite_merge_row_diff");
     let (ours_diff, theirs_diff) = std::thread::scope(|scope| {
         let ours = scope.spawn(|| {
-            row_level_diff_snapshots_with_page_candidates(
-                runtime,
-                &base_snapshot,
-                &ours_snapshot,
+            row_level_diff_readers_with_page_candidates(
+                &base_reader,
+                &ours_reader,
                 &ours_page_candidates,
             )
         });
         let theirs = scope.spawn(|| {
-            row_level_diff_snapshots_with_page_candidates(
-                runtime,
-                &base_snapshot,
-                &theirs_snapshot,
+            row_level_diff_readers_with_page_candidates(
+                &base_reader,
+                &theirs_reader,
                 &theirs_page_candidates,
             )
         });
@@ -804,6 +812,24 @@ pub fn plan_snapshot_merge_with_policy(
     });
     let ours_diff = ours_diff?;
     let theirs_diff = theirs_diff?;
+    row_diff_trace.finish(&[
+        (
+            "ours_rows",
+            ours_diff
+                .table_changes
+                .iter()
+                .map(|table| table.changes.len() as u64)
+                .sum(),
+        ),
+        (
+            "theirs_rows",
+            theirs_diff
+                .table_changes
+                .iter()
+                .map(|table| table.changes.len() as u64)
+                .sum(),
+        ),
+    ]);
     let ours_touches = row_touches(&ours_diff.table_changes, policy);
     let theirs_touches = row_touches(&theirs_diff.table_changes, policy);
     let mut conflicts = Vec::new();
