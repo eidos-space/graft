@@ -7,6 +7,11 @@ SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
 
 ### Changed
 
+- Fetch records commit ancestry in new object-pack indexes and uses it to prefetch the complete
+  pack chain from the requested head to a local ancestor in one bounded read bundle. The retained
+  eight-push plus unrelated-branch regression collapses the cold Fetch topology from 19 HTTP
+  requests to 4 while excluding the unrelated pack. Pre-existing indexes receive a bounded
+  128-pack/48 MiB migration path before falling back to exact lazy reads.
 - Fetch coalesces immutable pack-index reads and missing SQLite snapshot commits into bounded
   Remote read bundles. In the retained Windows trace with 15 pack indexes, the index phase changes
   from 15 authenticated HTTP GETs to one request; longer histories are split automatically at the
@@ -23,9 +28,13 @@ SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
 - New local storage commits retain the hash computed from their already-resident segment pages;
   legacy commits are backfilled after their first hash calculation. Sparse merge imports no longer
   rescan a historical full-database segment to rebuild hashes that were already established.
+- SQLite merge planning reuses one dense page-origin manifest per Base/Ours/Theirs snapshot across
+  candidate selection and parallel row diffs instead of rebuilding ordered maps for each pass.
 
 ### Compatibility
 
+- The optional `commits` field in pack-index format version 1 is an integrity-neutral hint. Older
+  clients ignore it, while new clients validate fetched object bytes exactly as before.
 - Repository and snapshot formats are unchanged. SDK clients fall back to bounded individual reads
   against Remote services that do not advertise or accept `read-bundle`.
 

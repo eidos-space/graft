@@ -133,6 +133,16 @@ backslash, slash-as-data, NUL/control, invalid encoding, and reserved-lock paths
 MUST be rejected. The current service library limits an object path to 768
 UTF-8 bytes and mutable comparison metadata to 16 KiB.
 
+An `objects/pack/<pack-id>.idx` version 1 document MAY carry an additive
+`commits` array beside its authoritative object offset entries. Each item gives
+a commit object ID contained in that pack and its parent object IDs. A client
+MAY use this graph only to select immutable packs for speculative prefetch. It
+MUST still decode every used object and validate its content-addressed ID;
+missing, incomplete, or incorrect ancestry MUST fall back to ordinary verified
+object discovery and MUST NOT change fetch results. Writers SHOULD include the
+hint for every commit object added by that publication. Readers MUST accept
+version 1 indexes that omit it.
+
 A backend implements byte-preserving `head`, ranged/full `get`, transactional
 `put/delete`, create-only `putIfAbsent`, `compareAndSwap`, `compareAndDelete`,
 sorted recursive `list`, and optionally multipart upload. Repository isolation

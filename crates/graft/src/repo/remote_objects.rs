@@ -1,5 +1,8 @@
 use super::*;
 
+pub(super) const LEGACY_PACK_PREFETCH_MAX_PACKS: usize = 128;
+const LEGACY_PACK_PREFETCH_MAX_BYTES: u64 = 48 * 1024 * 1024;
+
 impl Repository {
     pub fn read_object(&self, id: &str) -> Result<object::Object> {
         let id = object::ObjectId::from_str(id)?;
@@ -154,6 +157,10 @@ impl Repository {
         let mut pack_cache = RemoteObjectPackCache::persistent(
             self.graft_dir.join(DIR_CACHE_REMOTE_OBJECT_PACK_INDEXES),
         );
+        let head_id = object::ObjectId::from_str(head)?;
+        if self.object_store().read_raw(&head_id)?.is_none() {
+            self.prefetch_commit_pack_chain(remote, &head_id, &mut pack_cache)?;
+        }
         while let Some(id) = stack.pop() {
             if seen.insert(id.clone(), ()).is_some() {
                 continue;
@@ -181,6 +188,113 @@ impl Repository {
             }
         }
         Ok(count)
+    }
+
+    /// Prefetches every immutable object pack on the advertised commit path from `head` to an
+    /// already-local ancestor in one remote read bundle.
+    ///
+    /// Pack ancestry is only a performance hint. A missing or legacy hint falls through to the
+    /// ordinary object-by-object path, and every decoded object is still verified by its ID.
+    pub(super) fn prefetch_commit_pack_chain(
+        &self,
+        remote: &crate::remote::Remote,
+        head: &object::ObjectId,
+        pack_cache: &mut RemoteObjectPackCache,
+    ) -> Result<()> {
+        let chain_trace = crate::trace::PushTraceSpan::new("remote_pack_chain");
+        let indexes = pack_cache.indexes(remote)?.to_vec();
+        let mut advertised = BTreeMap::<object::ObjectId, (String, Vec<object::ObjectId>)>::new();
+        let mut pack_sizes = BTreeMap::<String, u64>::new();
+        for index in &indexes {
+            let bytes = index
+                .objects
+                .iter()
+                .filter_map(|entry| entry.offset.checked_add(entry.len))
+                .max()
+                .unwrap_or(0);
+            pack_sizes.insert(index.pack.clone(), bytes);
+            for commit in &index.commits {
+                advertised
+                    .entry(commit.id.clone())
+                    .or_insert_with(|| (index.pack.clone(), commit.parents.clone()));
+            }
+        }
+
+        let mut stack = vec![head.clone()];
+        let mut seen = BTreeSet::new();
+        let mut pack_order = Vec::new();
+        let mut discovered_packs = BTreeSet::new();
+        let mut unresolved = false;
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id.clone()) || self.object_store().read_raw(&id)?.is_some() {
+                continue;
+            }
+            let Some((pack, parents)) = advertised.get(&id) else {
+                unresolved = true;
+                continue;
+            };
+            if discovered_packs.insert(pack.clone()) {
+                pack_order.push(pack.clone());
+            }
+            stack.extend(parents.iter().cloned());
+        }
+
+        // Pack indexes written before ancestry hints were introduced remain format-v1
+        // compatible. For a bounded legacy repository, fetching those small packs together trades
+        // a strictly capped amount of possible cross-branch overfetch for far fewer authenticated
+        // round trips. Large repositories keep the exact lazy fallback.
+        let mut legacy_candidates = BTreeSet::new();
+        if unresolved {
+            let mut legacy = BTreeMap::<String, u64>::new();
+            for index in indexes.iter().filter(|index| index.commits.is_empty()) {
+                legacy.insert(
+                    index.pack.clone(),
+                    pack_sizes.get(&index.pack).copied().unwrap_or(0),
+                );
+            }
+            let legacy_bytes = legacy
+                .values()
+                .try_fold(0_u64, |total, bytes| total.checked_add(*bytes));
+            if legacy.len() <= LEGACY_PACK_PREFETCH_MAX_PACKS
+                && legacy_bytes.is_some_and(|bytes| bytes <= LEGACY_PACK_PREFETCH_MAX_BYTES)
+            {
+                for pack in legacy.into_keys() {
+                    legacy_candidates.insert(pack.clone());
+                    if discovered_packs.insert(pack.clone()) {
+                        pack_order.push(pack);
+                    }
+                }
+            }
+        }
+        // Keep speculative memory bounded. The order begins at the requested head, so an
+        // oversized history still accelerates the most immediately useful prefix and lets the
+        // authoritative lazy path fetch the remainder as needed.
+        let mut packs = BTreeSet::new();
+        let mut selected_bytes = 0_u64;
+        for pack in &pack_order {
+            let bytes = pack_sizes.get(pack).copied().unwrap_or(0);
+            let Some(next_bytes) = selected_bytes.checked_add(bytes) else {
+                break;
+            };
+            if packs.len() == LEGACY_PACK_PREFETCH_MAX_PACKS
+                || next_bytes > LEGACY_PACK_PREFETCH_MAX_BYTES
+            {
+                break;
+            }
+            packs.insert(pack.clone());
+            selected_bytes = next_bytes;
+        }
+        let legacy_packs = packs.intersection(&legacy_candidates).count() as u64;
+        let prefetched = pack_cache.prefetch_packs(remote, &packs)?;
+        chain_trace.finish(&[
+            ("discovered_packs", pack_order.len() as u64),
+            ("selected_packs", packs.len() as u64),
+            ("selected_bytes", selected_bytes),
+            ("prefetched_packs", prefetched as u64),
+            ("legacy_packs", legacy_packs),
+            ("unresolved", u64::from(unresolved)),
+        ]);
+        Ok(())
     }
 
     pub(super) fn push_commit_chain(
@@ -235,6 +349,10 @@ impl Repository {
                 }));
             };
             let commit_id = object::ObjectId::from_str(&id)?;
+            commits.push(RemoteObjectPackCommit {
+                id: commit_id.clone(),
+                parents: commit.parents.clone(),
+            });
             objects.insert(commit_id.clone(), bytes);
             self.collect_object_graph_for_pack(
                 &commit.tree,
@@ -245,7 +363,6 @@ impl Repository {
             for parent in &commit.parents {
                 stack.push(parent.to_string());
             }
-            commits.push(commit_id);
         }
 
         let count = commits.len();
@@ -274,7 +391,7 @@ impl Repository {
             ("bytes", missing_external_bytes),
         ]);
         let pack_trace = crate::trace::PushTraceSpan::new("object_pack_build");
-        let pack = self.prepare_object_pack(objects)?;
+        let pack = self.prepare_object_pack(objects, commits)?;
         pack_trace.finish(&[("objects", object_count)]);
         Ok(PreparedObjectPush { commits: count, pack, bundle_objects })
     }
@@ -420,6 +537,7 @@ impl Repository {
     pub(super) fn prepare_object_pack(
         &self,
         objects: BTreeMap<object::ObjectId, Vec<u8>>,
+        mut commits: Vec<RemoteObjectPackCommit>,
     ) -> Result<Option<crate::remote::RemoteObjectPack>> {
         if objects.is_empty() {
             return Ok(None);
@@ -437,10 +555,13 @@ impl Repository {
         let pack_id = blake3::hash(&pack).to_hex().to_string();
         let pack_path = format!("{DIR_OBJECTS_PACK}/{pack_id}.pack");
         let index_path = format!("{DIR_OBJECTS_PACK}/{pack_id}.idx");
+        commits.sort_by(|left, right| left.id.cmp(&right.id));
+        commits.dedup_by(|left, right| left.id == right.id);
         let index = RemoteObjectPackIndex {
             version: REMOTE_OBJECT_PACK_VERSION,
             pack: pack_path,
             objects: entries,
+            commits,
         };
         let index_bytes =
             serde_json::to_vec(&index).map_err(|err| RepoErr::InvalidRemoteObject {

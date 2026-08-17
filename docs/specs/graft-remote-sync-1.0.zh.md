@@ -74,6 +74,13 @@ Path segment 独立 percent encode；空、`.`、`..`、backslash、slash-as-dat
 invalid encoding 与 lock namespace 必须拒绝。当前 library object path 最大 768
 UTF-8 bytes，comparison metadata 最大 16 KiB。
 
+`objects/pack/<pack-id>.idx` 的 version 1 document 可以在 authoritative object
+offset entries 之外附加 `commits` 数组，记录该 pack 内的 commit object ID 及 parent
+object IDs。Client 只能把它作为选择 immutable pack 的 speculative prefetch hint；实际
+使用 object 前仍必须 decode 并验证 content-addressed ID。Ancestry 缺失、不完整或错误时
+必须 fallback 到普通的 verified object discovery，不能改变 fetch 结果。Writer 应为本次
+publication 新增的每个 commit 写入 hint；reader 必须接受不含该字段的 version 1 index。
+
 Backend 提供 byte-preserving head/get、transactional put/delete、put-if-absent、CAS、
 CAD、sorted recursive list 与可选 multipart；必须 repository isolation。
 

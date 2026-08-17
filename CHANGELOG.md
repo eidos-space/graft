@@ -4,6 +4,11 @@
 
 ### Changed
 
+- Object-pack indexes now advertise an optional, integrity-neutral commit ancestry hint. Fetch
+  selects every pack from the requested head to an already-local ancestor and downloads that set
+  through one bounded read bundle instead of paying one authenticated round trip per push. Existing
+  indexes without ancestry use a 128-pack/48 MiB bounded batch and retain exact lazy discovery above
+  that limit.
 - HTTP Remotes support an additive, bounded `read-bundle` operation for immutable objects. Pack
   indexes and snapshot commits are fetched in sorted batches, requests above the 256-object server
   limit are split automatically, and older services fall back to bounded individual reads.
@@ -24,6 +29,9 @@
   memory. Legacy local commits are hashed once and backfilled in place without rebuilding their
   page-version index, preventing later sparse merge imports from rereading an old full-database
   checkpoint merely to reconstruct repository snapshot identity.
+- Three-way SQLite planning shares one cached dense page-origin manifest for Base, Ours, and Theirs.
+  Base is no longer rebuilt for both candidate derivation and both row-diff readers, and direct
+  vector lookup replaces balanced-tree lookup for every decoded page.
 - SQLite row merge now reuses proven segment page sets across immutable snapshots, targets
   `WITHOUT ROWID` analysis to changed B-tree pages, and installs an already validated merge
   candidate directly instead of serializing the database again during completion.
@@ -69,6 +77,8 @@
 
 ### Compatibility
 
+- Pack-index `commits` ancestry is an optional additive field in format version 1. Older clients
+  ignore it; newer clients treat it only as a prefetch hint and still validate every object ID.
 - `read-bundle` is an additive Remote capability. New clients transparently use individual GETs
   when a service returns protocol-aware 404, 405, or 413 responses; existing clients continue to
   use the unchanged raw-object endpoints.

@@ -723,6 +723,12 @@ struct RemoteObjectPackIndex {
     version: u32,
     pack: String,
     objects: Vec<RemoteObjectPackEntry>,
+    /// Commit ancestry advertised by this immutable pack.
+    ///
+    /// This is a disposable fetch hint, not repository truth. Older v1 indexes omit it and remain
+    /// valid; object decoding and hash validation still define correctness after a pack arrives.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    commits: Vec<RemoteObjectPackCommit>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -730,6 +736,12 @@ struct RemoteObjectPackEntry {
     id: object::ObjectId,
     offset: u64,
     len: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RemoteObjectPackCommit {
+    id: object::ObjectId,
+    parents: Vec<object::ObjectId>,
 }
 
 #[derive(Debug, Default)]
@@ -768,6 +780,51 @@ impl RemoteObjectPackCache {
             })?;
         self.packs.insert(pack.to_string(), bytes.clone());
         Ok(bytes)
+    }
+
+    fn prefetch_packs(
+        &mut self,
+        remote: &crate::remote::Remote,
+        packs: &BTreeSet<String>,
+    ) -> Result<usize> {
+        let missing = packs
+            .iter()
+            .filter(|pack| !self.packs.contains_key(*pack))
+            .cloned()
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            return Ok(0);
+        }
+
+        let prefetch_trace = crate::trace::PushTraceSpan::new("remote_pack_prefetch");
+        let mut fetched = match block_on_remote(remote.get_raw_bundle(&missing))? {
+            ReadBundleOutcome::Downloaded(objects) => objects,
+            ReadBundleOutcome::Unsupported => block_on_remote(async {
+                stream::iter(missing.iter().cloned())
+                    .map(|path| async move {
+                        Ok::<_, RemoteErr>((path.clone(), remote.get_raw(&path).await?))
+                    })
+                    .buffer_unordered(REMOTE_REF_READ_CONCURRENCY)
+                    .try_filter_map(
+                        |(path, bytes)| async move { Ok(bytes.map(|bytes| (path, bytes))) },
+                    )
+                    .try_collect::<BTreeMap<_, _>>()
+                    .await
+            })?,
+        };
+        let mut fetched_bytes = 0_u64;
+        for pack in &missing {
+            let bytes = fetched
+                .remove(pack)
+                .ok_or_else(|| RepoErr::InvalidRemoteObject {
+                    path: pack.clone(),
+                    message: "missing pack object".to_string(),
+                })?;
+            fetched_bytes += bytes.len() as u64;
+            self.packs.insert(pack.clone(), bytes);
+        }
+        prefetch_trace.finish(&[("packs", missing.len() as u64), ("bytes", fetched_bytes)]);
+        Ok(missing.len())
     }
 }
 
@@ -2640,7 +2697,14 @@ fn decode_remote_object_pack_index(path: &str, bytes: &[u8]) -> Result<RemoteObj
         });
     }
     let min_offset = REMOTE_OBJECT_PACK_MAGIC.len() as u64;
+    let mut object_ids = BTreeSet::new();
     for entry in &index.objects {
+        if !object_ids.insert(entry.id.clone()) {
+            return Err(RepoErr::InvalidRemoteObject {
+                path: path.to_string(),
+                message: format!("pack index repeats object {}", entry.id),
+            });
+        }
         if entry.len == 0 {
             return Err(RepoErr::InvalidRemoteObject {
                 path: path.to_string(),
@@ -2663,6 +2727,24 @@ fn decode_remote_object_pack_index(path: &str, bytes: &[u8]) -> Result<RemoteObj
                 path: path.to_string(),
                 message: format!("pack entry for object {} overflows u64 range", entry.id),
             })?;
+    }
+    let mut commit_ids = BTreeSet::new();
+    for commit in &index.commits {
+        if !object_ids.contains(&commit.id) {
+            return Err(RepoErr::InvalidRemoteObject {
+                path: path.to_string(),
+                message: format!(
+                    "pack ancestry advertises commit {} outside the pack",
+                    commit.id
+                ),
+            });
+        }
+        if !commit_ids.insert(commit.id.clone()) {
+            return Err(RepoErr::InvalidRemoteObject {
+                path: path.to_string(),
+                message: format!("pack ancestry repeats commit {}", commit.id),
+            });
+        }
     }
     Ok(index)
 }

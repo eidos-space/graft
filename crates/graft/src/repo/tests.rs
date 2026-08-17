@@ -5121,6 +5121,7 @@ fn remote_pack_indexes_are_persisted_and_repaired_as_disposable_hints() {
             version: REMOTE_OBJECT_PACK_VERSION,
             pack: format!("{DIR_OBJECTS_PACK}/{pack_id}.pack"),
             objects: Vec::new(),
+            commits: Vec::new(),
         };
         fs::write(
             remote_dir.path().join(&path),
@@ -5218,6 +5219,7 @@ fn remote_pack_indexes_use_one_read_bundle_after_listing() {
             version: REMOTE_OBJECT_PACK_VERSION,
             pack: format!("{DIR_OBJECTS_PACK}/{pack_id}.pack"),
             objects: Vec::new(),
+            commits: Vec::new(),
         };
         indexes.push((path, serde_json::to_vec(&index).unwrap()));
     }
@@ -5278,6 +5280,343 @@ fn remote_pack_indexes_use_one_read_bundle_after_listing() {
         15
     );
     server.join().unwrap();
+}
+
+#[test]
+fn fetch_prefetches_a_multi_push_pack_chain_in_one_bundle() {
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        thread,
+    };
+
+    fn read_request(stream: &mut std::net::TcpStream) -> (String, Vec<u8>) {
+        let mut headers = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !headers.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).unwrap();
+            headers.push(byte[0]);
+        }
+        let headers = String::from_utf8(headers).unwrap();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length: ")
+                    .map(str::parse::<usize>)
+            })
+            .transpose()
+            .unwrap()
+            .unwrap_or(0);
+        let mut body = vec![0; content_length];
+        stream.read_exact(&mut body).unwrap();
+        (headers, body)
+    }
+
+    fn write_response(stream: &mut std::net::TcpStream, content_type: &str, body: &[u8]) {
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nGraft-Protocol: 1\r\nConnection: close\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .unwrap();
+        stream.write_all(body).unwrap();
+        stream.flush().unwrap();
+    }
+
+    fn write_bundle(stream: &mut std::net::TcpStream, root: &Path, manifest: &[u8]) -> Vec<String> {
+        let manifest: serde_json::Value = serde_json::from_slice(manifest).unwrap();
+        let paths = manifest["paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|path| path.as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        let mut body = Vec::new();
+        for path in &paths {
+            let bytes = fs::read(root.join(path)).unwrap();
+            body.extend_from_slice(&(path.len() as u32).to_be_bytes());
+            body.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+            body.extend_from_slice(path.as_bytes());
+            body.extend_from_slice(&bytes);
+        }
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nGraft-Protocol: 1\r\nConnection: close\r\nX-Graft-Bundle-Objects: {}\r\nX-Graft-Bundle-Total-Bytes: {}\r\nContent-Length: {}\r\n\r\n",
+            paths.len(),
+            body.len(),
+            body.len()
+        )
+        .unwrap();
+        stream.write_all(&body).unwrap();
+        stream.flush().unwrap();
+        paths
+    }
+
+    let remote_dir = tempfile::tempdir().unwrap();
+    let source_dir = tempfile::tempdir().unwrap();
+    let source = Repository::init(source_dir.path()).unwrap();
+    source
+        .remote_add(
+            "origin",
+            RemoteConfig::Fs {
+                root: remote_dir.path().to_string_lossy().into_owned(),
+            },
+        )
+        .unwrap();
+    let note = source_dir.path().join("note.txt");
+    let mut expected_head = String::new();
+    let mut main_commits = BTreeSet::new();
+    for revision in 1..=8 {
+        fs::write(&note, format!("revision {revision}\n")).unwrap();
+        source.stage_artifact_path(&note).unwrap();
+        expected_head = source
+            .commit_staged(format!("revision {revision}"))
+            .unwrap()
+            .id;
+        main_commits.insert(expected_head.clone());
+        source.push("origin", "main").unwrap();
+    }
+    source.branch_create("side", None).unwrap();
+    source.switch_branch("side").unwrap();
+    fs::write(&note, "unrelated side branch\n").unwrap();
+    source.stage_artifact_path(&note).unwrap();
+    let side_head = source.commit_staged("side").unwrap().id;
+    source.push("origin", "side").unwrap();
+
+    let pack_root = remote_dir.path().join(DIR_OBJECTS_PACK);
+    let mut index_paths = fs::read_dir(&pack_root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "idx"))
+        .map(|path| {
+            format!(
+                "{DIR_OBJECTS_PACK}/{}",
+                path.file_name().unwrap().to_string_lossy()
+            )
+        })
+        .collect::<Vec<_>>();
+    index_paths.sort();
+    assert_eq!(index_paths.len(), 9);
+    let mut pack_paths = index_paths
+        .iter()
+        .filter_map(|path| {
+            let index = decode_remote_object_pack_index(
+                path,
+                &fs::read(remote_dir.path().join(path)).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(index.commits.len(), 1);
+            let commit = index.commits[0].id.to_string();
+            if main_commits.contains(&commit) {
+                Some(index.pack)
+            } else {
+                assert_eq!(commit, side_head);
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    pack_paths.sort();
+    assert_eq!(pack_paths.len(), 8);
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let remote_root = remote_dir.path().to_path_buf();
+    let served_head = expected_head.clone();
+    let expected_indexes = index_paths.clone();
+    let expected_packs = pack_paths.clone();
+    let server = thread::spawn(move || {
+        let (mut head, _) = listener.accept().unwrap();
+        let (request, _) = read_request(&mut head);
+        assert!(request.starts_with("GET /repo/raw/refs/heads/main HTTP/1.1"));
+        write_response(
+            &mut head,
+            "application/octet-stream",
+            format!("{served_head}\n").as_bytes(),
+        );
+
+        let (mut list, _) = listener.accept().unwrap();
+        let (request, _) = read_request(&mut list);
+        assert!(request.starts_with("GET /repo/list?prefix=objects%2Fpack HTTP/1.1"));
+        let list_body = serde_json::to_vec(&serde_json::json!({
+            "paths": expected_indexes
+                .iter()
+                .chain(expected_packs.iter())
+                .collect::<Vec<_>>()
+        }))
+        .unwrap();
+        write_response(&mut list, "application/json", &list_body);
+
+        let (mut indexes, _) = listener.accept().unwrap();
+        let (request, manifest) = read_request(&mut indexes);
+        assert!(request.starts_with("POST /repo/read-bundle HTTP/1.1"));
+        assert_eq!(
+            write_bundle(&mut indexes, &remote_root, &manifest),
+            expected_indexes
+        );
+
+        let (mut packs, _) = listener.accept().unwrap();
+        let (request, manifest) = read_request(&mut packs);
+        assert!(request.starts_with("POST /repo/read-bundle HTTP/1.1"));
+        assert_eq!(
+            write_bundle(&mut packs, &remote_root, &manifest),
+            expected_packs
+        );
+    });
+
+    let clone_dir = tempfile::tempdir().unwrap();
+    let clone = Repository::init(clone_dir.path()).unwrap();
+    clone
+        .remote_add(
+            "origin",
+            RemoteConfig::Http {
+                url: format!("http://{address}/repo"),
+                token_env: None,
+            },
+        )
+        .unwrap();
+    let fetched = clone.fetch("origin", "main").unwrap();
+    assert_eq!(fetched.head, expected_head);
+    assert_eq!(fetched.commits, 8);
+    server.join().unwrap();
+}
+
+#[test]
+fn bounded_legacy_pack_indexes_are_prefetched_for_existing_remotes() {
+    let repo_dir = tempfile::tempdir().unwrap();
+    let repo = Repository::init(repo_dir.path()).unwrap();
+    let remote = RemoteConfig::Memory.build().unwrap();
+    let mut indexes = Vec::new();
+    for value in 1_u8..=3 {
+        let pack_id = format!("{value:064x}");
+        let pack = format!("{DIR_OBJECTS_PACK}/{pack_id}.pack");
+        let mut bytes = REMOTE_OBJECT_PACK_MAGIC.to_vec();
+        bytes.push(value);
+        block_on_remote(remote.put_raw_if_not_exists(&pack, Bytes::from(bytes))).unwrap();
+        indexes.push(RemoteObjectPackIndex {
+            version: REMOTE_OBJECT_PACK_VERSION,
+            pack,
+            objects: vec![RemoteObjectPackEntry {
+                id: object::ObjectId::for_bytes(&[value]),
+                offset: REMOTE_OBJECT_PACK_MAGIC.len() as u64,
+                len: 1,
+            }],
+            commits: Vec::new(),
+        });
+    }
+    let mut cache = RemoteObjectPackCache {
+        indexes: Some(indexes),
+        ..RemoteObjectPackCache::default()
+    };
+
+    repo.prefetch_commit_pack_chain(
+        &remote,
+        &object::ObjectId::for_bytes(b"unresolved legacy head"),
+        &mut cache,
+    )
+    .unwrap();
+
+    assert_eq!(cache.packs.len(), 3);
+}
+
+#[test]
+fn oversized_legacy_pack_sets_keep_the_exact_lazy_fallback() {
+    let repo_dir = tempfile::tempdir().unwrap();
+    let repo = Repository::init(repo_dir.path()).unwrap();
+    let remote = RemoteConfig::Memory.build().unwrap();
+    let indexes = (0_usize..=remote_objects::LEGACY_PACK_PREFETCH_MAX_PACKS)
+        .map(|value| RemoteObjectPackIndex {
+            version: REMOTE_OBJECT_PACK_VERSION,
+            pack: format!("{DIR_OBJECTS_PACK}/{value:064x}.pack"),
+            objects: vec![RemoteObjectPackEntry {
+                id: object::ObjectId::for_bytes(&value.to_be_bytes()),
+                offset: REMOTE_OBJECT_PACK_MAGIC.len() as u64,
+                len: 1,
+            }],
+            commits: Vec::new(),
+        })
+        .collect();
+    let mut cache = RemoteObjectPackCache {
+        indexes: Some(indexes),
+        ..RemoteObjectPackCache::default()
+    };
+
+    repo.prefetch_commit_pack_chain(
+        &remote,
+        &object::ObjectId::for_bytes(b"unresolved large legacy head"),
+        &mut cache,
+    )
+    .unwrap();
+
+    assert!(cache.packs.is_empty());
+}
+
+#[test]
+fn incomplete_pack_ancestry_hint_falls_back_to_verified_discovery() {
+    let remote_dir = tempfile::tempdir().unwrap();
+    let source_dir = tempfile::tempdir().unwrap();
+    let source = Repository::init(source_dir.path()).unwrap();
+    source
+        .remote_add(
+            "origin",
+            RemoteConfig::Fs {
+                root: remote_dir.path().to_string_lossy().into_owned(),
+            },
+        )
+        .unwrap();
+    let note = source_dir.path().join("note.txt");
+    let mut expected_head = String::new();
+    for revision in 1..=2 {
+        fs::write(&note, format!("revision {revision}\n")).unwrap();
+        source.stage_artifact_path(&note).unwrap();
+        expected_head = source
+            .commit_staged(format!("revision {revision}"))
+            .unwrap()
+            .id;
+        source.push("origin", "main").unwrap();
+    }
+
+    let pack_root = remote_dir.path().join(DIR_OBJECTS_PACK);
+    let mut modified = false;
+    for entry in fs::read_dir(&pack_root).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_none_or(|extension| extension != "idx") {
+            continue;
+        }
+        let remote_path = format!(
+            "{DIR_OBJECTS_PACK}/{}",
+            path.file_name().unwrap().to_string_lossy()
+        );
+        let mut index =
+            decode_remote_object_pack_index(&remote_path, &fs::read(&path).unwrap()).unwrap();
+        if index
+            .commits
+            .iter()
+            .any(|commit| commit.id.to_string() == expected_head)
+        {
+            index.commits[0].parents.clear();
+            fs::write(path, serde_json::to_vec(&index).unwrap()).unwrap();
+            modified = true;
+            break;
+        }
+    }
+    assert!(modified);
+
+    let clone_dir = tempfile::tempdir().unwrap();
+    let clone = Repository::init(clone_dir.path()).unwrap();
+    clone
+        .remote_add(
+            "origin",
+            RemoteConfig::Fs {
+                root: remote_dir.path().to_string_lossy().into_owned(),
+            },
+        )
+        .unwrap();
+    let fetched = clone.fetch("origin", "main").unwrap();
+
+    assert_eq!(fetched.head, expected_head);
+    assert_eq!(fetched.commits, 2);
+    assert!(clone.read_commit(&expected_head).is_ok());
 }
 
 #[test]
