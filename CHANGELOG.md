@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## Graft 0.14.0 — 2026-08-22
+
+### Added
+
+- `graft diff --no-index <from.sqlite> <to.sqlite>` compares two physical SQLite files without a
+  repository. Optional `--rows` and `--json` modes expose logical schema/table/row changes from
+  consistent online snapshots that include committed WAL frames.
+
 ### Changed
 
 - Object-pack indexes now advertise an optional, integrity-neutral commit ancestry hint. Fetch
