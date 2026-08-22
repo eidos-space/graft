@@ -154,8 +154,15 @@ enum Command {
         message: String,
     },
 
-    /// Compare repository revisions, staged changes, or the worktree
+    /// Compare repository revisions, staged changes, the worktree, or two `SQLite` files
     Diff {
+        /// Compare two physical `SQLite` files without using a Graft repository
+        #[arg(
+            long,
+            conflicts_with_all = ["staged", "kind", "content", "root", "path"]
+        )]
+        no_index: bool,
+
         /// Emit row-level changes for modified `SQLite` database snapshots
         #[arg(long)]
         rows: bool,
@@ -1204,6 +1211,7 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
             print_output(output);
         }
         Command::Diff {
+            no_index,
             rows,
             staged,
             kind,
@@ -1215,6 +1223,29 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
             path,
             json,
         } => {
+            if no_index {
+                if db_override.is_some() {
+                    bail!("diff --no-index cannot be combined with --db");
+                }
+                let from = from
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("diff --no-index requires two SQLite files"))?;
+                let to = to
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("diff --no-index requires two SQLite files"))?;
+                let diff = graft_sqlite::diff_sqlite_files(
+                    Path::new(from),
+                    Path::new(to),
+                    graft_sqlite::SqliteFileDiffOptions { rows },
+                )?;
+                let output = if json {
+                    serde_json::to_string(&diff.to_json())?
+                } else {
+                    diff.to_report()?
+                };
+                print_output(Some(output));
+                return Ok(());
+            }
             let suffix = if json { "json_diff" } else { "diff" };
             let arg = repo_diff_arg(RepoDiffArgSpec {
                 rows,
@@ -1834,6 +1865,7 @@ fn validate_command_repo_paths(command: &Command) -> Result<()> {
         return Ok(());
     }
     let (path, lossless_serialization) = match command {
+        Command::Diff { no_index: true, .. } => (None, false),
         Command::Add(args) => (args.path.as_deref(), true),
         Command::Rm(args) => (args.path.as_deref(), false),
         Command::Diff { root: Some(_), from: Some(path), .. } => (Some(Path::new(path)), true),
@@ -3594,6 +3626,7 @@ mod tests {
         .unwrap();
 
         let Command::Diff {
+            no_index,
             rows,
             staged,
             kind,
@@ -3608,6 +3641,7 @@ mod tests {
         else {
             panic!("expected diff command");
         };
+        assert!(!no_index);
         assert!(rows);
         assert!(!staged);
         assert_eq!(kind, None);
@@ -3657,6 +3691,7 @@ mod tests {
         ])
         .unwrap();
         let Command::Diff {
+            no_index,
             rows,
             staged,
             kind,
@@ -3671,6 +3706,7 @@ mod tests {
         else {
             panic!("expected diff command");
         };
+        assert!(!no_index);
         assert!(!rows);
         assert!(staged);
         assert_eq!(kind, Some(PathKind::BinaryFile));
@@ -3698,6 +3734,69 @@ mod tests {
     }
 
     #[test]
+    fn parses_no_index_sqlite_file_diff() {
+        let cli = Cli::try_parse_from([
+            "graft",
+            "diff",
+            "--no-index",
+            "--rows",
+            "--json",
+            "old.sqlite",
+            "new.sqlite",
+        ])
+        .unwrap();
+        let Command::Diff {
+            no_index,
+            rows,
+            staged,
+            kind,
+            content,
+            root,
+            from,
+            to,
+            path,
+            json,
+            ..
+        } = cli.command
+        else {
+            panic!("expected diff command");
+        };
+        assert!(no_index);
+        assert!(rows);
+        assert!(!staged);
+        assert_eq!(kind, None);
+        assert!(!content);
+        assert_eq!(root, None);
+        assert_eq!(from.as_deref(), Some("old.sqlite"));
+        assert_eq!(to.as_deref(), Some("new.sqlite"));
+        assert_eq!(path, None);
+        assert!(json);
+
+        assert!(
+            Cli::try_parse_from([
+                "graft",
+                "diff",
+                "--no-index",
+                "--staged",
+                "old.sqlite",
+                "new.sqlite",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "graft",
+                "diff",
+                "--no-index",
+                "old.sqlite",
+                "new.sqlite",
+                "third.sqlite",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn parses_bounded_single_path_text_content_diff() {
         let cli = Cli::try_parse_from([
             "graft",
@@ -3713,6 +3812,7 @@ mod tests {
         ])
         .unwrap();
         let Command::Diff {
+            no_index,
             rows,
             staged,
             kind,
@@ -3728,6 +3828,7 @@ mod tests {
             panic!("expected diff command");
         };
 
+        assert!(!no_index);
         assert!(json);
         assert!(content);
         assert!(!rows);
@@ -3801,6 +3902,7 @@ mod tests {
         ])
         .unwrap();
         let Command::Diff {
+            no_index,
             rows,
             staged,
             kind,
@@ -3816,6 +3918,7 @@ mod tests {
             panic!("expected diff command");
         };
 
+        assert!(!no_index);
         assert!(json);
         assert!(content);
         assert_eq!(from.as_deref(), Some("HEAD"));
@@ -3854,6 +3957,7 @@ mod tests {
         ])
         .unwrap();
         let Command::Diff {
+            no_index,
             rows,
             staged,
             kind,
@@ -3868,6 +3972,7 @@ mod tests {
         else {
             panic!("expected diff command");
         };
+        assert!(!no_index);
         assert!(json);
         assert!(content);
         assert!(!rows);

@@ -27,6 +27,13 @@ staged/unstaged）；`staged` 是 `HEAD` 与 Normal index；`root=R` 是 empty t
 `stagedFallback` 只在请求 path 没有 worktree change 时使用 staged comparison，并
 必须说明实际 source。Path/table filter 只缩小工作量，不改变 side identity。
 
+CLI `--no-index` mode 不发现 repository，直接比较两个普通物理 SQLite 文件。两侧是
+从显式 `from` 和 `to` path 捕获的一致 image。它支持 `--rows` 和 `--json`，但不支持
+repository selector（`staged`、`root`、`kind`、`content`）或 `--db`。非 SQLite 输入
+必须拒绝，不能作为普通 binary file 比较。JSON 用 path 和 page count 标识两侧，报告
+`changed`、`kind` 和是否请求 rows；只有对 changed pair 请求逻辑展开时才包含
+`row_diff`。
+
 Path/artifact identity 由 Repository 规格定义，snapshot/hydration 由 Storage
 规格定义，merge version 由 Merge 规格定义。
 
@@ -153,6 +160,13 @@ Direct streaming 应避免加载全库。`WITHOUT ROWID` 在 layout 支持时使
 否则 fallback `materialized_compat`。Compatibility DB 必须在隔离 temp path 创建、
 只读打开，并设置 `trusted_schema=OFF` 等 defensive option；成功失败都要清理，不得
 改变 repository/worktree。
+
+`--no-index` 通过 SQLite consistent backup path 捕获每个物理 side，包括已提交的 WAL
+frames。文件级相等性使用与 repository worktree diff 相同的 4 KiB snapshot comparison，
+只忽略 SQLite page 1 的 volatile cache-invalidation counters 和 last-writer library
+version。若物理文件 changed、但没有受支持的 row/schema logical result，文件仍是
+changed；请求 row expansion 时使用
+`file_changed_no_supported_logical_changes`。
 
 ## 8. Bounded row API
 

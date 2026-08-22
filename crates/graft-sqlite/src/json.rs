@@ -6,6 +6,40 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
+/// One side of a repository-independent physical `SQLite` file comparison.
+#[derive(Debug, Clone, Serialize)]
+pub struct JsonSqliteFileDiffSide {
+    pub path: String,
+    pub page_count: u32,
+}
+
+/// Logical details requested for a repository-independent `SQLite` file comparison.
+#[derive(Debug, Clone, Serialize)]
+pub struct JsonSqliteFileRowDiff {
+    pub logical_status: String,
+    pub capabilities: Vec<String>,
+    pub limitations: Vec<JsonDiffLimitation>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub schema_changes: Vec<JsonSchemaChange>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tables: Vec<JsonTableChanges>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub opaque_changes: Vec<JsonOpaqueChange>,
+    pub telemetry: JsonRowDiffTelemetry,
+}
+
+/// JSON result for `graft diff --no-index`.
+#[derive(Debug, Clone, Serialize)]
+pub struct JsonSqliteFileDiffResult {
+    pub from: JsonSqliteFileDiffSide,
+    pub to: JsonSqliteFileDiffSide,
+    pub changed: bool,
+    pub kind: String,
+    pub rows: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub row_diff: Option<JsonSqliteFileRowDiff>,
+}
+
 /// Table summary in a diff (for `graft_json_diff`)
 #[derive(Debug, Clone, Serialize)]
 pub struct JsonTableSummary {

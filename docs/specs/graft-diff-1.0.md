@@ -40,6 +40,15 @@ path has no worktree change. It MUST report which comparison supplied the
 result. Explicit path/table filters narrow work; they do not alter side
 identity.
 
+The CLI `--no-index` mode compares exactly two ordinary physical SQLite files
+without repository discovery. Its sides are the consistent images captured
+from the explicit `from` and `to` paths. It accepts `--rows` and `--json`, but
+not repository selectors (`staged`, `root`, `kind`, `content`) or `--db`.
+Non-SQLite inputs are rejected rather than treated as generic binary files.
+JSON identifies both sides by path and page count, reports `changed`, `kind`,
+and whether rows were requested, and includes `row_diff` only when logical
+expansion was requested for a changed pair.
+
 Repository path and artifact identity are defined by [Graft Repository
 1.0](./graft-repository-1.0.md). Storage snapshots and hydration are defined by
 [Graft Storage and Snapshots 1.0](./graft-storage-snapshots-1.0.md). Merge
@@ -236,6 +245,14 @@ layout is directly supported and fall back to `materialized_compat` otherwise.
 opened read-only for comparison, and use defensive settings including
 `trusted_schema=OFF`. They MUST be cleaned up on success and failure. They are
 not worktree files and MUST NOT alter repository state.
+
+`--no-index` captures each physical side through SQLite's consistent backup
+path, including committed WAL frames. Its file-level equality uses the same
+4 KiB snapshot comparison as repository worktree diff and ignores only the
+volatile SQLite page-1 cache-invalidation counters and last-writer library
+version. Physical changes with no supported logical row/schema result remain
+changed and use `file_changed_no_supported_logical_changes` when row expansion
+was requested.
 
 ## 8. Bounded row APIs
 

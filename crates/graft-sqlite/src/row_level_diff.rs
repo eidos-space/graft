@@ -618,6 +618,13 @@ impl RowLevelDiff {
     pub fn to_report(&self) -> String {
         let mut report = format!("Diff LSN {} -> {}\n", self.from_lsn, self.to_lsn);
         report.push_str("============================\n\n");
+        report.push_str(&self.to_report_body());
+        report
+    }
+
+    /// Generate the human-readable logical change body without snapshot-specific LSN headings.
+    pub fn to_report_body(&self) -> String {
+        let mut report = String::new();
 
         if self.table_changes.is_empty()
             && self.schema_changes.is_empty()

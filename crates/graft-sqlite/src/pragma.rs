@@ -68,7 +68,7 @@ mod repo_snapshot;
 mod repo_staging;
 mod repo_switch;
 mod repo_sync;
-mod row_diff;
+pub(crate) mod row_diff;
 mod row_merge_output;
 pub(crate) mod spec;
 pub(crate) mod sqlite_worktree;

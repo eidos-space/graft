@@ -678,7 +678,7 @@ impl PreparedSqliteStage {
 }
 
 impl PhysicalSqliteReader {
-    pub(super) fn open(path: &Path) -> Result<Self, ErrCtx> {
+    pub(crate) fn open(path: &Path) -> Result<Self, ErrCtx> {
         validate_sqlite_source(path)?;
 
         let snapshot_dir = tempfile::Builder::new()
@@ -740,6 +740,28 @@ impl PhysicalSqliteReader {
 
     pub(super) fn worktree_state(&self) -> RepoWorktreeFileState {
         RepoWorktreeFileState { page_count: self.page_count() }
+    }
+
+    pub(crate) fn matches_reader(&self, other: &dyn VolumeRead) -> Result<bool, ErrCtx> {
+        if self.page_count() != other.page_count() {
+            return Ok(false);
+        }
+        for page_number in 1..=self.page_count().to_u32() {
+            graft::repo::cancellation_checkpoint()?;
+            let pageidx = PageIdx::try_from(page_number).map_err(|error| {
+                ErrCtx::InvalidCommand(
+                    format!("invalid SQLite page index {page_number}: {error}").into(),
+                )
+            })?;
+            if !sqlite_page_bytes_equal(
+                page_number,
+                self.read_page(pageidx)?.as_ref(),
+                other.read_page(pageidx)?.as_ref(),
+            ) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     fn visit_page_chunks(

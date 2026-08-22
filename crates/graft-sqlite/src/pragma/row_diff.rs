@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) fn json_opaque_changes(
+pub(crate) fn json_opaque_changes(
     changes: &[crate::row_level_diff::OpaqueChange],
 ) -> Vec<crate::json::JsonOpaqueChange> {
     changes
@@ -14,7 +14,7 @@ pub(super) fn json_opaque_changes(
         .collect()
 }
 
-pub(super) fn json_schema_changes(
+pub(crate) fn json_schema_changes(
     changes: &[crate::row_level_diff::SchemaChange],
 ) -> Vec<crate::json::JsonSchemaChange> {
     changes
@@ -29,7 +29,7 @@ pub(super) fn json_schema_changes(
         .collect()
 }
 
-pub(super) fn json_diff_capabilities(diff: &crate::row_level_diff::RowLevelDiff) -> Vec<String> {
+pub(crate) fn json_diff_capabilities(diff: &crate::row_level_diff::RowLevelDiff) -> Vec<String> {
     diff.analysis
         .capabilities
         .iter()
@@ -37,7 +37,7 @@ pub(super) fn json_diff_capabilities(diff: &crate::row_level_diff::RowLevelDiff)
         .collect()
 }
 
-pub(super) fn json_diff_limitations(
+pub(crate) fn json_diff_limitations(
     diff: &crate::row_level_diff::RowLevelDiff,
 ) -> Vec<crate::json::JsonDiffLimitation> {
     json_limitations(&diff.analysis.limitations)
@@ -318,7 +318,7 @@ fn unavailable_bounded_file(
     }
 }
 
-pub(super) fn json_table_changes(
+pub(crate) fn json_table_changes(
     changes: &[crate::row_level_diff::TableChanges],
 ) -> Vec<crate::json::JsonTableChanges> {
     changes
