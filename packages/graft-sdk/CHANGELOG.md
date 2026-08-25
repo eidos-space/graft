@@ -5,6 +5,21 @@ SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
 
 ## Unreleased
 
+## Graft SDK 0.3.21 — 2026-08-26
+
+### Changed
+
+- Owner-published incremental status snapshots can now be revalidated without opening runtime
+  storage, allowing the matching Graft CLI to serve exact `status` results while an Electron or
+  Node.js application retains the repository lock.
+- Repository index updates now use atomic replacement so lock-independent readers observe a
+  complete old or new index.
+
+### Compatibility
+
+- The JavaScript API and repository/status-cache formats are unchanged. Existing SDK clients do
+  not require code changes.
+
 ## Graft SDK 0.3.20 — 2026-08-25
 
 ### Fixed

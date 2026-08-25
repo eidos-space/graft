@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+## Graft 0.15.2 — 2026-08-26
+
+### Changed
+
+- `graft log` now reads atomic refs and immutable repository objects without opening runtime
+  storage, so it remains available while an embedded SDK session owns the repository lock.
+- `graft status` now revalidates and renders an exact status snapshot published by the repository
+  owner before opening runtime storage. Stale or missing snapshots still fall back to the
+  authoritative status path instead of reporting optimistic results.
+
+### Compatibility
+
+- Repository, object, snapshot, and status-cache formats are unchanged. Index updates now use
+  atomic replacement so concurrent readers observe a complete old or new index.
+
 ## Graft 0.15.1 — 2026-08-25
 
 ### Fixed
