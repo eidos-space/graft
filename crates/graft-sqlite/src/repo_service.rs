@@ -16,10 +16,11 @@ use graft::{
 
 use crate::{
     error::ErrCtx,
+    page_delta::{parse_sha256_hex, sha256_hex_bytes, write_delta_from_readers},
     pragma::{
         GraftCommand,
         parse::parse_row_identity,
-        repo_checkout::export_repo_path,
+        repo_checkout::{export_repo_path, write_repo_file_state_to_new_path},
         repo_conflicts::{
             prepare_repo_semantic_merge_seed, resolve_repo_cell_conflict,
             stage_repo_external_sqlite_result, stage_repo_worktree_sqlite_result,
@@ -29,7 +30,9 @@ use crate::{
         spec::{
             RepoExportSpec, RepoResolveCellSpec, RepoResolveRowSpec, RepoResolveSpec, ResolveSide,
         },
-        sqlite_worktree::physical_sqlite_file_matches_state,
+        sqlite_worktree::{
+            physical_sqlite_file_matches_state, prepare_cached_physical_sqlite_file_state,
+        },
     },
     session::{RepoRuntimeRegistry, RepositorySessionContext},
 };
@@ -80,6 +83,66 @@ pub struct RepositoryResolveCellOptions {
     pub table: String,
     pub identity: serde_json::Value,
     pub column: String,
+}
+
+/// Immutable `SQLite` capture produced without changing refs, index, or worktree files.
+#[derive(Debug, Clone)]
+pub struct RepositorySqliteCapture {
+    pub state: CommitFileState,
+    pub content_fingerprint: String,
+    pub sha256: String,
+    pub bytes: u64,
+    pub changed_pages: usize,
+    pub page_hash_cache_hit: bool,
+    pub delta: Option<RepositorySqliteDelta>,
+}
+
+/// Portable fixed-page delta between two immutable `SQLite` captures.
+#[derive(Debug, Clone)]
+pub struct RepositorySqliteDelta {
+    pub output: PathBuf,
+    pub bytes: u64,
+    pub changed_pages: usize,
+    pub base_content_fingerprint: String,
+    pub base_sha256: String,
+    pub target_sha256: String,
+}
+
+fn write_sqlite_page_delta(
+    runtime: &graft::rt::runtime::Runtime,
+    base: &CommitFileState,
+    target: &CommitFileState,
+    output: &Path,
+    base_sha256: [u8; 32],
+    target_sha256: [u8; 32],
+) -> Result<RepositorySqliteDelta, ErrCtx> {
+    let base_snapshot = base.snapshot.to_snapshot();
+    let target_snapshot = target.snapshot.to_snapshot();
+    let base_reader = runtime.snapshot_reader(base_snapshot.clone());
+    let target_reader = runtime.snapshot_reader(target_snapshot);
+    let candidates = base_reader
+        .changed_page_candidates(&target_reader)?
+        .into_iter()
+        .collect();
+    let metadata = write_delta_from_readers(
+        &base_reader,
+        &target_reader,
+        output,
+        base_sha256,
+        target_sha256,
+        Some(candidates),
+    )?;
+    Ok(RepositorySqliteDelta {
+        output: output.to_path_buf(),
+        bytes: metadata.delta_bytes,
+        changed_pages: metadata.changed_pages as usize,
+        base_content_fingerprint: format!(
+            "graft-sqlite-v1:{}",
+            runtime.snapshot_checksum(&base_snapshot)?
+        ),
+        base_sha256: metadata.base_sha256,
+        target_sha256: metadata.target_sha256,
+    })
 }
 
 /// The worktree effect of one structured conflict resolution.
@@ -350,6 +413,77 @@ impl RepositoryCommandService {
                 output: output.to_path_buf(),
             },
         )
+    }
+
+    /// Captures one physical `SQLite` worktree file into `Graft` storage and exports that exact
+    /// immutable image. Supplying a prior capture allows unchanged pages to remain shared.
+    pub fn capture_worktree_sqlite(
+        &mut self,
+        path: &Path,
+        output: &Path,
+        base: Option<&CommitFileState>,
+        base_sha256: Option<&str>,
+        delta_output: Option<&Path>,
+    ) -> Result<RepositorySqliteCapture, ErrCtx> {
+        let runtime = self.file.runtime().clone();
+        let repo = repo_for_file(&mut self.file)?;
+        let physical_path = repo.worktree().join(path);
+        let key = repo.file_key(&physical_path)?;
+        let (state, prepared) = prepare_cached_physical_sqlite_file_state(
+            &runtime,
+            &repo,
+            &format!("sdk-capture:{key}"),
+            &physical_path,
+            base,
+        )?;
+        let target_sha256 = write_repo_file_state_to_new_path(&runtime, &state, output)?;
+        let sha256 = sha256_hex_bytes(&target_sha256);
+        let content_fingerprint = format!(
+            "graft-sqlite-v1:{}",
+            runtime.snapshot_checksum(&state.snapshot.to_snapshot())?
+        );
+        let bytes = std::fs::metadata(output)?.len();
+        let delta = match (base, delta_output) {
+            (Some(base), Some(delta_output)) => {
+                let Some(base_sha256) = base_sha256 else {
+                    let _ = std::fs::remove_file(output);
+                    return Err(ErrCtx::InvalidCommand(
+                        "SQLite delta capture requires the base snapshot SHA-256".into(),
+                    ));
+                };
+                let base_sha256 = match parse_sha256_hex(base_sha256) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = std::fs::remove_file(output);
+                        return Err(error);
+                    }
+                };
+                match write_sqlite_page_delta(
+                    &runtime,
+                    base,
+                    &state,
+                    delta_output,
+                    base_sha256,
+                    target_sha256,
+                ) {
+                    Ok(delta) => Some(delta),
+                    Err(error) => {
+                        let _ = std::fs::remove_file(output);
+                        return Err(error);
+                    }
+                }
+            }
+            _ => None,
+        };
+        Ok(RepositorySqliteCapture {
+            state,
+            content_fingerprint,
+            sha256,
+            bytes,
+            changed_pages: prepared.changed_page_count(),
+            page_hash_cache_hit: prepared.page_hash_cache_hit(),
+            delta,
+        })
     }
 
     /// Validates a provider-owned candidate, materializes it, and stages it as one merge result.

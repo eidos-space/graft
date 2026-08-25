@@ -66,6 +66,8 @@ const STATUS_SNAPSHOT_SCHEMA_VERSION: u32 = 3;
 const MAX_STATUS_SNAPSHOTS: usize = 4;
 const STATUS_SNAPSHOT_MAX_BYTES: u64 = 256 * 1024 * 1024;
 const WORKTREE_STABILITY_ATTEMPTS: usize = 3;
+const SQLITE_CAPTURE_TOKEN_VERSION: u32 = 2;
+const MAX_SQLITE_CAPTURE_TOKEN_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -340,6 +342,7 @@ pub enum RepositoryOperation {
     StatusIncremental,
     AddAll,
     StagePaths,
+    CaptureSqliteSnapshot,
     RecordPathMove,
     UntrackPaths,
     Commit,
@@ -903,6 +906,43 @@ pub struct StagePathsOptions {
 }
 
 #[derive(Debug, Clone)]
+pub struct CaptureSqliteSnapshotOptions {
+    pub path: PathBuf,
+    pub output: PathBuf,
+    pub base_snapshot_token: Option<String>,
+    pub delta_output: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CaptureSqliteSnapshotResult {
+    pub path: String,
+    pub output: String,
+    pub snapshot_token: String,
+    pub content_fingerprint: String,
+    pub sha256: String,
+    pub bytes: u64,
+    pub page_count: u32,
+    pub changed_pages: usize,
+    pub reused_snapshot: bool,
+    pub page_hash_cache_hit: bool,
+    pub delta_output: Option<String>,
+    pub delta_bytes: Option<u64>,
+    pub delta_changed_pages: Option<usize>,
+    pub delta_base_content_fingerprint: Option<String>,
+    pub delta_base_sha256: Option<String>,
+    pub delta_target_sha256: Option<String>,
+    pub materializes_worktree: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SqliteCaptureToken {
+    version: u32,
+    path: String,
+    state: CommitFileState,
+    sha256: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct RecordPathMoveOptions {
     pub previous_path: PathBuf,
     pub path: PathBuf,
@@ -1325,6 +1365,99 @@ impl RepositorySession {
             })();
             status_cache.invalidate();
             operation
+        })
+    }
+
+    /// Captures a consistent immutable `SQLite` image without staging, committing, moving refs, or
+    /// replacing the worktree file. The opaque token may be supplied to the next capture so Graft
+    /// only writes pages that differ from the prior publication snapshot.
+    pub fn capture_sqlite_snapshot(
+        &self,
+        options: &CaptureSqliteSnapshotOptions,
+    ) -> Result<CaptureSqliteSnapshotResult> {
+        let path = normalize_requested_path(&options.path)?;
+        if !options.output.is_absolute() {
+            return Err(invalid_argument(
+                "SQLite capture output must be an absolute path",
+            ));
+        }
+        if options
+            .delta_output
+            .as_ref()
+            .is_some_and(|path| !path.is_absolute())
+        {
+            return Err(invalid_argument(
+                "SQLite capture delta output must be an absolute path",
+            ));
+        }
+        if options.delta_output.as_ref() == Some(&options.output) {
+            return Err(invalid_argument(
+                "SQLite capture output and delta output must be different paths",
+            ));
+        }
+        let base = options
+            .base_snapshot_token
+            .as_deref()
+            .map(|token| decode_sqlite_capture_token(token, &path))
+            .transpose()?;
+        self.with_service(|service| {
+            graft::repo::cancellation_checkpoint().map_err(repo_error)?;
+            let captured = service
+                .capture_worktree_sqlite(
+                    Path::new(&path),
+                    &options.output,
+                    base.as_ref().map(|token| &token.state),
+                    base.as_ref().map(|token| token.sha256.as_str()),
+                    options.delta_output.as_deref(),
+                )
+                .map_err(repository_command_error)?;
+            let reused_snapshot = base
+                .as_ref()
+                .is_some_and(|token| token.state.snapshot == captured.state.snapshot);
+            let page_count = captured.state.snapshot.page_count.to_u32();
+            let delta_output = captured
+                .delta
+                .as_ref()
+                .map(|delta| delta.output.to_string_lossy().into_owned());
+            let delta_bytes = captured.delta.as_ref().map(|delta| delta.bytes);
+            let delta_changed_pages = captured.delta.as_ref().map(|delta| delta.changed_pages);
+            let delta_base_content_fingerprint = captured
+                .delta
+                .as_ref()
+                .map(|delta| delta.base_content_fingerprint.clone());
+            let delta_base_sha256 = captured
+                .delta
+                .as_ref()
+                .map(|delta| delta.base_sha256.clone());
+            let delta_target_sha256 = captured
+                .delta
+                .as_ref()
+                .map(|delta| delta.target_sha256.clone());
+            let snapshot_token = encode_sqlite_capture_token(&SqliteCaptureToken {
+                version: SQLITE_CAPTURE_TOKEN_VERSION,
+                path: path.clone(),
+                state: captured.state,
+                sha256: captured.sha256.clone(),
+            })?;
+            Ok(CaptureSqliteSnapshotResult {
+                path,
+                output: options.output.to_string_lossy().into_owned(),
+                snapshot_token,
+                content_fingerprint: captured.content_fingerprint,
+                sha256: captured.sha256,
+                bytes: captured.bytes,
+                page_count,
+                changed_pages: captured.changed_pages,
+                reused_snapshot,
+                page_hash_cache_hit: captured.page_hash_cache_hit,
+                delta_output,
+                delta_bytes,
+                delta_changed_pages,
+                delta_base_content_fingerprint,
+                delta_base_sha256,
+                delta_target_sha256,
+                materializes_worktree: false,
+            })
         })
     }
 
@@ -3997,6 +4130,38 @@ fn normalize_requested_path(path: &Path) -> Result<String> {
         .replace('\\', "/");
     graft::repo::validate_repo_path_identity(&key).map_err(repo_error)?;
     Ok(key)
+}
+
+fn decode_sqlite_capture_token(token: &str, expected_path: &str) -> Result<SqliteCaptureToken> {
+    if token.len() > MAX_SQLITE_CAPTURE_TOKEN_BYTES {
+        return Err(invalid_argument(
+            "SQLite capture token exceeds the supported size",
+        ));
+    }
+    let decoded = serde_json::from_str::<SqliteCaptureToken>(token)
+        .map_err(|_| invalid_argument("SQLite capture token is invalid"))?;
+    if decoded.version != SQLITE_CAPTURE_TOKEN_VERSION {
+        return Err(invalid_argument(
+            "SQLite capture token version is unsupported",
+        ));
+    }
+    if decoded.path != expected_path {
+        return Err(invalid_argument(
+            "SQLite capture token belongs to a different repository path",
+        ));
+    }
+    Ok(decoded)
+}
+
+fn encode_sqlite_capture_token(token: &SqliteCaptureToken) -> Result<String> {
+    let encoded = serde_json::to_string(token).map_err(status_encode_error)?;
+    if encoded.len() > MAX_SQLITE_CAPTURE_TOKEN_BYTES {
+        return Err(SdkError::new(
+            SdkErrorCode::InvalidResponse,
+            "SQLite capture token exceeds the supported size",
+        ));
+    }
+    Ok(encoded)
 }
 
 fn normalize_batch_paths(paths: &[PathBuf]) -> Result<Vec<String>> {
@@ -8130,6 +8295,147 @@ mod tests {
                 .unwrap(),
             2
         );
+    }
+
+    #[test]
+    fn sqlite_capture_is_incremental_and_does_not_change_repository_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let outputs = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("app.eidos");
+        let database = Connection::open(&database_path).unwrap();
+        database
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA wal_autocheckpoint=0;
+                 CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+                 INSERT INTO items (name) VALUES ('one');",
+            )
+            .unwrap();
+
+        let session = RepositorySession::new(directory.path());
+        session.open().unwrap();
+        session.init().unwrap();
+        let before = session.status().unwrap();
+        let first = session
+            .capture_sqlite_snapshot(&CaptureSqliteSnapshotOptions {
+                path: PathBuf::from("app.eidos"),
+                output: outputs.path().join("first.eidos"),
+                base_snapshot_token: None,
+                delta_output: None,
+            })
+            .unwrap();
+        assert!(first.content_fingerprint.starts_with("graft-sqlite-v1:"));
+        assert_eq!(first.sha256.len(), 64);
+        assert!(first.changed_pages > 0);
+        assert!(!first.reused_snapshot);
+        assert!(!first.materializes_worktree);
+        assert_eq!(session.status().unwrap(), before);
+        session.close().unwrap();
+        session.open().unwrap();
+        assert_eq!(session.status().unwrap(), before);
+
+        database
+            .execute("INSERT INTO items (name) VALUES ('two')", [])
+            .unwrap();
+        let second_delta = outputs.path().join("second.delta");
+        let second = session
+            .capture_sqlite_snapshot(&CaptureSqliteSnapshotOptions {
+                path: PathBuf::from("app.eidos"),
+                output: outputs.path().join("second.eidos"),
+                base_snapshot_token: Some(first.snapshot_token.clone()),
+                delta_output: Some(second_delta.clone()),
+            })
+            .unwrap();
+        assert_ne!(second.content_fingerprint, first.content_fingerprint);
+        assert!(second.changed_pages > 0);
+        assert_eq!(second.delta_output.as_deref(), second_delta.to_str());
+        assert!(second.delta_bytes.is_some_and(|bytes| bytes > 104));
+        assert!(second.delta_changed_pages.is_some_and(|pages| pages > 0));
+        assert_eq!(
+            second.delta_base_content_fingerprint.as_deref(),
+            Some(first.content_fingerprint.as_str())
+        );
+        assert_eq!(
+            second.delta_base_sha256.as_deref(),
+            Some(first.sha256.as_str())
+        );
+        assert_eq!(
+            second.delta_target_sha256.as_deref(),
+            Some(second.sha256.as_str())
+        );
+        let inspected = graft_sqlite::inspect_sqlite_page_delta(&second_delta).unwrap();
+        assert_eq!(inspected.base_sha256, first.sha256);
+        assert_eq!(inspected.target_sha256, second.sha256);
+        let restored = outputs.path().join("second-restored.eidos");
+        graft_sqlite::apply_sqlite_page_delta(
+            &outputs.path().join("first.eidos"),
+            &second_delta,
+            &restored,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(&restored).unwrap(),
+            fs::read(outputs.path().join("second.eidos")).unwrap()
+        );
+        assert!(!second.reused_snapshot);
+        assert_eq!(session.status().unwrap(), before);
+
+        let third = session
+            .capture_sqlite_snapshot(&CaptureSqliteSnapshotOptions {
+                path: PathBuf::from("app.eidos"),
+                output: outputs.path().join("third.eidos"),
+                base_snapshot_token: Some(second.snapshot_token.clone()),
+                delta_output: Some(outputs.path().join("third.delta")),
+            })
+            .unwrap();
+        assert_eq!(third.content_fingerprint, second.content_fingerprint);
+        assert_eq!(third.changed_pages, 0);
+        assert!(third.reused_snapshot);
+        assert_eq!(session.status().unwrap(), before);
+
+        let existing_output = outputs.path().join("existing.eidos");
+        fs::write(&existing_output, b"preserve output").unwrap();
+        assert!(
+            session
+                .capture_sqlite_snapshot(&CaptureSqliteSnapshotOptions {
+                    path: PathBuf::from("app.eidos"),
+                    output: existing_output.clone(),
+                    base_snapshot_token: None,
+                    delta_output: None,
+                })
+                .is_err()
+        );
+        assert_eq!(fs::read(&existing_output).unwrap(), b"preserve output");
+
+        let failed_output = outputs.path().join("failed.eidos");
+        let existing_delta = outputs.path().join("existing.delta");
+        fs::write(&existing_delta, b"preserve delta").unwrap();
+        assert!(
+            session
+                .capture_sqlite_snapshot(&CaptureSqliteSnapshotOptions {
+                    path: PathBuf::from("app.eidos"),
+                    output: failed_output.clone(),
+                    base_snapshot_token: Some(second.snapshot_token),
+                    delta_output: Some(existing_delta.clone()),
+                })
+                .is_err()
+        );
+        assert!(!failed_output.exists());
+        assert_eq!(fs::read(&existing_delta).unwrap(), b"preserve delta");
+
+        for (path, expected) in [
+            (outputs.path().join("first.eidos"), 1_i64),
+            (outputs.path().join("second.eidos"), 2_i64),
+            (outputs.path().join("third.eidos"), 2_i64),
+        ] {
+            let captured = Connection::open(path).unwrap();
+            assert_eq!(
+                captured
+                    .query_row("SELECT COUNT(*) FROM items", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                expected
+            );
+        }
     }
 
     #[test]

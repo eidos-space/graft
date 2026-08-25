@@ -675,6 +675,10 @@ impl PreparedSqliteStage {
     pub(crate) fn page_hash_cache_hit(&self) -> bool {
         self.page_hash_cache_hit
     }
+
+    pub(crate) fn changed_page_count(&self) -> usize {
+        self.changed_pages.len()
+    }
 }
 
 impl PhysicalSqliteReader {
@@ -1688,7 +1692,7 @@ pub(super) fn prepare_physical_sqlite_file_state(
     prepare_physical_sqlite_file_state_with_cache(runtime, path, base, None)
 }
 
-pub(super) fn prepare_cached_physical_sqlite_file_state(
+pub(crate) fn prepare_cached_physical_sqlite_file_state(
     runtime: &Runtime,
     repo: &Repository,
     key: &str,

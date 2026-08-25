@@ -5,6 +5,13 @@ SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
 
 ## Unreleased
 
+### Added
+
+- `captureSqliteSnapshot()` exports a consistent create-new SQLite image without changing Graft
+  history or the worktree. A prior opaque capture token enables page reuse and an optional bounded
+  `GRAFTD01` fixed-page delta for content-addressed publication transports. Capture results now
+  expose the exact snapshot SHA-256; delta results expose their embedded base and target digests.
+
 ## Graft SDK 0.3.18 — 2026-08-17
 
 ### Changed

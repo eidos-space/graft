@@ -1,4 +1,5 @@
 use super::*;
+use sha2::{Digest, Sha256};
 
 pub(super) fn run_repo_checkout(
     runtime: &Runtime,
@@ -2117,6 +2118,46 @@ pub(super) fn write_repo_file_state_to_path(
     }
     let reader = runtime.snapshot_reader(snapshot);
     write_volume_reader_to_path(&reader, path)
+}
+
+pub(crate) fn write_repo_file_state_to_new_path(
+    runtime: &Runtime,
+    state: &CommitFileState,
+    path: &Path,
+) -> Result<[u8; 32], ErrCtx> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    let write_result = (|| -> Result<[u8; 32], ErrCtx> {
+        let mut hasher = Sha256::new();
+        let snapshot = state.snapshot.to_snapshot();
+        if !snapshot.is_empty() {
+            let reader = runtime.snapshot_reader(snapshot);
+            for page_idx in reader.page_count().iter() {
+                graft::repo::cancellation_checkpoint()?;
+                let page = reader.read_page(page_idx)?;
+                hasher.update(page.as_ref());
+                output.write_all(page.as_ref())?;
+            }
+        }
+        output.flush()?;
+        output.sync_all()?;
+        Ok(hasher.finalize().into())
+    })();
+    drop(output);
+    match write_result {
+        Ok(sha256) => Ok(sha256),
+        Err(error) => {
+            let _ = std::fs::remove_file(path);
+            Err(error)
+        }
+    }
 }
 
 fn write_repo_file_state_to_prepared_path(

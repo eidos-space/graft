@@ -83,6 +83,13 @@ class RepositorySession {
     return callJson(() => this.#native.stagePaths(stageOptions, signal))
   }
 
+  async captureSqliteSnapshot(options) {
+    const { signal, ...captureOptions } = options
+    return callJson(() =>
+      this.#native.captureSqliteSnapshot(captureOptions, signal)
+    )
+  }
+
   async recordPathMove(options) {
     const { signal, ...moveOptions } = options
     return callJson(() => this.#native.recordPathMove(moveOptions, signal))

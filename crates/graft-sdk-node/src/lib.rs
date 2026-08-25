@@ -4,6 +4,7 @@ use graft_sdk::{
     AbortMergeOptions as CoreAbortMergeOptions,
     AcceptSemanticMergeResultOptions as CoreAcceptSemanticMergeResultOptions,
     ApplyMergeOptions as CoreApplyMergeOptions, CancellationToken,
+    CaptureSqliteSnapshotOptions as CoreCaptureSqliteSnapshotOptions,
     CommitChangedPathsOptions as CoreCommitChangedPathsOptions,
     ContinueMergeOptions as CoreContinueMergeOptions,
     DiffMergeSqliteOptions as CoreDiffMergeSqliteOptions, DiffOptions as CoreDiffOptions,
@@ -108,6 +109,14 @@ pub struct StagePathsOptions {
     pub paths: Vec<String>,
     pub expected_head: Option<String>,
     pub force: Option<bool>,
+}
+
+#[napi(object)]
+pub struct CaptureSqliteSnapshotOptions {
+    pub path: String,
+    pub output: String,
+    pub base_snapshot_token: Option<String>,
+    pub delta_output: Option<String>,
 }
 
 #[napi(object)]
@@ -326,6 +335,9 @@ enum JsonOperation {
     AddAll,
     StagePaths {
         options: CoreStagePathsOptions,
+    },
+    CaptureSqliteSnapshot {
+        options: CoreCaptureSqliteSnapshotOptions,
     },
     RecordPathMove {
         options: CoreRecordPathMoveOptions,
@@ -554,6 +566,14 @@ impl JsonTask {
             return serde_json::to_string(&value)
                 .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
         }
+        if let JsonOperation::CaptureSqliteSnapshot { options } = &self.operation {
+            let value = self
+                .session
+                .capture_sqlite_snapshot(options)
+                .map_err(napi_error)?;
+            return serde_json::to_string(&value)
+                .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
+        }
         if let JsonOperation::RecordPathMove { options } = &self.operation {
             let value = self.session.record_path_move(options).map_err(napi_error)?;
             return serde_json::to_string(&value)
@@ -755,6 +775,9 @@ impl JsonTask {
             }
             JsonOperation::AddAll => self.session.add_all(),
             JsonOperation::StagePaths { .. } => {
+                unreachable!("handled before JSON value dispatch")
+            }
+            JsonOperation::CaptureSqliteSnapshot { .. } => {
                 unreachable!("handled before JSON value dispatch")
             }
             JsonOperation::RecordPathMove { .. } => {
@@ -960,6 +983,26 @@ impl NodeRepositorySession {
                     paths: options.paths.into_iter().map(PathBuf::from).collect(),
                     expected_head: options.expected_head,
                     force: options.force.unwrap_or(false),
+                },
+            },
+            signal,
+        )
+    }
+
+    #[napi]
+    pub fn capture_sqlite_snapshot(
+        &self,
+        options: CaptureSqliteSnapshotOptions,
+        signal: Option<AbortSignal>,
+    ) -> AsyncTask<JsonTask> {
+        json_task(
+            self,
+            JsonOperation::CaptureSqliteSnapshot {
+                options: CoreCaptureSqliteSnapshotOptions {
+                    path: PathBuf::from(options.path),
+                    output: PathBuf::from(options.output),
+                    base_snapshot_token: options.base_snapshot_token,
+                    delta_output: options.delta_output.map(PathBuf::from),
                 },
             },
             signal,
@@ -1833,6 +1876,9 @@ pub fn operation_materializes_worktree(operation: String) -> Result<bool> {
         "list_remotes" | "listRemotes" => RepositoryOperation::ListRemotes,
         "add_all" | "addAll" => RepositoryOperation::AddAll,
         "stage_paths" | "stagePaths" => RepositoryOperation::StagePaths,
+        "capture_sqlite_snapshot" | "captureSqliteSnapshot" => {
+            RepositoryOperation::CaptureSqliteSnapshot
+        }
         "record_path_move" | "recordPathMove" => RepositoryOperation::RecordPathMove,
         "untrack_paths" | "untrackPaths" => RepositoryOperation::UntrackPaths,
         "commit" => RepositoryOperation::Commit,

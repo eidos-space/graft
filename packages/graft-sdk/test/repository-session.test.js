@@ -54,6 +54,7 @@ test("exposes ABI-stable SDK metadata and materialization contract", () => {
     "listRemotes",
     "addAll",
     "stagePaths",
+    "captureSqliteSnapshot",
     "recordPathMove",
     "untrackPaths",
     "commit",
@@ -300,6 +301,79 @@ test("records file moves as one rename without re-reading the payload", async ()
     await session.close()
   })
 })
+
+test(
+  "captures incremental SQLite publication snapshots without changing history",
+  nodeSqliteTest,
+  async () => {
+    await withTemporaryDirectory("graft-sdk-publish-capture-", async (root) => {
+      const outputRoot = await fs.mkdtemp(
+        path.join(os.tmpdir(), "graft-sdk-publish-capture-output-")
+      )
+      const databasePath = path.join(root, "records.eidos")
+      const firstOutput = path.join(outputRoot, "first.snapshot.eidos")
+      const secondOutput = path.join(outputRoot, "second.snapshot.eidos")
+      const deltaOutput = path.join(outputRoot, "second.graft-delta")
+      const database = new DatabaseSync(databasePath)
+      database.exec(`
+        PRAGMA journal_mode=WAL;
+        CREATE TABLE records (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO records (value) VALUES ('one');
+      `)
+
+      const session = await RepositorySession.open(root)
+      await session.init()
+      const statusBefore = await session.statusIncremental()
+      const first = await session.captureSqliteSnapshot({
+        path: "records.eidos",
+        output: firstOutput,
+      })
+      assert.equal(JSON.parse(first.snapshot_token).version, 2)
+      assert.match(first.content_fingerprint, /^graft-sqlite-v1:/)
+      assert.match(first.sha256, /^[0-9a-f]{64}$/)
+      assert.equal(first.changed_pages, first.page_count)
+      assert.equal(first.materializes_worktree, false)
+
+      database.exec("INSERT INTO records (value) VALUES ('two')")
+      const second = await session.captureSqliteSnapshot({
+        path: "records.eidos",
+        output: secondOutput,
+        baseSnapshotToken: first.snapshot_token,
+        deltaOutput,
+      })
+      assert.notEqual(second.content_fingerprint, first.content_fingerprint)
+      assert.ok(second.changed_pages > 0)
+      assert.ok(second.changed_pages <= second.page_count)
+      assert.equal(second.delta_output, deltaOutput)
+      assert.ok(second.delta_bytes > 104)
+      assert.ok(second.delta_changed_pages > 0)
+      assert.equal(
+        second.delta_base_content_fingerprint,
+        first.content_fingerprint
+      )
+      assert.equal(second.delta_base_sha256, first.sha256)
+      assert.equal(second.delta_target_sha256, second.sha256)
+
+      const snapshot = new DatabaseSync(secondOutput, { readOnly: true })
+      assert.deepEqual(
+        snapshot
+          .prepare("SELECT value FROM records ORDER BY id")
+          .all()
+          .map(({ value }) => value),
+        ["one", "two"]
+      )
+      snapshot.close()
+
+      const metadata = await session.repositoryMetadata()
+      const status = await session.statusIncremental()
+      assert.equal(metadata.current_head, null)
+      assert.deepEqual(status.status.paths, statusBefore.status.paths)
+      await session.close()
+      database.close()
+      await fs.rm(outputRoot, { recursive: true, force: true })
+    })
+  }
+)
 
 test(
   "table-scoped row diff scans and returns only the requested table",

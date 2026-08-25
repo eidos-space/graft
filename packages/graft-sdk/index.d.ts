@@ -90,6 +90,37 @@ export interface StagePathsOptions extends OperationOptions {
   force?: boolean
 }
 
+export interface CaptureSqliteSnapshotOptions extends OperationOptions {
+  /** Normalized repository-relative path to one physical SQLite database. */
+  path: string
+  /** Absolute destination path for the immutable standalone SQLite image. */
+  output: string
+  /** Opaque token returned by the preceding capture of this same path. */
+  baseSnapshotToken?: string
+  /** Optional absolute output path for a portable page delta against the base token. */
+  deltaOutput?: string
+}
+
+export interface CaptureSqliteSnapshotResult {
+  path: string
+  output: string
+  snapshot_token: string
+  content_fingerprint: string
+  sha256: string
+  bytes: number
+  page_count: number
+  changed_pages: number
+  reused_snapshot: boolean
+  page_hash_cache_hit: boolean
+  delta_output?: string
+  delta_bytes?: number
+  delta_changed_pages?: number
+  delta_base_content_fingerprint?: string
+  delta_base_sha256?: string
+  delta_target_sha256?: string
+  materializes_worktree: false
+}
+
 export interface RecordPathMoveOptions extends OperationOptions {
   /** Tracked repository-relative path before the completed physical rename. */
   previousPath: string
@@ -1001,6 +1032,9 @@ export class RepositorySession {
   listRemotes(options?: OperationOptions): Promise<ListRemotesResult>
   addAll(options?: OperationOptions): Promise<GraftJson>
   stagePaths(options: StagePathsOptions): Promise<BatchPathsResult>
+  captureSqliteSnapshot(
+    options: CaptureSqliteSnapshotOptions
+  ): Promise<CaptureSqliteSnapshotResult>
   recordPathMove(options: RecordPathMoveOptions): Promise<RecordPathMoveResult>
   untrackPaths(options: UntrackPathsOptions): Promise<BatchPathsResult>
   commit(message: string, options?: OperationOptions): Promise<GraftJson>
