@@ -111,6 +111,37 @@ Primary-key JSON preserves identity types. BLOB key parts use an explicit
 marker such as `{ "$blob": "00ff" }`; the same `key` object can be passed to
 `graft resolve --row`.
 
+### Direct SQLite File Diff
+
+```bash
+graft diff --no-index --json --rows old.sqlite new.sqlite
+```
+
+This repository-independent response does not contain repository `paths`.
+Instead it returns:
+
+| Field | Meaning |
+| --- | --- |
+| `from`, `to` | Physical file `path` and captured `page_count` for each side. |
+| `changed` | Whether the stable SQLite page content differs. |
+| `kind` | Always `sqlite_database`. |
+| `rows` | Whether logical row expansion was requested. |
+| `row_diff` | Logical status, capabilities, limitations, schema, tables, opaque changes, and telemetry; omitted unless a changed pair was requested with `--rows`. |
+
+### SQLite Page Delta
+
+```bash
+graft delta create --base old.sqlite --target new.sqlite --output update.graft-delta --json
+graft delta inspect update.graft-delta --json
+graft delta apply --base old.sqlite --delta update.graft-delta --output restored.sqlite --json
+```
+
+The top-level `operation` is `sqlite_delta_create`, `sqlite_delta_inspect`, or
+`sqlite_delta_apply`. Path fields identify the explicit inputs and create-new
+output. The nested `delta`, `metadata`, or `result` object contains
+`format`, `header_bytes`, `page_bytes`, exact base/target byte lengths and
+SHA-256 digests, `changed_pages`, `delta_bytes`, and `beneficial`.
+
 ## Conflicts
 
 ```bash

@@ -18,6 +18,7 @@ adapter 只映射行为，不重新定义行为。
 | --- | --- | --- | --- |
 | Repository 与对象模型 | [Graft Repository 1.0](./graft-repository-1.0.md) | [中文](./graft-repository-1.0.zh.md) | `graft::repo` |
 | Page storage 与 snapshot | [Graft Storage and Snapshots 1.0](./graft-storage-snapshots-1.0.md) | [中文](./graft-storage-snapshots-1.0.zh.md) | `graft` runtime/storage |
+| 可移植 SQLite page delta | [Graft SQLite Page Delta 1.0](./graft-sqlite-page-delta-1.0.md) | [中文](./graft-sqlite-page-delta-1.0.zh.md) | `graft-sqlite` |
 | Diff 与历史检查 | [Graft Diff 1.0](./graft-diff-1.0.md) | [中文](./graft-diff-1.0.zh.md) | repository diff + `graft-sqlite` row diff |
 | Merge 与冲突恢复 | [Graft Merge 1.0](./graft-merge-1.0.md) | [中文](./graft-merge-1.0.zh.md) | repository merge + SQLite row merge |
 | Remote 与同步 | [Graft Remote Sync 1.0](./graft-remote-sync-1.0.md) | [中文](./graft-remote-sync-1.0.zh.md) | repository sync + remote protocol |
@@ -61,6 +62,7 @@ Storage snapshots         Diff + Merge
 | --- | --- |
 | Repository discovery、规范化路径、object、commit、ref、index、status、history | Repository |
 | 4 KiB page、log、LSN、volume、snapshot、hydration、storage GC | Storage and Snapshots |
+| 与 repository 无关的 SQLite delta 格式、创建、检查与应用 | SQLite Page Delta |
 | path/content/row/schema/opaque 比较与有界检查 | Diff |
 | topology、merge state、conflict、resolution、continue/abort | Merge |
 | Remote URI/backend、wire protocol、fetch/push/pull/clone 与 publication | Remote Sync |
@@ -97,6 +99,7 @@ GRAFT-SDK-1.0        retained Rust/Node repository session
 GRAFT-Browser-1.0    WASM/OPFS host 组合与能力披露
 GRAFT-VFS-1.0        实时 SQLite VFS 与 extension surface
 GRAFT-Worktree-1.0   普通文件物化与恢复
+GRAFT-Delta-1.0      可移植 SQLite page delta 的创建与应用
 ```
 
 实现必须分别声明 profile。Profile 描述行为，不绑定某个 crate 或语言。当前仓库
@@ -109,6 +112,7 @@ release claim。
 | --- | --- | --- |
 | Repository | `crates/graft/src/repo.rs` 与 `repo/` | object/ref/index/history/inventory test |
 | Storage | `core/`、`snapshot.rs`、`volume.rs`、`rt/`、`local/` | runtime/action/hydration/GC test |
+| SQLite Page Delta | `crates/graft-sqlite/src/page_delta.rs` | create/inspect/apply round trip、digest 拒绝、CLI 与 SDK capture test |
 | Diff | repository diff/history 与 `row_level_diff.rs` | rowid/PK/schema/opaque/bounded/SDK test |
 | Merge | core merge 与 SQLite row merge/output | topology/conflict/resolution/reopen/browser fixture |
 | Remote | repository sync、remote/runtime action、`packages/graft-remote` | Rust 与 framework/Hono/Cloudflare protocol test |

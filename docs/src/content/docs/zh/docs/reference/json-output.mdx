@@ -78,6 +78,35 @@ diff 的顶层 `paths` 适合做导航；SQLite database entries 在 `--rows` �
 主键 JSON 会保留 identity type。BLOB 主键字段使用 `{ "$blob": "00ff" }`
 这样的显式标记；同一个 `key` object 可以直接传给 `graft resolve --row`。
 
+### 直接比较 SQLite 文件
+
+```bash
+graft diff --no-index --json --rows old.sqlite new.sqlite
+```
+
+这个 repository-independent response 不包含 repository `paths`，而是返回：
+
+| Field | 含义 |
+| --- | --- |
+| `from`、`to` | 每个物理 side 的 `path` 和捕获到的 `page_count`。 |
+| `changed` | stable SQLite page content 是否不同。 |
+| `kind` | 固定为 `sqlite_database`。 |
+| `rows` | 是否请求 logical row expansion。 |
+| `row_diff` | logical status、capabilities、limitations、schema、tables、opaque changes 和 telemetry；仅在 changed pair 使用 `--rows` 时存在。 |
+
+### SQLite Page Delta
+
+```bash
+graft delta create --base old.sqlite --target new.sqlite --output update.graft-delta --json
+graft delta inspect update.graft-delta --json
+graft delta apply --base old.sqlite --delta update.graft-delta --output restored.sqlite --json
+```
+
+顶层 `operation` 是 `sqlite_delta_create`、`sqlite_delta_inspect` 或
+`sqlite_delta_apply`。路径字段标识显式输入与 create-new 输出。嵌套的 `delta`、
+`metadata` 或 `result` 包含 `format`、`header_bytes`、`page_bytes`、base/target
+精确字节数与 SHA-256、`changed_pages`、`delta_bytes` 和 `beneficial`。
+
 conflict JSON 可包含 rowid、声明主键或 semantic-key 类型的 `row_conflicts`，
 以及 `schema_conflicts`、`opaque_changes`、`blocked_reasons` 和 `apply_policy`。
 

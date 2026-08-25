@@ -49,6 +49,10 @@ cat script.sql | graft sql --db data.sqlite
 | `graft log [--json] [--limit n] [--after oid]` | 显示仓库历史；分页需要 JSON 输出。 |
 | `graft show [--json] <rev>` | 显示一个 repository commit。 |
 | `graft diff [--json] [--rows] [--content [--max-content-bytes n]] [--kind kind] [--staged] [from] [to] [path]` | 比较 worktree、index 或 revisions，也可以按 kind 过滤。 |
+| `graft diff --no-index [--json] [--rows] <from.sqlite> <to.sqlite>` | 不依赖 repository，直接比较两个物理 SQLite 文件。 |
+| `graft delta create --base <base.sqlite> --target <target.sqlite> --output <file> [--json]` | 创建可移植、可自校验的 SQLite page delta。 |
+| `graft delta apply --base <base.sqlite> --delta <file> --output <target.sqlite> [--json]` | 把 delta 应用到精确 base，且不覆盖已有输出。 |
+| `graft delta inspect <file> [--json]` | 不应用 delta，只校验并显示其元数据。 |
 | `graft checkout [--json] [-f] <rev> [path]` | checkout 一个 revision，或从 revision restore 一个路径。 |
 | `graft restore [--json] [--staged] [--source rev] <path>`<br />`graft restore [--json] --staged --all [--kind kind]` | restore 一个 worktree path、一个 staged path，或按 kind 批量 unstage。 |
 | `graft export [--json] [--source rev] --output <file> [path]` | 把 Graft 数据库 snapshot 写成物理 SQLite 文件。 |
@@ -63,7 +67,17 @@ graft log --json
 graft log --json --limit 50
 graft diff --json --rows HEAD~1 HEAD data.sqlite
 graft diff --json --content --max-content-bytes 65536 HEAD~1 HEAD notes.md
+graft diff --no-index --rows old.sqlite new.sqlite
 ```
+
+`diff --no-index` 会把两个物理文件分别捕获为一致的 SQLite snapshot，并包含已提交的
+WAL frames。它只接受两个 SQLite database file，不能和 repository-only selector
+或 `--db` 一起使用。
+
+`delta` command group 同样不依赖 repository，也不能与 `--db` 组合。Create 与 apply
+使用一致的 SQLite image，以精确 base/target SHA-256 绑定 delta，逐 page 处理数据，
+并且不会覆盖已有输出。`GRAFTD01` layout 与失败规则见
+[SQLite Page Delta 规格](https://github.com/eidos-space/graft/blob/main/docs/specs/graft-sqlite-page-delta-1.0.zh.md)。
 
 `diff --content` 会返回一个 changed UTF-8 text artifact 的
 bounded content。它要求 `--json`，不能和 `--rows` 或 `--staged` 一起使用；

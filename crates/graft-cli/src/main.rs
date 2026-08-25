@@ -201,6 +201,12 @@ enum Command {
         json: bool,
     },
 
+    /// Create, apply, or inspect repository-independent `SQLite` deltas
+    Delta {
+        #[command(subcommand)]
+        command: DeltaCommand,
+    },
+
     /// Show a repository revision
     Show {
         /// Revision, for example HEAD or HEAD~1
@@ -565,6 +571,58 @@ enum MergeApiCommand {
         #[arg(long)]
         state_token: String,
     },
+}
+
+#[derive(Subcommand)]
+enum DeltaCommand {
+    /// Create a delta from one physical `SQLite` database to another
+    Create(DeltaCreateArgs),
+    /// Apply a delta to its exact base and materialize a new `SQLite` database
+    Apply(DeltaApplyArgs),
+    /// Validate and describe a delta without applying it
+    Inspect(DeltaInspectArgs),
+}
+
+#[derive(Args)]
+struct DeltaCreateArgs {
+    /// Base physical `SQLite` database
+    #[arg(long, value_name = "PATH")]
+    base: PathBuf,
+    /// Target physical `SQLite` database
+    #[arg(long, value_name = "PATH")]
+    target: PathBuf,
+    /// New delta file to create; existing files are never overwritten
+    #[arg(long, value_name = "PATH")]
+    output: PathBuf,
+    /// Emit machine-readable JSON
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct DeltaApplyArgs {
+    /// Exact base physical `SQLite` database
+    #[arg(long, value_name = "PATH")]
+    base: PathBuf,
+    /// Delta file to apply
+    #[arg(long, value_name = "PATH")]
+    delta: PathBuf,
+    /// New target database to create; existing files are never overwritten
+    #[arg(long, value_name = "PATH")]
+    output: PathBuf,
+    /// Emit machine-readable JSON
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct DeltaInspectArgs {
+    /// Delta file to validate and inspect
+    #[arg(value_name = "PATH")]
+    delta: PathBuf,
+    /// Emit machine-readable JSON
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -1265,6 +1323,12 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
                 arg.as_deref(),
             )?);
         }
+        Command::Delta { command } => {
+            if db_override.is_some() {
+                bail!("delta commands cannot be combined with --db");
+            }
+            print_output(Some(run_delta_command(command)?));
+        }
         Command::Show { rev, json } => {
             let suffix = if json { "json_show" } else { "show" };
             print_output(run_repository_command(
@@ -1669,6 +1733,86 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn run_delta_command(command: DeltaCommand) -> Result<String> {
+    match command {
+        DeltaCommand::Create(args) => {
+            let metadata =
+                graft_sqlite::create_sqlite_page_delta(&args.base, &args.target, &args.output)?;
+            if args.json {
+                return serde_json::to_string(&serde_json::json!({
+                    "operation": "sqlite_delta_create",
+                    "base": args.base.to_string_lossy(),
+                    "target": args.target.to_string_lossy(),
+                    "output": args.output.to_string_lossy(),
+                    "delta": metadata,
+                }))
+                .context("failed to serialize SQLite delta output");
+            }
+            Ok(format!(
+                "Created SQLite delta {}\nBase: {} ({} bytes, {})\nTarget: {} ({} bytes, {})\nChanged pages: {}\nDelta bytes: {}\nSmaller than target: {}",
+                args.output.display(),
+                args.base.display(),
+                metadata.base_bytes,
+                metadata.base_sha256,
+                args.target.display(),
+                metadata.target_bytes,
+                metadata.target_sha256,
+                metadata.changed_pages,
+                metadata.delta_bytes,
+                if metadata.beneficial { "yes" } else { "no" },
+            ))
+        }
+        DeltaCommand::Apply(args) => {
+            let metadata =
+                graft_sqlite::apply_sqlite_page_delta(&args.base, &args.delta, &args.output)?;
+            if args.json {
+                return serde_json::to_string(&serde_json::json!({
+                    "operation": "sqlite_delta_apply",
+                    "base": args.base.to_string_lossy(),
+                    "delta": args.delta.to_string_lossy(),
+                    "output": args.output.to_string_lossy(),
+                    "result": metadata,
+                }))
+                .context("failed to serialize SQLite delta output");
+            }
+            Ok(format!(
+                "Applied SQLite delta {}\nBase: {} ({} bytes, {})\nOutput: {} ({} bytes, {})\nChanged pages: {}",
+                args.delta.display(),
+                args.base.display(),
+                metadata.base_bytes,
+                metadata.base_sha256,
+                args.output.display(),
+                metadata.target_bytes,
+                metadata.target_sha256,
+                metadata.changed_pages,
+            ))
+        }
+        DeltaCommand::Inspect(args) => {
+            let metadata = graft_sqlite::inspect_sqlite_page_delta(&args.delta)?;
+            if args.json {
+                return serde_json::to_string(&serde_json::json!({
+                    "operation": "sqlite_delta_inspect",
+                    "delta": args.delta.to_string_lossy(),
+                    "metadata": metadata,
+                }))
+                .context("failed to serialize SQLite delta output");
+            }
+            Ok(format!(
+                "SQLite delta {}\nFormat: {}\nBase: {} bytes ({})\nTarget: {} bytes ({})\nChanged pages: {}\nDelta bytes: {}\nSmaller than target: {}",
+                args.delta.display(),
+                metadata.format,
+                metadata.base_bytes,
+                metadata.base_sha256,
+                metadata.target_bytes,
+                metadata.target_sha256,
+                metadata.changed_pages,
+                metadata.delta_bytes,
+                if metadata.beneficial { "yes" } else { "no" },
+            ))
+        }
+    }
 }
 
 fn run_repository_command(
@@ -2837,6 +2981,118 @@ mod tests {
     use super::*;
 
     static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn parses_repository_independent_delta_commands() {
+        let cli = Cli::try_parse_from([
+            "graft",
+            "delta",
+            "create",
+            "--base",
+            "base.sqlite",
+            "--target",
+            "target.sqlite",
+            "--output",
+            "update.graft-delta",
+            "--json",
+        ])
+        .unwrap();
+        let Command::Delta { command: DeltaCommand::Create(args) } = cli.command else {
+            panic!("expected delta create command");
+        };
+        assert_eq!(args.base, PathBuf::from("base.sqlite"));
+        assert_eq!(args.target, PathBuf::from("target.sqlite"));
+        assert_eq!(args.output, PathBuf::from("update.graft-delta"));
+        assert!(args.json);
+
+        let cli = Cli::try_parse_from([
+            "graft",
+            "delta",
+            "apply",
+            "--base",
+            "base.sqlite",
+            "--delta",
+            "update.graft-delta",
+            "--output",
+            "restored.sqlite",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Delta { command: DeltaCommand::Apply(_) }
+        ));
+
+        let cli =
+            Cli::try_parse_from(["graft", "delta", "inspect", "update.graft-delta", "--json"])
+                .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Delta {
+                command: DeltaCommand::Inspect(DeltaInspectArgs { json: true, .. })
+            }
+        ));
+    }
+
+    #[test]
+    fn runs_delta_create_inspect_and_apply_without_a_repository() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = directory.path().join("base.sqlite");
+        let target = directory.path().join("target.sqlite");
+        let delta = directory.path().join("update.graft-delta");
+        let restored = directory.path().join("restored.sqlite");
+        let connection = Connection::open(&base).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA page_size=4096;
+                 CREATE TABLE records(id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO records(value) VALUES ('base');",
+            )
+            .unwrap();
+        drop(connection);
+        std::fs::copy(&base, &target).unwrap();
+        let connection = Connection::open(&target).unwrap();
+        connection
+            .execute("UPDATE records SET value = 'target' WHERE id = 1", [])
+            .unwrap();
+        drop(connection);
+
+        let created = run_delta_command(DeltaCommand::Create(DeltaCreateArgs {
+            base: base.clone(),
+            target,
+            output: delta.clone(),
+            json: true,
+        }))
+        .unwrap();
+        let created: Value = serde_json::from_str(&created).unwrap();
+        assert_eq!(created["operation"], "sqlite_delta_create");
+        assert_eq!(created["delta"]["format"], "graft-sqlite-page-delta-v1");
+
+        let inspected = run_delta_command(DeltaCommand::Inspect(DeltaInspectArgs {
+            delta: delta.clone(),
+            json: true,
+        }))
+        .unwrap();
+        let inspected: Value = serde_json::from_str(&inspected).unwrap();
+        assert_eq!(
+            inspected["metadata"]["target_sha256"],
+            created["delta"]["target_sha256"]
+        );
+
+        run_delta_command(DeltaCommand::Apply(DeltaApplyArgs {
+            base,
+            delta,
+            output: restored.clone(),
+            json: true,
+        }))
+        .unwrap();
+        let connection = Connection::open(restored).unwrap();
+        let value: String = connection
+            .query_row("SELECT value FROM records WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(value, "target");
+    }
 
     #[test]
     fn parses_log_as_repository_history() {

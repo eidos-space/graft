@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Added
+
+- `graft delta create`, `graft delta inspect`, and `graft delta apply` expose the repository-
+  independent `GRAFTD01` SQLite page-delta format. Deltas embed exact byte lengths and SHA-256
+  identities for both sides, stream page-by-page, and never overwrite existing outputs.
+
 ## Graft 0.14.0 — 2026-08-22
 
 ### Added

@@ -21,6 +21,7 @@ or implementation techniques that have no observable effect.
 | --- | --- | --- | --- |
 | Repository and object model | [Graft Repository 1.0](./graft-repository-1.0.md) | [中文](./graft-repository-1.0.zh.md) | `graft::repo` |
 | Page storage and snapshots | [Graft Storage and Snapshots 1.0](./graft-storage-snapshots-1.0.md) | [中文](./graft-storage-snapshots-1.0.zh.md) | `graft` runtime/storage |
+| Portable SQLite page deltas | [Graft SQLite Page Delta 1.0](./graft-sqlite-page-delta-1.0.md) | [中文](./graft-sqlite-page-delta-1.0.zh.md) | `graft-sqlite` |
 | Diff and historical inspection | [Graft Diff 1.0](./graft-diff-1.0.md) | [中文](./graft-diff-1.0.zh.md) | repository diff + `graft-sqlite` row diff |
 | Merge and conflict recovery | [Graft Merge 1.0](./graft-merge-1.0.md) | [中文](./graft-merge-1.0.zh.md) | repository merge + SQLite row merge |
 | Remotes and synchronization | [Graft Remote Sync 1.0](./graft-remote-sync-1.0.md) | [中文](./graft-remote-sync-1.0.zh.md) | repository sync + remote protocol |
@@ -69,6 +70,7 @@ all capitals.
 | --- | --- |
 | Repository discovery, normalized paths, objects, commits, refs, index, status, history | Repository |
 | 4 KiB pages, logs, LSNs, volumes, snapshots, hydration, storage GC | Storage and Snapshots |
+| Repository-independent SQLite delta format, creation, inspection, and application | SQLite Page Delta |
 | Path/content/row/schema/opaque comparison and bounded inspection | Diff |
 | Topology, merge state, conflicts, resolutions, continue/abort | Merge |
 | Remote URI/backend behavior, wire protocol, fetch/push/pull/clone and publication | Remote Sync |
@@ -115,6 +117,7 @@ GRAFT-SDK-1.0        retained Rust and Node repository sessions
 GRAFT-Browser-1.0    WASM/OPFS host composition and capability disclosure
 GRAFT-VFS-1.0        live SQLite VFS and extension surface
 GRAFT-Worktree-1.0   ordinary-file materialization and recovery
+GRAFT-Delta-1.0      portable SQLite page-delta creation and application
 ```
 
 An implementation MUST claim profiles separately. A profile claim identifies
@@ -128,6 +131,7 @@ conformance targets rather than release claims.
 | --- | --- | --- |
 | Repository | `crates/graft/src/repo.rs`, `crates/graft/src/repo/` | repository/object/ref/index/history/inventory tests |
 | Storage and Snapshots | `crates/graft/src/core/`, `snapshot.rs`, `volume.rs`, `rt/`, `local/` | runtime, storage action, snapshot hydration and GC tests |
+| SQLite Page Delta | `crates/graft-sqlite/src/page_delta.rs` | create/inspect/apply round trips, digest rejection, CLI and SDK capture tests |
 | Diff | repository diff/history plus `crates/graft-sqlite/src/row_level_diff.rs` | rowid/PK/schema/opaque/bounded diff tests and SDK contracts |
 | Merge | `crates/graft/src/repo/merge.rs`, `graft-sqlite` row merge/output | core topology, SQLite conflict/resolution, reopen and browser fixture tests |
 | Remote Sync | repository sync, remote/runtime actions, `packages/graft-remote` | Rust remote tests plus framework/Hono/Cloudflare protocol tests |
