@@ -14,11 +14,11 @@ use std::{
 };
 
 pub use graft::repo::{
-    CancellationToken, RepoPathContent, RepoPathContentState, TransferDirection, TransferProgress,
-    TransferProgressReporter,
+    CancellationToken, RepoPathContent, RepoPathContentState, RepoStatus, TransferDirection,
+    TransferProgress, TransferProgressReporter,
 };
 use graft::repo::{
-    CommitArtifactState, CommitFileState, MergeOutcome, MergePlan, RepoPathStorage, RepoStatus,
+    CommitArtifactState, CommitFileState, MergeOutcome, MergePlan, RepoPathStorage,
     RepoTrackedPathKind, Repository,
     index::{Index, IndexEntry, IndexStage},
 };
@@ -171,6 +171,28 @@ pub struct IncrementalStatusResult {
     pub change_token: String,
     pub status: RepoStatus,
     pub telemetry: StatusTelemetry,
+}
+
+/// Reads an exact status classification previously published by a repository SDK session.
+///
+/// This path never opens the repository runtime or Fjall storage. The persisted classification is
+/// returned only when its repository metadata, index, ignore inputs, and complete worktree
+/// fingerprints still match. A missing or stale proof returns `None` so callers can fall back to
+/// an authoritative runtime-backed status without ever presenting stale state as current.
+pub fn read_persisted_status_snapshot(
+    target: impl AsRef<Path>,
+) -> Result<Option<IncrementalStatusResult>> {
+    for attempt in 0..WORKTREE_STABILITY_ATTEMPTS {
+        match read_persisted_status_snapshot_once(target.as_ref()) {
+            Ok(result) => return Ok(result),
+            Err(error)
+                if error.code() == SdkErrorCode::RepositoryStale
+                    && attempt + 1 < WORKTREE_STABILITY_ATTEMPTS => {}
+            Err(error) if error.code() == SdkErrorCode::RepositoryStale => return Ok(None),
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("bounded persisted status read always returns")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3635,6 +3657,47 @@ fn system_time_ns(time: SystemTime) -> Option<u128> {
     time.duration_since(UNIX_EPOCH)
         .ok()
         .map(|value| value.as_nanos())
+}
+
+fn read_persisted_status_snapshot_once(target: &Path) -> Result<Option<IncrementalStatusResult>> {
+    let started = Instant::now();
+    graft::repo::cancellation_checkpoint().map_err(repo_error)?;
+    let repo = Repository::discover(target).map_err(repo_error)?;
+    let head_target = repo.head_target().map_err(repo_error)?;
+    let index = repo.read_index().map_err(repo_error)?;
+    let mut cache = IncrementalStatusCache::default();
+    if !load_persistent_status_snapshot(&repo, &mut cache, &head_target, &index)? {
+        return Ok(None);
+    }
+
+    let (tracked, untracked) = stable_worktree_fingerprints(&repo, &cache.files, &cache.artifacts)?;
+    if tracked != cache.tracked_fingerprints || untracked != cache.untracked_fingerprints {
+        return Ok(None);
+    }
+
+    let mut status = cache
+        .status
+        .clone()
+        .expect("a loaded persisted status snapshot contains status");
+    repo.refresh_status_repository_projection(&mut status)
+        .map_err(repo_error)?;
+    let paths_examined = tracked.len() + untracked.len();
+    Ok(Some(incremental_status_result(
+        &cache,
+        status,
+        started,
+        StatusTelemetry {
+            duration_us: 0,
+            paths_examined,
+            metadata_cache_hits: paths_examined,
+            metadata_cache_misses: 0,
+            tree_cache_hit: true,
+            status_cache_hit: true,
+            persistent_snapshot_hit: true,
+            persistent_snapshot_saved: false,
+            stability_retries: 0,
+        },
+    )))
 }
 
 fn load_persistent_status_snapshot(
@@ -7360,6 +7423,47 @@ mod tests {
             .unwrap();
         let encoded = fs::read_to_string(snapshot).unwrap();
         assert!(!encoded.contains(&directory.path().to_string_lossy().to_string()));
+    }
+
+    #[test]
+    fn persisted_status_snapshot_is_lock_free_and_rejects_stale_worktree_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let note = directory.path().join("note.txt");
+        let owner = RepositorySession::new(directory.path());
+        owner.open().unwrap();
+        owner.init().unwrap();
+        fs::write(&note, "one\n").unwrap();
+        owner.add_all().unwrap();
+        owner.commit("initial").unwrap();
+        let published = owner.status_incremental().unwrap();
+        assert!(published.telemetry.persistent_snapshot_saved);
+
+        let contender = RepositorySession::new(directory.path());
+        let locked = contender.open().unwrap_err();
+        assert_eq!(locked.code(), SdkErrorCode::RepositoryBusy);
+
+        let cached = read_persisted_status_snapshot(directory.path())
+            .unwrap()
+            .expect("owner-published status should be readable without opening storage");
+        assert!(cached.telemetry.persistent_snapshot_hit);
+        assert_eq!(cached.change_token, published.change_token);
+        assert!(!cached.status.dirty);
+
+        fs::write(&note, "two\n").unwrap();
+        assert!(
+            read_persisted_status_snapshot(directory.path())
+                .unwrap()
+                .is_none(),
+            "a changed worktree must invalidate the persisted proof"
+        );
+
+        let refreshed = owner.status_incremental().unwrap();
+        assert!(refreshed.status.dirty);
+        let dirty = read_persisted_status_snapshot(directory.path())
+            .unwrap()
+            .expect("the refreshed exact classification should be published");
+        assert!(dirty.status.dirty);
+        assert_eq!(dirty.change_token, refreshed.change_token);
     }
 
     #[test]

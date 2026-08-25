@@ -14,7 +14,7 @@ use graft_sdk::{
     AbortMergeOptions, ApplyMergeOptions, ContinueMergeOptions, ListMergeConflictsOptions,
     ListMergePathsOptions, MergePathFilter, MergePathResult, MergeVersion, PlanMergeOptions,
     ReadMergeVersionOptions, RepositorySession, ResolveMergeRowOptions, SetMergePathResultOptions,
-    WriteAndStageTextResultOptions,
+    WriteAndStageTextResultOptions, read_persisted_status_snapshot,
 };
 use rusqlite::{Batch, Connection, fallible_iterator::FallibleIterator, types::ValueRef};
 use serde_json::Value;
@@ -1088,9 +1088,8 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
             }
             if json {
                 let arg = repo_log_arg(limit, after.as_deref())?;
-                print_output(run_repository_command(
+                print_output(run_repository_metadata_command(
                     db_override,
-                    None,
                     "json_log",
                     Some(&arg),
                 )?);
@@ -1098,7 +1097,7 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
                 if limit.is_some() || after.is_some() {
                     bail!("log pagination requires --json");
                 }
-                print_output(run_repository_command(db_override, None, "log", None)?);
+                print_output(run_repository_metadata_command(db_override, "log", None)?);
             }
         }
         Command::Init(args) => {
@@ -1119,14 +1118,7 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
             )?);
         }
         Command::Status { json, kind } => {
-            let pragma = if json { "json_status" } else { "status" };
-            let arg = repo_status_arg(kind);
-            print_output(run_repository_command(
-                db_override,
-                None,
-                pragma,
-                arg.as_deref(),
-            )?);
+            print_output(run_repository_status_command(db_override, json, kind)?);
         }
         Command::Audit(args) => {
             let pragma = if args.json { "json_audit" } else { "audit" };
@@ -1826,6 +1818,44 @@ fn run_repository_command(
         None => resolve_repo_workspace_session()?,
     };
     execute_repository_command(&db, suffix, arg)
+}
+
+fn run_repository_metadata_command(
+    db_override: Option<&Path>,
+    suffix: &str,
+    arg: Option<&str>,
+) -> Result<Option<String>> {
+    let target = match db_override {
+        Some(path) => resolve_cli_db(Some(path))?,
+        None => resolve_repo_workspace_session()?,
+    };
+    let command = graft_sqlite::repo_service::RepositoryCommand::parse(suffix, arg)?;
+    graft_sqlite::repo_service::execute_repository_metadata_command(&target, command)
+        .map_err(anyhow::Error::from)
+}
+
+fn run_repository_status_command(
+    db_override: Option<&Path>,
+    json: bool,
+    kind: Option<PathKind>,
+) -> Result<Option<String>> {
+    let target = match db_override {
+        Some(path) => resolve_cli_db(Some(path))?,
+        None => resolve_repo_workspace_session()?,
+    };
+    let suffix = if json { "json_status" } else { "status" };
+    let arg = repo_status_arg(kind);
+    let command = graft_sqlite::repo_service::RepositoryCommand::parse(suffix, arg.as_deref())?;
+    if let Some(snapshot) = read_persisted_status_snapshot(&target)? {
+        return graft_sqlite::repo_service::execute_repository_persisted_status_command(
+            &target,
+            command,
+            snapshot.status,
+        )
+        .map_err(anyhow::Error::from);
+    }
+    graft_sqlite::repo_service::execute_repository_command(&target, command)
+        .map_err(anyhow::Error::from)
 }
 
 fn clean_commit_error(err: anyhow::Error) -> anyhow::Error {
@@ -3135,6 +3165,140 @@ mod tests {
             repo_log_arg(limit, after.as_deref()).unwrap(),
             "--with-status --limit 25 --after \"abc123\""
         );
+    }
+
+    #[test]
+    fn log_reads_metadata_while_another_session_owns_the_storage_lock() {
+        let _guard = CWD_LOCK.lock().unwrap();
+        let original_dir = std::env::current_dir().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::env::set_current_dir(temp_dir.path()).unwrap();
+
+        let result = (|| -> Result<()> {
+            run_command(Command::Init(InitArgs { json: false }), None)?;
+            let db = Path::new("app.sqlite");
+            run_sql(
+                Some(db),
+                &[String::from(
+                    "CREATE TABLE docs(id INTEGER PRIMARY KEY, title TEXT); \
+                     INSERT INTO docs VALUES (1, 'first');",
+                )],
+            )?;
+            let add_arg = repo_add_arg(false, false, None, Some(db))?;
+            run_repository_command(Some(db), None, "add", add_arg.as_deref())?;
+            run_repository_command(Some(db), None, "commit", Some("first commit"))?;
+
+            run_sql(
+                Some(db),
+                &[String::from(
+                    "UPDATE docs SET title = 'second' WHERE id = 1;",
+                )],
+            )?;
+            run_repository_command(Some(db), None, "add", add_arg.as_deref())?;
+            run_repository_command(Some(db), None, "commit", Some("second commit"))?;
+
+            let repository = Repository::open(temp_dir.path())?;
+            let session = RepositorySession::new(repository.worktree());
+            session.open()?;
+
+            let locked = run_repository_command(Some(db), None, "log", None)
+                .expect_err("the storage-backed command path should contend with the live session");
+            assert!(locked.to_string().contains("Locked"), "{locked:#}");
+
+            let human =
+                run_repository_metadata_command(Some(db), "log", None)?.expect("human log output");
+            assert!(human.contains("second commit"), "{human}");
+            assert!(human.contains("first commit"), "{human}");
+
+            let first_arg = repo_log_arg(Some(1), None)?;
+            let first = run_repository_metadata_command(Some(db), "json_log", Some(&first_arg))?
+                .expect("first JSON log page");
+            let first: Value = serde_json::from_str(&first)?;
+            assert_eq!(first["current_branch"], "main");
+            assert_eq!(first["commits"].as_array().map(Vec::len), Some(1));
+            assert_eq!(first["commits"][0]["message"], "second commit");
+            assert_eq!(first["has_more"], true);
+            let cursor = first["next_cursor"].as_str().expect("next cursor");
+
+            let second_arg = repo_log_arg(Some(1), Some(cursor))?;
+            let second = run_repository_metadata_command(Some(db), "json_log", Some(&second_arg))?
+                .expect("second JSON log page");
+            let second: Value = serde_json::from_str(&second)?;
+            assert_eq!(second["commits"].as_array().map(Vec::len), Some(1));
+            assert_eq!(second["commits"][0]["message"], "first commit");
+            assert_eq!(second["has_more"], false);
+
+            session.close()?;
+            Ok(())
+        })();
+
+        std::env::set_current_dir(original_dir).unwrap();
+        result.unwrap();
+    }
+
+    #[test]
+    fn status_reads_owner_published_snapshot_while_storage_is_locked() {
+        let _guard = CWD_LOCK.lock().unwrap();
+        let original_dir = std::env::current_dir().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::env::set_current_dir(temp_dir.path()).unwrap();
+
+        let result = (|| -> Result<()> {
+            run_command(Command::Init(InitArgs { json: false }), None)?;
+            let db = Path::new("app.sqlite");
+            run_sql(
+                Some(db),
+                &[String::from(
+                    "CREATE TABLE docs(id INTEGER PRIMARY KEY, title TEXT); \
+                     INSERT INTO docs VALUES (1, 'first');",
+                )],
+            )?;
+            let add_arg = repo_add_arg(false, false, None, Some(db))?;
+            run_repository_command(Some(db), None, "add", add_arg.as_deref())?;
+            run_repository_command(Some(db), None, "commit", Some("initial"))?;
+
+            let owner = RepositorySession::new(temp_dir.path());
+            owner.open()?;
+            let clean = owner.status_incremental()?;
+            assert!(clean.telemetry.persistent_snapshot_saved);
+            assert!(!clean.status.dirty);
+
+            let locked = run_repository_command(Some(db), None, "status", None)
+                .expect_err("the runtime-backed status path should contend with the owner");
+            assert!(locked.to_string().contains("Locked"), "{locked:#}");
+
+            let human =
+                run_repository_status_command(Some(db), false, None)?.expect("human status output");
+            assert!(human.contains("Worktree clean."), "{human}");
+
+            let json =
+                run_repository_status_command(Some(db), true, None)?.expect("JSON status output");
+            let json: Value = serde_json::from_str(&json)?;
+            assert_eq!(json["current_branch"], "main");
+            assert_eq!(json["dirty"], false);
+
+            run_sql(
+                Some(db),
+                &[String::from(
+                    "UPDATE docs SET title = 'second' WHERE id = 1;",
+                )],
+            )?;
+            assert!(read_persisted_status_snapshot(db)?.is_none());
+            let dirty = owner.status_incremental()?;
+            assert!(dirty.status.dirty);
+
+            let json = run_repository_status_command(Some(db), true, None)?
+                .expect("refreshed JSON status output");
+            let json: Value = serde_json::from_str(&json)?;
+            assert_eq!(json["dirty"], true);
+            assert_eq!(json["unstaged_changes"][0]["path"], "app.sqlite");
+
+            owner.close()?;
+            Ok(())
+        })();
+
+        std::env::set_current_dir(original_dir).unwrap();
+        result.unwrap();
     }
 
     #[test]

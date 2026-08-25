@@ -1396,11 +1396,8 @@ impl Repository {
 
     pub(super) fn write_index(&self, index: &index::Index) -> Result<()> {
         let path = self.index_path();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(path, toml::to_string_pretty(index)?)?;
-        Ok(())
+        let encoded = toml::to_string_pretty(index)?;
+        write_file_atomic(&path, encoded.as_bytes())
     }
 
     pub(super) fn clear_index(&self) -> Result<()> {

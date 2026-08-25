@@ -956,6 +956,46 @@ impl GraftCommand {
 }
 
 impl GraftCommand {
+    /// Evaluates commands whose complete read set is limited to atomic refs and immutable
+    /// repository objects. Keep this allowlist explicit: adding a command that touches the index,
+    /// worktree, snapshots, remotes, or runtime storage would break lock-free process concurrency.
+    pub(crate) fn eval_metadata(self, repo: &Repository) -> Result<Option<String>, ErrCtx> {
+        match self {
+            GraftCommand::Log => eval_repo_log(repo),
+            GraftCommand::JsonLog { spec } => eval_json_repo_log(repo, spec),
+            _ => pragma_err!("repository command requires an open storage session"),
+        }
+    }
+
+    /// Formats a status classification whose exact worktree proof was produced by an existing
+    /// repository owner and revalidated without opening runtime storage.
+    pub(crate) fn eval_persisted_status(
+        self,
+        repo: &Repository,
+        status: RepoStatus,
+    ) -> Result<Option<String>, ErrCtx> {
+        match self {
+            GraftCommand::Status { spec } => {
+                let status = filter_repo_status_by_kind(status, spec.kind);
+                Ok(Some(format_repo_status(&status)?))
+            }
+            GraftCommand::JsonStatus { spec } => {
+                let status = filter_repo_status_by_kind(status, spec.kind);
+                let kind = spec.kind.map(repo_tracked_path_kind_json_label);
+                let current_head = status.head_target.clone();
+                let current_branch = repo.current_branch()?;
+                Ok(Some(to_json(&JsonRepoStatus {
+                    current_head,
+                    current_branch,
+                    kind,
+                    status,
+                    conflict_analysis: None,
+                })?))
+            }
+            _ => pragma_err!("repository command is not a persisted status read"),
+        }
+    }
+
     pub fn eval(
         self,
         _runtime: &Runtime,
@@ -1972,10 +2012,7 @@ impl GraftCommand {
                 })?))
             }
 
-            GraftCommand::Log => {
-                let repo = repo_for_file(file)?;
-                Ok(Some(format_repo_log(&repo)?))
-            }
+            GraftCommand::Log => eval_repo_log(&repo_for_file(file)?),
 
             GraftCommand::Reset { rev, mode } => {
                 let outcome = run_repo_reset(&runtime, file, &rev, mode)?;
@@ -2036,29 +2073,7 @@ impl GraftCommand {
                 Ok(Some(format_repo_show(&commit)?))
             }
 
-            GraftCommand::JsonLog { spec } => {
-                let repo = repo_for_file(file)?;
-                let (commits, has_more) = match spec.limit {
-                    Some(limit) => repo.log_page(limit, spec.after.as_deref())?,
-                    None => (repo.log()?, false),
-                };
-                match spec.mode {
-                    JsonLogMode::LegacyArray => Ok(Some(to_json(&commits)?)),
-                    JsonLogMode::WithStatus => {
-                        let (current_head, current_branch) = repo_head_and_branch(&repo)?;
-                        let next_cursor = has_more
-                            .then(|| commits.last().map(|commit| commit.id.clone()))
-                            .flatten();
-                        Ok(Some(to_json(&JsonRepoLogOutcome {
-                            current_head,
-                            current_branch,
-                            commits,
-                            next_cursor,
-                            has_more,
-                        })?))
-                    }
-                }
-            }
+            GraftCommand::JsonLog { spec } => eval_json_repo_log(&repo_for_file(file)?, spec),
 
             GraftCommand::JsonRepoDiff { spec } => {
                 if !file.is_idle() {
@@ -2152,6 +2167,33 @@ impl GraftCommand {
                     commit,
                 })?))
             }
+        }
+    }
+}
+
+fn eval_repo_log(repo: &Repository) -> Result<Option<String>, ErrCtx> {
+    Ok(Some(format_repo_log(repo)?))
+}
+
+fn eval_json_repo_log(repo: &Repository, spec: JsonLogSpec) -> Result<Option<String>, ErrCtx> {
+    let (commits, has_more) = match spec.limit {
+        Some(limit) => repo.log_page(limit, spec.after.as_deref())?,
+        None => (repo.log()?, false),
+    };
+    match spec.mode {
+        JsonLogMode::LegacyArray => Ok(Some(to_json(&commits)?)),
+        JsonLogMode::WithStatus => {
+            let (current_head, current_branch) = repo_head_and_branch(repo)?;
+            let next_cursor = has_more
+                .then(|| commits.last().map(|commit| commit.id.clone()))
+                .flatten();
+            Ok(Some(to_json(&JsonRepoLogOutcome {
+                current_head,
+                current_branch,
+                commits,
+                next_cursor,
+                has_more,
+            })?))
         }
     }
 }

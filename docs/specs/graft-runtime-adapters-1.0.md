@@ -123,6 +123,21 @@ There is no global SDK mutex. Hosts SHOULD maintain at most one live session
 per canonical repository/Space identity while allowing unrelated repositories
 to proceed independently.
 
+CLI commands whose complete read set is limited to atomically replaced refs
+and immutable repository objects MAY bypass the retained runtime and storage
+lock. `graft log` MUST use this metadata-only path and remain readable while a
+live session owns the same repository's storage lock. This exception MUST NOT
+be extended to commands that inspect or mutate the index, worktree, snapshots,
+remotes, or runtime storage without equivalent concurrency evidence.
+
+`graft status` MAY bypass runtime storage only by loading a complete persisted
+status classification and revalidating the cache identity and all relevant
+worktree fingerprints described in section 7. A missing, stale, racing, or
+corrupt proof MUST fall back to authoritative runtime-backed status and MUST
+NOT be presented as current. Index writers MUST use same-directory temporary
+files and atomic replacement so concurrent readers cannot observe partial
+serialization.
+
 ### 4.3 Durable state
 
 The session itself is not canonical state. Process crash or finalizer drop
@@ -252,6 +267,12 @@ Writes use a same-directory temporary file, file sync, atomic rename, and
 directory sync. Absolute worktree paths and credentials MUST NOT be serialized.
 Cache deletion/corruption can only reduce performance; full status remains the
 source of truth.
+
+The CLI MAY consume a validated snapshot without opening a second runtime. It
+MUST apply the same validation as the SDK, refresh repository/ref projection,
+and preserve the canonical human and JSON status shapes. Cache miss or
+invalidation continues through full status rather than returning a partial or
+optimistic clean result.
 
 Incremental status returns a generation, change token, full status, and
 telemetry including duration, examined paths, metadata/tree/status cache hits,

@@ -36,8 +36,12 @@ flowchart LR
 
 `RepositoryCommandService::open_with_credentials` performs `setup_graft_temporary` and creates the
 runtime registry once. Subsequent commands use the retained service instead of repeating that
-setup. The CLI continues calling `execute_repository_command`, which opens a service for one
-command and therefore preserves existing behavior.
+setup. Storage-backed CLI commands continue calling `execute_repository_command`, which opens a
+service for one command and therefore preserves existing behavior. Metadata-only commands such as
+`graft log` execute directly against atomic refs and immutable repository objects. `graft status`
+first validates an exact owner-published classification under `.graft/cache/sdk-status`; a valid
+proof is formatted without opening Fjall, while a missing or stale proof falls back to the ordinary
+runtime-backed status path.
 
 Commands call the typed `RepositoryCommandService` and repository core directly; the SDK does not
 open a SQLite connection or transport repository operations through PRAGMAs. The CLI uses the same
@@ -54,6 +58,11 @@ JavaScript stack frame.
 - separate sessions for different repository paths: independent and parallelizable;
 - separate sessions for the same repository: the storage lock rejects the second with
   `GRAFT_SDK_REPOSITORY_BUSY`.
+
+Lock-independent CLI readers are not repository sessions and therefore do not participate in the
+storage lock. Their allowlist is explicit: `graft log` reads refs and immutable objects, while
+`graft status` may only use a status proof after the SDK cache validation rechecks repository,
+index, ignore, tracked, and visible-untracked inputs.
 
 There is intentionally no global SDK mutex. Eidos should keep a registry keyed by canonical Space
 identity and enforce one live session for each Space.
@@ -88,6 +97,12 @@ content fingerprints for relevant nested ignore sources. Loading also rechecks e
 visible-untracked metadata fingerprint before returning cached status. Any mismatch or corrupt
 file fully invalidates the snapshot. Absolute worktree paths are stripped before serialization;
 remote bearer credentials are never part of repository config or the snapshot.
+
+The CLI uses the same validation when a resident SDK session owns Fjall. It never reports a stale
+snapshot as current: invalidation continues through the authoritative runtime path, which may
+return repository-busy when another process owns storage and has not yet published a fresh proof.
+Repository index replacement is atomic so lock-independent readers observe either the old complete
+index or the new complete index, never a partially serialized document.
 
 ## Worktree and application database handles
 

@@ -266,6 +266,35 @@ pub fn execute_repository_command(
     service.execute(command)
 }
 
+/// Executes a repository command that is proven to read only atomic refs and immutable objects.
+///
+/// Unlike [`execute_repository_command`], this path does not construct a repository runtime or
+/// open Fjall storage. It is therefore safe to use while another process owns the repository
+/// storage lock. The command itself enforces the metadata-only allowlist.
+pub fn execute_repository_metadata_command(
+    target: &Path,
+    command: RepositoryCommand,
+) -> Result<Option<String>, ErrCtx> {
+    let repo = discover_target_repository(target)
+        .ok_or_else(|| ErrCtx::Repo(graft::repo::RepoErr::NotFound(target.to_path_buf())))?;
+    command.command.eval_metadata(&repo)
+}
+
+/// Formats a previously proven exact status without opening the repository runtime.
+///
+/// The caller is responsible for validating that `status` still matches repository metadata,
+/// index, ignore inputs, and worktree fingerprints. This boundary retains the canonical command
+/// filtering and human/JSON output shapes while avoiding a second Fjall owner.
+pub fn execute_repository_persisted_status_command(
+    target: &Path,
+    command: RepositoryCommand,
+    status: RepoStatus,
+) -> Result<Option<String>, ErrCtx> {
+    let repo = discover_target_repository(target)
+        .ok_or_else(|| ErrCtx::Repo(graft::repo::RepoErr::NotFound(target.to_path_buf())))?;
+    command.command.eval_persisted_status(&repo, status)
+}
+
 /// A long-lived repository command service.
 ///
 /// Opening retains the repository-scoped runtime and its local storage lock until this value is

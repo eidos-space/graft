@@ -75,6 +75,18 @@ error。`close` 先发布 closing，等待当前操作，拒绝 queued work，�
 返回 busy。没有 global SDK mutex，host 应按 canonical Space/repository identity 只
 保留一个 live session。
 
+完整 read set 仅包含 atomic replace 的 refs 与 immutable repository objects 的 CLI
+command 可以绕过 retained runtime/storage lock。`graft log` 必须走这条 metadata-only
+路径，并在同 repository 的 live session 持有 storage lock 时仍可读取。没有同等并发
+证据时，不得把该例外扩展到会读取或修改 index、worktree、snapshots、remotes 或
+runtime storage 的 command。
+
+`graft status` 只有在加载完整 persisted status classification，并按第 7 节重新验证
+cache identity 与全部相关 worktree fingerprint 后，才可以绕过 runtime storage。
+Missing、stale、racing 或 corrupt proof 必须回退到 authoritative runtime-backed status，
+不得作为 current result 返回。Index writer 必须使用 same-directory temp 与 atomic
+replacement，保证 concurrent reader 不会读到 partial serialization。
+
 Session 不是 canonical state。Crash/finalizer 后新 session 从 `.graft`、objects、
 index、refs 与 merge records 恢复，不需要 daemon/socket/PID registry。
 
@@ -162,6 +174,10 @@ refs、config、ignore source、tracked 与 visible-untracked fingerprint。返�
 写入用 same-directory temp、file sync、atomic rename、directory sync。不能序列化
 absolute path 或 credential。Cache 丢失只影响性能。Incremental result 含 generation、
 change token、full status 与 cache/stability telemetry。
+
+CLI 可以在不打开第二个 runtime 的情况下消费 validated snapshot，但必须复用同一套
+验证、刷新 repository/ref projection，并保持 canonical human/JSON status shape。Cache
+miss 或 invalidation 必须继续执行 full status，不能返回 partial 或 optimistic clean。
 
 ## 8. Stability 与 materialization gate
 
