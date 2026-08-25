@@ -72,8 +72,8 @@ pub fn create_sqlite_page_delta(
     target: &Path,
     output: &Path,
 ) -> Result<SqlitePageDeltaMetadata, ErrCtx> {
-    let base_reader = PhysicalSqliteReader::open(base)?;
-    let target_reader = PhysicalSqliteReader::open(target)?;
+    let base_reader = PhysicalSqliteReader::open_stable(base)?;
+    let target_reader = PhysicalSqliteReader::open_stable(target)?;
     let base_sha256 = hash_reader(&base_reader)?;
     let target_sha256 = hash_reader(&target_reader)?;
     write_delta_from_readers(
@@ -92,7 +92,7 @@ pub fn apply_sqlite_page_delta(
     delta: &Path,
     output: &Path,
 ) -> Result<SqlitePageDeltaMetadata, ErrCtx> {
-    let base_reader = PhysicalSqliteReader::open(base)?;
+    let base_reader = PhysicalSqliteReader::open_stable(base)?;
     let mut delta_reader = BufReader::new(File::open(delta)?);
     let delta_bytes = std::fs::metadata(delta)?.len();
     let header = read_and_validate_header(&mut delta_reader, delta_bytes)?;
@@ -493,5 +493,46 @@ mod tests {
         std::fs::write(&delta, bytes).unwrap();
 
         assert!(inspect_sqlite_page_delta(&delta).is_err());
+    }
+
+    #[test]
+    fn delta_identity_uses_exact_snapshot_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = directory.path().join("base.sqlite");
+        let target = directory.path().join("target.sqlite");
+        let delta = directory.path().join("update.graft-delta");
+        let restored = directory.path().join("restored.sqlite");
+        create_database(&base, 2);
+        let base_connection = Connection::open(&base).unwrap();
+        base_connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .unwrap();
+        base_connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+        drop(base_connection);
+        let base_bytes = std::fs::read(&base).unwrap();
+        std::fs::copy(&base, &target).unwrap();
+        let target_connection = Connection::open(&target).unwrap();
+        target_connection
+            .execute(
+                "UPDATE records SET value = ?1 WHERE id = 1",
+                params![vec![55_u8; 2048]],
+            )
+            .unwrap();
+        target_connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+        drop(target_connection);
+
+        let expected_base_sha256: [u8; SHA256_BYTES] = Sha256::digest(&base_bytes).into();
+        let created = create_sqlite_page_delta(&base, &target, &delta).unwrap();
+
+        assert_eq!(created.base_sha256, sha256_hex(&expected_base_sha256));
+        apply_sqlite_page_delta(&base, &delta, &restored).unwrap();
+        assert_eq!(
+            std::fs::read(restored).unwrap(),
+            std::fs::read(target).unwrap()
+        );
     }
 }

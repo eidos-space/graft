@@ -698,7 +698,7 @@ impl PhysicalSqliteReader {
     ///
     /// Unlike `SQLite`'s online backup, this preserves page-1 change counters. That matters when an
     /// internally generated merge result is rebound to an already-open VFS connection.
-    fn open_stable(path: &Path) -> Result<Self, ErrCtx> {
+    pub(crate) fn open_stable(path: &Path) -> Result<Self, ErrCtx> {
         validate_sqlite_source(path)?;
         Self::open_snapshot(path, path, None)
     }
