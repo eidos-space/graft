@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## Graft 0.15.1 — 2026-08-25
+
+### Fixed
+
+- `GRAFTD01` creation and application now preserve the exact bytes and SHA-256 identity of
+  immutable WAL-mode SQLite snapshots instead of passing them through SQLite online backup.
+
 ## Graft 0.15.0 — 2026-08-25
 
 ### Added

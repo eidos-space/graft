@@ -5,6 +5,13 @@ SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
 
 ## Unreleased
 
+## Graft SDK 0.3.20 — 2026-08-25
+
+### Fixed
+
+- Incremental SQLite capture deltas now apply reliably to exported WAL-mode base snapshots because
+  Graft preserves their exact page-1 bytes and SHA-256 identity.
+
 ## Graft SDK 0.3.19 — 2026-08-25
 
 ### Added
