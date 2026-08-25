@@ -5,6 +5,8 @@ SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
 
 ## Unreleased
 
+## Graft SDK 0.3.19 — 2026-08-25
+
 ### Added
 
 - `captureSqliteSnapshot()` exports a consistent create-new SQLite image without changing Graft

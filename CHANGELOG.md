@@ -2,11 +2,18 @@
 
 ## Unreleased
 
+## Graft 0.15.0 — 2026-08-25
+
 ### Added
 
 - `graft delta create`, `graft delta inspect`, and `graft delta apply` expose the repository-
   independent `GRAFTD01` SQLite page-delta format. Deltas embed exact byte lengths and SHA-256
   identities for both sides, stream page-by-page, and never overwrite existing outputs.
+
+### Compatibility
+
+- `GRAFTD01` is a new opt-in transport format. Repository objects, snapshots, refs, remotes, and
+  existing CLI commands are unchanged.
 
 ## Graft 0.14.0 — 2026-08-22
 
