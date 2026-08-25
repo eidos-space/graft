@@ -1,0 +1,128 @@
+---
+title: 02 SQLite 如何变成快照
+description: 从 WAL-aware 一致备份，到 4 KiB page、segment、storage commit、log 与 snapshot descriptor。
+---
+
+## Graft 不截取一个“正在变化的文件”
+
+SQLite 的 committed state 可能同时分布在 main database 和 `-wal`。直接复制主文件可能
+漏掉已提交 WAL frame，也可能在 writer 改页时得到撕裂镜像。因此 `graft add` 先通过
+SQLite backup boundary 建立一个私有、独立、一致的 snapshot：
+
+- 包含 backup 开始时可见的已提交 transaction；
+- 包含仍在 WAL 中、尚未 checkpoint 的已提交 frame；
+- 不包含未提交 transaction；
+- 输出是 standalone database，不依赖源 `-wal`/`-shm`；
+- 源应用不需要为了 `add` 手工 checkpoint。
+
+在 macOS 的安全条件满足时，rollback-journal database 可以使用文件 clone 快路径；其他
+情况使用 SQLite online backup。二者必须得到相同的逻辑结果。
+
+## SQLite page size 与 Graft page size 是两件事
+
+SQLite 文件头可以声明 512 B 到 64 KiB 的合法 page size。Graft storage 始终以固定
+**4096 bytes** 为一页；这里更接近内容分块，而不是承诺与数据库自己的 B-tree page
+边界完全相同。
+
+例如一个使用 8 KiB SQLite page 的 24 KiB 数据库，会被 Graft 看成 6 个 4 KiB chunk。
+checkout 时再按顺序拼回同样的 24 KiB 文件。逻辑 row diff 如不能直接解释该布局，会走
+`materialized_compat`，而不会改变 storage 粒度。
+
+## 首次 add：建立 lineage
+
+假设私有镜像有 5 个 4 KiB page：
+
+```text
+physical image: [P1][P2][P3][P4][P5]
+                         |
+                         v
+new Volume V
+local Log L
+storage commit (L, 1)
+segment S1 = {1:P1, 2:P2, 3:P3, 4:P4, 5:P5}
+page_count = 5
+```
+
+storage commit 的 identity 是 `(LogId, LSN)`。LSN 从 1 开始，只在同一 log 内单调递增；
+`L1/3` 和 `L2/3` 没有时间或先后可比性。storage commit 还携带 page count、changed-page
+set/segment index、content hash 等元数据。
+
+## 第二次 add：只追加变化页
+
+下一次 transaction 只让 page 1 和 page 4 发生净变化，并把文件扩到 6 页：
+
+```text
+base snapshot @ (L,1): [P1 ][P2][P3][P4 ][P5]
+new private image:     [P1'][P2][P3][P4'][P5][P6]
+                           |          |       |
+                           +----------+-------+
+                                      v
+storage commit (L,2)
+segment S2 = {1:P1', 4:P4', 6:P6}
+page_count = 6
+```
+
+读取新 snapshot 的 page 4 时，reader 先从较新的 `(L,2)` 找到 `S2`；读取 page 2 时，
+新 commit 没有该页，于是回退到 `(L,1)` 的 `S1`。因此 snapshot 是逻辑上的完整数据库，
+但物理上可以由多次 immutable delta 叠加得到。
+
+导入时会按 chunk 计算 hash，并与 staged/HEAD baseline 比较。大文件可以使用可重建的
+page-hash cache 跳过未变 chunk；cache 命中只改变成本，不改变结果。每个候选变化页最终
+仍以字节比较确认。
+
+## snapshot 是有序覆盖路径
+
+概念结构为：
+
+```text
+page_count = 6
+ranges = [
+  (log L, start 1, end 2)
+]
+```
+
+更复杂的 checkout/rebind/sync 可以让一个 snapshot 包含多个 log range。range 按优先级
+从高到低；前面的 commit 提供新版本，后面的 range 是 fallback。每个 range 两端都包含，
+且 snapshot blob 会为其中每个 LSN 记录 expected storage commit hash。
+
+```text
+sqlite-snapshot-v1
+volume <V>
+page_count 6
+range <L> 1 2
+commit 1 <hash-of-storage-commit-1>
+commit 2 <hash-of-storage-commit-2>
+```
+
+`VolumeId` 是当前 lineage 的 mutable handle；snapshot descriptor 才是 commit 中的
+canonical SQLite content。历史 checkout 可以从旧 snapshot 创建新的 volume，而不会让
+旧历史变成可写对象。
+
+## 没有净变化时发生什么
+
+如果每个 4 KiB chunk 和 page count 都与 baseline 相同：
+
+- 不创建 ImportTarget；
+- 不追加 storage commit；
+- index 可以复用同一 `CommitFileState` 和 snapshot blob；
+- 后续 repository commit 也不会因为“文件被 SQLite 打开过”而虚构内容变化。
+
+SQLite page 1 中某些易变计数会按实现定义进行等价比较，目标仍是表达可复用的 canonical
+state，而不是把无意义的文件级抖动当成应用变化。
+
+## 截断与删除页
+
+page count 也是 snapshot 的一部分。文件从 6 页缩到 4 页时，新 storage commit 可以只
+记录 `page_count = 4`。这是 soft truncate：超出范围的旧 frame 可能仍在底层 storage，
+但 snapshot reader 不会暴露它们。它不是 secure erase；真正删除不可达 storage 由 GC
+完成。
+
+## 两种 commit 再对照一次
+
+| 名称 | 标识 | 保存的关系 | 用户通常怎样引用 |
+| --- | --- | --- | --- |
+| storage commit | `(LogId, LSN)` + hash | 哪些 4 KiB page 改了 | 不直接引用，属于内部坐标 |
+| repository commit | BLAKE3 object ID | 整个 app-state tree 与 parents | `HEAD`、branch、tag、revspec |
+
+日常诊断从 repository commit 和 path 出发。只有排查 page lineage、hydrate 或 sync 时，
+才继续进入 log/LSN 层。

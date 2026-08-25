@@ -1,0 +1,135 @@
+---
+title: 01 Repository And Objects
+description: Open .graft and separate immutable objects, mutable refs, the index, and the worktree.
+---
+
+## A repository is not one database
+
+A Graft repository is an ordinary worktree plus `.graft/`. Applications own the physical worktree
+files; `.graft/` stores history, staged state, refs, SQLite page storage, and recovery records.
+
+```text
+project/
+  app.sqlite
+  settings.json
+  attachments/report.pdf
+  .graft/
+    config.toml
+    HEAD
+    refs/
+    logs/
+    objects/
+    store/
+    index/
+    locks/
+    tmp/
+```
+
+A repository path is normalized UTF-8 relative to the worktree. Empty paths, `.`, `..`, absolute
+paths, and paths addressing `.graft` are invalid identities.
+
+## Map of `.graft/`
+
+| Path | Contents | Role |
+| --- | --- | --- |
+| `config.toml` | format, branch, files, merge, and remote settings | mutable metadata |
+| `HEAD` | symbolic branch ref or detached commit | mutable pointer |
+| `refs/heads/*` | local branch repository commit IDs | mutable pointers |
+| `refs/remotes/*` | last fetched remote positions | mutable pointers |
+| `refs/tags/*` | lightweight or annotated tags | mutable pointers |
+| `logs/HEAD`, `logs/refs/*` | ref update log | append-only recovery aid |
+| `objects/??/*` | blobs, trees, commits, tags | content-addressed immutable data |
+| `objects/pack/*` | packed repository objects | immutable data |
+| `store/fjall/` | SQLite volumes, logs, commits, segments, pages | storage engine data |
+| `store/files/` | bytes for external artifacts | content-addressed payloads |
+| `index/state.toml` | normal and merge stages | mutable staged truth |
+| `index/worktree.toml` | dirty/deleted observations | rebuildable optimization |
+| `MERGE_HEAD`, `ORIG_HEAD` | merge target and original head | recovery metadata |
+| `locks/`, `tmp/`, `cache/` | coordination, replacement, caches | non-canonical support state |
+
+Not everything inside `.graft/` has the same status. Objects and snapshots have content identity;
+refs and the index are mutable control state; deleting a cache should only cost performance.
+
+## The repository object graph
+
+```text
+refs/heads/main
+       |
+       v
+commit C2 ----parent----> commit C1
+   |                         |
+   tree                      tree
+   |
+   +-- app.sqlite ----------> sqlite-snapshot-v1 blob
+   +-- settings.json -------> file-blob-v2
+   +-- report.pdf ----------> large-file-pointer-v1
+```
+
+The canonical loose-object envelope is:
+
+```text
+graft-object 1 <kind> <payload-length>\0<payload>
+```
+
+`kind` is `blob`, `tree`, `commit`, or `tag`. The BLAKE3 of the whole envelope is a 64-character
+object ID. Loose objects use two-character fan-out. Reads recompute the ID, and an existing object
+with the same content never needs to be overwritten.
+
+### Three content representations
+
+| Worktree content | Tree mode | Blob | Byte storage |
+| --- | ---: | --- | --- |
+| SQLite database | `160000` | `sqlite-snapshot-v1` | pages in `store/fjall` |
+| inline text/small file | `100644` | `file-blob-v2` | Base64 in the blob |
+| external file | `100644` | `large-file-pointer-v1` | content-hash fan-out under `store/files/` |
+
+An external pointer can exist while its bytes are not locally hydrated. Knowing an artifact's
+identity and being able to read its bytes are separate states.
+
+## Refs are mutable publication pointers
+
+Objects are never modified in place. A commit writes new objects and then replaces
+`refs/heads/main`:
+
+```text
+before: main -> C1
+write:          C2(parent=C1)
+after:  main -------------> C2
+```
+
+`HEAD` normally contains a symbolic ref such as `refs/heads/main`; a detached HEAD contains a
+commit ID. Before the first commit, that symbolic branch may not exist yet: an unborn branch.
+
+Higher-level operations write immutable dependencies before moving a ref. Expected-value updates
+report stale state instead of overwriting a concurrent writer.
+
+## The index is an overlay on HEAD
+
+Outside a merge, the index stores only staged differences from `HEAD`:
+
+- a stage-0 object adds or replaces a path;
+- a stage-0 entry without an object deletes a path;
+- no entry means inherit the `HEAD` version.
+
+During merge, one path can have:
+
+| Stage | Meaning |
+| ---: | --- |
+| 1 | Base |
+| 2 | Ours |
+| 3 | Theirs |
+| 0 | Resolved next-commit result |
+
+Any unresolved stage prevents a normal commit. A missing stage can mean deletion; it is not by
+itself corruption.
+
+## Authority cheat sheet
+
+| Question | Authority |
+| --- | --- |
+| What is the app reading now? | physical worktree file |
+| What will the next commit contain? | `HEAD` plus stage-0 index overlay |
+| What is in a historical version? | commit → tree → blob graph |
+| What bytes does a SQLite blob represent? | descriptor → storage commits/pages |
+| Where is the current branch? | `HEAD` and `refs/heads/*` |
+| What were both sides of a conflict? | index stages plus merge journal |

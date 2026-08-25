@@ -1,0 +1,91 @@
+---
+title: 03 Stage And Commit
+description: Trace init, SQLite and artifact staging, the index overlay, objects, and ref publication.
+---
+
+## `graft init` creates control state
+
+Initialization canonicalizes the worktree, creates `.graft`, writes defaults, and makes `HEAD`
+symbolically name `main`:
+
+```text
+HEAD = ref: refs/heads/main
+refs/heads/main = absent
+index = empty
+objects = empty
+storage = empty
+```
+
+This unborn state does not create a database or automatically track worktree files.
+
+## Full SQLite add sequence
+
+1. Normalize and validate repository-relative path identity.
+2. Classify the regular file and validate its SQLite header.
+3. Select the index snapshot, or `HEAD`, as the baseline.
+4. Capture a standalone private image through SQLite backup, including committed WAL.
+5. Compare 4 KiB chunks and reuse unchanged baseline pages.
+6. If needed, atomically batch new segment pages and a storage commit.
+7. Encode volume, page count, log ranges, and hashes in a `sqlite-snapshot-v1` blob.
+8. Write a stage-0 index entry with mode, object ID, and parsed snapshot state.
+9. Clear the path's observation marker; later status may still verify the physical file.
+
+Immutable storage and a blob can now exist while the branch still points at the old commit.
+
+## Ordinary files take a separate staging path
+
+Graft reads exact bytes and chooses inline or external storage:
+
+- small text normally becomes a Base64 `file-blob-v2`;
+- binary, large text, or configured external paths put raw bytes under the content-hash fan-out in `store/files/`
+  and write a `large-file-pointer-v1` blob;
+- stage 0 names that blob object.
+
+Both pipelines end as a typed path-to-blob entry, so databases, settings, and attachments can form
+one application-state commit.
+
+## The index freezes the staged result
+
+```text
+10:00  app.sqlite = A
+10:01  graft add app.sqlite       index = snapshot(A)
+10:02  app commits transaction B  worktree = B, index remains A
+10:03  graft commit               repository commit contains A
+```
+
+B is not lost. It remains an unstaged worktree change after the commit. This is why a commit is
+repeatable and does not race a second application transaction.
+
+## Full commit sequence
+
+1. Read `HEAD` and the index; reject unresolved stages.
+2. Apply stage 0 as an overlay to the `HEAD` tree.
+3. Ensure each SQLite path has its snapshot blob and each artifact its staged blob.
+4. Sort paths canonically and write the tree object.
+5. Write the commit object with tree, parents, signatures, message, and summaries.
+6. Update the attached branch ref, or detached `HEAD`.
+7. Append reflog information and clear completed merge state when applicable.
+8. Clear the index.
+
+The safety order is immutable objects first, mutable ref last. Failure before ref movement can
+leave unreachable objects, but not a branch pointing at half a commit.
+
+## What commit does not do
+
+It does not re-backup the worktree, checkpoint application WAL, replace `app.sqlite`, stage newer
+changes, or push a remote.
+
+| Point | Worktree | Index | Storage/objects | `main` |
+| --- | --- | --- | --- | --- |
+| after init | untracked files | empty | empty | unborn |
+| after SQLite transaction | bytes/WAL changed | empty | unchanged | unchanged |
+| after add | not replaced | snapshot A | delta + blob | unchanged |
+| after another transaction | B | still A | unchanged | unchanged |
+| after commit | still B | cleared | tree + commit(A) | commit(A) |
+
+## Current durability boundary
+
+Refs, `HEAD`, config, observations, and external-payload replacement use sibling temp plus rename.
+Some loose object, index, and merge-record writes remain direct. Reads validate hashes or parse the
+whole record, but the current format does not promise crash atomicity or an end-to-end `fsync`
+contract for those writes. Reflog append is also not the same transaction as ref replacement.

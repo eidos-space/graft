@@ -1,0 +1,116 @@
+---
+title: 06 远端、失败与恢复
+description: 理解 immutable data、mutable ref publication、CAS、pull=fetch+merge，以及本地和远端失败边界。
+---
+
+## Remote 传输三种不同的状态
+
+```text
+repository objects / packs       immutable
+SQLite commits / segments/files  immutable
+HEAD / refs/**                    mutable transactional metadata
+```
+
+这一区分决定了 push 的安全顺序。immutable data 可以用 content identity 去重和重传；branch
+ref 是“让别人看见新历史”的 publication point，必须 compare-and-swap（CAS）。
+
+## Push：依赖先到，ref 最后动
+
+一次 push 概念上按以下顺序：
+
+1. 发布 commit 引用的 SQLite storage commits、segments/pages；
+2. 发布 external payload bytes；
+3. 发布 blob/tree/commit object 或 pack/index；
+4. 用开始时观察到的远端 ref 值作为 expected value，CAS 更新目标 branch。
+
+如果第 1–3 步后第 4 步 CAS 失败，远端可能留下不可达 immutable data，但 branch 仍指向一
+条完整旧历史。反过来的顺序会让 ref 暂时指向缺 page/blob 的 commit，因此不允许。
+
+force push 只放宽 non-fast-forward policy，不取消 expected-value CAS。另一位 writer 在你
+上传期间移动了 branch 时，你仍必须重新 fetch/判断，不能盲目覆盖。
+
+## Fetch、Pull、Clone 分别做什么
+
+### Fetch
+
+下载所选 remote ref 的 repository graph/object，并以 expected state 更新
+`refs/remotes/<remote>/<branch>`。它不会移动当前本地 branch、改 index、触发 merge 或
+materialize worktree。
+
+fetch 可以只拿 metadata 和必要 object；历史 SQLite page 或 external payload 仍可能在
+真正 diff/checkout 时 lazy hydrate。所以“能看到 log”不保证“所有历史 bytes 已离线”。
+
+### Pull
+
+pull 不是一条特殊覆盖算法，而是：
+
+```text
+fetch -> merge plan -> apply
+```
+
+因此它继承 up-to-date、fast-forward、three-way、conflict、stale token、SQLite
+materialization 和 handle 关闭规则。
+
+### Clone
+
+clone 初始化新 repository，配置 remote，取得一个稳定 ref 及其 immutable dependencies，
+建立 tracking/upstream，最后 checkout。已有非空 destination 不会被静默覆盖。
+
+## Publication outcome unknown
+
+最难的失败发生在“CAS 请求已发送，但 ACK 丢了”：
+
+```text
+client ---- CAS(new head) ----> remote
+client <--- connection lost ---X
+```
+
+远端可能拒绝、可能已成功，也可能结果未知。此时不能直接发布另一个 successor。正确做法是
+保留 pending/recovery state，重新读取 remote ref：
+
+- ref 等于预期新值：把本地状态 reconcile 为成功；
+- ref 仍是旧值：可以按明确失败处理；
+- ref 是其他值：视为并发/divergence，重新 fetch/plan。
+
+timeout 和 cancellation 也只能保证 safe boundary；请求发出后，取消不等于远端没有执行。
+
+## 本地失败时哪些东西可信
+
+| 失败位置 | 可能留下什么 | 仍应信任什么 |
+| --- | --- | --- |
+| add 的 private backup | temp file | worktree、旧 index；temp 可清理 |
+| storage commit 后、index 前 | unreachable storage delta/blob | 旧 index/ref |
+| tree/commit 写完、ref 前 | unreachable repository objects | 旧 ref |
+| ref 替换后、reflog append 前 | 新 branch，缺一条 reflog | ref 与 object graph |
+| 多路径 checkout 中途 | 部分 temp/backup，恢复可能不完整 | repository canonical state + status/reconcile |
+| active merge 中途 | stages、journal、可能的 candidate | index + merge journal，不猜 worktree |
+| push immutable 完成、CAS 失败 | remote unreachable immutable data | remote ref |
+
+object read 会验证 requested ID；snapshot descriptor 会验证 expected storage commit hash；
+external payload 会验证 content hash 与 size。发现 mismatch 时必须报 corruption，不能用零页
+或空文件顶替。
+
+## 三种清理不是一回事
+
+| 维护域 | 追踪的 root | 清理目标 |
+| --- | --- | --- |
+| SQLite storage GC | index snapshots、HEAD/branches、merge/orig head、remote refs、tags 等 | unreachable volume/log/segment/page |
+| payload prune | index 与 refs/tags 可达的 external pointers | `store/files` 中不可达 bytes |
+| repository object GC | commit/tree/blob reachability | 当前 1.0 没有 public loose-object GC |
+
+不要用“这个 object 不在当前 branch”直接推导它可删除：index、其他 branch、remote-tracking
+ref、tag 和 active merge 都可能仍引用它。pending remote publication 和恢复记录也需要进入
+相应 storage roots。
+
+## 面对异常时的恢复顺序
+
+1. 停止继续写入，尤其不要删除 `.graft/tmp`、merge record 或 WAL 来“试试看”。
+2. 关闭可能受影响的应用 SQLite handles。
+3. 运行只读 `graft status --json`，确认 branch、index、merge 和 path actions。
+4. 若 active merge，使用 inspection 后继续 resolve/continue，或明确 abort。
+5. 若 remote publication 不确定，先 fetch/inspect remote ref，再决定 retry。
+6. 对 missing/corrupt object、payload 或 page 使用 audit/remote repair；不要制造替代 bytes。
+7. 只有 canonical state 已确认后，才清理由它证明不可达的 cache/temp/data。
+
+掌控感来自知道每一层的 publication point：SQLite transaction、index、repository ref 和
+remote ref 各自完成一次独立的“现在可以被下一层看见”。

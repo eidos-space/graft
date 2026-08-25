@@ -1,0 +1,102 @@
+---
+title: 05 Diff And Merge
+description: Move from path identity to SQLite row, schema, and opaque analysis, then durable merge state.
+---
+
+## Diff compares identity before interpreting content
+
+Repository diff first compares trees and classifies added, deleted, and modified paths. SQLite uses
+snapshot identity; artifacts use content identity. An exact delete/add pair can be an exact move,
+but version 1.0 has no similarity rename heuristic.
+
+A modified SQLite path is then interpreted across independent domains:
+
+- row inserts, deletes, and updates;
+- schema entry changes;
+- opaque virtual, FTS, internal, and index B-tree changes;
+- capabilities, limitations, and execution scope.
+
+An empty row list does not prove the database is unchanged. Inspect logical status, schema, opaque
+changes, and limitations together.
+
+## Row identity and execution paths
+
+Ordinary tables use signed 64-bit `rowid`. `WITHOUT ROWID` tables use typed composite primary keys
+in declaration order. Generated columns may be displayed but are excluded from ordinary replay.
+
+Supported 4 KiB layouts can use streaming B-tree readers. Non-native page sizes and some
+`WITHOUT ROWID` layouts use isolated temporary databases and report `materialized_compat`. Both
+paths must produce equivalent observations. Diff never modifies refs, index, merge journal, or the
+tracked worktree.
+
+## Three-way inputs
+
+```text
+                 Base
+                /    \
+             Ours    Theirs
+```
+
+Base is the common ancestor, Ours is local `HEAD` at plan time, and Theirs is the target revision.
+Unrelated histories use an explicit empty base with `merge_base = null`.
+
+| Outcome | Condition | Apply effect |
+| --- | --- | --- |
+| up to date | Theirs is an Ours ancestor | no change |
+| fast-forward | Ours is a Theirs ancestor | move ref and checkout |
+| three-way | both diverged | durable index/journal, then resolve/continue or abort |
+
+`planMerge` is read-only. Its token binds heads, target, checkout actions, candidate index, and the
+frozen policy. Apply recomputes current state; stale input has no side effect.
+
+## Path-level decisions
+
+| Relationship | Result |
+| --- | --- |
+| Ours == Theirs | shared version |
+| Ours == Base | Theirs |
+| Theirs == Base | Ours |
+| added on one side only | added side |
+| identical add/add | shared addition |
+| delete versus unchanged | deletion |
+| divergent modify or modify/delete | type-specific merge or conflict |
+
+Artifacts use conservative whole-path conflicts. Graft attempts row/schema-aware merge only when
+all three inputs are compatible SQLite snapshots. Malformed, unsupported, or opaque uncertainty
+falls back to a whole-path conflict rather than guessing.
+
+## Constructing a SQLite result
+
+Graft seeds a private candidate from immutable Ours, validates its integrity, and replays safe
+changes inside one SQLite transaction. Independent row edits combine; incompatible edits to the
+same identity become conflicts. Schema and internal resolvers are a bounded built-in set, not
+arbitrary SQL hooks. Constraint maintenance and foreign-key validation run before publication.
+
+A WAL changed-page set can accelerate sparse import, but it is only a conservative set of output
+pages. It never defines cross-branch semantics or bypasses identity checks.
+
+## Durable conflict state
+
+Three-way apply persists:
+
+```text
+.graft/ORIG_HEAD
+.graft/MERGE_HEAD
+.graft/index/state.toml
+.graft/merge-resolution-session.json
+```
+
+The worktree is not the only conflict record. Reopening can recover original stages, frozen policy,
+row/cell choices, and unresolved counts. A `graft-merge-v1:` state token binds the complete merge
+state; any relevant change makes an old token stale.
+
+Whole-path or row/cell/table resolution eventually collapses a path to stage 0. `continue` requires
+no conflicts and creates a repository commit with parents `[Ours, Theirs]`. `abort` restores from
+`ORIG_HEAD` and clears records only after restoration succeeds.
+
+After interruption, the only safe paths are:
+
+```text
+inspect -> continue resolving -> continue
+inspect -> abort
+```

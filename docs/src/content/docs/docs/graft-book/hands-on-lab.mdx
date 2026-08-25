@@ -1,0 +1,155 @@
+---
+title: 07 Hands-On Lab
+description: Observe worktree, index, objects, storage, refs, diff, and checkout in a minimal repository.
+---
+
+The point of this lab is to predict which of worktree, index, immutable stores, and refs will change
+before each command, then verify the prediction.
+
+## 0. Initialize an isolated repository
+
+```bash
+mkdir graft-book-lab
+cd graft-book-lab
+graft init
+find .graft -maxdepth 3 -print | sort
+cat .graft/HEAD
+```
+
+`HEAD` should name `refs/heads/main`, while that branch has no commit ID yet.
+
+## 1. Change only the worktree
+
+```bash
+graft sql --db app.sqlite \
+  "CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT NOT NULL);"
+graft sql --db app.sqlite \
+  "INSERT INTO notes(body) VALUES ('first');"
+printf '{"theme":"paper"}\n' > settings.json
+graft status --json
+```
+
+Storage-engine files created during initialization do not imply a staged snapshot. Status and the
+index are the authorities.
+
+## 2. Stage a consistent snapshot
+
+```bash
+graft add app.sqlite
+graft add settings.json
+graft status --json
+sed -n '1,240p' .graft/index/state.toml
+find .graft/objects -type f | sort
+du -sh .graft/store/fjall .graft/store/files .graft/objects
+```
+
+The index now has two stage-0 paths. SQLite names a snapshot blob, settings names an inline blob,
+and `main` still has no repository commit.
+
+## 3. Prove commit consumes the index
+
+```bash
+graft sql --db app.sqlite \
+  "INSERT INTO notes(body) VALUES ('second, not staged yet');"
+graft commit -m "seed app state"
+graft status --json
+cat .graft/HEAD
+cat .graft/refs/heads/main
+graft show --json HEAD
+graft diff --json
+```
+
+The commit contains the first staged snapshot. The second row remains unstaged. Export the history
+to verify it directly:
+
+```bash
+graft export --source HEAD --output head.sqlite app.sqlite
+sqlite3 head.sqlite 'SELECT * FROM notes;'
+sqlite3 app.sqlite 'SELECT * FROM notes;'
+```
+
+## 4. Observe a page delta and repository commit
+
+```bash
+du -sk .graft/store/fjall .graft/objects
+graft add app.sqlite
+graft commit -m "add second note"
+du -sk .graft/store/fjall .graft/objects
+graft log --json
+graft diff --json --rows HEAD~1 HEAD app.sqlite
+```
+
+Do not expect directory size to increase by exactly one page; Fjall and indexes have overhead. The
+semantic observation is one inserted row and a new repository commit whose parent is the old one.
+
+## 5. A branch is another ref
+
+```bash
+graft branch experiment
+find .graft/refs/heads -type f -maxdepth 2 -print -exec sed -n '1p' {} \;
+graft switch experiment
+cat .graft/HEAD
+```
+
+Two branches naming one commit do not duplicate objects or SQLite pages.
+
+```bash
+graft sql --db app.sqlite \
+  "UPDATE notes SET body='changed on experiment' WHERE id=1;"
+graft add app.sqlite
+graft commit -m "edit first note"
+graft diff --json --rows main experiment app.sqlite
+```
+
+## 6. Observe materialization
+
+Close long-lived application connections first:
+
+```bash
+graft switch main
+sqlite3 app.sqlite 'SELECT * FROM notes ORDER BY id;'
+graft switch experiment
+sqlite3 app.sqlite 'SELECT * FROM notes ORDER BY id;'
+```
+
+Switch reconstructs an ordinary database from the target snapshot and updates its binding. Use
+refs, snapshot identity, and query results—not inode stability—to identify the version.
+
+## 7. Optional filesystem remote
+
+```bash
+mkdir ../graft-book-remote
+graft remote add origin "fs://$(cd ../graft-book-remote && pwd)"
+graft push origin experiment
+find ../graft-book-remote -maxdepth 4 -type f | sort | sed -n '1,120p'
+```
+
+The target keeps immutable data separate from mutable refs; the successful ref update makes the
+uploaded graph reachable.
+
+## Debugging checklist
+
+```text
+1. Is HEAD symbolic or detached?
+2. Which repository commit does the branch ref name?
+3. Does the index override the path or contain stages 1/2/3?
+4. Have worktree bytes diverged from the staged snapshot?
+5. Are required objects, payloads, and pages hydrated?
+6. Can this operation materialize, and are application handles closed?
+7. After failure, which ref/index/journal remains canonical?
+```
+
+## Source map
+
+| Question | Normative owner | Main implementation entry points |
+| --- | --- | --- |
+| `.graft`, objects, refs, index | `docs/specs/graft-repository-1.0.md` | `crates/graft/src/repo.rs`, `repo/object.rs`, `repo/staging.rs`, `repo/worktree_state.rs` |
+| 4 KiB pages, logs, LSNs, snapshots | `docs/specs/graft-storage-snapshots-1.0.md` | `snapshot.rs`, `volume_reader.rs`, `volume_writer.rs`, `local/fjall_storage.rs` |
+| consistent physical capture and replacement | `docs/specs/graft-worktree-materialization-1.0.md` | `crates/graft-sqlite/src/pragma/sqlite_worktree.rs`, `repo_checkout.rs` |
+| path, row, and schema diff | `docs/specs/graft-diff-1.0.md` | `crates/graft-sqlite/src/row_level_diff.rs` |
+| three-way merge and durable conflicts | `docs/specs/graft-merge-1.0.md` | `crates/graft/src/repo/merge.rs`, `crates/graft-sqlite/src/row_merge.rs` |
+| push, fetch, pull, and remote CAS | `docs/specs/graft-remote-sync-1.0.md` | `crates/graft/src/repo/sync.rs`, `repo/remote_objects.rs`, `packages/graft-remote` |
+
+Read the specification to learn what must hold, the entry point to learn the present implementation,
+and tests to find executable evidence. Do not derive a public contract from Fjall private keys or
+temporary filenames.

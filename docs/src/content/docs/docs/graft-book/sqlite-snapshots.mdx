@@ -1,0 +1,101 @@
+---
+title: 02 SQLite Snapshots
+description: Follow WAL-aware capture into 4 KiB pages, segments, storage commits, logs, and snapshot descriptors.
+---
+
+## Graft does not copy a moving file
+
+Committed SQLite state may live in both the main database and `-wal`. Copying only the main file
+can miss committed frames or capture torn state. `graft add` first creates a private, standalone,
+consistent image through a SQLite backup boundary. It includes committed WAL frames and excludes
+uncommitted transactions; the application does not need to checkpoint manually.
+
+On macOS a safe rollback-journal case can use a file-clone fast path. Other cases use SQLite online
+backup. Both must produce the same logical result.
+
+## SQLite page size is not Graft page size
+
+SQLite supports physical page sizes from 512 B through 64 KiB. Graft storage always uses fixed
+4096-byte pages. An 8 KiB SQLite page therefore occupies two Graft chunks. Checkout concatenates
+the chunks into the original file; row analysis can use a compatibility database when it cannot
+interpret a layout directly.
+
+## First add: create a lineage
+
+For a five-page image:
+
+```text
+physical image: [P1][P2][P3][P4][P5]
+                         |
+                         v
+new Volume V
+local Log L
+storage commit (L, 1)
+segment S1 = {1:P1, 2:P2, 3:P3, 4:P4, 5:P5}
+page_count = 5
+```
+
+A storage commit is addressed by `(LogId, LSN)`. LSNs start at one and are ordered only within a
+log. Two different logs at LSN 3 are not chronologically comparable.
+
+## Second add: append changed pages
+
+If pages 1 and 4 change and the file grows:
+
+```text
+base @ (L,1):     [P1 ][P2][P3][P4 ][P5]
+new image:        [P1'][P2][P3][P4'][P5][P6]
+                      |          |       |
+                      +----------+-------+
+                                 v
+storage commit (L,2)
+segment S2 = {1:P1', 4:P4', 6:P6}
+page_count = 6
+```
+
+Reading page 4 finds it in the newer segment. Reading page 2 falls back to the older commit. A
+snapshot is a complete logical database even when its physical representation overlays immutable
+deltas.
+
+Import hashes chunks against the staged or `HEAD` baseline. A rebuildable page-hash cache can skip
+unchanged chunks, but candidate changes are still confirmed by byte comparison.
+
+## A snapshot is an ordered overlay path
+
+```text
+page_count = 6
+ranges = [ (log L, start 1, end 2) ]
+```
+
+More complex rebind and synchronization paths can contain several log ranges. Earlier ranges have
+higher priority; later ranges provide fallback pages. The repository blob includes an expected
+content hash for every LSN:
+
+```text
+sqlite-snapshot-v1
+volume <V>
+page_count 6
+range <L> 1 2
+commit 1 <storage-commit-hash-1>
+commit 2 <storage-commit-hash-2>
+```
+
+`VolumeId` is a mutable lineage handle. The descriptor is the canonical SQLite content referenced
+by repository history. Checking out an old snapshot can create a new volume without making history
+mutable.
+
+## No net change
+
+When all chunks and the page count match the baseline, Graft does not append a storage commit. The
+index can reuse the same file state and snapshot blob. Merely opening a database does not invent an
+application-state change.
+
+Shrinking page count is a soft truncate: old frames may remain in storage but are outside the
+logical file. It is not secure erase; storage GC later removes unreachable data.
+
+## Two commits compared
+
+| Name | Identity | Relationship | Normal user reference |
+| --- | --- | --- | --- |
+| storage commit | `(LogId, LSN)` plus hash | changed 4 KiB pages | internal coordinate |
+| repository commit | BLAKE3 object ID | app-state tree and parents | branch, tag, revspec |

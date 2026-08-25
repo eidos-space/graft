@@ -1,0 +1,126 @@
+---
+title: 05 Diff、Merge 与冲突
+description: 从 path identity 到 SQLite row/schema/opaque 分析，再到 durable three-way merge state。
+---
+
+## Diff 先比较身份，再解释内容
+
+repository diff 的第一层是 tree comparison：
+
+```text
+from tree                       to tree
+app.sqlite -> snapshot A        app.sqlite -> snapshot B   modified
+old.txt    -> blob X                                      deleted
+                                  new.txt -> blob Y        added
+```
+
+SQLite 用 snapshot identity，普通文件用 content identity。完全相同的一删一增可以被识别为
+exact move；1.0 不做 similarity rename heuristic。
+
+第二层才把 modified SQLite path 展开为四个互相独立的 domain：
+
+- row：insert、delete、update；
+- schema：table/index/trigger 等 schema entry 的增删改；
+- opaque：virtual table、FTS shadow、internal table、未表达成 row 的 index B-tree 变化；
+- capability/limitation：这次分析覆盖了什么、遗漏了什么。
+
+所以“row changes 为空”不能推出“数据库没变”。必须同时看 `logical_status`、schema、opaque
+和 limitations。
+
+## row identity 从哪里来
+
+- 普通 table 使用 signed 64-bit `rowid`；
+- `WITHOUT ROWID` table 使用声明顺序的 typed composite primary key；
+- key part 保留 null/integer/real/text/blob 类型；
+- generated column 可以展示，但不能被当成普通可写 column 重放。
+
+4 KiB、受支持的 B-tree layout 可以直接 streaming parser；非原生 SQLite page size 或某些
+`WITHOUT ROWID` layout 会把两个历史 snapshot 写到隔离临时库，交给 SQLite 只读查询，
+response scope 标记为 `materialized_compat`。两条路径必须给出等价事实。
+
+Diff 无论走哪条路径都不能改 ref、index、merge journal 或 tracked worktree。
+
+## Three-way merge 的三个输入
+
+```text
+                 Base
+                /    \
+             Ours    Theirs
+```
+
+- Base：共同祖先；无共同祖先时当前实现用 empty base，并明确返回 `null`；
+- Ours：plan 时本地 `HEAD`；
+- Theirs：目标 revision。
+
+planning 先判 topology：
+
+| 结果 | 条件 | apply 后发生什么 |
+| --- | --- | --- |
+| up to date | Theirs 是 Ours ancestor | 什么都不变 |
+| fast-forward | Ours 是 Theirs ancestor | ref 移到 Theirs，并 checkout |
+| three-way | 双方分叉 | 写 merge index/journal，之后 resolve/continue 或 abort |
+
+`planMerge` 是只读的。plan token hash 绑定 target、heads、checkout actions、candidate
+index 和冻结 merge policy；apply 会在当前 state 重新验证，stale token 不产生副作用。
+
+## path-level 决策表
+
+| Base / Ours / Theirs 关系 | 结果 |
+| --- | --- |
+| Ours == Theirs | 共同版本 |
+| Ours == Base | 取 Theirs |
+| Theirs == Base | 取 Ours |
+| 只有一侧新增 | 取新增侧 |
+| 双方新增且完全相同 | 共同新增 |
+| 一侧删除、另一侧未改 | 删除 |
+| 双方发散修改，或修改/删除 | type-specific merge，不能安全合并则 conflict |
+
+普通文件采取保守的 whole-path conflict。三侧都是 compatible SQLite snapshot 时，Graft
+才尝试 row/schema-aware merge；malformed、unsupported 或 opaque uncertainty 会回退为整
+路径冲突，而不是猜测。
+
+## SQLite row merge 如何构造结果
+
+Graft 从不可变 Ours snapshot 建立 private candidate，验证 source integrity，然后在一个
+SQLite transaction 中重放可安全合并的变化。互不触碰的 row 自动组合；同一 identity 的
+不兼容 update/delete 等成为 row conflict。受支持的 schema/internal resolver 是有限的，
+不是任意 SQL hook。
+
+完成后至少要通过相应的 SQLite constraint 维护与 `foreign_key_check`。失败的 candidate
+不会替换 index 或 worktree。WAL changed-page set 可以帮助 sparse import，但只是一组保守
+候选页：它不能定义 branch merge 语义，也不能绕过逐页 identity 验证。
+
+## 冲突为什么能跨进程恢复
+
+three-way apply 持久化：
+
+```text
+.graft/ORIG_HEAD                 原 Ours commit
+.graft/MERGE_HEAD                Theirs commit
+.graft/index/state.toml          Base/Ours/Theirs/Normal stages
+.graft/merge-resolution-session.json
+                                 原始 stages、冻结 policy、row/cell choices
+```
+
+worktree 不是冲突的唯一记录。即使关闭 CLI/SDK session，重新打开仍可以从 index 和 journal
+恢复双方版本、未解决数量和已做选择。当前 state token 以 `graft-merge-v1:` 开头，绑定完整
+merge state；任何 index、status 或 resolution 变化都会让旧 token stale。
+
+## Resolution、continue 与 abort
+
+- whole-path ours/theirs：把选择结果折叠为 stage 0；选择 deletion 时 staged deletion；
+- row/cell/table resolution：先持久化选择，最后一个冲突解决后才一次性构造并可能
+  materialize candidate；
+- manual text/provider result：先验证精确结果，再 stage；
+- `continue`：要求没有 conflict stage，`HEAD` 仍是 Ours，然后创建 parents 为
+  `[Ours, Theirs]` 的 repository commit；
+- `abort`：根据 `ORIG_HEAD` 和 durable state 恢复，成功后才清 merge record。
+
+如果失败或进程退出，恢复入口始终是：
+
+```text
+inspect -> 继续 resolve -> continue
+inspect -> abort
+```
+
+启动时绝不能因为物理 worktree 看起来像某一侧，就自动选择 Ours 或 Theirs。

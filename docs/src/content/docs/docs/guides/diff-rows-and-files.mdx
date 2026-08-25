@@ -11,6 +11,25 @@ Graft has two diff layers:
 Use repository diffs to answer "which app-state paths changed?" Use row diffs
 to answer "which SQLite rows changed?"
 
+## Compare Two SQLite Files Directly
+
+Use `--no-index` when the databases are ordinary files rather than two sides
+of a Graft repository:
+
+```bash
+graft diff --no-index old.sqlite new.sqlite
+graft diff --no-index --rows old.sqlite new.sqlite
+graft diff --no-index --rows --json old.sqlite new.sqlite
+```
+
+The command accepts exactly two regular SQLite database files and does not
+require or discover a Graft repository. The default output reports whether the
+physical SQLite snapshots differ; `--rows` expands a changed pair into logical
+schema, table, row, and opaque changes. Each side is captured consistently via
+SQLite's online backup mechanism, including committed WAL frames. Repository
+selectors such as `--staged`, `--root`, `--kind`, and `--content` do not apply
+to `--no-index`.
+
 ## Compare Worktree Changes
 
 ```bash
@@ -123,6 +142,6 @@ Suggested UI treatment:
 | binary file changed | Show file-level metadata and allow open/replace/download. |
 
 Low-level LSN diffs are documented under
-[Snapshot Storage And LSNs](/docs/internals/snapshot-storage-lsns/) for storage
+[SQLite Snapshots](/docs/graft-book/sqlite-snapshots/) for storage
 debugging. Normal user-facing history should use repository commits and
 revspecs.

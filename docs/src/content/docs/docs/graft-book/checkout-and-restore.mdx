@@ -1,0 +1,81 @@
+---
+title: 04 Checkout And Restore
+description: Separate hydration, materialization, and export, then follow safe SQLite replacement.
+---
+
+## Three different actions
+
+| Action | Destination | Moves ref/index | Replaces tracked worktree |
+| --- | --- | ---: | ---: |
+| hydration | local object/page/payload store | no | no |
+| materialization | repository-relative physical path | depends on caller | yes |
+| export | caller-selected independent path | no | no |
+
+Row diff can create a temporary `materialized_compat` database. It lives in an isolated temporary
+directory and is not application-worktree materialization.
+
+## Checkout starts from canonical state
+
+`switch`, revision checkout, restore, hard reset, pull, clone, and some merge operations compute a
+checkout plan. Before applying it, Graft resolves and validates tree/blob data, hydrates missing
+immutable dependencies, checks collisions, determines affected paths, and performs replacement
+preflight before changing repository state where ordering permits.
+
+Planning may hydrate data, but it may not move `HEAD`, modify the index, or touch application files.
+
+## Close application handles first
+
+Checkout installs a new ordinary SQLite file and does not preserve its inode. Even an idle
+connection can continue referring to the old file description. The safe host lifecycle is:
+
+```text
+drain transactions / optionally checkpoint
+          |
+close affected application SQLite handles
+          |
+run materializing Graft operation
+          |
+success: reopen
+failure: inspect status and path results, reconcile, then reopen or retry
+```
+
+`operationMaterializesWorktree(name)` is a conservative pre-call gate. `true` means the operation
+can materialize for some input. Post-call `worktree_paths` reports the exact effect.
+
+## Replacing one SQLite path
+
+The adapter validates a regular file, probes an exclusive transaction with bounded timeout,
+checkpoints and truncates WAL when required, returns to rollback-journal mode, removes regular
+sidecars, and holds a replacement guard. It writes the complete snapshot to a unique same-directory
+temporary file, flushes it, atomically renames/replaces the path, and updates its volume binding.
+
+An active writer, long transaction, busy WAL, non-regular sidecar, or path collision fails without
+overwriting the main file.
+
+## Multi-path checkout is not one filesystem transaction
+
+Affected SQLite files are moved to private `.graft/tmp/workspace-checkout-*` backups. Graft then
+materializes SQLite, artifacts, and bindings path by path. A later failure triggers reverse-order
+restoration. One rename may be atomic; the whole multi-path checkout is not. After failure, inspect
+`graft status` and returned path actions rather than guessing from one visible file.
+
+## Disabling SQLite projection
+
+`worktree.materialize_sqlite = false` stops ordinary checkout plans from projecting SQLite
+snapshots. Canonical repository state and volume bindings still change, and explicit resolution or
+ordinary artifacts can still write the worktree. Use the operation gate, not this setting alone, to
+manage application handles.
+
+| Operation | Can materialize | Main change |
+| --- | ---: | --- |
+| status, log, diff, fetch | no | read or local repository storage only |
+| add, commit | no | index/objects/ref |
+| restore staged, mixed reset | no | index/ref classification |
+| switch, checkout, path restore | yes | apply checkout plan |
+| hard reset, pull, clone | yes | canonical state plus projection |
+| planMerge | no | read-only plan, optional hydration |
+| applyMerge, resolution, abort | yes | result or restored files |
+| export | no | independent destination |
+
+Non-materializing does not mean no disk writes: fetch writes stores and commit writes objects/refs.
+It only promises not to replace application-owned tracked paths.

@@ -8,6 +8,23 @@ Graft 有两层 diff：
 - repository diff：比较 app-state tree 里的路径
 - row diff：把 modified SQLite snapshot 展开成 table/row/schema changes
 
+## 直接比较两个 SQLite 文件
+
+当数据库只是两个普通文件，而不是 Graft repository 的两个 side 时，使用
+`--no-index`：
+
+```bash
+graft diff --no-index old.sqlite new.sqlite
+graft diff --no-index --rows old.sqlite new.sqlite
+graft diff --no-index --rows --json old.sqlite new.sqlite
+```
+
+命令只接受两个普通 SQLite database file，不需要也不会发现 Graft repository。
+默认输出说明两个物理 SQLite snapshot 是否不同；`--rows` 会把 changed pair 展开为
+schema、table、row 和 opaque changes。两侧都通过 SQLite online backup 取得一致
+snapshot，并包含已提交的 WAL frames。`--staged`、`--root`、`--kind`、`--content`
+等 repository selector 不能与 `--no-index` 一起使用。
+
 ## 比较 Worktree 和 Staged
 
 ```bash
@@ -89,5 +106,5 @@ modified: app.sqlite
       new: [Null, Text("write quickstart"), Text("done")]
 ```
 
-普通应用 UI 应使用 repository commits 和 revspecs。LSN 级 debug diff 放在
-[快照存储与 LSN](/zh/docs/internals/snapshot-storage-lsns/)。
+普通应用 UI 应使用 repository commits 和 revspecs。LSN 与底层 page history 见
+[SQLite 如何变成快照](/zh/docs/graft-book/sqlite-snapshots/)。

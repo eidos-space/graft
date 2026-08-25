@@ -1,0 +1,108 @@
+---
+title: 03 从 add 到 commit
+description: 按执行顺序解释 init、SQLite/file staging、index overlay、tree/commit object 和 ref 更新。
+---
+
+## `graft init`：只建立控制结构
+
+`init` canonicalize worktree 根目录，创建 `.graft` 布局和默认配置，并让 `HEAD` symbolic
+指向默认 branch `main`。此时：
+
+```text
+HEAD = ref: refs/heads/main
+refs/heads/main = 尚不存在
+index = empty
+objects = empty
+storage = empty
+```
+
+这叫 unborn `HEAD`。`init` 不会创建 `app.sqlite`，也不会扫描并自动跟踪工作区。
+
+## `graft add app.sqlite` 的完整顺序
+
+1. **解析 path identity**：把参数归一为仓库相对 UTF-8 path，拒绝 `.graft` 内部和 sidecar。
+2. **识别内容类型**：检查普通文件与 SQLite header；已跟踪 SQLite 路径若变成非 SQLite
+   内容，会报错而不是静默改成普通文件。
+3. **选择 baseline**：优先使用 index 中已 staged snapshot，否则使用 `HEAD` 版本。
+4. **一致捕获**：通过 SQLite backup 得到 standalone private image，合并已提交 WAL。
+5. **比较 4 KiB chunk**：复用 baseline 中未变 page，只为净变化建立 storage delta。
+6. **提交 storage state**：若有变化，批量写 segment pages 与 storage commit，得到新 snapshot。
+7. **写 snapshot blob**：把 volume、page count、log ranges 与 commit hashes 编码成
+   `sqlite-snapshot-v1` repository blob。
+8. **更新 index**：为 `app.sqlite` 写 stage 0 entry，包含 mode、blob object ID 和解析后的
+   snapshot state。
+9. **清理 observation**：该 path 的 dirty marker 被清除；后续 status 仍可验证物理文件。
+
+这里已经写入了 immutable storage 和 blob object，但 branch ref 仍停在旧 commit。
+
+## 普通文件走另一条 staging 通道
+
+`graft add settings.json` 会读取精确 bytes，判断 UTF-8/text 或 binary，再按配置选择：
+
+- 小文本通常写 `file-blob-v2`，bytes 以 Base64 包在 blob 中；
+- binary、超过阈值的文本、或匹配 `files.external_paths` 的路径，先把原始 bytes 写入
+  `store/files/??/*`（按 content hash fan-out），再写 `large-file-pointer-v1` blob；
+- index stage 0 指向相应 blob object ID。
+
+这两条通道最后都变成“path → typed blob”的 staged entry，所以一个 commit 可以原子地
+表达数据库、配置和附件属于同一应用版本。
+
+## 为什么 add 以后还可以继续改数据库
+
+因为 index 保存的是 add 时已经捕获的 snapshot，而不是“稍后再读取这个路径”的承诺：
+
+```text
+10:00  app.sqlite = A
+10:01  graft add app.sqlite       index = snapshot(A)
+10:02  app writes transaction B   worktree = B, index 仍是 A
+10:03  graft commit               commit = A
+```
+
+结果不是丢数据：B 仍留在 worktree，并在 commit 后被 status 报告为 unstaged change。
+这与 Git 的 index 语义一致，也是可重复 commit 的关键。
+
+## `graft commit` 的完整顺序
+
+1. 读取 `HEAD` tree 和 index；若有 stage 1/2/3 conflict，立即拒绝。
+2. 把 stage 0 当作 `HEAD` overlay：添加、替换或删除 path，得到完整 next tree state。
+3. 为所有 SQLite path 确认/写入 snapshot blob；普通 artifact blob 已在 add 时写好。
+4. 按 canonical path 排序，写 tree object。
+5. 写 commit object，记录 tree、parents、签名、message、表摘要与 path change counts。
+6. attached HEAD 时更新当前 branch ref；detached HEAD 时更新 `HEAD` 本身。
+7. 追加相应 reflog，清 active merge state（如这是 merge completion）。
+8. 清空 index。
+
+关键顺序是“**先 immutable objects，后 mutable ref**”。如果在移动 ref 前失败，新 object
+最多成为暂时不可达数据；branch 不会指向缺少 tree/blob 的半个 commit。
+
+## commit 不做的事
+
+普通 `commit` 不会：
+
+- 重新读取或重新 backup SQLite worktree；
+- checkpoint 应用的 WAL；
+- 替换 `app.sqlite` 的 inode；
+- 自动 stage 10:02 以后发生的变化；
+- push remote；
+- 把多个本地 metadata 文件提升成一个 filesystem transaction。
+
+## 状态变化表
+
+| 时刻 | worktree | index | storage/objects | `main` ref |
+| --- | --- | --- | --- | --- |
+| init 后 | 未跟踪文件 | empty | empty | unborn |
+| SQLite transaction 后 | 新 bytes/WAL | empty | unchanged | unchanged |
+| add 后 | 不改写 | snapshot A | 写 page delta + blob | unchanged |
+| add 后又 transaction | snapshot B | 仍是 A | unchanged | unchanged |
+| commit 后 | 仍是 B | cleared | tree + commit(A) | 移到 commit(A) |
+| 再 add/commit | B | B 后 cleared | 新 delta/blob/tree/commit | 移到 commit(B) |
+
+## 当前持久性边界
+
+refs、`HEAD`、config、worktree observation 与 external payload replacement 使用 sibling
+temp + rename。loose object、index 和 merge record 的某些写入仍是 direct write；读取时
+会校验 object hash 或完整 parse，但当前不承诺这些写入 crash-atomic，也没有全链路
+`fsync` durability 契约。reflog append 与 ref replacement 也不是同一 transaction。
+
+所以“进程返回成功后的逻辑顺序”和“突然断电时每个目录项都已落盘”不是同一保证。
+这会在[远端、失败与恢复](/zh/docs/graft-book/remotes-and-recovery/)中继续讨论。

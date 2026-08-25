@@ -1,0 +1,109 @@
+---
+title: "Inside Graft: How Data Moves"
+description: Build a bottom-up mental model of Graft by following one complete data lifecycle.
+---
+
+This booklet answers one question: **after an application commits a SQLite transaction, how does
+that change become Graft history that can be compared, merged, synchronized, and restored?**
+
+It follows one repository containing `app.sqlite`, `settings.json`, and a large
+`attachments/report.pdf`. These contents take different storage paths and meet in one repository
+commit.
+
+## Graft maintains two histories
+
+This is the most important fact in the book.
+
+```text
+Application history (repository history)
+branch/ref -> repository commit -> tree -> path blob
+                                           |
+                                           +-- file bytes / external pointer
+                                           +-- SQLite snapshot descriptor
+
+SQLite storage history
+snapshot descriptor -> VolumeId + ordered log ranges
+                                  |
+                                  +-- (LogId, LSN) storage commits
+                                                 |
+                                                 +-- changed 4 KiB pages
+```
+
+A repository commit says which paths make up an application version. A storage commit says which
+4 KiB pages changed from a prior SQLite state. They are not the same commit and are not one-to-one:
+
+- one repository commit can reference several databases and ordinary files;
+- `graft add app.sqlite` can create a storage commit before a repository commit exists;
+- a no-op add can reuse a snapshot without creating a storage commit;
+- a branch ref points to a repository commit, never directly to an LSN.
+
+## The five states of one change
+
+For an insert into a `notes` table:
+
+```text
+1. worktree
+   ordinary SQLite changes app.sqlite and perhaps app.sqlite-wal
+          |
+          | graft add
+          v
+2. consistent private image (temporary)
+   SQLite online backup captures committed transactions
+          |
+          | 4 KiB chunk comparison
+          v
+3. storage snapshot
+   changed pages enter an immutable segment and storage commit
+          |
+          | snapshot descriptor
+          v
+4. index
+   stage 0 for app.sqlite names that exact snapshot
+          |
+          | graft commit
+          v
+5. repository history
+   write blob -> tree -> commit, then move refs/heads/main
+```
+
+The private image is only a capture boundary. The index is the authority for the next commit.
+`commit` does not reopen a database that may have changed since `add`.
+
+## Four questions for every operation
+
+1. **Which state does it read?** Worktree, index, a commit, or a side of an active merge?
+2. **Which state does it write?** Storage, objects, index, ref, merge journal, remote, or worktree?
+3. **What identifies the result?** Byte hash, object ID, snapshot descriptor, or `(LogId, LSN)`?
+4. **What remains authoritative after failure?** A ref, index, merge journal, or rebuildable cache?
+
+## How the documentation is divided
+
+| Goal | Section | What it answers |
+| --- | --- | --- |
+| Get started | Quickstart | What is the shortest working path? |
+| Complete a task | Guides | Which commands and sequence should I use? |
+| Build a mental model | Inside Graft | Why does data move this way, and where are failure boundaries? |
+| Look up an exact contract | Reference | What are the exact fields, options, URIs, policies, and protocol shapes? |
+
+One owner explains each fact in full. Other pages keep only the summary needed to link there. The
+former Concepts and Internals pages have been folded into this book, with redirects for old URLs.
+
+## Reading order
+
+1. [Repository And Objects](/docs/graft-book/repository-and-objects/)
+2. [SQLite Snapshots](/docs/graft-book/sqlite-snapshots/)
+3. [Stage And Commit](/docs/graft-book/stage-and-commit/)
+4. [Checkout And Restore](/docs/graft-book/checkout-and-restore/)
+5. [Diff And Merge](/docs/graft-book/diff-and-merge/)
+6. [Remotes And Recovery](/docs/graft-book/remotes-and-recovery/)
+7. [Hands-On Lab](/docs/graft-book/hands-on-lab/)
+
+## Contract versus implementation
+
+Path identity, object/ref/index semantics, snapshot content, merge results, and remote publication
+order are observable contracts. Fjall key encodings, cache names, Rust module boundaries, and temp
+file names are implementation details. They are useful for debugging but not product integration.
+
+There is no supported repository-control compatibility layer based on SQLite PRAGMAs. Supported
+integration surfaces are the `graft` CLI and its JSON output, the Node.js/Electron SDK, and the HTTP
+remote packages.

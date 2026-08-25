@@ -1,0 +1,140 @@
+---
+title: 01 仓库、对象与引用
+description: 拆开 .graft，理解 immutable object、mutable ref、index 和工作区各自负责什么。
+---
+
+## 一个仓库不是一个数据库
+
+Graft repository 是一个普通 worktree 加上 `.graft/`。worktree 文件供应用使用；
+`.graft/` 保存历史、暂存状态、refs、SQLite page storage 和恢复记录。
+
+```text
+project/
+  app.sqlite                  应用正在打开的普通 SQLite 文件
+  settings.json               普通文件
+  attachments/report.pdf      普通文件
+  .graft/
+    config.toml
+    HEAD
+    refs/
+    logs/
+    objects/
+    store/
+    index/
+    locks/
+    tmp/
+```
+
+repository path 是规范化的 UTF-8 相对路径，例如 `attachments/report.pdf`。空路径、
+`.`、`..`、绝对路径和任何指向 `.graft` 内部的路径都不是合法 identity。
+
+## `.graft/` 的地图
+
+| 路径 | 保存什么 | 性质 |
+| --- | --- | --- |
+| `config.toml` | format、branch、文件策略、merge policy、remote 地址 | mutable metadata |
+| `HEAD` | 当前 branch 的 symbolic ref，或 detached commit | mutable pointer |
+| `refs/heads/*` | 本地 branch 指向的 repository commit ID | mutable pointer |
+| `refs/remotes/*` | 最近 fetch 到的远端位置 | mutable pointer |
+| `refs/tags/*` | lightweight 或 annotated tag | mutable pointer |
+| `logs/HEAD`、`logs/refs/*` | ref 更新记录 | append-only recovery aid |
+| `objects/??/*` | blob、tree、commit、tag | content-addressed immutable data |
+| `objects/pack/*` | 打包后的 repository objects | immutable data |
+| `store/fjall/` | SQLite volume、log、storage commit、segment/page | storage engine data |
+| `store/files/` | external artifact 的原始 bytes | content-addressed payload |
+| `index/state.toml` | stage 0 与 merge stages | mutable staged truth |
+| `index/worktree.toml` | dirty/deleted observation | 可重建的优化信号 |
+| `MERGE_HEAD`、`ORIG_HEAD` | active merge 的 target 与原始 head | recovery metadata |
+| `locks/`、`tmp/`、`cache/` | 协调、临时替换与可重建缓存 | 非 canonical state |
+
+不要把“在 `.graft/` 里”都理解为同一种持久性。objects 和快照内容靠 content identity
+校验；refs 与 index 是会变化的控制状态；cache 删除后应当只损失性能。
+
+## repository object graph
+
+repository history 与 Git 类似，是一张由 hash 连接的不可变图：
+
+```text
+refs/heads/main
+       |
+       v
+commit C2 ----parent----> commit C1
+   |                         |
+   tree                      tree
+   |                         |
+   +-- app.sqlite ----------> sqlite-snapshot-v1 blob
+   +-- settings.json -------> file-blob-v2
+   +-- report.pdf ----------> large-file-pointer-v1
+```
+
+loose object 的 canonical envelope 是：
+
+```text
+graft-object 1 <kind> <payload-length>\0<payload>
+```
+
+`kind` 是 `blob`、`tree`、`commit` 或 `tag`。整个 envelope 的 BLAKE3 是 64 位十六
+进制 object ID，文件按前两个字符 fan-out 到 `objects/ab/cdef...`。读取 object 时会
+重新计算并验证 ID；同样内容得到同样 ID，已有 object 不需要覆盖。
+
+### 三种 path content
+
+| worktree 内容 | tree mode | blob 表示 | 真正 bytes 在哪里 |
+| --- | ---: | --- | --- |
+| SQLite database | `160000` | `sqlite-snapshot-v1` | `store/fjall` 的 page storage |
+| inline 文本/小文件 | `100644` | `file-blob-v2` | blob 自身的 Base64 payload |
+| external 文件 | `100644` | `large-file-pointer-v1` | `store/files/??/*`，按 content hash fan-out |
+
+external pointer 记录内容 hash 与大小。pointer object 存在不代表 payload bytes 一定已
+hydrate；因此“历史知道这个文件”和“本机能读出这个文件”是两个不同问题。
+
+## ref：可变指针，而不是内容
+
+object 不会被原地修改。一次新 commit 会写新 object，随后把
+`refs/heads/main` 从旧 commit ID 替换为新 ID：
+
+```text
+before: main -> C1
+write:          C2(parent=C1)
+after:  main -------------> C2
+```
+
+`HEAD` 通常保存 `refs/heads/main` 这样的 symbolic ref；detached 状态才直接保存 commit。
+首次 commit 之前，`HEAD` 可以指向尚不存在的 `main`，这叫 unborn branch。
+
+ref 更新是 mutable publication boundary。高层操作先写齐 immutable content，最后才移动
+ref；带 expected value 的更新遇到并发变化会报告 stale，而不是覆盖另一位 writer。
+
+## index：HEAD 上的一层 overlay
+
+正常状态下，index 不保存完整 tree 的副本。它只记录相对 `HEAD` 的 staged overlay：
+
+- stage 0 有 object：新增或替换该 path；
+- stage 0 没有 object：删除该 path；
+- index 没有该 path：沿用 `HEAD` 中的版本。
+
+merge 时同一路径可以出现：
+
+| stage | 含义 |
+| ---: | --- |
+| 1 | Base，共同祖先 |
+| 2 | Ours，合并前的本地版本 |
+| 3 | Theirs，目标版本 |
+| 0 | 已解决、下一 commit 要使用的结果 |
+
+只要还存在 1/2/3 stage，普通 `commit` 就必须失败。缺少某个 stage 表示那一侧删除或
+不存在，不是损坏。
+
+## 权威状态速查
+
+| 你要回答的问题 | 应查看 |
+| --- | --- |
+| 应用现在正在读写什么 | worktree physical file |
+| 下一次 commit 会包含什么 | `HEAD` 加 index stage 0 overlay |
+| 某个历史版本包含什么 | commit → tree → blob graph |
+| SQLite blob 的具体 bytes 是什么 | snapshot descriptor → storage commits/pages |
+| 当前 branch 在哪里 | `HEAD` 与 `refs/heads/*` |
+| merge 冲突双方是什么 | index stages + durable merge journal |
+| 本地缺失内容能否下载 | object/payload/snapshot identity + remote availability |
+
+下一章会沿着 `sqlite-snapshot-v1` blob 继续向下，直到真正的 4 KiB page。

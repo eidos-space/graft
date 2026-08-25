@@ -1,0 +1,191 @@
+---
+title: 07 动手观察每一次变化
+description: 用一个最小仓库亲手观察 worktree、index、objects、storage、refs、diff 与 checkout 的变化。
+---
+
+这组实验刻意不使用内部 Rust API。目标不是背文件格式，而是训练一种习惯：每运行一条
+命令，先预测 worktree、index、immutable store 和 ref 中谁会变化，再验证。
+
+## 0. 创建隔离目录
+
+```bash
+mkdir graft-book-lab
+cd graft-book-lab
+graft init
+```
+
+检查初始布局：
+
+```bash
+find .graft -maxdepth 3 -print | sort
+cat .graft/HEAD
+```
+
+你应看到 `HEAD` 指向 `refs/heads/main`，但该 ref 还没有 commit ID。
+
+## 1. 只修改 worktree
+
+```bash
+graft sql --db app.sqlite \
+  "CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT NOT NULL);"
+graft sql --db app.sqlite \
+  "INSERT INTO notes(body) VALUES ('first');"
+printf '{"theme":"paper"}\n' > settings.json
+graft status --json
+```
+
+现在只有 worktree 发生了应用级变化。暂停并验证：
+
+```bash
+find .graft/objects -type f | sort
+find .graft/store -type f | sort | sed -n '1,40p'
+```
+
+初始化产生的 storage engine 文件不代表已经有 staged snapshot；以 `status` 和 index 为准。
+
+## 2. Stage 一致 snapshot
+
+```bash
+graft add app.sqlite
+graft add settings.json
+graft status --json
+```
+
+检查三类结果：
+
+```bash
+sed -n '1,240p' .graft/index/state.toml
+find .graft/objects -type f | sort
+du -sh .graft/store/fjall .graft/store/files .graft/objects
+```
+
+此时应能观察到：
+
+- index 中有两个 stage 0 path；
+- `app.sqlite` entry 指向 SQLite snapshot blob；
+- `settings.json` 指向 inline file blob；
+- `refs/heads/main` 仍不存在或没有 commit ID。
+
+## 3. 证明 commit 消费 index，而不是重新读 worktree
+
+在不再次 add 的情况下写第二行：
+
+```bash
+graft sql --db app.sqlite \
+  "INSERT INTO notes(body) VALUES ('second, not staged yet');"
+graft commit -m "seed app state"
+graft status --json
+```
+
+检查 ref：
+
+```bash
+cat .graft/HEAD
+cat .graft/refs/heads/main
+graft show --json HEAD
+graft diff --json
+```
+
+预期：commit 只含第一次 add 时的 snapshot；第二行仍作为 unstaged worktree change。若要
+直接验证历史内容，可以导出到独立文件：
+
+```bash
+graft export --source HEAD --output head.sqlite app.sqlite
+sqlite3 head.sqlite 'SELECT * FROM notes;'
+sqlite3 app.sqlite 'SELECT * FROM notes;'
+```
+
+两个查询的差异就是 index 边界。
+
+## 4. 观察 page delta 与 repository commit
+
+记录当前大小并提交第二行：
+
+```bash
+du -sk .graft/store/fjall .graft/objects
+graft add app.sqlite
+graft commit -m "add second note"
+du -sk .graft/store/fjall .graft/objects
+graft log --json
+graft diff --json --rows HEAD~1 HEAD app.sqlite
+```
+
+不要期待目录大小恰好只增加一个 SQLite page：Fjall、索引和 metadata 有自己的开销。
+应观察的语义是 row diff 只有一个 insert，而新 repository commit 的 parent 是旧 commit；
+底层 storage 只为净变化 page 建立新 segment，而不是把历史定义为两个完整文件副本。
+
+## 5. 观察 branch 只是另一个 ref
+
+```bash
+graft branch experiment
+find .graft/refs/heads -type f -maxdepth 2 -print -exec sed -n '1p' {} \;
+graft switch experiment
+cat .graft/HEAD
+```
+
+创建 branch 主要是新增 mutable pointer。若两个 branch 指向同一 commit，objects 和
+SQLite pages 不会复制一份。
+
+在 experiment 上修改并提交：
+
+```bash
+graft sql --db app.sqlite \
+  "UPDATE notes SET body='changed on experiment' WHERE id=1;"
+graft add app.sqlite
+graft commit -m "edit first note"
+graft diff --json --rows main experiment app.sqlite
+```
+
+## 6. 观察 checkout materialization
+
+先确保没有应用持有 `app.sqlite` 的长期 connection，然后：
+
+```bash
+graft switch main
+sqlite3 app.sqlite 'SELECT * FROM notes ORDER BY id;'
+graft switch experiment
+sqlite3 app.sqlite 'SELECT * FROM notes ORDER BY id;'
+```
+
+每次 switch 都从目标 snapshot 重建普通 SQLite 文件，并更新 binding。不要用 inode 是否
+相同判断版本是否变化；使用 branch/ref、snapshot identity 和 SQL 查询结果。
+
+## 7. 可选：观察 remote publication
+
+```bash
+mkdir ../graft-book-remote
+graft remote add origin "fs://$(cd ../graft-book-remote && pwd)"
+graft push origin experiment
+find ../graft-book-remote -maxdepth 4 -type f | sort | sed -n '1,120p'
+```
+
+你会看到 immutable objects/storage 与 mutable refs 是分开的。push 成功后，目标 ref 才让
+上传的 commit graph 可达。
+
+## 每次卡住时使用这张清单
+
+```text
+1. 当前 HEAD 是 symbolic branch 还是 detached commit？
+2. branch ref 指向哪个 repository commit？
+3. index 是否覆盖该 path？是否有 stage 1/2/3？
+4. worktree bytes 与 index snapshot 是否已经分叉？
+5. 需要的 blob、payload、storage page 是否已 hydrate？
+6. 这条操作是否可能 materialize，应用 handle 是否已关闭？
+7. 如果失败，ref/index/merge journal 中哪个仍是 canonical state？
+```
+
+## 源码路标：需要验证时从哪里读
+
+| 问题 | 规范 owner | 主要实现入口 |
+| --- | --- | --- |
+| `.graft`、object、ref、index | `docs/specs/graft-repository-1.0.md` | `crates/graft/src/repo.rs`、`repo/object.rs`、`repo/staging.rs`、`repo/worktree_state.rs` |
+| 4 KiB page、log、LSN、snapshot | `docs/specs/graft-storage-snapshots-1.0.md` | `snapshot.rs`、`volume_reader.rs`、`volume_writer.rs`、`local/fjall_storage.rs` |
+| 物理 SQLite 的一致捕获与替换 | `docs/specs/graft-worktree-materialization-1.0.md` | `crates/graft-sqlite/src/pragma/sqlite_worktree.rs`、`repo_checkout.rs` |
+| path/row/schema diff | `docs/specs/graft-diff-1.0.md` | `crates/graft-sqlite/src/row_level_diff.rs` |
+| three-way merge 与 durable conflict | `docs/specs/graft-merge-1.0.md` | `crates/graft/src/repo/merge.rs`、`crates/graft-sqlite/src/row_merge.rs` |
+| push/fetch/pull 与 remote CAS | `docs/specs/graft-remote-sync-1.0.md` | `crates/graft/src/repo/sync.rs`、`repo/remote_objects.rs`、`packages/graft-remote` |
+
+先读规范确认“必须是什么”，再读入口函数确认“现在怎样实现”，最后用测试确认“哪些边界有
+可执行证据”。不要从 Fjall 私有 key 或临时文件名反推公开契约。
+
+完成这组实验后，按上面的源码路标回到规范和实现，就能把类型放回正确的生命周期位置。

@@ -1,0 +1,83 @@
+---
+title: 06 Remotes And Recovery
+description: Understand immutable dependencies, CAS ref publication, pull as fetch plus merge, and recovery boundaries.
+---
+
+## Three remote state classes
+
+```text
+repository objects / packs       immutable
+SQLite commits / segments/files  immutable
+HEAD / refs/**                    mutable transactional metadata
+```
+
+Immutable data can be content-verified and retried. A branch ref is the publication point that
+makes a history visible, so it requires compare-and-swap (CAS).
+
+## Push dependencies first, ref last
+
+1. Publish SQLite commits, segments, and pages.
+2. Publish external payload bytes.
+3. Publish repository objects or pack/index.
+4. CAS the destination branch against the value observed at start.
+
+If CAS fails, the remote may retain unreachable immutable data while its branch still names a
+complete old history. Publishing the ref first would expose a commit with missing dependencies and
+is forbidden. Force only relaxes fast-forward policy; it does not remove expected-value CAS.
+
+## Fetch, pull, and clone
+
+Fetch downloads the selected graph and updates `refs/remotes/<remote>/<branch>` with expected state.
+It does not move the current branch, modify the index, merge, or materialize. Metadata can arrive
+before all historical pages or payload bytes; later reads may hydrate lazily.
+
+Pull is exactly:
+
+```text
+fetch -> merge plan -> apply
+```
+
+It inherits fast-forward, three-way, conflicts, stale checks, materialization, and handle rules.
+
+Clone initializes a new repository, configures the remote, obtains a stable ref and immutable
+dependencies, establishes tracking/upstream, then checks out. It does not silently overwrite a
+non-empty destination.
+
+## Unknown publication outcome
+
+When a CAS request was sent but its acknowledgement is lost, the server may have rejected or
+committed it. Do not publish a different successor blindly. Read the remote ref and reconcile:
+
+- expected new value means success;
+- unchanged old value means known failure;
+- another value means concurrency/divergence and requires fetch plus a new plan.
+
+Timeout and cancellation also only guarantee safe boundaries. Cancellation after request dispatch
+does not prove the server did nothing.
+
+## Failure authority table
+
+| Failure point | Possible residue | Authority |
+| --- | --- | --- |
+| private add backup | temp file | worktree and old index |
+| storage commit before index | unreachable storage/blob | old index/ref |
+| tree/commit before ref | unreachable objects | old ref |
+| ref before reflog append | new branch, missing reflog line | ref and object graph |
+| multi-path checkout | backups or partial restoration | canonical repository state plus status |
+| active merge | stages, journal, candidate | index and merge journal |
+| remote immutable upload before CAS failure | unreachable remote data | remote ref |
+
+Reads validate object IDs, expected storage commit hashes, and payload content hash/size. Corruption
+must be reported; a missing page cannot be synthesized as zero and a missing payload is not empty.
+
+## Separate maintenance domains
+
+| Domain | Roots | Removes |
+| --- | --- | --- |
+| SQLite storage GC | index, heads, branches, merge state, remote refs, tags | unreachable storage data |
+| payload prune | index and reachable external pointers | unreachable `store/files` bytes |
+| repository object GC | object graph | no public loose-object GC in 1.0 |
+
+Recovery order: stop writes, close affected SQLite handles, inspect `status --json`, finish or abort
+an active merge from its journal, reconcile uncertain remote refs, repair verified missing content,
+and only then clean data proven unreachable.
