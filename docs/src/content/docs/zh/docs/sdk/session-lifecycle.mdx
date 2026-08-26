@@ -1,0 +1,71 @@
+---
+title: 会话与工作区安全
+description: 协调 Graft 仓库会话、应用写入者和会改变工作区的操作。
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+一个 `RepositorySession` 拥有一个仓库 runtime。同一会话中的调用会串行执行，
+但应用仍然拥有工作区中的 SQLite 连接和普通文件。
+
+## 保持单一仓库写入者
+
+同一时间只能有一个 SDK 会话或外部 Graft 写入者拥有仓库。第二个写入者会收到
+`GRAFT_SDK_REPOSITORY_BUSY`。
+
+不要立即循环重试。应关闭失效会话、停止外部 Graft 进程，或提示用户关闭另一个
+应用实例。
+
+## 识别会替换文件的操作
+
+检查、暂存、提交、fetch 和 push 不会替换被跟踪的工作区文件。以下操作可能会：
+
+- `restore` 与 `restorePaths`
+- `pull` 与 `cloneRepository`
+- `applyMerge`
+- 写入已选结果的 merge resolution 方法
+- `continueMerge` 与 `abortMerge`
+
+执行会改变工作区的操作前：
+
+1. 停止新的应用写入。
+2. 等待活动事务结束。
+3. 关闭可能被替换路径的 SQLite 句柄。
+4. 运行 SDK 操作。
+5. 重新打开受影响的句柄并校验结果状态。
+
+可以用 `operationMaterializesWorktree(name)` 实现保守的调用前门禁。变更操作完成后
+还会返回 `worktree_paths`，用于限定刷新范围。
+
+<Aside type="note" title="暂存不会改写工作区">
+  `addAll()`、`stagePaths()` 和 `commit()` 会捕获或推进仓库状态，但不会替换
+  当前 SQLite 文件。应用可以保持原有 SQLite 句柄；如果需要确定性的检查点，
+  应在暂存前定义清楚事务边界。
+</Aside>
+
+## 关闭与重新打开
+
+`close()` 会拒绝排队中的新工作、等待正在执行的操作、释放 runtime，并且可以重复
+调用。`reopen()` 会从持久化仓库状态重建 runtime。
+
+Node.js 进程崩溃后，操作系统会释放存储锁。启动替代进程并打开新会话即可，
+不需要 daemon lease 或 PID 恢复文件。
+
+## 取消长时间操作
+
+异步 SDK 方法接受 `AbortSignal`。取消后会抛出 `AbortError`，保留的会话仍可继续
+使用。多路径操作被取消时可能已经完成一部分，因此重试前先重新读取状态。
+
+## 按错误码处理失败
+
+使用 `error.code`，不要解析消息文本。
+
+| 错误码 | 处理方式 |
+| --- | --- |
+| `GRAFT_SDK_REPOSITORY_BUSY` | 找到并关闭另一个仓库写入者。 |
+| `GRAFT_SDK_SESSION_CLOSED` | 打开新会话，或重新打开现有会话。 |
+| `GRAFT_SDK_SESSION_CLOSING` | 等待关闭完成，不再加入新操作。 |
+| `GRAFT_SDK_REPOSITORY_STALE` | 刷新 HEAD 或 merge state，再重建带保护的操作。 |
+| `GRAFT_SDK_REPOSITORY_COMMAND` | 检查结构化仓库命令错误。 |
+
+完整方法与结果类型以 `@eidos.space/graft` 随包提供的声明为准。

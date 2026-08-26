@@ -239,7 +239,8 @@ ABI 稳定不等于 binary 跨 OS/arch/libc。CommonJS root package 要求 Node.
 依次从 `GRAFT_SDK_NATIVE_PATH`、colocated binary 或 exact platform optional package
 加载；当前覆盖 macOS arm64/x64、Linux
 glibc arm64/x64、Windows x64。没有 browser fallback、install compile 或 remote
-binary download。Electron 应在 utility process 使用，并把 `.node` 留在 ASAR 外。
+binary download。打包后的 Node.js 应用必须让 Node module loader 能访问所选的
+`.node` 文件。
 
 ## 12. Browser/WASM profile
 

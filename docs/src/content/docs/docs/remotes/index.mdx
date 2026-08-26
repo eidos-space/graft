@@ -1,0 +1,67 @@
+---
+title: Remote Service
+description: Choose a Graft remote backend or integrate the HTTP remote protocol into your service.
+---
+
+import { CardGrid, LinkCard } from "@astrojs/starlight/components";
+
+A Graft remote stores repository objects, refs, SQLite snapshot data, and
+external payloads outside the local `.graft/` directory. It enables fetch,
+pull, push, and clone; it does not replace SQLite transactions or provide a
+real-time operation log.
+
+## Choose a backend
+
+| Backend | Use it for |
+| --- | --- |
+| `memory` | Unit tests and short-lived fixtures. |
+| `fs://` | Local development, mounted storage, and end-to-end smoke tests. |
+| `s3://` or `s3_compatible://` | Direct object-storage integration controlled by the application environment. |
+| `https://` | Product-facing sync with your authentication, authorization, limits, and tenant routing. |
+
+Use [Remote URIs](/docs/reference/remote-uris/) for exact syntax and credential
+rules.
+
+## Use an existing remote
+
+The CLI and SDK can both configure and use remotes. Start with the workflow
+guide if the service or storage backend already exists.
+
+<LinkCard
+  title="Sync with remotes"
+  href="/docs/guides/sync-remotes/"
+  description="Configure a remote, push, fetch, pull, and clone."
+/>
+
+## Build an HTTP remote
+
+Graft separates protocol behavior from framework and storage concerns:
+
+| Package | Responsibility |
+| --- | --- |
+| `@eidos.space/graft-remote` | Fetch-based protocol engine, validation, and backend interfaces. |
+| `@eidos.space/graft-remote-hono` | Hono routing adapter. |
+| `@eidos.space/graft-remote-cloudflare` | R2 and SQLite Durable Object backend helpers. |
+
+Your host service still owns authentication, authorization, repository naming,
+request limits, secrets, routing, and deployment.
+
+<CardGrid>
+  <LinkCard
+    title="Build an HTTP remote"
+    href="/docs/guides/http-remote/"
+    description="Mount the protocol engine and connect a storage backend."
+  />
+  <LinkCard
+    title="Read the protocol"
+    href="/docs/reference/remote-protocol/"
+    description="Implement or verify the versioned HTTP wire contract."
+  />
+</CardGrid>
+
+## Security boundary
+
+Remote credentials are explicit client or adapter inputs. Do not store bearer
+tokens in repository config, remote URLs, logs, caches, or result payloads.
+Production HTTP remotes should use HTTPS and enforce repository-level access
+for every discovery, read, and write operation.

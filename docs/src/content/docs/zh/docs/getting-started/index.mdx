@@ -1,0 +1,64 @@
+---
+title: 选择接入方式
+description: 根据应用架构选择合适的 Graft 接入面。
+---
+
+import { CardGrid, LinkCard } from "@astrojs/starlight/components";
+
+Graft 提供三种开发者接入面。它们使用同一套仓库模型，也可以组合在一个产品中。
+
+| 从这里开始 | 适用情况 |
+| --- | --- |
+| Graft CLI | 正在评估 Graft、编写脚本，或可以运行短生命周期的子进程。 |
+| Node.js SDK | 应用需要在进程内保持常驻仓库会话。 |
+| 远端服务 | 仓库需要通过你运营的基础设施进行同步。 |
+
+## Graft CLI
+
+CLI 是建立可用仓库的最短路径，也是 shell 脚本和读取 `--json` 输出的服务所使用的
+自动化边界。
+
+<LinkCard
+  title="运行 CLI 快速开始"
+  href="/zh/docs/quickstart/cli/"
+  description="创建仓库、暂存 SQLite 数据库、查看行级差异并恢复数据。"
+/>
+
+## Node.js SDK
+
+当 Node.js 应用需要跨调用保持仓库状态时，使用 `@eidos.space/graft`。
+
+<LinkCard
+  title="打开 SDK 会话"
+  href="/zh/docs/sdk/quickstart/"
+  description="安装软件包、初始化仓库、读取状态并创建提交。"
+/>
+
+## 远端服务
+
+远端把仓库对象、引用、SQLite 快照数据和外部载荷保存在本地仓库之外。可以使用
+HTTP 软件包把 Graft 同步接入现有服务，也可以让 CLI 和 SDK 连接文件系统或
+S3-compatible 存储。
+
+<LinkCard
+  title="选择远端后端"
+  href="/zh/docs/remotes/"
+  description="比较文件系统、对象存储与 HTTP 远端的接入方式。"
+/>
+
+## 继续理解模型
+
+完成第一个接入后，只需阅读与你相关的层：
+
+<CardGrid>
+  <LinkCard
+    title="架构导读"
+    href="/zh/docs/graft-book/"
+    description="理解仓库、快照、暂存、合并与恢复。"
+  />
+  <LinkCard
+    title="规范"
+    href="/zh/docs/specifications/"
+    description="实现或验证适配器时，查阅规范性契约。"
+  />
+</CardGrid>

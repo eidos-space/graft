@@ -1,14 +1,15 @@
 .hero {
   grid-template-columns: minmax(0, 52rem);
-  align-items: start;
+  justify-content: center;
+  text-align: center;
 }
 
 .hero .copy {
-  align-items: flex-start;
+  align-items: center;
 }
 
 .hero .actions {
-  justify-content: flex-start;
+  justify-content: center;
 }
 
 .hero .tagline {

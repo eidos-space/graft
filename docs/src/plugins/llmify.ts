@@ -11,18 +11,17 @@ import {
 
 const GRAFT_DESCRIPTION = `# Graft Documentation
 
-Graft is version control for SQLite-backed app state. It records SQLite
-databases and app-owned files together, so a commit describes one coherent
-application state that can be inspected, restored, branched, merged, and synced.
+Graft is developer infrastructure for versioning SQLite-backed application
+state. It records SQLite databases and app-owned files together so an
+application can inspect, restore, branch, merge, and synchronize one coherent
+state.
 
-## Core Benefits
+## Integration Surfaces
 
-- **App-state commits**: SQLite databases, text files, binary files, and external payloads can live in one repository tree.
-- **Git-like workflows**: status, add, commit, branch, switch, diff, restore, merge, fetch, pull, push, and clone.
-- **SQLite integration**: use ordinary SQLite worktree files with consistent snapshot staging and materialization.
-- **Row-aware review**: supported SQLite changes can be shown as row and schema diffs instead of opaque file changes.
-- **Application UI support**: JSON output describes status, diffs, conflicts, payloads, config, and sync state.
-- **Remote sync**: use filesystem, S3-compatible, or Graft HTTP remotes.
+- **Graft CLI**: evaluation, scripts, automation, and structured JSON subprocess integration.
+- **Node.js SDK**: resident in-process repository sessions.
+- **Remote service**: filesystem, object-storage, or authenticated HTTP synchronization.
+- **Architecture and specifications**: system design and normative observable contracts.
 
 ## Documentation Sitemap
 

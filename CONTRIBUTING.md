@@ -70,7 +70,7 @@ cargo nextest run
 cargo nextest run -p graft
 cargo nextest run runtime_sanity
 
-# Build and test the resident Node.js/Electron SDK
+# Build and test the resident Node.js SDK
 pnpm install --frozen-lockfile
 pnpm --dir packages/graft-sdk build:native
 pnpm --dir packages/graft-sdk test

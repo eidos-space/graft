@@ -166,9 +166,9 @@ dependencies for macOS arm64/x64, Linux glibc arm64/x64, and Windows x64. Each o
 contains exactly one binary and declares npm host constraints. There is no install script, native
 compilation, or binary download on the consumer machine.
 
-Electron loads the SDK only in a utility process and must leave the selected `.node` file outside
-ASAR, or include `*.node` in `asarUnpack`. The Rust crates remain private implementation details;
-the npm contract is the supported Node/Electron integration surface.
+Packaged Node.js applications must keep the selected `.node` file accessible to Node's module
+loader. The Rust crates remain private implementation details; the npm contract is the supported
+Node.js integration surface.
 
 SDK releases use independent `graft-sdk-vX.Y.Z` annotated tags, while CLI/SQLite releases continue
 to use `vX.Y.Z`. Both tag types must point to commits reachable from `main`.

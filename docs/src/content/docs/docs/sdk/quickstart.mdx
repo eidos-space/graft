@@ -1,0 +1,83 @@
+---
+title: SDK Quickstart
+description: Open a Graft repository session and create the first app-state commit.
+---
+
+import { Steps } from "@astrojs/starlight/components";
+
+This guide assumes your application already owns a directory containing its
+SQLite database and files.
+
+<Steps>
+
+1. Install the SDK.
+
+   ```bash
+   pnpm add @eidos.space/graft
+   ```
+
+2. Open and initialize the repository.
+
+   ```js
+   const { RepositorySession } = require("@eidos.space/graft");
+
+   const session = await RepositorySession.open(appDataRoot);
+   await session.init();
+   ```
+
+   `init()` creates `.graft/` beside the application worktree. Call it once for
+   a new repository.
+
+3. Read status.
+
+   ```js
+   const result = await session.statusIncremental();
+   console.log(result.status.paths);
+   ```
+
+   Each changed path reports its repository-relative path, content kind,
+   storage strategy, and staged or unstaged state.
+
+4. Stage and commit the current application state.
+
+   ```js
+   await session.addAll();
+   const commit = await session.commit("initial app state");
+   console.log(commit);
+   ```
+
+   `addAll()` captures committed SQLite transactions and app-owned files into
+   the index. `commit()` advances history from that staged state.
+
+5. Close the session.
+
+   ```js
+   await session.close();
+   ```
+
+   Use `try`/`finally` in production so orderly shutdown always releases the
+   repository runtime.
+
+</Steps>
+
+## Review only the paths that changed
+
+```js
+const status = await session.statusIncremental();
+const paths = status.status.paths.map(({ path }) => path);
+
+const diff = await session.diffPaths({
+  paths,
+  rows: true,
+  limit: 100,
+});
+```
+
+For a large SQLite database, request a table summary first and load rows only
+when the user opens a table. See the package TypeScript declarations for the
+complete `diffSqlitePaths` result types.
+
+## Next
+
+- [Coordinate sessions and worktree changes](/docs/sdk/session-lifecycle/)
+- [Configure a remote](/docs/remotes/)

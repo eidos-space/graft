@@ -68,10 +68,10 @@ graft log
 | --- | --- |
 | [CLI](https://graft.eidos.space/zh/docs/quickstart/cli/) | 评估、脚本、智能体与一次性命令 |
 | [结构化 JSON 输出](https://graft.eidos.space/zh/docs/reference/json-output/) | 稳定的应用与自动化边界 |
-| [Node.js 与 Electron SDK](https://graft.eidos.space/zh/docs/sdk/) | 长驻的进程内仓库会话 |
+| [Node.js SDK](https://graft.eidos.space/zh/docs/sdk/) | 长驻的进程内仓库会话 |
 | [远程服务包](https://graft.eidos.space/zh/docs/remotes/) | 托管 Graft HTTP 远程协议 |
 
-安装 Node.js 与 Electron SDK：
+安装 Node.js SDK：
 
 ```sh
 pnpm add @eidos.space/graft
@@ -106,7 +106,7 @@ SQLite 库与文件 API。
 
 ## 项目状态
 
-Graft 目前仍是实验性项目。CLI、结构化输出、Node.js/Electron SDK 和远程协议
+Graft 目前仍是实验性项目。CLI、结构化输出、Node.js SDK 和远程协议
 是受支持的集成界面；存储布局与内部 Rust 模块仍属于实现细节。
 
 Graft 是 SQLite 事务的补充，不替代应用授权、实时复制或用于源码管理的 Git。

@@ -1,0 +1,78 @@
+---
+title: SDK 快速开始
+description: 打开 Graft 仓库会话并创建第一个应用状态提交。
+---
+
+import { Steps } from "@astrojs/starlight/components";
+
+本指南假设应用已经拥有一个包含 SQLite 数据库和相关文件的目录。
+
+<Steps>
+
+1. 安装 SDK。
+
+   ```bash
+   pnpm add @eidos.space/graft
+   ```
+
+2. 打开并初始化仓库。
+
+   ```js
+   const { RepositorySession } = require("@eidos.space/graft");
+
+   const session = await RepositorySession.open(appDataRoot);
+   await session.init();
+   ```
+
+   `init()` 会在应用工作区旁创建 `.graft/`。新仓库只需调用一次。
+
+3. 读取状态。
+
+   ```js
+   const result = await session.statusIncremental();
+   console.log(result.status.paths);
+   ```
+
+   每个变更路径都会返回仓库相对路径、内容类型、存储方式，以及暂存状态。
+
+4. 暂存并提交当前应用状态。
+
+   ```js
+   await session.addAll();
+   const commit = await session.commit("initial app state");
+   console.log(commit);
+   ```
+
+   `addAll()` 把已提交的 SQLite 事务和应用文件捕获到 index，`commit()` 再从
+   该暂存状态推进历史。
+
+5. 关闭会话。
+
+   ```js
+   await session.close();
+   ```
+
+   生产代码应使用 `try`/`finally`，确保正常关闭时释放仓库 runtime。
+
+</Steps>
+
+## 只检查发生变化的路径
+
+```js
+const status = await session.statusIncremental();
+const paths = status.status.paths.map(({ path }) => path);
+
+const diff = await session.diffPaths({
+  paths,
+  rows: true,
+  limit: 100,
+});
+```
+
+对于大型 SQLite 数据库，先请求表级摘要，等用户打开某张表时再加载行。完整的
+`diffSqlitePaths` 结果类型以软件包的 TypeScript 声明为准。
+
+## 下一步
+
+- [协调会话与工作区变更](/zh/docs/sdk/session-lifecycle/)
+- [配置远端](/zh/docs/remotes/)

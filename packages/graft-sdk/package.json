@@ -1,7 +1,7 @@
 {
   "name": "@eidos.space/graft",
   "version": "0.3.21",
-  "description": "Long-lived in-process Graft repository sessions for Node.js and Electron.",
+  "description": "Long-lived in-process Graft repository sessions for Node.js.",
   "license": "MIT OR Apache-2.0",
   "repository": {
     "type": "git",
@@ -13,7 +13,6 @@
   "keywords": [
     "graft",
     "sqlite",
-    "electron",
     "node-api",
     "napi-rs"
   ],

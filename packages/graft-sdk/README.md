@@ -1,9 +1,9 @@
-# Graft SDK for Node.js and Electron
+# Graft SDK for Node.js
 
-`@eidos.space/graft` embeds Graft as a long-lived, in-process repository SDK for Node.js and
-Electron. It is the native application integration surface used by Eidos Lite Desktop. The Rust
-session and Node-API crates remain repository-internal implementation crates and are not published
-to crates.io.
+`@eidos.space/graft` embeds Graft as a long-lived, in-process repository SDK for Node.js. It is the
+native application integration surface used by applications such as Eidos Lite. The Rust session
+and Node-API crates remain repository-internal implementation crates and are not published to
+crates.io.
 
 The useful analogy is:
 
@@ -20,7 +20,7 @@ There is no daemon, JSON-stdin transport, or Graft CLI subprocess in the SDK cal
 ## Architecture
 
 ```text
-Electron utility process
+Node.js application
   └─ JavaScript RepositorySession
        └─ Node-API 8 native class (one Arc-owned handle)
             └─ Rust RepositorySession (one mutex per repository session)
@@ -63,9 +63,8 @@ packages/graft-sdk/native/graft-sdk.darwin-arm64.node
 
 The local binary is intentionally ignored by Git. It is a Mach-O arm64 dynamic library that exports
 Node-API 8, so it is insulated from Node's V8 ABI and `NODE_MODULE_VERSION`. It is still
-platform/architecture-specific. An Electron package must copy it outside ASAR, or list `*.node`
-under `asarUnpack`, and load it in the utility process. `GRAFT_SDK_NATIVE_PATH` may point tests or
-packaging harnesses at an explicit addon path.
+platform/architecture-specific. `GRAFT_SDK_NATIVE_PATH` may point tests or packaging harnesses at
+an explicit addon path.
 
 Published packages use the standard native optional-dependency model: the root package contains
 the JavaScript wrapper, declarations, README, and changelog; each platform package contains exactly
@@ -116,8 +115,8 @@ try {
 }
 ```
 
-Eidos Lite should keep one session per open Space in its utility process rather than constructing a
-session per command:
+Eidos Lite keeps one session per open Space in its resident Node.js process rather than constructing
+a session per command:
 
 ```js
 const sessions = new Map()
@@ -135,9 +134,9 @@ async function closeSpace(spaceId) {
 }
 ```
 
-The Electron main/renderer boundary can continue to use typed IPC, but the utility process must
-load this package directly. It must not launch `graft`, host a long-running CLI daemon, or proxy
-commands over JSON stdin.
+A trusted Node.js process should load this package directly. User-interface processes should receive
+typed, serializable results rather than native objects, credentials, or unrestricted paths. The host
+must not launch `graft`, run a long-lived CLI daemon, or proxy commands over JSON stdin.
 
 ## API and worktree materialization
 
@@ -238,8 +237,8 @@ external Graft writer gets `GRAFT_SDK_REPOSITORY_BUSY`. Different repository pat
 parallel. External changes to ordinary worktree files are observed by subsequent `status`,
 `diff`, and `addAll` calls.
 
-If an Electron utility process crashes, the OS releases its storage lock. A replacement utility
-process creates a new session and calls `open()`; Graft reconstructs the runtime from durable
+If a Node.js process crashes, the OS releases its storage lock. A replacement process creates a
+new session and calls `open()`; Graft reconstructs the runtime from durable
 repository state and may reuse the validated classification snapshot described below. No stale
 daemon registration or PID file is involved.
 

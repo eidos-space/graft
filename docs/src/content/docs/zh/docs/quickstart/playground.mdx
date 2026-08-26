@@ -1,12 +1,12 @@
 ---
 title: Playground 导览
-description: 在零安装、纯浏览器 worktree 中试用真实的 Graft v0.13.0 CLI。
+description: 在零安装、纯浏览器 worktree 中试用真实的 Graft v0.15.2 CLI。
 ---
 
 import { Aside, Steps } from "@astrojs/starlight/components";
 
 [Graft Playground](/playground/) 运行编译为 WebAssembly 的真实 Graft
-v0.13.0 CLI。worktree、SQLite 数据库和 `.graft/` repository 都保存在浏览器
+v0.15.2 CLI。worktree、SQLite 数据库和 `.graft/` repository 都保存在浏览器
 Origin Private File System（OPFS）中，因此不安装 Graft、也不改动本地文件就能
 学习完整模型。
 
@@ -19,7 +19,7 @@ Origin Private File System（OPFS）中，因此不安装 Graft、也不改动�
 
 <Steps>
 
-1. [打开 Playground](/playground/)，等待 **GRAFT v0.13.0 · WASM** runtime
+1. [打开 Playground](/playground/)，等待 **GRAFT v0.15.2 · WASM** runtime
    indicator 出现。
 2. 打开 **引导**，先完成 **基础**：初始化 repository、创建
    `data.sqlite`、添加文件、stage 并 commit。
@@ -37,7 +37,7 @@ Origin Private File System（OPFS）中，因此不安装 Graft、也不改动�
 | 区域 | 展示内容 |
 | --- | --- |
 | 文件 | 同一个应用状态 worktree 中的文本、图片和 SQLite 路径。 |
-| Terminal | v0.13.0 CLI 和支持路径移动的小型 OPFS shell。 |
+| Terminal | v0.15.2 CLI 和支持路径移动的小型 OPFS shell。 |
 | 版本 | Status、rename-aware staging、commit、branch、reset 和 history。 |
 | Diff | 文本变化、图片版本和 SQLite row diff。 |
 | 冲突 | Three-way merge 状态和 row-aware resolution。 |
@@ -53,4 +53,4 @@ Origin Private File System（OPFS）中，因此不安装 Graft、也不改动�
 
 完成引导后，通过 [CLI 快速开始](/zh/docs/quickstart/cli/) 在本地目录重复同一套
 repository 流程。需要进程内集成时，再看
-[Node.js 与 Electron SDK](/zh/docs/guides/node-electron-sdk/)。
+[Node.js SDK](/zh/docs/sdk/)。

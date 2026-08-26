@@ -1,68 +1,72 @@
 ---
 title: 安装
-description: 安装 Graft CLI、从源码构建，并接入 Node.js SDK。
+description: 安装 Graft CLI、Node.js SDK 或远端服务软件包。
 ---
 
-import { Aside } from "@astrojs/starlight/components";
+import { Tabs, TabItem } from "@astrojs/starlight/components";
 
-最快的试用方式是 CLI。需要进程内集成时，应用可以使用常驻 Node.js/Electron SDK。
+只安装应用实际使用的接入面。
 
-## 安装 CLI
+<Tabs>
+  <TabItem label="CLI">
 
-```bash
-curl -fsSL https://graft.eidos.space/install.sh \
-  | GRAFT_VERSION=0.13.0 sh
-graft --version
-# graft-cli 0.13.0
-```
+  ```bash
+  curl -fsSL https://graft.eidos.space/install.sh | sh
+  graft --version
+  ```
 
-<Aside type="note" title="最新 release">
-  去掉 `GRAFT_VERSION=0.13.0` 会安装最新已发布版本。
-</Aside>
+  安装脚本会为当前平台下载最新发布的二进制文件。需要固定版本时：
 
-也可以从
-[GitHub releases](https://github.com/eidos-space/graft/releases)
-下载预构建 archive。
+  ```bash
+  curl -fsSL https://graft.eidos.space/install.sh \
+    | GRAFT_VERSION=0.15.2 sh
+  ```
+
+  也可以从 [GitHub Releases](https://github.com/eidos-space/graft/releases)
+  下载预构建压缩包。
+
+  </TabItem>
+  <TabItem label="Node.js SDK">
+
+  ```bash
+  pnpm add @eidos.space/graft
+  ```
+
+  软件包支持 Node.js 20 及以上版本，并为当前平台选择预构建 Node-API 8 二进制文件。
+  继续阅读 [SDK 快速开始](/zh/docs/sdk/quickstart/)。
+
+  </TabItem>
+  <TabItem label="远端服务">
+
+  根据宿主环境选择软件包：
+
+  ```bash
+  pnpm add @eidos.space/graft-remote
+  pnpm add @eidos.space/graft-remote-hono hono
+  pnpm add @eidos.space/graft-remote-cloudflare
+  ```
+
+  选择协议引擎、路由适配器或 Cloudflare 存储适配器前，先阅读
+  [远端服务](/zh/docs/remotes/)。
+
+  </TabItem>
+</Tabs>
 
 ## 从源码构建 CLI
 
-在仓库根目录：
+源码构建需要 Rust 1.91 或更高版本：
 
 ```bash
+git clone https://github.com/eidos-space/graft.git
+cd graft
 cargo build -p graft-cli --bin graft --release
+./target/release/graft --version
 ```
 
-生成位置：
+如果要在仓库外使用源码构建，把 `target/release/graft` 加入 `PATH`。
 
-```text
-target/release/graft
-```
+## 下一步
 
-加入 PATH：
-
-```bash
-mkdir -p ~/.local/bin
-ln -sf "$(pwd)/target/release/graft" ~/.local/bin/graft
-hash -r
-graft --help
-```
-
-## 构建文档
-
-```bash
-cd docs
-pnpm install
-pnpm build
-```
-
-## 安装 Node.js 与 Electron SDK
-
-```bash
-pnpm add @eidos.space/graft
-```
-
-npm package 提供长生命周期的进程内 repository session 和预构建 Node-API 8 binary。
-继续阅读 [Node.js 与 Electron SDK](/zh/docs/guides/node-electron-sdk/)。
-
-下一步先跑 [CLI 快速开始](/zh/docs/quickstart/cli/)。应用需要常驻 repository session
-时，再看 [Node.js 与 Electron SDK](/zh/docs/guides/node-electron-sdk/)。
+- [选择接入方式](/zh/docs/getting-started/)
+- [运行 CLI 快速开始](/zh/docs/quickstart/cli/)
+- [打开 SDK 会话](/zh/docs/sdk/quickstart/)

@@ -1,9 +1,9 @@
 ---
-title: "Inside Graft: How Data Moves"
-description: Build a bottom-up mental model of Graft by following one complete data lifecycle.
+title: Architecture Guide
+description: Follow one application change through Graft's repository, SQLite storage, merge, remote, and recovery layers.
 ---
 
-This booklet answers one question: **after an application commits a SQLite transaction, how does
+This guide answers one question: **after an application commits a SQLite transaction, how does
 that change become Graft history that can be compared, merged, synchronized, and restored?**
 
 It follows one repository containing `app.sqlite`, `settings.json`, and a large
@@ -76,17 +76,9 @@ The private image is only a capture boundary. The index is the authority for the
 3. **What identifies the result?** Byte hash, object ID, snapshot descriptor, or `(LogId, LSN)`?
 4. **What remains authoritative after failure?** A ref, index, merge journal, or rebuildable cache?
 
-## How the documentation is divided
-
-| Goal | Section | What it answers |
-| --- | --- | --- |
-| Get started | Quickstart | What is the shortest working path? |
-| Complete a task | Guides | Which commands and sequence should I use? |
-| Build a mental model | Inside Graft | Why does data move this way, and where are failure boundaries? |
-| Look up an exact contract | Reference | What are the exact fields, options, URIs, policies, and protocol shapes? |
-
-One owner explains each fact in full. Other pages keep only the summary needed to link there. The
-former Concepts and Internals pages have been folded into this book, with redirects for old URLs.
+Read this section after completing a CLI or SDK quickstart. It explains the
+system boundaries needed to design a safe integration; task pages remain the
+source for command sequences, and the specifications define exact contracts.
 
 ## Reading order
 
@@ -105,5 +97,5 @@ order are observable contracts. Fjall key encodings, cache names, Rust module bo
 file names are implementation details. They are useful for debugging but not product integration.
 
 There is no supported repository-control compatibility layer based on SQLite PRAGMAs. Supported
-integration surfaces are the `graft` CLI and its JSON output, the Node.js/Electron SDK, and the HTTP
+integration surfaces are the `graft` CLI and its JSON output, the Node.js SDK, and the HTTP
 remote packages.

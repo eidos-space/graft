@@ -1,0 +1,49 @@
+---
+title: Node.js SDK
+description: 在 Node.js 应用中嵌入常驻 Graft 仓库会话。
+---
+
+import { CardGrid, LinkCard } from "@astrojs/starlight/components";
+
+`@eidos.space/graft` 是 Node.js 的进程内接入方式。它使用与 CLI 相同的 Rust
+仓库实现，但会在多次调用之间保持一个常驻仓库会话。
+
+以下情况适合使用 SDK：
+
+- 频繁读取状态、历史或差异，不希望每次启动子进程；
+- 需要类型明确的结果和结构化错误码；
+- 需要可以取消的仓库操作；
+- 需要明确协调可能替换工作区文件的操作。
+
+评估、脚本和短生命周期自动化应先使用 [CLI](/zh/docs/quickstart/cli/)。
+
+## 安装
+
+```bash
+pnpm add @eidos.space/graft
+```
+
+软件包支持 Node.js 20 及以上版本，并为受支持的 macOS、Linux 与 Windows
+目标提供预编译 Node-API 8 二进制文件。使用方不需要 Rust 工具链或系统 SQLite。
+
+## 运行模型
+
+- 每个规范化仓库路径保持一个 `RepositorySession`。
+- 同一会话中的调用串行执行，不同仓库可以并行。
+- 不要把仓库路径、凭据和原生对象暴露给不受信任的界面代码。
+- 应用不再使用仓库时关闭会话。
+
+## 继续
+
+<CardGrid>
+  <LinkCard
+    title="SDK 快速开始"
+    href="/zh/docs/sdk/quickstart/"
+    description="打开会话、初始化仓库、读取状态并提交应用状态。"
+  />
+  <LinkCard
+    title="会话与工作区安全"
+    href="/zh/docs/sdk/session-lifecycle/"
+    description="协调 SQLite 句柄、取消、仓库写入者与关闭流程。"
+  />
+</CardGrid>

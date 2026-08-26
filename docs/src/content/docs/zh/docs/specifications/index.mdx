@@ -1,0 +1,29 @@
+---
+title: 规范
+description: 查找仓库、存储、差异、合并、适配器与远端的 Graft 规范性契约。
+---
+
+英文规范定义 Graft 的可观察契约。实现兼容适配器、审查行为变更或判断规则归属时，
+应以英文规范为准。普通产品接入请使用任务指南。
+
+| 契约 | 规范 |
+| --- | --- |
+| 仓库路径、对象、引用、index 与 commit | [Graft Repository 1.0](https://github.com/eidos-space/graft/blob/main/docs/specs/graft-repository-1.0.md) |
+| SQLite 存储快照与恢复语义 | [Graft Storage Snapshots 1.0](https://github.com/eidos-space/graft/blob/main/docs/specs/graft-storage-snapshots-1.0.md) |
+| 工作区捕获与 materialization | [Graft Worktree Materialization 1.0](https://github.com/eidos-space/graft/blob/main/docs/specs/graft-worktree-materialization-1.0.md) |
+| 路径与 SQLite 逻辑差异 | [Graft Diff 1.0](https://github.com/eidos-space/graft/blob/main/docs/specs/graft-diff-1.0.md) |
+| 三方合并与冲突 | [Graft Merge 1.0](https://github.com/eidos-space/graft/blob/main/docs/specs/graft-merge-1.0.md) |
+| Runtime 与宿主适配器边界 | [Graft Runtime Adapters 1.0](https://github.com/eidos-space/graft/blob/main/docs/specs/graft-runtime-adapters-1.0.md) |
+| 远端发布与同步 | [Graft Remote Sync 1.0](https://github.com/eidos-space/graft/blob/main/docs/specs/graft-remote-sync-1.0.md) |
+| 可移植固定页 SQLite delta | [Graft SQLite Page Delta 1.0](https://github.com/eidos-space/graft/blob/main/docs/specs/graft-sqlite-page-delta-1.0.md) |
+
+先阅读[规范索引](https://github.com/eidos-space/graft/blob/main/docs/specs/README.zh.md)，
+了解职责归属、conformance 标记和规范层次。
+
+## 契约与实现
+
+仓库标识、快照内容、差异与合并结果、适配器安全边界和远端发布顺序属于可观察
+契约。缓存文件名、Rust 模块边界、临时路径和存储引擎 key encoding 属于实现细节，
+除非规范另有说明。
+
+行为发生变化时，应同时更新所属规范与可执行 conformance evidence。

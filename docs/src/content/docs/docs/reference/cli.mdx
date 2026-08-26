@@ -28,8 +28,9 @@ graft sql --db data.sqlite "CREATE TABLE t(id INTEGER PRIMARY KEY); INSERT INTO 
 cat script.sql | graft sql --db data.sqlite
 ```
 
-`graft sql` opens a normal physical SQLite worktree file. It uses the same
-platform SQLite VFS as other database tools and application libraries.
+`graft sql` opens a normal physical SQLite worktree file. Other database tools
+and application libraries can open that file with their ordinary SQLite
+connections.
 
 It requires an explicit `--db` path and an existing `.graft/` repository. Use `graft init` once in the worktree before creating or modifying a database through the CLI.
 
@@ -60,6 +61,10 @@ It requires an explicit `--db` path and an existing `.graft/` repository. Use `g
 | `graft restore [--json] [--staged] [--source rev] <path>`<br />`graft restore [--json] --staged --all [--kind kind]` | Restore a worktree path, one staged path, or all staged paths optionally filtered by kind. |
 | `graft export [--json] [--source rev] --output <file> [path]` | Write a Graft database snapshot as a physical SQLite file. |
 | `graft reset [--json] [--soft\|--mixed\|--hard] <rev>` | Move the current branch or HEAD. |
+
+Interactive `graft log` uses Git-style commit blocks and opens the configured
+pager (`GIT_PAGER`, then `PAGER`, or `less` by default). Piped, redirected, and
+JSON output are written directly.
 
 When `graft add` stages a physical SQLite path, it takes a consistent online
 backup and compares 4 KiB Graft storage chunks with the current staged or

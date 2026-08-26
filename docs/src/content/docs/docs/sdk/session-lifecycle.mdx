@@ -1,0 +1,79 @@
+---
+title: Sessions And Worktree Safety
+description: Coordinate Graft repository sessions with application writers and worktree-changing operations.
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+A `RepositorySession` owns one repository runtime. Calls on that session are
+serialized, but the application still owns the live SQLite connections and
+ordinary files in the worktree.
+
+## Keep one repository writer
+
+Only one SDK session or external Graft writer can own a repository at a time.
+A second writer receives `GRAFT_SDK_REPOSITORY_BUSY`.
+
+Do not retry in a tight loop. Close the stale session, stop the external Graft
+process, or ask the user to close the other application instance.
+
+## Know which operations replace files
+
+Inspection, staging, commit, fetch, and push do not replace tracked worktree
+files. These operations can:
+
+- `restore` and `restorePaths`
+- `pull` and `cloneRepository`
+- `applyMerge`
+- merge resolution methods that write a chosen result
+- `continueMerge` and `abortMerge`
+
+Before a worktree-changing operation:
+
+1. Stop new application writes.
+2. Drain active transactions.
+3. Close SQLite handles for paths that may be replaced.
+4. Run the SDK operation.
+5. Reopen the affected handles and validate the resulting state.
+
+Use `operationMaterializesWorktree(name)` to implement the conservative gate.
+Completed mutation results also report `worktree_paths`, which bounds the
+refresh work after the call.
+
+<Aside type="note" title="Staging is read-only to the worktree">
+  `addAll()`, `stagePaths()`, and `commit()` capture or advance repository
+  state without replacing the live SQLite file. An application can keep the
+  same SQLite handle open, although it should define a transaction boundary
+  before staging when a deterministic checkpoint matters.
+</Aside>
+
+## Close and reopen
+
+`close()` rejects queued work, waits for the in-flight operation, releases the
+runtime, and is idempotent. `reopen()` reconstructs the runtime from durable
+repository state.
+
+If a Node.js process crashes, the operating system releases the storage lock.
+Start a replacement process and open a fresh session; no daemon lease or PID
+recovery file is required.
+
+## Cancel long operations
+
+Async SDK methods accept an `AbortSignal`. Cancellation rejects with
+`AbortError`; the retained session remains usable. A cancelled multi-path
+operation may have completed a prefix, so read status before retrying.
+
+## Handle errors by code
+
+Use `error.code`, not message text. Common lifecycle codes are:
+
+| Code | Action |
+| --- | --- |
+| `GRAFT_SDK_REPOSITORY_BUSY` | Find and close the other repository writer. |
+| `GRAFT_SDK_SESSION_CLOSED` | Open a new session or reopen the existing one. |
+| `GRAFT_SDK_SESSION_CLOSING` | Wait for shutdown and do not enqueue more work. |
+| `GRAFT_SDK_REPOSITORY_STALE` | Refresh HEAD or merge state, then rebuild the guarded operation. |
+| `GRAFT_SDK_REPOSITORY_COMMAND` | Inspect the structured repository command failure. |
+
+For the complete method and result types, use the declarations shipped with
+`@eidos.space/graft`.

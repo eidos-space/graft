@@ -7,7 +7,7 @@ aligned with the current tree, CI workflows, and `CONTRIBUTING.md`.
 
 Graft provides Git-like version control for application state stored in
 ordinary SQLite database files and app-owned files. The supported integration
-surfaces are the `graft` CLI and its JSON output, the Node.js/Electron SDK, and
+surfaces are the `graft` CLI and its JSON output, the Node.js SDK, and
 the HTTP remote packages.
 
 - The Rust package is named `graft-cli`; its executable is still named `graft`.
@@ -34,7 +34,7 @@ the HTTP remote packages.
 | `crates/graft-test` | Shared Rust test support and integration tests. |
 | `crates/graft-bench` | Reproducible CLI performance and storage benchmarks. |
 | `crates/graft-tracing` | Shared tracing setup. |
-| `packages/graft-sdk` | Published Node.js/Electron package, tests, and release tooling. |
+| `packages/graft-sdk` | Published Node.js package, tests, and release tooling. |
 | `packages/graft-remote*` | Framework-neutral, Hono, and Cloudflare remote packages. |
 | `services/graft-remote-cloudflare` | Deployable Cloudflare Worker used to verify the remote stack. |
 | `web-demo` | Browser/WASM playground. |
@@ -94,7 +94,7 @@ cargo run -p graft-cli -- <command> [arguments...]
 just run tool vid   # also accepts log or sid
 ```
 
-### Node.js/Electron SDK
+### Node.js SDK
 
 ```bash
 pnpm --dir packages/graft-sdk build:native

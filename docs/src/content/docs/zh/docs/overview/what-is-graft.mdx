@@ -1,86 +1,63 @@
 ---
 title: Graft 是什么
-description: 理解 Graft 作为 SQLite 应用状态版本管理工具的定位。
+description: 了解 Graft 管理什么、位于应用的哪一层，以及如何选择接入面。
 ---
 
-Graft 是 SQLite 应用状态的版本管理工具。它把 SQLite 数据库和应用拥有的
-文件放在同一个仓库里，并提供 Git-like 操作：status、add、commit、
-branch、switch、diff、restore、merge、fetch、pull 和 push。
-
-一句话：
+Graft 为普通 SQLite 数据库和应用文件提供版本管理。
 
 ```text
-SQLite 负责事务。
-Graft 负责历史。
+SQLite 负责事务，Graft 负责历史。
 ```
 
-Git 的一等版本管理体验主要围绕纯文本：line diff、line merge 和 code review。
-SQLite 文件当然也能提交到 Git，但通常只是 opaque database file。Graft 让
-SQLite 数据库获得一等版本管理表面：repository path、snapshot、row diff、
-row-aware merge、structured conflicts 和 restore。
+## 它解决的问题
 
-## 问题
-
-很多应用的持久状态不止一个数据库文件：
+应用的持久状态通常分布在多个路径中：
 
 ```text
 app-data/
   data.sqlite
-  search.sqlite
   settings.json
   attachments/
     invoice.pdf
-    avatar.png
 ```
 
-`data.sqlite` 里的行可能引用 `attachments/` 里的文件。如果 rollback、
-branch、AI edit 或 sync 只改变数据库而没有改变对应文件，应用会打开一个
-不一致的状态。
+`data.sqlite` 中的一行可能引用 `attachments/invoice.pdf`。如果恢复、建立分支
+或同步时只处理其中一个路径，应用可能得到无法使用的状态。
 
-Graft 的核心约束是：
-
-```text
-一次 commit 记录一个一致的应用状态。
-```
+Graft 把选定的数据库与文件记录在同一个仓库提交中。这个提交表示一份完整、
+一致的应用状态。
 
 ## Graft 提供什么
 
-- 与 worktree 并列的 `.graft/` 仓库目录。
-- 用于 staging SQLite snapshot 和文件 artifact 的 index。
-- 作为一等版本路径的 SQLite 数据库，而不是 opaque binary blob。
-- commit、ref、branch、tag 和 remote-tracking ref。
-- 支持的 SQLite 表的行级 diff。
-- 对文件 artifact 和不支持的 SQLite surface 采用保守冲突。
-- 面向应用 UI 的 JSON 输出。
-- 基于本地文件、S3-compatible 对象存储或 Graft HTTP 协议的 remotes。
+- 一致捕获 SQLite 快照，包括已提交的 WAL frames；
+- repository index 与不可变提交；
+- 路径级差异和受支持的 SQLite 行级差异；
+- 分支、恢复、三方合并与结构化冲突；
+- 本地、对象存储与 HTTP 远端；
+- 结构化 CLI 输出和进程内 Node.js SDK。
 
-## 适合使用的场景
+工作区中仍然是普通 SQLite 文件。现有 SQLite library 不需要自定义 VFS 或
+Graft 专用查询接口。
 
-- SQLite local-first 应用，并且有附件目录。
-- 应用允许 AI agent 修改结构化数据或文件。
-- 产品需要用户可见的历史、checkpoint 或 change review。
-- 需要 row-aware diff，而不是只能看到数据库文件变了。
-- 大文件放在 SQLite 外部，但要和数据库行一起版本化。
+## 它位于哪一层
 
-## 不适合替代什么
+当应用需要为一组相关数据库和文件提供可见历史、检查点、变更审查、分支式工作流、
+恢复或同步时，使用 Graft。
 
-Graft 不替代 SQLite transaction、应用权限系统，也不是源代码 Git 仓库。
-它也不是实时 SQL 操作复制协议。Graft 记录 repository snapshot，并合并
-应用状态。
+Graft 不会替代：
 
-## 集成入口
+- SQLite 事务；
+- 应用的身份验证与授权；
+- 实时 operation-log replication；
+- 通用源码仓库；
+- 独立的备份与保留策略。
 
-CLI 适合本地和脚本：
+## 开发者接入面
 
-```bash
-graft init
-graft sql --db data.sqlite "CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT);"
-graft add --all
-graft commit -m "seed notes"
-```
+| 接入面 | 用途 |
+| --- | --- |
+| Graft CLI | 评估、脚本、自动化和 JSON 子进程接入。 |
+| Node.js SDK | 进程内常驻仓库会话。 |
+| 远端软件包 | 通过你运营的基础设施提供带身份验证的 HTTP 同步。 |
 
-应用可以调用带 `--json` 的 CLI，直接消费结构化 status、diff、conflict 和 sync
-结果。SQLite 仍是普通物理 worktree 文件，现有数据库 library 不需要自定义 VFS。
-
-需要常驻进程内边界的应用可以使用 Node.js 与 Electron SDK。它提供相同的
-repository 操作，不必为每条命令启动新的 CLI 进程。
+继续阅读[选择接入方式](/zh/docs/getting-started/)。

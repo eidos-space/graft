@@ -4,11 +4,11 @@ description: 当前 Graft 的能力、稳定性边界和预期。
 ---
 
 Graft 仍然是实验性项目。本文档以
-[v0.13.0 release](https://github.com/eidos-space/graft/releases/latest)
+[v0.15.2 release](https://github.com/eidos-space/graft/releases/latest)
 为基线，重点是 SQLite 应用状态版本管理：SQLite snapshot、应用文件、
 row-aware diff、merge 和 remote sync。
 
-只存在于开发分支的能力不属于 v0.13.0 文档，除非页面明确标注为未发布。
+只存在于开发分支的能力不属于 v0.15.2 文档，除非页面明确标注为未发布。
 
 ## 当前可用
 
@@ -24,7 +24,7 @@ row-aware diff、merge 和 remote sync。
 - 普通 rowid table 和声明主键的 `WITHOUT ROWID` table 的行级 diff、row-aware
   merge 和逐行 resolution，包括 `STRICT` 与复合主键 schema。
 - 面向应用的 JSON 输出。
-- 通过 Node-API 8 `@eidos.space/graft` package 提供的常驻 Node.js/Electron
+- 通过 Node-API 8 `@eidos.space/graft` package 提供的常驻 Node.js
   repository session。
 - `fs://`、`s3://`、`s3_compatible://` 和 `graft+http(s)://` remotes。
 - 可连接实现 Graft HTTP remote protocol 服务的 HTTP remote client。
@@ -60,9 +60,9 @@ connection。Graft 不会在另一个 writer 活跃时覆盖数据库。
 ## Release
 
 预构建 CLI archive 随
-[v0.13.0 GitHub release](https://github.com/eidos-space/graft/releases/latest)
+[v0.15.2 GitHub release](https://github.com/eidos-space/graft/releases/latest)
 发布。
-常驻 Node.js/Electron SDK 独立计版本并发布为
+常驻 Node.js SDK 独立计版本并发布为
 [`@eidos.space/graft`](https://github.com/eidos-space/graft)。
 
 这个仓库是 [orbitinghail/graft](https://github.com/orbitinghail/graft) 的

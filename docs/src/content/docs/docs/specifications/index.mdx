@@ -1,0 +1,32 @@
+---
+title: Specifications
+description: Find the normative Graft contracts for repositories, storage, diffs, merges, adapters, and remotes.
+---
+
+The English specifications define Graft's observable contracts. Use them when
+implementing a compatible adapter, reviewing a behavior change, or deciding
+which layer owns a rule. Use the task guides for normal product integration.
+
+| Contract | Specification |
+| --- | --- |
+| Repository paths, objects, refs, index, and commits | [Graft Repository 1.0](https://github.com/eidos-space/graft/blob/main/docs/specs/graft-repository-1.0.md) |
+| SQLite storage snapshots and restore semantics | [Graft Storage Snapshots 1.0](https://github.com/eidos-space/graft/blob/main/docs/specs/graft-storage-snapshots-1.0.md) |
+| Worktree capture and materialization | [Graft Worktree Materialization 1.0](https://github.com/eidos-space/graft/blob/main/docs/specs/graft-worktree-materialization-1.0.md) |
+| Path and SQLite logical diff behavior | [Graft Diff 1.0](https://github.com/eidos-space/graft/blob/main/docs/specs/graft-diff-1.0.md) |
+| Three-way merge and conflict behavior | [Graft Merge 1.0](https://github.com/eidos-space/graft/blob/main/docs/specs/graft-merge-1.0.md) |
+| Runtime and host adapter boundaries | [Graft Runtime Adapters 1.0](https://github.com/eidos-space/graft/blob/main/docs/specs/graft-runtime-adapters-1.0.md) |
+| Remote publication and synchronization | [Graft Remote Sync 1.0](https://github.com/eidos-space/graft/blob/main/docs/specs/graft-remote-sync-1.0.md) |
+| Portable fixed-page SQLite deltas | [Graft SQLite Page Delta 1.0](https://github.com/eidos-space/graft/blob/main/docs/specs/graft-sqlite-page-delta-1.0.md) |
+
+Start with the [specification index](https://github.com/eidos-space/graft/blob/main/docs/specs/README.md)
+for ownership, conformance labels, and the canonical layer order.
+
+## Contract versus implementation
+
+Repository identity, snapshot content, diff and merge results, adapter safety,
+and remote publication order are observable contracts. Cache file names, Rust
+module boundaries, temporary paths, and storage-engine key encodings are
+implementation details unless a specification says otherwise.
+
+Behavior changes should update the owning specification and executable
+conformance evidence together.

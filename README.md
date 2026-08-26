@@ -71,10 +71,10 @@ Continue with the [CLI quickstart](https://graft.eidos.space/docs/quickstart/cli
 | --- | --- |
 | [CLI](https://graft.eidos.space/docs/quickstart/cli/) | Evaluation, scripts, agents, and one-shot commands |
 | [Structured JSON output](https://graft.eidos.space/docs/reference/json-output/) | Stable application and automation boundaries |
-| [Node.js and Electron SDK](https://graft.eidos.space/docs/sdk/) | Long-lived, in-process repository sessions |
+| [Node.js SDK](https://graft.eidos.space/docs/sdk/) | Long-lived, in-process repository sessions |
 | [Remote service packages](https://graft.eidos.space/docs/remotes/) | Hosting the Graft HTTP remote protocol |
 
-Install the Node.js and Electron SDK with:
+Install the Node.js SDK with:
 
 ```sh
 pnpm add @eidos.space/graft
@@ -109,7 +109,7 @@ Applications keep using their existing SQLite library and file APIs.
 
 ## Project Status
 
-Graft is experimental. The CLI, structured output, Node.js/Electron SDK, and
+Graft is experimental. The CLI, structured output, Node.js SDK, and
 remote protocol are supported integration surfaces. Storage layouts and
 internal Rust modules remain implementation details.
 

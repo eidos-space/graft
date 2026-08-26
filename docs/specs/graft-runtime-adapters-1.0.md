@@ -370,8 +370,8 @@ the path named by `GRAFT_SDK_NATIVE_PATH`, a colocated native binary, or an
 exact platform optional package. Supported package families
 currently cover macOS arm64/x64, Linux glibc arm64/x64, and Windows x64. There
 is no browser fallback, install-time compilation, or remote binary download.
-Electron hosts keep `.node` outside ASAR or unpack it and SHOULD use a utility
-process rather than the renderer.
+Packaged Node.js applications MUST keep the selected `.node` file accessible
+to Node's module loader.
 
 ## 12. Browser/WASM profile
 

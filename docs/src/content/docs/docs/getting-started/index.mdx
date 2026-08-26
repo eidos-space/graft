@@ -1,0 +1,68 @@
+---
+title: Choose An Integration
+description: Choose the Graft surface that matches your application architecture.
+---
+
+import { CardGrid, LinkCard } from "@astrojs/starlight/components";
+
+Graft exposes three developer surfaces. They use the same repository model and
+can be combined in one product.
+
+| Start with | Choose it when |
+| --- | --- |
+| Graft CLI | You are evaluating Graft, writing scripts, or can run short-lived subprocesses. |
+| Node.js SDK | Your application needs a resident in-process repository session. |
+| Remote service | Repositories must synchronize through infrastructure you operate. |
+
+## Graft CLI
+
+The CLI is the shortest path to a working repository. It is also the supported
+automation boundary for shell scripts and services that consume `--json`
+output.
+
+<LinkCard
+  title="Run the CLI quickstart"
+  href="/docs/quickstart/cli/"
+  description="Create a repository, stage a SQLite database, inspect a row diff, and restore it."
+/>
+
+## Node.js SDK
+
+Use `@eidos.space/graft` when a Node.js application needs to keep repository
+state resident across calls.
+
+<LinkCard
+  title="Open an SDK session"
+  href="/docs/sdk/quickstart/"
+  description="Install the package, initialize a repository, read status, and create a commit."
+/>
+
+## Remote service
+
+A remote stores repository objects, refs, SQLite snapshot data, and external
+payloads outside the local repository. Use the HTTP packages to add Graft sync
+to an existing service, or connect the CLI and SDK to filesystem or S3-compatible
+storage.
+
+<LinkCard
+  title="Choose a remote backend"
+  href="/docs/remotes/"
+  description="Compare filesystem, object-storage, and HTTP remote integrations."
+/>
+
+## Then learn the model
+
+Once the first integration works, read only the layer you need:
+
+<CardGrid>
+  <LinkCard
+    title="Architecture guide"
+    href="/docs/graft-book/"
+    description="Understand repositories, snapshots, staging, merges, and recovery."
+  />
+  <LinkCard
+    title="Specifications"
+    href="/docs/specifications/"
+    description="Use the normative contracts when implementing or validating an adapter."
+  />
+</CardGrid>

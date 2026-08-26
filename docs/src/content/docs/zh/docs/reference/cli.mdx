@@ -58,6 +58,10 @@ cat script.sql | graft sql --db data.sqlite
 | `graft export [--json] [--source rev] --output <file> [path]` | 把 Graft 数据库 snapshot 写成物理 SQLite 文件。 |
 | `graft reset [--json] [--soft\|--mixed\|--hard] <rev>` | 移动当前 branch 或 HEAD。 |
 
+在交互式终端中，`graft log` 使用与 Git 一致的 commit block，并打开配置的
+pager（依次使用 `GIT_PAGER`、`PAGER`，默认是 `less`）。管道、重定向和 JSON
+输出会直接写出。
+
 `graft diff --rows` 会把 modified SQLite database snapshot 展开成 table 和 row changes：
 
 ```bash

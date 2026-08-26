@@ -1,0 +1,52 @@
+---
+title: Node.js SDK
+description: Embed a resident Graft repository session in a Node.js application.
+---
+
+import { CardGrid, LinkCard } from "@astrojs/starlight/components";
+
+`@eidos.space/graft` is the in-process integration for Node.js. It uses the
+same Rust repository implementation as the CLI, but keeps one
+repository session resident across calls.
+
+Use the SDK when your application needs:
+
+- frequent status, history, or diff reads without starting a subprocess;
+- typed results and structured error codes;
+- cancellable repository operations;
+- explicit coordination around operations that replace worktree files.
+
+Use the [CLI](/docs/quickstart/cli/) instead for evaluation, scripts, and
+short-lived automation.
+
+## Install
+
+```bash
+pnpm add @eidos.space/graft
+```
+
+The package supports Node.js 20 and newer and ships prebuilt Node-API 8
+binaries for supported macOS, Linux, and Windows targets. Consumers do not need
+a Rust toolchain or a system SQLite library.
+
+## Runtime model
+
+- Keep one `RepositorySession` for each canonical repository path.
+- Calls on one session run serially; different repositories can run in parallel.
+- Keep repository paths, credentials, and the native object outside untrusted UI code.
+- Close the session when the application stops using the repository.
+
+## Continue
+
+<CardGrid>
+  <LinkCard
+    title="SDK quickstart"
+    href="/docs/sdk/quickstart/"
+    description="Open a session, initialize a repository, read status, and commit app state."
+  />
+  <LinkCard
+    title="Sessions and worktree safety"
+    href="/docs/sdk/session-lifecycle/"
+    description="Coordinate SQLite handles, cancellation, repository writers, and shutdown."
+  />
+</CardGrid>

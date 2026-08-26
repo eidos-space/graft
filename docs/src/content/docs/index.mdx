@@ -2,97 +2,65 @@
 title: Graft
 head:
   - tag: title
-    content: Graft - Version control for SQLite-backed app state
-description: Graft versions SQLite databases and app-owned files together.
+    content: Graft - Version control for SQLite application state
+description: Add inspectable history, restore, merge, and remote sync to SQLite-backed applications.
 template: splash
 hero:
-  tagline: Version control for SQLite-backed app state.
+  tagline: Version control for SQLite application state.
   actions:
-    - text: Try the Playground
-      link: /playground/
-    - text: Start with the CLI
-      link: /docs/quickstart/cli/
+    - text: Choose an integration
+      link: /docs/getting-started/
+    - text: Install Graft
+      link: /docs/overview/installation/
       variant: secondary
 ---
 
-import { Aside, CardGrid, LinkCard } from "@astrojs/starlight/components";
+import { CardGrid, LinkCard } from "@astrojs/starlight/components";
 
-<Aside type="note" title="Version baseline">
-  This site documents the [Graft v0.13.0 release](https://github.com/eidos-space/graft/releases/latest).
-  Experimental or unreleased surfaces are called out explicitly.
-</Aside>
-
-Graft adds Git-like history to the state behind SQLite-backed applications.
-It versions SQLite databases and app-owned files together, so a commit records
-one coherent state your app can open.
-
-Git can store a `.sqlite` file, but it mostly treats that file as opaque bytes.
-Graft makes SQLite databases first-class versioned objects: you can stage,
-commit, diff rows, merge compatible changes, resolve structured conflicts, and
-restore them as database state.
-
-Use it when your app data directory looks like this:
+Graft is developer infrastructure for applications that keep durable state in
+SQLite databases and app-owned files. It records both as one version, then lets
+your application inspect, restore, branch, merge, and synchronize that state.
 
 ```text
-app-data/
-  data.sqlite
-  search.sqlite
-  settings.json
-  attachments/
-    note-42.png
-    contract.pdf
+SQLite owns transactions. Graft owns history.
 ```
 
-Graft keeps SQLite in charge of reads, writes, indexes, and transactions. It
-adds the repository layer around those files: stage, commit, branch, switch,
-diff rows, restore state, merge changes, and sync through remotes.
-
-## Start Here
+## Choose your integration
 
 <CardGrid>
   <LinkCard
-    title="What Is Graft"
-    href="/docs/overview/what-is-graft/"
-    description="The problem Graft solves and where it fits."
-  />
-  <LinkCard
-    title="CLI Quickstart"
+    title="Graft CLI"
     href="/docs/quickstart/cli/"
-    description="Create a repository, commit data, diff rows, and restore state."
+    description="Evaluate Graft, automate repository workflows, or integrate through structured JSON output."
   />
   <LinkCard
-    title="Node.js And Electron SDK"
-    href="/docs/guides/node-electron-sdk/"
-    description="Embed a long-lived repository session in a desktop or Node.js application."
+    title="Node.js SDK"
+    href="/docs/sdk/"
+    description="Keep a repository session inside a Node.js application or service."
   />
   <LinkCard
-    title="App-State Walkthrough"
-    href="/docs/quickstart/app-state-walkthrough/"
-    description="Track a database, files, branches, diffs, and a remote together."
+    title="Remote service"
+    href="/docs/remotes/"
+    description="Add authenticated remote storage and synchronization to your product."
   />
 </CardGrid>
 
-## Common Tasks
+## Understand the system
 
 <CardGrid>
   <LinkCard
-    title="Track databases and files"
-    href="/docs/guides/track-databases-and-files/"
-    description="Understand path kinds, storage strategies, and staging."
+    title="What Graft manages"
+    href="/docs/overview/what-is-graft/"
+    description="The problem, product boundary, and repository model."
   />
   <LinkCard
-    title="Build an app UI"
-    href="/docs/guides/json-ui/"
-    description="Use JSON status, diff, conflict, and payload output."
+    title="Architecture guide"
+    href="/docs/graft-book/"
+    description="Follow a change from a live SQLite file to a commit, merge, remote, and restored worktree."
   />
   <LinkCard
-    title="Sync with remotes"
-    href="/docs/guides/sync-remotes/"
-    description="Push, fetch, pull, clone, and choose a remote backend."
-  />
-  <LinkCard
-    title="Resolve merge conflicts"
-    href="/docs/guides/merge-conflicts/"
-    description="Use row-aware auto-merge and structured conflict output."
+    title="Specifications"
+    href="/docs/specifications/"
+    description="Read the normative contracts for repositories, snapshots, diffs, merges, adapters, and remotes."
   />
 </CardGrid>
