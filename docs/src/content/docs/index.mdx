@@ -2,14 +2,14 @@
 title: Graft
 head:
   - tag: title
-    content: Graft - Version control for SQLite application state
-description: Add inspectable history, restore, merge, and remote sync to SQLite-backed applications.
+    content: Graft - Git for SQLite
+description: Storage-efficient snapshots, schema-aware merges, and row-level diffs for SQLite.
 template: splash
 hero:
-  tagline: Version control for SQLite application state.
+  tagline: Git for SQLite.
   actions:
-    - text: Choose an integration
-      link: /docs/getting-started/
+    - text: Try in the browser
+      link: /docs/quickstart/playground/
     - text: Install Graft
       link: /docs/overview/installation/
       variant: secondary
@@ -17,13 +17,13 @@ hero:
 
 import { CardGrid, LinkCard } from "@astrojs/starlight/components";
 
-Graft is developer infrastructure for applications that keep durable state in
-SQLite databases and app-owned files. It records both as one version, then lets
-your application inspect, restore, branch, merge, and synchronize that state.
+Git tracks a SQLite database as an opaque binary file. Graft understands
+SQLite: it creates storage-efficient snapshots, shows schema and row-level
+changes, and merges supported database changes. Related files can travel in the
+same commit.
 
-```text
-SQLite owns transactions. Graft owns history.
-```
+Graft uses a familiar Git-like workflow with its own repository and remote
+formats.
 
 ## Choose your integration
 

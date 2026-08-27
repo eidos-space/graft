@@ -1,18 +1,34 @@
 ---
 title: What Is Graft
-description: Understand what Graft versions, where it fits, and which developer surface to use.
+description: Learn how Graft versions SQLite databases and related files, where it fits, and how to integrate it.
 ---
 
-Graft is version control for application state stored in ordinary SQLite
-databases and app-owned files.
+Think of Graft as **Git for SQLite**. It adds the database semantics that Git
+lacks: storage-efficient snapshots, schema-aware merges, and row-level diffs.
 
-```text
-SQLite owns transactions. Graft owns history.
-```
+Graft uses a familiar Git-like workflow with its own repository and remote
+formats.
 
 ## The problem
 
-An application's durable state often spans several paths:
+A custom diff driver can render a `.sqlite` file as readable text for review.
+Git's storage and merge still operate on one binary file, with no native model
+for SQLite pages, schemas, tables, or rows.
+
+That leaves three database-specific gaps:
+
+- **Storage:** capture a consistent database state, including committed WAL
+  frames, and address changed chunks independently of a whole-file blob.
+- **Diff:** explain changes in terms of schemas, tables, and rows instead of
+  only changed file bytes.
+- **Merge:** combine compatible schema and row changes, then expose precise
+  conflicts when automatic merge is unsafe.
+
+Graft implements those SQLite-aware operations behind familiar commits,
+branches, restore, and remotes. The worktree still contains ordinary SQLite
+files, so applications keep using their existing SQLite libraries.
+
+Graft can also version files that belong with the database:
 
 ```text
 app-data/
@@ -26,20 +42,17 @@ A row in `data.sqlite` may refer to `attachments/invoice.pdf`. Restoring,
 branching, or synchronizing only one of those paths can produce a state the
 application cannot use.
 
-Graft records the selected databases and files in one repository commit. That
-commit identifies one coherent application state.
+Graft records the selected databases and files in one repository commit, so a
+database row and the file it references can move through history together.
 
 ## What Graft adds
 
-- consistent SQLite snapshot capture, including committed WAL frames;
-- a repository index and immutable commits;
-- path-level and supported SQLite row-level diffs;
-- branches, restore, three-way merge, and structured conflicts;
+- storage-efficient SQLite snapshots, including committed WAL frames;
+- schema-, table-, row-, and path-level diffs;
+- schema-aware three-way merge and structured row conflicts;
+- immutable commits, branches, restore, and remote sync;
 - local, object-storage, and HTTP remotes;
 - structured CLI output and an in-process Node.js SDK.
-
-The worktree still contains ordinary SQLite files. Existing SQLite libraries
-do not need a custom VFS or Graft-specific query interface.
 
 ## Where it fits
 

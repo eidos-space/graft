@@ -2,14 +2,14 @@
 title: Graft
 head:
   - tag: title
-    content: Graft - SQLite 应用状态的版本管理
-description: 为 SQLite 应用增加可检查的历史、恢复、合并与远端同步能力。
+    content: Graft - 为 SQLite 而生的版本控制
+description: 为 SQLite 提供存储高效的快照、表结构合并与行级差异。
 template: splash
 hero:
-  tagline: SQLite 应用状态的版本管理。
+  tagline: 为 SQLite 而生的版本控制。
   actions:
-    - text: 选择接入方式
-      link: /zh/docs/getting-started/
+    - text: 在线体验
+      link: /zh/docs/quickstart/playground/
     - text: 安装 Graft
       link: /zh/docs/overview/installation/
       variant: secondary
@@ -17,12 +17,11 @@ hero:
 
 import { CardGrid, LinkCard } from "@astrojs/starlight/components";
 
-Graft 面向构建 SQLite 应用的开发者。它把 SQLite 数据库和应用文件记录为
-同一个版本，让应用可以检查、恢复、建立分支、合并并同步完整状态。
+Git 会把 SQLite 数据库作为不透明的二进制文件跟踪。Graft 创建存储高效的快照，
+展示表结构与行级变化，并合并受支持的数据库改动。
+相关文件也可以包含在同一次提交中。
 
-```text
-SQLite 负责事务，Graft 负责历史。
-```
+Graft 采用类似 Git 的工作流，并使用独立的仓库格式与远端机制。
 
 ## 选择接入方式
 

@@ -1,19 +1,30 @@
 # Graft
 
-**Version control for SQLite-backed application state.**
+**Git for SQLite.**
 
 [Try the Playground](https://graft.eidos.space/playground/) ·
 [Documentation](https://graft.eidos.space/) ·
 [Releases](https://github.com/eidos-space/graft/releases) ·
 [简体中文](./README.zh-CN.md)
 
-Graft records SQLite databases and app-owned files as one application state.
-It adds commits, branches, row-level diffs, merges, restore, and remote sync
-without requiring a custom SQLite VFS.
+Git tracks a SQLite database as an opaque binary file. Graft adds
+storage-efficient snapshots, schema-aware merges, and row-level diffs while
+keeping the worktree as ordinary SQLite files.
 
 ## Why Graft?
 
-Application state often spans a database and the files around it:
+A custom diff driver can render a readable view of `data.sqlite` for review.
+Git's storage and merge still operate at the file level, leaving SQLite
+storage, schemas, and rows invisible.
+
+Graft adds those database semantics:
+
+- Consistent snapshots, including committed WAL frames
+- Content-addressed chunks that reuse unchanged SQLite content across versions
+- Schema-, table-, and row-level diffs and merges
+- Git-like commits, branches, tags, restore, and remote sync
+
+Related files can be recorded in the same commit as the database:
 
 ```text
 app-data/
@@ -22,18 +33,8 @@ app-data/
   attachments/
 ```
 
-SQLite keeps database transactions consistent, but it does not version the
-whole directory. Git versions files, but usually treats SQLite as an opaque
-binary. Graft handles both together:
-
-- Consistent snapshots of SQLite databases and related files
-- Table- and row-level SQLite diffs and merges
-- Git-like commits, branches, tags, and restore
-- Structured CLI output, an embedded SDK, and remote sync
-
-```text
-SQLite owns transactions. Graft owns history.
-```
+Graft uses a familiar Git-like workflow with its own repository and remote
+formats.
 
 ## Try Graft
 

@@ -1,18 +1,28 @@
 # Graft
 
-**面向 SQLite 应用状态的版本控制。**
+**为 SQLite 而生的版本控制。**
 
 [在线体验](https://graft.eidos.space/playground/) ·
 [文档](https://graft.eidos.space/zh/) ·
 [版本发布](https://github.com/eidos-space/graft/releases) ·
 [English](./README.md)
 
-Graft 将 SQLite 数据库和应用自有文件记录为一个完整的应用状态。它提供提交、
-分支、行级差异、合并、恢复和远程同步能力，无需自定义 SQLite VFS。
+Git 会把 SQLite 数据库作为不透明的二进制文件跟踪。Graft 提供存储高效的快照、
+表结构合并与行级差异，同时保留普通 SQLite 工作区文件。
 
 ## 为什么使用 Graft？
 
-应用状态通常同时存在于数据库和周边文件中：
+自定义差异工具可以把 `data.sqlite` 转换成可读内容，方便审查变化。Git 的存储和
+合并仍停留在文件级，无法识别 SQLite 的存储、表结构和行。
+
+Graft 补上这些数据库语义：
+
+- 捕获一致快照，包括 WAL 中已经提交的内容
+- 通过内容寻址的数据块复用不同版本中未变化的 SQLite 内容
+- 提供表结构、表和行级差异与合并
+- 提供类似 Git 的提交、分支、标签、恢复与远端同步
+
+数据库的相关文件也可以记录在同一次提交中：
 
 ```text
 app-data/
@@ -21,17 +31,7 @@ app-data/
   attachments/
 ```
 
-SQLite 能保证数据库事务一致，却不会为整个目录保留版本。Git 可以记录文件，
-但通常只能把 SQLite 视为不透明的二进制文件。Graft 同时处理两者：
-
-- 为 SQLite 数据库和关联文件创建一致快照
-- 提供 SQLite 表级、行级差异与合并
-- 提供类似 Git 的提交、分支、标签和恢复
-- 提供结构化 CLI 输出、嵌入式 SDK 与远程同步
-
-```text
-SQLite 管事务，Graft 管历史。
-```
+Graft 采用类似 Git 的工作流，并使用独立的仓库格式与远端机制。
 
 ## 体验 Graft
 
