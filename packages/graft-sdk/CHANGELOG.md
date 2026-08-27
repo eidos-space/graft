@@ -5,6 +5,8 @@ SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
 
 ## Unreleased
 
+## Graft SDK 0.3.22 — 2026-08-27
+
 ### Fixed
 
 - SQLite worktree comparisons now ignore the schema cookie rewritten by online backup, preventing
