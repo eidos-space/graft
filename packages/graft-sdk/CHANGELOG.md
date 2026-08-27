@@ -5,6 +5,16 @@ SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
 
 ## Unreleased
 
+### Fixed
+
+- SQLite worktree comparisons now ignore the schema cookie rewritten by online backup, preventing
+  clean databases committed on macOS from appearing modified after a Windows clone.
+
+### Compatibility
+
+- The JavaScript API, repository, and snapshot formats are unchanged. Disposable SQLite page-index
+  and worktree-probe caches are rebuilt under version 5.
+
 ## Graft SDK 0.3.21 — 2026-08-26
 
 ### Changed
