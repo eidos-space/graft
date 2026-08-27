@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Fixed
+
+- SQLite worktree comparisons now ignore the schema cookie rewritten by online backup, preventing
+  clean databases committed on macOS from appearing modified after a Windows clone.
+
+### Compatibility
+
+- Repository and snapshot formats are unchanged. Disposable SQLite page-index and worktree-probe
+  caches are rebuilt under version 5 so previously cached false modifications cannot survive the
+  upgrade.
+
 ## Graft 0.15.2 — 2026-08-26
 
 ### Changed
