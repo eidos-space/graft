@@ -1,7 +1,8 @@
 use std::{
-    io::Read,
+    io::{IsTerminal, Read, Write},
     num::NonZeroU64,
     path::{Path, PathBuf},
+    process::{Command as ProcessCommand, Stdio},
 };
 
 use anyhow::{Context, Result, bail};
@@ -19,6 +20,9 @@ use graft_sdk::{
 use rusqlite::{Batch, Connection, fallible_iterator::FallibleIterator, types::ValueRef};
 use serde_json::Value;
 
+#[cfg(not(target_arch = "wasm32"))]
+mod upgrade;
+
 #[derive(Subcommand)]
 enum Command {
     /// Generate an internal test identifier
@@ -26,6 +30,19 @@ enum Command {
         /// Identifier kind to generate
         #[arg(value_enum)]
         kind: IdKind,
+    },
+
+    /// Upgrade the graft CLI to the latest stable release
+    Upgrade,
+
+    /// Replace a running Windows executable after its parent process exits.
+    #[command(name = "_upgrade-replace", hide = true)]
+    UpgradeReplace {
+        #[arg(long, hide = true)]
+        source: PathBuf,
+
+        #[arg(long, hide = true)]
+        destination: PathBuf,
     },
 
     /// Show repository history
@@ -1082,6 +1099,21 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
             IdKind::Log => println!("{}", LogId::random()),
             IdKind::Sid => println!("{}", SegmentId::random()),
         },
+        Command::Upgrade => {
+            #[cfg(not(target_arch = "wasm32"))]
+            upgrade::run()?;
+            #[cfg(target_arch = "wasm32")]
+            bail!("graft upgrade is only available in the native CLI");
+        }
+        Command::UpgradeReplace { source, destination } => {
+            #[cfg(windows)]
+            upgrade::replace_after_parent_exit(&source, &destination)?;
+            #[cfg(not(windows))]
+            {
+                let _ = (source, destination);
+                bail!("internal upgrade replacement is only available on Windows");
+            }
+        }
         Command::Log { json, limit, after } => {
             if limit == Some(0) {
                 bail!("log --limit must be greater than zero");
@@ -1097,7 +1129,7 @@ fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
                 if limit.is_some() || after.is_some() {
                     bail!("log pagination requires --json");
                 }
-                print_output(run_repository_metadata_command(db_override, "log", None)?);
+                print_log_output(run_repository_metadata_command(db_override, "log", None)?)?;
             }
         }
         Command::Init(args) => {
@@ -2719,6 +2751,62 @@ fn print_output(output: Option<String>) {
             println!();
         }
     }
+}
+
+fn print_log_output(output: Option<String>) -> Result<()> {
+    let Some(output) = output.filter(|output| !output.is_empty()) else {
+        return Ok(());
+    };
+
+    if !std::io::stdout().is_terminal() {
+        print_output(Some(output));
+        return Ok(());
+    }
+
+    let Some((program, arguments)) = configured_pager() else {
+        print_output(Some(output));
+        return Ok(());
+    };
+    let mut command = ProcessCommand::new(program);
+    command
+        .args(arguments)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    let is_less = Path::new(command.get_program())
+        .file_name()
+        .is_some_and(|name| name == "less");
+    if is_less && std::env::var_os("LESS").is_none() {
+        command.env("LESS", "FRX");
+    }
+
+    let Ok(mut child) = command.spawn() else {
+        print_output(Some(output));
+        return Ok(());
+    };
+    let write_result = child
+        .stdin
+        .take()
+        .expect("pager stdin was configured")
+        .write_all(output.as_bytes());
+    let _ = child.wait();
+
+    match write_result {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn configured_pager() -> Option<(String, Vec<String>)> {
+    let configured = std::env::var("GIT_PAGER")
+        .ok()
+        .or_else(|| std::env::var("PAGER").ok())
+        .unwrap_or_else(|| "less".to_string());
+    let mut words = configured.split_whitespace();
+    let program = words.next()?.to_string();
+    let arguments = words.map(ToOwned::to_owned).collect();
+    Some((program, arguments))
 }
 
 fn remote_sync_arg(args: &RemoteSyncArgs) -> Result<Option<String>> {

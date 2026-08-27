@@ -4,19 +4,19 @@ description: 当前 Graft 的能力、稳定性边界和预期。
 ---
 
 Graft 仍然是实验性项目。本文档以
-[v0.15.2 release](https://github.com/eidos-space/graft/releases/latest)
+[v0.15.3 release](https://github.com/eidos-space/graft/releases/latest)
 为基线，重点介绍 SQLite 数据库及相关文件的版本控制：一致快照、行级差异、
 合并、恢复与远端同步。
 
-只存在于开发分支的能力不属于 v0.15.2 文档，除非页面明确标注为未发布。
+只存在于开发分支的能力不属于 v0.15.3 文档，除非页面明确标注为未发布。
 
 ## 当前可用
 
 - CLI：`init`、`clone`、`sql`、`status`、`audit`、`gc`、`ls-files`、
   `payload`、`config`、`add`、`rm`、`commit`、`log`、`show`、`diff`、
   `checkout`、`restore`、`export`、`reset`、`branch`、`switch`、`tag`、
-  `merge`、`conflicts`、`resolve`、`remote`、`ls-remote`、`fetch`、`pull`
-  和 `push`。
+  `merge`、`conflicts`、`resolve`、`remote`、`ls-remote`、`fetch`、`pull`、
+  `push` 和 `upgrade`。
 - `.graft/` 下的项目本地仓库状态。
 - 一个 worktree 中跟踪多个 SQLite 数据库路径。
 - 与 SQLite snapshot 在同一个 commit tree 中的 text/binary file artifact。
@@ -60,7 +60,7 @@ connection。Graft 不会在另一个 writer 活跃时覆盖数据库。
 ## Release
 
 预构建 CLI archive 随
-[v0.15.2 GitHub release](https://github.com/eidos-space/graft/releases/latest)
+[v0.15.3 GitHub release](https://github.com/eidos-space/graft/releases/latest)
 发布。
 常驻 Node.js SDK 独立计版本并发布为
 [`@eidos.space/graft`](https://github.com/eidos-space/graft)。

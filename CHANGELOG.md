@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## Graft 0.15.3 — 2026-08-27
+
+### Added
+
+- `graft upgrade` downloads, verifies, and installs the latest stable CLI release for the current
+  platform.
+
+### Changed
+
+- `graft log` now uses Git-style commit blocks and opens a pager for interactive terminals, keeping
+  the newest commit visible first while allowing keyboard navigation.
+
 ### Fixed
 
 - SQLite worktree comparisons now ignore the schema cookie rewritten by online backup, preventing

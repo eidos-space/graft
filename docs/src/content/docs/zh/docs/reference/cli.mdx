@@ -46,6 +46,7 @@ cat script.sql | graft sql --db data.sqlite
 | `graft add [--json] [--all [--kind kind]] [path]` | 暂存全部 worktree 变化，也可以按 kind 过滤；不传 `--all` 时暂存一个 repo-relative path。 |
 | `graft rm [--json] [--cached] [path]` | 暂存已跟踪数据库或文件的删除；`--cached` 会保留 worktree 内容。 |
 | `graft commit [--json] -m <message>` | 从 index 创建 repository commit。 |
+| `graft upgrade` | 下载并安装当前平台最新的稳定版 CLI。 |
 | `graft log [--json] [--limit n] [--after oid]` | 显示仓库历史；分页需要 JSON 输出。 |
 | `graft show [--json] <rev>` | 显示一个 repository commit。 |
 | `graft diff [--json] [--rows] [--content [--max-content-bytes n]] [--kind kind] [--staged] [from] [to] [path]` | 比较 worktree、index 或 revisions，也可以按 kind 过滤。 |

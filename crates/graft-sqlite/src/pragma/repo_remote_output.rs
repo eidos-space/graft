@@ -116,7 +116,7 @@ pub(super) fn remote_config_uri(config: &RemoteConfig) -> String {
 }
 
 pub(super) fn format_repo_log(repo: &Repository) -> Result<String, ErrCtx> {
-    let commits = repo.log()?;
+    let commits = repo.history_summary_page(usize::MAX, None)?.commits;
     if commits.is_empty() {
         return Ok("No commits yet.".to_string());
     }
@@ -124,12 +124,25 @@ pub(super) fn format_repo_log(repo: &Repository) -> Result<String, ErrCtx> {
     let mut f = String::new();
     for commit in commits {
         writeln!(&mut f, "commit {}", commit.id)?;
-        if let Some(parent) = commit.parent {
-            writeln!(&mut f, "parent {parent}")?;
+        if commit.parents.len() > 1 {
+            let parents = commit
+                .parents
+                .iter()
+                .map(|parent| &parent[..parent.len().min(7)])
+                .collect::<Vec<_>>()
+                .join(" ");
+            writeln!(&mut f, "Merge: {parents}")?;
         }
-        writeln!(&mut f, "date {}", format_unix_millis(commit.timestamp_ms))?;
+        writeln!(&mut f, "Author: Graft <graft@example.invalid>")?;
+        writeln!(
+            &mut f,
+            "Date:   {}",
+            format_git_log_date(commit.timestamp_ms)
+        )?;
         writeln!(&mut f)?;
-        writeln!(&mut f, "    {}", commit.message)?;
+        for line in commit.message.split('\n') {
+            writeln!(&mut f, "    {line}")?;
+        }
         writeln!(&mut f)?;
     }
     Ok(f)

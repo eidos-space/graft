@@ -19,11 +19,17 @@ import { Tabs, TabItem } from "@astrojs/starlight/components";
 
   ```bash
   curl -fsSL https://graft.eidos.space/install.sh \
-    | GRAFT_VERSION=0.15.2 sh
+    | GRAFT_VERSION=0.15.3 sh
   ```
 
   也可以从 [GitHub Releases](https://github.com/eidos-space/graft/releases)
   下载预构建压缩包。
+
+  安装后，可以使用下面的命令原地更新当前 CLI：
+
+  ```bash
+  graft upgrade
+  ```
 
   </TabItem>
   <TabItem label="Node.js SDK">

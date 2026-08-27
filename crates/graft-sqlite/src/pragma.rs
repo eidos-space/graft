@@ -111,6 +111,39 @@ fn format_unix_millis(timestamp_ms: u64) -> String {
     )
 }
 
+/// Format a Graft commit timestamp using Git's default `log` date shape.
+fn format_git_log_date(timestamp_ms: u64) -> String {
+    let seconds = (timestamp_ms / 1000) as i64;
+    let days = seconds.div_euclid(86_400);
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = (z - era * 146_097) as u32;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = (year_of_era as i64) + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = if month_prime < 10 {
+        month_prime + 3
+    } else {
+        month_prime - 9
+    };
+    let year = if month <= 2 { year + 1 } else { year };
+    let day_seconds = seconds.rem_euclid(86_400) as u32;
+    let weekday =
+        ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][(days + 4).rem_euclid(7) as usize];
+    let month = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ][(month - 1) as usize];
+    format!(
+        "{weekday} {month} {day:>2} {:02}:{:02}:{:02} {year} +0000",
+        day_seconds / 3_600,
+        (day_seconds / 60) % 60,
+        day_seconds % 60
+    )
+}
+
 pub(crate) struct Pragma<'a> {
     name: &'a str,
     arg: Option<&'a str>,

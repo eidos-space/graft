@@ -4,11 +4,11 @@ description: Current Graft capabilities, stability boundaries, and what to expec
 ---
 
 Graft is an experimental project. This documentation targets the
-[v0.15.2 release](https://github.com/eidos-space/graft/releases/latest) and
+[v0.15.3 release](https://github.com/eidos-space/graft/releases/latest) and
 focuses on versioning SQLite databases and the files around them: consistent
 snapshots, row-aware diffs, merge support, restore, and remote sync.
 
-Features that exist only on the development branch are not part of the v0.15.2
+Features that exist only on the development branch are not part of the v0.15.3
 documentation unless a page labels them as unreleased.
 
 ## Available Today
@@ -16,8 +16,8 @@ documentation unless a page labels them as unreleased.
 - CLI workflows for `init`, `clone`, `sql`, `status`, `audit`, `gc`,
   `ls-files`, `payload`, `config`, `add`, `rm`, `commit`, `log`, `show`,
   `diff`, `checkout`, `restore`, `export`, `reset`, `branch`, `switch`, `tag`,
-  `merge`, `conflicts`, `resolve`, `remote`, `ls-remote`, `fetch`, `pull`, and
-  `push`.
+  `merge`, `conflicts`, `resolve`, `remote`, `ls-remote`, `fetch`, `pull`,
+  `push`, and `upgrade`.
 - Repository-local state under `.graft/`.
 - Multiple tracked SQLite database paths in one worktree.
 - Text and binary file artifacts in the same commit tree as SQLite snapshots.
@@ -69,7 +69,7 @@ writer.
 ## Release Artifacts
 
 Prebuilt CLI archives are published with the
-[v0.15.2 GitHub release](https://github.com/eidos-space/graft/releases/latest).
+[v0.15.3 GitHub release](https://github.com/eidos-space/graft/releases/latest).
 The resident Node.js SDK is independently versioned and published as
 [`@eidos.space/graft`](https://github.com/eidos-space/graft).
 

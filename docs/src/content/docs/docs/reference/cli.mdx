@@ -50,6 +50,7 @@ It requires an explicit `--db` path and an existing `.graft/` repository. Use `g
 | `graft add [--json] [--all [--kind kind]] [path]` | Stage all worktree changes, optionally filtered by kind, or one repo-relative path. |
 | `graft rm [--json] [--cached] [path]` | Stage removal of a tracked database or file; `--cached` keeps worktree contents. |
 | `graft commit [--json] -m <message>` | Create a repository commit from the index. |
+| `graft upgrade` | Download and install the latest stable CLI release for the current platform. |
 | `graft log [--json] [--limit n] [--after oid]` | Show repository history; pagination requires JSON output. |
 | `graft show [--json] <rev>` | Show one repository commit. |
 | `graft diff [--json] [--rows] [--content [--max-content-bytes n]] [--kind kind] [--staged] [from] [to] [path]` | Compare worktree, index, or revisions, optionally filtered by kind. |
