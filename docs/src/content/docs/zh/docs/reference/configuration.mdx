@@ -22,6 +22,10 @@ config 保存 repository format settings、object format、命名远端和 branc
 repository_format_version = 2
 default_branch = "main"
 
+[user]
+name = "Mayne"
+email = "me@example.com"
+
 [extensions]
 object_format = "blake3"
 
@@ -40,6 +44,15 @@ merge = "refs/heads/main"
 graft remote add origin fs:///srv/graft/app
 graft branch --set-upstream-to origin/main main
 ```
+
+可以使用与 Git 兼容的 key 配置新 commit 和 annotated tag 写入的身份：
+
+```bash
+graft config set user.name "Mayne"
+graft config set user.email "me@example.com"
+```
+
+默认身份是 `Graft <graft@example.invalid>`。对任意 key 执行 unset 可恢复默认值。
 
 嵌入式应用可以使用 `graft config ... --json` 读取或修改结构化配置，而不必解析
 终端文本。

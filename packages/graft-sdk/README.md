@@ -76,7 +76,12 @@ Rust toolchain or system SQLite library, and the package has no install script.
 ```js
 const { RepositorySession } = require("@eidos.space/graft")
 
-const session = await RepositorySession.open(spaceRoot)
+const session = await RepositorySession.open(spaceRoot, {
+  identity: {
+    name: "Mayne",
+    email: "me@example.com",
+  },
+})
 try {
   const status = await session.statusIncremental()
   const diff = await session.diffPaths({
@@ -86,6 +91,11 @@ try {
     table: "customers",
     limit: 100,
   })
+
+  // For a persistent repository identity, use the config API.
+  await session.configSet("user.name", "Mayne")
+  await session.configSet("user.email", "me@example.com")
+  const configuredEmail = await session.configGet("user.email")
 
   // For large SQLite changes, first load table counts with no row payloads.
   const summary = await session.diffSqlitePaths({
@@ -145,12 +155,13 @@ files in the Space. Changes confined to `.graft` are not counted.
 
 | Method | Purpose | Materializes tracked worktree files |
 | --- | --- | --- |
-| `open`, `close`, `reopen` | Manage the retained repository runtime | No |
+| `open`, `close`, `reopen` | Manage the retained repository runtime; `open` accepts an optional in-memory identity override | No |
 | `init` | Initialize `.graft` metadata | No |
 | `status` | Inspect worktree and index state | No |
 | `statusIncremental` | Inspect status with a stable generation/change token and safe cache telemetry | No |
 | `repositoryMetadata` | Read head, branch, upstream, and repository format without scanning the worktree | No |
 | `listRemotes` | Read a credential-free remote URL/config projection without scanning the worktree | No |
+| `configGet`, `configList`, `configSet`, `configUnset` | Read or update effective repository configuration, including `user.name` and `user.email` | No |
 | `addAll` | Read/import the current worktree into the index | No |
 | `stagePaths` | Stage up to 1,000 explicit paths in one serialized SDK call | No |
 | `captureSqliteSnapshot` | Export one immutable SQLite image and optionally a fixed-page delta from a prior opaque capture token | No |

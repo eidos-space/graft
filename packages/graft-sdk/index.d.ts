@@ -999,16 +999,31 @@ export interface IgnoredPathsResult {
   }
 }
 
+export interface ConfigEntry {
+  key: string
+  value: string
+}
+
+export interface RepositorySessionIdentity {
+  name: string
+  email: string
+}
+
+export interface RepositorySessionOptions extends OperationOptions {
+  /** In-memory identity override for commits and ref updates in this session. */
+  identity?: RepositorySessionIdentity
+}
+
 export class GraftSdkError extends Error {
   readonly code: string
   readonly cause?: unknown
 }
 
 export class RepositorySession {
-  constructor(target: string)
+  constructor(target: string, options?: RepositorySessionOptions)
   static open(
     target: string,
-    options?: OperationOptions
+    options?: RepositorySessionOptions
   ): Promise<RepositorySession>
 
   readonly target: string
@@ -1030,6 +1045,14 @@ export class RepositorySession {
     options?: OperationOptions
   ): Promise<RepositoryMetadataResult>
   listRemotes(options?: OperationOptions): Promise<ListRemotesResult>
+  configGet(key: string, options?: OperationOptions): Promise<ConfigEntry>
+  configList(options?: OperationOptions): Promise<ConfigEntry[]>
+  configSet(
+    key: string,
+    value: string,
+    options?: OperationOptions
+  ): Promise<ConfigEntry>
+  configUnset(key: string, options?: OperationOptions): Promise<ConfigEntry>
   addAll(options?: OperationOptions): Promise<GraftJson>
   stagePaths(options: StagePathsOptions): Promise<BatchPathsResult>
   captureSqliteSnapshot(

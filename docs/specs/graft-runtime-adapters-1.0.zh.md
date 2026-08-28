@@ -90,6 +90,12 @@ replacement，保证 concurrent reader 不会读到 partial serialization。
 Session 不是 canonical state。Crash/finalizer 后新 session 从 `.graft`、objects、
 index、refs 与 merge records 恢复，不需要 daemon/socket/PID registry。
 
+SDK session 可以携带包含 `name` 和 `email` 的内存 `identity` 覆盖。覆盖只作用于该
+session 执行的 commit 和 ref 更新，在同一个 session 对象的 `close`/`reopen` 后仍然保留，
+且不得写入 repository config。未提供覆盖时，session 依次使用 repository 的
+`user.name`/`user.email` 和 repository 默认值。需要持久化修改身份时使用 repository
+config API。
+
 ## 5. SDK operation surface
 
 CLI 与 SDK 主要映射如下；SDK 空白表示当前 CLI-only，不是另一套实现：
@@ -105,6 +111,7 @@ CLI 与 SDK 主要映射如下；SDK 空白表示当前 CLI-only，不是另一�
 | `log`, `show` | `history`, `historySummaries`, `commitDetails`, `commitChangedPaths` | lazy metadata/detail/path page |
 | `ls-files`/ignore | `inventory`, `isIgnoredPath(s)` | bounded classification |
 | metadata/`remote list` | `repositoryMetadata`, `listRemotes` | credential-redacted metadata |
+| `config get/list/set/unset` | `configGet`, `configList`, `configSet`, `configUnset` | effective repository config entries |
 | `restore` | `restore`, `restorePaths` | affected paths/checkout outcome |
 | remote config subset | `configureRemote` | local config/upstream |
 | `fetch/push/pull` | 同名 method | remote/ref/merge outcome |
@@ -118,7 +125,8 @@ CLI 与 SDK 主要映射如下；SDK 空白表示当前 CLI-only，不是另一�
 Init, Status, StatusIncremental, AddAll, StagePaths, RecordPathMove,
 UntrackPaths, Commit, Diff, DiffPaths, ReadPathContent, History,
 HistorySummaries, CommitDetails, CommitChangedPaths, IsIgnoredPath,
-IsIgnoredPaths, Inventory, RepositoryMetadata, ListRemotes, Restore,
+IsIgnoredPaths, Inventory, RepositoryMetadata, ListRemotes, ConfigGet,
+ConfigList, ConfigSet, ConfigUnset, Restore,
 RestorePaths, RemoteConfigure, Push, Fetch, Pull, Clone, PlanMerge,
 ApplyMerge, GetMergeStatus, ListMergePaths, ListMergeConflicts,
 ReadMergeVersion, SetMergePathResult, ResolveMergeRow,

@@ -16,13 +16,14 @@ class GraftSdkError extends Error {
 class RepositorySession {
   #native
 
-  constructor(target) {
-    this.#native = new native.RepositorySession(path.resolve(target))
+  constructor(target, { identity } = {}) {
+    this.#native = new native.RepositorySession(path.resolve(target), identity)
   }
 
   static async open(target, options = {}) {
-    const session = new RepositorySession(target)
-    await session.open(options)
+    const { identity, signal } = options
+    const session = new RepositorySession(target, { identity })
+    await session.open({ signal })
     return session
   }
 
@@ -72,6 +73,22 @@ class RepositorySession {
 
   async listRemotes({ signal } = {}) {
     return callJson(() => this.#native.listRemotes(signal))
+  }
+
+  async configGet(key, { signal } = {}) {
+    return callJson(() => this.#native.configGet(key, signal))
+  }
+
+  async configList({ signal } = {}) {
+    return callJson(() => this.#native.configList(signal))
+  }
+
+  async configSet(key, value, { signal } = {}) {
+    return callJson(() => this.#native.configSet(key, value, signal))
+  }
+
+  async configUnset(key, { signal } = {}) {
+    return callJson(() => this.#native.configUnset(key, signal))
   }
 
   async addAll({ signal } = {}) {

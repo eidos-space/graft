@@ -9,7 +9,7 @@ use graft::{
     remote::{RemoteConfig, RemoteCredentialErr, RemoteCredentials},
     repo::{
         CommitFileState, CommitObject, RepoCommitChangedPathsPage, RepoHistorySummaryPage,
-        RepoStatus, Repository,
+        RepoStatus, Repository, UserConfig,
     },
     setup::setup_graft_temporary,
 };
@@ -316,10 +316,24 @@ impl RepositoryCommandService {
         target: &Path,
         credentials: RemoteCredentials,
     ) -> Result<Self, ErrCtx> {
+        Self::open_with_credentials_and_identity(target, credentials, None)
+    }
+
+    /// Opens a service with explicit credentials and an in-memory user identity override.
+    pub fn open_with_credentials_and_identity(
+        target: &Path,
+        credentials: RemoteCredentials,
+        user_identity: Option<UserConfig>,
+    ) -> Result<Self, ErrCtx> {
+        if let Some(user_identity) = &user_identity {
+            user_identity.validate()?;
+        }
         let base_runtime = setup_graft_temporary(RemoteConfig::Memory, None)?;
         let runtimes = Arc::new(RepoRuntimeRegistry::new(base_runtime.clone()));
-        let repo = discover_target_repository(target)
-            .map(|repo| repo.with_remote_credentials(credentials.clone()));
+        let repo = discover_target_repository(target).map(|repo| {
+            repo.with_remote_credentials(credentials.clone())
+                .with_user_identity(user_identity.clone())
+        });
         let runtime = match &repo {
             Some(repo) => runtimes.runtime_for(repo)?,
             None => base_runtime,
@@ -338,6 +352,7 @@ impl RepositoryCommandService {
             repository_database,
             repo,
             runtimes,
+            user_identity,
         )?;
         file.set_remote_credentials(credentials.clone());
         Ok(Self { file, credentials })

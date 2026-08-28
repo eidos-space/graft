@@ -9,6 +9,12 @@ A `RepositorySession` owns one repository runtime. Calls on that session are
 serialized, but the application still owns the live SQLite connections and
 ordinary files in the worktree.
 
+Pass an optional `identity: { name, email }` to `RepositorySession.open()` or
+the constructor for an in-memory identity override. It applies to commits and
+ref updates in that session, survives `close()`/`reopen()` on the same session,
+and does not modify `.graft/config.toml`. Use `configSet("user.name", ...)` and
+`configSet("user.email", ...)` for a persistent repository identity.
+
 ## Keep one repository writer
 
 Only one SDK session or external Graft writer can own a repository at a time.

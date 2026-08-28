@@ -22,6 +22,7 @@ use graft_sdk::{
     RecordSemanticMergeConflictsOptions as CoreRecordSemanticMergeConflictsOptions,
     RemoteConfigureOptions as CoreRemoteConfigureOptions, RepositoryOperation,
     RepositorySession as CoreRepositorySession,
+    RepositorySessionIdentity as CoreRepositorySessionIdentity,
     ResolveMergeCellOptions as CoreResolveMergeCellOptions,
     ResolveMergeRowOptions as CoreResolveMergeRowOptions,
     ResolveMergeTableOptions as CoreResolveMergeTableOptions, RestoreOptions as CoreRestoreOptions,
@@ -52,6 +53,12 @@ pub struct DiffOptions {
     pub to: Option<String>,
     pub path: Option<String>,
     pub table: Option<String>,
+}
+
+#[napi(object)]
+pub struct RepositorySessionIdentity {
+    pub name: String,
+    pub email: String,
 }
 
 #[napi(object)]
@@ -332,6 +339,17 @@ enum JsonOperation {
     StatusIncremental,
     RepositoryMetadata,
     ListRemotes,
+    ConfigGet {
+        key: String,
+    },
+    ConfigList,
+    ConfigSet {
+        key: String,
+        value: String,
+    },
+    ConfigUnset {
+        key: String,
+    },
     AddAll,
     StagePaths {
         options: CoreStagePathsOptions,
@@ -521,6 +539,26 @@ impl JsonTask {
         }
         if matches!(self.operation, JsonOperation::ListRemotes) {
             let value = self.session.list_remotes().map_err(napi_error)?;
+            return serde_json::to_string(&value)
+                .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
+        }
+        if let JsonOperation::ConfigGet { key } = &self.operation {
+            let value = self.session.config_get(key).map_err(napi_error)?;
+            return serde_json::to_string(&value)
+                .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
+        }
+        if matches!(self.operation, JsonOperation::ConfigList) {
+            let value = self.session.config_list().map_err(napi_error)?;
+            return serde_json::to_string(&value)
+                .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
+        }
+        if let JsonOperation::ConfigSet { key, value } = &self.operation {
+            let value = self.session.config_set(key, value).map_err(napi_error)?;
+            return serde_json::to_string(&value)
+                .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
+        }
+        if let JsonOperation::ConfigUnset { key } = &self.operation {
+            let value = self.session.config_unset(key).map_err(napi_error)?;
             return serde_json::to_string(&value)
                 .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
         }
@@ -770,7 +808,12 @@ impl JsonTask {
             JsonOperation::Init => self.session.init(),
             JsonOperation::Status => self.session.status(),
             JsonOperation::StatusIncremental => unreachable!("handled before JSON value dispatch"),
-            JsonOperation::RepositoryMetadata | JsonOperation::ListRemotes => {
+            JsonOperation::RepositoryMetadata
+            | JsonOperation::ListRemotes
+            | JsonOperation::ConfigGet { .. }
+            | JsonOperation::ConfigList
+            | JsonOperation::ConfigSet { .. }
+            | JsonOperation::ConfigUnset { .. } => {
                 unreachable!("handled before JSON value dispatch")
             }
             JsonOperation::AddAll => self.session.add_all(),
@@ -895,9 +938,15 @@ pub struct NodeRepositorySession {
 #[napi]
 impl NodeRepositorySession {
     #[napi(constructor)]
-    pub fn new(target: String) -> Self {
+    pub fn new(target: String, identity: Option<RepositorySessionIdentity>) -> Self {
         Self {
-            session: Arc::new(CoreRepositorySession::new(target)),
+            session: Arc::new(CoreRepositorySession::new_with_identity(
+                target,
+                identity.map(|identity| CoreRepositorySessionIdentity {
+                    name: identity.name,
+                    email: identity.email,
+                }),
+            )),
         }
     }
 
@@ -963,6 +1012,31 @@ impl NodeRepositorySession {
     #[napi]
     pub fn list_remotes(&self, signal: Option<AbortSignal>) -> AsyncTask<JsonTask> {
         json_task(self, JsonOperation::ListRemotes, signal)
+    }
+
+    #[napi(js_name = "configGet")]
+    pub fn config_get(&self, key: String, signal: Option<AbortSignal>) -> AsyncTask<JsonTask> {
+        json_task(self, JsonOperation::ConfigGet { key }, signal)
+    }
+
+    #[napi(js_name = "configList")]
+    pub fn config_list(&self, signal: Option<AbortSignal>) -> AsyncTask<JsonTask> {
+        json_task(self, JsonOperation::ConfigList, signal)
+    }
+
+    #[napi(js_name = "configSet")]
+    pub fn config_set(
+        &self,
+        key: String,
+        value: String,
+        signal: Option<AbortSignal>,
+    ) -> AsyncTask<JsonTask> {
+        json_task(self, JsonOperation::ConfigSet { key, value }, signal)
+    }
+
+    #[napi(js_name = "configUnset")]
+    pub fn config_unset(&self, key: String, signal: Option<AbortSignal>) -> AsyncTask<JsonTask> {
+        json_task(self, JsonOperation::ConfigUnset { key }, signal)
     }
 
     #[napi]
@@ -1874,6 +1948,10 @@ pub fn operation_materializes_worktree(operation: String) -> Result<bool> {
         "status_incremental" | "statusIncremental" => RepositoryOperation::StatusIncremental,
         "repository_metadata" | "repositoryMetadata" => RepositoryOperation::RepositoryMetadata,
         "list_remotes" | "listRemotes" => RepositoryOperation::ListRemotes,
+        "config_get" | "configGet" => RepositoryOperation::ConfigGet,
+        "config_list" | "configList" => RepositoryOperation::ConfigList,
+        "config_set" | "configSet" => RepositoryOperation::ConfigSet,
+        "config_unset" | "configUnset" => RepositoryOperation::ConfigUnset,
         "add_all" | "addAll" => RepositoryOperation::AddAll,
         "stage_paths" | "stagePaths" => RepositoryOperation::StagePaths,
         "capture_sqlite_snapshot" | "captureSqliteSnapshot" => {

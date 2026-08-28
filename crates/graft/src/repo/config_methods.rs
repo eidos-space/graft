@@ -3,10 +3,13 @@ use super::*;
 impl Repository {
     pub fn config(&self) -> Result<RepoConfig> {
         let raw = fs::read_to_string(self.config_path())?;
-        Ok(toml::from_str(&raw)?)
+        let config: RepoConfig = toml::from_str(&raw)?;
+        config.user.validate()?;
+        Ok(config)
     }
 
     pub fn write_config(&self, config: &RepoConfig) -> Result<()> {
+        config.user.validate()?;
         config.merge.validate()?;
         let raw = toml::to_string_pretty(config)?;
         let path = self.config_path();
@@ -31,6 +34,12 @@ impl Repository {
         let mut config = self.config()?;
 
         match key {
+            CONFIG_KEY_USER_NAME => {
+                config.user.name = parse_config_identity_value(key, value)?;
+            }
+            CONFIG_KEY_USER_EMAIL => {
+                config.user.email = parse_config_identity_value(key, value)?;
+            }
             CONFIG_KEY_FILES_INLINE_TEXT_THRESHOLD => {
                 config.files.inline_text_threshold = parse_config_byte_unit_value(key, value)?;
             }
@@ -103,6 +112,12 @@ impl Repository {
         let mut config = self.config()?;
 
         match key {
+            CONFIG_KEY_USER_NAME => {
+                config.user.name = UserConfig::default().name;
+            }
+            CONFIG_KEY_USER_EMAIL => {
+                config.user.email = UserConfig::default().email;
+            }
             CONFIG_KEY_FILES_INLINE_TEXT_THRESHOLD => {
                 config.files.inline_text_threshold = FileConfig::default().inline_text_threshold;
             }
@@ -156,4 +171,9 @@ impl Repository {
     pub(super) fn track_roots(&self) -> Result<Vec<String>> {
         Ok(self.config()?.track.roots())
     }
+}
+
+fn parse_config_identity_value(key: &str, value: &str) -> Result<String> {
+    config::validate_identity_value(key, value)?;
+    Ok(value.to_string())
 }

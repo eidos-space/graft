@@ -181,12 +181,14 @@ ignore 不能静默 untrack 已跟踪 path。Inventory 要区分 tracked、untra
 ## 7. 配置契约
 
 默认值包括 repository format 2、`blake3`、branch `main`、1 MiB inline text
-threshold、空 external path/track root、开启物理 SQLite materialization，以及 merge
-规格定义的 built-in resolver。
+threshold、空 external path/track root、开启物理 SQLite materialization、默认用户身份
+`Graft <graft@example.invalid>`，以及 merge 规格定义的 built-in resolver。
 
 Generic config API 只接受：
 
 ```text
+user.name
+user.email
 files.inline_text_threshold
 files.external_paths
 track.default_roots
@@ -199,7 +201,9 @@ merge.internal_resolvers.<subject>
 merge.schema_resolvers.<operation>
 ```
 
-值必须 type-check，resolver 必须属于支持组合。Unset scalar 恢复默认；unset
+`user.name` 和 `user.email` 配置新 commit 的 author/committer identity，以及 annotated
+tag 的 tagger identity。缺少 user 字段时使用上述默认值。Identity value 不能是空字符串；
+email 的其他内容保持 opaque，不要求特定的地址语法。值必须 type-check，resolver 必须属于支持组合。Unset scalar 恢复默认；unset
 per-table/per-subject override 则删除 override。Unknown key 必须失败。Remote 与
 branch upstream 由专用操作管理；credential 不能写入 config。
 

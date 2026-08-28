@@ -123,6 +123,16 @@ pub(super) fn format_repo_log(repo: &Repository) -> Result<String, ErrCtx> {
 
     let mut f = String::new();
     for commit in commits {
+        let author = match repo.read_object(&commit.id)? {
+            graft::repo::object::Object::Commit(commit) => {
+                format!("{} <{}>", commit.author.name, commit.author.email)
+            }
+            _ => {
+                return Err(ErrCtx::InvalidCommand(
+                    format!("history entry `{}` is not a commit object", commit.id).into(),
+                ));
+            }
+        };
         writeln!(&mut f, "commit {}", commit.id)?;
         if commit.parents.len() > 1 {
             let parents = commit
@@ -133,7 +143,7 @@ pub(super) fn format_repo_log(repo: &Repository) -> Result<String, ErrCtx> {
                 .join(" ");
             writeln!(&mut f, "Merge: {parents}")?;
         }
-        writeln!(&mut f, "Author: Graft <graft@example.invalid>")?;
+        writeln!(&mut f, "Author: {author}")?;
         writeln!(
             &mut f,
             "Date:   {}",

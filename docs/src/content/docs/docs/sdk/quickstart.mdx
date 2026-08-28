@@ -21,12 +21,20 @@ SQLite database and files.
    ```js
    const { RepositorySession } = require("@eidos.space/graft");
 
-   const session = await RepositorySession.open(appDataRoot);
+   const session = await RepositorySession.open(appDataRoot, {
+     identity: {
+       name: "Mayne",
+       email: "me@example.com",
+     },
+   });
    await session.init();
    ```
 
    `init()` creates `.graft/` beside the application worktree. Call it once for
-   a new repository.
+   a new repository. The optional `identity` is an in-memory session override
+   for commit and ref identities; use `configSet("user.name", ...)` and
+   `configSet("user.email", ...)` when the identity should be stored in the
+   repository.
 
 3. Read status.
 

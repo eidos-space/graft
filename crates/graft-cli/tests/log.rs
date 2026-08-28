@@ -31,13 +31,27 @@ fn log_uses_git_style_blocks_and_keeps_newest_commit_first() {
     repo.stage_artifact_path(&note).unwrap();
     let second = repo.commit_staged("second commit\nwith details").unwrap();
 
+    run_graft(temp_dir.path(), &["config", "set", "user.name", "Mayne"]);
+    run_graft(
+        temp_dir.path(),
+        &["config", "set", "user.email", "me@example.com"],
+    );
+    fs::write(&note, "third\n").unwrap();
+    repo.stage_artifact_path(&note).unwrap();
+    let third = repo.commit_staged("third commit").unwrap();
+
     let output = run_graft(temp_dir.path(), &["log"]);
 
-    let newest = output.find(&format!("commit {}", second.id)).unwrap();
+    let newest = output.find(&format!("commit {}", third.id)).unwrap();
+    let middle = output.find(&format!("commit {}", second.id)).unwrap();
     let oldest = output.find(&format!("commit {}", first.id)).unwrap();
-    assert!(newest < oldest, "{output}");
+    assert!(newest < middle && middle < oldest, "{output}");
     assert!(
         output.contains("Author: Graft <graft@example.invalid>"),
+        "{output}"
+    );
+    assert!(
+        output.contains("Author: Mayne <me@example.com>"),
         "{output}"
     );
     assert!(output.contains("Date:   "), "{output}");

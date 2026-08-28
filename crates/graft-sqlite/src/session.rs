@@ -8,7 +8,7 @@ use graft::{
     GraftErr,
     core::VolumeId,
     remote::RemoteCredentials,
-    repo::{CommitFileState, CommitTableSummary, Repository},
+    repo::{CommitFileState, CommitTableSummary, Repository, UserConfig},
     rt::runtime::Runtime,
     snapshot::Snapshot,
     volume_reader::VolumeReadRef,
@@ -52,6 +52,7 @@ pub(crate) struct RepositorySessionContext {
     pub(crate) tag: String,
     pub(crate) vid: VolumeId,
     pub(crate) repo: Option<Repository>,
+    user_identity: Option<UserConfig>,
     remote_credentials: RemoteCredentials,
     repo_runtimes: Arc<RepoRuntimeRegistry>,
     repository_database: Option<PathBuf>,
@@ -74,6 +75,7 @@ impl RepositorySessionContext {
         repository_database: Option<PathBuf>,
         repo: Option<Repository>,
         repo_runtimes: Arc<RepoRuntimeRegistry>,
+        user_identity: Option<UserConfig>,
     ) -> Result<Self, ErrCtx> {
         let volume = runtime.volume_open(None, None, None)?;
         Ok(Self {
@@ -81,6 +83,7 @@ impl RepositorySessionContext {
             tag,
             vid: volume.vid,
             repo,
+            user_identity,
             remote_credentials: RemoteCredentials::environment(),
             repo_runtimes,
             repository_database,
@@ -165,8 +168,14 @@ impl RepositorySessionContext {
             .map(|repo| repo.with_remote_credentials(credentials));
     }
 
+    pub(crate) fn user_identity(&self) -> Option<&UserConfig> {
+        self.user_identity.as_ref()
+    }
+
     pub(crate) fn attach_repo(&mut self, repo: Repository) -> Result<(), ErrCtx> {
-        let repo = repo.with_remote_credentials(self.remote_credentials.clone());
+        let repo = repo
+            .with_remote_credentials(self.remote_credentials.clone())
+            .with_user_identity(self.user_identity.clone());
         let runtime = self.repo_runtimes.runtime_for(&repo)?;
         self.switch_runtime(runtime)?;
         self.repo = Some(repo);

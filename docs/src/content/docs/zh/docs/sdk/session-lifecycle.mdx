@@ -8,6 +8,12 @@ import { Aside } from "@astrojs/starlight/components";
 一个 `RepositorySession` 拥有一个仓库 runtime。同一会话中的调用会串行执行，
 但应用仍然拥有工作区中的 SQLite 连接和普通文件。
 
+可以在 `RepositorySession.open()` 或构造函数中传入可选的
+`identity: { name, email }`，作为内存中的 session identity 覆盖。它会作用于该 session
+中的 commit 和 ref 更新，在同一个 session 的 `close()`/`reopen()` 后仍然保留，且不会修改
+`.graft/config.toml`。如果希望身份持久化到仓库，请使用 `configSet("user.name", ...)` 和
+`configSet("user.email", ...)`。
+
 ## 保持单一仓库写入者
 
 同一时间只能有一个 SDK 会话或外部 Graft 写入者拥有仓库。第二个写入者会收到

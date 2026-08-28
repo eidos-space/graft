@@ -145,6 +145,13 @@ releases OS-backed resources; a new session reconstructs from `.graft`, object
 storage, index, refs, and durable merge records. No daemon lease, stdin stream,
 socket, or PID registry is required for recovery.
 
+An SDK session MAY carry an in-memory `identity` override with `name` and
+`email`. The override applies to commits and ref updates executed by that
+session, survives `close`/`reopen` on the same session object, and MUST NOT be
+written to repository configuration. When absent, the session uses the
+repository's configured `user.name` and `user.email`, then the repository
+defaults. Persistent identity changes use the repository configuration API.
+
 ## 5. Rust/Node SDK operation surface
 
 Shared CLI/SDK domains map as follows. A blank SDK cell means CLI-only in the
@@ -161,6 +168,7 @@ current contract, not a second implementation.
 | `log`, `show` | `history`, `historySummaries`, `commitDetails`, `commitChangedPaths` | lazy metadata/details/path pages |
 | `ls-files`, ignore checks | `inventory`, `isIgnoredPath(s)` | bounded path classification |
 | repository/ref metadata, `remote list` | `repositoryMetadata`, `listRemotes` | credential-redacted metadata |
+| `config get/list/set/unset` | `configGet`, `configList`, `configSet`, `configUnset` | effective repository configuration entries |
 | `restore` | `restore`, `restorePaths` | affected paths and checkout outcome |
 | `remote add/set-url` subset | `configureRemote` | local config/upstream outcome |
 | `fetch`, `push`, `pull` | same method names | remote/ref plus merge outcome where applicable |
@@ -174,7 +182,8 @@ The stable operation classification is:
 Init, Status, StatusIncremental, AddAll, StagePaths, RecordPathMove,
 UntrackPaths, Commit, Diff, DiffPaths, ReadPathContent, History,
 HistorySummaries, CommitDetails, CommitChangedPaths, IsIgnoredPath,
-IsIgnoredPaths, Inventory, RepositoryMetadata, ListRemotes, Restore,
+IsIgnoredPaths, Inventory, RepositoryMetadata, ListRemotes, ConfigGet,
+ConfigList, ConfigSet, ConfigUnset, Restore,
 RestorePaths, RemoteConfigure, Push, Fetch, Pull, Clone, PlanMerge,
 ApplyMerge, GetMergeStatus, ListMergePaths, ListMergeConflicts,
 ReadMergeVersion, DiffMergeSqlite, SetMergePathResult, ResolveMergeRow,

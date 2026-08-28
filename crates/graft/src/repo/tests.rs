@@ -89,6 +89,100 @@ fn config_get_set_manages_files_inline_text_threshold() {
 }
 
 #[test]
+fn config_get_set_manages_user_identity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = Repository::init(tmp.path()).unwrap();
+
+    assert_eq!(
+        repo.config_get(CONFIG_KEY_USER_NAME).unwrap().value,
+        "Graft"
+    );
+    assert_eq!(
+        repo.config_get(CONFIG_KEY_USER_EMAIL).unwrap().value,
+        "graft@example.invalid"
+    );
+
+    assert_eq!(
+        repo.config_set(CONFIG_KEY_USER_NAME, "Mayne").unwrap(),
+        RepoConfigEntry {
+            key: CONFIG_KEY_USER_NAME.to_string(),
+            value: "Mayne".to_string(),
+        }
+    );
+    assert_eq!(
+        repo.config_set(CONFIG_KEY_USER_EMAIL, "me@example.com")
+            .unwrap(),
+        RepoConfigEntry {
+            key: CONFIG_KEY_USER_EMAIL.to_string(),
+            value: "me@example.com".to_string(),
+        }
+    );
+    assert_eq!(repo.config().unwrap().user.name, "Mayne");
+    assert_eq!(repo.config().unwrap().user.email, "me@example.com");
+
+    let raw_config = fs::read_to_string(repo.graft_dir().join(CONFIG_FILE)).unwrap();
+    assert!(raw_config.contains("[user]"));
+    assert!(raw_config.contains("name = \"Mayne\""));
+    assert!(raw_config.contains("email = \"me@example.com\""));
+
+    assert!(matches!(
+        repo.config_set(CONFIG_KEY_USER_EMAIL, ""),
+        Err(RepoErr::InvalidConfigValue { key, .. }) if key == CONFIG_KEY_USER_EMAIL
+    ));
+    assert!(matches!(
+        repo.config_set(CONFIG_KEY_USER_NAME, "Bad\tName"),
+        Err(RepoErr::InvalidConfigValue { key, .. }) if key == CONFIG_KEY_USER_NAME
+    ));
+    assert!(matches!(
+        repo.config_set(CONFIG_KEY_USER_EMAIL, "bad@example.com>"),
+        Err(RepoErr::InvalidConfigValue { key, .. }) if key == CONFIG_KEY_USER_EMAIL
+    ));
+
+    assert_eq!(
+        repo.config_unset(CONFIG_KEY_USER_EMAIL).unwrap().value,
+        "graft@example.invalid"
+    );
+    assert_eq!(
+        repo.config_unset(CONFIG_KEY_USER_NAME).unwrap().value,
+        "Graft"
+    );
+}
+
+#[test]
+fn commit_and_annotated_tag_use_configured_user_identity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = Repository::init(tmp.path()).unwrap();
+    repo.config_set(CONFIG_KEY_USER_NAME, "Mayne").unwrap();
+    repo.config_set(CONFIG_KEY_USER_EMAIL, "me@example.com")
+        .unwrap();
+
+    let path = tmp.path().join("note.txt");
+    fs::write(&path, "tracked\n").unwrap();
+    repo.stage_artifact_path(&path).unwrap();
+    let commit = repo.commit_staged("initial").unwrap();
+    let object::Object::Commit(commit_object) = repo.read_object(&commit.id).unwrap() else {
+        panic!("expected commit object");
+    };
+    assert_eq!(commit_object.author.name, "Mayne");
+    assert_eq!(commit_object.author.email, "me@example.com");
+    assert_eq!(commit_object.committer.name, "Mayne");
+    assert_eq!(commit_object.committer.email, "me@example.com");
+
+    let tag = repo
+        .tag_create_annotated("release", None, "release")
+        .unwrap();
+    let object::Object::Tag(tag_object) = repo.read_object(&tag.object).unwrap() else {
+        panic!("expected tag object");
+    };
+    assert_eq!(tag_object.tagger.name, "Mayne");
+    assert_eq!(tag_object.tagger.email, "me@example.com");
+
+    let reflog =
+        fs::read_to_string(repo.graft_dir().join(DIR_LOGS_REFS).join("refs/heads/main")).unwrap();
+    assert!(reflog.contains("Mayne <me@example.com>"));
+}
+
+#[test]
 fn config_get_set_manages_files_external_paths() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = Repository::init(tmp.path()).unwrap();
@@ -524,6 +618,14 @@ fn config_list_reports_effective_supported_entries() {
         repo.config_list().unwrap(),
         vec![
             RepoConfigEntry {
+                key: CONFIG_KEY_USER_NAME.to_string(),
+                value: "Graft".to_string()
+            },
+            RepoConfigEntry {
+                key: CONFIG_KEY_USER_EMAIL.to_string(),
+                value: "graft@example.invalid".to_string()
+            },
+            RepoConfigEntry {
                 key: CONFIG_KEY_FILES_INLINE_TEXT_THRESHOLD.to_string(),
                 value: "1 MB".to_string()
             },
@@ -592,6 +694,14 @@ fn config_list_reports_effective_supported_entries() {
     assert_eq!(
         repo.config_list().unwrap(),
         vec![
+            RepoConfigEntry {
+                key: CONFIG_KEY_USER_NAME.to_string(),
+                value: "Graft".to_string()
+            },
+            RepoConfigEntry {
+                key: CONFIG_KEY_USER_EMAIL.to_string(),
+                value: "graft@example.invalid".to_string()
+            },
             RepoConfigEntry {
                 key: CONFIG_KEY_FILES_INLINE_TEXT_THRESHOLD.to_string(),
                 value: "8 MB".to_string()

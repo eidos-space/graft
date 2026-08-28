@@ -14,6 +14,8 @@ pub const CONFIG_KEY_FILES_EXTERNAL_PATHS: &str = "files.external_paths";
 pub const CONFIG_KEY_TRACK_DEFAULT_ROOTS: &str = "track.default_roots";
 pub const CONFIG_KEY_TRACK_USER_ROOTS: &str = "track.user_roots";
 pub const CONFIG_KEY_WORKTREE_MATERIALIZE_SQLITE: &str = "worktree.materialize_sqlite";
+pub const CONFIG_KEY_USER_NAME: &str = "user.name";
+pub const CONFIG_KEY_USER_EMAIL: &str = "user.email";
 pub const CONFIG_KEY_MERGE_DEFAULT_SEMANTIC_KEYS: &str = "merge.default_semantic_keys";
 pub const CONFIG_KEY_MERGE_SEMANTIC_KEYS_PREFIX: &str = "merge.semantic_keys.";
 pub const CONFIG_KEY_MERGE_GENERATED_COLUMNS_PREFIX: &str = "merge.generated_columns.";
@@ -40,6 +42,9 @@ pub struct RepoConfigEntry {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RepoConfig {
     pub core: CoreConfig,
+
+    #[serde(default, skip_serializing_if = "UserConfig::is_default")]
+    pub user: UserConfig,
 
     #[serde(default)]
     pub extensions: ExtensionsConfig,
@@ -76,6 +81,66 @@ impl Default for CoreConfig {
             default_branch: "main".to_string(),
         }
     }
+}
+
+const DEFAULT_USER_NAME: &str = "Graft";
+const DEFAULT_USER_EMAIL: &str = "graft@example.invalid";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserConfig {
+    #[serde(default = "default_user_name")]
+    pub name: String,
+    #[serde(default = "default_user_email")]
+    pub email: String,
+}
+
+impl UserConfig {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        for (key, value) in [
+            (CONFIG_KEY_USER_NAME, &self.name),
+            (CONFIG_KEY_USER_EMAIL, &self.email),
+        ] {
+            validate_identity_value(key, value)?;
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn validate_identity_value(key: &str, value: &str) -> Result<()> {
+    if value.trim().is_empty()
+        || value
+            .chars()
+            .any(|character| character.is_control() || matches!(character, '<' | '>'))
+    {
+        return Err(RepoErr::InvalidConfigValue {
+            key: key.to_string(),
+            value: value.to_string(),
+            message: "identity value must contain visible text and must not contain control characters, `<`, or `>`"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+impl Default for UserConfig {
+    fn default() -> Self {
+        Self {
+            name: default_user_name(),
+            email: default_user_email(),
+        }
+    }
+}
+
+fn default_user_name() -> String {
+    DEFAULT_USER_NAME.to_string()
+}
+
+fn default_user_email() -> String {
+    DEFAULT_USER_EMAIL.to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -165,7 +230,11 @@ pub(super) fn normalize_config_key(key: &str) -> Result<&str> {
 }
 
 pub(super) fn config_entry(config: &RepoConfig, key: &str) -> Result<RepoConfigEntry> {
-    let value = if key == CONFIG_KEY_FILES_INLINE_TEXT_THRESHOLD {
+    let value = if key == CONFIG_KEY_USER_NAME {
+        config.user.name.clone()
+    } else if key == CONFIG_KEY_USER_EMAIL {
+        config.user.email.clone()
+    } else if key == CONFIG_KEY_FILES_INLINE_TEXT_THRESHOLD {
         config.files.inline_text_threshold.to_string()
     } else if key == CONFIG_KEY_FILES_EXTERNAL_PATHS {
         format_config_string_list(&config.files.external_paths)
@@ -215,6 +284,14 @@ pub(super) fn config_entry(config: &RepoConfig, key: &str) -> Result<RepoConfigE
 
 pub(super) fn config_entries(config: &RepoConfig) -> Vec<RepoConfigEntry> {
     let mut entries = vec![
+        RepoConfigEntry {
+            key: CONFIG_KEY_USER_NAME.to_string(),
+            value: config.user.name.clone(),
+        },
+        RepoConfigEntry {
+            key: CONFIG_KEY_USER_EMAIL.to_string(),
+            value: config.user.email.clone(),
+        },
         RepoConfigEntry {
             key: CONFIG_KEY_FILES_INLINE_TEXT_THRESHOLD.to_string(),
             value: config.files.inline_text_threshold.to_string(),

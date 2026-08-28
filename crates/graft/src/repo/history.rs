@@ -625,8 +625,8 @@ impl Repository {
             .iter()
             .map(|parent| object::ObjectId::from_str(parent))
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        let signature =
-            object::Signature::new("Graft", "graft@example.invalid", timestamp_ms, "+0000");
+        let user = self.user_identity.clone().unwrap_or(self.config()?.user);
+        let signature = object::Signature::new(user.name, user.email, timestamp_ms, "+0000");
         Ok(object::CommitObject {
             tree,
             parents,

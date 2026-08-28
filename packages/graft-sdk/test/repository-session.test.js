@@ -52,6 +52,10 @@ test("exposes ABI-stable SDK metadata and materialization contract", () => {
     "statusIncremental",
     "repositoryMetadata",
     "listRemotes",
+    "configGet",
+    "configList",
+    "configSet",
+    "configUnset",
     "addAll",
     "stagePaths",
     "captureSqliteSnapshot",
@@ -86,6 +90,55 @@ test("exposes ABI-stable SDK metadata and materialization contract", () => {
   ]) {
     assert.equal(operationMaterializesWorktree(operation), false)
   }
+})
+
+test("configures the commit user identity through the SDK", async () => {
+  await withTemporaryDirectory("graft-sdk-config-", async (root) => {
+    const session = await RepositorySession.open(root)
+    await session.init()
+
+    assert.equal((await session.configGet("user.name")).value, "Graft")
+    assert.equal(
+      (await session.configSet("user.name", "Mayne")).value,
+      "Mayne"
+    )
+    assert.equal(
+      (await session.configSet("user.email", "me@example.com")).value,
+      "me@example.com"
+    )
+    const entries = await session.configList()
+    assert.equal(entries.find(({ key }) => key === "user.name").value, "Mayne")
+    assert.equal(
+      (await session.configUnset("user.email")).value,
+      "graft@example.invalid"
+    )
+
+    await session.close()
+  })
+})
+
+test("accepts a session identity without persisting it to repository config", async () => {
+  await withTemporaryDirectory("graft-sdk-session-identity-", async (root) => {
+    const session = await RepositorySession.open(root, {
+      identity: {
+        name: "Session User",
+        email: "session@example.com",
+      },
+    })
+    await session.init()
+    await fs.writeFile(path.join(root, "note.txt"), "session identity\n")
+    await session.addAll()
+    await session.commit("session commit")
+
+    assert.equal((await session.configGet("user.name")).value, "Graft")
+    assert.equal((await session.configGet("user.email")).value, "graft@example.invalid")
+    await session.close()
+    await session.open()
+    await fs.writeFile(path.join(root, "second.txt"), "session identity again\n")
+    await session.addAll()
+    await session.commit("session commit again")
+    await session.close()
+  })
 })
 
 test("merge policy SDK is versioned, CAS guarded, and cancellable", async () => {

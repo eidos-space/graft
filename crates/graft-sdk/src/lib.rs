@@ -14,12 +14,12 @@ use std::{
 };
 
 pub use graft::repo::{
-    CancellationToken, RepoPathContent, RepoPathContentState, RepoStatus, TransferDirection,
-    TransferProgress, TransferProgressReporter,
+    CancellationToken, RepoConfigEntry, RepoPathContent, RepoPathContentState, RepoStatus,
+    TransferDirection, TransferProgress, TransferProgressReporter,
 };
 use graft::repo::{
     CommitArtifactState, CommitFileState, MergeOutcome, MergePlan, RepoPathStorage,
-    RepoTrackedPathKind, Repository,
+    RepoTrackedPathKind, Repository, UserConfig,
     index::{Index, IndexEntry, IndexStage},
 };
 pub use graft::repo::{ManagedColumnResolver, MergeConfig, SemanticKeyCollation};
@@ -76,6 +76,25 @@ pub enum SessionLifecycle {
     Opening,
     Open,
     Closing,
+}
+
+/// An in-memory identity override used by one embedded repository session.
+///
+/// When omitted, commits and ref updates use the repository's configured `user.name` and
+/// `user.email`, falling back to Graft's defaults.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepositorySessionIdentity {
+    pub name: String,
+    pub email: String,
+}
+
+impl From<&RepositorySessionIdentity> for UserConfig {
+    fn from(identity: &RepositorySessionIdentity) -> Self {
+        Self {
+            name: identity.name.clone(),
+            email: identity.email.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -380,6 +399,10 @@ pub enum RepositoryOperation {
     Inventory,
     RepositoryMetadata,
     ListRemotes,
+    ConfigGet,
+    ConfigList,
+    ConfigSet,
+    ConfigUnset,
     Restore,
     RestorePaths,
     RemoteConfigure,
@@ -1090,6 +1113,7 @@ impl IncrementalStatusCache {
 /// serialize, while independent session instances can run on different worker threads.
 pub struct RepositorySession {
     target: PathBuf,
+    user_identity: Option<RepositorySessionIdentity>,
     credentials: RemoteCredentials,
     lifecycle: AtomicU8,
     state: Mutex<SessionState>,
@@ -1108,8 +1132,17 @@ impl std::fmt::Debug for RepositorySession {
 impl RepositorySession {
     /// Creates a closed session. [`Self::open`] performs the potentially expensive runtime setup.
     pub fn new(target: impl AsRef<Path>) -> Self {
+        Self::new_with_identity(target, None)
+    }
+
+    /// Creates a closed session with an in-memory identity override.
+    pub fn new_with_identity(
+        target: impl AsRef<Path>,
+        user_identity: Option<RepositorySessionIdentity>,
+    ) -> Self {
         Self {
             target: repository_session_target(target.as_ref()),
+            user_identity,
             credentials: RemoteCredentials::explicit(),
             lifecycle: AtomicU8::new(LIFECYCLE_CLOSED),
             state: Mutex::new(SessionState {
@@ -1148,9 +1181,12 @@ impl RepositorySession {
         }
 
         let mut state = self.state.lock();
-        let service =
-            RepositoryCommandService::open_with_credentials(&self.target, self.credentials.clone())
-                .map_err(|error| self.command_error(error));
+        let service = RepositoryCommandService::open_with_credentials_and_identity(
+            &self.target,
+            self.credentials.clone(),
+            self.user_identity.as_ref().map(UserConfig::from),
+        )
+        .map_err(|error| self.command_error(error));
         let service = match service {
             Ok(service) => service,
             Err(error) => {
@@ -1193,9 +1229,10 @@ impl RepositorySession {
         state.status_cache = IncrementalStatusCache::default();
         self.lifecycle.store(LIFECYCLE_OPENING, Ordering::Release);
 
-        match RepositoryCommandService::open_with_credentials(
+        match RepositoryCommandService::open_with_credentials_and_identity(
             &self.target,
             self.credentials.clone(),
+            self.user_identity.as_ref().map(UserConfig::from),
         ) {
             Ok(service) => {
                 state.service = Some(service);
@@ -1285,6 +1322,46 @@ impl RepositorySession {
                     paths_examined: 0,
                 },
             })
+        })
+    }
+
+    /// Reads one effective repository configuration entry.
+    pub fn config_get(&self, key: &str) -> Result<RepoConfigEntry> {
+        self.with_service(|service| {
+            let repo = service.repository().map_err(repository_command_error)?;
+            repo.config_get(key).map_err(repo_error)
+        })
+    }
+
+    /// Reads all effective repository configuration entries.
+    pub fn config_list(&self) -> Result<Vec<RepoConfigEntry>> {
+        self.with_service(|service| {
+            let repo = service.repository().map_err(repository_command_error)?;
+            repo.config_list().map_err(repo_error)
+        })
+    }
+
+    /// Updates one repository configuration entry.
+    pub fn config_set(&self, key: &str, value: &str) -> Result<RepoConfigEntry> {
+        self.with_state(|state| {
+            let SessionState { service, status_cache } = state;
+            let service = service.as_mut().ok_or_else(session_closed_error)?;
+            let repo = service.repository().map_err(repository_command_error)?;
+            let result = repo.config_set(key, value).map_err(repo_error);
+            status_cache.invalidate();
+            result
+        })
+    }
+
+    /// Restores one repository configuration entry to its default.
+    pub fn config_unset(&self, key: &str) -> Result<RepoConfigEntry> {
+        self.with_state(|state| {
+            let SessionState { service, status_cache } = state;
+            let service = service.as_mut().ok_or_else(session_closed_error)?;
+            let repo = service.repository().map_err(repository_command_error)?;
+            let result = repo.config_unset(key).map_err(repo_error);
+            status_cache.invalidate();
+            result
         })
     }
 
@@ -5660,6 +5737,10 @@ mod tests {
         assert!(!RepositoryOperation::Inventory.materializes_worktree());
         assert!(!RepositoryOperation::RepositoryMetadata.materializes_worktree());
         assert!(!RepositoryOperation::ListRemotes.materializes_worktree());
+        assert!(!RepositoryOperation::ConfigGet.materializes_worktree());
+        assert!(!RepositoryOperation::ConfigList.materializes_worktree());
+        assert!(!RepositoryOperation::ConfigSet.materializes_worktree());
+        assert!(!RepositoryOperation::ConfigUnset.materializes_worktree());
         assert!(!RepositoryOperation::RemoteConfigure.materializes_worktree());
         assert!(!RepositoryOperation::Push.materializes_worktree());
         assert!(!RepositoryOperation::Fetch.materializes_worktree());
@@ -5673,6 +5754,128 @@ mod tests {
         assert!(!RepositoryOperation::ListMergeConflicts.materializes_worktree());
         assert!(!RepositoryOperation::ReadMergeVersion.materializes_worktree());
         assert!(!RepositoryOperation::DiffMergeSqlite.materializes_worktree());
+    }
+
+    #[test]
+    fn repository_session_configures_user_identity_for_commits() {
+        let directory = tempfile::tempdir().unwrap();
+        let session = RepositorySession::new(directory.path());
+        session.open().unwrap();
+        session.init().unwrap();
+
+        assert_eq!(session.config_get("user.name").unwrap().value, "Graft");
+        assert_eq!(
+            session.config_set("user.name", "Mayne").unwrap().value,
+            "Mayne"
+        );
+        assert_eq!(
+            session
+                .config_set("user.email", "me@example.com")
+                .unwrap()
+                .value,
+            "me@example.com"
+        );
+        assert_eq!(
+            session.config_get("user.email").unwrap().value,
+            "me@example.com"
+        );
+
+        fs::write(directory.path().join("note.txt"), "tracked\n").unwrap();
+        session.add_all().unwrap();
+        let commit_id = session.commit("initial").unwrap()["commit"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        session.close().unwrap();
+
+        let repo = Repository::open(directory.path()).unwrap();
+        let graft::repo::object::Object::Commit(commit) = repo.read_object(&commit_id).unwrap()
+        else {
+            panic!("expected commit object");
+        };
+        assert_eq!(commit.author.name, "Mayne");
+        assert_eq!(commit.author.email, "me@example.com");
+        assert_eq!(commit.committer.name, "Mayne");
+        assert_eq!(commit.committer.email, "me@example.com");
+    }
+
+    #[test]
+    fn repository_session_identity_overrides_repository_config_without_persisting() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = Repository::init(directory.path()).unwrap();
+        repo.config_set("user.name", "Repository User").unwrap();
+        repo.config_set("user.email", "repository@example.com")
+            .unwrap();
+
+        let session = RepositorySession::new_with_identity(
+            directory.path(),
+            Some(RepositorySessionIdentity {
+                name: "Session User".to_string(),
+                email: "session@example.com".to_string(),
+            }),
+        );
+        session.open().unwrap();
+        fs::write(directory.path().join("note.txt"), "session identity\n").unwrap();
+        session.add_all().unwrap();
+        let commit_id = session.commit("session commit").unwrap()["commit"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        session.close().unwrap();
+        session.open().unwrap();
+        fs::write(
+            directory.path().join("second.txt"),
+            "session identity again\n",
+        )
+        .unwrap();
+        session.add_all().unwrap();
+        let second_commit_id = session.commit("session commit again").unwrap()["commit"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        session.close().unwrap();
+
+        let repo = Repository::open(directory.path()).unwrap();
+        assert_eq!(
+            repo.config_get("user.name").unwrap().value,
+            "Repository User"
+        );
+        assert_eq!(
+            repo.config_get("user.email").unwrap().value,
+            "repository@example.com"
+        );
+        let graft::repo::object::Object::Commit(commit) = repo.read_object(&commit_id).unwrap()
+        else {
+            panic!("expected commit object");
+        };
+        assert_eq!(commit.author.name, "Session User");
+        assert_eq!(commit.author.email, "session@example.com");
+        assert_eq!(commit.committer.name, "Session User");
+        assert_eq!(commit.committer.email, "session@example.com");
+        let graft::repo::object::Object::Commit(commit) =
+            repo.read_object(&second_commit_id).unwrap()
+        else {
+            panic!("expected commit object");
+        };
+        assert_eq!(commit.author.name, "Session User");
+        assert_eq!(commit.author.email, "session@example.com");
+    }
+
+    #[test]
+    fn repository_session_rejects_an_invalid_identity_override() {
+        let directory = tempfile::tempdir().unwrap();
+        let session = RepositorySession::new_with_identity(
+            directory.path(),
+            Some(RepositorySessionIdentity {
+                name: "Invalid\tUser".to_string(),
+                email: "invalid@example.com".to_string(),
+            }),
+        );
+
+        let error = session.open().unwrap_err();
+        assert_eq!(error.code(), SdkErrorCode::RepositoryCommand);
+        assert!(error.message().contains("identity value"));
+        assert_eq!(session.lifecycle(), SessionLifecycle::Closed);
     }
 
     #[test]

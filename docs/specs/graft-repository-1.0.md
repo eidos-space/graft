@@ -291,11 +291,14 @@ untracked, ignored, and tracked-but-now-ignored paths.
 The default configuration includes repository format 2, object format
 `blake3`, default branch `main`, a 1 MiB inline text threshold, no explicit
 external paths or track roots, physical SQLite materialization enabled, and
-the built-in merge resolver defaults defined by the merge specification.
+the default user identity `Graft <graft@example.invalid>`, and the built-in
+merge resolver defaults defined by the merge specification.
 
 The generic configuration command accepts only these key families:
 
 ```text
+user.name
+user.email
 files.inline_text_threshold
 files.external_paths
 track.default_roots
@@ -308,6 +311,10 @@ merge.internal_resolvers.<subject>
 merge.schema_resolvers.<operation>
 ```
 
+`user.name` and `user.email` configure the author and committer identity for
+new commits and the tagger identity for annotated tags. Missing user fields
+use the defaults above. Identity values MUST NOT be empty, but the email value
+is otherwise opaque and is not required to use a particular address grammar.
 Values MUST be type-checked and resolver values MUST be from supported pairs.
 Unsetting a scalar default restores its default; unsetting a per-table or
 per-subject override removes that override. Unknown generic keys MUST fail.

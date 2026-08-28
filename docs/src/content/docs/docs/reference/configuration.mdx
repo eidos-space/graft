@@ -22,6 +22,10 @@ Example:
 repository_format_version = 2
 default_branch = "main"
 
+[user]
+name = "Mayne"
+email = "me@example.com"
+
 [extensions]
 object_format = "blake3"
 
@@ -40,6 +44,17 @@ Applications should normally update config through CLI commands instead of editi
 graft remote add origin fs:///srv/graft/app
 graft branch --set-upstream-to origin/main main
 ```
+
+Configure the identity written into new commits and annotated tags with the
+Git-compatible keys:
+
+```bash
+graft config set user.name "Mayne"
+graft config set user.email "me@example.com"
+```
+
+The default identity is `Graft <graft@example.invalid>`. Unset either key to
+restore its default.
 
 Embedded applications can use `graft config ... --json` to read or update
 structured config entries without parsing terminal text.

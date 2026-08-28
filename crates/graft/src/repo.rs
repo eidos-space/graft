@@ -39,9 +39,10 @@ pub use config::{
     CONFIG_KEY_MERGE_DEFAULT_SEMANTIC_KEYS, CONFIG_KEY_MERGE_GENERATED_COLUMNS_PREFIX,
     CONFIG_KEY_MERGE_INTERNAL_RESOLVERS_PREFIX, CONFIG_KEY_MERGE_SCHEMA_RESOLVERS_PREFIX,
     CONFIG_KEY_MERGE_SEMANTIC_KEYS_PREFIX, CONFIG_KEY_TRACK_DEFAULT_ROOTS,
-    CONFIG_KEY_TRACK_USER_ROOTS, CONFIG_KEY_WORKTREE_MATERIALIZE_SQLITE, FileConfig,
-    MERGE_POLICY_VERSION, ManagedColumnResolver, MergeConfig, RepoConfig, RepoConfigEntry,
-    SemanticKeyCollation, TrackConfig, WorktreeConfig,
+    CONFIG_KEY_TRACK_USER_ROOTS, CONFIG_KEY_USER_EMAIL, CONFIG_KEY_USER_NAME,
+    CONFIG_KEY_WORKTREE_MATERIALIZE_SQLITE, FileConfig, MERGE_POLICY_VERSION,
+    ManagedColumnResolver, MergeConfig, RepoConfig, RepoConfigEntry, SemanticKeyCollation,
+    TrackConfig, UserConfig, WorktreeConfig,
 };
 pub use object::{CommitPathChangeCounts, CommitTableSummary};
 
@@ -82,7 +83,6 @@ pub const REPOSITORY_FORMAT_VERSION: u32 = 2;
 pub const OBJECT_FORMAT: &str = "blake3";
 pub const DEFAULT_TEXT_DIFF_CONTENT_LIMIT: ByteUnit = ByteUnit::MB;
 const NULL_OBJECT_ID: &str = "0000000000000000000000000000000000000000000000000000000000000000";
-const REFLOG_ACTOR: &str = "Graft <graft@example.invalid>";
 const DEFAULT_LARGE_FILE_THRESHOLD: ByteUnit = ByteUnit::MB;
 #[cfg(unix)]
 const ARTIFACT_STAT_CACHE_MAX_ENTRIES: usize = 100_000;
@@ -1939,6 +1939,7 @@ pub struct Repository {
     worktree: PathBuf,
     graft_dir: PathBuf,
     remote_credentials: RemoteCredentials,
+    user_identity: Option<UserConfig>,
 }
 
 impl fmt::Debug for Repository {
@@ -1948,6 +1949,7 @@ impl fmt::Debug for Repository {
             .field("worktree", &self.worktree)
             .field("graft_dir", &self.graft_dir)
             .field("remote_credentials", &self.remote_credentials)
+            .field("user_identity", &self.user_identity)
             .finish()
     }
 }
@@ -1971,6 +1973,7 @@ impl Repository {
             worktree,
             graft_dir,
             remote_credentials: RemoteCredentials::environment(),
+            user_identity: None,
         };
 
         repo.create_layout()?;
@@ -2004,6 +2007,7 @@ impl Repository {
             worktree,
             graft_dir,
             remote_credentials: RemoteCredentials::environment(),
+            user_identity: None,
         };
         repo.ensure_supported_format()?;
         Ok(repo)
@@ -2048,6 +2052,12 @@ impl Repository {
     /// Returns this repository with the supplied in-memory remote credential policy.
     pub fn with_remote_credentials(mut self, remote_credentials: RemoteCredentials) -> Self {
         self.remote_credentials = remote_credentials;
+        self
+    }
+
+    /// Returns this repository with an in-memory user identity override.
+    pub fn with_user_identity(mut self, user_identity: Option<UserConfig>) -> Self {
+        self.user_identity = user_identity;
         self
     }
 
@@ -2146,12 +2156,12 @@ fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn reflog_line(old: Option<&str>, new: Option<&str>, message: &str) -> String {
+fn reflog_line(old: Option<&str>, new: Option<&str>, actor: &str, message: &str) -> String {
     format!(
         "{} {} {} {} +0000\t{}\n",
         reflog_value(old),
         reflog_value(new),
-        REFLOG_ACTOR,
+        actor,
         now_ms(),
         sanitize_reflog_message(message)
     )

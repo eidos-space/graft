@@ -320,7 +320,10 @@ impl Repository {
             object: target_id,
             object_type: object::ObjectKind::Commit,
             name: name.to_string(),
-            tagger: object::Signature::new("Graft", "graft@example.invalid", now_ms(), "+0000"),
+            tagger: {
+                let user = self.user_identity.clone().unwrap_or(self.config()?.user);
+                object::Signature::new(user.name, user.email, now_ms(), "+0000")
+            },
             message: message.clone(),
         };
         let object = self
@@ -1288,12 +1291,13 @@ impl Repository {
         new: Option<&str>,
         message: &str,
     ) -> Result<()> {
+        let actor = self.reflog_actor()?;
         fs::create_dir_all(self.graft_dir.join(DIR_LOGS_HEAD))?;
         fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(self.graft_dir.join(DIR_LOGS_HEAD).join("HEAD"))?
-            .write_all(reflog_line(old, new, message).as_bytes())?;
+            .write_all(reflog_line(old, new, &actor, message).as_bytes())?;
         Ok(())
     }
 
@@ -1304,6 +1308,7 @@ impl Repository {
         new: Option<&str>,
         message: &str,
     ) -> Result<()> {
+        let actor = self.reflog_actor()?;
         validate_full_ref(reference)?;
         let path = self.graft_dir.join(DIR_LOGS_REFS).join(reference);
         if let Some(parent) = path.parent() {
@@ -1313,7 +1318,12 @@ impl Repository {
             .create(true)
             .append(true)
             .open(path)?
-            .write_all(reflog_line(old, new, message).as_bytes())?;
+            .write_all(reflog_line(old, new, &actor, message).as_bytes())?;
         Ok(())
+    }
+
+    fn reflog_actor(&self) -> Result<String> {
+        let user = self.user_identity.clone().unwrap_or(self.config()?.user);
+        Ok(format!("{} <{}>", user.name, user.email))
     }
 }

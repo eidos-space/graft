@@ -58,7 +58,8 @@ pub(crate) fn repo_for_file(file: &mut RepositorySessionContext) -> Result<Repos
         ))));
     }
     let repo = Repository::discover_for_file(&file.tag)?
-        .with_remote_credentials(file.remote_credentials().clone());
+        .with_remote_credentials(file.remote_credentials().clone())
+        .with_user_identity(file.user_identity().cloned());
     file.repo = Some(repo.clone());
     Ok(repo)
 }

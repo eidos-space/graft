@@ -20,11 +20,19 @@ import { Steps } from "@astrojs/starlight/components";
    ```js
    const { RepositorySession } = require("@eidos.space/graft");
 
-   const session = await RepositorySession.open(appDataRoot);
+   const session = await RepositorySession.open(appDataRoot, {
+     identity: {
+       name: "Mayne",
+       email: "me@example.com",
+     },
+   });
    await session.init();
    ```
 
    `init()` 会在应用工作区旁创建 `.graft/`。新仓库只需调用一次。
+   可选的 `identity` 是当前 session 的内存覆盖，用于 commit 和 ref identity；如果希望
+   身份持久保存在仓库中，请使用 `configSet("user.name", ...)` 和
+   `configSet("user.email", ...)`。
 
 3. 读取状态。
 
