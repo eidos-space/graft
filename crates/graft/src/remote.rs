@@ -54,6 +54,7 @@ const MULTIPART_HEADER_PART_NUMBER: &str = "x-graft-part-number";
 const MAX_UPLOAD_BUNDLE_MANIFEST_BYTES: usize = 64 * 1024;
 const MAX_UPLOAD_BUNDLE_OBJECTS: usize = 65_536;
 const MAX_UPLOAD_BUNDLE_PATH_BYTES: usize = 768;
+const MAX_RECEIVE_BUNDLE_OBJECTS: usize = 256;
 const MAX_READ_BUNDLE_OBJECTS: usize = 256;
 const MAX_READ_BUNDLE_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -2329,6 +2330,9 @@ impl HttpRemote {
         expected: Option<&[u8]>,
         replacement: Bytes,
     ) -> Result<HttpReceivePackResult> {
+        if objects.len() > MAX_RECEIVE_BUNDLE_OBJECTS {
+            return Ok(HttpReceivePackResult::RetryIndividually);
+        }
         let manifest = ReceiveBundleManifest {
             version: 1,
             objects: objects
@@ -2346,11 +2350,7 @@ impl HttpRemote {
             message: format!("failed to encode receive-bundle manifest: {err}"),
         })?;
         if manifest.len() > 16 * 1024 {
-            return Err(RemoteErr::HttpStatus {
-                status: 413,
-                path: ref_path.to_string(),
-                message: "receive-bundle manifest exceeds 16 KiB".to_string(),
-            });
+            return Ok(HttpReceivePackResult::RetryIndividually);
         }
 
         let object_bytes = objects.iter().try_fold(0_usize, |total, object| {
@@ -4117,6 +4117,89 @@ mod tests {
         );
         let last = events.last().unwrap();
         assert_eq!(last.transferred_bytes, last.total_bytes.unwrap());
+    }
+
+    #[tokio::test]
+    async fn receive_bundle_falls_back_before_sending_an_oversized_manifest() {
+        let remote = RemoteConfig::Http {
+            url: "http://127.0.0.1:1/org/repo".to_string(),
+            token_env: None,
+        }
+        .build()
+        .unwrap();
+        let RemoteBackend::Http(http) = &remote.backend else {
+            panic!("expected HTTP remote");
+        };
+        let long_suffix = "x".repeat(128);
+        let objects = (0..200)
+            .map(|index| {
+                RemoteBundleObject::new(
+                    format!("logs/{index:04}/commits/{long_suffix}"),
+                    [Bytes::from_static(b"object")],
+                    false,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let pack = RemoteObjectPack::new(
+            "a".repeat(64),
+            Bytes::from_static(b"pack"),
+            Bytes::from_static(b"idx"),
+        );
+
+        assert!(matches!(
+            http.receive_bundle(
+                &objects,
+                &pack,
+                "refs/heads/main",
+                None,
+                Bytes::from_static(b"new\n"),
+            )
+            .await
+            .unwrap(),
+            HttpReceivePackResult::RetryIndividually
+        ));
+    }
+
+    #[tokio::test]
+    async fn receive_bundle_falls_back_before_sending_too_many_objects() {
+        let remote = RemoteConfig::Http {
+            url: "http://127.0.0.1:1/org/repo".to_string(),
+            token_env: None,
+        }
+        .build()
+        .unwrap();
+        let RemoteBackend::Http(http) = &remote.backend else {
+            panic!("expected HTTP remote");
+        };
+        let objects = (0..=MAX_RECEIVE_BUNDLE_OBJECTS)
+            .map(|index| {
+                RemoteBundleObject::new(
+                    format!("segments/{index:04}"),
+                    [Bytes::from_static(b"object")],
+                    true,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let pack = RemoteObjectPack::new(
+            "b".repeat(64),
+            Bytes::from_static(b"pack"),
+            Bytes::from_static(b"idx"),
+        );
+
+        assert!(matches!(
+            http.receive_bundle(
+                &objects,
+                &pack,
+                "refs/heads/main",
+                None,
+                Bytes::from_static(b"new\n"),
+            )
+            .await
+            .unwrap(),
+            HttpReceivePackResult::RetryIndividually
+        ));
     }
 
     #[tokio::test]

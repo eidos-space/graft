@@ -572,27 +572,10 @@ fn repo_branch_snapshots(
     stop_at: Option<&str>,
     remote_store: Arc<Remote>,
 ) -> Result<Vec<graft::snapshot::Snapshot>, ErrCtx> {
-    let mut stop_commits = BTreeSet::<String>::new();
-    if let Some(stop_at) = stop_at {
-        stop_commits.insert(stop_at.to_string());
-    } else {
-        stop_commits.extend(repo_remote_reachable_commits_known_locally(repo, remote)?);
-    }
-    let mut stack = vec![
-        repo.branch_target(branch)?
-            .ok_or(ErrCtx::Repo(graft::repo::RepoErr::UnbornHead))?,
-    ];
-    let mut seen = std::collections::BTreeSet::<String>::new();
+    let commits = repo_branch_commits_to_publish(repo, remote, branch, stop_at)?;
     let mut snapshots = Vec::new();
 
-    while let Some(next) = stack.pop() {
-        if !seen.insert(next.clone()) {
-            continue;
-        }
-        if stop_commits.contains(&next) {
-            continue;
-        }
-        let commit = repo.read_commit(&next)?;
+    for commit in commits {
         let parent_files = repo_commit_parent_file_states(repo, &commit)?;
         for (path, state) in &commit.files {
             let snapshot =
@@ -604,17 +587,42 @@ fn repo_branch_snapshots(
             prepare_repo_snapshot_for_push(runtime, &snapshot, Some(remote_store.clone()))?;
             snapshots.push(runtime_snapshot);
         }
-
-        if commit.parents.is_empty() {
-            if let Some(parent) = commit.parent {
-                stack.push(parent);
-            }
-        } else {
-            stack.extend(commit.parents);
-        }
     }
 
     Ok(snapshots)
+}
+
+fn repo_branch_commits_to_publish(
+    repo: &Repository,
+    remote: &str,
+    branch: &str,
+    stop_at: Option<&str>,
+) -> Result<Vec<CommitObject>, ErrCtx> {
+    let stop_commits = if let Some(stop_at) = stop_at {
+        repo_reachable_commits_known_locally(repo, [stop_at.to_string()])
+    } else {
+        repo_remote_reachable_commits_known_locally(repo, remote)?
+    };
+    let mut stack = vec![
+        repo.branch_target(branch)?
+            .ok_or(ErrCtx::Repo(graft::repo::RepoErr::UnbornHead))?,
+    ];
+    let mut seen = std::collections::BTreeSet::<String>::new();
+    let mut commits = Vec::new();
+
+    while let Some(next) = stack.pop() {
+        if !seen.insert(next.clone()) {
+            continue;
+        }
+        if stop_commits.contains(&next) {
+            continue;
+        }
+        let commit = repo.read_commit(&next)?;
+        stack.extend(repo_commit_parent_ids(&commit));
+        commits.push(commit);
+    }
+
+    Ok(commits)
 }
 
 pub(super) fn repo_remote_reachable_commits_known_locally(
@@ -819,6 +827,53 @@ mod tests {
     use graft::setup::setup_graft_temporary;
 
     use super::*;
+
+    #[test]
+    fn branch_snapshot_push_stops_at_all_commits_reachable_from_remote_head() {
+        let remote_directory = tempfile::tempdir().unwrap();
+        let remote_config = RemoteConfig::Fs {
+            root: remote_directory.path().to_string_lossy().into_owned(),
+        };
+
+        let source_directory = tempfile::tempdir().unwrap();
+        let source = Repository::init(source_directory.path()).unwrap();
+        source.remote_add("origin", remote_config.clone()).unwrap();
+        let source_app = source_directory.path().join("app.txt");
+        let source_notes = source_directory.path().join("notes.txt");
+        std::fs::write(&source_app, "base app\n").unwrap();
+        std::fs::write(&source_notes, "base notes\n").unwrap();
+        source.stage_artifact_path(&source_app).unwrap();
+        source.stage_artifact_path(&source_notes).unwrap();
+        let base = source.commit_staged("base").unwrap();
+        source.push("origin", "main").unwrap();
+
+        let clone_directory = tempfile::tempdir().unwrap();
+        let clone = Repository::init(clone_directory.path()).unwrap();
+        clone.remote_add("origin", remote_config).unwrap();
+        clone.pull("origin", "main", "main").unwrap();
+
+        std::fs::write(&source_notes, "remote notes\n").unwrap();
+        source.stage_artifact_path(&source_notes).unwrap();
+        let remote_commit = source.commit_staged("remote notes").unwrap();
+        source.push("origin", "main").unwrap();
+        let clone_app = clone_directory.path().join("app.txt");
+        std::fs::write(&clone_app, "local app\n").unwrap();
+        clone.stage_artifact_path(&clone_app).unwrap();
+        let local_commit = clone.commit_staged("local app").unwrap();
+        clone.pull("origin", "main", "main").unwrap();
+        let merge_commit = clone.commit_staged("merge origin/main").unwrap();
+
+        let commits =
+            repo_branch_commits_to_publish(&clone, "origin", "main", Some(&remote_commit.id))
+                .unwrap()
+                .into_iter()
+                .map(|commit| commit.id)
+                .collect::<BTreeSet<_>>();
+
+        assert_eq!(commits, BTreeSet::from([merge_commit.id, local_commit.id]));
+        assert!(!commits.contains(&base.id));
+        assert!(!commits.contains(&remote_commit.id));
+    }
 
     #[test]
     fn push_snapshot_preflight_hydrates_a_remote_commit_missing_locally() {
