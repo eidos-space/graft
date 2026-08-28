@@ -918,7 +918,7 @@ dependencies = [
 
 [[package]]
 name = "graft"
-version = "0.15.4"
+version = "0.15.5"
 dependencies = [
  "assert_matches",
  "base64",
@@ -975,7 +975,7 @@ dependencies = [
 
 [[package]]
 name = "graft-cli"
-version = "0.15.4"
+version = "0.15.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -1016,7 +1016,7 @@ dependencies = [
 
 [[package]]
 name = "graft-sqlite"
-version = "0.15.4"
+version = "0.15.5"
 dependencies = [
  "blake3",
  "bytes",
@@ -1038,7 +1038,7 @@ dependencies = [
 
 [[package]]
 name = "graft-test"
-version = "0.15.4"
+version = "0.15.5"
 dependencies = [
  "anyhow",
  "graft",
@@ -1051,7 +1051,7 @@ dependencies = [
 
 [[package]]
 name = "graft-tracing"
-version = "0.15.4"
+version = "0.15.5"
 dependencies = [
  "tracing",
  "tracing-subscriber",

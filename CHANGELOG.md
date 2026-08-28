@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+## Graft 0.15.5 — 2026-08-28
+
+### Fixed
+
+- `graft upgrade` now restores the executable permission on downloaded Unix binaries before
+  validating them, and CLI release archives preserve that permission after GitHub artifact
+  staging.
+- The shell installer now resolves the latest stable CLI tag from both compact and pretty-printed
+  GitHub release metadata.
+
+### Compatibility
+
+- Repository, snapshot, remote, CLI JSON, and SDK session formats are unchanged.
+
 ## Graft 0.15.4 — 2026-08-28
 
 ### Added
