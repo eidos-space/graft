@@ -5,7 +5,7 @@ SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
 
 ## Unreleased
 
-## Graft SDK 0.3.23 — 2026-08-28
+## Graft SDK 0.3.24 — 2026-08-28
 
 ### Added
 
@@ -13,6 +13,12 @@ SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
   including the Git-style `user.name` and `user.email` identity keys.
 - Session construction accepts an in-memory identity override. The override applies to commits,
   annotated tags, and reflogs for that session without changing `.graft/config.toml`.
+
+### Fixed
+
+- Persistent incremental-status loading now skips stale candidates and continues searching for an
+  exact worktree fingerprint match, avoiding reopen cache misses when snapshot mtimes tie or sort
+  differently across platforms.
 
 ### Compatibility
 
