@@ -5,6 +5,21 @@ SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
 
 ## Unreleased
 
+## Graft SDK 0.3.25 — 2026-08-28
+
+### Fixed
+
+- Push after a merge now excludes the complete history already reachable from the Remote head,
+  preventing previously published commits and snapshots from being uploaded again.
+- HTTP push falls back to individual object transfer when a receive bundle would exceed the
+  service's object-count or manifest-size limits, avoiding a terminal `413 Payload Too Large`
+  failure for repositories with longer histories.
+
+### Compatibility
+
+- The JavaScript API, repository format, snapshot format, and Remote protocol are unchanged. No
+  migration or application code change is required.
+
 ## Graft SDK 0.3.24 — 2026-08-28
 
 ### Added
