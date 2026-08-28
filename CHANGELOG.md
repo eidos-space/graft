@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+## Graft 0.15.4 — 2026-08-28
+
+### Added
+
+- Repository configuration now supports Git-style `user.name` and `user.email` keys through
+  `graft config`. New commits, annotated tags, and reflogs use the configured identity.
+
+### Changed
+
+- `graft log` now prints the canonical author stored in each commit instead of substituting a
+  hard-coded Graft identity.
+
+### Compatibility
+
+- Repository and snapshot formats are unchanged. Repositories without an explicit user identity
+  retain the deterministic `Graft <graft@example.invalid>` fallback.
+
 ## Graft 0.15.3 — 2026-08-27
 
 ### Added

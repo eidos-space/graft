@@ -5,6 +5,21 @@ SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
 
 ## Unreleased
 
+## Graft SDK 0.3.23 — 2026-08-28
+
+### Added
+
+- Rust and Node.js repository sessions can read, list, set, and unset repository configuration,
+  including the Git-style `user.name` and `user.email` identity keys.
+- Session construction accepts an in-memory identity override. The override applies to commits,
+  annotated tags, and reflogs for that session without changing `.graft/config.toml`.
+
+### Compatibility
+
+- The new Rust and JavaScript APIs are additive. Repository and snapshot formats are unchanged,
+  and sessions without an identity override retain repository configuration and the deterministic
+  fallback identity.
+
 ## Graft SDK 0.3.22 — 2026-08-27
 
 ### Fixed
