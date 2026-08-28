@@ -101,15 +101,19 @@ make_temp_dir() {
   tmp_dir="$(mktemp -d "${base%/}/graft-install.XXXXXX")"
 }
 
+latest_stable_cli_tag() {
+  release_json="$1"
+  tr '{},' '\n\n\n' < "$release_json" |
+    sed -n \
+      's/^[[:space:]]*"tag_name":[[:space:]]*"\(v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)".*/\1/p' |
+    head -n 1
+}
+
 resolve_version() {
   if [ "$VERSION_INPUT" = "latest" ] || [ -z "$VERSION_INPUT" ]; then
     release_json="${tmp_dir}/release.json"
     download "https://api.github.com/repos/${REPO}/releases?per_page=100" "$release_json"
-    tag="$(
-      sed -n \
-        's/^[[:space:]]*"tag_name":[[:space:]]*"\(v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)".*/\1/p' \
-        "$release_json" | head -n 1
-    )"
+    tag="$(latest_stable_cli_tag "$release_json")"
     [ -n "$tag" ] || fail "could not resolve latest stable CLI release tag for ${REPO}"
     VERSION="${tag#v}"
   else
@@ -184,29 +188,35 @@ install_binary() {
   esac
 }
 
-make_temp_dir
-trap 'rm -rf "$tmp_dir"' EXIT INT TERM
+main() {
+  make_temp_dir
+  trap 'rm -rf "$tmp_dir"' EXIT INT TERM
 
-detect_target
-default_install_dir
-resolve_version
+  detect_target
+  default_install_dir
+  resolve_version
 
-ARCHIVE="graft-cli-${VERSION}-${TARGET}.${archive_ext}"
-BASE_URL="https://github.com/${REPO}/releases/download/${tag}"
-ARCHIVE_PATH="${tmp_dir}/${ARCHIVE}"
-CHECKSUM_PATH="${tmp_dir}/SHA256SUMS"
-EXTRACT_DIR="${tmp_dir}/extract"
+  ARCHIVE="graft-cli-${VERSION}-${TARGET}.${archive_ext}"
+  BASE_URL="https://github.com/${REPO}/releases/download/${tag}"
+  ARCHIVE_PATH="${tmp_dir}/${ARCHIVE}"
+  CHECKSUM_PATH="${tmp_dir}/SHA256SUMS"
+  EXTRACT_DIR="${tmp_dir}/extract"
 
-say "downloading ${ARCHIVE}"
-download "${BASE_URL}/${ARCHIVE}" "$ARCHIVE_PATH"
+  say "downloading ${ARCHIVE}"
+  download "${BASE_URL}/${ARCHIVE}" "$ARCHIVE_PATH"
 
-if [ "$SKIP_VERIFY" = "true" ]; then
-  say "skipping checksum verification"
-else
-  download "${BASE_URL}/SHA256SUMS" "$CHECKSUM_PATH"
-  verify_archive "$ARCHIVE_PATH" "$CHECKSUM_PATH"
-  say "checksum verified"
+  if [ "$SKIP_VERIFY" = "true" ]; then
+    say "skipping checksum verification"
+  else
+    download "${BASE_URL}/SHA256SUMS" "$CHECKSUM_PATH"
+    verify_archive "$ARCHIVE_PATH" "$CHECKSUM_PATH"
+    say "checksum verified"
+  fi
+
+  extract_archive "$ARCHIVE_PATH" "$EXTRACT_DIR"
+  install_binary "${EXTRACT_DIR}/${executable}"
+}
+
+if [ "${GRAFT_INSTALLER_TEST_MODE:-false}" != "true" ]; then
+  main "$@"
 fi
-
-extract_archive "$ARCHIVE_PATH" "$EXTRACT_DIR"
-install_binary "${EXTRACT_DIR}/${executable}"

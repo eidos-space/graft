@@ -61,6 +61,9 @@ jobs:
       - name: Cargo fmt
         run: cargo fmt --check
 
+      - name: Installer script tests
+        run: sh scripts/install-script.test.sh
+
       - name: Build
         run: just build-all
 

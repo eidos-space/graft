@@ -320,6 +320,7 @@ fn verify_replacement(path: &Path, expected: Version) -> Result<()> {
     if !metadata.file_type().is_file() {
         bail!("release archive contained a non-file graft executable");
     }
+    ensure_replacement_is_executable(path)?;
     let output = Command::new(path)
         .arg("--version")
         .output()
@@ -339,6 +340,27 @@ fn verify_replacement(path: &Path, expected: Version) -> Result<()> {
             version_string(expected)
         );
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn ensure_replacement_is_executable(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = fs::metadata(path)
+        .with_context(|| format!("failed to inspect {}", path.display()))?
+        .permissions();
+    let mode = permissions.mode();
+    if mode & 0o100 == 0 {
+        permissions.set_mode(mode | 0o100);
+        fs::set_permissions(path, permissions)
+            .with_context(|| format!("failed to make {} executable", path.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_replacement_is_executable(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -491,5 +513,21 @@ mod tests {
             reported_version("graft 0.15.3\n"),
             Some(Version { major: 0, minor: 15, patch: 3 })
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_verification_restores_executable_permission() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary_directory = tempfile::tempdir().unwrap();
+        let replacement = temporary_directory.path().join("graft");
+        fs::write(&replacement, "#!/bin/sh\nprintf 'graft-cli 0.15.5\\n'\n").unwrap();
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o644)).unwrap();
+
+        verify_replacement(&replacement, Version { major: 0, minor: 15, patch: 5 }).unwrap();
+
+        let mode = fs::metadata(&replacement).unwrap().permissions().mode();
+        assert_ne!(mode & 0o111, 0);
     }
 }

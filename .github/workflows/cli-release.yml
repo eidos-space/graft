@@ -207,8 +207,15 @@ jobs:
             if [[ "$target" == *"windows"* ]]; then
               (cd "$dir" && zip -r "${asset_dir}/${archive_base}.zip" .)
             else
+              chmod 755 "$dir/graft"
               tar -czf "${asset_dir}/${archive_base}.tar.gz" -C "$dir" .
             fi
+          done
+          for archive in release-assets/*.tar.gz; do
+            extract_dir="$(mktemp -d)"
+            tar -xzf "$archive" -C "$extract_dir"
+            test -x "$extract_dir/graft"
+            rm -rf "$extract_dir"
           done
           (cd release-assets && sha256sum * > SHA256SUMS)
 
