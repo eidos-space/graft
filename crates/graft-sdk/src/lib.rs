@@ -3832,6 +3832,12 @@ fn load_persistent_status_snapshot(
         {
             continue;
         }
+        let (tracked, untracked) =
+            stable_worktree_fingerprints(repo, &snapshot.files, &snapshot.artifacts)?;
+        if tracked != snapshot.tracked_fingerprints || untracked != snapshot.untracked_fingerprints
+        {
+            continue;
+        }
         snapshot.status.worktree = repo.worktree().to_path_buf();
         snapshot.status.graft_dir = repo.graft_dir().to_path_buf();
         cache.initialized = true;
@@ -7626,6 +7632,64 @@ mod tests {
             .unwrap();
         let encoded = fs::read_to_string(snapshot).unwrap();
         assert!(!encoded.contains(&directory.path().to_string_lossy().to_string()));
+    }
+
+    #[test]
+    fn persistent_status_snapshot_skips_stale_candidates_before_exact_match() {
+        let directory = tempfile::tempdir().unwrap();
+        let note = directory.path().join("note.txt");
+        let session = RepositorySession::new(directory.path());
+        session.open().unwrap();
+        session.init().unwrap();
+        fs::write(&note, "one\n").unwrap();
+        session.add_all().unwrap();
+        session.commit("initial").unwrap();
+
+        let clean = session.status_incremental().unwrap();
+        assert!(clean.telemetry.persistent_snapshot_saved);
+        fs::write(&note, "two\n").unwrap();
+        let dirty = session.status_incremental().unwrap();
+        assert!(dirty.status.dirty);
+        assert!(dirty.telemetry.persistent_snapshot_saved);
+        session.close().unwrap();
+
+        let cache_directory = directory.path().join(".graft/cache/sdk-status");
+        let mut clean_snapshots = 0;
+        let mut dirty_snapshots = 0;
+        for entry in fs::read_dir(&cache_directory)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+        {
+            let path = entry.path();
+            if path.extension().is_none_or(|extension| extension != "json") {
+                continue;
+            }
+            let snapshot =
+                serde_json::from_slice::<PersistedStatusSnapshot>(&fs::read(&path).unwrap())
+                    .unwrap();
+            let modified = if snapshot.status.dirty {
+                dirty_snapshots += 1;
+                UNIX_EPOCH + Duration::from_secs(10)
+            } else {
+                clean_snapshots += 1;
+                UNIX_EPOCH + Duration::from_secs(20)
+            };
+            OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(modified))
+                .unwrap();
+        }
+        assert!(clean_snapshots > 0);
+        assert!(dirty_snapshots > 0);
+
+        let cached = read_persisted_status_snapshot(directory.path())
+            .unwrap()
+            .expect("the exact dirty snapshot should be selected after a stale candidate");
+        assert!(cached.telemetry.persistent_snapshot_hit);
+        assert!(cached.status.dirty);
+        assert_eq!(cached.change_token, dirty.change_token);
     }
 
     #[test]
