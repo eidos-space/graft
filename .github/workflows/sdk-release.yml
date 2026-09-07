@@ -395,6 +395,9 @@ jobs:
               const metadata = await session.repositoryMetadata()
               const remotes = await session.listRemotes()
               const history = await session.historySummaries({ limit: 1 })
+              const pathHistory = await session.pathHistory({
+                path: 'note.txt', limit: 1, maxCommits: 10, maxBytes: 1048576,
+              })
               const diff = await session.diffPaths({ paths: ['note.txt'], limit: 1 })
               const content = await session.readPathContent({
                 revision: initial.commit.id,
@@ -406,6 +409,11 @@ jobs:
                 metadata.telemetry.paths_examined !== 0 ||
                 !Array.isArray(remotes.remotes) ||
                 history.commits.length !== 1 ||
+                pathHistory.commits.length !== 1 ||
+                pathHistory.commits[0].id !== initial.commit.id ||
+                pathHistory.commits[0].change !== 'added' ||
+                pathHistory.has_more !== false ||
+                pathHistory.telemetry.blob_objects_read !== 0 ||
                 diff.paths.length !== 1 ||
                 content.content.state !== 'utf8' ||
                 content.content.content !== 'one\n' ||

@@ -361,6 +361,50 @@ exact moves. SQLite move detection uses snapshot/path identity; ordinary file
 moves require exact content identity. Similarity heuristics are not part of
 version 1.0.
 
+### 8.4 Bounded exact-path history (SDK extension)
+
+`pathHistory` MUST compare an exact normalized path's tree-entry mode/object ID
+against the first parent, comparing a root with absence. It MUST NOT read blob
+payloads or materialize the worktree. Results follow first-parent traversal from
+newest to oldest, regardless of timestamps. A merge is one comparison with its
+first parent; second-parent commits are not separately enumerated. Renames are
+not followed: old-path deletion and new-path addition belong to separate queries.
+Deletion and later recreation remain part of the same path's history.
+
+The initial call pins the current HEAD. An unborn HEAD returns an exhausted
+empty page. The opaque versioned, checksummed cursor binds the normalized path,
+initial commit and next unscanned commit. A mismatched path, unsupported version,
+or damaged cursor MUST fail. The checksum detects corruption; it is not an
+authorization mechanism. Callers MUST use returned cursors without modification.
+Continuation MUST NOT rescan from HEAD to recover its position. Advancing,
+rewinding or switching HEAD does not change a continuation, including when the
+initial commit becomes unreachable. Cursors do not retain objects against GC;
+missing or corrupt required objects fail explicitly, never silently restart.
+
+Limits are independent: returned matches (1–100, default 50), comparisons
+(1–1000, default 100), and actual object bytes read (1 KiB–64 MiB, default 8 MiB).
+A page MAY contain no matches and still have `has_more: true` and `next_cursor`.
+Only `has_more: false` means traversal ended. Clients MUST NOT automatically
+scan unbounded pages to fill a visible page. If the byte budget cannot complete
+even one comparison, the call fails with an invalid-argument error suggesting a
+larger budget; the hard 64 MiB ceiling may make unusually large objects
+unsupported. This MUST NOT yield a repeatedly nonadvancing continuation.
+
+Telemetry reports completed comparisons, actual commit/tree objects read,
+actual canonical object bytes read (including an unfinished final comparison),
+and zero blob reads. At most two commit objects and two tree objects are read
+per attempted comparison; a page can attempt one unfinished comparison beyond
+its completed count. Decoded flat-tree memory and CPU are proportional to the
+bounded metadata bytes, not returned match count. Only a selected tree-entry
+identity is retained across comparisons. Cancellation is checked per comparison,
+per 64 KiB read and around object decoding; decoding one bounded object is not
+interruptible internally.
+
+Each result provides commit `id`, all `parents`, message, timestamp and
+`change` (`added`, `modified`, `deleted`). The ID is accepted by
+`readPathContent`; a deleted path reads as absent and its first parent provides
+the prior version. A newly started query sees the current HEAD.
+
 ## 9. Restore, reset, and repository maintenance
 
 Restore may copy a selected revision or index version into the index and/or
@@ -371,6 +415,19 @@ worktree according to explicit options. Reset modes are:
 | soft | move | preserve | preserve |
 | mixed | move | reset to target | preserve |
 | hard | move | reset to target | project target |
+
+The SDK `restorePaths` worktree-only profile preserves HEAD and the entire index,
+including target-path staging. `requireClean` checks tracked work in the entire
+repository, not only selected paths. With `requireClean: false`, unrelated dirty
+and staged paths are preserved, but uncommitted target contents may be replaced.
+`expectedHead` compares only HEAD; it does not protect external filesystem edits.
+A host requiring target-content safety must coordinate writers and validate the
+reviewed target before applying. A separate precheck has a TOCTOU window and is
+not an atomic content CAS. Each ordinary-file replacement is atomic, while
+subsequent bookkeeping may still fail; multi-path operations can leave a prefix
+applied after an error or cancellation. Callers must inspect state after failure.
+A directory pathspec may select descendants; single-file callers must supply a
+file path.
 
 Physical projection rules are owned by the materialization specification.
 Reset and restore MUST reject unsafe unresolved state unless the operation

@@ -734,6 +734,41 @@ export interface HistoryTelemetry {
   blob_objects_read: 0
 }
 
+export interface PathHistoryOptions extends OperationOptions {
+  /** Exact normalized repository path. Renames are not followed. */
+  path: string
+  /** Maximum matches, 1–100; default 50. */
+  limit?: number
+  /** Maximum first-parent comparisons, 1–1000; default 100. */
+  maxCommits?: number
+  /** Metadata byte budget, 1024–67108864; default 8 MiB. */
+  maxBytes?: number
+  /** Opaque continuation from this exact path; pins the initial HEAD. */
+  cursor?: string
+}
+
+export interface PathHistoryResult {
+  path: string
+  start: string | null
+  commits: Array<{
+    id: string
+    parents: string[]
+    message: string
+    timestamp_ms: number
+    change: "added" | "modified" | "deleted"
+  }>
+  /** May be true even when commits is empty. Continue using next_cursor. */
+  has_more: boolean
+  next_cursor: string | null
+  telemetry: {
+    commits_scanned: number
+    commit_objects_read: number
+    tree_objects_read: number
+    object_bytes_read: number
+    blob_objects_read: 0
+  }
+}
+
 export interface HistorySummariesResult {
   commits: CommitSummary[]
   has_more: boolean
@@ -1066,6 +1101,7 @@ export class RepositorySession {
   diffSqlitePaths(options: SqliteDiffPathsOptions): Promise<SqliteDiffPathsResult>
   readPathContent(options: ReadPathContentOptions): Promise<ReadPathContentResult>
   history(options?: HistoryOptions): Promise<GraftJson>
+  pathHistory(options: PathHistoryOptions): Promise<PathHistoryResult>
   historySummaries(options?: HistoryOptions): Promise<HistorySummariesResult>
   commitDetails(
     revision: string,

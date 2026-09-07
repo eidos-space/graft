@@ -726,7 +726,7 @@ binary on Node.js 20 and 24, assembles and verifies all optional packages, publi
 packages before the root package, creates a GitHub SDK release from the matching entry in
 [`CHANGELOG.md`](CHANGELOG.md) with checksums, then installs the public root package on every
 supported platform under Node.js 20 and 24 and exercises `statusIncremental`, metadata, remotes,
-history summaries, explicit-path diff, and an up-to-date merge plan/apply cycle. Publishing uses npm
+history summaries, bounded exact-path history, explicit-path diff, and an up-to-date merge plan/apply cycle. Publishing uses npm
 OIDC Trusted Publishing; the SDK workflow does not read a persistent npm token. After each npm
 publish, the job allows up to ten minutes for the immutable version to become visible through the
 registry read path before it advances to the next package.
@@ -734,3 +734,43 @@ registry read path before it advances to the next package.
 See [`RELEASE.md`](https://github.com/eidos-space/graft/blob/main/RELEASE.md) for the first-publish
 credential bootstrap, npm trusted publisher configuration, partial-release recovery, and
 post-publish checks.
+
+### Exact-path history
+
+```js
+const page = await session.pathHistory({
+  path: 'notes/example.md', limit: 50, maxCommits: 100,
+  maxBytes: 8 * 1024 * 1024, // metadata read budget, not response size
+  // cursor: previousPage.next_cursor,
+  // signal: abortController.signal,
+})
+// Request another page only on a bounded user/application action.
+// Empty commits + has_more means more history remains to scan.
+// Read a selected version using readPathContent({ revision: entry.id, ... }).
+```
+
+This is exact-path first-parent history, including deletion/recreation; renames
+are not followed. A cursor pins the initial HEAD and keeps working after HEAD
+changes, as long as required immutable objects still exist. Never edit cursors
+or reuse them for a different path. `has_more: false` is the end of traversal;
+an empty page alone is not. Limits are 1–100 matches, 1–1000 comparisons and
+1 KiB–64 MiB actual metadata bytes. Defaults are 50, 100 and 8 MiB. If one
+comparison cannot fit, increase `maxBytes`; comparisons exceeding the hard
+ceiling explicitly fail. No content blobs or worktree materialization occur.
+
+`restorePaths({paths:[path], source:entry.id, expectedHead, requireClean:false})`
+restores the worktree while preserving HEAD and the complete index, including
+staged changes to the target. Other dirty and untracked files remain unchanged.
+`requireClean:true` rejects changes anywhere in the tracked repository.
+`expectedHead` is not a compare-and-swap of target bytes: external target edits
+can be overwritten. An integrating host must coordinate its writers, recheck
+target bytes/existence and staged state against the user's reviewed state, and
+keep writers quiescent through completion. A separate check alone has a TOCTOU
+window; Graft does not provide an atomic filesystem-content CAS. Unsaved editor
+drafts and copies remain the host's responsibility.
+
+Ordinary-file replacement is an atomic rename, but worktree bookkeeping follows
+replacement and may fail after the file changed. Multi-path restore is not a
+transaction; a failure/cancellation can leave an applied prefix. After any
+mutation error, re-read actual state before retrying. A directory path is a
+pathspec and can affect descendants; use an exact file path for single-file UI.

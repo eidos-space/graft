@@ -45,6 +45,15 @@ use napi::{
 use napi_derive::napi;
 
 #[napi(object)]
+pub struct PathHistoryOptions {
+    pub path: String,
+    pub limit: Option<u32>,
+    pub max_commits: Option<u32>,
+    pub max_bytes: Option<u32>,
+    pub cursor: Option<String>,
+}
+
+#[napi(object)]
 pub struct DiffOptions {
     pub rows: Option<bool>,
     pub staged: Option<bool>,
@@ -382,6 +391,9 @@ enum JsonOperation {
         limit: usize,
         after: Option<String>,
     },
+    PathHistory {
+        options: graft_sdk::PathHistoryOptions,
+    },
     HistorySummaries {
         limit: usize,
         after: Option<String>,
@@ -559,6 +571,11 @@ impl JsonTask {
         }
         if let JsonOperation::ConfigUnset { key } = &self.operation {
             let value = self.session.config_unset(key).map_err(napi_error)?;
+            return serde_json::to_string(&value)
+                .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
+        }
+        if let JsonOperation::PathHistory { options } = &self.operation {
+            let value = self.session.path_history(options).map_err(napi_error)?;
             return serde_json::to_string(&value)
                 .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
         }
@@ -840,7 +857,7 @@ impl JsonTask {
             JsonOperation::History { limit, after } => {
                 self.session.history(*limit, after.as_deref())
             }
-            JsonOperation::HistorySummaries { .. } => {
+            JsonOperation::PathHistory { .. } | JsonOperation::HistorySummaries { .. } => {
                 unreachable!("handled before JSON value dispatch")
             }
             JsonOperation::CommitDetails { revision } => self.session.commit_details(revision),
@@ -1236,6 +1253,27 @@ impl NodeRepositorySession {
             JsonOperation::History {
                 limit: limit.unwrap_or(50) as usize,
                 after,
+            },
+            signal,
+        )
+    }
+
+    #[napi]
+    pub fn path_history(
+        &self,
+        options: PathHistoryOptions,
+        signal: Option<AbortSignal>,
+    ) -> AsyncTask<JsonTask> {
+        json_task(
+            self,
+            JsonOperation::PathHistory {
+                options: graft_sdk::PathHistoryOptions {
+                    path: options.path,
+                    limit: options.limit.unwrap_or(50) as usize,
+                    max_commits: options.max_commits.unwrap_or(100) as usize,
+                    max_bytes: u64::from(options.max_bytes.unwrap_or(8 * 1024 * 1024)),
+                    cursor: options.cursor,
+                },
             },
             signal,
         )
@@ -1965,6 +2003,7 @@ pub fn operation_materializes_worktree(operation: String) -> Result<bool> {
         "diff_sqlite_paths" | "diffSqlitePaths" => RepositoryOperation::DiffPaths,
         "read_path_content" | "readPathContent" => RepositoryOperation::ReadPathContent,
         "history" => RepositoryOperation::History,
+        "path_history" | "pathHistory" => RepositoryOperation::PathHistory,
         "history_summaries" | "historySummaries" => RepositoryOperation::HistorySummaries,
         "commit_details" | "commitDetails" => RepositoryOperation::CommitDetails,
         "commit_changed_paths" | "commitChangedPaths" => RepositoryOperation::CommitChangedPaths,
