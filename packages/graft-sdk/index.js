@@ -146,6 +146,11 @@ class RepositorySession {
     return callJson(() => this.#native.history(limit, after, signal))
   }
 
+  async pathHistory(options) {
+    const { signal, ...query } = options
+    return callJson(() => this.#native.pathHistory(query, signal))
+  }
+
   async historySummaries(options = {}) {
     const { limit = 50, after, signal } = options
     return callJson(() => this.#native.historySummaries(limit, after, signal))

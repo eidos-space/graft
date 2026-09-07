@@ -214,6 +214,8 @@ pub fn read_persisted_status_snapshot(
     unreachable!("bounded persisted status read always returns")
 }
 
+pub use graft::repo::{PathHistoryOptions, PathHistoryPage};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryTelemetry {
     pub duration_us: u64,
@@ -392,6 +394,7 @@ pub enum RepositoryOperation {
     ReadPathContent,
     History,
     HistorySummaries,
+    PathHistory,
     CommitDetails,
     CommitChangedPaths,
     IsIgnoredPath,
@@ -1863,6 +1866,18 @@ impl RepositorySession {
             argument.push_str(after);
         }
         self.execute_json("json_log", Some(&argument))
+    }
+
+    /// Exact-path history pinned to the initial HEAD, with bounded metadata I/O.
+    pub fn path_history(&self, options: &PathHistoryOptions) -> Result<PathHistoryPage> {
+        normalize_requested_path(Path::new(&options.path))?;
+        self.with_service(|service| {
+            let repo = service.repository().map_err(repository_command_error)?;
+            repo.path_history(options).map_err(|error| match error {
+                graft::repo::RepoErr::InvalidPathHistory(message) => invalid_argument(message),
+                other => repo_error(other),
+            })
+        })
     }
 
     /// Returns a bounded summary page. Commit trees and blobs are never read by this operation.

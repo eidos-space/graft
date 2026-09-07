@@ -1,0 +1,179 @@
+{
+  "version": "0.3.26-rc.0",
+  "node": "v24.20.0",
+  "platform": "darwin-arm64",
+  "cold_definition": "fresh process; OS file cache not flushed",
+  "scenarios": [
+    {
+      "name": "long-sparse",
+      "commits": 1200,
+      "paths": 32,
+      "setup_ms": 5877.8328329999995,
+      "samples": [
+        {
+          "ms": 9.14712499999996,
+          "matches": 0,
+          "has_more": true,
+          "commits_scanned": 100,
+          "commit_objects_read": 200,
+          "tree_objects_read": 101,
+          "object_bytes_read": 365992,
+          "blob_objects_read": 0
+        },
+        {
+          "ms": 5.574874999999906,
+          "matches": 0,
+          "has_more": true,
+          "commits_scanned": 100,
+          "commit_objects_read": 200,
+          "tree_objects_read": 101,
+          "object_bytes_read": 365992,
+          "blob_objects_read": 0
+        },
+        {
+          "ms": 5.374791999999957,
+          "matches": 0,
+          "has_more": true,
+          "commits_scanned": 100,
+          "commit_objects_read": 200,
+          "tree_objects_read": 101,
+          "object_bytes_read": 365992,
+          "blob_objects_read": 0
+        },
+        {
+          "ms": 5.317291999999952,
+          "matches": 0,
+          "has_more": true,
+          "commits_scanned": 100,
+          "commit_objects_read": 200,
+          "tree_objects_read": 101,
+          "object_bytes_read": 365992,
+          "blob_objects_read": 0
+        },
+        {
+          "ms": 4.966542000000004,
+          "matches": 0,
+          "has_more": true,
+          "commits_scanned": 100,
+          "commit_objects_read": 200,
+          "tree_objects_read": 101,
+          "object_bytes_read": 365992,
+          "blob_objects_read": 0
+        },
+        {
+          "ms": 4.804250000000025,
+          "matches": 0,
+          "has_more": true,
+          "commits_scanned": 100,
+          "commit_objects_read": 200,
+          "tree_objects_read": 101,
+          "object_bytes_read": 365992,
+          "blob_objects_read": 0
+        }
+      ],
+      "full": {
+        "ms": 81.239958,
+        "pages": 12,
+        "scanned": 1200,
+        "bytes": 4386316,
+        "matches": 1
+      },
+      "cancellation": {
+        "ms": 2.757957999999917,
+        "error": "AbortError",
+        "worker_recovered_ms": 0.13949999999999818
+      },
+      "restore_ms": 2.016375000000039,
+      "initial_rss_bytes": 53592064,
+      "query_max_rss_kib": 53344,
+      "max_rss_kib": 55600
+    },
+    {
+      "name": "large-directory",
+      "commits": 100,
+      "paths": 10000,
+      "setup_ms": 60580.116875,
+      "samples": [
+        {
+          "ms": 33.52075000000002,
+          "matches": 0,
+          "has_more": true,
+          "commits_scanned": 8,
+          "commit_objects_read": 18,
+          "tree_objects_read": 9,
+          "object_bytes_read": 7738578,
+          "blob_objects_read": 0
+        },
+        {
+          "ms": 25.20770799999997,
+          "matches": 0,
+          "has_more": true,
+          "commits_scanned": 8,
+          "commit_objects_read": 18,
+          "tree_objects_read": 9,
+          "object_bytes_read": 7738578,
+          "blob_objects_read": 0
+        },
+        {
+          "ms": 26.95670899999999,
+          "matches": 0,
+          "has_more": true,
+          "commits_scanned": 8,
+          "commit_objects_read": 18,
+          "tree_objects_read": 9,
+          "object_bytes_read": 7738578,
+          "blob_objects_read": 0
+        },
+        {
+          "ms": 27.765125000000012,
+          "matches": 0,
+          "has_more": true,
+          "commits_scanned": 8,
+          "commit_objects_read": 18,
+          "tree_objects_read": 9,
+          "object_bytes_read": 7738578,
+          "blob_objects_read": 0
+        },
+        {
+          "ms": 23.283209,
+          "matches": 0,
+          "has_more": true,
+          "commits_scanned": 8,
+          "commit_objects_read": 18,
+          "tree_objects_read": 9,
+          "object_bytes_read": 7738578,
+          "blob_objects_read": 0
+        },
+        {
+          "ms": 22.98574999999994,
+          "matches": 0,
+          "has_more": true,
+          "commits_scanned": 8,
+          "commit_objects_read": 18,
+          "tree_objects_read": 9,
+          "object_bytes_read": 7738578,
+          "blob_objects_read": 0
+        }
+      ],
+      "full": {
+        "ms": 416.1661250000001,
+        "pages": 13,
+        "scanned": 100,
+        "bytes": 96301714,
+        "matches": 1
+      },
+      "cancellation": {
+        "ms": 2.9416250000000446,
+        "error": "AbortError",
+        "worker_recovered_ms": 6.1410829999999805
+      },
+      "restore_ms": 216.48991600000022,
+      "initial_rss_bytes": 53166080,
+      "query_max_rss_kib": 76192,
+      "max_rss_kib": 108304
+    }
+  ],
+  "macos": "15.7.3",
+  "rust": "1.91.1",
+  "native_sha256": "fdbff7a9b72f75bccef95b9ab6c64f3e75174ba303dafa6017e194e5d741bb77"
+}

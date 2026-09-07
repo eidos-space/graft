@@ -22,6 +22,10 @@ mod artifacts;
 mod config;
 mod config_methods;
 mod history;
+mod path_history;
+pub use path_history::{
+    PathHistoryEntry, PathHistoryOptions, PathHistoryPage, PathHistoryTelemetry,
+};
 pub mod index;
 mod inventory;
 mod merge;
@@ -392,6 +396,9 @@ const REMOTE_OBJECT_PACK_MAGIC: &[u8] = b"graft-object-pack-v1\n";
 
 #[derive(Debug, Error)]
 pub enum RepoErr {
+    #[error("invalid path history request: {0}")]
+    InvalidPathHistory(String),
+
     #[error("operation cancelled")]
     Cancelled,
 

@@ -221,7 +221,44 @@ summary 可只读 commit metadata；details 与 changed paths 延迟 hydrate tre
 move；SQLite 按 snapshot identity，普通文件按完全相同内容配对，1.0 不定义
 similarity rename。
 
+### 8.4 有界精确路径历史（SDK 扩展）
+
+`pathHistory` 比较规范化精确路径的 tree-entry mode/object ID 与第一父提交；
+根提交与不存在比较。不读 blob、不物化工作区。按 first-parent 从新到旧遍历，
+不按时间排序。合并提交只与第一父提交比较，不单独列出第二父链。
+不追踪重命名：旧路径删除、新路径新增；同一路径的删除与重建都保留。
+
+首次调用固定当前 HEAD；未出生 HEAD 返回结束空页。版本化、带校验和的 opaque
+cursor 绑定规范化路径、起始提交及下一未扫描提交。不同路径、版本不支持或
+损坏游标报错。校验和只检测损坏，不是鉴权；调用者必须原样使用返回游标。
+续页不从 HEAD 重扫；HEAD 新增、回退、切换或起始提交变得不可达不影响续页。
+游标不会防止 GC；缺失或损坏的必需对象明确报错，不自动重启查询。
+
+返回条数（1–100，默认 50）、比较数（1–1000，默认 100）、实际读取对象字节
+（1 KiB–64 MiB，默认 8 MiB）分别受限。空页仍可有 `has_more: true` 与游标；
+仅 `has_more: false` 表示历史结束。客户端不能为凑满展示页而无限自动翻页。
+预算不足以完成一次比较时返回 invalid-argument，提示增加预算；超过 64 MiB
+上限的大对象可能不支持，不返回无法推进的游标。
+
+Telemetry 报告已完成比较、实际 commit/tree 对象读取、实际 canonical 字节
+（含最后未完成比较的读取）和零 blob 读取。每次尝试最多读两个 commit、两个 tree；
+一页可比完成数多尝试一次。平面树解码的 CPU/内存随有界元数据字节增长，
+不能用返回条数表示工作量。比较之间仅保留一个路径的 tree-entry identity。
+每次比较、每 64 KiB 读取及对象解码前后检查取消；单个有界对象解码内部不可中断。
+
+每项包含 `id`、全部 `parents`、message、timestamp 和 `change`
+（added/modified/deleted）。`id` 可用于 `readPathContent`；删除版本返回 absent，
+第一父提交用于读取删除前内容。重新发起查询使用当前 HEAD。
+
 ## 9. Restore、reset 与维护
+
+SDK `restorePaths` 的 worktree-only 模式保留 HEAD 和完整 index（包括目标暂存）。
+`requireClean` 检查整个仓库的 tracked 修改，不限所选路径。false 时保留无关脏文件
+与暂存，但可能覆盖目标未提交内容。`expectedHead` 仅比较 HEAD，不能保护外部文件
+修改。需要内容安全的 host 必须协调 writer 并校验用户审阅过的目标状态；单独前检
+存在 TOCTOU 窗口，不是原子内容 CAS。普通文件逐个原子替换，后续 bookkeeping 仍
+可能失败；多路径失败或取消可留下已应用前缀。失败后应检查实际状态。目录 pathspec
+可选择后代；单文件调用者必须传文件路径。
 
 Reset 语义：
 

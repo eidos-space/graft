@@ -1,0 +1,143 @@
+"use strict"
+const assert = require("node:assert/strict")
+const fs = require("node:fs/promises")
+const os = require("node:os")
+const path = require("node:path")
+const test = require("node:test")
+const { RepositorySession, operationMaterializesWorktree } = require("..")
+
+async function fixture(t) {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "graft-path-history-"))
+  const session = await RepositorySession.open(root)
+  await session.init()
+  t.after(async () => { await session.close(); await fs.rm(root, { recursive: true, force: true }) })
+  const write = (name, content) => fs.writeFile(path.join(root, name), content)
+  const commit = async (message) => { await session.addAll(); return (await session.commit(message)).commit.id }
+  return { root, session, write, commit }
+}
+
+test("native path history bounds sparse scans, pins HEAD, and validates cursors", async (t) => {
+  const { session, write, commit } = await fixture(t)
+  assert.equal(operationMaterializesWorktree("pathHistory"), false)
+  assert.equal((await session.pathHistory({ path: "rare.txt" })).has_more, false)
+  await write("rare.txt", "original")
+  const original = await commit("original")
+  for (let i = 0; i < 12; i++) { await write("other.txt", `${i}`); await commit(`other ${i}`) }
+  const first = await session.pathHistory({ path: "rare.txt", maxCommits: 3 })
+  assert.deepEqual(first.commits, [])
+  assert.equal(first.has_more, true)
+  assert.equal(first.telemetry.commits_scanned, 3)
+  assert.equal(first.telemetry.tree_objects_read, 4)
+  assert.equal(first.telemetry.blob_objects_read, 0)
+  assert.ok(first.telemetry.object_bytes_read > 0)
+  await write("rare.txt", "new")
+  const latest = await commit("new HEAD")
+  let cursor = first.next_cursor
+  let found = []
+  for (let pageCount = 0; pageCount < 10; pageCount++) {
+    const page = await session.pathHistory({ path: "rare.txt", cursor, maxCommits: 3 })
+    assert.equal(page.start, first.start)
+    found.push(...page.commits)
+    if (!page.has_more) { cursor = null; break }
+    assert.notEqual(page.next_cursor, cursor)
+    cursor = page.next_cursor
+  }
+  assert.equal(cursor, null)
+  assert.deepEqual(found.map(x => x.id), [original])
+  assert.equal(found[0].change, "added")
+  assert.deepEqual(found[0].parents, [])
+  assert.equal((await session.pathHistory({ path: "rare.txt" })).commits[0].id, latest)
+  await assert.rejects(session.pathHistory({ path: "other.txt", cursor: first.next_cursor }), /cursor/)
+  await assert.rejects(session.pathHistory({ path: "rare.txt", cursor: "damaged" }), /cursor/)
+  const damaged = first.next_cursor.slice(0, -1) + (first.next_cursor.endsWith('0') ? '1' : '0')
+  await assert.rejects(session.pathHistory({ path: 'rare.txt', cursor: damaged }), /cursor/)
+  for (const opts of [{ limit: 0 }, { maxCommits: 0 }, { maxBytes: 0 }]) {
+    await assert.rejects(session.pathHistory({ path: "rare.txt", ...opts }), /path history|limit/)
+  }
+  const abort = new AbortController()
+  const work = session.pathHistory({ path: "rare.txt", signal: abort.signal })
+  abort.abort()
+  await assert.rejects(work, error => error.name === "AbortError")
+  assert.equal((await session.pathHistory({ path: "rare.txt" })).commits[0].id, latest)
+})
+
+test("native exact path history exposes rename deletion and recreation", async (t) => {
+  const { root, session, write, commit } = await fixture(t)
+  await write("a.txt", "one")
+  const rootId = await commit("root")
+  await fs.rename(path.join(root, "a.txt"), path.join(root, "b.txt"))
+  const renameId = await commit("rename")
+  await write("a.txt", "two")
+  const rebuildId = await commit("rebuild")
+  const page = await session.pathHistory({ path: "a.txt" })
+  assert.deepEqual(page.commits.map(x => [x.id, x.change]), [[rebuildId, "added"], [renameId, "deleted"], [rootId, "added"]])
+  assert.equal((await session.pathHistory({ path: "b.txt" })).commits.length, 1)
+  const deleted = await session.readPathContent({ revision: renameId, path: "a.txt", maxBytes: 100 })
+  assert.equal(deleted.content.state, "absent")
+  const staged = await session.diff({ staged: true })
+  await session.restorePaths({ paths: ['a.txt'], source: renameId, expectedHead: rebuildId })
+  await assert.rejects(fs.stat(path.join(root, 'a.txt')), { code: 'ENOENT' })
+  assert.equal(await fs.readFile(path.join(root, 'b.txt'), 'utf8'), 'one')
+  assert.equal((await session.repositoryMetadata()).current_head, rebuildId)
+  assert.deepEqual(await session.diff({ staged: true }), staged)
+})
+
+test("native single-file restore preserves HEAD, entire index and unrelated dirty work", async (t) => {
+  const { root, session, write, commit } = await fixture(t)
+  await write("target.txt", "old"); await write("other.txt", "old other")
+  const old = await commit("old")
+  await write("target.txt", "head"); await write("other.txt", "head other")
+  const head = await commit("head")
+  await write("target.txt", "staged target"); await write("other.txt", "staged other")
+  await session.stagePaths({ paths: ["target.txt", "other.txt"], expectedHead: head })
+  await write("target.txt", "external target"); await write("other.txt", "external other")
+  await write("untracked.txt", "untracked")
+  const stagedBefore = await session.diff({ staged: true })
+  await assert.rejects(session.restorePaths({ paths: ["target.txt"], source: old, expectedHead: head, requireClean: true }), /staged|worktree/)
+  assert.equal(await fs.readFile(path.join(root, "target.txt"), "utf8"), "external target")
+  await assert.rejects(session.restorePaths({ paths: ["target.txt"], source: old, expectedHead: old }), /HEAD changed/)
+  assert.equal(await fs.readFile(path.join(root, "target.txt"), "utf8"), "external target")
+  await session.restorePaths({ paths: ["target.txt"], source: old, expectedHead: head, requireClean: false })
+  assert.equal(await fs.readFile(path.join(root, "target.txt"), "utf8"), "old")
+  assert.equal(await fs.readFile(path.join(root, "other.txt"), "utf8"), "external other")
+  assert.equal(await fs.readFile(path.join(root, "untracked.txt"), "utf8"), "untracked")
+  assert.equal((await session.status()).current_head, head)
+  assert.deepEqual(await session.diff({ staged: true }), stagedBefore)
+  // Batch calls are sequential, not transactional: a later invalid path leaves the first applied.
+  await write('target.txt', 'external again')
+  await assert.rejects(session.restorePaths({ paths: ['target.txt', 'z-missing.txt'], source: old, expectedHead: head }), /not tracked|not found/)
+  assert.equal(await fs.readFile(path.join(root, 'target.txt'), 'utf8'), 'old')
+  assert.deepEqual(await session.diff({ staged: true }), stagedBefore)
+})
+
+test("native merged history compares first parent and excludes second-parent commits", async (t) => {
+  const { root, session, write, commit } = await fixture(t)
+  const external = await fs.mkdtemp(path.join(os.tmpdir(), "graft-path-merge-"))
+  const remote = path.join(external, 'remote'); const clone = path.join(external, 'clone')
+  await fs.mkdir(remote); await fs.mkdir(clone)
+  await write('a.txt', 'base'); await write('other.txt', 'base')
+  const base = await commit('base')
+  await session.configureRemote({ name: 'origin', url: `fs://${remote}`, upstreamBranch: 'main' })
+  await session.push()
+  const local = await RepositorySession.open(clone)
+  t.after(async () => { await local.close(); await fs.rm(external, { recursive: true, force: true }) })
+  await local.cloneRepository({ remoteUrl: `fs://${remote}` })
+  await write('a.txt', 'remote')
+  const remoteId = await commit('remote change'); await session.push()
+  await fs.writeFile(path.join(clone, 'other.txt'), 'local')
+  await local.addAll(); const localId = (await local.commit('local change')).commit.id
+  await local.fetch()
+  const plan = await local.planMerge({ revision: 'origin/main', expectedHead: localId })
+  assert.equal(plan.kind, 'three_way')
+  const applied = await local.applyMerge({ revision: 'origin/main', expectedHead: localId, planToken: plan.plan_token })
+  if (applied.merge.state === 'merging') {
+    await local.continueMerge({ expectedStateToken: applied.merge.state_token, message: 'merge' })
+  }
+  const page = await local.pathHistory({ path: 'a.txt' })
+  assert.equal(page.commits.length, 2)
+  assert.deepEqual(page.commits[0].parents, [localId, remoteId])
+  assert.equal(page.commits[1].id, base)
+  assert.equal(page.commits[0].change, 'modified')
+  assert.equal(page.commits.some(x => x.id === remoteId), false)
+  assert.equal(await fs.readFile(path.join(root, 'a.txt'), 'utf8'), 'remote')
+})
