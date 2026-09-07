@@ -5,6 +5,10 @@ SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
 
 ## Unreleased
 
+## Graft SDK 0.3.26 — 2026-09-07
+
+### Added
+
 - Add `pathHistory` for exact-path, first-parent history with a HEAD-pinned cursor,
   independent comparison/metadata-byte budgets, cancellation, and actual read telemetry.
   Renames are intentionally not followed; deletions and recreation remain visible.

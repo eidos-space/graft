@@ -726,7 +726,7 @@ binary on Node.js 20 and 24, assembles and verifies all optional packages, publi
 packages before the root package, creates a GitHub SDK release from the matching entry in
 [`CHANGELOG.md`](CHANGELOG.md) with checksums, then installs the public root package on every
 supported platform under Node.js 20 and 24 and exercises `statusIncremental`, metadata, remotes,
-history summaries, explicit-path diff, and an up-to-date merge plan/apply cycle. Publishing uses npm
+history summaries, bounded exact-path history, explicit-path diff, and an up-to-date merge plan/apply cycle. Publishing uses npm
 OIDC Trusted Publishing; the SDK workflow does not read a persistent npm token. After each npm
 publish, the job allows up to ten minutes for the immutable version to become visible through the
 registry read path before it advances to the next package.
