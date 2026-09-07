@@ -148,6 +148,7 @@ class RepositorySession {
 
   async pathHistory(options) {
     const { signal, ...query } = options
+    signal?.throwIfAborted()
     return callJson(() => this.#native.pathHistory(query, signal))
   }
 

@@ -55,8 +55,10 @@ test("native path history bounds sparse scans, pins HEAD, and validates cursors"
     await assert.rejects(session.pathHistory({ path: "rare.txt", ...opts }), /path history|limit/)
   }
   const abort = new AbortController()
-  const work = session.pathHistory({ path: "rare.txt", signal: abort.signal })
+  // A short native query may finish before a subsequent abort reaches it.
+  // Cancel before dispatch so this assertion does not depend on worker timing.
   abort.abort()
+  const work = session.pathHistory({ path: "rare.txt", signal: abort.signal })
   await assert.rejects(work, error => error.name === "AbortError")
   assert.equal((await session.pathHistory({ path: "rare.txt" })).commits[0].id, latest)
 })
