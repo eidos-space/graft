@@ -5,6 +5,14 @@ SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
 
 ## Unreleased
 
+## Graft SDK 0.3.27 — 2026-09-08
+
+### Improved
+
+- Avoid repeated ancestry scans when upstream tips are unchanged, while invalidating cached projections when refs change.
+- Deduplicate immutable object validation within a single fetch, while revalidating on subsequent fetches.
+- Read inactive merge policy without a full worktree status scan.
+
 ## Graft SDK 0.3.26 — 2026-09-07
 
 ### Added
