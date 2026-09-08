@@ -5094,13 +5094,38 @@ fn upstream_status_reports_heads_and_common_ancestor_for_divergence() {
         Some(RepoUpstreamStatus {
             remote: "origin".to_string(),
             branch: "main".to_string(),
-            local: local_commit.id,
-            remote_target: remote_commit.id,
+            local: local_commit.id.clone(),
+            remote_target: remote_commit.id.clone(),
             common_ancestor: Some(base.id),
             ahead: 1,
             behind: 1,
             state: RepoUpstreamState::Diverged,
         })
+    );
+    let mut projected = clone.status().unwrap();
+    clone
+        .refresh_status_repository_projection(&mut projected)
+        .unwrap();
+    assert_eq!(
+        projected.upstream_status,
+        clone.status().unwrap().upstream_status
+    );
+    clone
+        .set_remote_tracking_ref("origin", "main", &local_commit.id)
+        .unwrap();
+    clone
+        .refresh_status_repository_projection(&mut projected)
+        .unwrap();
+    assert_eq!((projected.ahead, projected.behind), (0, 0));
+    clone
+        .set_remote_tracking_ref("origin", "main", &remote_commit.id)
+        .unwrap();
+    clone
+        .refresh_status_repository_projection(&mut projected)
+        .unwrap();
+    assert_eq!(
+        projected.upstream_status,
+        clone.status().unwrap().upstream_status
     );
 }
 

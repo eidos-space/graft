@@ -13,7 +13,24 @@ impl Repository {
             .transpose()?
             .flatten();
         let head_target = self.head_target()?;
-        let upstream_status = self.upstream_status(head_target.as_deref(), upstream.as_ref())?;
+        let remote_target = upstream
+            .as_ref()
+            .map(|value| self.remote_tracking_ref(&value.remote, &value.branch))
+            .transpose()?
+            .flatten();
+        // Commit ancestry is immutable. Reuse its projection only when both
+        // freshly read tips and the upstream identity still match exactly.
+        let previous = status.upstream_status.as_ref().filter(|previous| {
+            head_target.as_deref() == Some(previous.local.as_str())
+                && remote_target.as_deref() == Some(previous.remote_target.as_str())
+                && upstream.as_ref().is_some_and(|value| {
+                    value.remote == previous.remote && value.branch == previous.branch
+                })
+        });
+        let upstream_status = match previous {
+            Some(previous) => Some(previous.clone()),
+            None => self.upstream_status(head_target.as_deref(), upstream.as_ref())?,
+        };
 
         status.repository_format_version = config.core.repository_format_version;
         status.head = head;
