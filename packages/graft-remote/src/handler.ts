@@ -1163,11 +1163,35 @@ async function receiveBundle(
       indexBytes,
     ]);
     requireReceiveContentLength(request.headers, bodyBytes);
-    for (const object of manifest) {
-      await receivePackObject(backend, source, object.path, object.bytes, object.allowExisting);
+    const objects = [
+      ...manifest,
+      { path: `objects/pack/${packId}.pack`, bytes: packBytes, allowExisting: true },
+      { path: `objects/pack/${packId}.idx`, bytes: indexBytes, allowExisting: true },
+    ];
+    // Bound buffering to 256 KiB; large objects retain streaming backpressure.
+    for (let index = 0; index < objects.length;) {
+      const object = objects[index]!;
+      if (object.bytes > 64 * 1024) {
+        await receivePackObject(backend, source, object.path, object.bytes, object.allowExisting);
+        index++;
+        continue;
+      }
+      const batch: { path: string; bytes: Uint8Array<ArrayBuffer>; allowExisting: boolean }[] = [];
+      while (index < objects.length && batch.length < 4 && objects[index]!.bytes <= 64 * 1024) {
+        const next = objects[index++]!;
+        batch.push({ path: next.path, bytes: await source.readExact(next.bytes), allowExisting: next.allowExisting });
+      }
+      const writes = await Promise.allSettled(batch.map(async (entry) => {
+        const created = await backend.putIfAbsent(entry.path, entry.bytes, "immutable", {
+          contentLength: entry.bytes.byteLength,
+        });
+        if (!created && !entry.allowExisting) {
+          throw new GraftProtocolError(412, "precondition_failed", "Bundled object already exists and requires client verification");
+        }
+      }));
+      // Settle every write before returning an error; never publish a partial batch.
+      for (const write of writes) if (write.status === "rejected") throw write.reason;
     }
-    await receivePackObject(backend, source, `objects/pack/${packId}.pack`, packBytes);
-    await receivePackObject(backend, source, `objects/pack/${packId}.idx`, indexBytes);
     await source.requireEnd();
     consumed = true;
   } finally {

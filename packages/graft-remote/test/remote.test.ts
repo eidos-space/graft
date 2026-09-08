@@ -189,6 +189,56 @@ async function remoteFetch(
 }
 
 describe("createGraftRemoteHandler", () => {
+  it.each([true, false])("validates bundle framing with large streaming objects (%s)", async (complete) => {
+    const backend = new MemoryRepository();
+    const app = createGraftRemoteHandler({ authenticate() {}, backend: () => backend });
+    const payload = new Uint8Array(65537).fill(42);
+    const manifest = new TextEncoder().encode(JSON.stringify({ version: 1, objects: [
+      {path: "segments/large", bytes: payload.length, allow_existing: true},
+    ] }));
+    const body = joinBytes([manifest, payload, new TextEncoder().encode(complete ? "pi" : "p")]);
+    const response = await remoteFetch(app, "/test/large/receive-bundle/refs/heads/main", {
+      method: "POST", headers: receiveBundleHeaders("e".repeat(64), undefined, "next\n", manifest, 1, 1, manifest.length + payload.length + 2), body,
+    });
+    expect(response.status).toBe(complete ? 204 : 400);
+    expect(backend.objects.has("refs/heads/main")).toBe(complete);
+    if (complete) expect(backend.objects.get("segments/large")).toEqual(payload);
+  });
+
+  it.each([false, true])("settles bounded bundle writes before publishing or failing (%s)", async (fail) => {
+    const backend = new MemoryRepository();
+    const put = backend.putIfAbsent.bind(backend);
+    let active = 0;
+    let peak = 0;
+    backend.putIfAbsent = async (path, body) => {
+      active++;
+      peak = Math.max(peak, active);
+      await new Promise(resolve => setTimeout(resolve, 10));
+      try {
+        if (fail && path === "segments/0") throw new Error("write failed");
+        return await put(path, body);
+      } finally { active--; }
+    };
+    const cas = backend.compareAndSwap.bind(backend);
+    backend.compareAndSwap = (...args) => {
+      expect(active).toBe(0);
+      expect(backend.objects.size).toBe(8);
+      return cas(...args);
+    };
+    const app = createGraftRemoteHandler({ authenticate() {}, backend: () => backend });
+    const manifest = new TextEncoder().encode(JSON.stringify({ version: 1, objects:
+      Array.from({length: 6}, (_, i) => ({path: `segments/${i}`, bytes: 1, allow_existing: true}))
+    }));
+    const body = joinBytes([manifest, new TextEncoder().encode("123456pi")]);
+    const response = await remoteFetch(app, "/test/batch/receive-bundle/refs/heads/main", {
+      method: "POST", headers: receiveBundleHeaders("d".repeat(64), undefined, "next\n", manifest, 1, 1, body.byteLength), body,
+    });
+    expect(response.status).toBe(fail ? 500 : 204);
+    expect(active).toBe(0);
+    expect(peak).toBe(4);
+    expect(backend.objects.has("refs/heads/main")).toBe(!fail);
+  });
+
   it("negotiates authentication and protocol without a framework dependency", async () => {
     const app = createTestApp();
 
