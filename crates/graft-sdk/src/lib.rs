@@ -8894,6 +8894,22 @@ mod tests {
         let initial = session.get_merge_policy().unwrap();
         assert_eq!(initial.policy.version, graft::repo::MERGE_POLICY_VERSION);
         assert!(!initial.active_merge);
+        // Reading the live policy does not depend on the worktree index.
+        // Later assertions in this test create a merge through the same session
+        // and prove that the fresh marker restores frozen-policy validation.
+        let index_path = directory.path().join(".graft/index/state.toml");
+        let index = fs::read(&index_path).ok();
+        fs::write(&index_path, "invalid index").unwrap();
+        assert!(session.status().is_err());
+        assert_eq!(
+            session.get_merge_policy().unwrap().policy_token,
+            initial.policy_token
+        );
+        if let Some(index) = index {
+            fs::write(&index_path, index).unwrap();
+        } else {
+            fs::remove_file(&index_path).unwrap();
+        }
         let invalid = session.validate_merge_policy(&MergePolicyDocument {
             version: 999,
             config: MergeConfig::default(),
@@ -8999,6 +9015,7 @@ mod tests {
         session
             .abort_merge(&AbortMergeOptions { expected_state_token: state_token })
             .unwrap();
+        assert!(!session.get_merge_policy().unwrap().active_merge);
         session.close().unwrap();
     }
 

@@ -983,6 +983,13 @@ pub(super) fn row_merge_policy_for_repo(
 pub(crate) fn active_merge_policy(
     repo: &Repository,
 ) -> Result<Option<(graft::repo::MergeConfig, String, u32)>, ErrCtx> {
+    // No frozen policy exists without MERGE_HEAD. Avoid classifying every
+    // worktree path and walking upstream history just to read the live policy.
+    // Check the marker anew on every call; present markers still use the full
+    // status and frozen-state validation below, and I/O errors must propagate.
+    if !repo.graft_dir().join("MERGE_HEAD").try_exists()? {
+        return Ok(None);
+    }
     let status = repo.status()?;
     if status.merge_head.is_none() {
         return Ok(None);
