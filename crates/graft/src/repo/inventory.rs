@@ -511,6 +511,20 @@ impl Repository {
             return Ok(None);
         };
 
+        // Equal tips describe the same reachable set, regardless of history size.
+        if local == remote_target {
+            return Ok(Some(RepoUpstreamStatus {
+                remote: upstream.remote.clone(),
+                branch: upstream.branch.clone(),
+                local: local.to_string(),
+                remote_target,
+                common_ancestor: None,
+                ahead: 0,
+                behind: 0,
+                state: RepoUpstreamState::UpToDate,
+            }));
+        }
+
         let local_reachable = self.reachable_commits(local)?;
         let remote_reachable = self.reachable_commits(&remote_target)?;
         let ahead = local_reachable.difference(&remote_reachable).count();

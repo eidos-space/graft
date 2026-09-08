@@ -5032,6 +5032,40 @@ fn pull_plan_freezes_fetched_target_before_tracking_ref_moves() {
 }
 
 #[test]
+fn upstream_status_equal_tips_tracks_subsequent_ref_changes() {
+    let remote_dir = tempfile::tempdir().unwrap();
+    let source_dir = tempfile::tempdir().unwrap();
+    let source = Repository::init(source_dir.path()).unwrap();
+    source
+        .remote_add(
+            "origin",
+            RemoteConfig::Fs {
+                root: remote_dir.path().to_string_lossy().into_owned(),
+            },
+        )
+        .unwrap();
+    source
+        .set_branch_upstream("main", "origin", "main")
+        .unwrap();
+    let base = source.commit("base").unwrap();
+    source.push("origin", "main").unwrap();
+    let synced = source.status().unwrap().upstream_status.unwrap();
+    assert_eq!(synced.state, RepoUpstreamState::UpToDate);
+    assert_eq!((synced.ahead, synced.behind), (0, 0));
+    assert_eq!(synced.local, base.id);
+    assert_eq!(synced.remote_target, base.id);
+    assert_eq!(synced.common_ancestor, None);
+    let next = source.commit("next").unwrap();
+    let ahead = source.status().unwrap().upstream_status.unwrap();
+    assert_eq!(ahead.state, RepoUpstreamState::Ahead);
+    assert_eq!((ahead.ahead, ahead.behind), (1, 0));
+    source.push("origin", "main").unwrap();
+    let synced = source.status().unwrap().upstream_status.unwrap();
+    assert_eq!(synced.state, RepoUpstreamState::UpToDate);
+    assert_eq!(synced.remote_target, next.id);
+}
+
+#[test]
 fn upstream_status_reports_heads_and_common_ancestor_for_divergence() {
     let remote_dir = tempfile::tempdir().unwrap();
     let remote = RemoteConfig::Fs {
