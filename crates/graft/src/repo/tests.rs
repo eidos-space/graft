@@ -4699,6 +4699,48 @@ fn push_all_and_fetch_all_sync_default_branch_refspecs() {
 }
 
 #[test]
+fn repeated_fetch_revalidates_shared_objects_and_recovers_missing_blobs() {
+    let remote_dir = tempfile::tempdir().unwrap();
+    let remote = RemoteConfig::Fs {
+        root: remote_dir.path().to_string_lossy().into_owned(),
+    };
+    let source_dir = tempfile::tempdir().unwrap();
+    let source = Repository::init(source_dir.path()).unwrap();
+    source.remote_add("origin", remote.clone()).unwrap();
+    let note = source_dir.path().join("shared.txt");
+    fs::write(&note, "shared across history").unwrap();
+    source.stage_artifact_path(&note).unwrap();
+    let first = source.commit_staged("base").unwrap();
+    let object::Object::Tree(tree) = source.read_object(first.tree.as_deref().unwrap()).unwrap()
+    else {
+        panic!("expected tree");
+    };
+    let blob = tree.entries[0].oid.clone();
+    let other = source_dir.path().join("other.txt");
+    fs::write(&other, "new file").unwrap();
+    source.stage_artifact_path(&other).unwrap();
+    let second = source.commit_staged("shared blob remains").unwrap();
+    source.push("origin", "main").unwrap();
+
+    let clone_dir = tempfile::tempdir().unwrap();
+    let clone = Repository::init(clone_dir.path()).unwrap();
+    clone.remote_add("origin", remote).unwrap();
+    assert_eq!(clone.fetch("origin", "main").unwrap().head, second.id);
+    assert_eq!(clone.fetch("origin", "main").unwrap().commits, 0);
+
+    let blob_path = clone.object_store().path_for(&blob);
+    let bytes = fs::read(&blob_path).unwrap();
+    fs::write(&blob_path, b"corrupt object").unwrap();
+    assert!(clone.fetch("origin", "main").is_err());
+    fs::write(&blob_path, &bytes).unwrap();
+    assert_eq!(clone.fetch("origin", "main").unwrap().commits, 0);
+
+    fs::remove_file(&blob_path).unwrap();
+    clone.fetch("origin", "main").unwrap();
+    assert_eq!(fs::read(blob_path).unwrap(), bytes);
+}
+
+#[test]
 fn explicit_refspecs_map_push_and_fetch_branch_names() {
     let remote_dir = tempfile::tempdir().unwrap();
     let remote = RemoteConfig::Fs {

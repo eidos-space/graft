@@ -154,6 +154,9 @@ impl Repository {
         let mut count = 0;
         let mut stack = vec![head.to_string()];
         let mut seen = BTreeMap::<String, ()>::new();
+        // Immutable subtrees are shared across commits. Validate their complete
+        // object graphs once per fetch, without retaining trust across requests.
+        let mut fetched_objects = BTreeSet::new();
         let mut pack_cache = RemoteObjectPackCache::persistent(
             self.graft_dir.join(DIR_CACHE_REMOTE_OBJECT_PACK_INDEXES),
         );
@@ -182,7 +185,7 @@ impl Repository {
                 }
             };
 
-            self.fetch_object_graph(remote, &commit.tree, &mut pack_cache)?;
+            self.fetch_object_graph(remote, &commit.tree, &mut pack_cache, &mut fetched_objects)?;
             for parent in commit.parents {
                 stack.push(parent.to_string());
             }
@@ -668,7 +671,11 @@ impl Repository {
         remote: &crate::remote::Remote,
         id: &object::ObjectId,
         pack_cache: &mut RemoteObjectPackCache,
+        fetched_objects: &mut BTreeSet<object::ObjectId>,
     ) -> Result<()> {
+        if fetched_objects.contains(id) {
+            return Ok(());
+        }
         let object = match self.object_store().read_raw(id)? {
             Some(bytes) => {
                 let object = object::Object::decode(&bytes)?;
@@ -686,14 +693,14 @@ impl Repository {
 
         match object {
             object::Object::Commit(commit) => {
-                self.fetch_object_graph(remote, &commit.tree, pack_cache)?;
+                self.fetch_object_graph(remote, &commit.tree, pack_cache, fetched_objects)?;
                 for parent in commit.parents {
-                    self.fetch_object_graph(remote, &parent, pack_cache)?;
+                    self.fetch_object_graph(remote, &parent, pack_cache, fetched_objects)?;
                 }
             }
             object::Object::Tree(tree) => {
                 for entry in tree.entries {
-                    self.fetch_object_graph(remote, &entry.oid, pack_cache)?;
+                    self.fetch_object_graph(remote, &entry.oid, pack_cache, fetched_objects)?;
                 }
             }
             object::Object::Blob(object::BlobObject::LargeFilePointer(pointer)) => {
@@ -701,6 +708,7 @@ impl Repository {
             }
             object::Object::Blob(_) | object::Object::Tag(_) => {}
         }
+        fetched_objects.insert(id.clone());
         Ok(())
     }
 
