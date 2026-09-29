@@ -26,6 +26,89 @@ const {
   sdkVersion,
 } = require("..")
 
+test(
+  "restoring a deleted SQLite file does not resurrect it on another device",
+  nodeSqliteTest,
+  async () => {
+    const fixture = await fs.mkdtemp(
+      path.join(os.tmpdir(), "graft-restore-delete-sync-")
+    )
+    const source = path.join(fixture, "source")
+    const remote = path.join(fixture, "remote")
+    const clone = path.join(fixture, "clone")
+    await fs.mkdir(source)
+    await fs.mkdir(remote)
+    const session = new RepositorySession(source)
+    const peer = new RepositorySession(clone)
+    const databasePath = path.join(source, "updates.eidos")
+    try {
+      const database = new DatabaseSync(databasePath)
+      database.exec("CREATE TABLE updates(id INTEGER PRIMARY KEY)")
+      database.close()
+      await fs.writeFile(path.join(source, "note.txt"), "before\n")
+      await session.open()
+      await session.init()
+      await session.addAll()
+      await session.commit("before deletion")
+      const before = (await session.repositoryMetadata()).current_head
+      await fs.unlink(databasePath)
+      await fs.writeFile(path.join(source, "note.txt"), "after\n")
+      await session.addAll()
+      await session.commit("delete database")
+      const deleted = (await session.repositoryMetadata()).current_head
+      await session.restorePaths({
+        source: before,
+        expectedHead: deleted,
+        paths: ["updates.eidos", "note.txt"],
+      })
+      await session.addAll()
+      await session.commit("restore before deletion")
+      const restored = (await session.repositoryMetadata()).current_head
+      await session.restorePaths({
+        source: deleted,
+        expectedHead: restored,
+        paths: ["updates.eidos", "note.txt"],
+      })
+      await assert.rejects(fs.stat(databasePath), { code: "ENOENT" })
+      const status = (await session.statusIncremental()).status
+      assert.ok(
+        status.unstaged_changes.some(
+          (change) =>
+            change.path === "updates.eidos" && change.change === "deleted"
+        )
+      )
+      // Match hosts that stage only the paths reported by incremental status.
+      await session.stagePaths({
+        paths: status.unstaged_changes.map((change) => change.path),
+      })
+      await session.commit("restore deletion")
+      await session.configureRemote({
+        name: "origin",
+        url: `fs://${remote}`,
+        upstreamBranch: "main",
+      })
+      await session.push()
+      await peer.open()
+      await peer.cloneRepository({ remoteUrl: `fs://${remote}` })
+      assert.equal(
+        (await peer.repositoryMetadata()).current_head,
+        (await session.repositoryMetadata()).current_head
+      )
+      await assert.rejects(fs.stat(path.join(clone, "updates.eidos")), {
+        code: "ENOENT",
+      })
+      assert.equal(
+        await fs.readFile(path.join(clone, "note.txt"), "utf8"),
+        "after\n"
+      )
+    } finally {
+      await session.close()
+      await peer.close()
+      await fs.rm(fixture, { recursive: true, force: true })
+    }
+  }
+)
+
 test("exposes ABI-stable SDK metadata and materialization contract", () => {
   assert.equal(sdkVersion(), packageMetadata.version)
   for (const operation of [

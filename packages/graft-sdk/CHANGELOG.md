@@ -5,6 +5,19 @@ SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
 
 ## Unreleased
 
+## Graft SDK 0.3.28 — 2026-09-29
+
+### Fixed
+
+- Restoring a SQLite file to a revision where it was deleted now reports the
+  deletion correctly. Staging and committing no longer resurrect the file from
+  a cached snapshot, and another device receives the deletion when syncing.
+
+### Compatibility
+
+- The SDK API, repository format and Remote protocol are unchanged. No data
+  migration is required.
+
 ## Graft SDK 0.3.27 — 2026-09-08
 
 ### Improved

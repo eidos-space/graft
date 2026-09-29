@@ -1032,6 +1032,12 @@ pub(super) fn repo_key_uses_volume_binding(repo: &Repository, key: &str) -> Resu
     if !repo.config()?.worktree.materialize_sqlite {
         return Ok(true);
     }
+    // A restore can leave a volume binding for a database it removed from disk.
+    // Deleted paths are included in dirty_paths(), but that cached volume must
+    // not hide the deletion from status or resurrect the snapshot during add.
+    if !repo.worktree().join(key).try_exists()? {
+        return Ok(false);
+    }
     Ok(repo.dirty_paths()?.iter().any(|dirty| dirty == key))
 }
 

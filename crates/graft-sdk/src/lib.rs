@@ -7527,6 +7527,72 @@ mod tests {
     }
 
     #[test]
+    fn restored_sqlite_deletion_survives_status_stage_commit_and_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("updates.eidos");
+        Connection::open(&database_path)
+            .unwrap()
+            .execute_batch("CREATE TABLE updates(id INTEGER PRIMARY KEY, value TEXT);")
+            .unwrap();
+        let session = RepositorySession::new(directory.path());
+        session.open().unwrap();
+        session.init().unwrap();
+        session.add_all().unwrap();
+        session.commit("before deletion").unwrap();
+        let before = session.repository_metadata().unwrap().current_head.unwrap();
+        fs::remove_file(&database_path).unwrap();
+        session.add_all().unwrap();
+        session.commit("delete database").unwrap();
+        let deleted = session.repository_metadata().unwrap().current_head.unwrap();
+        session
+            .restore_paths(&RestorePathsOptions {
+                source: Some(before),
+                expected_head: Some(deleted.clone()),
+                require_clean: false,
+                paths: vec![PathBuf::from("updates.eidos")],
+            })
+            .unwrap();
+        session.add_all().unwrap();
+        session.commit("restore old database").unwrap();
+        let restored = session.repository_metadata().unwrap().current_head.unwrap();
+        session
+            .restore_paths(&RestorePathsOptions {
+                source: Some(deleted),
+                expected_head: Some(restored),
+                require_clean: false,
+                paths: vec![PathBuf::from("updates.eidos")],
+            })
+            .unwrap();
+        assert!(!database_path.exists());
+        let status = session.status_incremental().unwrap();
+        assert_eq!(status.status.unstaged_changes.len(), 1);
+        assert_eq!(
+            status.status.unstaged_changes[0].change,
+            graft::repo::RepoWorktreeChangeKind::Deleted
+        );
+        session
+            .stage_paths(&StagePathsOptions {
+                paths: vec![PathBuf::from("updates.eidos")],
+                expected_head: None,
+                force: false,
+            })
+            .unwrap();
+        session.commit("restore deletion").unwrap();
+        session.close().unwrap();
+        session.open().unwrap();
+        assert!(!session.status_incremental().unwrap().status.dirty);
+        let repo = Repository::discover(directory.path()).unwrap();
+        assert!(
+            !repo
+                .show_revision("HEAD")
+                .unwrap()
+                .files
+                .contains_key("updates.eidos")
+        );
+        assert!(!database_path.exists());
+    }
+
+    #[test]
     fn incremental_status_reuses_metadata_and_advances_generation() {
         let directory = tempfile::tempdir().unwrap();
         let note = directory.path().join("note.txt");
