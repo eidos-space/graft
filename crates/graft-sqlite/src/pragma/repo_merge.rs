@@ -111,10 +111,25 @@ pub(super) fn run_repo_merge(
         &plan.checkout,
         &status,
     )?;
-    let previous_files = current_repo_files_for_checkout(&repo)?;
-    let previous_artifacts = current_repo_artifacts_for_checkout(&repo)?;
+    let mut previous_files = current_repo_files_for_checkout(&repo)?;
+    let mut previous_artifacts = current_repo_artifacts_for_checkout(&repo)?;
+    let mut checkout = plan.checkout.clone();
+    if matches!(plan.outcome, MergeOutcome::FastForward { .. }) {
+        // The authoritative clean-worktree check above already compared each
+        // physical file with its current committed state. Equal immutable
+        // states need no replacement, backup, rehydration, or host validation.
+        // Keep the complete plan for moving HEAD; narrow only filesystem work.
+        checkout
+            .files
+            .retain(|key, state| previous_files.get(key) != Some(state));
+        checkout
+            .artifacts
+            .retain(|key, state| previous_artifacts.get(key) != Some(state));
+        previous_files.retain(|key, state| plan.checkout.files.get(key) != Some(state));
+        previous_artifacts.retain(|key, state| plan.checkout.artifacts.get(key) != Some(state));
+    }
     let mut _sqlite_replacement_guards =
-        preflight_workspace_checkout(&repo, &plan.checkout, &previous_files)?;
+        preflight_workspace_checkout(&repo, &checkout, &previous_files)?;
     let mut outcome = repo.apply_merge_plan(&plan)?;
     release_sqlite_guards_for_filesystem_change(&mut _sqlite_replacement_guards);
     checkout_merge_outcome(
@@ -122,7 +137,7 @@ pub(super) fn run_repo_merge(
         file,
         &repo,
         &outcome,
-        Some(&plan.checkout),
+        Some(&checkout),
         &previous_files,
         &previous_artifacts,
         None,
@@ -158,7 +173,7 @@ pub(super) fn run_repo_merge(
     let paths = merge_path_actions(
         &repo,
         &outcome,
-        Some(&plan.checkout),
+        Some(&checkout),
         &previous_files,
         &previous_artifacts,
     )?;

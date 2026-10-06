@@ -5943,6 +5943,56 @@ mod tests {
     }
 
     #[test]
+    fn fast_forward_artifact_edit_preserves_unchanged_sqlite_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("unchanged.eidos");
+        let note = directory.path().join("new.md");
+        Connection::open(&database).unwrap().execute_batch("CREATE TABLE records(id INTEGER PRIMARY KEY, value TEXT); INSERT INTO records VALUES(1,'base');").unwrap();
+        let session = RepositorySession::new(directory.path());
+        session.open().unwrap();
+        session.init().unwrap();
+        session.add_all().unwrap();
+        session.commit("base").unwrap();
+        session.close().unwrap();
+        Repository::open(directory.path())
+            .unwrap()
+            .switch_new_branch("target", None)
+            .unwrap();
+        session.open().unwrap();
+        fs::write(&note, "from phone\n").unwrap();
+        session.add_all().unwrap();
+        session.commit("artifact only").unwrap();
+        session.close().unwrap();
+        Repository::open(directory.path())
+            .unwrap()
+            .switch_branch("main")
+            .unwrap();
+        fs::remove_file(&note).unwrap();
+        session.open().unwrap();
+        let before = fs::metadata(&database).unwrap().modified().unwrap();
+        let contents = fs::read(&database).unwrap();
+        let head = session.repository_metadata().unwrap().current_head;
+        let plan = session
+            .plan_merge(&PlanMergeOptions {
+                revision: "target".into(),
+                expected_head: head.clone(),
+            })
+            .unwrap();
+        let result = session
+            .apply_merge(&ApplyMergeOptions {
+                revision: "target".into(),
+                expected_head: head,
+                plan_token: plan.plan_token,
+            })
+            .unwrap();
+        assert_eq!(result.worktree_paths, vec!["new.md"]);
+        assert_eq!(fs::metadata(&database).unwrap().modified().unwrap(), before);
+        assert_eq!(fs::read(&database).unwrap(), contents);
+        assert_eq!(fs::read_to_string(&note).unwrap(), "from phone\n");
+        assert_eq!(session.status().unwrap()["dirty"], false);
+    }
+
+    #[test]
     fn git_like_text_merge_survives_reopen_and_stages_edited_result() {
         let directory = tempfile::tempdir().unwrap();
         let note = directory.path().join("note.txt");
