@@ -35,6 +35,7 @@ mod refspec;
 mod remote_objects;
 mod staging;
 mod sync;
+pub use sync::PreparedFetch;
 mod worktree;
 mod worktree_state;
 
@@ -109,6 +110,9 @@ pub struct TransferProgress {
     pub direction: TransferDirection,
     pub transferred_bytes: u64,
     pub total_bytes: Option<u64>,
+    /// True when a complete remaining-transfer plan was declared. A total
+    /// inferred from individual HTTP responses is not a fixed denominator.
+    pub total_is_final: bool,
 }
 
 #[derive(Default)]
@@ -122,6 +126,7 @@ struct TransferProgressDirectionCounters {
     transferred_bytes: u64,
     total_bytes: u64,
     indeterminate: bool,
+    total_is_final: bool,
     declared_remaining_bytes: u64,
     last_emit: Option<Instant>,
 }
@@ -153,11 +158,17 @@ impl TransferProgressReporter {
             match total_bytes {
                 Some(total_bytes) => {
                     let declared = counters.declared_remaining_bytes.min(total_bytes);
+                    if total_bytes > declared {
+                        counters.total_is_final = false;
+                    }
                     counters.declared_remaining_bytes -= declared;
                     counters.total_bytes =
                         counters.total_bytes.saturating_add(total_bytes - declared);
                 }
-                None => counters.indeterminate = true,
+                None => {
+                    counters.indeterminate = true;
+                    counters.total_is_final = false;
+                }
             }
             due_transfer_progress(direction, counters)
         };
@@ -171,6 +182,7 @@ impl TransferProgressReporter {
             let mut counters = self.inner.counters.lock().unwrap();
             let counters = direction_counters(&mut counters, direction);
             counters.total_bytes = counters.total_bytes.saturating_add(total_bytes);
+            counters.total_is_final = true;
             counters.declared_remaining_bytes = counters
                 .declared_remaining_bytes
                 .saturating_add(total_bytes);
@@ -179,6 +191,35 @@ impl TransferProgressReporter {
         if let Some(progress) = progress {
             (self.inner.callback)(progress);
         }
+    }
+
+    fn start_planning(&self, direction: TransferDirection) {
+        let progress = {
+            let mut counters = self.inner.counters.lock().unwrap();
+            let counters = direction_counters(&mut counters, direction);
+            counters.total_bytes = counters.transferred_bytes;
+            counters.declared_remaining_bytes = 0;
+            counters.indeterminate = true;
+            counters.total_is_final = false;
+            counters.last_emit = Some(Instant::now());
+            transfer_progress(direction, counters)
+        };
+        (self.inner.callback)(progress);
+    }
+
+    fn plan_remaining(&self, direction: TransferDirection, remaining: u64) {
+        let progress = {
+            let mut counters = self.inner.counters.lock().unwrap();
+            let counters = direction_counters(&mut counters, direction);
+            counters.total_bytes = counters.transferred_bytes.saturating_add(remaining);
+            counters.declared_remaining_bytes = remaining;
+            counters.indeterminate = false;
+            counters.total_is_final = true;
+            counters.last_emit = Some(Instant::now());
+            transfer_progress(direction, counters)
+        };
+        // Planning is a phase boundary, so it must not be throttled away.
+        (self.inner.callback)(progress);
     }
 
     fn advance(&self, direction: TransferDirection, bytes: u64) {
@@ -247,6 +288,7 @@ fn transfer_progress(
         direction,
         transferred_bytes: counters.transferred_bytes,
         total_bytes: (!counters.indeterminate).then_some(counters.total_bytes),
+        total_is_final: counters.total_is_final && !counters.indeterminate,
     }
 }
 
@@ -280,6 +322,14 @@ pub(crate) fn declare_transfer_progress_total(direction: TransferDirection, tota
     ACTIVE_TRANSFER_PROGRESS.with(|active| {
         if let Some(reporter) = active.borrow().as_ref() {
             reporter.declare_aggregate_total(direction, total_bytes);
+        }
+    });
+}
+
+pub(crate) fn plan_remaining_transfer(direction: TransferDirection, bytes: u64) {
+    ACTIVE_TRANSFER_PROGRESS.with(|active| {
+        if let Some(reporter) = active.borrow().as_ref() {
+            reporter.plan_remaining(direction, bytes);
         }
     });
 }
@@ -2543,20 +2593,24 @@ fn commit_parent_ids(commit: &CommitObject) -> Vec<String> {
 fn block_on_remote<T>(
     future: impl std::future::Future<Output = std::result::Result<T, RemoteErr>>,
 ) -> Result<T> {
-    thread_local! {
-        static REMOTE_RUNTIME: RefCell<Option<tokio::runtime::Runtime>> = const { RefCell::new(None) };
-    }
-
-    REMOTE_RUNTIME.with(|runtime| {
-        let mut runtime = runtime.borrow_mut();
-        if runtime.is_none() {
-            *runtime = Some(
-                tokio::runtime::Builder::new_current_thread()
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // HTTP clients are shared with snapshot hydration. Their connection
+        // drivers must keep running after a synchronous repository call ends,
+        // including while another executor uses or drops the pooled client.
+        // One process-wide worker also bounds the cost across SDK sessions.
+        static REMOTE_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+        let runtime = match REMOTE_RUNTIME.get() {
+            Some(runtime) => runtime,
+            None => {
+                let candidate = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .thread_name("graft-repository-io")
                     .enable_all()
-                    .build()?,
-            );
-        }
-        let runtime = runtime.as_ref().expect("runtime initialized");
+                    .build()?;
+                REMOTE_RUNTIME.get_or_init(|| candidate)
+            }
+        };
         if let Some(cancellation) = active_cancellation_token() {
             return runtime.block_on(async {
                 tokio::select! {
@@ -2566,7 +2620,34 @@ fn block_on_remote<T>(
             });
         }
         Ok(runtime.block_on(future)?)
-    })
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        thread_local! {
+            static REMOTE_RUNTIME: RefCell<Option<tokio::runtime::Runtime>> = const { RefCell::new(None) };
+        }
+
+        REMOTE_RUNTIME.with(|runtime| {
+            let mut runtime = runtime.borrow_mut();
+            if runtime.is_none() {
+                *runtime = Some(
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()?,
+                );
+            }
+            let runtime = runtime.as_ref().expect("runtime initialized");
+            if let Some(cancellation) = active_cancellation_token() {
+                return runtime.block_on(async {
+                    tokio::select! {
+                        result = future => Ok(result?),
+                        () = wait_for_cancellation(cancellation) => Err(RepoErr::Cancelled),
+                    }
+                });
+            }
+            Ok(runtime.block_on(future)?)
+        })
+    }
 }
 
 pub(crate) async fn wait_for_cancellation(cancellation: CancellationToken) {

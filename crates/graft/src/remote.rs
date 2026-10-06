@@ -383,7 +383,14 @@ fn build_http_client() -> std::result::Result<reqwest::Client, reqwest::Error> {
         // across the entire repository session so proxies never mix request
         // types with different response-body behavior on one connection.
         .http1_only()
-        .hickory_dns(true)
+        // Read, probe, and upload pools share the transport's connection budget.
+        // Keep one warm idle connection per pool; completed parallel probes
+        // must not occupy every relay slot needed by the next upload burst.
+        .pool_max_idle_per_host(1)
+        // Android resolves through the platform network service, not
+        // /etc/resolv.conf. Hickory's Unix system configuration cannot load
+        // there; reqwest's system resolver uses Android's getaddrinfo instead.
+        .hickory_dns(!cfg!(target_os = "android"))
         .connect_timeout(Duration::from_secs(5))
         // Do not put a wall-clock deadline on the shared client. Reads attach
         // their own bounded request timeout, while mutation uploads remain
@@ -722,8 +729,8 @@ impl Remote {
                     // use http1 to maximize throughput
                     // http2 routes all requests through a single connection
                     .http1_only()
-                    // enable hickory DNS resolver for DNS caching
-                    .hickory_dns(true)
+                    // Android has no /etc/resolv.conf; use its system resolver.
+                    .hickory_dns(!cfg!(target_os = "android"))
                     .connect_timeout(Duration::from_secs(5))
                     // .tcp_user_timeout(Duration::from_secs(60))
                     .build()?;
@@ -912,6 +919,45 @@ impl Remote {
                 Err(err) => Err(err.into()),
             },
             RemoteBackend::Http(remote) => remote.get_raw(path).await,
+        }
+    }
+
+    /// Read a small immutable payload without buffering an oversized response.
+    pub(crate) async fn get_raw_bounded(
+        &self,
+        path: &str,
+        max_bytes: usize,
+    ) -> Result<Option<Bytes>> {
+        match &self.backend {
+            RemoteBackend::ObjectStore(store) => {
+                let size = match store.stat(path).await {
+                    Ok(metadata) => metadata.content_length(),
+                    Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+                    Err(err) => return Err(err.into()),
+                };
+                if size > max_bytes as u64 {
+                    return Err(payload_size_error(path));
+                }
+                if size == 0 {
+                    return Ok(Some(Bytes::new()));
+                }
+                let result = store
+                    .read_options(
+                        path,
+                        ReadOptions {
+                            range: (0..size).into(),
+                            ..ReadOptions::default()
+                        },
+                    )
+                    .await;
+                match result {
+                    Ok(buffer) if buffer.len() <= max_bytes => Ok(Some(buffer.to_bytes())),
+                    Ok(_) => Err(payload_size_error(path)),
+                    Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+                    Err(err) => Err(err.into()),
+                }
+            }
+            RemoteBackend::Http(remote) => remote.get_raw_with_limit(path, Some(max_bytes)).await,
         }
     }
 
@@ -1760,6 +1806,14 @@ impl HttpRemote {
     }
 
     async fn get_raw(&self, path: &str) -> Result<Option<Bytes>> {
+        self.get_raw_with_limit(path, None).await
+    }
+
+    async fn get_raw_with_limit(
+        &self,
+        path: &str,
+        max_bytes: Option<usize>,
+    ) -> Result<Option<Bytes>> {
         let response = self
             .send(
                 self.request(reqwest::Method::GET, self.raw_url("raw", path)),
@@ -1777,7 +1831,13 @@ impl HttpRemote {
         }
         let response = Self::check_response(response, path).await?;
         Ok(Some(
-            tracked_response_bytes(response, "get_body", TransferDirection::Download).await?,
+            tracked_response_bytes_with_limit(
+                response,
+                "get_body",
+                TransferDirection::Download,
+                max_bytes.map(|limit| (path, limit)),
+            )
+            .await?,
         ))
     }
 
@@ -2627,12 +2687,39 @@ async fn tracked_response_bytes(
     operation: &'static str,
     direction: TransferDirection,
 ) -> Result<Bytes> {
+    tracked_response_bytes_with_limit(response, operation, direction, None).await
+}
+
+fn payload_size_error(path: &str) -> RemoteErr {
+    RemoteErr::HttpStatus {
+        status: 413,
+        path: path.into(),
+        message: "remote payload exceeds its declared size".into(),
+    }
+}
+
+async fn tracked_response_bytes_with_limit(
+    response: reqwest::Response,
+    operation: &'static str,
+    direction: TransferDirection,
+    limit: Option<(&str, usize)>,
+) -> Result<Bytes> {
     let total_bytes = response.content_length();
+    if let Some((path, max_bytes)) = limit
+        && total_bytes.is_some_and(|bytes| bytes > max_bytes as u64)
+    {
+        return Err(payload_size_error(path));
+    }
     let mut progress = begin_transfer_progress(direction, total_bytes);
     let mut body = response.bytes_stream();
     let mut output = Vec::new();
     while let Some(chunk) = body.next().await {
         let chunk = chunk.map_err(|err| RemoteErr::http_transport(operation, err))?;
+        if let Some((path, max_bytes)) = limit
+            && chunk.len() > max_bytes.saturating_sub(output.len())
+        {
+            return Err(payload_size_error(path));
+        }
         if let Some(progress) = progress.as_mut() {
             progress.advance(chunk.len() as u64);
         }
@@ -4544,6 +4631,80 @@ mod tests {
         assert!(first.has_segment(&SegmentId::random()).await.unwrap());
         assert!(second.has_segment(&SegmentId::random()).await.unwrap());
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bounded_payload_reads_reject_declared_and_chunked_oversize() {
+        for headers_and_body in [
+            "Content-Length: 9\r\n\r\noversized",
+            "Transfer-Encoding: chunked\r\n\r\n9\r\noversized\r\n0\r\n\r\n",
+            "Content-Length: 4\r\n\r\ngood",
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 4096];
+                assert!(socket.read(&mut request).await.unwrap() > 0);
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nGraft-Protocol: 1\r\nConnection: close\r\n{headers_and_body}").as_bytes()).await.unwrap();
+            });
+            let remote = RemoteConfig::Http {
+                url: format!("http://{address}/repo"),
+                token_env: None,
+            }
+            .build_with_credentials("origin", &RemoteCredentials::explicit())
+            .unwrap();
+            let result = remote.get_raw_bounded("store/files/payload", 4).await;
+            if headers_and_body.ends_with("good") {
+                assert_eq!(result.unwrap().unwrap().as_ref(), b"good");
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(RemoteErr::HttpStatus { status: 413, .. })
+                ));
+            }
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_parallel_probes_release_excess_idle_connections() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(5));
+        let server = tokio::spawn(async move {
+            let mut tasks = Vec::new();
+            for _ in 0..5 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let barrier = barrier.clone();
+                tasks.push(tokio::spawn(async move {
+                    read_http_request(&mut socket).await;
+                    barrier.wait().await;
+                    socket.write_all(b"HTTP/1.1 204 No Content\r\nGraft-Protocol: 1\r\nContent-Length: 0\r\n\r\n").await.unwrap();
+                    let mut byte = [0];
+                    matches!(tokio::time::timeout(Duration::from_secs(2), socket.read(&mut byte)).await, Ok(Ok(0)))
+                }));
+            }
+            let mut released = 0;
+            for task in tasks {
+                released += usize::from(task.await.unwrap());
+            }
+            released
+        });
+        let remote = HttpRemote::new(format!("http://{address}/repo"), None).unwrap();
+        let probes = (0..5).map(|_| remote.has_raw("store/files/payload"));
+        assert!(
+            futures::future::try_join_all(probes)
+                .await
+                .unwrap()
+                .into_iter()
+                .all(|exists| exists)
+        );
+        assert_eq!(
+            server.await.unwrap(),
+            4,
+            "only one probe connection may remain idle"
+        );
     }
 
     #[tokio::test]

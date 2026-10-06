@@ -1491,6 +1491,21 @@ pub(crate) fn physical_sqlite_file_matches_state(
     physical.matches_state(runtime, expected)
 }
 
+/// Status uses the same exact-state probe as diff. Retain the `SQLite` read lock while checking
+/// its fingerprint and content, so an unrelated Markdown edit does not copy and compare every
+/// unchanged database again. WAL and missing/invalid caches keep the authoritative fallback.
+pub(super) fn physical_sqlite_file_matches_cached_state(
+    runtime: &Runtime,
+    repo: &Repository,
+    key: &str,
+    path: &Path,
+    expected: &CommitFileState,
+) -> Result<bool, ErrCtx> {
+    with_consistent_physical_sqlite_reader(path, |physical| {
+        physical.matches_cached_state(runtime, repo, key, expected)
+    })
+}
+
 /// Verifies an internally copied, stable worktree candidate against an immutable Graft state.
 ///
 /// The content-addressed page index turns the common path into one sequential candidate read.
@@ -2603,6 +2618,39 @@ mod tests {
         })
         .unwrap();
         assert!(!matches_changed);
+    }
+
+    #[test]
+    fn cached_status_detects_external_writes_with_and_without_wal() {
+        for journal in ["delete", "wal"] {
+            let temp = tempfile::tempdir().unwrap();
+            let repo = Repository::init(temp.path()).unwrap();
+            let path = temp.path().join("app.sqlite");
+            let connection = create_database(&path, journal);
+            let runtime = test_runtime();
+            let expected = import_physical_sqlite_file_state(&runtime, &path, None).unwrap();
+            let matches = || {
+                physical_sqlite_file_matches_cached_state(
+                    &runtime,
+                    &repo,
+                    "app.sqlite",
+                    &path,
+                    &expected,
+                )
+                .unwrap()
+            };
+            assert!(matches());
+            assert!(matches());
+            // Same-size external writes must invalidate a warm probe, including WAL-only writes.
+            connection
+                .execute(
+                    "UPDATE records SET payload = ?1 WHERE id = 48",
+                    [vec![0x5A_u8; 3_000]],
+                )
+                .unwrap();
+            assert!(!matches());
+            assert!(!matches());
+        }
     }
 
     #[test]

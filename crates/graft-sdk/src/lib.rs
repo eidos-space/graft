@@ -2280,6 +2280,17 @@ impl RepositorySession {
         self.execute_json_mutating("json_pull", argument.as_deref())
     }
 
+    /// Fetch and hydrate a branch with one planned download budget. Does not
+    /// change HEAD, index, or worktree; a subsequent merge applies the version.
+    pub fn fetch_for_checkout(&self, remote: &str, branch: &str) -> Result<Value> {
+        self.with_service(|service| {
+            let outcome = service
+                .fetch_for_checkout(remote, branch)
+                .map_err(repository_command_error)?;
+            Ok(serde_json::json!(outcome))
+        })
+    }
+
     /// Returns the effective merge policy and its stable compare-and-swap token.
     pub fn get_merge_policy(&self) -> Result<MergePolicyResult> {
         self.with_service(|service| {
@@ -5724,6 +5735,94 @@ mod tests {
     use super::*;
 
     #[test]
+    fn planned_fetch_hydrates_target_without_materializing_and_applies_offline() {
+        let source = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let remote = tempfile::tempdir().unwrap();
+        let writer = RepositorySession::new(source.path());
+        let reader = RepositorySession::new(target.path());
+        for session in [&writer, &reader] {
+            session.open().unwrap();
+            session.init().unwrap();
+            session
+                .with_service(|service| {
+                    service
+                        .repository()
+                        .unwrap()
+                        .remote_add(
+                            "origin",
+                            RemoteConfig::Fs {
+                                root: remote.path().join("store").to_string_lossy().into_owned(),
+                            },
+                        )
+                        .unwrap();
+                    Ok(())
+                })
+                .unwrap();
+        }
+        let database = source.path().join("data.db");
+        Connection::open(&database)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE items(value BLOB); INSERT INTO items VALUES(randomblob(65536));",
+            )
+            .unwrap();
+        let payload = vec![7u8; 1024 * 1024];
+        fs::write(source.path().join("file.bin"), &payload).unwrap();
+        writer.add_all().unwrap();
+        writer.commit("data and file").unwrap();
+        writer.push(Some("origin"), Some("main")).unwrap();
+        let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let target_path = target.path().to_path_buf();
+        let reporter = graft::repo::TransferProgressReporter::new(move |event| {
+            assert!(!target_path.join("data.db").exists());
+            assert!(!target_path.join("file.bin").exists());
+            sink.lock().push(event);
+        });
+        let result = graft::repo::with_transfer_progress(&reporter, || {
+            reader.fetch_for_checkout("origin", "main")
+        })
+        .unwrap();
+        let planned = events
+            .lock()
+            .iter()
+            .copied()
+            .filter(|event| event.total_is_final)
+            .collect::<Vec<_>>();
+        assert!(!planned.is_empty());
+        assert!(
+            planned
+                .iter()
+                .all(|event| event.total_bytes == planned[0].total_bytes)
+        );
+        assert!(planned[0].total_bytes.unwrap() > payload.len() as u64);
+        assert!(reader.repository_metadata().unwrap().current_head.is_none());
+        // Taking the entire remote away proves application uses only prepared data.
+        fs::rename(remote.path().join("store"), remote.path().join("offline")).unwrap();
+        let revision = result["head"].as_str().unwrap().to_string();
+        let plan = reader
+            .plan_merge(&PlanMergeOptions {
+                revision: revision.clone(),
+                expected_head: None,
+            })
+            .unwrap();
+        reader
+            .apply_merge(&ApplyMergeOptions {
+                revision,
+                expected_head: None,
+                plan_token: plan.plan_token,
+            })
+            .unwrap();
+        assert_eq!(fs::read(target.path().join("file.bin")).unwrap(), payload);
+        let count: i64 = Connection::open(target.path().join("data.db"))
+            .unwrap()
+            .query_row("SELECT length(value) FROM items", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 65536);
+    }
+
+    #[test]
     fn operation_materialization_contract_is_explicit() {
         assert!(RepositoryOperation::Restore.materializes_worktree());
         assert!(RepositoryOperation::RestorePaths.materializes_worktree());
@@ -5940,6 +6039,56 @@ mod tests {
             session.repository_metadata().unwrap().current_head,
             Some(target.id)
         );
+    }
+
+    #[test]
+    fn fast_forward_artifact_edit_preserves_unchanged_sqlite_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("unchanged.eidos");
+        let note = directory.path().join("new.md");
+        Connection::open(&database).unwrap().execute_batch("CREATE TABLE records(id INTEGER PRIMARY KEY, value TEXT); INSERT INTO records VALUES(1,'base');").unwrap();
+        let session = RepositorySession::new(directory.path());
+        session.open().unwrap();
+        session.init().unwrap();
+        session.add_all().unwrap();
+        session.commit("base").unwrap();
+        session.close().unwrap();
+        Repository::open(directory.path())
+            .unwrap()
+            .switch_new_branch("target", None)
+            .unwrap();
+        session.open().unwrap();
+        fs::write(&note, "from phone\n").unwrap();
+        session.add_all().unwrap();
+        session.commit("artifact only").unwrap();
+        session.close().unwrap();
+        Repository::open(directory.path())
+            .unwrap()
+            .switch_branch("main")
+            .unwrap();
+        fs::remove_file(&note).unwrap();
+        session.open().unwrap();
+        let before = fs::metadata(&database).unwrap().modified().unwrap();
+        let contents = fs::read(&database).unwrap();
+        let head = session.repository_metadata().unwrap().current_head;
+        let plan = session
+            .plan_merge(&PlanMergeOptions {
+                revision: "target".into(),
+                expected_head: head.clone(),
+            })
+            .unwrap();
+        let result = session
+            .apply_merge(&ApplyMergeOptions {
+                revision: "target".into(),
+                expected_head: head,
+                plan_token: plan.plan_token,
+            })
+            .unwrap();
+        assert_eq!(result.worktree_paths, vec!["new.md"]);
+        assert_eq!(fs::metadata(&database).unwrap().modified().unwrap(), before);
+        assert_eq!(fs::read(&database).unwrap(), contents);
+        assert_eq!(fs::read_to_string(&note).unwrap(), "from phone\n");
+        assert_eq!(session.status().unwrap()["dirty"], false);
     }
 
     #[test]

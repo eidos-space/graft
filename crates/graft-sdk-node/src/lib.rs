@@ -189,6 +189,7 @@ pub struct NodeTransferProgress {
     pub direction: String,
     pub transferred_bytes: f64,
     pub total_bytes: Option<f64>,
+    pub total_is_final: bool,
 }
 
 type TransferProgressCallback = ThreadsafeFunction<
@@ -2117,6 +2118,7 @@ fn node_transfer_progress(progress: CoreTransferProgress) -> NodeTransferProgres
         .to_string(),
         transferred_bytes: progress.transferred_bytes as f64,
         total_bytes: progress.total_bytes.map(|bytes| bytes as f64),
+        total_is_final: progress.total_is_final,
     }
 }
 

@@ -110,7 +110,7 @@ fn cache_diff_snapshot(
     }
 }
 
-pub(super) fn hydrate_repo_file_state(
+pub(crate) fn hydrate_repo_file_state(
     runtime: &Runtime,
     state: &CommitFileState,
     remote: Option<Arc<Remote>>,
@@ -308,6 +308,15 @@ impl<'a> RepoSnapshotResolver<'a> {
         plan: &CheckoutPlan,
     ) -> Result<CheckoutPlan, ErrCtx> {
         let mut plan = plan.clone();
+        if let Some(remote) = self.remote.clone() {
+            let snapshots = plan
+                .files
+                .values()
+                .map(|state| state.snapshot.to_snapshot())
+                .collect::<Vec<_>>();
+            self.runtime
+                .prepare_snapshots_download(&snapshots, remote)?;
+        }
         for state in plan.files.values_mut() {
             *state = self.resolve_file_state(state)?;
         }

@@ -446,8 +446,10 @@ pub(crate) fn repo_status_for_file(
                             });
                         Some(RepoWorktreeChangeKind::Modified)
                     }
-                    Ok(true) => match physical_sqlite_file_matches_state(
+                    Ok(true) => match physical_sqlite_file_matches_cached_state(
                         runtime,
+                        repo,
+                        &key,
                         &physical_path,
                         &expected_state,
                     ) {

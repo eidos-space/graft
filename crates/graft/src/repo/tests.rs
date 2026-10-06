@@ -1130,6 +1130,7 @@ fn transfer_progress_reports_known_and_unknown_body_lengths() {
         direction: TransferDirection::Upload,
         transferred_bytes: 5,
         total_bytes: Some(5),
+        total_is_final: false,
     }));
     assert_eq!(
         events.last(),
@@ -1137,9 +1138,43 @@ fn transfer_progress_reports_known_and_unknown_body_lengths() {
             direction: TransferDirection::Download,
             transferred_bytes: 7,
             total_bytes: None,
+            total_is_final: false,
         })
     );
     assert!(begin_transfer_progress(TransferDirection::Upload, Some(1)).is_none());
+}
+
+#[test]
+fn planned_download_has_a_fixed_total_and_invalidates_unplanned_requests() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let captured = events.clone();
+    let reporter = TransferProgressReporter::new(move |event| captured.lock().unwrap().push(event));
+    with_transfer_progress(&reporter, || {
+        let mut metadata = begin_transfer_progress(TransferDirection::Download, None).unwrap();
+        metadata.advance(7);
+        plan_remaining_transfer(TransferDirection::Download, 30);
+        for size in [10, 20] {
+            let mut body =
+                begin_transfer_progress(TransferDirection::Download, Some(size)).unwrap();
+            body.advance(size);
+            body.finish();
+        }
+    });
+    let planned = events
+        .lock()
+        .unwrap()
+        .iter()
+        .copied()
+        .filter(|e| e.total_is_final)
+        .collect::<Vec<_>>();
+    assert_eq!(planned.first().unwrap().transferred_bytes, 7);
+    assert!(planned.iter().all(|e| e.total_bytes == Some(37)));
+    assert_eq!(planned.last().unwrap().transferred_bytes, 37);
+    with_transfer_progress(&reporter, || {
+        let mut unexpected = begin_transfer_progress(TransferDirection::Download, Some(5)).unwrap();
+        unexpected.advance(5);
+    });
+    assert!(!events.lock().unwrap().last().unwrap().total_is_final);
 }
 
 #[test]
@@ -1171,6 +1206,7 @@ fn transfer_progress_coalesces_short_transfers_and_flushes_the_aggregate_total()
             direction: TransferDirection::Upload,
             transferred_bytes: 0,
             total_bytes: Some(100_000),
+            total_is_final: true,
         })
     );
     assert_eq!(
@@ -1179,6 +1215,7 @@ fn transfer_progress_coalesces_short_transfers_and_flushes_the_aggregate_total()
             direction: TransferDirection::Upload,
             transferred_bytes: 100_000,
             total_bytes: Some(100_000),
+            total_is_final: true,
         })
     );
 }
@@ -1203,6 +1240,7 @@ fn transfer_progress_retains_periodic_partial_updates() {
         direction: TransferDirection::Upload,
         transferred_bytes: 40,
         total_bytes: Some(100),
+        total_is_final: false,
     }));
     assert_eq!(
         events.last(),
@@ -1210,6 +1248,7 @@ fn transfer_progress_retains_periodic_partial_updates() {
             direction: TransferDirection::Upload,
             transferred_bytes: 100,
             total_bytes: Some(100),
+            total_is_final: false,
         })
     );
 }
@@ -5388,6 +5427,61 @@ fn remote_pack_indexes_are_persisted_and_repaired_as_disposable_hints() {
         paths.len()
     );
     decode_remote_object_pack_index(repaired_path, &fs::read(repaired_cache).unwrap()).unwrap();
+}
+
+#[test]
+fn repository_http_pool_keeps_driving_between_executors() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        for _ in 0..2 {
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                if socket.read_exact(&mut byte).is_err() {
+                    return;
+                }
+                request.push(byte[0]);
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nGraft-Protocol: 1\r\nContent-Length: 2\r\n\r\nok")
+                .unwrap();
+        }
+    });
+    let remote = RemoteConfig::Http {
+        url: format!("http://{address}/repo"),
+        token_env: None,
+    }
+    .build()
+    .unwrap();
+    assert_eq!(
+        block_on_remote(remote.get_raw("first"))
+            .unwrap()
+            .unwrap()
+            .as_ref(),
+        b"ok"
+    );
+    let other = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let result = other.block_on(async {
+        tokio::time::timeout(Duration::from_secs(1), remote.get_raw("second")).await
+    });
+    server.join().unwrap();
+    assert_eq!(
+        result
+            .expect("repository pool stopped driving when its caller returned")
+            .unwrap()
+            .unwrap()
+            .as_ref(),
+        b"ok"
+    );
 }
 
 #[test]
