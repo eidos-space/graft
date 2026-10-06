@@ -419,6 +419,18 @@ impl Remote {
             .contains_key(path))
     }
 
+    pub(crate) async fn get_raw_bounded(
+        &self,
+        path: &str,
+        max_bytes: usize,
+    ) -> Result<Option<Bytes>> {
+        let bytes = self.get_raw(path).await?;
+        if bytes.as_ref().is_some_and(|value| value.len() > max_bytes) {
+            return Err(RemoteErr::BundledObjectTooLarge { path: path.into() });
+        }
+        Ok(bytes)
+    }
+
     pub(crate) async fn download_upload_bundle(
         &self,
         _ref_path: &str,

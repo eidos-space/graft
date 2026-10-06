@@ -5391,6 +5391,61 @@ fn remote_pack_indexes_are_persisted_and_repaired_as_disposable_hints() {
 }
 
 #[test]
+fn repository_http_pool_keeps_driving_between_executors() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        for _ in 0..2 {
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                if socket.read_exact(&mut byte).is_err() {
+                    return;
+                }
+                request.push(byte[0]);
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nGraft-Protocol: 1\r\nContent-Length: 2\r\n\r\nok")
+                .unwrap();
+        }
+    });
+    let remote = RemoteConfig::Http {
+        url: format!("http://{address}/repo"),
+        token_env: None,
+    }
+    .build()
+    .unwrap();
+    assert_eq!(
+        block_on_remote(remote.get_raw("first"))
+            .unwrap()
+            .unwrap()
+            .as_ref(),
+        b"ok"
+    );
+    let other = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let result = other.block_on(async {
+        tokio::time::timeout(Duration::from_secs(1), remote.get_raw("second")).await
+    });
+    server.join().unwrap();
+    assert_eq!(
+        result
+            .expect("repository pool stopped driving when its caller returned")
+            .unwrap()
+            .unwrap()
+            .as_ref(),
+        b"ok"
+    );
+}
+
+#[test]
 fn remote_pack_index_cache_rejects_non_content_addressed_paths() {
     let cache = Path::new("cache");
     assert!(remote_object_pack_index_cache_path(cache, "objects/pack/../escape.idx").is_none());
