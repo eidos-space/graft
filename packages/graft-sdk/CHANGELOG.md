@@ -5,6 +5,38 @@ SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
 
 ## Unreleased
 
+## Graft SDK 0.3.29 — 2026-10-07
+
+### Added
+
+- Rust sessions can use `fetch_for_checkout` to download and validate a target
+  revision before applying it to the worktree, with one planned transfer budget
+  for external files and missing compressed SQLite segments. Cached data is
+  excluded and shared content is counted once.
+- Transfer progress exposes `total_is_final` in Rust and `totalIsFinal` in Node.js
+  so hosts can distinguish a planned total from a running sum of response sizes.
+
+### Fixed
+
+- Android HTTP remotes use the platform DNS resolver instead of requiring Unix
+  resolver configuration.
+- Repository HTTP connections keep running between synchronous calls and
+  executors. Parallel probes release excess idle connections for later uploads.
+- Cancelled or invalid prepared fetches do not advance the remote tracking ref.
+
+### Improved
+
+- Fetch preloads small external payloads with four bounded concurrent requests,
+  retaining content verification and the fallback for larger files.
+- SQLite status reuses exact-state probes while detecting external and WAL writes.
+- Fast-forward merges preserve unchanged SQLite files and apply only changed paths.
+
+### Compatibility
+
+- Repository, snapshot, and Remote protocol formats are unchanged. No data
+  migration is required. Rust consumers constructing `TransferProgress` directly
+  must supply the new `total_is_final` field.
+
 ## Graft SDK 0.3.28 — 2026-09-29
 
 ### Fixed

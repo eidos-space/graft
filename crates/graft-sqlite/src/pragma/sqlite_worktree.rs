@@ -1491,7 +1491,7 @@ pub(crate) fn physical_sqlite_file_matches_state(
     physical.matches_state(runtime, expected)
 }
 
-/// Status uses the same exact-state probe as diff. Retain the SQLite read lock while checking
+/// Status uses the same exact-state probe as diff. Retain the `SQLite` read lock while checking
 /// its fingerprint and content, so an unrelated Markdown edit does not copy and compare every
 /// unchanged database again. WAL and missing/invalid caches keep the authoritative fallback.
 pub(super) fn physical_sqlite_file_matches_cached_state(
