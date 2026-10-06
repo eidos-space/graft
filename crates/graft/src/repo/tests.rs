@@ -1130,6 +1130,7 @@ fn transfer_progress_reports_known_and_unknown_body_lengths() {
         direction: TransferDirection::Upload,
         transferred_bytes: 5,
         total_bytes: Some(5),
+        total_is_final: false,
     }));
     assert_eq!(
         events.last(),
@@ -1137,9 +1138,43 @@ fn transfer_progress_reports_known_and_unknown_body_lengths() {
             direction: TransferDirection::Download,
             transferred_bytes: 7,
             total_bytes: None,
+            total_is_final: false,
         })
     );
     assert!(begin_transfer_progress(TransferDirection::Upload, Some(1)).is_none());
+}
+
+#[test]
+fn planned_download_has_a_fixed_total_and_invalidates_unplanned_requests() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let captured = events.clone();
+    let reporter = TransferProgressReporter::new(move |event| captured.lock().unwrap().push(event));
+    with_transfer_progress(&reporter, || {
+        let mut metadata = begin_transfer_progress(TransferDirection::Download, None).unwrap();
+        metadata.advance(7);
+        plan_remaining_transfer(TransferDirection::Download, 30);
+        for size in [10, 20] {
+            let mut body =
+                begin_transfer_progress(TransferDirection::Download, Some(size)).unwrap();
+            body.advance(size);
+            body.finish();
+        }
+    });
+    let planned = events
+        .lock()
+        .unwrap()
+        .iter()
+        .copied()
+        .filter(|e| e.total_is_final)
+        .collect::<Vec<_>>();
+    assert_eq!(planned.first().unwrap().transferred_bytes, 7);
+    assert!(planned.iter().all(|e| e.total_bytes == Some(37)));
+    assert_eq!(planned.last().unwrap().transferred_bytes, 37);
+    with_transfer_progress(&reporter, || {
+        let mut unexpected = begin_transfer_progress(TransferDirection::Download, Some(5)).unwrap();
+        unexpected.advance(5);
+    });
+    assert!(!events.lock().unwrap().last().unwrap().total_is_final);
 }
 
 #[test]
@@ -1171,6 +1206,7 @@ fn transfer_progress_coalesces_short_transfers_and_flushes_the_aggregate_total()
             direction: TransferDirection::Upload,
             transferred_bytes: 0,
             total_bytes: Some(100_000),
+            total_is_final: true,
         })
     );
     assert_eq!(
@@ -1179,6 +1215,7 @@ fn transfer_progress_coalesces_short_transfers_and_flushes_the_aggregate_total()
             direction: TransferDirection::Upload,
             transferred_bytes: 100_000,
             total_bytes: Some(100_000),
+            total_is_final: true,
         })
     );
 }
@@ -1203,6 +1240,7 @@ fn transfer_progress_retains_periodic_partial_updates() {
         direction: TransferDirection::Upload,
         transferred_bytes: 40,
         total_bytes: Some(100),
+        total_is_final: false,
     }));
     assert_eq!(
         events.last(),
@@ -1210,6 +1248,7 @@ fn transfer_progress_retains_periodic_partial_updates() {
             direction: TransferDirection::Upload,
             transferred_bytes: 100,
             total_bytes: Some(100),
+            total_is_final: false,
         })
     );
 }

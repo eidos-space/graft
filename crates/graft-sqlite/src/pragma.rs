@@ -64,7 +64,7 @@ mod repo_output;
 mod repo_paths;
 mod repo_refs;
 mod repo_remote_output;
-mod repo_snapshot;
+pub(crate) mod repo_snapshot;
 mod repo_staging;
 mod repo_switch;
 mod repo_sync;

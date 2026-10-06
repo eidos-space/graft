@@ -480,6 +480,54 @@ impl Runtime {
         self.run_action(HydrateSnapshot { snapshot })
     }
 
+    /// Fetch only snapshot metadata, then plan the exact compressed segment
+    /// bytes missing from local storage across the entire checkout. Shared
+    /// frames count once. This does not hydrate pages or change the worktree.
+    /// Call before hydrating these snapshots in the same progress scope.
+    pub fn prepare_snapshots_download(
+        &self,
+        snapshots: &[Snapshot],
+        remote: Arc<Remote>,
+    ) -> Result<u64> {
+        let bytes = self.snapshots_download_bytes(snapshots, remote)?;
+        crate::repo::plan_remaining_transfer(crate::repo::TransferDirection::Download, bytes);
+        Ok(bytes)
+    }
+
+    /// Fetch log metadata and count missing compressed segment ranges without
+    /// downloading segment bodies or declaring an operation-wide total.
+    pub fn snapshots_download_bytes(
+        &self,
+        snapshots: &[Snapshot],
+        remote: Arc<Remote>,
+    ) -> Result<u64> {
+        let mut ranges = std::collections::BTreeMap::<SegmentId, Vec<std::ops::Range<u64>>>::new();
+        for snapshot in snapshots {
+            if self.snapshot_hydration_cached(snapshot)? {
+                continue;
+            }
+            self.snapshot_fetch_from(snapshot, remote.clone())?;
+            for frame in self.storage().read().find_missing_frames(snapshot)? {
+                ranges.entry(frame.sid).or_default().push(frame.bytes);
+            }
+        }
+        let mut bytes = 0u64;
+        for ranges in ranges.values_mut() {
+            ranges.sort_unstable_by_key(|range| (range.start, range.end));
+            let mut end = 0;
+            for range in ranges {
+                let start = range.start.max(end);
+                bytes = bytes
+                    .checked_add(range.end.saturating_sub(start))
+                    .ok_or_else(|| {
+                        LogicalErr::Other("snapshot download size exceeds u64".into())
+                    })?;
+                end = end.max(range.end);
+            }
+        }
+        Ok(bytes)
+    }
+
     /// Returns whether a previous complete hydration of this exact snapshot is
     /// recorded in the local storage index.
     pub fn snapshot_hydration_cached(&self, snapshot: &Snapshot) -> Result<bool> {
@@ -883,6 +931,60 @@ mod tests {
 
         runtime.storage_gc(&BTreeSet::new(), &[], false).unwrap();
         assert!(!runtime.snapshot_hydration_cached(&snapshot).unwrap());
+    }
+
+    #[test]
+    fn download_plan_deduplicates_snapshots_and_excludes_cached_frames() {
+        let tokio_rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let remote = Arc::new(RemoteConfig::Memory.build().unwrap());
+        let source = Runtime::new(
+            tokio_rt.handle().clone(),
+            remote.clone(),
+            Arc::new(FjallStorage::open_temporary().unwrap()),
+            None,
+        );
+        let vid = source.volume_open(None, None, None).unwrap().vid;
+        let mut writer = source.volume_writer(vid.clone()).unwrap();
+        writer
+            .write_page(PageIdx::must_new(1), Page::test_filled(7))
+            .unwrap();
+        writer.commit().unwrap();
+        let snapshot = source.volume_snapshot(&vid).unwrap();
+        source
+            .snapshot_push_to(snapshot.clone(), remote.clone())
+            .unwrap();
+        let destination = Runtime::new(
+            tokio_rt.handle().clone(),
+            remote.clone(),
+            Arc::new(FjallStorage::open_temporary().unwrap()),
+            None,
+        );
+        let one = destination
+            .prepare_snapshots_download(std::slice::from_ref(&snapshot), remote.clone())
+            .unwrap();
+        assert!(one > 0);
+        assert!(
+            !destination
+                .snapshot_missing_pages(&snapshot)
+                .unwrap()
+                .is_empty()
+        );
+        let duplicate = destination
+            .prepare_snapshots_download(&[snapshot.clone(), snapshot.clone()], remote.clone())
+            .unwrap();
+        assert_eq!(duplicate, one);
+        destination
+            .snapshot_hydrate_from(snapshot.clone(), remote.clone())
+            .unwrap();
+        assert_eq!(
+            destination
+                .prepare_snapshots_download(&[snapshot], remote)
+                .unwrap(),
+            0
+        );
     }
 
     #[test]

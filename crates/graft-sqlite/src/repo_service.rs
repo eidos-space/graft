@@ -370,6 +370,35 @@ impl RepositoryCommandService {
         repo_for_file(&mut self.file)
     }
 
+    /// Fetch a branch and hydrate its target snapshots before worktree application.
+    /// Plan external files and `SQLite` segments together before downloading either.
+    pub fn fetch_for_checkout(
+        &mut self,
+        remote: &str,
+        branch: &str,
+    ) -> Result<graft::repo::FetchOutcome, ErrCtx> {
+        let repo = self.repository()?;
+        let runtime = self.file.runtime().clone();
+        let prepared = repo.prepare_fetch(remote, branch)?;
+        let plan = repo.plan_revision_checkout(prepared.head())?;
+        let store = Arc::new(repo.remote_store(remote)?);
+        let snapshots = plan
+            .files
+            .values()
+            .map(|state| state.snapshot.to_snapshot())
+            .collect::<Vec<_>>();
+        let bytes = runtime.snapshots_download_bytes(&snapshots, store.clone())?;
+        prepared.plan_download(bytes)?;
+        for state in plan.files.values() {
+            crate::pragma::repo_snapshot::hydrate_repo_file_state(
+                &runtime,
+                state,
+                Some(store.clone()),
+            )?;
+        }
+        Ok(prepared.finish()?)
+    }
+
     /// Computes the repository status while retaining the service runtime.
     pub fn status(&mut self) -> Result<RepoStatus, ErrCtx> {
         let runtime = self.file.runtime().clone();

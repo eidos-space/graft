@@ -1729,6 +1729,7 @@ test("reports real HTTP response bytes through the JavaScript progress callback"
         ),
         JSON.stringify(progress)
       )
+      assert.ok(progress.every((event) => event.totalIsFinal === false))
     } finally {
       await session.close()
       server.closeAllConnections()

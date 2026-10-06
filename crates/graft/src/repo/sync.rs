@@ -1,6 +1,111 @@
 use super::*;
 
+/// Immutable metadata fetched for a branch, before external payload downloads.
+/// Dropping this preparation leaves refs, index, and worktree unchanged.
+pub struct PreparedFetch<'a> {
+    repository: &'a Repository,
+    remote: Remote,
+    outcome: FetchOutcome,
+    payload_bytes: u64,
+}
+
+impl PreparedFetch<'_> {
+    pub fn head(&self) -> &str {
+        &self.outcome.head
+    }
+
+    /// Declare the combined external-file and adapter-owned download budget.
+    pub fn plan_download(&self, additional_bytes: u64) -> Result<()> {
+        let bytes = self
+            .payload_bytes
+            .checked_add(additional_bytes)
+            .ok_or_else(|| RepoErr::InvalidRemoteObject {
+                path: self.outcome.head.clone(),
+                message: "download size exceeds u64".into(),
+            })?;
+        plan_remaining_transfer(TransferDirection::Download, bytes);
+        Ok(())
+    }
+
+    /// Download and validate external payloads, then publish the tracking ref.
+    pub fn finish(self) -> Result<FetchOutcome> {
+        cancellation_checkpoint()?;
+        self.repository
+            .fetch_commit_chain(&self.remote, &self.outcome.head)?;
+        cancellation_checkpoint()?;
+        self.repository.set_remote_tracking_ref(
+            &self.outcome.remote,
+            &self.outcome.branch,
+            &self.outcome.head,
+        )?;
+        Ok(self.outcome)
+    }
+}
+
 impl Repository {
+    /// Fetch the immutable graph without downloading external file contents.
+    /// Adapters can add their snapshot budget before completing this fetch.
+    pub fn prepare_fetch(&self, remote: &str, branch: &str) -> Result<PreparedFetch<'_>> {
+        cancellation_checkpoint()?;
+        validate_remote_name(remote)?;
+        validate_ref_name(branch)?;
+        ACTIVE_TRANSFER_PROGRESS.with(|active| {
+            if let Some(reporter) = active.borrow().as_ref() {
+                reporter.start_planning(TransferDirection::Download);
+            }
+        });
+        let remote_store = self.remote_store(remote)?;
+        let head_path = format!("refs/heads/{branch}");
+        let have = self.remote_tracking_ref(remote, branch)?;
+        let bundle = tempfile::tempdir()?;
+        let downloaded = block_on_remote(remote_store.download_fetch_bundle(
+            &head_path,
+            have.as_deref(),
+            bundle.path(),
+        ))?;
+        let (head, imported) = match downloaded {
+            FetchBundleOutcome::Downloaded => {
+                let store = RemoteConfig::Fs {
+                    root: bundle.path().to_string_lossy().into_owned(),
+                }
+                .build()?;
+                let head = block_on_remote(store.get_raw(&head_path))?.ok_or_else(|| {
+                    RepoErr::InvalidRemoteObject {
+                        path: head_path.clone(),
+                        message: "fetch-bundle omitted its reference".into(),
+                    }
+                })?;
+                (
+                    parse_remote_ref(&head_path, head)?,
+                    self.import_remote_object_pack_bundle(bundle.path())?,
+                )
+            }
+            FetchBundleOutcome::Unsupported => {
+                let head = block_on_remote(remote_store.get_raw(&head_path))?.ok_or_else(|| {
+                    RepoErr::RemoteBranchNotFound {
+                        remote: remote.into(),
+                        branch: branch.into(),
+                    }
+                })?;
+                (parse_remote_ref(&head_path, head)?, BTreeSet::new())
+            }
+        };
+        let (fetched, payload_bytes) = self.fetch_graph_metadata(&remote_store, &head)?;
+        let reachable = self.commit_ancestors_inclusive(&head)?;
+        let commits = fetched + imported.intersection(&reachable).count();
+        Ok(PreparedFetch {
+            repository: self,
+            remote: remote_store,
+            outcome: FetchOutcome {
+                remote: remote.into(),
+                branch: branch.into(),
+                head,
+                commits,
+            },
+            payload_bytes,
+        })
+    }
+
     pub fn fetch(&self, remote: &str, branch: &str) -> Result<FetchOutcome> {
         validate_remote_name(remote)?;
         validate_ref_name(branch)?;

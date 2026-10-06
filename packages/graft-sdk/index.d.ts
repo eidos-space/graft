@@ -176,6 +176,8 @@ export interface TransferProgress {
   direction: "upload" | "download"
   transferredBytes: number
   totalBytes?: number
+  /** False for a running sum of HTTP response sizes; true for a planned total. */
+  totalIsFinal: boolean
 }
 
 export type MergePlanKind = "up_to_date" | "fast_forward" | "three_way"
