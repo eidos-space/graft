@@ -1216,6 +1216,16 @@ test(
         expectedHead: cloneHead,
       })
       assert.equal(plan.kind, "fast_forward")
+      const unchangedDatabases = await Promise.all(
+        ["crm.eidos", "project.eidos"].map(async (name) => {
+          const databasePath = path.join(clone, name)
+          return {
+            databasePath,
+            contents: await fs.readFile(databasePath),
+            modified: (await fs.stat(databasePath, { bigint: true })).mtimeNs,
+          }
+        })
+      )
       const applied = await cloneSession.applyMerge({
         revision: "origin/main",
         expectedHead: cloneHead,
@@ -1223,11 +1233,14 @@ test(
         onProgress: () => undefined,
       })
       assert.equal(applied.merge.state, "none")
-      assert.deepEqual(applied.worktree_paths, [
-        "crm.eidos",
-        "notes.txt",
-        "project.eidos",
-      ])
+      assert.deepEqual(applied.worktree_paths, ["notes.txt"])
+      for (const database of unchangedDatabases) {
+        assert.deepEqual(await fs.readFile(database.databasePath), database.contents)
+        assert.equal(
+          (await fs.stat(database.databasePath, { bigint: true })).mtimeNs,
+          database.modified
+        )
+      }
       assert.equal(
         await fs.readFile(path.join(clone, "notes.txt"), "utf8"),
         "whole Space\nupdated\n"

@@ -36,6 +36,7 @@ SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
 - Repository, snapshot, and Remote protocol formats are unchanged. No data
   migration is required. Rust consumers constructing `TransferProgress` directly
   must supply the new `total_is_final` field.
+- Fast-forward merge results list only changed paths in `worktree_paths`.
 
 ## Graft SDK 0.3.28 — 2026-09-29
 
