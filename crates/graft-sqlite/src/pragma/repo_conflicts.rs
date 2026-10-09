@@ -971,9 +971,14 @@ pub(super) fn row_merge_side_from_label(label: &str) -> Option<crate::row_merge:
 pub(super) fn row_merge_policy_for_repo(
     repo: &Repository,
 ) -> Result<crate::row_merge::RowMergePolicy, ErrCtx> {
-    let status = repo.status()?;
-    let merge = if status.merge_head.is_some() {
-        read_row_conflict_resolution_state(repo, &status)?.merge_policy
+    let merge_head = read_merge_head_marker(repo, "MERGE_HEAD")?;
+    let merge = if merge_head.is_some() {
+        read_row_conflict_resolution_state_for_heads(
+            repo,
+            &read_merge_head_marker(repo, "ORIG_HEAD")?,
+            &merge_head,
+        )?
+        .merge_policy
     } else {
         repo.config()?.merge.effective()
     };
@@ -983,23 +988,30 @@ pub(super) fn row_merge_policy_for_repo(
 pub(crate) fn active_merge_policy(
     repo: &Repository,
 ) -> Result<Option<(graft::repo::MergeConfig, String, u32)>, ErrCtx> {
-    // No frozen policy exists without MERGE_HEAD. Avoid classifying every
-    // worktree path and walking upstream history just to read the live policy.
-    // Check the marker anew on every call; present markers still use the full
-    // status and frozen-state validation below, and I/O errors must propagate.
-    if !repo.graft_dir().join("MERGE_HEAD").try_exists()? {
+    // Policy identity depends on durable merge heads and the journal, not on
+    // unrelated worktree contents or the current upstream relation.
+    let merge_head = read_merge_head_marker(repo, "MERGE_HEAD")?;
+    if merge_head.is_none() {
         return Ok(None);
     }
-    let status = repo.status()?;
-    if status.merge_head.is_none() {
-        return Ok(None);
-    }
-    let state = read_row_conflict_resolution_state(repo, &status)?;
+    let state = read_row_conflict_resolution_state_for_heads(
+        repo,
+        &read_merge_head_marker(repo, "ORIG_HEAD")?,
+        &merge_head,
+    )?;
     Ok(Some((
         state.merge_policy,
         state.policy_token,
         state.policy_version,
     )))
+}
+
+fn read_merge_head_marker(repo: &Repository, name: &str) -> Result<Option<String>, ErrCtx> {
+    match std::fs::read_to_string(repo.worktree().join(".graft").join(name)) {
+        Ok(raw) => Ok((!raw.trim().is_empty()).then(|| raw.trim().to_string())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn row_merge_policy_from_config(
@@ -1134,6 +1146,14 @@ pub(super) fn read_row_conflict_resolution_state(
     repo: &Repository,
     status: &RepoStatus,
 ) -> Result<RowConflictResolutionState, ErrCtx> {
+    read_row_conflict_resolution_state_for_heads(repo, &status.orig_head, &status.merge_head)
+}
+
+fn read_row_conflict_resolution_state_for_heads(
+    repo: &Repository,
+    orig_head: &Option<String>,
+    merge_head: &Option<String>,
+) -> Result<RowConflictResolutionState, ErrCtx> {
     let path = row_conflict_resolution_state_path(repo);
     let mut state = match std::fs::read_to_string(&path) {
         Ok(raw) => serde_json::from_str::<RowConflictResolutionState>(&raw).map_err(|err| {
@@ -1146,12 +1166,12 @@ pub(super) fn read_row_conflict_resolution_state(
             )
         })?,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            merge_resolution_state_from_index(repo, status)?
+            merge_resolution_state_from_index_for_heads(repo, orig_head, merge_head)?
         }
         Err(err) => return Err(err.into()),
     };
-    if state.orig_head != status.orig_head || state.merge_head != status.merge_head {
-        return merge_resolution_state_from_index(repo, status);
+    if state.orig_head != *orig_head || state.merge_head != *merge_head {
+        return merge_resolution_state_from_index_for_heads(repo, orig_head, merge_head);
     }
     if state.schema_version == 1 {
         let policy = repo.config()?.merge.effective();
@@ -1174,18 +1194,23 @@ pub(super) fn read_row_conflict_resolution_state(
 }
 
 pub(super) fn initialize_merge_resolution_state(repo: &Repository) -> Result<(), ErrCtx> {
-    let status = repo.status()?;
-    if status.merge_head.is_none() {
+    let merge_head = read_merge_head_marker(repo, "MERGE_HEAD")?;
+    if merge_head.is_none() {
         clear_row_conflict_resolution_state(repo)?;
         return Ok(());
     }
-    let state = merge_resolution_state_from_index(repo, &status)?;
+    let state = merge_resolution_state_from_index_for_heads(
+        repo,
+        &read_merge_head_marker(repo, "ORIG_HEAD")?,
+        &merge_head,
+    )?;
     write_row_conflict_resolution_state(repo, &state)
 }
 
-fn merge_resolution_state_from_index(
+fn merge_resolution_state_from_index_for_heads(
     repo: &Repository,
-    status: &RepoStatus,
+    orig_head: &Option<String>,
+    merge_head: &Option<String>,
 ) -> Result<RowConflictResolutionState, ErrCtx> {
     let index = repo.read_index()?;
     let mut paths = BTreeMap::<String, MergeResolutionPathState>::new();
@@ -1205,8 +1230,8 @@ fn merge_resolution_state_from_index(
     let policy_token = merge_policy.policy_token();
     Ok(RowConflictResolutionState {
         schema_version: 2,
-        orig_head: status.orig_head.clone(),
-        merge_head: status.merge_head.clone(),
+        orig_head: orig_head.clone(),
+        merge_head: merge_head.clone(),
         merge_policy,
         policy_token,
         policy_version: graft::repo::MERGE_POLICY_VERSION,
@@ -1249,8 +1274,11 @@ pub(super) fn set_merge_path_resolution(
     key: &str,
     resolution: Option<&str>,
 ) -> Result<(), ErrCtx> {
-    let status = repo.status()?;
-    let mut state = read_row_conflict_resolution_state(repo, &status)?;
+    let mut state = read_row_conflict_resolution_state_for_heads(
+        repo,
+        &read_merge_head_marker(repo, "ORIG_HEAD")?,
+        &read_merge_head_marker(repo, "MERGE_HEAD")?,
+    )?;
     let Some(path) = state.paths.get_mut(key) else {
         return Err(ErrCtx::Repo(graft::repo::RepoErr::PathNotConflicted(
             key.to_string(),

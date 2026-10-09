@@ -1083,6 +1083,15 @@ struct IncrementalStatusCache {
     ignore_matcher: Option<graft::repo::RepoIgnoreMatcher>,
     tracked_ignored_paths: Option<Vec<String>>,
     persistent_snapshot_attempted: bool,
+    conflict_proof: Option<ConflictStatusProof>,
+    conflict_analysis: Option<(String, Vec<Value>)>,
+    merge_base: Option<(String, String, Option<String>)>,
+}
+
+#[derive(PartialEq, Eq)]
+struct ConflictStatusProof {
+    metadata: String,
+    files: BTreeMap<String, TrackedFingerprint>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2439,7 +2448,7 @@ impl RepositorySession {
                 MergeStatus::None
             } else {
                 let incremental = refresh_incremental_status(service, status_cache)?;
-                merge_status_from_incremental(service, &incremental)?
+                merge_status_from_incremental(service, &incremental, status_cache)?
             };
             let worktree_paths = merge_worktree_paths_from_output(&output);
             Ok(MergeApplyResult {
@@ -2457,7 +2466,7 @@ impl RepositorySession {
             let SessionState { service, status_cache } = state;
             let service = service.as_mut().ok_or_else(session_closed_error)?;
             let incremental = refresh_incremental_status(service, status_cache)?;
-            merge_status_from_incremental(service, &incremental)
+            merge_status_from_incremental(service, &incremental, status_cache)
         })
     }
 
@@ -2514,17 +2523,36 @@ impl RepositorySession {
             let repo = service.repository().map_err(repository_command_error)?;
             let index = repo.read_index().map_err(repo_error)?;
             let state_token = durable_merge_state_token(&repo, &incremental.status, &index)?;
-            let output =
-                execute_json_command(service, RepositoryCommand::conflicts(), "conflicts")?;
-            let conflicts = output
-                .get("conflicts")
-                .and_then(Value::as_array)
-                .ok_or_else(|| {
-                    SdkError::new(
-                        SdkErrorCode::InvalidResponse,
-                        "conflicts response did not contain a conflict array",
-                    )
-                })?;
+            let conflicts = if let Some((token, conflicts)) = &status_cache.conflict_analysis
+                && token == &state_token
+            {
+                conflicts.clone()
+            } else {
+                let output =
+                    execute_json_command(service, RepositoryCommand::conflicts(), "conflicts")?;
+                let conflicts = output
+                    .get("conflicts")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| {
+                        SdkError::new(
+                            SdkErrorCode::InvalidResponse,
+                            "conflicts response did not contain a conflict array",
+                        )
+                    })?
+                    .clone();
+                // Keep only one bounded analysis; every page still validates the
+                // repository and worktree before consulting this session cache.
+                status_cache.conflict_analysis = if serde_json::to_vec(&conflicts)
+                    .map_err(status_encode_error)?
+                    .len()
+                    <= 4 * 1024 * 1024
+                {
+                    Some((state_token.clone(), conflicts.clone()))
+                } else {
+                    None
+                };
+                conflicts
+            };
             let mut items = conflicts
                 .iter()
                 .filter(|item| item.get("path").and_then(Value::as_str) == Some(path.as_str()))
@@ -2562,7 +2590,8 @@ impl RepositorySession {
             let repo = service.repository().map_err(repository_command_error)?;
             let index = repo.read_index().map_err(repo_error)?;
             let state_token = durable_merge_state_token(&repo, &incremental.status, &index)?;
-            let (orig_head, merge_head, merge_base) = active_merge_heads(&repo, &incremental)?;
+            let (orig_head, merge_head, merge_base) =
+                active_merge_heads(&repo, &incremental, status_cache)?;
             if options.version == MergeVersion::Result {
                 return read_worktree_merge_content(&repo, &path, options.max_bytes, state_token);
             }
@@ -2614,7 +2643,8 @@ impl RepositorySession {
             let repo = service.repository().map_err(repository_command_error)?;
             let index = repo.read_index().map_err(repo_error)?;
             let state_token = durable_merge_state_token(&repo, &incremental.status, &index)?;
-            let (orig_head, merge_head, merge_base) = active_merge_heads(&repo, &incremental)?;
+            let (orig_head, merge_head, merge_base) =
+                active_merge_heads(&repo, &incremental, status_cache)?;
             let revision_for = |version: MergeSqliteVersion| -> Result<String> {
                 match version {
                     MergeSqliteVersion::Base => merge_base.clone().ok_or_else(|| {
@@ -2737,7 +2767,7 @@ impl RepositorySession {
                 .map_err(repository_command_error)?;
             status_cache.invalidate();
             let incremental = refresh_incremental_status(service, status_cache)?;
-            let merge = merge_status_from_incremental(service, &incremental)?;
+            let merge = merge_status_from_incremental(service, &incremental, status_cache)?;
             Ok(MergeOperationResult {
                 output: serde_json::json!({
                     "operation": "resolve_merge_cell",
@@ -2776,7 +2806,7 @@ impl RepositorySession {
                 .map_err(repository_command_error)?;
             status_cache.invalidate();
             let incremental = refresh_incremental_status(service, status_cache)?;
-            let merge = merge_status_from_incremental(service, &incremental)?;
+            let merge = merge_status_from_incremental(service, &incremental, status_cache)?;
             Ok(MergeOperationResult {
                 output: serde_json::json!({
                     "operation": "stage_merge_sqlite_result",
@@ -2824,7 +2854,8 @@ impl RepositorySession {
             }
             let state_token = durable_merge_state_token(&repo, &incremental.status, &index)?;
             let policy = service.merge_policy().map_err(repository_command_error)?;
-            let (orig_head, merge_head, merge_base) = active_merge_heads(&repo, &incremental)?;
+            let (orig_head, merge_head, merge_base) =
+                active_merge_heads(&repo, &incremental, status_cache)?;
             let provider_token = semantic_merge_provider_token(
                 &options.provider,
                 &path,
@@ -3007,7 +3038,7 @@ impl RepositorySession {
             };
             status_cache.invalidate();
             let incremental = refresh_incremental_status(service, status_cache)?;
-            let merge = merge_status_from_incremental(service, &incremental)?;
+            let merge = merge_status_from_incremental(service, &incremental, status_cache)?;
             Ok(MergeOperationResult {
                 output: serde_json::json!({
                     "operation": "accept_semantic_merge_result",
@@ -3051,7 +3082,7 @@ impl RepositorySession {
             let output = execute_json_command(service, command, "resolve_merge_table")?;
             status_cache.invalidate();
             let incremental = refresh_incremental_status(service, status_cache)?;
-            let merge = merge_status_from_incremental(service, &incremental)?;
+            let merge = merge_status_from_incremental(service, &incremental, status_cache)?;
             let worktree_paths = merge_worktree_paths_from_output(&output);
             Ok(MergeOperationResult { output, merge, worktree_paths })
         })
@@ -3075,7 +3106,7 @@ impl RepositorySession {
             )?;
             status_cache.invalidate();
             let incremental = refresh_incremental_status(service, status_cache)?;
-            let merge = merge_status_from_incremental(service, &incremental)?;
+            let merge = merge_status_from_incremental(service, &incremental, status_cache)?;
             let worktree_paths = merge_worktree_paths_from_output(&output);
             Ok(MergeOperationResult { output, merge, worktree_paths })
         })
@@ -3111,7 +3142,7 @@ impl RepositorySession {
             )?;
             status_cache.invalidate();
             let incremental = refresh_incremental_status(service, status_cache)?;
-            let merge = merge_status_from_incremental(service, &incremental)?;
+            let merge = merge_status_from_incremental(service, &incremental, status_cache)?;
             Ok(MergeOperationResult {
                 output: serde_json::json!({
                     "operation": "write_and_stage_text_result",
@@ -3186,7 +3217,7 @@ impl RepositorySession {
                 execute_json_command(service, RepositoryCommand::merge_abort(), "merge_abort")?;
             status_cache.invalidate();
             let incremental = refresh_incremental_status(service, status_cache)?;
-            let merge = merge_status_from_incremental(service, &incremental)?;
+            let merge = merge_status_from_incremental(service, &incremental, status_cache)?;
             let worktree_paths = merge_worktree_paths_from_output(&output);
             let _ = fs::remove_dir_all(semantic_workspaces);
             Ok(MergeOperationResult { output, merge, worktree_paths })
@@ -3218,7 +3249,7 @@ impl RepositorySession {
             let output = execute_json_command(service, command, "resolve_conflict")?;
             status_cache.invalidate();
             let incremental = refresh_incremental_status(service, status_cache)?;
-            let merge = merge_status_from_incremental(service, &incremental)?;
+            let merge = merge_status_from_incremental(service, &incremental, status_cache)?;
             let worktree_paths = merge_worktree_paths_from_output(&output);
             Ok(MergeOperationResult { output, merge, worktree_paths })
         })
@@ -3476,6 +3507,9 @@ fn refresh_incremental_status_once(
         }
     }
 
+    // Worktree changes may preserve the serialized status and its state token.
+    // They must nevertheless invalidate the analyzed conflict contents.
+    cache.conflict_analysis = None;
     let previous_status = cache.status.clone();
     let before_files = repo.index_files().map_err(repo_error)?;
     let before_artifacts = repo.index_artifacts().map_err(repo_error)?;
@@ -3546,11 +3580,48 @@ fn refresh_conflicted_incremental_status(
     head_target: Option<String>,
     index: Index,
 ) -> Result<IncrementalStatusResult> {
+    let repo = service.repository().map_err(repository_command_error)?;
+    let proof = conflict_status_proof(&repo, &index)?;
+    if cache.initialized
+        && cache.head_target == head_target
+        && cache.index == index
+        && cache.conflict_proof.as_ref() == Some(&proof)
+    {
+        let previous = cache
+            .status
+            .clone()
+            .expect("initialized conflict cache contains status");
+        let mut status = previous.clone();
+        repo.refresh_status_repository_projection(&mut status)
+            .map_err(repo_error)?;
+        if status_changed(Some(&previous), &status)? {
+            cache.generation = cache.generation.saturating_add(1).max(1);
+        }
+        cache.status = Some(status.clone());
+        return Ok(incremental_status_result(
+            cache,
+            status,
+            started,
+            StatusTelemetry {
+                metadata_cache_hits: proof.files.len(),
+                paths_examined: proof.files.len(),
+                tree_cache_hit: true,
+                status_cache_hit: true,
+                duration_us: 0,
+                metadata_cache_misses: 0,
+                persistent_snapshot_hit: false,
+                persistent_snapshot_saved: false,
+                stability_retries: 0,
+            },
+        ));
+    }
+    cache.conflict_analysis = None;
     let previous_status = cache.status.clone();
     let status = service.status().map_err(repository_command_error)?;
     let repo = service.repository().map_err(repository_command_error)?;
     if repo.head_target().map_err(repo_error)? != head_target
         || repo.read_index().map_err(repo_error)? != index
+        || conflict_status_proof(&repo, &index)? != proof
     {
         return Err(repository_stale_error(
             "repository refs or conflict index changed while status was being collected",
@@ -3565,6 +3636,7 @@ fn refresh_conflicted_incremental_status(
     cache.index_metadata_initialized = true;
     cache.initialized = true;
     cache.persistent_snapshot_attempted = false;
+    cache.conflict_proof = Some(proof);
     if status_changed(previous_status.as_ref(), &status)? {
         cache.generation = cache.generation.saturating_add(1).max(1);
     }
@@ -3585,6 +3657,36 @@ fn refresh_conflicted_incremental_status(
             stability_retries: 0,
         },
     ))
+}
+
+fn conflict_status_proof(repo: &Repository, index: &Index) -> Result<ConflictStatusProof> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(repository_metadata_fingerprint(repo, index)?.as_bytes());
+    hasher.update(ignore_source_fingerprint(repo)?.as_bytes());
+    hash_optional_file(
+        &mut hasher,
+        repo.graft_dir(),
+        &repo.graft_dir().join("index/worktree.toml"),
+    )?;
+    let visible = visible_untracked_fingerprints(repo, &BTreeMap::new(), &BTreeMap::new())?;
+    let paths = visible
+        .keys()
+        .chain(index.entries.iter().map(|entry| &entry.path))
+        .collect::<BTreeSet<_>>();
+    let mut files = BTreeMap::new();
+    for key in paths {
+        graft::repo::cancellation_checkpoint().map_err(repo_error)?;
+        // Include WAL, SHM and rollback journals even when a conflicted database
+        // cannot be represented by the ordinary stage-zero file inventory.
+        files.insert(
+            key.clone(),
+            tracked_fingerprint(repo.worktree().join(key), true)?,
+        );
+    }
+    Ok(ConflictStatusProof {
+        metadata: hasher.finalize().to_hex().to_string(),
+        files,
+    })
 }
 
 fn incremental_status_result(
@@ -4905,6 +5007,7 @@ fn merge_plan_result(
 fn merge_status_from_incremental(
     service: &mut RepositoryCommandService,
     incremental: &IncrementalStatusResult,
+    cache: &mut IncrementalStatusCache,
 ) -> Result<MergeStatus> {
     let Some(merge_head) = incremental.status.merge_head.clone() else {
         return Ok(MergeStatus::None);
@@ -4917,9 +5020,7 @@ fn merge_status_from_incremental(
     })?;
     let repo = service.repository().map_err(repository_command_error)?;
     let policy = service.merge_policy().map_err(repository_command_error)?;
-    let merge_base = repo
-        .merge_base_between(&orig_head, &merge_head)
-        .map_err(repo_error)?;
+    let merge_base = cached_merge_base(&repo, &orig_head, &merge_head, cache)?;
     let index = repo.read_index().map_err(repo_error)?;
     let state_token = durable_merge_state_token(&repo, &incremental.status, &index)?;
     Ok(MergeStatus::Merging {
@@ -4974,6 +5075,7 @@ fn merge_worktree_paths_from_output(output: &Value) -> Vec<String> {
 fn active_merge_heads(
     repo: &Repository,
     incremental: &IncrementalStatusResult,
+    cache: &mut IncrementalStatusCache,
 ) -> Result<(String, String, Option<String>)> {
     let merge_head =
         incremental.status.merge_head.clone().ok_or_else(|| {
@@ -4985,10 +5087,29 @@ fn active_merge_heads(
             "repository has MERGE_HEAD without ORIG_HEAD",
         )
     })?;
-    let merge_base = repo
-        .merge_base_between(&orig_head, &merge_head)
-        .map_err(repo_error)?;
+    let merge_base = cached_merge_base(repo, &orig_head, &merge_head, cache)?;
     Ok((orig_head, merge_head, merge_base))
+}
+
+fn cached_merge_base(
+    repo: &Repository,
+    orig_head: &str,
+    merge_head: &str,
+    cache: &mut IncrementalStatusCache,
+) -> Result<Option<String>> {
+    if let Some((ours, theirs, base)) = &cache.merge_base
+        && ours == orig_head
+        && theirs == merge_head
+    {
+        return Ok(base.clone());
+    }
+    // Commit IDs identify immutable ancestry. Key by the actual active merge
+    // heads, which may be a Peer merge unrelated to the configured upstream.
+    let base = repo
+        .merge_base_between(orig_head, merge_head)
+        .map_err(repo_error)?;
+    cache.merge_base = Some((orig_head.to_string(), merge_head.to_string(), base.clone()));
+    Ok(base)
 }
 
 fn require_merge_state_token(
@@ -6143,6 +6264,45 @@ mod tests {
         assert_eq!(merge_head, theirs.id);
         assert_eq!(unmerged_count, 1);
 
+        session
+            .with_state(|state| {
+                let repo = Repository::open(directory.path()).unwrap();
+                assert_eq!(
+                    cached_merge_base(&repo, &orig_head, &orig_head, &mut state.status_cache)?,
+                    Some(orig_head.clone())
+                );
+                assert_eq!(
+                    cached_merge_base(&repo, &orig_head, &merge_head, &mut state.status_cache)?,
+                    repo.merge_base_between(&orig_head, &merge_head).unwrap()
+                );
+                Ok(())
+            })
+            .unwrap();
+
+        let first = session.status_incremental().unwrap();
+        let hot = session.status_incremental().unwrap();
+        assert!(hot.telemetry.status_cache_hit);
+        assert_eq!(hot.change_token, first.change_token);
+        let original = fs::read(&note).unwrap();
+        fs::write(&note, vec![b'x'; original.len()]).unwrap();
+        assert!(
+            !session
+                .status_incremental()
+                .unwrap()
+                .telemetry
+                .status_cache_hit
+        );
+        fs::write(&note, original).unwrap();
+        let restored = session.status_incremental().unwrap();
+        assert!(!restored.telemetry.status_cache_hit);
+        assert!(
+            session
+                .status_incremental()
+                .unwrap()
+                .telemetry
+                .status_cache_hit
+        );
+
         let paths = session
             .list_merge_paths(&ListMergePathsOptions {
                 filter: MergePathFilter::All,
@@ -6865,6 +7025,40 @@ mod tests {
                 .iter()
                 .all(|item| item["status"] == "unresolved")
         );
+
+        let repeated = clone
+            .list_merge_conflicts(&ListMergeConflictsOptions {
+                path: PathBuf::from("space.eidos"),
+                limit: 10,
+                after: None,
+                expected_state_token: state_token.clone(),
+            })
+            .unwrap();
+        assert_eq!(repeated.items, conflicts.items);
+        clone
+            .with_state(|state| {
+                assert!(state.status_cache.conflict_analysis.is_some());
+                Ok(())
+            })
+            .unwrap();
+        // A WAL write must invalidate both status and analyzed conflicts even
+        // when the main database's bytes and merge token remain unchanged.
+        let wal = clone_database.with_extension("eidos-wal");
+        fs::write(&wal, b"external WAL probe").unwrap();
+        assert!(
+            !clone
+                .status_incremental()
+                .unwrap()
+                .telemetry
+                .status_cache_hit
+        );
+        clone
+            .with_state(|state| {
+                assert!(state.status_cache.conflict_analysis.is_none());
+                Ok(())
+            })
+            .unwrap();
+        fs::remove_file(wal).unwrap();
 
         let stale_table = clone
             .resolve_merge_table(&ResolveMergeTableOptions {
@@ -9220,6 +9414,19 @@ mod tests {
         let frozen = session.get_merge_policy().unwrap();
         assert!(frozen.active_merge);
         assert_eq!(frozen.policy_token, policy_token);
+        let journal_path = directory
+            .path()
+            .join(".graft/merge-resolution-session.json");
+        let original_journal = fs::read(&journal_path).unwrap();
+        let mut corrupt: Value = serde_json::from_slice(&original_journal).unwrap();
+        corrupt["policy_token"] = Value::String("invalid".to_string());
+        fs::write(&journal_path, serde_json::to_vec(&corrupt).unwrap()).unwrap();
+        assert!(session.get_merge_policy().is_err());
+        fs::write(&journal_path, &original_journal).unwrap();
+        assert_eq!(
+            session.get_merge_policy().unwrap().policy_token,
+            policy_token
+        );
         let error = session
             .set_merge_policy(&SetMergePolicyOptions {
                 policy: frozen.policy,

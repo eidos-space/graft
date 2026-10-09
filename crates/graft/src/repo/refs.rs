@@ -699,7 +699,8 @@ impl Repository {
             if id == ancestor {
                 return Ok(true);
             }
-            for parent in commit_parent_ids(&self.read_commit(&id)?) {
+            // Graph traversal needs parent edges, not historical file trees or diffs.
+            for parent in self.read_commit_summary(&id)?.parents {
                 stack.push(parent);
             }
         }
@@ -766,7 +767,7 @@ impl Repository {
             let node_parents = if let Some(node_parents) = parents.get(&id) {
                 node_parents.clone()
             } else {
-                let node_parents = commit_parent_ids(&self.read_commit(&id)?);
+                let node_parents = self.read_commit_summary(&id)?.parents;
                 parents.insert(id.clone(), node_parents.clone());
                 node_parents
             };
