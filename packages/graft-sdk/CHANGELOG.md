@@ -5,6 +5,27 @@ SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
 
 ## Unreleased
 
+## Graft SDK 0.3.30 — 2026-10-09
+
+### Improved
+
+- Active merge status and repeated conflict queries reuse session-local results
+  after checking repository metadata, worktree fingerprints and SQLite sidecars.
+  Conflict analysis is bounded to 4 MiB and invalidates after external writes.
+- Ancestry and reachability queries read verified commit parent edges without
+  loading historical file trees or computing unrelated diffs.
+- Merge-base reuse follows the actual active merge heads, including peer merges
+  whose heads differ from the configured upstream.
+- Frozen merge-policy reads and resolution-journal updates read their durable
+  heads and journal directly, avoiding unrelated worktree and history scans.
+
+### Compatibility
+
+- The SDK API, repository format and Remote protocol are unchanged. No data
+  migration is required. Merge-policy integrity checks and final merge
+  validation remain enabled. Application-specific automatic merge rules remain
+  the host application's responsibility.
+
 ## Graft SDK 0.3.29 — 2026-10-07
 
 ### Added

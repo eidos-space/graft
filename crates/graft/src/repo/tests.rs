@@ -874,6 +874,43 @@ fn history_summary_page_is_lightweight_paginated_and_carries_path_counts() {
 }
 
 #[test]
+fn ancestry_reads_verified_commit_edges_without_hydrating_trees() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = Repository::init(tmp.path()).unwrap();
+    let seed = repo.commit("seed").unwrap();
+    let object::Object::Commit(mut template) = repo.read_object(&seed.id).unwrap() else {
+        panic!("expected commit");
+    };
+    template.tree = object::ObjectId::from_str(&"0".repeat(64)).unwrap();
+    let write = |parents: &[String], message: &str| {
+        let mut commit = template.clone();
+        commit.parents = parents.iter().map(|id| id.parse().unwrap()).collect();
+        commit.message = message.to_string();
+        repo.object_store()
+            .write(&object::Object::Commit(commit))
+            .unwrap()
+            .to_string()
+    };
+    let base = write(&[], "base");
+    let left = write(std::slice::from_ref(&base), "left");
+    let right = write(std::slice::from_ref(&base), "right");
+    let merged = write(&[left.clone(), right.clone()], "merge");
+    assert!(repo.read_commit(&base).is_err());
+    assert!(repo.is_ancestor(&base, &merged).unwrap());
+    assert!(!repo.is_ancestor(&left, &right).unwrap());
+    assert_eq!(repo.merge_base(&left, &right).unwrap(), Some(base.clone()));
+    assert_eq!(
+        repo.reachable_commits(&merged).unwrap(),
+        BTreeSet::from([base.clone(), left, right, merged.clone(),])
+    );
+    let id = object::ObjectId::from_str(&base).unwrap();
+    let commit_path = repo.object_store().path_for(&id);
+    let raw = fs::read_to_string(&commit_path).unwrap();
+    fs::write(commit_path, raw.replace("base", "fake")).unwrap();
+    assert!(repo.reachable_commits(&merged).is_err());
+}
+
+#[test]
 fn commit_changed_paths_pages_root_and_first_parent_changes() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = Repository::init(tmp.path()).unwrap();

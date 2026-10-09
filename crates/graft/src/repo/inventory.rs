@@ -579,7 +579,7 @@ impl Repository {
             if !reachable.insert(id.clone()) {
                 continue;
             }
-            for parent in commit_parent_ids(&self.read_commit(&id)?) {
+            for parent in self.read_commit_summary(&id)?.parents {
                 stack.push(parent);
             }
         }
