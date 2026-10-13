@@ -44,6 +44,9 @@ use napi::{
 };
 use napi_derive::napi;
 
+#[cfg(feature = "e2ee")]
+mod e2ee;
+
 #[napi(object)]
 pub struct PathHistoryOptions {
     pub path: String,
@@ -439,6 +442,23 @@ enum JsonOperation {
         remote_url: String,
         branch: Option<String>,
         bearer_token: Option<String>,
+    },
+    #[cfg(feature = "e2ee")]
+    AddEncryptedRemote {
+        name: String,
+        config: graft_sdk::RemoteConfig,
+    },
+    #[cfg(feature = "e2ee")]
+    CloneEncryptedRemote {
+        remote_name: String,
+        config: graft_sdk::RemoteConfig,
+        branch: Option<String>,
+    },
+    #[cfg(feature = "e2ee")]
+    PushInitialBranch {
+        context: Arc<e2ee::InitialBranchContext>,
+        branch: Option<String>,
+        verification_directory: Option<String>,
     },
     PlanMerge {
         options: CorePlanMergeOptions,
@@ -887,6 +907,27 @@ impl JsonTask {
             JsonOperation::Clone { remote_url, branch, bearer_token } => self
                 .session
                 .clone_repository(remote_url, branch.as_deref(), bearer_token.take()),
+            #[cfg(feature = "e2ee")]
+            JsonOperation::AddEncryptedRemote { name, config } => {
+                self.session.add_remote_with_config(name, config.clone())
+            }
+            #[cfg(feature = "e2ee")]
+            JsonOperation::CloneEncryptedRemote { remote_name, config, branch } => self
+                .session
+                .clone_repository_with_named_config(remote_name, config.clone(), branch.as_deref()),
+            #[cfg(feature = "e2ee")]
+            JsonOperation::PushInitialBranch { context, branch, verification_directory } => {
+                return e2ee::push_initial_branch(
+                    &self.session,
+                    context,
+                    branch.as_deref(),
+                    verification_directory.as_deref(),
+                )
+                .and_then(|value| {
+                    serde_json::to_string(&value)
+                        .map_err(|error| Error::new(Status::GenericFailure, error.to_string()))
+                });
+            }
             JsonOperation::PlanMerge { .. }
             | JsonOperation::GetMergePolicy
             | JsonOperation::ValidateMergePolicy { .. }
@@ -951,6 +992,167 @@ impl Task for LifecycleTask {
 #[napi(js_name = "RepositorySession")]
 pub struct NodeRepositorySession {
     session: Arc<CoreRepositorySession>,
+}
+
+#[cfg(feature = "e2ee")]
+#[napi]
+impl NodeRepositorySession {
+    #[cfg(unix)]
+    #[napi]
+    pub fn prepare_encrypted_migration(
+        &self,
+        env: Env,
+        remote: &e2ee::NodeEncryptedRemoteSession,
+        password: napi::bindgen_prelude::Buffer,
+        options: e2ee::migration::PrepareEncryptedMigrationOptions,
+    ) -> Result<napi::bindgen_prelude::AsyncBlock<String>> {
+        e2ee::migration::run(
+            env,
+            self.session.clone(),
+            remote,
+            password,
+            e2ee::migration::Action::Prepare(options),
+        )
+    }
+
+    #[cfg(unix)]
+    #[napi]
+    pub fn resume_encrypted_migration(
+        &self,
+        env: Env,
+        remote: &e2ee::NodeEncryptedRemoteSession,
+        password: napi::bindgen_prelude::Buffer,
+    ) -> Result<napi::bindgen_prelude::AsyncBlock<String>> {
+        e2ee::migration::run(
+            env,
+            self.session.clone(),
+            remote,
+            password,
+            e2ee::migration::Action::Resume,
+        )
+    }
+
+    #[cfg(unix)]
+    #[napi]
+    pub fn verify_encrypted_migration(
+        &self,
+        env: Env,
+        remote: &e2ee::NodeEncryptedRemoteSession,
+        password: napi::bindgen_prelude::Buffer,
+        options: e2ee::migration::VerifyEncryptedMigrationOptions,
+    ) -> Result<napi::bindgen_prelude::AsyncBlock<String>> {
+        e2ee::migration::run(
+            env,
+            self.session.clone(),
+            remote,
+            password,
+            e2ee::migration::Action::Verify(options),
+        )
+    }
+
+    #[cfg(unix)]
+    #[napi]
+    pub fn cutover_encrypted_migration(
+        &self,
+        env: Env,
+        remote: &e2ee::NodeEncryptedRemoteSession,
+        password: napi::bindgen_prelude::Buffer,
+        options: e2ee::migration::VerifyEncryptedMigrationOptions,
+    ) -> Result<napi::bindgen_prelude::AsyncBlock<String>> {
+        e2ee::migration::run(
+            env,
+            self.session.clone(),
+            remote,
+            password,
+            e2ee::migration::Action::Cutover(options),
+        )
+    }
+
+    #[napi(factory)]
+    pub fn with_encrypted_remote(
+        target: String,
+        remote: &e2ee::NodeEncryptedRemoteSession,
+        identity: Option<RepositorySessionIdentity>,
+    ) -> Result<Self> {
+        let session = Arc::new(CoreRepositorySession::new_with_remote_credentials(
+            target,
+            identity.map(|identity| CoreRepositorySessionIdentity {
+                name: identity.name,
+                email: identity.email,
+            }),
+            remote.credentials.clone(),
+        ));
+        session
+            .validate_encrypted_host_directories(&remote.host_directories)
+            .map_err(e2ee::secret_error)?;
+        Ok(Self { session })
+    }
+
+    #[napi]
+    pub fn add_encrypted_remote(
+        &self,
+        remote: &e2ee::NodeEncryptedRemoteSession,
+        signal: Option<AbortSignal>,
+    ) -> Result<AsyncTask<JsonTask>> {
+        self.session
+            .validate_encrypted_host_directories(&remote.host_directories)
+            .map_err(e2ee::secret_error)?;
+        Ok(json_task(
+            self,
+            JsonOperation::AddEncryptedRemote {
+                name: remote.remote_name.clone(),
+                config: remote.config.clone(),
+            },
+            signal,
+        ))
+    }
+
+    #[napi]
+    pub fn push_initial_branch(
+        &self,
+        remote: &e2ee::NodeEncryptedRemoteSession,
+        branch: Option<String>,
+        verification_directory: Option<String>,
+        signal: Option<AbortSignal>,
+    ) -> Result<AsyncTask<JsonTask>> {
+        self.session
+            .validate_encrypted_host_directories(&remote.host_directories)
+            .map_err(e2ee::secret_error)?;
+        if let Some(directory) = &verification_directory {
+            e2ee::validate_verification_directory(
+                &self.session,
+                &remote.host_directories,
+                directory,
+            )?;
+        }
+        let context = remote.initial_branch_context()?;
+        Ok(json_task(
+            self,
+            JsonOperation::PushInitialBranch { context, branch, verification_directory },
+            signal,
+        ))
+    }
+
+    #[napi]
+    pub fn clone_encrypted_remote(
+        &self,
+        remote: &e2ee::NodeEncryptedRemoteSession,
+        branch: Option<String>,
+        signal: Option<AbortSignal>,
+    ) -> Result<AsyncTask<JsonTask>> {
+        self.session
+            .validate_encrypted_host_directories(&remote.host_directories)
+            .map_err(e2ee::secret_error)?;
+        Ok(json_task(
+            self,
+            JsonOperation::CloneEncryptedRemote {
+                remote_name: remote.remote_name.clone(),
+                config: remote.config.clone(),
+                branch,
+            },
+            signal,
+        ))
+    }
 }
 
 #[napi]

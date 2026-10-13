@@ -4,6 +4,59 @@ const fs = require("node:fs")
 const path = require("node:path")
 
 const native = loadNativeBinding()
+const encryptedHandles = new WeakMap()
+
+/** Trusted host only. Password buffers are consumed by the native entry point. */
+class EncryptedRemoteSession {
+  #native
+
+  constructor(options) {
+    if (!native.EncryptedRemoteSession) {
+      throw new GraftSdkError("Native E2EE support is unavailable", "GRAFT_SDK_E2EE_UNSUPPORTED_ENCRYPTED_PROFILE")
+    }
+    this.#native = callSync(() => new native.EncryptedRemoteSession(options))
+    encryptedHandles.set(this, this.#native)
+  }
+
+  get state() { return this.#native.state }
+  get paused() { return this.#native.paused }
+  unlock(password) {
+    if (!Buffer.isBuffer(password)) {
+      throw new GraftSdkError("Password input must be a Buffer", "GRAFT_SDK_INVALID_ARGUMENT")
+    }
+    return call(() => this.#native.unlock(password))
+  }
+  unlockRemembered() { return call(() => this.#native.unlockRemembered()) }
+  initializeConfig(password) {
+    if (!Buffer.isBuffer(password)) throw new GraftSdkError("Password input must be a Buffer", "GRAFT_SDK_INVALID_ARGUMENT")
+    return call(() => this.#native.initializeConfig(password))
+  }
+  resumeInitialConfig(password) {
+    if (!Buffer.isBuffer(password)) throw new GraftSdkError("Password input must be a Buffer", "GRAFT_SDK_INVALID_ARGUMENT")
+    return call(() => this.#native.resumeInitialConfig(password))
+  }
+  changePassword(currentPassword, newPassword) {
+    if (!Buffer.isBuffer(currentPassword) || !Buffer.isBuffer(newPassword)) {
+      if (Buffer.isBuffer(currentPassword)) currentPassword.fill(0)
+      if (Buffer.isBuffer(newPassword)) newPassword.fill(0)
+      throw new GraftSdkError("Password inputs must be Buffers", "GRAFT_SDK_INVALID_ARGUMENT")
+    }
+    return call(() => this.#native.changePassword(currentPassword, newPassword))
+  }
+  resumePasswordChange() { return call(() => this.#native.resumePasswordChange()) }
+  retainedUploads() { return callSync(() => JSON.parse(this.#native.retainedUploads())) }
+  resumeRetainedUpload(opaqueKey) { return call(() => this.#native.resumeRetainedUpload(opaqueKey)) }
+  restartRetainedUpload(opaqueKey) { return call(() => this.#native.restartRetainedUpload(opaqueKey)) }
+  remember() { return call(() => this.#native.remember()) }
+  lock() { return call(() => this.#native.lock()) }
+  pause(paused) { return callSync(() => this.#native.pause(paused)) }
+  disconnect() { return call(() => this.#native.disconnect()) }
+  reconnect(bearerToken) { return callSync(() => this.#native.reconnect(bearerToken)) }
+  refreshBearerToken(authenticationDomain, accountSubject, bearerToken) {
+    return callSync(() => this.#native.refreshBearerToken(authenticationDomain, accountSubject, bearerToken))
+  }
+  forget() { return call(() => this.#native.forget()) }
+}
 
 class GraftSdkError extends Error {
   constructor(message, code, cause) {
@@ -15,14 +68,24 @@ class GraftSdkError extends Error {
 
 class RepositorySession {
   #native
+  #encryptedRemote
 
-  constructor(target, { identity } = {}) {
-    this.#native = new native.RepositorySession(path.resolve(target), identity)
+  constructor(target, { identity, encryptedRemote } = {}) {
+    this.#encryptedRemote = encryptedRemote
+    if (encryptedRemote !== undefined) {
+      const handle = encryptedHandles.get(encryptedRemote)
+      if (!handle || !native.RepositorySession.withEncryptedRemote) {
+        throw new GraftSdkError("Invalid native encrypted remote session", "GRAFT_SDK_INVALID_ARGUMENT")
+      }
+      this.#native = callSync(() => native.RepositorySession.withEncryptedRemote(path.resolve(target), handle, identity))
+    } else {
+      this.#native = new native.RepositorySession(path.resolve(target), identity)
+    }
   }
 
   static async open(target, options = {}) {
-    const { identity, signal } = options
-    const session = new RepositorySession(target, { identity })
+    const { identity, encryptedRemote, signal } = options
+    const session = new RepositorySession(target, { identity, encryptedRemote })
     await session.open({ signal })
     return session
   }
@@ -33,6 +96,49 @@ class RepositorySession {
 
   get lifecycle() {
     return this.#native.lifecycle
+  }
+
+  async addEncryptedRemote({ signal } = {}) {
+    const handle = encryptedHandles.get(this.#encryptedRemote)
+    if (!handle) throw new GraftSdkError("Encrypted remote session required", "GRAFT_SDK_INVALID_ARGUMENT")
+    return callJson(() => this.#native.addEncryptedRemote(handle, signal))
+  }
+
+  async cloneEncryptedRemote({ branch, signal } = {}) {
+    const handle = encryptedHandles.get(this.#encryptedRemote)
+    if (!handle) throw new GraftSdkError("Encrypted remote session required", "GRAFT_SDK_INVALID_ARGUMENT")
+    return callJson(() => this.#native.cloneEncryptedRemote(handle, branch, signal))
+  }
+
+  async pushInitialBranch({ branch, verificationDirectory, signal } = {}) {
+    const handle = encryptedHandles.get(this.#encryptedRemote)
+    if (!handle) throw new GraftSdkError("Encrypted remote session required", "GRAFT_SDK_INVALID_ARGUMENT")
+    return callJson(() => this.#native.pushInitialBranch(handle, branch, verificationDirectory === undefined ? undefined : path.resolve(verificationDirectory), signal))
+  }
+
+  prepareEncryptedMigration(password, options) {
+    return this.#migration("prepareEncryptedMigration", password, options)
+  }
+  resumeEncryptedMigration(password) {
+    return this.#migration("resumeEncryptedMigration", password)
+  }
+  verifyEncryptedMigration(password, options) {
+    return this.#migration("verifyEncryptedMigration", password, options)
+  }
+  cutoverEncryptedMigration(password, options) {
+    return this.#migration("cutoverEncryptedMigration", password, options)
+  }
+  #migration(method, password, options) {
+    if (!Buffer.isBuffer(password)) throw new GraftSdkError("Password input must be a Buffer", "GRAFT_SDK_INVALID_ARGUMENT")
+    const handle = encryptedHandles.get(this.#encryptedRemote)
+    if (!handle || typeof this.#native[method] !== "function") {
+      password.fill(0)
+      throw new GraftSdkError("Native encrypted migration unavailable", "GRAFT_SDK_E2EE_UNSUPPORTED_ENCRYPTED_PROFILE")
+    }
+    return callJson(() => {
+      try { return this.#native[method](handle, password, options) }
+      finally { password.fill(0) }
+    })
   }
 
   async open({ signal } = {}) {
@@ -506,7 +612,7 @@ function normalizeError(error) {
     return error
   }
   const message = error instanceof Error ? error.message : String(error)
-  const match = message.match(/^\[(GRAFT_SDK_[A-Z_]+)\]\s*(.*)$/s)
+  const match = message.match(/^\[(GRAFT_SDK_[A-Z0-9_]+)\]\s*(.*)$/s)
   if (!match) {
     return new GraftSdkError(message, "GRAFT_SDK_NATIVE", error)
   }
@@ -573,6 +679,7 @@ function isMusl() {
 }
 
 module.exports = {
+  EncryptedRemoteSession,
   GraftSdkError,
   RepositorySession,
   operationMaterializesWorktree,

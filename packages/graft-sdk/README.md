@@ -774,3 +774,213 @@ replacement and may fail after the file changed. Multi-path restore is not a
 transaction; a failure/cancellation can leave an applied prefix. After any
 mutation error, re-read actual state before retrying. A directory path is a
 pathspec and can affect descendants; use an exact file path for single-file UI.
+
+## Native encrypted remote hosts
+
+Trusted Node hosts can opt into the native `e2ee` feature. Default native builds
+do not include it. The build script's third argument selects `plain`, `e2ee` or
+`macos-keychain`, after its target and output directory. `pnpm test:e2ee-node`
+builds a temporary addon and verifies it against the actual HTTP remote handler.
+Current checkpoint storage requires Unix owner-only private directories outside
+the repository; unsupported hosts fail rather than using weaker storage.
+
+For an existing encrypted remote, first authenticate the account and verify its
+domain/subject and pinned UUID. Create a host handle with explicit private-state
+paths. Use `createCheckpoint: true` only for intentional new-device enrollment;
+use `false` on later starts so missing/corrupt state is rejected.
+
+```js
+const { EncryptedRemoteSession, RepositorySession } = require('@eidos.space/graft')
+const authority = new EncryptedRemoteSession({
+  remoteName: 'origin', url: verifiedRemoteUrl, uuid: pinnedRepositoryUuid,
+  authenticationDomain: verifiedDomain, accountSubject: verifiedAccount,
+  bearerToken: accountToken,
+  checkpointDirectory: privateCheckpointDirectory,
+  createCheckpoint: isNewDeviceEnrollment,
+  stagingDirectory: privateStagingDirectory,
+  recoveryDirectory: privateRecoveryDirectory,
+})
+await authority.unlock(passwordBuffer) // Consumes and immediately clears this Buffer.
+const session = await RepositorySession.open(target, { encryptedRemote: authority })
+await session.addEncryptedRemote() // Explicit add; does not overwrite an existing remote.
+await session.push({ remote: 'origin', branch: 'main' })
+await authority.lock() // Cancels and drains key-owning work before resolving.
+await session.close()
+await authority.disconnect()
+```
+
+For a fresh destination, use `session.cloneEncryptedRemote({ branch: 'main' })`
+instead of initializing/adding a remote. The destination must be empty or absent.
+The clone retains the authority's `remoteName`, including names other than `origin`,
+and shares its live token refresh, lock and disconnect lifecycle. Passwords must be exclusive caller-owned
+Buffers containing 1–1024 UTF-8 bytes; strings and invalid input are rejected.
+The API does not erase copies previously created by the application. Dropping a
+Promise does not cancel a request: explicitly lock or disconnect it. Runtime
+close/reopen leaves the shared authority's state intact.
+
+Keep `recoveryDirectory` across process restarts, separate from disposable staging
+and outside the worktree. Binding an encrypted repository session rejects
+checkpoint, recovery and staging directories that overlap its discovered
+worktree or repository metadata, including resolved path aliases. The same check
+runs when adding or cloning an encrypted remote. Checkpoint and recovery paths inside staging are rejected
+before enrollment. Native ref updates persist their exact ciphertext before
+publication. A new handle over the same checkpoint and recovery directories
+reconciles pending updates and retries the retained bytes. Unknown results remain
+pending; a different target cannot replace an unconfirmed candidate. Missing
+records/directories in admitted slots, damaged records, or missing/damaged
+namespace allocation evidence fail closed. `createCheckpoint` controls explicit first enrollment of both
+checkpoint and recovery storage; `false` reopens both and never recreates missing
+storage. Reconnect keeps the same recovery providers. Retain the entire directory,
+including its `multipart` namespace and any pending upload ciphertext. A missing
+multipart namespace in an existing enrollment is a recovery error and is never
+silently recreated.
+After explicit unlock, `authority.retainedUploads()` lists admitted unfinished
+uploads by opaque key. `resumeRetainedUpload(key)` reopens the exact retained
+ciphertext. If the server's multipart admission cannot be recovered, explicitly
+call `restartRetainedUpload(key)`: native code confirms abort of the pinned
+server session before starting a new one with the same ciphertext. An unknown
+abort preserves the old identity. These methods cannot allocate a missing slot
+or accept arbitrary recovery paths. Their results are `created`, `reused`,
+`unconfirmed` or `unknown`; only the first two confirm authenticated completion.
+Interrupted empty first allocation resumes only when durable evidence proves the
+slot has never been admitted. Existing active or corrupt records are never
+overwritten. Reconstruction of lost admitted slots or namespace evidence is
+not yet supported.
+
+`pause(true)` retains the key while preventing sync admission. Reconnect requires
+the same verified account identity and remains locked until explicit unlock.
+
+For a newly account-registered empty encrypted remote, a locked authority can
+call `authority.initializeConfig(passwordBuffer)`. The native entry clears the
+exclusive caller-owned Buffer synchronously, generates a random root and writes
+one locally verified wrapped candidate in `recoveryDirectory` before publishing
+it create-if-absent. No root key or config bytes pass through JavaScript. Existing
+local config trust prevents a replacement initialization.
+
+The result is `config_published`, `unconfirmed`, `conflict` or `unknown`.
+`config_published` confirms only the config; initial source/branch/HEAD publication
+and readable-branch verification are still required for connected success.
+For an uncertain result, await `authority.lock()` or reopen the same host
+directories with `createCheckpoint: false`, then call
+`authority.resumeInitialConfig(passwordBuffer)` while locked. Resume unwraps the
+retained candidate, inspects it and retries its original bytes only when still
+absent. Wrong passwords or lost records fail closed. Conflict locks the losing
+session; the host must explicitly enroll in the winner using fresh local trust
+rather than reuse the losing root or overwrite its config. Empty remote identity
+registration is an account-service responsibility outside these SDK APIs.
+
+After config publication, an unlocked authority-bound repository can call
+`source.pushInitialBranch()`. Native recovery first binds the checked-out branch
+and committed HEAD to the initialization journal. Retries and reopened sessions
+load that same intent; another source commit is rejected before network discovery.
+The repository service rechecks the source before dependency publication and
+uses the retained ref/HEAD recovery slots. A failed HEAD update does not replace
+the intent or upload a different initial history.
+
+For the connection gate, call
+`source.pushInitialBranch({ verificationDirectory: freshEmptyDirectory })`.
+Use a fresh independent destination outside the source repository and all host
+checkpoint/recovery/staging directories. Occupied or overlapping destinations
+are rejected before initialization intent or remote publication changes. An
+absent destination is allowed. Native code clones the default remote
+branch into it, verifies the expected branch and commit, closes the verifier and
+durably advances the initialization journal to Connected. Only then does the
+result contain `state: "connected"`; without verification it contains
+`state: "branch_published"`. The verification directory contains ordinary
+plaintext local files and is left available to the host. Each retry needs a
+fresh destination; the SDK does not erase an existing verification copy.
+After reopening a branch-publication attempt, use ordinary `unlock` on the
+authority and reopen the original repository before retrying this operation.
+The persisted source remote must exactly match the authority's config. Custom
+remote names are supported: verification derives an isolated `origin` credential
+registration for the same pinned remote and secret session, without renaming or
+modifying the source authority's registrations.
+
+Existing committed history can migrate to a newly registered encrypted target
+with `source.prepareEncryptedMigration(passwordBuffer, { allRefs: true, mappings,
+targetHead })`. Each mapping contains full `source` and `target` ref names; every
+selected branch, unborn branch, remote-tracking ref and tag needs an explicit mapping. Alternatively,
+pass a nonempty `references` array instead of `allRefs`. `targetHead` is a full
+mapped branch name, such as `refs/heads/main`. Preparation is offline and retains
+one wrapped root plus exact source, target, enrollment and progress journals
+under the authority's recovery directory.
+
+`resumeEncryptedMigration(passwordBuffer)` publishes only that retained plan.
+It can be repeated after reopening the same authority with `createCheckpoint:
+false`; missing state never replans or generates another root. Publication
+returns `ready-for-independent-verification`. Then call
+`verifyEncryptedMigration(passwordBuffer, { verificationDirectory, bearerToken })`
+for fresh password recovery of every selected ref and all reachable SQLite and
+file history. Use a fresh empty or absent absolute destination outside the
+source and host directories, and a token for the same verified account.
+
+`cutoverEncryptedMigration(passwordBuffer, verificationOptions)` repeats that
+independent verification while native code holds the source's actual canonical
+repository mutation gate, then atomically persists the local remote and mapped
+branch upstreams. The result is `host-cutover-confirmed`. These migration calls
+require a locked authority, clear the supplied exclusive Buffer synchronously,
+and relock before completion. No JavaScript boolean or callback can stand in for
+the native fence. Every verification attempt needs a fresh destination; its
+plaintext recovered history remains available to the host.
+
+The gate excludes participating current-version Graft commands in other threads
+and processes for this local repository. Hosts must separately coordinate their
+ordinary SQLite/file writers; direct `.graft` edits and legacy binaries are not
+covered. Migration changes committed history and local configuration only.
+`offlineDevices` remains `pending`; local cutover never claims device revocation.
+
+Trusted hosts can call `authority.changePassword(currentBuffer, newBuffer)` while
+unlocked. Both exclusive caller-owned Buffers are cleared synchronously, including
+rejection. Current-password reentry authorizes the change; the native provider
+persists the exact config transaction inside `recoveryDirectory`. No JavaScript
+crypto or journal callbacks are required.
+
+The result is `confirmed`, `unconfirmed`, `conflict` or `unknown`. Display completion
+only for `confirmed`. A pending transaction prevents preparing another change.
+After an uncertain result, explicitly unlock the appropriate current/new password
+or approved remembered key, then call `authority.resumePasswordChange()` on the
+same or reopened authority. It restores retained bytes, inspects the result and
+retries only when the exact old config remains current. Unknown outcomes require
+reconciliation; conflicts require the host to stop and refresh its flow. Existing
+unlocked devices continue using the same root key after a password change.
+
+The native journal retains the last retired candidate until a newer transaction
+supersedes it. This lets resume recover a lost local retirement acknowledgement
+after reopening. A retired record alone does not establish success; resume still
+authenticates the remote config. The record contains password-wrapped root
+material, so changing a password does not revoke access to older wrapping records.
+This API does not implement forgotten-password reset or device revocation.
+Switching accounts requires a new handle. Refresh tokens only after verifying
+their unchanged domain/subject with `refreshBearerToken`.
+
+Handle encrypted repository failures through `GraftSdkError.code`, including
+errors from `push`, `fetch` and `cloneEncryptedRemote`:
+
+| Code | Action |
+| --- | --- |
+| `GRAFT_SDK_E2EE_LOCKED` | Ask for explicit unlock. |
+| `GRAFT_SDK_E2EE_PAUSED` | Resume only according to the host's user intent. |
+| `GRAFT_SDK_E2EE_AUTHENTICATION_FAILED` | Resolve HTTP account authentication/authorization; verify identity before refreshing a token. |
+| `GRAFT_SDK_E2EE_INTEGRITY_FAILED` / `GRAFT_SDK_E2EE_CONFIG_ROLLBACK_DETECTED` | Stop and investigate; do not automatically overwrite data or reset the checkpoint. |
+| `GRAFT_SDK_REMOTE_PUBLICATION_OUTCOME_UNKNOWN` | Reconcile the publication before deciding whether to retry. |
+
+Account authentication failure and encrypted-data integrity failure are separate
+conditions. Error text is diagnostic; do not use it to decide whether a repository
+is busy or a secret session needs unlock. An unknown/unconfirmed publication
+retains its publication code even when its underlying cause is cancellation.
+
+A `macos-keychain` build accepts `keychainApplication` and
+`keychainAccessGroup` for a correctly signed/entitled host's default application
+group. `remember`, `unlockRemembered` and `forget` use that native provider.
+Unavailable storage disables remembering without a plaintext fallback; a host
+may continue with session-only password unlock. Hosts must coordinate all sessions
+sharing an entry before forgetting it. Successful remembering/restart in a signed
+host still requires platform validation. Keep this authority in the trusted host;
+never expose it or its key-management methods through ordinary plugin RPC.
+
+These Node APIs do not provision the account-side encrypted service identity,
+reset a forgotten password or claim revocation of offline devices. Config
+initialization, migration of committed history, native fenced local cutover and
+current-password change are
+described above. Remaining workflows and production conformance gates are defined
+in [E2EE Remote 1.0](../../docs/specs/graft-e2ee-remote-1.0.md).
