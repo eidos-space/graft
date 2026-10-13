@@ -13,6 +13,28 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
+/// Native E2EE host integration. Secrets are opaque Rust handles, never SDK JSON.
+#[cfg(all(feature = "e2ee", not(target_arch = "wasm32")))]
+pub use graft::e2ee;
+#[cfg(all(feature = "e2ee", not(target_arch = "wasm32")))]
+pub use graft::remote::EncryptedTransferBudget;
+pub use graft::remote::{RemoteConfig, RemoteCredentials};
+#[cfg(all(feature = "e2ee", unix))]
+pub use graft::repo::{
+    Head, MigrationPlanningBudget, MigrationPublicationBudget, MigrationRefSelection,
+};
+mod encrypted_errors;
+#[cfg(all(feature = "e2ee", unix))]
+mod encrypted_migration;
+pub use encrypted_errors::EncryptedErrorCode;
+#[cfg(all(feature = "e2ee", not(target_arch = "wasm32")))]
+pub use encrypted_errors::{encrypted_http_error_code, encryption_error_code};
+#[cfg(all(feature = "e2ee", unix))]
+pub use encrypted_migration::{
+    EncryptedMigrationCoordinator, IndependentMigrationVerification, MigrationCoordinatorOptions,
+    MigrationCutoverIntent, MigrationJournalPaths, MigrationPublicationState,
+    MigrationVerificationOptions, MigrationWriteFence, RepositoryMigrationFence,
+};
 pub use graft::repo::{
     CancellationToken, RepoConfigEntry, RepoPathContent, RepoPathContentState, RepoStatus,
     TransferDirection, TransferProgress, TransferProgressReporter,
@@ -23,10 +45,7 @@ use graft::repo::{
     index::{Index, IndexEntry, IndexStage},
 };
 pub use graft::repo::{ManagedColumnResolver, MergeConfig, SemanticKeyCollation};
-use graft::{
-    core::byte_unit::ByteUnit,
-    remote::{RemoteConfig, RemoteCredentialErr, RemoteCredentials},
-};
+use graft::{core::byte_unit::ByteUnit, remote::RemoteCredentialErr};
 use graft_sqlite::{
     error::ErrCtx,
     repo_service::{
@@ -100,6 +119,7 @@ impl From<&RepositorySessionIdentity> for UserConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SdkErrorCode {
+    Encrypted(EncryptedErrorCode),
     SessionClosed,
     SessionOpening,
     SessionClosing,
@@ -118,6 +138,7 @@ pub enum SdkErrorCode {
 impl SdkErrorCode {
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Encrypted(code) => code.as_str(),
             Self::SessionClosed => "GRAFT_SDK_SESSION_CLOSED",
             Self::SessionOpening => "GRAFT_SDK_SESSION_OPENING",
             Self::SessionClosing => "GRAFT_SDK_SESSION_CLOSING",
@@ -362,6 +383,7 @@ pub enum SafeRemoteKind {
     Fs,
     S3Compatible,
     Http,
+    EncryptedHttp,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1152,10 +1174,22 @@ impl RepositorySession {
         target: impl AsRef<Path>,
         user_identity: Option<RepositorySessionIdentity>,
     ) -> Self {
+        Self::new_with_remote_credentials(target, user_identity, RemoteCredentials::explicit())
+    }
+
+    /// Creates a closed session with explicit, shared host credentials.
+    /// Native encrypted remotes require a host-registered secret session. Closing
+    /// this repository runtime does not disconnect credentials shared by other
+    /// repositories; the host owns locking and disconnecting that secret session.
+    pub fn new_with_remote_credentials(
+        target: impl AsRef<Path>,
+        user_identity: Option<RepositorySessionIdentity>,
+        credentials: RemoteCredentials,
+    ) -> Self {
         Self {
             target: repository_session_target(target.as_ref()),
             user_identity,
-            credentials: RemoteCredentials::explicit(),
+            credentials,
             lifecycle: AtomicU8::new(LIFECYCLE_CLOSED),
             state: Mutex::new(SessionState {
                 service: None,
@@ -1166,6 +1200,76 @@ impl RepositorySession {
 
     pub fn target(&self) -> &Path {
         &self.target
+    }
+
+    /// Reject occupied clone destinations before a host publishes remote state.
+    pub fn validate_clone_destination(&self) -> Result<()> {
+        let worktree = self.target.parent().unwrap_or_else(|| Path::new("."));
+        graft_sqlite::repo_service::validate_clone_destination(worktree)
+            .map_err(repository_command_error)
+    }
+
+    /// Trusted encrypted hosts must keep persistent state and disposable staging
+    /// separate from the actual worktree, including discovered parents and aliases.
+    /// This validates placement without opening a runtime or sending requests.
+    #[cfg(all(feature = "e2ee", not(target_arch = "wasm32")))]
+    pub fn validate_encrypted_host_directories(&self, directories: &[PathBuf]) -> e2ee::Result<()> {
+        for directory in directories {
+            std::fs::canonicalize(directory)
+                .map_err(|error| e2ee::EncryptionError::CheckpointUnavailable(error.kind()))?;
+        }
+        self.validate_encrypted_host_directory_targets(directories)
+    }
+
+    /// Check proposed host-state paths before allocation, resolving existing
+    /// ancestors and repository discovery without creating filesystem state.
+    #[cfg(all(feature = "e2ee", not(target_arch = "wasm32")))]
+    pub fn validate_encrypted_host_directory_targets(
+        &self,
+        directories: &[PathBuf],
+    ) -> e2ee::Result<()> {
+        let base = if self
+            .target
+            .file_name()
+            .is_some_and(|name| name == graft::repo::GRAFT_DIR)
+            || self.target.is_file()
+        {
+            self.target
+                .parent()
+                .ok_or(e2ee::EncryptionError::InvalidSessionBinding)?
+        } else {
+            &self.target
+        };
+        let intended = canonical_encrypted_host_target(base)?;
+        let discovery = intended
+            .ancestors()
+            .find(|path| path.is_dir())
+            .ok_or(e2ee::EncryptionError::InvalidSessionBinding)?;
+        let (worktree, metadata) = match Repository::discover(discovery) {
+            Ok(repository) => (
+                repository.worktree().to_owned(),
+                Some(repository.graft_dir().to_owned()),
+            ),
+            Err(graft::repo::RepoErr::NotFound(_)) => (intended, None),
+            Err(_) => return Err(e2ee::EncryptionError::InvalidSessionBinding),
+        };
+        let worktree = canonical_encrypted_host_target(&worktree)?;
+        let metadata = metadata
+            .map(std::fs::canonicalize)
+            .transpose()
+            .map_err(|error| e2ee::EncryptionError::CheckpointUnavailable(error.kind()))?;
+        for directory in directories {
+            let directory = canonical_encrypted_host_target(directory)?;
+            if directory.starts_with(&worktree)
+                || worktree.starts_with(&directory)
+                || metadata.as_ref().is_some_and(|metadata| {
+                    directory.starts_with(metadata) || metadata.starts_with(&directory)
+                })
+            {
+                return Err(e2ee::EncryptionError::InvalidSessionBinding);
+            }
+        }
+        Ok(())
     }
 
     pub fn lifecycle(&self) -> SessionLifecycle {
@@ -2272,9 +2376,503 @@ impl RepositorySession {
         })
     }
 
+    /// Add an explicitly typed remote without URI profile inference or overwrite.
+    pub fn add_remote_with_config(&self, name: &str, config: RemoteConfig) -> Result<Value> {
+        validate_remote_name(name)?;
+        if let RemoteConfig::Http { url, .. } | RemoteConfig::EncryptedHttp { url, .. } = &config {
+            let uri = url.strip_prefix("http://").map_or_else(
+                || url.clone(),
+                |location| format!("graft+http://{location}"),
+            );
+            validate_sdk_remote_url(&uri)?;
+        }
+        self.with_service(|service| {
+            execute_json_command(
+                service,
+                RepositoryCommand::remote_add_with_config(name.to_owned(), config),
+                "remote_add",
+            )
+        })
+    }
+
     pub fn push(&self, remote: Option<&str>, branch: Option<&str>) -> Result<Value> {
         let argument = remote_branch_argument(remote, branch)?;
         self.execute_json("json_push", argument.as_deref())
+    }
+
+    /// Publish the source pinned by a trusted host's initialization journal.
+    #[cfg(all(feature = "e2ee", not(target_arch = "wasm32")))]
+    pub fn push_initialization_intent(
+        &self,
+        remote: &str,
+        intent: &graft::e2ee::InitializationIntent,
+    ) -> Result<Value> {
+        self.with_service(|service| {
+            let outcome = service
+                .push_initialization_intent(remote, intent)
+                .map_err(repository_command_error)?;
+            Ok(serde_json::json!(outcome))
+        })
+    }
+
+    /// Bind host initialization recovery to this exact persisted remote config.
+    #[cfg(all(feature = "e2ee", not(target_arch = "wasm32")))]
+    pub fn validate_initialization_remote_config(
+        &self,
+        remote: &str,
+        config: &RemoteConfig,
+    ) -> Result<()> {
+        self.with_service(|service| {
+            let repository = service.repository().map_err(repository_command_error)?;
+            if repository.config().map_err(repo_error)?.remotes.get(remote) != Some(config) {
+                return Err(SdkError::new(
+                    SdkErrorCode::Encrypted(EncryptedErrorCode::StaleObservation),
+                    "initialization remote binding changed",
+                ));
+            }
+            Ok(())
+        })
+    }
+
+    /// Recheck the exact remote config in the publication service boundary.
+    #[cfg(all(feature = "e2ee", not(target_arch = "wasm32")))]
+    pub fn push_initialization_intent_with_config(
+        &self,
+        remote: &str,
+        config: &RemoteConfig,
+        intent: &graft::e2ee::InitializationIntent,
+    ) -> Result<Value> {
+        self.with_service(|service| {
+            let repository = service.repository().map_err(repository_command_error)?;
+            if repository.config().map_err(repo_error)?.remotes.get(remote) != Some(config) {
+                return Err(SdkError::new(
+                    SdkErrorCode::Encrypted(EncryptedErrorCode::StaleObservation),
+                    "initialization remote binding changed",
+                ));
+            }
+            let outcome = service
+                .push_initialization_intent(remote, intent)
+                .map_err(repository_command_error)?;
+            Ok(serde_json::json!(outcome))
+        })
+    }
+
+    /// Read-only private migration inventory. Does not hydrate or publish history.
+    #[cfg(all(feature = "e2ee", not(target_arch = "wasm32")))]
+    pub fn plan_migration_source(
+        &self,
+        selection: graft::repo::MigrationRefSelection,
+        budget: graft::repo::MigrationPlanningBudget,
+    ) -> Result<graft::repo::MigrationSourcePlan> {
+        self.with_service(|service| {
+            service
+                .repository()
+                .map_err(repository_command_error)?
+                .plan_migration_source(selection, budget)
+                .map_err(repo_error)
+        })
+    }
+
+    /// Preflight exact target refs/HEAD without enrolling or contacting a remote.
+    #[cfg(all(feature = "e2ee", not(target_arch = "wasm32")))]
+    pub fn plan_migration_target_refs(
+        &self,
+        source: &graft::repo::MigrationSourcePlan,
+        mappings: Vec<(String, String)>,
+        head: graft::repo::Head,
+    ) -> Result<graft::repo::MigrationTargetPlan> {
+        self.with_service(|service| {
+            service
+                .repository()
+                .map_err(repository_command_error)?
+                .plan_migration_target_refs(source, mappings, head)
+                .map_err(repo_error)
+        })
+    }
+
+    /// Revalidate the exact source bound to a target plan, without remote effects.
+    #[cfg(all(feature = "e2ee", not(target_arch = "wasm32")))]
+    pub fn validate_migration_target_plan(
+        &self,
+        plan: &graft::repo::MigrationTargetPlan,
+    ) -> Result<()> {
+        self.with_service(|service| {
+            service
+                .repository()
+                .map_err(repository_command_error)?
+                .validate_migration_target_plan(plan)
+                .map_err(repo_error)
+        })
+    }
+
+    /// Retain target mapping/HEAD and frozen source in a dedicated private directory.
+    /// Binding does not enroll a target or prove a fresh root/config.
+    #[cfg(all(feature = "e2ee", unix, not(target_arch = "wasm32")))]
+    pub fn create_migration_target_journal(
+        &self,
+        directory: &Path,
+        binding: &e2ee::SessionBinding,
+        plan: &graft::repo::MigrationTargetPlan,
+    ) -> Result<()> {
+        let host_error = |error: e2ee::EncryptionError| {
+            SdkError::new(
+                encrypted_errors::encryption_error_code(&error),
+                "private target migration journal unavailable",
+            )
+        };
+        self.validate_encrypted_host_directories(&[directory.to_path_buf()])
+            .map_err(host_error)?;
+        self.with_service(|service| {
+            let repo = service.repository().map_err(repository_command_error)?;
+            let bytes = plan.encode_private().map_err(repo_error)?;
+            repo.restore_migration_target_plan(&bytes)
+                .map_err(repo_error)?;
+            e2ee::FileMigrationTargetJournal::create(directory, binding, &bytes)
+                .map_err(host_error)?;
+            repo.validate_migration_target_plan(plan)
+                .map_err(repo_error)
+        })
+    }
+
+    /// Reopen exact target intent; never adopt changed source refs or a new HEAD.
+    #[cfg(all(feature = "e2ee", unix, not(target_arch = "wasm32")))]
+    pub fn restore_migration_target_journal(
+        &self,
+        directory: &Path,
+        binding: &e2ee::SessionBinding,
+    ) -> Result<graft::repo::MigrationTargetPlan> {
+        let host_error = |error: e2ee::EncryptionError| {
+            SdkError::new(
+                encrypted_errors::encryption_error_code(&error),
+                "private target migration journal unavailable",
+            )
+        };
+        self.validate_encrypted_host_directories(&[directory.to_path_buf()])
+            .map_err(host_error)?;
+        self.with_service(|service| {
+            let journal =
+                e2ee::FileMigrationTargetJournal::open(directory, binding).map_err(host_error)?;
+            let bytes = journal.load(binding).map_err(host_error)?;
+            service
+                .repository()
+                .map_err(repository_command_error)?
+                .restore_migration_target_plan(&bytes)
+                .map_err(repo_error)
+        })
+    }
+
+    /// Bind a retained target plan to the exact prepared initialization config.
+    /// This local preparation does not publish config or prove a fresh remote.
+    #[cfg(all(feature = "e2ee", unix, not(target_arch = "wasm32")))]
+    pub fn create_migration_enrollment_journal(
+        &self,
+        directory: &Path,
+        target_directory: &Path,
+        secret: &e2ee::SecretSession,
+        initialization: &dyn e2ee::InitializationJournal,
+    ) -> Result<()> {
+        let host_error = |error: e2ee::EncryptionError| {
+            SdkError::new(
+                encrypted_errors::encryption_error_code(&error),
+                "private migration enrollment unavailable",
+            )
+        };
+        self.validate_encrypted_host_directories(&[
+            directory.to_path_buf(),
+            target_directory.to_path_buf(),
+        ])
+        .map_err(host_error)?;
+        let operation = secret.begin_operation().map_err(host_error)?;
+        self.with_service(|service| {
+            let repo = service.repository().map_err(repository_command_error)?;
+            let initial = initialization.load(secret.binding()).map_err(host_error)?;
+            if initial.stage != e2ee::InitializationStage::Prepared || initial.intent.is_some() {
+                return Err(host_error(e2ee::EncryptionError::StaleObservation));
+            }
+            let target = e2ee::FileMigrationTargetJournal::open(target_directory, secret.binding())
+                .map_err(host_error)?
+                .load(secret.binding())
+                .map_err(host_error)?;
+            let plan = repo
+                .restore_migration_target_plan(&target)
+                .map_err(repo_error)?;
+            let record = e2ee::MigrationEnrollmentRecord::new(&operation, initial.config, target)
+                .map_err(host_error)?;
+            let bytes = record.encode_private().map_err(host_error)?;
+            operation.check_active().map_err(host_error)?;
+            e2ee::FileMigrationEnrollmentJournal::create(directory, secret.binding(), &bytes)
+                .map_err(host_error)?;
+            repo.validate_migration_target_plan(&plan)
+                .map_err(repo_error)?;
+            operation.check_active().map_err(host_error)
+        })
+    }
+
+    /// Recover exact enrollment intent under an admitted root, without changing
+    /// config trust or reporting any remote publication stage as confirmed.
+    #[cfg(all(feature = "e2ee", unix, not(target_arch = "wasm32")))]
+    pub fn restore_migration_enrollment_journal(
+        &self,
+        directory: &Path,
+        target_directory: &Path,
+        secret: &e2ee::SecretSession,
+        initialization: &dyn e2ee::InitializationJournal,
+    ) -> Result<graft::repo::MigrationTargetPlan> {
+        let host_error = |error: e2ee::EncryptionError| {
+            SdkError::new(
+                encrypted_errors::encryption_error_code(&error),
+                "private migration enrollment unavailable",
+            )
+        };
+        self.validate_encrypted_host_directories(&[
+            directory.to_path_buf(),
+            target_directory.to_path_buf(),
+        ])
+        .map_err(host_error)?;
+        let operation = secret.begin_operation().map_err(host_error)?;
+        self.with_service(|service| {
+            let initial = initialization.load(secret.binding()).map_err(host_error)?;
+            let target = e2ee::FileMigrationTargetJournal::open(target_directory, secret.binding())
+                .map_err(host_error)?
+                .load(secret.binding())
+                .map_err(host_error)?;
+            let bytes = e2ee::FileMigrationEnrollmentJournal::open(directory, secret.binding())
+                .map_err(host_error)?
+                .load(secret.binding())
+                .map_err(host_error)?;
+            let record =
+                e2ee::MigrationEnrollmentRecord::restore(&operation, &bytes).map_err(host_error)?;
+            record
+                .require_intent(&initial.config, &target)
+                .map_err(host_error)?;
+            let plan = service
+                .repository()
+                .map_err(repository_command_error)?
+                .restore_migration_target_plan(record.target_intent())
+                .map_err(repo_error)?;
+            operation.check_active().map_err(host_error)?;
+            Ok(plan)
+        })
+    }
+
+    /// Guard online initialization with retained migration config/target/source.
+    /// Pass this journal to `EncryptedHttpClient` configuration publication or reconciliation.
+    #[cfg(all(feature = "e2ee", unix, not(target_arch = "wasm32")))]
+    pub fn migration_initialization_journal(
+        &self,
+        directory: &Path,
+        target_directory: &Path,
+        secret: e2ee::SecretSession,
+        initialization: std::sync::Arc<dyn e2ee::InitializationJournal>,
+    ) -> Result<std::sync::Arc<e2ee::MigrationInitializationJournal>> {
+        let host_error = |error: e2ee::EncryptionError| {
+            SdkError::new(
+                encrypted_errors::encryption_error_code(&error),
+                "migration initialization unavailable",
+            )
+        };
+        self.validate_encrypted_host_directories(&[
+            directory.to_path_buf(),
+            target_directory.to_path_buf(),
+        ])
+        .map_err(host_error)?;
+        self.with_service(|service| {
+            let repo = service.repository().map_err(repository_command_error)?;
+            e2ee::MigrationInitializationJournal::new(
+                repo,
+                directory,
+                target_directory,
+                secret,
+                initialization,
+            )
+            .map(std::sync::Arc::new)
+            .map_err(host_error)
+        })
+    }
+
+    /// Persist the exact frozen source in an existing owner-only host directory.
+    /// Target binding does not enroll a remote or prove that its root key is new.
+    #[cfg(all(feature = "e2ee", unix, not(target_arch = "wasm32")))]
+    pub fn create_migration_source_journal(
+        &self,
+        directory: &Path,
+        binding: &e2ee::SessionBinding,
+        plan: &graft::repo::MigrationSourcePlan,
+    ) -> Result<()> {
+        let host_error = |error: e2ee::EncryptionError| {
+            SdkError::new(
+                encrypted_errors::encryption_error_code(&error),
+                "private migration journal unavailable",
+            )
+        };
+        self.validate_encrypted_host_directories(&[directory.to_path_buf()])
+            .map_err(host_error)?;
+        self.with_service(|service| {
+            let repo = service.repository().map_err(repository_command_error)?;
+            repo.validate_migration_source_plan(plan)
+                .map_err(repo_error)?;
+            let bytes = plan.encode_private().map_err(repo_error)?;
+            // Rehash the closure before allocating an immutable journal namespace.
+            repo.restore_migration_source_plan(&bytes)
+                .map_err(repo_error)?;
+            e2ee::FileMigrationSourceJournal::create(directory, binding, &bytes)
+                .map_err(host_error)?;
+            repo.validate_migration_source_plan(plan)
+                .map_err(repo_error)
+        })
+    }
+
+    /// Reopen retained source bytes; a changed HEAD or selected inventory fails closed.
+    #[cfg(all(feature = "e2ee", unix, not(target_arch = "wasm32")))]
+    pub fn restore_migration_source_journal(
+        &self,
+        directory: &Path,
+        binding: &e2ee::SessionBinding,
+    ) -> Result<graft::repo::MigrationSourcePlan> {
+        let host_error = |error: e2ee::EncryptionError| {
+            SdkError::new(
+                encrypted_errors::encryption_error_code(&error),
+                "private migration journal unavailable",
+            )
+        };
+        self.validate_encrypted_host_directories(&[directory.to_path_buf()])
+            .map_err(host_error)?;
+        self.with_service(|service| {
+            let journal =
+                e2ee::FileMigrationSourceJournal::open(directory, binding).map_err(host_error)?;
+            let bytes = journal.load(binding).map_err(host_error)?;
+            service
+                .repository()
+                .map_err(repository_command_error)?
+                .restore_migration_source_plan(&bytes)
+                .map_err(repo_error)
+        })
+    }
+
+    /// Reject a changed source before the host advances its migration workflow.
+    #[cfg(all(feature = "e2ee", not(target_arch = "wasm32")))]
+    pub fn validate_migration_source_plan(
+        &self,
+        plan: &graft::repo::MigrationSourcePlan,
+    ) -> Result<()> {
+        self.with_service(|service| {
+            service
+                .repository()
+                .map_err(repository_command_error)?
+                .validate_migration_source_plan(plan)
+                .map_err(repo_error)
+        })
+    }
+
+    /// Verify the planned local storage and file dependencies without HTTP or checkout.
+    #[cfg(all(feature = "e2ee", not(target_arch = "wasm32")))]
+    pub fn verify_migration_source_dependencies(
+        &self,
+        plan: &graft::repo::MigrationSourcePlan,
+        budget: graft::repo::MigrationVerificationBudget,
+    ) -> Result<graft::repo::MigrationDependencyVerification> {
+        self.with_service(|service| {
+            service
+                .verify_migration_source_dependencies(plan, budget)
+                .map_err(repository_command_error)
+        })
+    }
+
+    /// Publish the frozen historical `SQLite` storage dependencies only.
+    #[cfg(all(feature = "e2ee", unix))]
+    pub fn publish_migration_storage_dependencies(
+        &self,
+        plan: &graft::repo::MigrationSourcePlan,
+        remote: std::sync::Arc<graft::remote::Remote>,
+        budget: graft::repo::MigrationVerificationBudget,
+        max_batch_pages: u64,
+    ) -> Result<graft::repo::MigrationDependencyVerification> {
+        self.with_service(|service| {
+            service
+                .publish_migration_storage_dependencies(plan, remote, budget, max_batch_pages)
+                .map_err(repository_command_error)
+        })
+    }
+
+    /// Publish the frozen storage, external files and repository objects only.
+    #[cfg(all(feature = "e2ee", unix))]
+    pub fn publish_migration_dependencies(
+        &self,
+        plan: &graft::repo::MigrationSourcePlan,
+        remote: std::sync::Arc<graft::remote::Remote>,
+        budget: graft::repo::MigrationPublicationBudget,
+    ) -> Result<graft::repo::MigrationDependencyPublication> {
+        self.with_service(|service| {
+            service
+                .publish_migration_dependencies(plan, remote, budget)
+                .map_err(repository_command_error)
+        })
+    }
+
+    /// Publish one branch from the retained target mapping after dependency transfer.
+    #[cfg(all(feature = "e2ee", unix))]
+    pub fn publish_migration_target_branch(
+        &self,
+        plan: &graft::repo::MigrationTargetPlan,
+        remote: std::sync::Arc<graft::remote::Remote>,
+        target_ref: &str,
+    ) -> Result<()> {
+        self.with_service(|service| {
+            service
+                .repository()
+                .map_err(repository_command_error)?
+                .publish_migration_target_branch(plan, &remote, target_ref)
+                .map_err(repo_error)
+        })
+    }
+
+    /// Publish a mapped tag with verified exact object bytes and durable recovery.
+    #[cfg(all(feature = "e2ee", unix))]
+    pub fn publish_migration_target_tag(
+        &self,
+        plan: &graft::repo::MigrationTargetPlan,
+        remote: std::sync::Arc<graft::remote::Remote>,
+        target_ref: &str,
+    ) -> Result<()> {
+        self.with_service(|service| {
+            service
+                .repository()
+                .map_err(repository_command_error)?
+                .publish_migration_target_tag(plan, &remote, target_ref)
+                .map_err(repo_error)
+        })
+    }
+
+    /// Publish the retained target HEAD after verified dependency/ref publication.
+    #[cfg(all(feature = "e2ee", unix))]
+    pub fn publish_migration_target_head(
+        &self,
+        plan: &graft::repo::MigrationTargetPlan,
+        remote: std::sync::Arc<graft::remote::Remote>,
+    ) -> Result<()> {
+        self.with_service(|service| {
+            service
+                .repository()
+                .map_err(repository_command_error)?
+                .publish_migration_target_head(plan, &remote)
+                .map_err(repo_error)
+        })
+    }
+
+    /// Publish all frozen mapped refs and then HEAD, with durable per-ref recovery.
+    #[cfg(all(feature = "e2ee", unix))]
+    pub fn publish_migration_target_refs(
+        &self,
+        plan: &graft::repo::MigrationTargetPlan,
+        remote: std::sync::Arc<graft::remote::Remote>,
+    ) -> Result<usize> {
+        self.with_service(|service| {
+            service
+                .repository()
+                .map_err(repository_command_error)?
+                .publish_migration_target_refs(plan, &remote)
+                .map_err(repo_error)
+        })
     }
 
     pub fn fetch(&self, remote: Option<&str>, branch: Option<&str>) -> Result<Value> {
@@ -3275,6 +3873,51 @@ impl RepositorySession {
         self.execute_json_mutating("json_clone", Some(&argument))
     }
 
+    /// Clone using an explicit profile and the host credentials passed to this
+    /// session. This does not enroll or unlock an encrypted remote.
+    pub fn clone_repository_with_config(
+        &self,
+        config: RemoteConfig,
+        branch: Option<&str>,
+    ) -> Result<Value> {
+        self.clone_repository_with_named_config("origin", config, branch)
+    }
+
+    /// Clone while retaining an explicitly registered local remote name.
+    /// Credentials, refresh, lock and disconnect remain owned by the original host session.
+    pub fn clone_repository_with_named_config(
+        &self,
+        remote_name: &str,
+        config: RemoteConfig,
+        branch: Option<&str>,
+    ) -> Result<Value> {
+        validate_remote_name(remote_name)?;
+        if let Some(branch) = branch {
+            validate_branch_name(branch)?;
+        }
+        if let RemoteConfig::Http { url, .. } | RemoteConfig::EncryptedHttp { url, .. } = &config {
+            let uri = url.strip_prefix("http://").map_or_else(
+                || url.clone(),
+                |location| format!("graft+http://{location}"),
+            );
+            validate_sdk_remote_url(&uri)?;
+        }
+        self.with_state(|state| {
+            let service = state.service.as_mut().ok_or_else(session_closed_error)?;
+            let result = execute_json_command(
+                service,
+                RepositoryCommand::clone_with_named_config(
+                    remote_name.into(),
+                    config,
+                    branch.map(str::to_owned),
+                ),
+                "clone",
+            );
+            state.status_cache.invalidate();
+            result
+        })
+    }
+
     fn execute_json(&self, name: &str, argument: Option<&str>) -> Result<Value> {
         self.with_service(|service| execute_json(service, name, argument))
     }
@@ -3312,6 +3955,13 @@ impl RepositorySession {
         if self.lifecycle.load(Ordering::Acquire) != LIFECYCLE_OPEN {
             return Err(session_closing_error());
         }
+        #[cfg(unix)]
+        let _mutation = state
+            .service
+            .as_ref()
+            .map(RepositoryCommandService::mutation_guard)
+            .transpose()
+            .map_err(repository_command_error)?;
         operation(&mut state).map_err(|error| self.redact_error(error))
     }
 
@@ -4380,6 +5030,7 @@ fn safe_remote_projection(config: &RemoteConfig) -> (SafeRemoteKind, String) {
         }
         // `token_env` and any in-memory bearer credential are intentionally excluded.
         RemoteConfig::Http { url, .. } => (SafeRemoteKind::Http, url.clone()),
+        RemoteConfig::EncryptedHttp { url, .. } => (SafeRemoteKind::EncryptedHttp, url.clone()),
     }
 }
 
@@ -4703,7 +5354,33 @@ fn sdk_error_code_for_error(error: &ErrCtx, message: &str) -> SdkErrorCode {
             repo::RepoErr,
         };
 
+        let remote_error = match error {
+            ErrCtx::Repo(RepoErr::Remote(remote))
+            | ErrCtx::Graft(graft::GraftErr::Remote(remote))
+            | ErrCtx::Setup(graft::setup::InitErr::Remote(remote)) => Some(remote),
+            _ => None,
+        };
+        if let Some(remote) = remote_error {
+            // Publication uncertainty takes precedence over its nested cause:
+            // cancellation or a timeout after send cannot prove no mutation.
+            if remote.publication_outcome_unknown() {
+                return SdkErrorCode::RemotePublicationOutcomeUnknown;
+            }
+            if remote.publication_unconfirmed() {
+                return SdkErrorCode::RemotePublicationUnconfirmed;
+            }
+            if matches!(remote, RemoteErr::EncryptedRemoteUnavailable) {
+                return SdkErrorCode::Encrypted(EncryptedErrorCode::UnsupportedEncryptedProfile);
+            }
+            #[cfg(feature = "e2ee")]
+            if let RemoteErr::Encryption(error) = remote {
+                return encrypted_http_error_code(error);
+            }
+        }
+
         match error {
+            ErrCtx::Repo(RepoErr::MutationBusy) => SdkErrorCode::RepositoryBusy,
+            ErrCtx::Repo(RepoErr::MutationFenceStale) => SdkErrorCode::RepositoryStale,
             ErrCtx::Repo(RepoErr::Remote(RemoteErr::PublicationUnconfirmed { .. })) => {
                 SdkErrorCode::RemotePublicationUnconfirmed
             }
@@ -4790,6 +5467,39 @@ fn repository_session_target(target: &Path) -> PathBuf {
         return target.join(graft::repo::GRAFT_DIR);
     }
     target.to_path_buf()
+}
+
+#[cfg(all(feature = "e2ee", not(target_arch = "wasm32")))]
+fn canonical_encrypted_host_target(target: &Path) -> e2ee::Result<PathBuf> {
+    let mut ancestor = if target.is_absolute() {
+        target.to_owned()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| e2ee::EncryptionError::CheckpointUnavailable(error.kind()))?
+            .join(target)
+    };
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::canonicalize(&ancestor) {
+            Ok(mut canonical) => {
+                for component in missing.into_iter().rev() {
+                    canonical.push(component);
+                }
+                return Ok(canonical);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let name = ancestor
+                    .file_name()
+                    .ok_or(e2ee::EncryptionError::InvalidSessionBinding)?
+                    .to_owned();
+                if !ancestor.pop() {
+                    return Err(e2ee::EncryptionError::InvalidSessionBinding);
+                }
+                missing.push(name);
+            }
+            Err(error) => return Err(e2ee::EncryptionError::CheckpointUnavailable(error.kind())),
+        }
+    }
 }
 
 fn diff_argument(options: &DiffOptions) -> Result<Option<String>> {
@@ -5854,6 +6564,66 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn typed_clone_rejects_http_secrets_before_initializing_destination() {
+        let directory = tempfile::tempdir().unwrap();
+        let session = RepositorySession::new(directory.path());
+        session.open().unwrap();
+        for url in [
+            "https://user:synthetic-secret@example.test/acme/repo",
+            "http://user:synthetic-secret@127.0.0.1:8787/acme/repo",
+            "https://example.test/acme/repo?token=synthetic-secret",
+            "http://127.0.0.1:8787/acme/repo#synthetic-secret",
+        ] {
+            for config in [
+                RemoteConfig::Http { url: url.into(), token_env: None },
+                RemoteConfig::EncryptedHttp {
+                    url: url.into(),
+                    uuid: "00010203-0405-4607-8809-0a0b0c0d0e0f".into(),
+                },
+            ] {
+                let error = session
+                    .clone_repository_with_config(config, None)
+                    .unwrap_err();
+                assert_eq!(error.code(), SdkErrorCode::InvalidArgument);
+                assert!(!error.message().contains("synthetic-secret"));
+                assert!(!directory.path().join(".graft").exists());
+            }
+        }
+    }
+
+    #[test]
+    fn clone_rejects_nonempty_destinations_before_initializing_or_reading_remote() {
+        for typed in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let precious = directory.path().join("existing.txt");
+            std::fs::write(&precious, b"existing user content").unwrap();
+            let session = RepositorySession::new(directory.path());
+            session.open().unwrap();
+            let error = if typed {
+                session.clone_repository_with_named_config(
+                    "vault",
+                    RemoteConfig::Http {
+                        url: "http://127.0.0.1:1/unreachable".into(),
+                        token_env: None,
+                    },
+                    None,
+                )
+            } else {
+                session.clone_repository("graft+http://127.0.0.1:1/unreachable", None, None)
+            }
+            .unwrap_err();
+            assert_eq!(error.code(), SdkErrorCode::RepositoryCommand);
+            assert!(
+                error
+                    .message()
+                    .contains("clone destination must be an empty directory")
+            );
+            assert_eq!(std::fs::read(precious).unwrap(), b"existing user content");
+            assert!(!directory.path().join(".graft").exists());
+        }
+    }
 
     #[test]
     fn planned_fetch_hydrates_target_without_materializing_and_applies_offline() {
@@ -7844,6 +8614,102 @@ mod tests {
         );
     }
 
+    #[cfg(all(feature = "e2ee", not(target_arch = "wasm32")))]
+    #[test]
+    fn encrypted_errors_preserve_typed_lifecycle_and_publication_outcomes() {
+        use graft::{
+            e2ee::{EncryptedHttpError, EncryptionError},
+            remote::RemoteErr,
+        };
+        for (error, expected) in [
+            (EncryptionError::Locked, EncryptedErrorCode::Locked),
+            (EncryptionError::Paused, EncryptedErrorCode::Paused),
+            (
+                EncryptionError::ConfigRollbackDetected,
+                EncryptedErrorCode::ConfigRollbackDetected,
+            ),
+            (
+                EncryptionError::CheckpointUnavailable(std::io::ErrorKind::PermissionDenied),
+                EncryptedErrorCode::CheckpointUnavailable,
+            ),
+        ] {
+            for layer in 0..3 {
+                let remote = RemoteErr::Encryption(EncryptedHttpError::Encryption(match &error {
+                    EncryptionError::Locked => EncryptionError::Locked,
+                    EncryptionError::Paused => EncryptionError::Paused,
+                    EncryptionError::ConfigRollbackDetected => {
+                        EncryptionError::ConfigRollbackDetected
+                    }
+                    EncryptionError::CheckpointUnavailable(kind) => {
+                        EncryptionError::CheckpointUnavailable(*kind)
+                    }
+                    _ => unreachable!(),
+                }));
+                let wrapped = match layer {
+                    0 => ErrCtx::Repo(graft::repo::RepoErr::Remote(remote)),
+                    1 => ErrCtx::Graft(graft::GraftErr::Remote(remote)),
+                    _ => ErrCtx::Setup(graft::setup::InitErr::Remote(remote)),
+                };
+                assert_eq!(
+                    repository_command_error(wrapped).code(),
+                    SdkErrorCode::Encrypted(expected)
+                );
+            }
+        }
+        // Classification is independent of translated/redacted message text.
+        let error = ErrCtx::Repo(graft::repo::RepoErr::Remote(EncryptionError::Locked.into()));
+        assert_eq!(
+            sdk_error_code_for_error(&error, "database locked; cancelled"),
+            SdkErrorCode::Encrypted(EncryptedErrorCode::Locked)
+        );
+        let unknown = repository_command_error(ErrCtx::Repo(graft::repo::RepoErr::Remote(
+            RemoteErr::EncryptedOutcomeUnknown {
+                source: Some(EncryptionError::Cancelled.into()),
+            },
+        )));
+        assert_eq!(
+            unknown.code(),
+            SdkErrorCode::RemotePublicationOutcomeUnknown
+        );
+        let unconfirmed = repository_command_error(ErrCtx::Graft(graft::GraftErr::Remote(
+            RemoteErr::EncryptedPublicationUnconfirmed,
+        )));
+        assert_eq!(
+            unconfirmed.code(),
+            SdkErrorCode::RemotePublicationUnconfirmed
+        );
+        let cancelled = repository_command_error(ErrCtx::Repo(graft::repo::RepoErr::Remote(
+            EncryptionError::Cancelled.into(),
+        )));
+        assert_eq!(cancelled.code(), SdkErrorCode::Cancelled);
+        assert_eq!(
+            encryption_error_code(&EncryptionError::AuthenticationFailed),
+            SdkErrorCode::Encrypted(EncryptedErrorCode::IntegrityFailed)
+        );
+        for status in [401, 403] {
+            assert_eq!(
+                encrypted_http_error_code(&EncryptedHttpError::HttpStatus(status)),
+                SdkErrorCode::Encrypted(EncryptedErrorCode::AuthenticationFailed)
+            );
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn encrypted_feature_unavailable_has_a_typed_sdk_error() {
+        let error = repository_command_error(ErrCtx::Repo(graft::repo::RepoErr::Remote(
+            graft::remote::RemoteErr::EncryptedRemoteUnavailable,
+        )));
+        assert_eq!(
+            error.code(),
+            SdkErrorCode::Encrypted(EncryptedErrorCode::UnsupportedEncryptedProfile)
+        );
+        assert_eq!(
+            error.code().as_str(),
+            "GRAFT_SDK_E2EE_UNSUPPORTED_ENCRYPTED_PROFILE"
+        );
+    }
+
     #[test]
     fn session_reuses_runtime_and_reopens_after_close() {
         let directory = tempfile::tempdir().unwrap();
@@ -8332,6 +9198,35 @@ mod tests {
         let error = with_cancellation(&cancellation, || session.repository_metadata()).unwrap_err();
         assert_eq!(error.code(), SdkErrorCode::Cancelled);
         assert_eq!(session.list_remotes().unwrap().telemetry.paths_examined, 0);
+    }
+
+    #[test]
+    fn encrypted_remote_metadata_is_public_profile_without_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = graft::repo::Repository::init(directory.path()).unwrap();
+        repository
+            .remote_add(
+                "origin",
+                RemoteConfig::EncryptedHttp {
+                    url: "https://encrypted.invalid/acme/repo".into(),
+                    uuid: "00010203-0405-4607-8809-0a0b0c0d0e0f".into(),
+                },
+            )
+            .unwrap();
+        drop(repository);
+        let session = RepositorySession::new(directory.path());
+        session.open().unwrap();
+        let remotes = session.list_remotes().unwrap();
+        assert_eq!(remotes.remotes[0].kind, SafeRemoteKind::EncryptedHttp);
+        assert_eq!(
+            remotes.remotes[0].url,
+            "https://encrypted.invalid/acme/repo"
+        );
+        assert_eq!(remotes.telemetry.paths_examined, 0);
+        assert_eq!(
+            serde_json::to_value(&remotes).unwrap()["remotes"][0]["kind"],
+            "encrypted_http"
+        );
     }
 
     #[test]

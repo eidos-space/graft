@@ -59,6 +59,10 @@ pub type Result<T> = std::result::Result<T, RemoteErr>;
 
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
 pub enum RemoteCredentialErr {
+    #[error("disconnect the encrypted session before changing its account credentials")]
+    EncryptedSessionActive,
+    #[error("encrypted session account binding does not match the authenticated credential")]
+    EncryptedSessionBindingMismatch,
     #[error("remote credential name must be a non-empty repository remote name")]
     InvalidRemoteName,
 
@@ -217,6 +221,10 @@ pub enum RemoteConfig {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         token_env: Option<String>,
     },
+    EncryptedHttp {
+        url: String,
+        uuid: String,
+    },
 }
 
 impl RemoteConfig {
@@ -331,6 +339,9 @@ impl Remote {
             RemoteConfig::Fs { .. } => Err(RemoteErr::UnsupportedInBrowser("filesystem")),
             RemoteConfig::S3Compatible { .. } => Err(RemoteErr::UnsupportedInBrowser("S3")),
             RemoteConfig::Http { .. } => Err(RemoteErr::UnsupportedInBrowser("HTTP")),
+            RemoteConfig::EncryptedHttp { .. } => {
+                Err(RemoteErr::UnsupportedInBrowser("encrypted HTTP"))
+            }
         }
     }
 
@@ -409,6 +420,14 @@ impl Remote {
             .expect("browser remote mutex poisoned")
             .get(path)
             .cloned())
+    }
+
+    pub(crate) fn buffered_read_limit(&self) -> Option<usize> {
+        None
+    }
+
+    pub(crate) async fn buffered_read_batches(&self, paths: &[String]) -> Result<Vec<Vec<String>>> {
+        Ok(vec![paths.to_vec()])
     }
 
     pub(crate) async fn has_raw(&self, path: &str) -> Result<bool> {

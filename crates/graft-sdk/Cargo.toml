@@ -22,11 +22,19 @@ parking_lot = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = "1.0"
 thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"], optional = true }
+zeroize = { workspace = true, optional = true }
 
 [features]
 default = []
+e2ee = ["graft/e2ee", "graft-sqlite/e2ee", "dep:tokio", "dep:zeroize"]
+native-crypto = ["e2ee", "graft/native-crypto"]
+macos-keychain = ["e2ee", "graft/macos-keychain"]
 bundled-sqlite = ["graft-sqlite/bundled-sqlite"]
 
 [dev-dependencies]
 rusqlite = { workspace = true }
+sha2 = { workspace = true }
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+zeroize = { workspace = true }

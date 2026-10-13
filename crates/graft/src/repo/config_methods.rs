@@ -9,13 +9,18 @@ impl Repository {
     }
 
     pub fn write_config(&self, config: &RepoConfig) -> Result<()> {
+        #[cfg(unix)]
+        let _mutation = self.mutation_guard()?;
         config.user.validate()?;
         config.merge.validate()?;
         let raw = toml::to_string_pretty(config)?;
         let path = self.config_path();
-        let temporary = path.with_extension("toml.tmp");
-        fs::write(&temporary, raw)?;
-        fs::rename(temporary, path)?;
+        let mut temporary = tempfile::NamedTempFile::new_in(&self.graft_dir)?;
+        std::io::Write::write_all(&mut temporary, raw.as_bytes())?;
+        temporary.as_file().sync_all()?;
+        temporary.persist(path).map_err(|error| error.error)?;
+        #[cfg(unix)]
+        fs::File::open(&self.graft_dir)?.sync_all()?;
         Ok(())
     }
 

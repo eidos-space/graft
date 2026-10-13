@@ -36,4 +36,5 @@ libc = "0.2.180"
 
 [features]
 default = []
+e2ee = ["graft/e2ee"]
 bundled-sqlite = ["rusqlite/bundled"]

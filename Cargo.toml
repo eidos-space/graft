@@ -16,6 +16,7 @@ codegen-units = 1
 
 [workspace.dependencies]
 anyhow = "1.0.100"
+argon2 = { version = "0.5.3", default-features = false }
 assert_matches = "1.5.0"
 base64 = "0.22.1"
 bilrost = "0.1014.1"
@@ -24,13 +25,17 @@ bs58 = "0.5.1"
 bytes = "1.10.1"
 bytestring = "1.5.0"
 circular-buffer = "1.2.0"
+chacha20poly1305 = { version = "0.10.1", default-features = false }
 clap = "4.5.49"
 config = { version = "0.15.18", features = ["toml"] }
 file-lock = "2.1.11"
 fjall = { path = "vendor/fjall", version = "3.1.6", features = ["bytes_1", "lz4"] }
 foldhash = "0.2.0"
 futures = "0.3.31"
+getrandom = "=0.4.1"
 hashbrown = "0.16.0"
+hkdf = "0.12.4"
+hmac = "0.12.1"
 ignore = "0.4.31"
 indoc = "2.0.7"
 itertools = "0.14.0"
@@ -45,6 +50,7 @@ range-set-blaze = "0.4.1"
 reqwest = { version = "0.12.26", default-features = false, features = ["hickory-dns", "rustls-tls", "stream"] }
 rusqlite = "0.38.0"
 serde = "1.0.228"
+security-framework = { version = "=3.7.0", default-features = false, features = ["OSX_10_15"] }
 sha2 = "0.10.9"
 splinter-rs = "0.12.1"
 static_assertions = "1.1.0"

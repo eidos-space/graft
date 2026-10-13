@@ -12,6 +12,8 @@ pub mod rt {
 }
 
 pub mod core;
+#[cfg(all(feature = "e2ee", not(target_arch = "wasm32")))]
+pub mod e2ee;
 pub mod err;
 pub mod oracle;
 #[cfg(not(target_arch = "wasm32"))]

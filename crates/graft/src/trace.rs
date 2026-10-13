@@ -107,7 +107,7 @@ fn duration_ms(duration: Duration) -> f64 {
     (duration.as_secs_f64() * 1_000.0 * 1_000.0).round() / 1_000.0
 }
 
-fn enabled() -> bool {
+pub(crate) fn enabled() -> bool {
     std::env::var_os(TRACE_ENV).is_some_and(|value| {
         let value = value.to_string_lossy();
         value == "1" || value.eq_ignore_ascii_case("true")

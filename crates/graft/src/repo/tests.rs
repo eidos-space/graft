@@ -4578,6 +4578,134 @@ fn push_noop_skips_remote_ref_lock() {
 }
 
 #[test]
+fn push_noop_repairs_missing_default_head_without_overwriting_existing_head() {
+    let remote_dir = tempfile::tempdir().unwrap();
+    let source_dir = tempfile::tempdir().unwrap();
+    let source = Repository::init(source_dir.path()).unwrap();
+    source
+        .remote_add(
+            "origin",
+            RemoteConfig::Fs {
+                root: remote_dir.path().to_string_lossy().into_owned(),
+            },
+        )
+        .unwrap();
+    let commit = source.commit("initial remote branch").unwrap();
+    source.push("origin", "main").unwrap();
+    // Reproduce a published branch whose initial symbolic HEAD did not survive.
+    fs::remove_file(remote_dir.path().join("HEAD")).unwrap();
+    source.branch_create("side", Some(&commit.id)).unwrap();
+    source.push("origin", "side").unwrap();
+    source.push("origin", "side").unwrap();
+    assert_eq!(source.remote_default_branch("origin").unwrap(), None);
+    let lock_path = remote_dir.path().join("locks/refs/heads/main.lock");
+    fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+    fs::write(lock_path, "held\n").unwrap();
+    let retried = source.push("origin", "main").unwrap();
+    assert_eq!(retried.head, commit.id);
+    assert_eq!(retried.commits, 0);
+    assert_eq!(
+        source.remote_default_branch("origin").unwrap().as_deref(),
+        Some("main")
+    );
+    fs::write(remote_dir.path().join("HEAD"), "ref: refs/heads/other\n").unwrap();
+    source.push("origin", "main").unwrap();
+    assert_eq!(
+        fs::read_to_string(remote_dir.path().join("HEAD")).unwrap(),
+        "ref: refs/heads/other\n"
+    );
+}
+
+#[test]
+#[cfg(all(feature = "e2ee", not(target_arch = "wasm32")))]
+fn initialization_push_rejects_source_changed_after_remote_observation() {
+    let remote_dir = tempfile::tempdir().unwrap();
+    let source_dir = tempfile::tempdir().unwrap();
+    let source = Repository::init(source_dir.path()).unwrap();
+    source
+        .remote_add(
+            "origin",
+            RemoteConfig::Fs {
+                root: remote_dir.path().to_string_lossy().into_owned(),
+            },
+        )
+        .unwrap();
+    let initial = source.commit("pinned initialization source").unwrap();
+    let intent = crate::e2ee::InitializationIntent::new("main".into(), initial.id).unwrap();
+    let observed = source.observe_remote_branch_head("origin", "main").unwrap();
+    source.commit("changed before initial publication").unwrap();
+    let stale = |result: Result<PushOutcome>| {
+        assert!(matches!(
+            result,
+            Err(RepoErr::Remote(crate::remote::RemoteErr::Encryption(
+                crate::e2ee::EncryptedHttpError::Encryption(
+                    crate::e2ee::EncryptionError::StaleObservation
+                )
+            )))
+        ));
+    };
+    stale(
+        source.push_initialization_intent_with_observed_head_and_snapshots(
+            "origin",
+            &intent,
+            observed,
+            crate::PreparedSnapshotPush::default(),
+        ),
+    );
+    stale(source.push_initialization_intent("origin", &intent));
+    assert!(!remote_dir.path().join("refs/heads/main").exists());
+    assert!(!remote_dir.path().join("objects").exists());
+    assert!(
+        source
+            .remote_tracking_ref("origin", "main")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+#[cfg(all(feature = "e2ee", not(target_arch = "wasm32")))]
+fn initialization_push_does_not_advance_an_existing_different_remote_head() {
+    let remote_dir = tempfile::tempdir().unwrap();
+    let source_dir = tempfile::tempdir().unwrap();
+    let source = Repository::init(source_dir.path()).unwrap();
+    source
+        .remote_add(
+            "origin",
+            RemoteConfig::Fs {
+                root: remote_dir.path().to_string_lossy().into_owned(),
+            },
+        )
+        .unwrap();
+    let earlier = source.commit("already published ancestor").unwrap();
+    source.push("origin", "main").unwrap();
+    let selected = source.commit("selected initial source").unwrap();
+    let intent = crate::e2ee::InitializationIntent::new("main".into(), selected.id).unwrap();
+    let before_ref = fs::read(remote_dir.path().join("refs/heads/main")).unwrap();
+    let before_head = fs::read(remote_dir.path().join("HEAD")).unwrap();
+    assert!(matches!(
+        source.push_initialization_intent("origin", &intent),
+        Err(RepoErr::Remote(crate::remote::RemoteErr::Encryption(
+            crate::e2ee::EncryptedHttpError::Encryption(
+                crate::e2ee::EncryptionError::StaleObservation
+            )
+        )))
+    ));
+    assert_eq!(
+        fs::read(remote_dir.path().join("refs/heads/main")).unwrap(),
+        before_ref
+    );
+    assert_eq!(
+        fs::read(remote_dir.path().join("HEAD")).unwrap(),
+        before_head
+    );
+    assert_eq!(
+        source.remote_tracking_ref("origin", "main").unwrap(),
+        Some(earlier.id)
+    );
+}
+
+#[test]
 fn force_push_overwrites_non_fast_forward_remote_ref() {
     let remote_dir = tempfile::tempdir().unwrap();
     let remote = RemoteConfig::Fs {
@@ -4653,6 +4781,130 @@ fn push_rejects_when_remote_ref_lock_is_held() {
     ));
     assert_eq!(source.remote_tracking_ref("origin", "main").unwrap(), None);
     assert!(!remote_dir.path().join("refs/heads/main").exists());
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn observed_push_rejects_wrong_branch_repository_and_changed_remote_configuration() {
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let repo = Repository::init(directory.path()).unwrap();
+    let config = RemoteConfig::Fs {
+        root: first.path().to_string_lossy().into_owned(),
+    };
+    repo.remote_add("origin", config.clone()).unwrap();
+    repo.commit("initial").unwrap();
+    let observed = repo.observe_remote_branch_head("origin", "main").unwrap();
+    assert!(observed.head().is_none());
+    assert!(matches!(
+        repo.push_branch_with_observed_head_and_snapshots(
+            "origin",
+            "main",
+            "other",
+            false,
+            observed,
+            crate::PreparedSnapshotPush::default()
+        ),
+        Err(RepoErr::RemoteRefChanged { .. })
+    ));
+    let observed = repo.observe_remote_branch_head("origin", "main").unwrap();
+    let other_directory = tempfile::tempdir().unwrap();
+    let other = Repository::init(other_directory.path()).unwrap();
+    other.remote_add("origin", config).unwrap();
+    other.commit("different repository").unwrap();
+    assert!(matches!(
+        other.push_branch_with_observed_head_and_snapshots(
+            "origin",
+            "main",
+            "main",
+            false,
+            observed,
+            crate::PreparedSnapshotPush::default()
+        ),
+        Err(RepoErr::RemoteRefChanged { .. })
+    ));
+    let observed = repo.observe_remote_branch_head("origin", "main").unwrap();
+    repo.remote_set_url(
+        "origin",
+        RemoteConfig::Fs {
+            root: second.path().to_string_lossy().into_owned(),
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        repo.push_branch_with_observed_head_and_snapshots(
+            "origin",
+            "main",
+            "main",
+            false,
+            observed,
+            crate::PreparedSnapshotPush::default()
+        ),
+        Err(RepoErr::RemoteRefChanged { .. })
+    ));
+    for remote in [first, second] {
+        assert!(!remote.path().join("refs/heads/main").exists());
+        assert!(!remote.path().join("objects").exists());
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn observed_push_preserves_read_time_ref_and_confirms_tracking_after_publication() {
+    let remote_directory = tempfile::tempdir().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let repo = Repository::init(directory.path()).unwrap();
+    repo.remote_add(
+        "origin",
+        RemoteConfig::Fs {
+            root: remote_directory.path().to_string_lossy().into_owned(),
+        },
+    )
+    .unwrap();
+    let base = repo.commit("initial").unwrap();
+    let observed = repo.observe_remote_branch_head("origin", "main").unwrap();
+    repo.push_branch_with_observed_head_and_snapshots(
+        "origin",
+        "main",
+        "main",
+        false,
+        observed,
+        crate::PreparedSnapshotPush::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        repo.remote_tracking_ref("origin", "main").unwrap(),
+        Some(base.id.clone())
+    );
+    let observed = repo.observe_remote_branch_head("origin", "main").unwrap();
+    assert_eq!(observed.head(), Some(base.id.as_str()));
+    let competing = "f".repeat(64);
+    fs::write(
+        remote_directory.path().join("refs/heads/main"),
+        format!("{competing}\n"),
+    )
+    .unwrap();
+    repo.commit("next").unwrap();
+    assert!(matches!(
+        repo.push_branch_with_observed_head_and_snapshots(
+            "origin",
+            "main",
+            "main",
+            false,
+            observed,
+            crate::PreparedSnapshotPush::default()
+        ),
+        Err(RepoErr::RemoteRefChanged { .. })
+    ));
+    assert_eq!(
+        repo.remote_tracking_ref("origin", "main").unwrap(),
+        Some(base.id)
+    );
+    assert_eq!(
+        fs::read_to_string(remote_directory.path().join("refs/heads/main")).unwrap(),
+        format!("{competing}\n")
+    );
 }
 
 #[test]

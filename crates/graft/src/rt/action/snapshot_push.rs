@@ -3,14 +3,15 @@ use std::{
     sync::Arc,
 };
 
-use bytes::Bytes;
 use bilrost::Message;
+use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream};
 use tokio::task::spawn_blocking;
 
 use crate::core::{
-    CommitHashBuilder, LogId, PageCount, SegmentId, commit_hash::CommitHash,
+    CommitHashBuilder, LogId, PageCount, SegmentId,
     commit::{Commit, SegmentIdx},
+    commit_hash::CommitHash,
     lsn::LSN,
 };
 use crate::{
@@ -23,6 +24,9 @@ use crate::{
 };
 
 const SEGMENT_EXISTS_CONCURRENCY: usize = 5;
+
+#[cfg(all(feature = "e2ee", unix))]
+mod encrypted;
 
 #[derive(Debug)]
 struct SnapshotUpload {
@@ -93,10 +97,22 @@ pub(crate) async fn prepare_snapshots(
     }
 
     let collect_trace = crate::trace::PushTraceSpan::new("sqlite_snapshot_collect");
+    #[cfg(all(feature = "e2ee", unix))]
+    let secret_cancellation = crate::repo::active_secret_cancellation_probe();
     let commits = spawn_blocking({
         let storage = storage.clone();
         let cancellation = cancellation.clone();
-        move || collect_snapshots_commits(storage, snapshots, cancellation)
+        #[cfg(all(feature = "e2ee", unix))]
+        let secret_cancellation = secret_cancellation.clone();
+        move || {
+            #[cfg(all(feature = "e2ee", unix))]
+            if let Some(probe) = secret_cancellation {
+                return crate::repo::with_secret_cancellation(probe, || {
+                    collect_snapshots_commits(storage, snapshots, cancellation)
+                });
+            }
+            collect_snapshots_commits(storage, snapshots, cancellation)
+        }
     })
     .await
     .expect("snapshot upload commit collection task failed")?;
@@ -119,8 +135,18 @@ pub(crate) async fn prepare_snapshots(
         BTreeSet::new()
     };
     negotiation_trace.finish(&[("existing_segments", existing_segments.len() as u64)]);
+    #[cfg(all(feature = "e2ee", unix))]
+    if remote.buffered_read_limit().is_some() {
+        return encrypted::prepare(storage, remote, commits, existing_segments, cancellation).await;
+    }
     let build_trace = crate::trace::PushTraceSpan::new("sqlite_snapshot_build");
     let uploads = spawn_blocking(move || {
+        #[cfg(all(feature = "e2ee", unix))]
+        if let Some(probe) = secret_cancellation {
+            return crate::repo::with_secret_cancellation(probe, || {
+                build_uploads(storage, commits, existing_segments, cancellation)
+            });
+        }
         build_uploads(storage, commits, existing_segments, cancellation)
     })
     .await
@@ -257,9 +283,7 @@ fn build_uploads(
         if segment_available_or_planned && !segment_idx.frames.is_empty() {
             let commit_hash = match commit.commit_hash.clone() {
                 Some(commit_hash) => commit_hash,
-                None => {
-                    commit_hash_for_segment_idx(&reader, &commit, &segment_idx, &cancellation)?
-                }
+                None => commit_hash_for_segment_idx(&reader, &commit, &segment_idx, &cancellation)?,
             };
             uploads.push(SnapshotUpload {
                 commit: commit
@@ -354,6 +378,10 @@ fn build_segment_for_commit(
 fn cancellation_checkpoint(
     cancellation: &Option<CancellationToken>,
 ) -> std::result::Result<(), GraftErr> {
+    #[cfg(all(feature = "e2ee", unix))]
+    if crate::repo::cancellation_checkpoint().is_err() {
+        return Err(LogicalErr::Cancelled.into());
+    }
     if cancellation
         .as_ref()
         .is_some_and(CancellationToken::is_cancelled)

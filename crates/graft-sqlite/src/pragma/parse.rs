@@ -58,6 +58,7 @@ pub(super) fn parse_repo_clone_arg(arg: &str) -> Result<RepoCloneSpec, PragmaErr
         return Err(pragma_fail("branch name must not be empty"));
     }
     Ok(RepoCloneSpec {
+        remote_name: "origin".into(),
         config: parse_remote_config_uri(uri)?,
         branch: branch.map(str::to_string),
         worktree,

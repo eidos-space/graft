@@ -29,12 +29,26 @@ pub use path_history::{
 pub mod index;
 mod inventory;
 mod merge;
+#[cfg(unix)]
+mod mutation_gate;
+#[cfg(unix)]
+pub use mutation_gate::RepositoryMutationGuard;
+#[cfg(all(feature = "e2ee", not(target_arch = "wasm32")))]
+mod migration;
+#[cfg(all(feature = "e2ee", not(target_arch = "wasm32")))]
+pub use migration::{
+    MigrationDependencyPublication, MigrationDependencyVerification, MigrationPlanningBudget,
+    MigrationPublicationBudget, MigrationRefSelection, MigrationSourcePlan, MigrationTargetPlan,
+    MigrationTargetRef, MigrationVerificationBudget,
+};
 pub mod object;
 mod refs;
 mod refspec;
 mod remote_objects;
 mod staging;
 mod sync;
+#[cfg(not(target_arch = "wasm32"))]
+pub use sync::ObservedRemoteBranchHead;
 pub use sync::PreparedFetch;
 mod worktree;
 mod worktree_state;
@@ -94,6 +108,8 @@ const ARTIFACT_STAT_CACHE_MAX_ENTRIES: usize = 100_000;
 
 thread_local! {
     static ACTIVE_CANCELLATION: RefCell<Option<CancellationToken>> = const { RefCell::new(None) };
+    #[cfg(all(feature = "e2ee", unix))]
+    static ACTIVE_SECRET_CANCELLATION: RefCell<Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>> = const { RefCell::new(None) };
     static ACTIVE_TRANSFER_PROGRESS: RefCell<Option<TransferProgressReporter>> = const { RefCell::new(None) };
 }
 
@@ -404,6 +420,12 @@ pub fn with_cancellation<T>(token: &CancellationToken, operation: impl FnOnce() 
 
 /// Returns [`RepoErr::Cancelled`] when the current operation's token was cancelled.
 pub fn cancellation_checkpoint() -> Result<()> {
+    #[cfg(all(feature = "e2ee", unix))]
+    if ACTIVE_SECRET_CANCELLATION
+        .with(|active| active.borrow().as_ref().is_some_and(|probe| probe()))
+    {
+        return Err(RepoErr::Cancelled);
+    }
     let cancelled = ACTIVE_CANCELLATION.with(|active| {
         active
             .borrow()
@@ -416,8 +438,30 @@ pub fn cancellation_checkpoint() -> Result<()> {
     Ok(())
 }
 
+/// Add a scoped native session check while retaining the host's cancellation token.
+#[cfg(all(feature = "e2ee", unix))]
+pub(crate) fn with_secret_cancellation<T>(
+    probe: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+    operation: impl FnOnce() -> T,
+) -> T {
+    struct Scope(Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>);
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            ACTIVE_SECRET_CANCELLATION.with(|active| active.replace(self.0.take()));
+        }
+    }
+    let _scope = Scope(ACTIVE_SECRET_CANCELLATION.with(|active| active.replace(Some(probe))));
+    operation()
+}
+
 pub(crate) fn active_cancellation_token() -> Option<CancellationToken> {
     ACTIVE_CANCELLATION.with(|active| active.borrow().clone())
+}
+
+#[cfg(all(feature = "e2ee", unix))]
+pub(crate) fn active_secret_cancellation_probe()
+-> Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>> {
+    ACTIVE_SECRET_CANCELLATION.with(|active| active.borrow().clone())
 }
 
 const CONFIG_FILE: &str = "config.toml";
@@ -444,8 +488,24 @@ const REMOTE_EXTERNAL_PAYLOAD_PROBE_CONCURRENCY: usize = 5;
 const REMOTE_OBJECT_PACK_VERSION: u32 = 1;
 const REMOTE_OBJECT_PACK_MAGIC: &[u8] = b"graft-object-pack-v1\n";
 
+#[cfg(all(feature = "e2ee", not(target_arch = "wasm32")))]
+mod e2ee_pack;
+#[cfg(all(feature = "e2ee", unix))]
+mod e2ee_push;
+mod fetch_boundary;
+mod index_budget;
+#[cfg(all(feature = "e2ee", not(target_arch = "wasm32")))]
+pub(crate) use e2ee_pack::{
+    split_verified_pack, verified_pack_file_topology, verified_pack_topology,
+};
+
 #[derive(Debug, Error)]
 pub enum RepoErr {
+    #[error("repository is busy with another operation")]
+    MutationBusy,
+
+    #[error("repository mutation guard is no longer valid")]
+    MutationFenceStale,
     #[error("invalid path history request: {0}")]
     InvalidPathHistory(String),
 
@@ -649,7 +709,7 @@ impl Head {
         }
     }
 
-    fn serialize(&self) -> String {
+    pub(crate) fn serialize(&self) -> String {
         match self {
             Self::Branch { name } => format!("ref: refs/heads/{name}\n"),
             Self::Detached { commit } => format!("{commit}\n"),
@@ -806,7 +866,28 @@ struct RemoteObjectPackCommit {
 struct RemoteObjectPackCache {
     indexes: Option<Vec<RemoteObjectPackIndex>>,
     packs: BTreeMap<String, Bytes>,
+    pack_order: std::collections::VecDeque<String>,
+    object_locations: BTreeMap<object::ObjectId, (usize, usize)>,
+    pack_sizes: Vec<u64>,
+    imported_packs: BTreeSet<String>,
+    imported_commits: BTreeSet<object::ObjectId>,
+    pending_payloads: BTreeMap<object::ObjectId, u64>,
     index_cache_dir: Option<PathBuf>,
+}
+
+fn remote_object_pack_extents(indexes: &[RemoteObjectPackIndex]) -> BTreeMap<&str, u64> {
+    let mut extents = BTreeMap::<&str, u64>::new();
+    for index in indexes {
+        let extent = index
+            .objects
+            .iter()
+            .filter_map(|entry| entry.offset.checked_add(entry.len))
+            .max()
+            .unwrap_or(0);
+        let maximum = extents.entry(&index.pack).or_default();
+        *maximum = (*maximum).max(extent);
+    }
+    extents
 }
 
 impl RemoteObjectPackCache {
@@ -819,24 +900,128 @@ impl RemoteObjectPackCache {
 
     fn indexes(&mut self, remote: &crate::remote::Remote) -> Result<&[RemoteObjectPackIndex]> {
         if self.indexes.is_none() {
-            self.indexes = Some(fetch_remote_object_pack_indexes(
-                remote,
-                self.index_cache_dir.as_deref(),
-            )?);
+            let mut indexes =
+                fetch_remote_object_pack_indexes(remote, self.index_cache_dir.as_deref())?;
+            for index in &mut indexes {
+                index
+                    .objects
+                    .sort_unstable_by(|left, right| left.id.cmp(&right.id));
+            }
+            // This is an advisory lookup, not an integrity proof. Canonical
+            // object hashing below remains mandatory. Keep its extra identity
+            // inventory bounded even for a larger remote index collection.
+            if indexes
+                .iter()
+                .map(|index| index.objects.len())
+                .sum::<usize>()
+                <= 100_000
+            {
+                for (pack, index) in indexes.iter().enumerate() {
+                    for (entry, object) in index.objects.iter().enumerate() {
+                        self.object_locations
+                            .entry(object.id.clone())
+                            .or_insert((pack, entry));
+                    }
+                }
+            }
+            // Historical indexes may describe different portions of one pack.
+            // Admit its combined extent, rather than depending on index order.
+            let pack_extents = remote_object_pack_extents(&indexes);
+            self.pack_sizes = indexes
+                .iter()
+                .map(|index| pack_extents[index.pack.as_str()])
+                .collect();
+            self.indexes = Some(indexes);
         }
         Ok(self.indexes.as_deref().expect("pack indexes initialized"))
     }
 
+    fn locate_object(
+        &mut self,
+        remote: &crate::remote::Remote,
+        id: &object::ObjectId,
+    ) -> Result<Option<(String, u64, u64, u64)>> {
+        self.indexes(remote)?;
+        let indexes = self.indexes.as_ref().expect("pack indexes initialized");
+        let location = self.object_locations.get(id).copied().or_else(|| {
+            if !self.object_locations.is_empty() {
+                return None;
+            }
+            indexes.iter().enumerate().find_map(|(pack, index)| {
+                index
+                    .objects
+                    .binary_search_by(|entry| entry.id.cmp(id))
+                    .ok()
+                    .map(|entry| (pack, entry))
+            })
+        });
+        Ok(location.map(|(pack, entry)| {
+            let index = &indexes[pack];
+            let object = &index.objects[entry];
+            (
+                index.pack.clone(),
+                object.offset,
+                object.len,
+                self.pack_sizes[pack],
+            )
+        }))
+    }
+
+    fn cache_pack(&mut self, remote: &crate::remote::Remote, pack: String, bytes: Bytes) {
+        self.pack_order.retain(|key| key != &pack);
+        self.reserve_pack_bytes(remote, bytes.len());
+        self.pack_order.push_back(pack.clone());
+        self.packs.insert(pack, bytes);
+    }
+
+    fn reserve_pack_bytes(&mut self, remote: &crate::remote::Remote, length: usize) {
+        if let Some(maximum) = remote.buffered_read_limit() {
+            let mut retained: usize = self.packs.values().map(Bytes::len).sum();
+            while retained > maximum.saturating_sub(length) {
+                let Some(evicted) = self.pack_order.pop_front() else {
+                    break;
+                };
+                if let Some(value) = self.packs.remove(&evicted) {
+                    retained -= value.len();
+                }
+            }
+        }
+    }
+
     fn pack_bytes(&mut self, remote: &crate::remote::Remote, pack: &str) -> Result<Bytes> {
         if let Some(bytes) = self.packs.get(pack) {
+            self.pack_order.retain(|key| key != pack);
+            self.pack_order.push_back(pack.to_string());
             return Ok(bytes.clone());
         }
-        let bytes =
+        let bytes = if let Some(maximum) = remote.buffered_read_limit() {
+            let index = self
+                .indexes(remote)?
+                .iter()
+                .position(|index| index.pack == pack)
+                .ok_or_else(|| RepoErr::InvalidRemoteObject {
+                    path: pack.into(),
+                    message: "pack has no index".into(),
+                })?;
+            let size = usize::try_from(self.pack_sizes[index])
+                .ok()
+                .filter(|size| *size <= maximum)
+                .ok_or_else(|| RepoErr::InvalidRemoteObject {
+                    path: pack.into(),
+                    message: "pack exceeds buffered read budget".into(),
+                })?;
+            // Reserve before downloading. The bounded, authenticated range can
+            // never allocate more pack bytes than the admitted index extent;
+            // an oversized/forged extent remains subject to the host budget.
+            self.reserve_pack_bytes(remote, size);
+            block_on_remote(remote.get_raw_range(pack, 0..size as u64))?
+        } else {
             block_on_remote(remote.get_raw(pack))?.ok_or_else(|| RepoErr::InvalidRemoteObject {
                 path: pack.to_string(),
                 message: "missing pack object".to_string(),
-            })?;
-        self.packs.insert(pack.to_string(), bytes.clone());
+            })?
+        };
+        self.cache_pack(remote, pack.to_string(), bytes.clone());
         Ok(bytes)
     }
 
@@ -855,6 +1040,10 @@ impl RemoteObjectPackCache {
         }
 
         let prefetch_trace = crate::trace::PushTraceSpan::new("remote_pack_prefetch");
+        if remote.buffered_read_limit().is_some() {
+            self.packs.clear();
+            self.pack_order.clear();
+        }
         let mut fetched = match block_on_remote(remote.get_raw_bundle(&missing))? {
             ReadBundleOutcome::Downloaded(objects) => objects,
             ReadBundleOutcome::Unsupported => block_on_remote(async {
@@ -879,7 +1068,7 @@ impl RemoteObjectPackCache {
                     message: "missing pack object".to_string(),
                 })?;
             fetched_bytes += bytes.len() as u64;
-            self.packs.insert(pack.clone(), bytes);
+            self.cache_pack(remote, pack.clone(), bytes);
         }
         prefetch_trace.finish(&[("packs", missing.len() as u64), ("bytes", fetched_bytes)]);
         Ok(missing.len())
@@ -2033,6 +2222,12 @@ impl Repository {
             user_identity: None,
         };
 
+        #[cfg(unix)]
+        let _mutation = {
+            fs::create_dir_all(&repo.graft_dir)?;
+            repo.mutation_guard()?
+        };
+
         repo.create_layout()?;
 
         if !repo.config_path().exists() {
@@ -2701,62 +2896,52 @@ fn fetch_remote_object_pack_indexes(
         .filter(|path| path.ends_with(".idx"))
         .collect::<Vec<_>>();
     let listed_indexes = paths.len() as u64;
-
-    let mut loaded = Vec::new();
+    let mut budget = index_budget::PackIndexBudget::new(remote.buffered_read_limit(), paths.len())?;
+    let mut indexes = Vec::new();
     let mut missing = Vec::new();
     for path in paths {
         let cache_path =
             cache_dir.and_then(|cache_dir| remote_object_pack_index_cache_path(cache_dir, &path));
         if let Some(cache_path) = cache_path.as_deref()
-            && let Ok(bytes) = fs::read(cache_path)
-            && decode_remote_object_pack_index(&path, &bytes).is_ok()
+            && let Some(index) = budget.cached(&path, cache_path)?
         {
-            loaded.push((path, Bytes::from(bytes), false, cache_path.to_path_buf()));
+            indexes.push(index);
         } else {
             missing.push((path, cache_path));
         }
     }
-    let cache_hits = loaded.len() as u64;
+    let cache_hits = indexes.len() as u64;
     let fetched_indexes = missing.len() as u64;
 
     let missing_paths = missing
         .iter()
         .map(|(path, _)| path.clone())
         .collect::<Vec<_>>();
-    let mut fetched = match block_on_remote(remote.get_raw_bundle(&missing_paths))? {
-        ReadBundleOutcome::Downloaded(objects) => objects,
-        ReadBundleOutcome::Unsupported => block_on_remote(async {
-            stream::iter(missing_paths)
-                .map(|path| async move {
-                    Ok::<_, RemoteErr>((path.clone(), remote.get_raw(&path).await?))
-                })
-                .buffered(REMOTE_REF_READ_CONCURRENCY)
-                .try_filter_map(|(path, bytes)| async move { Ok(bytes.map(|bytes| (path, bytes))) })
-                .try_collect::<BTreeMap<_, _>>()
-                .await
-        })?,
-    };
-    for (path, cache_path) in missing {
-        if let Some(bytes) = fetched.remove(&path) {
-            loaded.push((path, bytes, true, cache_path.unwrap_or_default()));
+    let mut missing = missing.into_iter().collect::<BTreeMap<_, _>>();
+    for batch in block_on_remote(remote.buffered_read_batches(&missing_paths))? {
+        let fetched = match block_on_remote(remote.get_raw_bundle(&batch))? {
+            ReadBundleOutcome::Downloaded(objects) => objects,
+            ReadBundleOutcome::Unsupported => block_on_remote(async {
+                stream::iter(batch)
+                    .map(|path| async move {
+                        Ok::<_, RemoteErr>((path.clone(), remote.get_raw(&path).await?))
+                    })
+                    .buffered(REMOTE_REF_READ_CONCURRENCY)
+                    .try_filter_map(
+                        |(path, bytes)| async move { Ok(bytes.map(|bytes| (path, bytes))) },
+                    )
+                    .try_collect::<BTreeMap<_, _>>()
+                    .await
+            })?,
+        };
+        for (path, bytes) in fetched {
+            let index = budget.decode(&path, &bytes)?;
+            if let Some(Some(cache_path)) = missing.remove(&path) {
+                let _ = write_remote_object_pack_index_cache(&cache_path, &bytes);
+            }
+            indexes.push(index);
         }
     }
-
-    let indexes = loaded
-        .into_iter()
-        .map(|(path, bytes, fetched, cache_path)| {
-            let index = decode_remote_object_pack_index(&path, &bytes)?;
-            if fetched && !cache_path.as_os_str().is_empty() {
-                // This is a disposable performance hint. A partial or corrupt cache entry is
-                // ignored and repaired from the immutable remote index on the next fetch.
-                if let Some(parent) = cache_path.parent() {
-                    let _ = fs::create_dir_all(parent);
-                }
-                let _ = fs::write(cache_path, &bytes);
-            }
-            Ok(index)
-        })
-        .collect::<Result<Vec<_>>>()?;
     fetch_trace.finish(&[
         ("listed_indexes", listed_indexes),
         ("cache_hits", cache_hits),
@@ -2774,12 +2959,31 @@ fn remote_object_pack_index_cache_path(cache_dir: &Path, remote_path: &str) -> O
     Some(cache_dir.join(name))
 }
 
+fn write_remote_object_pack_index_cache(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let parent = path.parent().ok_or(std::io::ErrorKind::InvalidInput)?;
+    fs::create_dir_all(parent)?;
+    let mut staged = tempfile::NamedTempFile::new_in(parent)?;
+    staged.write_all(bytes)?;
+    // Replace the directory entry atomically; never follow an existing cache
+    // symlink or expose a partially written index to concurrent readers.
+    staged.persist(path).map_err(|error| error.error)?;
+    Ok(())
+}
+
 fn decode_remote_object_pack_index(path: &str, bytes: &[u8]) -> Result<RemoteObjectPackIndex> {
     let index: RemoteObjectPackIndex =
         serde_json::from_slice(bytes).map_err(|err| RepoErr::InvalidRemoteObject {
             path: path.to_string(),
             message: format!("invalid pack index JSON: {err}"),
         })?;
+    validate_remote_object_pack_index(path, index)
+}
+
+fn validate_remote_object_pack_index(
+    path: &str,
+    index: RemoteObjectPackIndex,
+) -> Result<RemoteObjectPackIndex> {
     if index.version != REMOTE_OBJECT_PACK_VERSION {
         return Err(RepoErr::InvalidRemoteObject {
             path: path.to_string(),
@@ -3307,7 +3511,7 @@ fn is_invalid_ref_char(ch: char) -> bool {
     ch.is_control() || ch.is_whitespace() || matches!(ch, '~' | '^' | ':' | '?' | '*' | '[' | '\\')
 }
 
-fn validate_full_ref(reference: &str) -> Result<()> {
+pub(crate) fn validate_full_ref(reference: &str) -> Result<()> {
     if let Some(name) = reference.strip_prefix("refs/heads/") {
         validate_ref_name(name)
     } else if let Some(rest) = reference.strip_prefix("refs/remotes/") {

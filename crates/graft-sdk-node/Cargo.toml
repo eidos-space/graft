@@ -22,6 +22,14 @@ graft-sdk = { path = "../graft-sdk", version = "0.3.30", features = ["bundled-sq
 napi = { workspace = true }
 napi-derive = { workspace = true }
 serde_json = "1.0"
+zeroize = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["rt-multi-thread"], optional = true }
+tempfile = { workspace = true, optional = true }
+
+[features]
+default = []
+e2ee = ["graft-sdk/native-crypto", "dep:zeroize", "dep:tokio", "dep:tempfile", "napi/tokio_rt"]
+macos-keychain = ["e2ee", "graft-sdk/macos-keychain"]
 
 [build-dependencies]
 napi-build = { workspace = true }

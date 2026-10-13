@@ -1,5 +1,48 @@
 use super::*;
 
+enum PushRefExpected {
+    Raw(Option<Bytes>),
+    #[cfg(not(target_arch = "wasm32"))]
+    Observed(crate::remote::RemoteRefObservation),
+}
+
+struct PushRemoteHead {
+    store: Remote,
+    head: Option<String>,
+    expected: PushRefExpected,
+    expected_source_head: Option<String>,
+}
+
+impl PushRefExpected {
+    fn bytes(&self) -> Option<&Bytes> {
+        match self {
+            Self::Raw(bytes) => bytes.as_ref(),
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::Observed(observed) => observed.bytes(),
+        }
+    }
+}
+
+/// Read-time remote and branch binding carried intact into publication.
+/// Its fields cannot be fabricated from a plaintext target or serialized.
+#[cfg(not(target_arch = "wasm32"))]
+pub struct ObservedRemoteBranchHead {
+    remote_name: String,
+    branch: String,
+    store: Remote,
+    observation: crate::remote::RemoteRefObservation,
+    head: Option<String>,
+    graft_dir: PathBuf,
+    config: RemoteConfig,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl ObservedRemoteBranchHead {
+    pub fn head(&self) -> Option<&str> {
+        self.head.as_deref()
+    }
+}
+
 /// Immutable metadata fetched for a branch, before external payload downloads.
 /// Dropping this preparation leaves refs, index, and worktree unchanged.
 pub struct PreparedFetch<'a> {
@@ -7,6 +50,7 @@ pub struct PreparedFetch<'a> {
     remote: Remote,
     outcome: FetchOutcome,
     payload_bytes: u64,
+    boundary: fetch_boundary::FetchBoundary,
 }
 
 impl PreparedFetch<'_> {
@@ -30,14 +74,18 @@ impl PreparedFetch<'_> {
     /// Download and validate external payloads, then publish the tracking ref.
     pub fn finish(self) -> Result<FetchOutcome> {
         cancellation_checkpoint()?;
-        self.repository
-            .fetch_commit_chain(&self.remote, &self.outcome.head)?;
+        self.repository.fetch_commit_chain_with_boundary(
+            &self.remote,
+            &self.outcome.head,
+            &self.boundary,
+        )?;
         cancellation_checkpoint()?;
         self.repository.set_remote_tracking_ref(
             &self.outcome.remote,
             &self.outcome.branch,
             &self.outcome.head,
         )?;
+        self.boundary.remember(&self.outcome.head)?;
         Ok(self.outcome)
     }
 }
@@ -56,7 +104,8 @@ impl Repository {
         });
         let remote_store = self.remote_store(remote)?;
         let head_path = format!("refs/heads/{branch}");
-        let have = self.remote_tracking_ref(remote, branch)?;
+        let have = self.verified_fetch_have(remote, branch)?;
+        let boundary = self.fetch_boundary(&remote_store, remote, branch, have.as_deref())?;
         let bundle = tempfile::tempdir()?;
         let downloaded = block_on_remote(remote_store.download_fetch_bundle(
             &head_path,
@@ -90,8 +139,9 @@ impl Repository {
                 (parse_remote_ref(&head_path, head)?, BTreeSet::new())
             }
         };
-        let (fetched, payload_bytes) = self.fetch_graph_metadata(&remote_store, &head)?;
-        let reachable = self.commit_ancestors_inclusive(&head)?;
+        let (fetched, payload_bytes) =
+            self.fetch_graph_metadata(&remote_store, &head, &boundary)?;
+        let reachable = self.fetched_commit_ancestors(&head, &boundary)?;
         let commits = fetched + imported.intersection(&reachable).count();
         Ok(PreparedFetch {
             repository: self,
@@ -103,6 +153,7 @@ impl Repository {
                 commits,
             },
             payload_bytes,
+            boundary,
         })
     }
 
@@ -117,6 +168,17 @@ impl Repository {
         validate_remote_name(remote)?;
         validate_ref_name(branch)?;
         let network_remote = self.remote_store(remote)?;
+        if network_remote.buffered_read_limit().is_some() {
+            // Encrypted aggregate fetches select packs only. Complete omitted
+            // canonical dependencies against the encrypted remote before clone.
+            let fetch = self.fetch_with_bundle_or_store(remote, branch, &network_remote)?;
+            self.remote_credentials.reset_http_clients();
+            return Ok(CloneFetch {
+                fetch,
+                remote: Arc::new(self.remote_store(remote)?),
+                _bundle: None,
+            });
+        }
         let head_path = format!("refs/heads/{branch}");
         let bundle = tempfile::tempdir()?;
         let outcome =
@@ -172,6 +234,24 @@ impl Repository {
         })
     }
 
+    fn verified_fetch_have(&self, remote: &str, branch: &str) -> Result<Option<String>> {
+        Ok(self.remote_tracking_ref(remote, branch)?.filter(|head| {
+            object::ObjectId::from_str(head).ok().is_some_and(|id| {
+                self.object_store()
+                    .read_raw(&id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|bytes| {
+                        object::ObjectId::for_bytes(&bytes) == id
+                            && matches!(
+                                object::Object::decode(&bytes),
+                                Ok(object::Object::Commit(_))
+                            )
+                    })
+            })
+        }))
+    }
+
     fn fetch_with_bundle_or_store(
         &self,
         remote: &str,
@@ -180,7 +260,8 @@ impl Repository {
     ) -> Result<FetchOutcome> {
         let trace = crate::trace::PushTraceSpan::new("remote_fetch_bundle");
         let head_path = format!("refs/heads/{branch}");
-        let have = self.remote_tracking_ref(remote, branch)?;
+        let have = self.verified_fetch_have(remote, branch)?;
+        let boundary = self.fetch_boundary(remote_store, remote, branch, have.as_deref())?;
         let bundle = tempfile::tempdir()?;
         let outcome = block_on_remote(remote_store.download_fetch_bundle(
             &head_path,
@@ -199,10 +280,11 @@ impl Repository {
                 };
                 let head = parse_remote_ref(&format!("refs/heads/{branch}"), head)?;
                 let imported = self.import_remote_object_pack_bundle(bundle.path())?;
-                let fetched = self.fetch_commit_chain(remote_store, &head)?;
-                let reachable = self.commit_ancestors_inclusive(&head)?;
+                let (fetched, reachable) =
+                    self.fetch_commit_graph_with_boundary(remote_store, &head, &boundary)?;
                 let imported = imported.intersection(&reachable).count();
                 self.set_remote_tracking_ref(remote, branch, &head)?;
+                boundary.remember(&head)?;
                 trace.finish(&[
                     ("supported", 1),
                     ("imported_commits", imported as u64),
@@ -217,7 +299,23 @@ impl Repository {
             }
             FetchBundleOutcome::Unsupported => {
                 trace.finish(&[("supported", 0)]);
-                self.fetch_with_store(remote, branch, remote_store)
+                let head = block_on_remote(remote_store.get_raw(&head_path))?.ok_or_else(|| {
+                    RepoErr::RemoteBranchNotFound {
+                        remote: remote.into(),
+                        branch: branch.into(),
+                    }
+                })?;
+                let head = parse_remote_ref(&head_path, head)?;
+                let commits =
+                    self.fetch_commit_chain_with_boundary(remote_store, &head, &boundary)?;
+                self.set_remote_tracking_ref(remote, branch, &head)?;
+                boundary.remember(&head)?;
+                Ok(FetchOutcome {
+                    remote: remote.into(),
+                    branch: branch.into(),
+                    head,
+                    commits,
+                })
             }
         }
     }
@@ -459,13 +557,171 @@ impl Repository {
         remote_branch: &str,
         force: bool,
     ) -> Result<PushOutcome> {
-        let remote_head = self.remote_branch_head_state(remote, remote_branch)?;
-        self.push_branch_with_force_and_remote_head(
+        let total_trace = crate::trace::PushTraceSpan::new("push_branch_total");
+        #[cfg(not(target_arch = "wasm32"))]
+        let outcome = {
+            let observation_trace = crate::trace::PushTraceSpan::new("push_remote_observation");
+            let observed = self.observe_remote_branch_head(remote, remote_branch)?;
+            observation_trace.finish(&[]);
+            self.push_branch_with_observed_head_and_snapshots(
+                remote,
+                local_branch,
+                remote_branch,
+                force,
+                observed,
+                crate::PreparedSnapshotPush::default(),
+            )
+        };
+        #[cfg(target_arch = "wasm32")]
+        let outcome = {
+            let observation_trace = crate::trace::PushTraceSpan::new("push_remote_observation");
+            let remote_head = self.remote_branch_head_state(remote, remote_branch)?;
+            observation_trace.finish(&[]);
+            self.push_branch_with_force_and_remote_head(
+                remote,
+                local_branch,
+                remote_branch,
+                force,
+                remote_head,
+            )
+        };
+        if outcome.is_ok() {
+            total_trace.finish(&[]);
+        }
+        outcome
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn observe_remote_branch_head(
+        &self,
+        remote: &str,
+        branch: &str,
+    ) -> Result<ObservedRemoteBranchHead> {
+        let local_trace = crate::trace::PushTraceSpan::new("push_observation_local_prepare");
+        validate_remote_name(remote)?;
+        validate_ref_name(branch)?;
+        let config = self
+            .config()?
+            .remotes
+            .get(remote)
+            .cloned()
+            .ok_or_else(|| RepoErr::RemoteNotFound(remote.to_owned()))?;
+        let store = config
+            .clone()
+            .build_with_credentials(remote, &self.remote_credentials)?;
+        let path = format!("refs/heads/{branch}");
+        local_trace.finish(&[]);
+        let remote_trace = crate::trace::PushTraceSpan::new("push_observation_remote_await");
+        let observation = block_on_remote(store.observe_ref(&path))?;
+        remote_trace.finish(&[]);
+        let head = observation
+            .bytes()
+            .map(|bytes| parse_remote_ref(&path, bytes.clone()))
+            .transpose()?;
+        Ok(ObservedRemoteBranchHead {
+            remote_name: remote.to_owned(),
+            branch: branch.to_owned(),
+            store,
+            observation,
+            head,
+            graft_dir: self.graft_dir.clone(),
+            config,
+        })
+    }
+
+    /// Publish the exact source retained by a trusted initialization journal.
+    /// A changed source fails before discovery and is rechecked after discovery.
+    #[cfg(all(feature = "e2ee", not(target_arch = "wasm32")))]
+    pub fn push_initialization_intent(
+        &self,
+        remote: &str,
+        intent: &crate::e2ee::InitializationIntent,
+    ) -> Result<PushOutcome> {
+        validate_remote_name(remote)?;
+        if self.branch_target(intent.branch())?.as_deref() != Some(intent.commit()) {
+            return Err(crate::remote::RemoteErr::from(
+                crate::e2ee::EncryptionError::StaleObservation,
+            )
+            .into());
+        }
+        let observed = self.observe_remote_branch_head(remote, intent.branch())?;
+        self.push_initialization_intent_with_observed_head_and_snapshots(
+            remote,
+            intent,
+            observed,
+            crate::PreparedSnapshotPush::default(),
+        )
+    }
+
+    #[cfg(all(feature = "e2ee", not(target_arch = "wasm32")))]
+    pub fn push_initialization_intent_with_observed_head_and_snapshots(
+        &self,
+        remote: &str,
+        intent: &crate::e2ee::InitializationIntent,
+        observed: ObservedRemoteBranchHead,
+        snapshots: crate::PreparedSnapshotPush,
+    ) -> Result<PushOutcome> {
+        if observed.remote_name != remote
+            || observed.branch != intent.branch()
+            || observed.graft_dir != self.graft_dir
+            || self.config()?.remotes.get(remote) != Some(&observed.config)
+            || observed
+                .head
+                .as_deref()
+                .is_some_and(|head| head != intent.commit())
+        {
+            return Err(crate::remote::RemoteErr::from(
+                crate::e2ee::EncryptionError::StaleObservation,
+            )
+            .into());
+        }
+        self.push_branch_with_expected_ref_and_snapshots(
+            remote,
+            intent.branch(),
+            intent.branch(),
+            false,
+            PushRemoteHead {
+                store: observed.store,
+                head: observed.head,
+                expected: PushRefExpected::Observed(observed.observation),
+                expected_source_head: Some(intent.commit().to_owned()),
+            },
+            snapshots,
+        )
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn push_branch_with_observed_head_and_snapshots(
+        &self,
+        remote: &str,
+        local_branch: &str,
+        remote_branch: &str,
+        force: bool,
+        observed: ObservedRemoteBranchHead,
+        snapshots: crate::PreparedSnapshotPush,
+    ) -> Result<PushOutcome> {
+        if observed.remote_name != remote
+            || observed.branch != remote_branch
+            || observed.graft_dir != self.graft_dir
+            || self.config()?.remotes.get(remote) != Some(&observed.config)
+        {
+            return Err(RepoErr::RemoteRefChanged {
+                remote: remote.to_owned(),
+                branch: remote_branch.to_owned(),
+            });
+        }
+        self.push_branch_with_expected_ref_and_snapshots(
             remote,
             local_branch,
             remote_branch,
             force,
-            remote_head,
+            PushRemoteHead {
+                store: observed.store,
+                head: observed.head,
+                expected: PushRefExpected::Observed(observed.observation),
+                expected_source_head: None,
+            },
+            snapshots,
         )
     }
 
@@ -497,18 +753,85 @@ impl Repository {
         snapshots: crate::PreparedSnapshotPush,
     ) -> Result<PushOutcome> {
         validate_remote_name(remote)?;
+        let store = self.remote_store(remote)?;
+        self.push_branch_with_expected_ref_and_snapshots(
+            remote,
+            local_branch,
+            remote_branch,
+            force,
+            PushRemoteHead {
+                store,
+                head: remote_head.head,
+                expected: PushRefExpected::Raw(remote_head.raw),
+                expected_source_head: None,
+            },
+            snapshots,
+        )
+    }
+
+    fn push_branch_with_expected_ref_and_snapshots(
+        &self,
+        remote: &str,
+        local_branch: &str,
+        remote_branch: &str,
+        force: bool,
+        state: PushRemoteHead,
+        snapshots: crate::PreparedSnapshotPush,
+    ) -> Result<PushOutcome> {
+        let branch_trace = crate::trace::PushTraceSpan::new("push_branch_publication_path");
+        let preflight_trace = crate::trace::PushTraceSpan::new("push_branch_preflight");
+        let PushRemoteHead {
+            store: remote_store,
+            head: remote_head,
+            expected,
+            expected_source_head,
+        } = state;
+        validate_remote_name(remote)?;
         validate_ref_name(local_branch)?;
         validate_ref_name(remote_branch)?;
-        let Some(head) = self.branch_target(local_branch)? else {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let PushRefExpected::Observed(observed) = &expected {
+            remote_store
+                .validate_ref_observation(&format!("refs/heads/{remote_branch}"), observed)?;
+        }
+        let local_head = self.branch_target(local_branch)?;
+        #[cfg(all(feature = "e2ee", not(target_arch = "wasm32")))]
+        if expected_source_head
+            .as_deref()
+            .is_some_and(|expected| local_head.as_deref() != Some(expected))
+        {
+            return Err(crate::remote::RemoteErr::from(
+                crate::e2ee::EncryptionError::StaleObservation,
+            )
+            .into());
+        }
+        #[cfg(not(all(feature = "e2ee", not(target_arch = "wasm32"))))]
+        debug_assert!(expected_source_head.is_none());
+        let Some(head) = local_head else {
             return Err(RepoErr::UnbornHead);
         };
 
-        let remote_store = self.remote_store(remote)?;
-        let RemoteBranchHead { raw: remote_head_raw, head: remote_head } = remote_head;
-        let remote_branch_existed = remote_head_raw.is_some();
+        let remote_branch_existed = expected.bytes().is_some();
 
         if remote_head.as_deref() == Some(head.as_str()) {
+            #[cfg(all(feature = "e2ee", not(target_arch = "wasm32")))]
+            if let PushRefExpected::Observed(observed) = &expected {
+                block_on_remote(remote_store.reconcile_observed_ref_journal(
+                    &format!("refs/heads/{remote_branch}"),
+                    observed,
+                ))?;
+            }
+            preflight_trace.finish(&[]);
+            // A previous push may have confirmed the branch but failed before
+            // creating its default HEAD. Retry that independent create without
+            // republishing dependencies or taking the branch mutation lock.
+            let head_trace = crate::trace::PushTraceSpan::new("push_default_head");
+            self.set_remote_head_if_absent(&remote_store, remote_branch)?;
+            head_trace.finish(&[]);
+            let tracking_trace = crate::trace::PushTraceSpan::new("push_local_tracking");
             self.set_remote_tracking_ref(remote, remote_branch, &head)?;
+            tracking_trace.finish(&[]);
+            branch_trace.finish(&[]);
             return Ok(PushOutcome {
                 remote: remote.to_string(),
                 local_branch: local_branch.to_string(),
@@ -531,18 +854,36 @@ impl Repository {
             });
         }
 
+        preflight_trace.finish(&[]);
+        let preparation_trace = crate::trace::PushTraceSpan::new("push_commit_chain_prepare");
         let mut prepared = self.push_commit_chain(&remote_store, &head, remote_head.as_deref())?;
         let mut bundle_objects = snapshots.into_bundle_objects()?;
         bundle_objects.append(&mut prepared.bundle_objects);
+        preparation_trace.finish(&[]);
         let head_path = format!("refs/heads/{remote_branch}");
         let publication_trace = crate::trace::PushTraceSpan::new("remote_publication");
-        let publication = block_on_remote(remote_store.publish_object_bundle_and_ref(
-            bundle_objects,
-            prepared.pack,
-            &head_path,
-            remote_head_raw.as_deref(),
-            format!("{head}\n"),
-        ));
+        let replacement = format!("{head}\n");
+        let publication = match expected {
+            PushRefExpected::Raw(raw) => {
+                block_on_remote(remote_store.publish_object_bundle_and_ref(
+                    bundle_objects,
+                    prepared.pack,
+                    &head_path,
+                    raw.as_deref(),
+                    replacement,
+                ))
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            PushRefExpected::Observed(observed) => {
+                block_on_remote(remote_store.publish_observed_object_bundle_and_ref(
+                    bundle_objects,
+                    prepared.pack,
+                    &head_path,
+                    &observed,
+                    replacement,
+                ))
+            }
+        };
         match publication {
             Ok(()) => publication_trace.finish(&[]),
             Err(RepoErr::Remote(RemoteErr::CompareAndSwap { .. } | RemoteErr::LockBusy { .. })) => {
@@ -554,9 +895,14 @@ impl Repository {
             Err(err) => return Err(err),
         }
         if !remote_branch_existed {
+            let head_trace = crate::trace::PushTraceSpan::new("push_default_head");
             self.set_remote_head_if_absent(&remote_store, remote_branch)?;
+            head_trace.finish(&[]);
         }
+        let tracking_trace = crate::trace::PushTraceSpan::new("push_local_tracking");
         self.set_remote_tracking_ref(remote, remote_branch, &head)?;
+        tracking_trace.finish(&[]);
+        branch_trace.finish(&[]);
 
         Ok(PushOutcome {
             remote: remote.to_string(),
@@ -580,13 +926,19 @@ impl Repository {
 
         let remote_store = self.remote_store(remote)?;
         let head_path = format!("refs/heads/{remote_branch}");
-        let remote_head_raw =
-            block_on_remote(remote_store.get_raw(&head_path))?.ok_or_else(|| {
-                RepoErr::RemoteBranchNotFound {
-                    remote: remote.to_string(),
-                    branch: remote_branch.to_string(),
-                }
-            })?;
+        #[cfg(not(target_arch = "wasm32"))]
+        let observed = block_on_remote(remote_store.observe_ref(&head_path))?;
+        #[cfg(not(target_arch = "wasm32"))]
+        let remote_head_raw = observed.bytes().cloned();
+        #[cfg(target_arch = "wasm32")]
+        let remote_head_raw = block_on_remote(remote_store.get_raw(&head_path))?;
+        let remote_head_raw = remote_head_raw.ok_or_else(|| RepoErr::RemoteBranchNotFound {
+            remote: remote.to_string(),
+            branch: remote_branch.to_string(),
+        })?;
+        #[cfg(not(target_arch = "wasm32"))]
+        let remote_head = parse_remote_ref(&head_path, remote_head_raw)?;
+        #[cfg(target_arch = "wasm32")]
         let remote_head = parse_remote_ref(&head_path, remote_head_raw.clone())?;
 
         if !force
@@ -599,9 +951,14 @@ impl Repository {
             });
         }
 
-        match block_on_remote(
+        #[cfg(not(target_arch = "wasm32"))]
+        let deletion =
+            block_on_remote(remote_store.compare_and_delete_observed_ref(&head_path, &observed));
+        #[cfg(target_arch = "wasm32")]
+        let deletion = block_on_remote(
             remote_store.compare_and_delete_raw(&head_path, Some(remote_head_raw.as_ref())),
-        ) {
+        );
+        match deletion {
             Ok(()) => {}
             Err(RepoErr::Remote(RemoteErr::CompareAndSwap { .. } | RemoteErr::LockBusy { .. })) => {
                 return Err(RepoErr::RemoteRefChanged {

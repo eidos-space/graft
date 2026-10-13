@@ -84,6 +84,8 @@ impl Repository {
     }
 
     pub fn clear_dirty(&self) -> Result<()> {
+        #[cfg(unix)]
+        let _mutation = self.mutation_guard()?;
         let path = self.worktree_state_path();
         if path.exists() {
             fs::remove_file(path)?;
@@ -538,12 +540,16 @@ impl Repository {
     }
 
     pub(super) fn write_merge_state(&self, orig_head: &str, merge_head: &str) -> Result<()> {
+        #[cfg(unix)]
+        let _mutation = self.mutation_guard()?;
         fs::write(self.orig_head_path(), format!("{orig_head}\n"))?;
         fs::write(self.merge_head_path(), format!("{merge_head}\n"))?;
         Ok(())
     }
 
     pub(super) fn clear_merge_state(&self) -> Result<()> {
+        #[cfg(unix)]
+        let _mutation = self.mutation_guard()?;
         for path in [self.merge_head_path(), self.orig_head_path()] {
             if path.exists() {
                 fs::remove_file(path)?;
@@ -1395,12 +1401,16 @@ impl Repository {
     }
 
     pub(super) fn write_index(&self, index: &index::Index) -> Result<()> {
+        #[cfg(unix)]
+        let _mutation = self.mutation_guard()?;
         let path = self.index_path();
         let encoded = toml::to_string_pretty(index)?;
         write_file_atomic(&path, encoded.as_bytes())
     }
 
     pub(super) fn clear_index(&self) -> Result<()> {
+        #[cfg(unix)]
+        let _mutation = self.mutation_guard()?;
         let path = self.index_path();
         if path.exists() {
             fs::remove_file(path)?;
@@ -1423,6 +1433,8 @@ impl Repository {
     }
 
     pub(super) fn write_worktree_state(&self, state: &WorktreeState) -> Result<()> {
+        #[cfg(unix)]
+        let _mutation = self.mutation_guard()?;
         let path = self.worktree_state_path();
         if state.dirty.is_empty() && state.deleted.is_empty() {
             if path.exists() {

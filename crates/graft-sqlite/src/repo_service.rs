@@ -28,7 +28,8 @@ use crate::{
         repo_core::repo_for_file,
         repo_diff::repo_status_for_file,
         spec::{
-            RepoExportSpec, RepoResolveCellSpec, RepoResolveRowSpec, RepoResolveSpec, ResolveSide,
+            RepoCloneSpec, RepoExportSpec, RepoResolveCellSpec, RepoResolveRowSpec,
+            RepoResolveSpec, ResolveSide,
         },
         sqlite_worktree::{
             physical_sqlite_file_matches_state, prepare_cached_physical_sqlite_file_state,
@@ -36,6 +37,27 @@ use crate::{
     },
     session::{RepoRuntimeRegistry, RepositorySessionContext},
 };
+
+/// Cloning may materialize every remote path; never merge that checkout into
+/// existing user files. Hosts can use this read-only check before publication.
+pub fn validate_clone_destination(worktree: &Path) -> Result<(), ErrCtx> {
+    match std::fs::symlink_metadata(worktree) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+        Ok(metadata) if !metadata.is_dir() => Err(ErrCtx::InvalidCommand(
+            "clone destination must be an empty directory or an absent path".into(),
+        )),
+        Ok(_) => {
+            if let Some(entry) = std::fs::read_dir(worktree)?.next() {
+                entry?;
+                return Err(ErrCtx::InvalidCommand(
+                    "clone destination must be an empty directory or an absent path".into(),
+                ));
+            }
+            Ok(())
+        }
+    }
+}
 
 /// A parsed, type-checked repository control-plane command.
 ///
@@ -168,6 +190,36 @@ pub struct RepositoryMergePolicy {
 }
 
 impl RepositoryCommand {
+    /// Add a remote using its explicit profile and pinned identity.
+    pub fn remote_add_with_config(name: String, config: RemoteConfig) -> Self {
+        Self {
+            command: GraftCommand::JsonRemoteAdd { name, config },
+        }
+    }
+
+    /// Clone using explicit typed remote configuration rather than a URI parser.
+    pub fn clone_with_config(config: RemoteConfig, branch: Option<String>) -> Self {
+        Self::clone_with_named_config("origin".into(), config, branch)
+    }
+
+    /// Preserve the trusted host's local name and credential registration during clone.
+    pub fn clone_with_named_config(
+        remote_name: String,
+        config: RemoteConfig,
+        branch: Option<String>,
+    ) -> Self {
+        Self {
+            command: GraftCommand::JsonRepoClone {
+                spec: RepoCloneSpec {
+                    remote_name,
+                    config,
+                    branch,
+                    worktree: None,
+                },
+            },
+        }
+    }
+
     pub fn parse(name: &str, argument: Option<&str>) -> Result<Self, ErrCtx> {
         let command = GraftCommand::parse_repository(name, argument)?;
         Ok(Self { command })
@@ -334,6 +386,8 @@ impl RepositoryCommandService {
             repo.with_remote_credentials(credentials.clone())
                 .with_user_identity(user_identity.clone())
         });
+        #[cfg(unix)]
+        let _mutation = repo.as_ref().map(Repository::mutation_guard).transpose()?;
         let runtime = match &repo {
             Some(repo) => runtimes.runtime_for(repo)?,
             None => base_runtime,
@@ -360,14 +414,306 @@ impl RepositoryCommandService {
 
     /// Executes one parsed repository command against the retained runtime.
     pub fn execute(&mut self, command: RepositoryCommand) -> Result<Option<String>, ErrCtx> {
+        #[cfg(unix)]
+        let _mutation = self.mutation_guard()?;
         self.credentials.reset_http_clients();
         let runtime = self.file.runtime().clone();
         command.command.eval(&runtime, &mut self.file)
     }
 
+    /// Native operation gate shared by typed commands and embedded SDK methods.
+    /// An absent repository has no committed history to fence; initialization
+    /// claims its metadata directory before its first persistent mutation.
+    #[cfg(unix)]
+    pub fn mutation_guard(&self) -> Result<Option<graft::repo::RepositoryMutationGuard>, ErrCtx> {
+        self.file
+            .repo
+            .as_ref()
+            .map(Repository::mutation_guard)
+            .transpose()
+            .map_err(Into::into)
+    }
+
     /// Returns the repository retained by this service, discovering it after `init` when needed.
     pub fn repository(&mut self) -> Result<Repository, ErrCtx> {
         repo_for_file(&mut self.file)
+    }
+
+    /// Publish a pinned initialization source using the retained snapshot runtime.
+    #[cfg(all(feature = "e2ee", not(target_arch = "wasm32")))]
+    pub fn push_initialization_intent(
+        &mut self,
+        remote: &str,
+        intent: &graft::e2ee::InitializationIntent,
+    ) -> Result<graft::repo::PushOutcome, ErrCtx> {
+        #[cfg(unix)]
+        let _mutation = self.mutation_guard()?;
+        self.credentials.reset_http_clients();
+        let repo = self.repository()?;
+        if repo.branch_target(intent.branch())?.as_deref() != Some(intent.commit()) {
+            return Err(graft::repo::RepoErr::from(graft::remote::RemoteErr::from(
+                graft::e2ee::EncryptionError::StaleObservation,
+            ))
+            .into());
+        }
+        let observed = repo.observe_remote_branch_head(remote, intent.branch())?;
+        if repo.branch_target(intent.branch())?.as_deref() != Some(intent.commit())
+            || observed.head().is_some_and(|head| head != intent.commit())
+        {
+            return Err(graft::repo::RepoErr::from(graft::remote::RemoteErr::from(
+                graft::e2ee::EncryptionError::StaleObservation,
+            ))
+            .into());
+        }
+        let runtime = self.file.runtime().clone();
+        let store = Arc::new(repo.remote_store(remote)?);
+        let snapshots = crate::pragma::repo_snapshot::prepare_repo_branch_snapshot_push(
+            &runtime,
+            &repo,
+            remote,
+            intent.branch(),
+            observed.head(),
+            store,
+        )?;
+        Ok(
+            repo.push_initialization_intent_with_observed_head_and_snapshots(
+                remote, intent, observed, snapshots,
+            )?,
+        )
+    }
+
+    /// Verify local migration file payloads and actual storage pages. Never hydrate
+    /// from a remote or replace physical databases; cached hashes are insufficient.
+    #[cfg(all(feature = "e2ee", not(target_arch = "wasm32")))]
+    pub fn verify_migration_source_dependencies(
+        &mut self,
+        plan: &graft::repo::MigrationSourcePlan,
+        budget: graft::repo::MigrationVerificationBudget,
+    ) -> Result<graft::repo::MigrationDependencyVerification, ErrCtx> {
+        #[cfg(unix)]
+        let _mutation = self.mutation_guard()?;
+        use graft::core::lsn::LSNRangeExt;
+        let repo = self.repository()?;
+        let payload_bytes =
+            repo.verify_migration_file_dependencies(plan, budget.max_payload_bytes)?;
+        let runtime = self.file.runtime().clone();
+        let mut expected = std::collections::BTreeMap::new();
+        for snapshot in plan.snapshots().values() {
+            graft::repo::cancellation_checkpoint()?;
+            if let Some(head) = snapshot.ranges.first() {
+                let commit = runtime.get_commit(&head.log, head.end)?.ok_or_else(|| {
+                    ErrCtx::InvalidCommand(
+                        "migration snapshot references missing local head commit".into(),
+                    )
+                })?;
+                if commit.page_count() != snapshot.page_count {
+                    return Err(ErrCtx::InvalidCommand(
+                        "migration snapshot page count disagrees with local storage".into(),
+                    ));
+                }
+            } else if !snapshot.page_count.is_empty() {
+                return Err(ErrCtx::InvalidCommand(
+                    "migration snapshot has pages without storage ranges".into(),
+                ));
+            }
+            for range in &snapshot.ranges {
+                let mut commits = range.commits.iter();
+                for lsn in (range.start..=range.end).iter() {
+                    graft::repo::cancellation_checkpoint()?;
+                    let commit = commits
+                        .next()
+                        .filter(|commit| commit.lsn == lsn)
+                        .ok_or_else(|| {
+                            ErrCtx::InvalidCommand(
+                                "migration snapshot lacks exact storage commit identities".into(),
+                            )
+                        })?;
+                    let key = (range.log.clone(), lsn);
+                    if let Some(previous) = expected.get(&key) {
+                        if previous != &commit.commit_hash {
+                            return Err(ErrCtx::InvalidCommand(
+                                "migration snapshots disagree on storage commit identity".into(),
+                            ));
+                        }
+                    } else {
+                        if expected.len() >= budget.max_storage_commits {
+                            return Err(graft::repo::RepoErr::from(
+                                graft::remote::RemoteErr::from(
+                                    graft::e2ee::EncryptionError::TooLarge,
+                                ),
+                            )
+                            .into());
+                        }
+                        expected.insert(key, commit.commit_hash.clone());
+                    }
+                }
+                if commits.next().is_some() {
+                    return Err(ErrCtx::InvalidCommand(
+                        "migration snapshot has extra storage commit identities".into(),
+                    ));
+                }
+            }
+        }
+        let mut pages = 0u64;
+        for ((log, lsn), hash) in &expected {
+            graft::repo::cancellation_checkpoint()?;
+            let commit = runtime.get_commit(log, *lsn)?.ok_or_else(|| {
+                ErrCtx::InvalidCommand(
+                    "migration snapshot references missing local storage commit".into(),
+                )
+            })?;
+            pages = pages
+                .checked_add(
+                    commit
+                        .segment_idx()
+                        .map_or(0, |index| u64::from(index.page_count().to_u32())),
+                )
+                .filter(|pages| *pages <= budget.max_storage_pages)
+                .ok_or_else(|| {
+                    graft::repo::RepoErr::from(graft::remote::RemoteErr::from(
+                        graft::e2ee::EncryptionError::TooLarge,
+                    ))
+                })?;
+            if runtime.recompute_commit_hash(log, *lsn)?.as_ref() != Some(hash) {
+                return Err(ErrCtx::InvalidCommand(
+                    "migration storage content does not match its authoritative identity".into(),
+                ));
+            }
+        }
+        repo.validate_migration_source_plan(plan)?;
+        Ok(graft::repo::MigrationDependencyVerification {
+            payloads: plan.external_payloads().len(),
+            payload_bytes,
+            snapshots: plan.snapshots().len(),
+            storage_commits: expected.len(),
+            storage_pages: pages,
+        })
+    }
+
+    /// Publish all frozen historical storage commits in bounded page batches.
+    /// Does not publish repository refs/objects/files or advance migration stages.
+    #[cfg(all(feature = "e2ee", unix))]
+    pub fn publish_migration_storage_dependencies(
+        &mut self,
+        plan: &graft::repo::MigrationSourcePlan,
+        remote: Arc<graft::remote::Remote>,
+        budget: graft::repo::MigrationVerificationBudget,
+        max_batch_pages: u64,
+    ) -> Result<graft::repo::MigrationDependencyVerification, ErrCtx> {
+        #[cfg(unix)]
+        let _mutation = self.mutation_guard()?;
+        remote.with_encrypted_operation(|| {
+            if max_batch_pages == 0 {
+                return Err(graft::repo::RepoErr::from(graft::remote::RemoteErr::from(
+                    graft::e2ee::EncryptionError::TooLarge,
+                ))
+                .into());
+            }
+            let verified = self.verify_migration_source_dependencies(plan, budget)?;
+            let repo = self.repository()?;
+            let runtime = self.file.runtime().clone();
+            let mut commits = std::collections::BTreeMap::new();
+            for snapshot in plan.snapshots().values() {
+                for range in &snapshot.ranges {
+                    for commit in &range.commits {
+                        graft::repo::cancellation_checkpoint()?;
+                        commits.insert((range.log.clone(), commit.lsn), commit.commit_hash.clone());
+                    }
+                }
+            }
+            // Preflight every individual commit before any remote negotiation.
+            let mut batches = Vec::new();
+            let mut batch = Vec::new();
+            let mut pages = 0u64;
+            for ((log, lsn), hash) in commits {
+                graft::repo::cancellation_checkpoint()?;
+                let commit = runtime.get_commit(&log, lsn)?.ok_or_else(|| {
+                    ErrCtx::InvalidCommand("migration storage commit disappeared".into())
+                })?;
+                let count = commit
+                    .segment_idx()
+                    .map_or(0, |index| u64::from(index.page_count().to_u32()));
+                if count > max_batch_pages {
+                    return Err(graft::repo::RepoErr::from(graft::remote::RemoteErr::from(
+                        graft::e2ee::EncryptionError::TooLarge,
+                    ))
+                    .into());
+                }
+                if !batch.is_empty() && (batch.len() == 512 || count > max_batch_pages - pages) {
+                    batches.push(std::mem::take(&mut batch));
+                    pages = 0;
+                }
+                pages += count;
+                batch.push((
+                    graft::snapshot::Snapshot::new(log, lsn..=lsn, commit.page_count()),
+                    hash,
+                ));
+            }
+            if !batch.is_empty() {
+                batches.push(batch);
+            }
+            repo.validate_migration_source_plan(plan)?;
+            for batch in batches {
+                for (snapshot, hash) in &batch {
+                    graft::repo::cancellation_checkpoint()?;
+                    let (log, lsn) = snapshot.head().ok_or_else(|| {
+                        ErrCtx::InvalidCommand("migration storage batch is empty".into())
+                    })?;
+                    if runtime.recompute_commit_hash(log, lsn)?.as_ref() != Some(hash) {
+                        return Err(ErrCtx::InvalidCommand(
+                            "migration storage changed before publication".into(),
+                        ));
+                    }
+                }
+                runtime.snapshots_push_to(
+                    batch.into_iter().map(|(snapshot, _)| snapshot).collect(),
+                    remote.clone(),
+                )?;
+            }
+            repo.validate_migration_source_plan(plan)?;
+            Ok(verified)
+        })
+    }
+
+    /// Publish all frozen dependencies without publishing refs or changing stages.
+    #[cfg(all(feature = "e2ee", unix))]
+    pub fn publish_migration_dependencies(
+        &mut self,
+        plan: &graft::repo::MigrationSourcePlan,
+        remote: Arc<graft::remote::Remote>,
+        budget: graft::repo::MigrationPublicationBudget,
+    ) -> Result<graft::repo::MigrationDependencyPublication, ErrCtx> {
+        #[cfg(unix)]
+        let _mutation = self.mutation_guard()?;
+        remote.with_encrypted_operation(|| {
+            if budget.max_pack_bytes == 0 || budget.max_storage_batch_pages == 0 {
+                return Err(graft::repo::RepoErr::from(graft::remote::RemoteErr::from(
+                    graft::e2ee::EncryptionError::TooLarge,
+                ))
+                .into());
+            }
+            let verified = self.publish_migration_storage_dependencies(
+                plan,
+                remote.clone(),
+                budget.verification,
+                budget.max_storage_batch_pages,
+            )?;
+            let repo = self.repository()?;
+            let payload_bytes = repo.publish_migration_file_dependencies(
+                plan,
+                &remote,
+                budget.verification.max_payload_bytes,
+            )?;
+            if payload_bytes != verified.payload_bytes {
+                return Err(ErrCtx::InvalidCommand(
+                    "migration payload inventory changed".into(),
+                ));
+            }
+            let repository_objects =
+                repo.publish_migration_repository_objects(plan, &remote, budget.max_pack_bytes)?;
+            repo.validate_migration_source_plan(plan)?;
+            Ok(graft::repo::MigrationDependencyPublication { repository_objects, verified })
+        })
     }
 
     /// Fetch a branch and hydrate its target snapshots before worktree application.
@@ -377,6 +723,8 @@ impl RepositoryCommandService {
         remote: &str,
         branch: &str,
     ) -> Result<graft::repo::FetchOutcome, ErrCtx> {
+        #[cfg(unix)]
+        let _mutation = self.mutation_guard()?;
         let repo = self.repository()?;
         let runtime = self.file.runtime().clone();
         let prepared = repo.prepare_fetch(remote, branch)?;
@@ -401,6 +749,8 @@ impl RepositoryCommandService {
 
     /// Computes the repository status while retaining the service runtime.
     pub fn status(&mut self) -> Result<RepoStatus, ErrCtx> {
+        #[cfg(unix)]
+        let _mutation = self.mutation_guard()?;
         let runtime = self.file.runtime().clone();
         let repo = repo_for_file(&mut self.file)?;
         repo_status_for_file(&runtime, &self.file, &repo)
@@ -434,6 +784,8 @@ impl RepositoryCommandService {
         &mut self,
         options: RepositoryResolveCellOptions,
     ) -> Result<RepositoryResolveOutcome, ErrCtx> {
+        #[cfg(unix)]
+        let _mutation = self.mutation_guard()?;
         let side = match options.side {
             RepositoryResolveSide::Ours => ResolveSide::Ours,
             RepositoryResolveSide::Theirs => ResolveSide::Theirs,
@@ -462,6 +814,8 @@ impl RepositoryCommandService {
 
     /// Validates and stages the current physical `SQLite` file as the resolved merge result.
     pub fn stage_worktree_sqlite_result(&mut self, path: &Path) -> Result<String, ErrCtx> {
+        #[cfg(unix)]
+        let _mutation = self.mutation_guard()?;
         let runtime = self.file.runtime().clone();
         let repo = repo_for_file(&mut self.file)?;
         stage_repo_worktree_sqlite_result(&runtime, &repo, path)
@@ -474,6 +828,8 @@ impl RepositoryCommandService {
         path: &Path,
         output: &Path,
     ) -> Result<String, ErrCtx> {
+        #[cfg(unix)]
+        let _mutation = self.mutation_guard()?;
         let runtime = self.file.runtime().clone();
         let repo = repo_for_file(&mut self.file)?;
         export_repo_path(
@@ -498,6 +854,8 @@ impl RepositoryCommandService {
         base_sha256: Option<&str>,
         delta_output: Option<&Path>,
     ) -> Result<RepositorySqliteCapture, ErrCtx> {
+        #[cfg(unix)]
+        let _mutation = self.mutation_guard()?;
         let runtime = self.file.runtime().clone();
         let repo = repo_for_file(&mut self.file)?;
         let physical_path = repo.worktree().join(path);
@@ -565,6 +923,8 @@ impl RepositoryCommandService {
         path: &Path,
         candidate_path: &Path,
     ) -> Result<String, ErrCtx> {
+        #[cfg(unix)]
+        let _mutation = self.mutation_guard()?;
         let runtime = self.file.runtime().clone();
         let repo = repo_for_file(&mut self.file)?;
         stage_repo_external_sqlite_result(&runtime, &repo, path, candidate_path)
@@ -577,6 +937,8 @@ impl RepositoryCommandService {
         candidate_path: &Path,
         managed_tables: &std::collections::BTreeSet<String>,
     ) -> Result<RepositorySemanticMergeSeed, ErrCtx> {
+        #[cfg(unix)]
+        let _mutation = self.mutation_guard()?;
         let runtime = self.file.runtime().clone();
         let repo = repo_for_file(&mut self.file)?;
         let (applied_sql, managed_conflicts) = prepare_repo_semantic_merge_seed(

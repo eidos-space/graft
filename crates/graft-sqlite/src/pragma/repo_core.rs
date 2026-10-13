@@ -75,25 +75,35 @@ pub(super) fn run_repo_clone(
         return pragma_err!("cannot clone into an existing .graft repository");
     }
 
-    let repo = match spec.worktree.as_ref() {
-        Some(worktree) => Repository::init(resolve_repo_worktree_arg(file, worktree)?)?,
-        None => Repository::init_for_file(&file.tag)?,
-    }
-    .with_remote_credentials(file.remote_credentials().clone());
+    let worktree = match spec.worktree.as_ref() {
+        Some(worktree) => resolve_repo_worktree_arg(file, worktree)?,
+        None => Path::new(&file.tag)
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf(),
+    };
+    crate::repo_service::validate_clone_destination(&worktree)?;
+    let repo =
+        Repository::init(&worktree)?.with_remote_credentials(file.remote_credentials().clone());
     let graft_dir = repo.graft_dir().to_path_buf();
     let mut attached = false;
     let result = (|| {
-        let remote_info = repo.remote_add("origin", spec.config)?;
+        let remote_name = &spec.remote_name;
+        let remote_info = repo.remote_add(remote_name, spec.config)?;
         let branch = match spec.branch {
             Some(branch) => branch,
             None => repo
-                .remote_default_branch("origin")?
+                .remote_default_branch(remote_name)?
                 .unwrap_or(repo.default_branch()?),
         };
-        let clone_fetch = repo.fetch_for_clone("origin", &branch)?;
+        let clone_fetch = repo.fetch_for_clone(remote_name, &branch)?;
         let fetch = &clone_fetch.fetch;
-        repo.branch_create(&branch, Some(&format!("refs/remotes/origin/{branch}")))?;
-        repo.set_branch_upstream(&branch, "origin", &branch)?;
+        repo.branch_create(
+            &branch,
+            Some(&format!("refs/remotes/{remote_name}/{branch}")),
+        )?;
+        repo.set_branch_upstream(&branch, remote_name, &branch)?;
         let plan = repo.plan_switch_branch(&branch)?;
         file.attach_repo(repo.clone())?;
         attached = true;
