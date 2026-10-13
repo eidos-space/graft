@@ -47,6 +47,13 @@ import type {
   GraftRequestContext,
   GraftWriteBody,
 } from "./types.js";
+import {
+  encryptedOperation,
+  validateEncryptionDescriptor,
+  validateEncryptionTransport,
+  ENCRYPTED_CAPABILITIES,
+} from "./encrypted.js";
+import { EncryptedRoutingIndex } from "./encrypted-routing.js";
 
 const OPERATIONS = new Set<GraftRemoteOperation>([
   "raw",
@@ -80,9 +87,10 @@ export function createGraftRemoteHandler<AdapterContext = undefined, Principal =
   options: GraftRemoteOptions<AdapterContext, Principal>,
 ): GraftRemoteHandler<AdapterContext> {
   const limits = normalizeRemoteLimits(options.limits);
+  const encryptedRouting = new Map<string, EncryptedRoutingIndex>();
   return async (request): Promise<Response> => {
     try {
-      return await handleRequest(request, options, limits);
+      return await handleRequest(request, options, limits, encryptedRouting);
     } catch (error) {
       if (options.onError !== undefined) {
         try {
@@ -107,6 +115,7 @@ async function handleRequest<AdapterContext, Principal>(
   input: GraftHandlerRequest<AdapterContext>,
   options: GraftRemoteOptions<AdapterContext, Principal>,
   limits: NormalizedRemoteLimits,
+  encryptedRouting: Map<string, EncryptedRoutingIndex>,
 ): Promise<Response> {
   const principal = await options.authenticate?.(input);
   if (input.request.headers.get(PROTOCOL_HEADER) !== PROTOCOL_VERSION) {
@@ -135,8 +144,25 @@ async function handleRequest<AdapterContext, Principal>(
     );
   }
   const repository: GraftRepository = { ...repositoryWithoutId, id };
-  const operation = parseOperation(parameters.operation);
-  const objectPath = parseObjectPath(operation, parameters.objectPath);
+  const encryptedRoute = parameters.operation === "e2ee";
+  const [encryptedAction, ...encryptedPath] = (parameters.objectPath ?? "").split("/");
+  const operation: GraftRemoteOperation = encryptedRoute
+    ? encryptedAction === "read-bundle"
+      ? "e2ee-read-bundle"
+      : encryptedAction === "fetch-bundle"
+        ? "e2ee-fetch-bundle"
+        : encryptedAction === "receive-bundle"
+          ? "e2ee-receive-bundle"
+          : parseOperation(parameters.operation)
+    : parseOperation(parameters.operation);
+  const objectPath = parseObjectPath(
+    operation,
+    encryptedRoute
+      ? encryptedPath.length === 0
+        ? undefined
+        : encryptedPath.join("/")
+      : parameters.objectPath,
+  );
   const action = validateMethodAndAction(input.request.method, operation);
   const requestContext: GraftRequestContext<AdapterContext, Principal> = {
     request: input.request,
@@ -153,25 +179,74 @@ async function handleRequest<AdapterContext, Principal>(
   if (backend === null) {
     throw new GraftProtocolError(404, "repository_not_found", "Repository not found");
   }
+  if (backend.encryption !== undefined) {
+    validateEncryptionDescriptor(backend.encryption);
+    validateEncryptionTransport(url);
+  }
 
   if (operation === "descriptor") {
     rejectUnexpectedQuery(url);
-    const capabilities: string[] = [...GRAFT_REMOTE_CAPABILITIES];
-    if (backend.multipart !== undefined) capabilities.push("multipart-object");
+    const capabilities: string[] =
+      backend.encryption === undefined
+        ? [...GRAFT_REMOTE_CAPABILITIES]
+        : [...ENCRYPTED_CAPABILITIES];
+    if (backend.encryption === undefined && backend.multipart !== undefined)
+      capabilities.push("multipart-object");
+    if (backend.encryption !== undefined && backend.multipart?.supportsEncryption === true)
+      capabilities.push("e2ee-multipart-object");
     return jsonResponse({
       protocol: "graft-remote",
       version: 1,
       repository: repository.id,
+      ...(backend.encryption === undefined
+        ? {}
+        : {
+            encryption: {
+              profile: backend.encryption.profile,
+              version: backend.encryption.version,
+              suite: backend.encryption.suite,
+              uuid: backend.encryption.uuid,
+            },
+          }),
       capabilities,
       limits: {
         ...(limits.maxRequestBytes === undefined
           ? {}
           : { max_request_bytes: limits.maxRequestBytes }),
-        ...(backend.multipart === undefined
+        ...(backend.multipart === undefined ||
+        (backend.encryption !== undefined && backend.multipart.supportsEncryption !== true)
           ? {}
           : { multipart_part_bytes: limits.multipartPartBytes }),
       },
     });
+  }
+  if (backend.encryption !== undefined) {
+    const identity = `${repository.id}\0${backend.encryption.uuid}`;
+    let routing = encryptedRouting.get(identity);
+    if (routing === undefined) {
+      if (encryptedRouting.size >= 4)
+        encryptedRouting.delete(encryptedRouting.keys().next().value!);
+      routing = new EncryptedRoutingIndex();
+    } else {
+      encryptedRouting.delete(identity);
+    }
+    encryptedRouting.set(identity, routing);
+    const response = await encryptedOperation(
+      input.request,
+      backend,
+      operation,
+      objectPath,
+      url,
+      limits.maxRequestBytes,
+      routing,
+    );
+    if (response !== undefined) return response;
+  } else if (operation.startsWith("e2ee-")) {
+    throw new GraftProtocolError(
+      409,
+      "profile_mismatch",
+      "Encrypted operation requires an encrypted remote",
+    );
   }
   if (operation === "list") {
     return listObjects(backend, url);
@@ -208,6 +283,10 @@ async function handleRequest<AdapterContext, Principal>(
       return compareAndSwap(input.request, backend, path);
     case "cad":
       return compareAndDelete(input.request, backend, path);
+    case "e2ee-read-bundle":
+    case "e2ee-fetch-bundle":
+    case "e2ee-receive-bundle":
+      throw new GraftProtocolError(500, "invalid_dispatch", "Encrypted operation was not handled");
   }
 }
 
@@ -225,7 +304,12 @@ function parseObjectPath(
   operation: GraftRemoteOperation,
   value: string | undefined,
 ): string | undefined {
-  if (operation === "descriptor" || operation === "list" || operation === "read-bundle") {
+  if (
+    operation === "descriptor" ||
+    operation === "list" ||
+    operation === "read-bundle" ||
+    operation === "e2ee-read-bundle"
+  ) {
     if (value !== undefined) {
       throw new GraftProtocolError(400, "invalid_list_path", "The operation has no path suffix");
     }
@@ -253,6 +337,8 @@ function validateMethodAndAction(
       requireMethod(method, "GET");
       return "read";
     case "read-bundle":
+    case "e2ee-read-bundle":
+    case "e2ee-fetch-bundle":
       requireMethod(method, "POST");
       return "read";
     case "raw":
@@ -272,6 +358,7 @@ function validateMethodAndAction(
       return "read";
     case "receive-pack":
     case "receive-bundle":
+    case "e2ee-receive-bundle":
       requireMethod(method, "POST");
       return "write";
     case "multipart-start":
@@ -309,15 +396,60 @@ async function startMultipartUpload(
       `Multipart object requires more than ${MAX_MULTIPART_PARTS} parts`,
     );
   }
-  const upload = await multipart.start(path, totalBytes, partBytes);
+  const encryption =
+    backend.encryption === undefined
+      ? undefined
+      : {
+          uuid: request.headers.get("x-graft-e2ee-uuid"),
+          uploadId: request.headers.get("x-graft-e2ee-upload-id"),
+          ciphertextSha256: request.headers.get("x-graft-e2ee-ciphertext-sha256"),
+        };
+  if (
+    encryption !== undefined &&
+    (encryption.uuid !== backend.encryption!.uuid ||
+      encryption.uploadId === null ||
+      !/^[0-9a-f]{64}$/.test(encryption.uploadId) ||
+      encryption.ciphertextSha256 === null ||
+      !/^[0-9a-f]{64}$/.test(encryption.ciphertextSha256))
+  )
+    throw new GraftProtocolError(
+      400,
+      "invalid_encrypted_upload",
+      "Encrypted multipart identity is invalid",
+    );
+  const identity =
+    encryption === undefined
+      ? undefined
+      : {
+          uuid: encryption.uuid!,
+          uploadId: encryption.uploadId!,
+          ciphertextSha256: encryption.ciphertextSha256!,
+        };
+  const upload = await multipart.start(path, totalBytes, partBytes, identity);
   if (upload === null) {
     throw new GraftProtocolError(412, "precondition_failed", "Object already exists");
   }
   validateMultipartUpload(upload, totalBytes, partBytes);
+  if (
+    identity !== undefined &&
+    (upload.encryption?.uuid !== identity.uuid ||
+      upload.encryption.uploadId !== identity.uploadId ||
+      upload.encryption.ciphertextSha256 !== identity.ciphertextSha256)
+  )
+    throw backendContractError("Encrypted multipart backend returned a different identity");
   return jsonResponse({
     upload_id: upload.uploadId,
     total_bytes: upload.totalBytes,
     part_bytes: upload.partBytes,
+    ...(identity === undefined
+      ? {}
+      : {
+          encryption: {
+            uuid: identity.uuid,
+            upload_id: identity.uploadId,
+            ciphertext_sha256: identity.ciphertextSha256,
+          },
+        }),
     uploaded_parts: upload.uploadedParts.map((part) => ({
       part_number: part.partNumber,
       bytes: part.bytes,
@@ -336,7 +468,11 @@ async function uploadMultipartPart(
   const uploadId = parseUploadId(request.headers);
   const partNumber = parsePositiveIntegerHeader(request.headers, MULTIPART_HEADER_PART_NUMBER);
   if (partNumber > MAX_MULTIPART_PARTS) {
-    throw new GraftProtocolError(400, "invalid_multipart_part", "Multipart part number is too large");
+    throw new GraftProtocolError(
+      400,
+      "invalid_multipart_part",
+      "Multipart part number is too large",
+    );
   }
   const contentLength = parseContentLengthHeader(request.headers);
   if (contentLength < 1 || contentLength > partBytes) {
@@ -360,7 +496,10 @@ async function completeMultipartUpload(
 ): Promise<Response> {
   requireImmutablePath(path);
   requireEmptyBody(request);
-  const created = await requireMultipartBackend(backend).complete(path, parseUploadId(request.headers));
+  const created = await requireMultipartBackend(backend).complete(
+    path,
+    parseUploadId(request.headers),
+  );
   if (!created) {
     throw new GraftProtocolError(412, "precondition_failed", "Object already exists");
   }
@@ -470,10 +609,7 @@ async function putIfAbsent(
   return emptyResponse();
 }
 
-async function uploadBundle(
-  backend: GraftRepositoryBackend,
-  refPath: string,
-): Promise<Response> {
+async function uploadBundle(backend: GraftRepositoryBackend, refPath: string): Promise<Response> {
   requireTransactionalPath(refPath);
   const reference = await readMetadataObject(backend, refPath);
   if (reference === null) throw objectNotFound();
@@ -705,7 +841,11 @@ function decodeFetchBundlePackIndex(path: string, bytes: Uint8Array): FetchBundl
       throw fetchBundleUnavailable("Pack ancestry entry has an invalid shape");
     }
     const commit = value as Record<string, unknown>;
-    if (!isObjectId(commit.id) || !Array.isArray(commit.parents) || !commit.parents.every(isObjectId)) {
+    if (
+      !isObjectId(commit.id) ||
+      !Array.isArray(commit.parents) ||
+      !commit.parents.every(isObjectId)
+    ) {
       throw fetchBundleUnavailable("Pack ancestry entry contains an invalid object id");
     }
     return { id: commit.id, parents: commit.parents };
@@ -735,10 +875,7 @@ function fetchBundleUnavailable(message: string): GraftProtocolError {
 const MAX_READ_BUNDLE_MANIFEST_BYTES = 256 * 1024;
 const MAX_READ_BUNDLE_RESPONSE_BYTES = 64 * 1024 * 1024;
 
-async function readBundle(
-  request: Request,
-  backend: GraftRepositoryBackend,
-): Promise<Response> {
+async function readBundle(request: Request, backend: GraftRepositoryBackend): Promise<Response> {
   const manifest = await readLimitedBody(request, MAX_READ_BUNDLE_MANIFEST_BYTES);
   let value: unknown;
   try {
@@ -874,10 +1011,7 @@ async function resolveObjectSizes(
   return resolved;
 }
 
-function uploadBundleTotalBytes(
-  manifest: Uint8Array,
-  objects: UploadBundleObject[],
-): number {
+function uploadBundleTotalBytes(manifest: Uint8Array, objects: UploadBundleObject[]): number {
   let total = manifest.byteLength;
   const encoder = new TextEncoder();
   for (const object of objects) {
@@ -1021,10 +1155,7 @@ class UploadBundleBody {
   }
 
   private fillPrefetch(): void {
-    const end = Math.min(
-      this.#objects.length,
-      this.#index + UPLOAD_BUNDLE_PREFETCH_OBJECTS,
-    );
+    const end = Math.min(this.#objects.length, this.#index + UPLOAD_BUNDLE_PREFETCH_OBJECTS);
     while (this.#nextPrefetch < end) {
       const index = this.#nextPrefetch;
       const path = this.#objects[index]!.path;
@@ -1089,9 +1220,7 @@ class UploadBundleBody {
   }
 }
 
-type PrefetchedObject =
-  | { ok: true; object: GraftObject | null }
-  | { ok: false; error: unknown };
+type PrefetchedObject = { ok: true; object: GraftObject | null } | { ok: false; error: unknown };
 
 function uploadBundleFrameHeader(path: string, size: number): Uint8Array<ArrayBuffer> {
   const pathBytes = new TextEncoder().encode(path);
@@ -1169,7 +1298,7 @@ async function receiveBundle(
       { path: `objects/pack/${packId}.idx`, bytes: indexBytes, allowExisting: true },
     ];
     // Bound buffering to 256 KiB; large objects retain streaming backpressure.
-    for (let index = 0; index < objects.length;) {
+    for (let index = 0; index < objects.length; ) {
       const object = objects[index]!;
       if (object.bytes > 64 * 1024) {
         await receivePackObject(backend, source, object.path, object.bytes, object.allowExisting);
@@ -1179,16 +1308,26 @@ async function receiveBundle(
       const batch: { path: string; bytes: Uint8Array<ArrayBuffer>; allowExisting: boolean }[] = [];
       while (index < objects.length && batch.length < 4 && objects[index]!.bytes <= 64 * 1024) {
         const next = objects[index++]!;
-        batch.push({ path: next.path, bytes: await source.readExact(next.bytes), allowExisting: next.allowExisting });
-      }
-      const writes = await Promise.allSettled(batch.map(async (entry) => {
-        const created = await backend.putIfAbsent(entry.path, entry.bytes, "immutable", {
-          contentLength: entry.bytes.byteLength,
+        batch.push({
+          path: next.path,
+          bytes: await source.readExact(next.bytes),
+          allowExisting: next.allowExisting,
         });
-        if (!created && !entry.allowExisting) {
-          throw new GraftProtocolError(412, "precondition_failed", "Bundled object already exists and requires client verification");
-        }
-      }));
+      }
+      const writes = await Promise.allSettled(
+        batch.map(async (entry) => {
+          const created = await backend.putIfAbsent(entry.path, entry.bytes, "immutable", {
+            contentLength: entry.bytes.byteLength,
+          });
+          if (!created && !entry.allowExisting) {
+            throw new GraftProtocolError(
+              412,
+              "precondition_failed",
+              "Bundled object already exists and requires client verification",
+            );
+          }
+        }),
+      );
       // Settle every write before returning an error; never publish a partial batch.
       for (const write of writes) if (write.status === "rejected") throw write.reason;
     }
@@ -1509,7 +1648,10 @@ function enforceRequestLimit(headers: Headers, maxRequestBytes: number | undefin
 function requireMultipartBackend(
   backend: GraftRepositoryBackend,
 ): NonNullable<GraftRepositoryBackend["multipart"]> {
-  if (backend.multipart === undefined) {
+  if (
+    backend.multipart === undefined ||
+    (backend.encryption !== undefined && backend.multipart.supportsEncryption !== true)
+  ) {
     throw new GraftProtocolError(
       404,
       "operation_not_found",

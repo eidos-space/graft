@@ -10,6 +10,27 @@ import {
 const ORIGIN = "https://remote.example";
 
 describe("createGraftRemote", () => {
+  it("routes encrypted aggregates through authorization and the shared protocol handler", async () => {
+    const key = `e2ee/packs/${"a".repeat(64)}`;
+    const operations: string[] = [];
+    const backend: GraftRepositoryBackend = {
+      encryption: {profile:"encrypted-remote-v1", version:1, suite:1, uuid:"123e4567-e89b-42d3-a456-426614174000"},
+      head: () => ({size:1}), get: () => ({size:1, body:new Uint8Array([7])}),
+      put: () => undefined, delete: () => undefined, putIfAbsent: () => false,
+      compareAndSwap: () => false, compareAndDelete: () => false,
+      list: () => ({paths:[], hasMore:false}),
+    };
+    const app = createGraftRemote({backend: () => backend, authorize: context => {operations.push(context.operation); expect(context.action).toBe(context.operation === "descriptor" ? "discover" : "read");}});
+    const body = JSON.stringify({version:1, keys:[key]});
+    const response = await app.request(`${ORIGIN}/alice/repo/e2ee/read-bundle`, {method:"POST", body, headers:{"Graft-Protocol":"1", "Content-Length":String(new TextEncoder().encode(body).length)}});
+    expect(response.status).toBe(200);
+    expect(response.headers.get("x-graft-bundle-objects")).toBe("1");
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    expect(new TextDecoder().decode(bytes.subarray(0, 8))).toBe("GRAFTEB1");
+    expect(operations).toEqual(["e2ee-read-bundle"]);
+    const insecure = await app.request("http://remote.example/alice/repo", {headers:{"Graft-Protocol":"1"}});
+    expect(insecure.status).toBe(400);
+  });
   it("mounts the core handler without taking over unrelated Hono routes", async () => {
     let objectPath: string | undefined;
     let adapterPath: string | undefined;

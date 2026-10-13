@@ -1,3 +1,5 @@
+import type { EncryptedRoutingHint } from "./encrypted-routing.js";
+
 export type MaybePromise<T> = T | Promise<T>;
 
 export interface GraftRepository {
@@ -27,6 +29,8 @@ export type GraftWriteBody = Uint8Array<ArrayBuffer> | ReadableStream<Uint8Array
 
 export interface GraftWriteOptions {
   contentLength?: number;
+  /** Structurally validated public hint; publish derived rows atomically with it. */
+  routingHint?: EncryptedRoutingHint;
 }
 
 export interface GraftListQuery {
@@ -55,13 +59,23 @@ export interface GraftMultipartUpload {
   totalBytes: number;
   partBytes: number;
   uploadedParts: GraftMultipartPart[];
+  encryption?: GraftMultipartEncryptionIdentity;
+}
+
+export interface GraftMultipartEncryptionIdentity {
+  uuid: string;
+  uploadId: string;
+  ciphertextSha256: string;
 }
 
 export interface GraftMultipartBackend {
+  /** Opt in only when identity, digest, and atomic publication are enforced. */
+  readonly supportsEncryption?: true;
   start(
     path: string,
     totalBytes: number,
     partBytes: number,
+    encryption?: GraftMultipartEncryptionIdentity,
   ): MaybePromise<GraftMultipartUpload | null>;
   uploadPart(
     path: string,
@@ -75,6 +89,14 @@ export interface GraftMultipartBackend {
 }
 
 export interface GraftRepositoryBackend {
+  /** Persisted repository identity; changing this requires a new remote. */
+  readonly encryption?: GraftEncryptionDescriptor;
+  readonly encryptedRouting?: {
+    select(
+      target: string,
+      have: string | null,
+    ): MaybePromise<Array<Pick<EncryptedRoutingHint, "key" | "pack" | "index">> | null>;
+  };
   head(path: string): MaybePromise<GraftObjectMetadata | null>;
   get(path: string, range?: GraftByteRange): MaybePromise<GraftObject | null>;
   put(path: string, value: Uint8Array<ArrayBuffer>): MaybePromise<void>;
@@ -101,6 +123,9 @@ export interface GraftRepositoryBackend {
 export type GraftRemoteAction = "discover" | "read" | "write";
 
 export type GraftRemoteOperation =
+  | "e2ee-read-bundle"
+  | "e2ee-fetch-bundle"
+  | "e2ee-receive-bundle"
   | "descriptor"
   | "raw"
   | "raw-if-not-exists"
@@ -116,6 +141,13 @@ export type GraftRemoteOperation =
   | "cas"
   | "cad"
   | "list";
+
+export interface GraftEncryptionDescriptor {
+  profile: "encrypted-remote-v1";
+  version: 1;
+  suite: 1;
+  uuid: string;
+}
 
 export interface GraftRouteParameters {
   namespace?: string;
