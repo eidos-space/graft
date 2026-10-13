@@ -91,3 +91,11 @@ e2ee = ["dep:argon2", "dep:chacha20poly1305", "dep:getrandom", "dep:hkdf", "dep:
 # Native hosts opt in to RustCrypto's runtime-detected hardware backend.
 native-crypto = ["e2ee", "dep:graft-native-crypto"]
 macos-keychain = ["e2ee", "dep:security-framework"]
+
+[[example]]
+name = "e2ee_range_benchmark"
+required-features = ["e2ee"]
+
+[[example]]
+name = "e2ee_load_benchmark"
+required-features = ["e2ee"]

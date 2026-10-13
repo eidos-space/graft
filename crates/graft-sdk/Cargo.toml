@@ -38,3 +38,11 @@ sha2 = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 zeroize = { workspace = true }
+
+[[example]]
+name = "e2ee_sync_benchmark"
+required-features = ["e2ee"]
+
+[[example]]
+name = "e2ee_sqlite_hydration_benchmark"
+required-features = ["e2ee"]

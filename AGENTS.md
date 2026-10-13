@@ -27,6 +27,7 @@ the HTTP remote packages.
 | Path | Responsibility |
 | --- | --- |
 | `crates/graft` | Core storage engine, repository model, refs, index, merge, sync, and remote backends. |
+| `crates/graft-native-crypto` | Optional target-aware Cargo feature routing for native SHA-2 backends; no runtime API. |
 | `crates/graft-sqlite` | Physical SQLite snapshot/import, row diff/merge, and worktree support. |
 | `crates/graft-cli` | `graft` command-line executable and CLI integration tests. |
 | `crates/graft-sdk` | Long-lived embedded Rust repository sessions. |
@@ -216,3 +217,7 @@ Follow `CONTRIBUTING.md` and the workspace lint configuration.
 - Core/CLI releases use a `vX.Y.Z` tag and `just run release X.Y.Z`; the
   `--execute` flag creates and pushes the tag, so use it only when explicitly
   authorized. SDK and remote packages have separate release workflows.
+- `graft-native-crypto` shares the core/CLI release version. If publishing the
+  Rust packages to crates.io, publish this dependency before `graft`; the
+  existing core/CLI workflow validates versions and publishes GitHub releases,
+  but does not publish Rust packages to crates.io.

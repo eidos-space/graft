@@ -11,6 +11,7 @@ on:
       - "crates/graft-sdk-node/**"
       - "crates/graft-sqlite/**"
       - "crates/graft/**"
+      - "crates/graft-native-crypto/**"
       - "packages/graft-sdk/**"
   push:
     tags:

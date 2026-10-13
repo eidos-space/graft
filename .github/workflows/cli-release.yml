@@ -64,7 +64,7 @@ jobs:
             echo "::error::release tag ${GITHUB_REF_NAME} must be annotated"
             exit 1
           fi
-          crates=(graft graft-sqlite graft-cli graft-test graft-tracing)
+          crates=(graft-native-crypto graft graft-sqlite graft-cli graft-test graft-tracing)
           for crate in "${crates[@]}"; do
             crate_version="$(cargo pkgid -p "$crate" | sed 's/.*#//')"
             if [[ "$crate_version" != "$RELEASE_VERSION" ]]; then
