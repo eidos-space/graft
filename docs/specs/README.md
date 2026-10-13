@@ -25,6 +25,7 @@ or implementation techniques that have no observable effect.
 | Diff and historical inspection | [Graft Diff 1.0](./graft-diff-1.0.md) | [中文](./graft-diff-1.0.zh.md) | repository diff + `graft-sqlite` row diff |
 | Merge and conflict recovery | [Graft Merge 1.0](./graft-merge-1.0.md) | [中文](./graft-merge-1.0.zh.md) | repository merge + SQLite row merge |
 | Remotes and synchronization | [Graft Remote Sync 1.0](./graft-remote-sync-1.0.md) | [中文](./graft-remote-sync-1.0.zh.md) | repository sync + remote protocol |
+| E2EE remote and opaque sync hints (opt-in native source profile) | [Graft E2EE Remote 1.0](./graft-e2ee-remote-1.0.md) | [中文](./graft-e2ee-remote-1.0.zh.md) | encrypted remote + trusted key host |
 | Runtime, CLI, and SDK adapters | [Graft Runtime and Adapters 1.0](./graft-runtime-adapters-1.0.md) | [中文](./graft-runtime-adapters-1.0.zh.md) | command service + SDK adapters |
 | Physical worktree projection | [Graft Worktree Materialization 1.0](./graft-worktree-materialization-1.0.md) | [中文](./graft-worktree-materialization-1.0.zh.md) | SQLite worktree adapter |
 
@@ -55,9 +56,15 @@ Storage snapshots         Diff + Merge
 
 The English documents are normative. Chinese documents are informative,
 section-aligned references and MUST NOT change the English meaning. Every 1.0
-document is a **draft implementation-aligned normative baseline**: requirements
+baseline document is a **draft implementation-aligned normative baseline**: requirements
 are backed by current source and tests, while known gaps and compatibility
 limits are stated explicitly instead of being promoted into promises.
+
+[Graft E2EE Remote 1.0](./graft-e2ee-remote-1.0.md) is separately marked as a
+**final design specification with an opt-in Unix native source implementation,
+not production-validated**. It defines an additional conformance target; it does
+not change plain remote behavior or establish default release support. Its explicit status takes
+precedence over the baseline classification above.
 
 The key words **MUST**, **MUST NOT**, **REQUIRED**, **SHALL**, **SHALL NOT**,
 **SHOULD**, **SHOULD NOT**, **RECOMMENDED**, **NOT RECOMMENDED**, **MAY**, and
@@ -74,6 +81,7 @@ all capitals.
 | Path/content/row/schema/opaque comparison and bounded inspection | Diff |
 | Topology, merge state, conflicts, resolutions, continue/abort | Merge |
 | Remote URI/backend behavior, wire protocol, fetch/push/pull/clone and publication | Remote Sync |
+| Encrypted remote encoding, opaque routing disclosures, key lifecycle and encrypted HTTP extensions | E2EE Remote |
 | Operation names, session lifecycle, serialization, cancellation, errors and host mapping | Runtime and Adapters |
 | Live SQLite VFS, extension registration, lock state, production PRAGMAs | SQLite Integration |
 | Ordinary SQLite files, WAL/sidecars, replacement locks, recovery | Worktree Materialization |
@@ -118,6 +126,8 @@ GRAFT-Browser-1.0    WASM/OPFS host composition and capability disclosure
 GRAFT-VFS-1.0        live SQLite VFS and extension surface
 GRAFT-Worktree-1.0   ordinary-file materialization and recovery
 GRAFT-Delta-1.0      portable SQLite page-delta creation and application
+GRAFT-E2EE-Remote-1.0 encrypted remote base and lifecycle; opt-in native source
+GRAFT-E2EE-Sync-1.0   optimized encrypted aggregates; opt-in native source
 ```
 
 An implementation MUST claim profiles separately. A profile claim identifies
@@ -135,6 +145,7 @@ conformance targets rather than release claims.
 | Diff | repository diff/history plus `crates/graft-sqlite/src/row_level_diff.rs` | rowid/PK/schema/opaque/bounded diff tests and SDK contracts |
 | Merge | `crates/graft/src/repo/merge.rs`, `graft-sqlite` row merge/output | core topology, SQLite conflict/resolution, reopen and browser fixture tests |
 | Remote Sync | repository sync, remote/runtime actions, `packages/graft-remote` | Rust remote tests plus framework/Hono/Cloudflare protocol tests |
+| E2EE Remote | native encrypted remote + trusted key host | no production conformance claim; required evidence in its Section 20 |
 | Runtime and Adapters | command service, Rust SDK, Node addon/package, `web-demo` worker | lifecycle/cache/cancel/error/contract tests and Playwright WASM tests |
 | Materialization | `graft-sqlite` checkout/snapshot/merge worktree paths | WAL/replacement/recovery/operation-gate integration tests |
 

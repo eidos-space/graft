@@ -119,6 +119,57 @@ CLI 与 SDK 主要映射如下；SDK 空白表示当前 CLI-only，不是另一�
 | merge/conflicts/resolve | plan/apply/status/list/version/path/row/text/provider/continue/abort | typed plan/state/provider token 与 outcome |
 | branch/tag/switch/reset/export/audit/payload/GC/SQL/low-level remote | — | CLI-only 1.0 |
 
+`listRemotes` 用 kind `encrypted_http` 区分加密 HTTP 配置。这是公开 profile
+信息，不表示会话已解锁或 adapter 已实现加密接入。URL projection 不包含
+credential、密码、密钥或宿主 staging 状态。
+
+原生 Rust SDK 的 `RepositorySession::new_with_remote_credentials` 接受显式共享的
+`RemoteCredentials` 和可选身份覆盖。原生 `e2ee` feature 允许通过该 provider
+使用宿主注册的加密会话。仓库 runtime 的 close/reopen 不断开其他仓库共享的密钥
+会话。宿主负责密钥会话的锁定、排空和凭据断开；此构造入口不接入远端或记住密钥。
+
+启用原生 `e2ee` feature 后，`graft_sdk::e2ee` 暴露核心的不透明密钥会话、检查点
+和可信 provider 接口。宿主可以显式调用 `EncryptedHttpClient::unlock_remembered`，
+读取已固定远端的公开 descriptor/config，加载绑定的记住根密钥，认证配置并持久
+推进检查点后才放行数据操作。条目缺失、存储不可用、身份/认证/检查点失败保持
+锁定。联网解锁不保存或删除凭据。调用取消与会话锁定遵守核心的任务排空契约。
+此 Rust 入口本身不提供 Node 密钥 API，也不代表宿主或平台的记住功能已获验证。
+
+Rust 加密 HTTP 客户端还提供 `publish_initial_config` 和不发送 mutation 的
+`reconcile_initial_config`，接受可信 `InitializationJournal`。宿主先用 journal
+中的精确本机候选配置解锁。`InitialConfigPublicationOutcome::Confirmed` 表示
+已读回并认证精确配置，且 journal 已持久推进到 config-published；不表示已连接，
+也不发布初始对象/ref。已知发布的配置丢失时，不重新 create。Unix 的
+`FileInitializationJournal` 要求私有目录、明确 create/open 和 owner-only 文件。
+其阻塞持久化任务留在持钥操作的排空边界内。完整接入、平台存储、宿主认证与
+CLI/Node 编排仍需满足 E2EE Remote 第 17 节。
+
+Node 绑定的可选 `e2ee` feature 增加可信宿主的 `EncryptedRemoteSession`，固定
+远端 name/URL/UUID 与宿主已认证的 domain/account subject。构造选项明确选择
+新建检查点或打开已有状态；已有状态丢失时不重建。目前原生检查点要求 Unix 的
+owner-only 私有目录。`macos-keychain` 额外启用获准的原生 provider；存储不可用
+不回退。默认 native artifact 不启用此 API。
+
+`unlock(Buffer)` 同步消费并清零调用方独占的密码 Buffer，在异步调度前登记解锁，
+只保留受控原生副本。拒绝字符串、无效 UTF-8 和越界输入；不承诺擦除之前的 JS
+副本，不返回密钥或密码 JSON。`unlockRemembered`、`remember`、`lock`、`pause`、
+`disconnect`、`reconnect`、`refreshBearerToken`、`forget` 保留核心生命周期和
+存储契约。丢弃 JS Promise 不取消任务；显式锁定/断开取消并排空已准入任务。
+切换账户需要新的身份绑定句柄。宿主验证刷新 token 的身份，并协调共享系统条目
+的全部会话。普通插件 RPC 不得暴露此权限。
+
+`RepositorySessionOptions.encryptedRemote` 将句柄的显式凭据共享给保留的 runtime。
+`addEncryptedRemote` 添加其类型化配置，不覆盖或推断 profile；
+`cloneEncryptedRemote` 遵守已有类型化 clone 与目标目录安全契约。runtime 的
+close/reopen 不锁定共享权限。仓库操作保留已有 AbortSignal 契约。远端接入、
+修改/恢复密码授权与签名宿主的系统记住证据仍是独立交付要求。
+
+`clone_repository_with_config` 接受类型化 `RemoteConfig` 和可选分支，复用 URI
+API 的 command-service clone 与目标目录安全契约。加密配置保留 profile/UUID，
+联网数据访问使用宿主注册的 `origin` 会话；不从明文 URL 推断加密，也不在配置中
+接受密钥。HTTP URL 中的凭据、query 和 fragment 在初始化目标目录前拒绝。
+这是 Rust SDK 入口；Node/CLI 接入仍须单独实现。
+
 稳定分类：
 
 ```text
@@ -239,6 +290,32 @@ GRAFT_SDK_REPOSITORY_COMMAND
 
 JS 除 cancel 外抛 `GraftSdkError(code,cause)`；cancel 为 `AbortError`。Error 必须 redact
 credential，并保留有意义 repository/remote conflict detail。
+
+加密操作必须先按类型化原因分类，再使用消息文本回退。Rust 提供
+`SdkErrorCode::Encrypted(EncryptedErrorCode)`；其 `as_str()` 与 Node 的
+`GraftSdkError.code` 使用 `GRAFT_SDK_E2EE_` 系列。该分类覆盖仓库
+push/fetch/clone，不只覆盖密钥会话方法。缺少加密功能时，即使是默认构建，
+也返回 `GRAFT_SDK_E2EE_UNSUPPORTED_ENCRYPTED_PROFILE`。
+
+| Code | 含义与宿主处理 |
+| --- | --- |
+| `GRAFT_SDK_E2EE_LOCKED` | 需要显式解锁；不是仓库写入锁。 |
+| `GRAFT_SDK_E2EE_DISCONNECTED` | 解锁前需要显式重连。 |
+| `GRAFT_SDK_E2EE_PAUSED` | 暂停接收同步操作；宿主保留用户的暂停意图。 |
+| `GRAFT_SDK_E2EE_AUTHENTICATION_FAILED` | HTTP 401/403，账户认证或授权失败。 |
+| `GRAFT_SDK_E2EE_INTEGRITY_FAILED` | 加密数据的密码学认证失败；刷新账户 token 无法修复。 |
+| `GRAFT_SDK_E2EE_UNLOCK_FAILED` | 密码解包失败；不区分错误密码与损坏的包装数据。 |
+| `GRAFT_SDK_E2EE_CONFIG_ROLLBACK_DETECTED` | 观察到的配置违反保留的检查点。 |
+| `GRAFT_SDK_E2EE_CHECKPOINT_UNAVAILABLE` | 无法读取或持久推进必需的信任状态。 |
+| `GRAFT_SDK_E2EE_REMEMBERED_KEY_MISSING` | 绑定身份没有记住的密钥条目。 |
+| `GRAFT_SDK_E2EE_SECURE_STORAGE_UNAVAILABLE` | 获准安全存储不可用或未授权。 |
+
+核心密码学错误 `AuthenticationFailed` 映射为 SDK `INTEGRITY_FAILED`，不得与
+HTTP 账户认证混淆。完整性、身份或回退错误后，宿主不得静默重置信任状态、覆盖
+远端数据或切换为明文。其余类型化加密原因保留 `EncryptedErrorCode` 的独立
+错误码；消息供诊断，不是分派 API。发布结果未知或未确认优先于内部取消或传输
+错误，并保留既有 `GRAFT_SDK_REMOTE_PUBLICATION_*` 错误码。只有普通取消才
+映射为 `GRAFT_SDK_CANCELLED`/`AbortError`。
 
 ## 11. Node package boundary
 

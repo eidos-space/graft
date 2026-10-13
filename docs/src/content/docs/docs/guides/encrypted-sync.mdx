@@ -1,0 +1,141 @@
+---
+title: Encrypted Sync
+description: Build the native encrypted transport, connect with a sync password, and recover interrupted publication.
+---
+
+Graft's native encrypted transport encrypts recorded history, SQLite snapshots,
+file content and ref values before sending them to an HTTP remote. Local
+worktrees and caches remain plaintext. The service can observe opaque object
+identifiers, sizes, timing and the routing relationships needed for synchronization.
+
+This is an opt-in source feature for Unix native hosts. Default CLI and Node
+builds do not enable it. Production conformance and OS-backed remembering require
+the evidence listed in the [E2EE specification](https://github.com/eidos-space/graft/blob/main/docs/specs/graft-e2ee-remote-1.0.md).
+Windows and browser E2EE are not supported by this implementation.
+
+## Build the CLI
+
+From a Graft checkout with the repository toolchain installed:
+
+```sh
+cargo build -p graft-cli --features e2ee --locked
+target/debug/graft e2ee --help
+```
+
+Use this feature-enabled binary for the commands below. Native Node hosts can
+build the addon with the `e2ee` feature and use the trusted `EncryptedRemoteSession`
+authority described in the [SDK README](https://github.com/eidos-space/graft/tree/main/packages/graft-sdk#native-encrypted-remote-hosts).
+Keep that authority in the trusted host process, outside ordinary plugin RPC.
+
+## Connect a device
+
+Obtain an encrypted remote's endpoint, UUID and authenticated account subject
+from the service's account-management flow. Keep the account bearer token in an
+explicitly named environment variable. The account credential grants service
+access; the separate sync password decrypts the repository root key.
+
+For an existing initialized remote, choose an empty or absent worktree and a new
+absolute host-state directory outside the worktree. Its parent must exist:
+
+```sh
+graft e2ee \
+  --worktree /absolute/path/notes \
+  --state-dir /absolute/private/notes-sync \
+  --url https://sync.example.org/account/repository \
+  --uuid 00010203-0405-4607-8809-0a0b0c0d0e0f \
+  --account YOUR_AUTHENTICATED_SUBJECT \
+  --token-env YOUR_TOKEN_VARIABLE \
+  --enroll clone
+```
+
+Replace the sample identity and paths with the service's values. The CLI prompts
+for the sync password without echoing it. It never accepts a password in argv or
+environment variables. Automation can use `--password-stdin` with a protected
+pipe; input is exact UTF-8 bytes, so a trailing newline becomes part of the password.
+
+For later commands, reuse the same identity, worktree and state directory and
+omit `--enroll`. Each invocation unlocks explicitly and drains its session on exit.
+Runtime failures return structured JSON and a nonzero exit status.
+
+| Action | Result |
+| --- | --- |
+| `fetch` | Receive verified history without replacing the worktree |
+| `pull` | Fetch and apply the normal merge/materialization rules |
+| `push` | Publish committed dependencies, then update the selected branch |
+| `change-password` | Replace the password wrapper for the same repository root |
+| `resume-password-change` | Reconcile the exact retained password-change candidate |
+
+Use ordinary local `add` and `commit` before push. Close affected application
+SQLite connections before pull. Encrypted transfer preserves Graft's existing
+WAL snapshot and worktree safety rules.
+
+A resident native session reuses locally verified history during incremental
+fetches and verifies every new dependency. Locking, disconnecting or starting a
+new secret session clears that receipt; missing or changed prior root metadata
+also triggers complete dependency validation. Objects are checked when read.
+An ordinary incremental fetch does not audit every previously cached file for
+out-of-band deletion or corruption. Use a fresh independent clone when validating
+a backup or checking complete remote restoration.
+
+## Initialize and recover
+
+For a newly registered empty encrypted remote, use `--enroll initialize
+--verification-directory /absolute/path/verification-clone` from a committed
+source repository. The verification destination must be empty or absent and
+separate from the source and host state. The CLI reports `connected` only after
+an independent new session successfully restores the selected branch. It leaves
+the verification clone in that destination.
+
+After interruption, preserve the private state and run `resume-initialization`
+without `--enroll`, using the same source, identity and a new empty verification
+destination. Do not delete recovery records to turn an uncertain operation into
+a fresh one. Missing or conflicting allocated recovery state fails closed.
+
+Large uploads use the service's advertised multipart transport. Restarting the
+CLI resumes the retained ciphertext and upload identity. Keep the host state
+until uncertain publications are reconciled. Older host enrollments can explicitly
+allocate unused recovery namespaces with `enroll-config-recovery` and
+`enroll-multipart-recovery` after unlocking.
+
+Use `multipart-uploads` to list retained opaque upload keys. Recover an existing
+candidate with `resume-multipart --key KEY`. If the service upload has expired or
+has an uncertain part write, `restart-multipart --key KEY` explicitly acknowledges
+aborting the old server session before retransmitting the same retained ciphertext.
+These operations do not require the original plaintext file. Missing recovery
+state is an error; it is never replaced with a newly encrypted candidate.
+
+## Migrate and switch this host
+
+Changing the sync password does not revoke a device that already possesses the
+root key. Replacing a compromised root requires migration to a new encrypted
+remote. Migration freezes explicit source-ref mappings, publishes dependencies
+and all selected refs, and independently restores the target before cutover.
+Use a newly registered target endpoint and UUID, and a new private state directory.
+Keep the selected source refs fixed while publishing the migration.
+
+| Action | Result |
+| --- | --- |
+| `--enroll prepare-migration` | Freeze explicitly selected refs, complete history, target mappings and a new root offline |
+| `resume-migration` | Publish or resume the exact retained configuration, dependencies, refs and HEAD |
+| `verify-migration --verification-directory PATH` | Restore every selected history into fresh private storage and leave this host's configuration unchanged |
+| `cutover-migration --verification-directory PATH` | Hold the native local write fence, independently verify again, then persist this host's remote and mapped branch upstreams |
+
+The verification directory must be new, empty and separate from the source and
+host state. Cutover preserves local history and ordinary files. Repeating it
+reconciles the same retained intent, including a previous interrupted acknowledgement.
+The local fence covers participating Graft commands; external SQLite/file writers,
+older binaries and other devices need their own coordination.
+See the [CLI workflow reference](/docs/reference/encrypted-cli/)
+for ref mapping arguments and recovery states. Offline devices
+must be switched separately; account-password reset cannot recover lost encryption
+keys.
+
+## Operate an encrypted service
+
+The service must register the encrypted identity explicitly and keep it stable.
+The Cloudflare adapter uses a Durable Object for exact ref updates and immutable
+visibility, and R2 for opaque ciphertext. See its
+[backend setup](https://github.com/eidos-space/graft/tree/main/packages/graft-remote-cloudflare).
+Published objects may reside under the adapter's staging prefix; do not attach a
+bucket expiration rule to that prefix. Completed-object garbage collection requires
+client-authorized reachability information and is not automatic.

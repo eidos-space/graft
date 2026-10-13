@@ -255,6 +255,10 @@ repository worktree 契约。隐藏的 WASM `merge-api` 创建真实 Rust
 对于 tracked physical SQLite path，在命令的执行顺序允许时，必须先完成
 replacement preflight，再改变 repository ref 或 index。
 
+如果应用或完成 merge 所需的快照和 payload 已在本地完整获取并验证，不能仅因 target 存在
+remote-tracking ref，就要求远端凭据或已解锁的加密同步会话。缺依赖时仍须通过
+认证的 hydration 补齐或显式失败，不能以部分或未经验证的本地数据替代。
+
 当前 adapter 的 preflight 会检查现有 target 是 regular file，拒绝 path-type
 collision，向 SQLite 请求 exclusive transaction，并拒绝 active transaction 或
 无法 checkpoint/detach 的 WAL。Restore 还检查 untracked collision；switch/checkout

@@ -288,6 +288,12 @@ untracked paths, and build the affected-path set. For tracked physical SQLite
 paths it MUST run the replacement preflight before changing repository refs or
 the index when the command supports that ordering.
 
+Applying or completing a merge whose required snapshots and payloads are fully available and
+verified locally MUST NOT require remote credentials or an unlocked encrypted
+sync session solely because its target has a remote-tracking ref. Missing
+dependencies still require authenticated hydration or an explicit failure; the
+adapter MUST NOT substitute partial or unverified local data.
+
 The current adapter preflight checks that an existing target is a regular file,
 rejects path-type collisions, asks SQLite for an exclusive transaction, and
 refuses an active transaction or a WAL that cannot be checkpointed and

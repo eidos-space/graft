@@ -1,0 +1,79 @@
+---
+title: 加密同步
+description: 构建原生加密传输，使用同步密码连接设备，并恢复中断的发布。
+---
+
+Graft 原生加密传输会先加密已记录历史、SQLite 快照、文件内容和引用值，再发送到 HTTP 远端。本地工作区与缓存仍是明文。服务可以观察不透明对象标识、大小、时间，以及同步需要的路由关系。
+
+这是 Unix 原生宿主需显式开启的源码功能，默认 CLI 和 Node 构建不包含它。生产符合性与系统安全存储能力需要提供 [E2EE 规范](https://github.com/eidos-space/graft/blob/main/docs/specs/graft-e2ee-remote-1.0.zh.md)列出的验证证据。当前实现不支持 Windows 和浏览器 E2EE。
+
+## 构建 CLI
+
+在已安装仓库工具链的 Graft checkout 中运行：
+
+```sh
+cargo build -p graft-cli --features e2ee --locked
+target/debug/graft e2ee --help
+```
+
+下文命令使用这个启用了功能的二进制。原生 Node 宿主可以用 `e2ee` feature 构建 addon，并按 [SDK README](https://github.com/eidos-space/graft/tree/main/packages/graft-sdk#native-encrypted-remote-hosts)使用受信任的 `EncryptedRemoteSession`。该权限对象应留在受信任的宿主进程中，不向普通插件 RPC 暴露。
+
+## 连接设备
+
+从服务的账户管理流程获取加密远端 endpoint、UUID 和已认证账户主体。账户 bearer token 放在显式指定的环境变量中。账户凭据授权服务访问；单独的同步密码用于解开仓库根密钥。
+
+连接已初始化的远端时，选择为空或不存在的工作区，以及工作区外一个新的绝对宿主状态目录。状态目录的父目录必须已经存在：
+
+```sh
+graft e2ee \
+  --worktree /absolute/path/notes \
+  --state-dir /absolute/private/notes-sync \
+  --url https://sync.example.org/account/repository \
+  --uuid 00010203-0405-4607-8809-0a0b0c0d0e0f \
+  --account YOUR_AUTHENTICATED_SUBJECT \
+  --token-env YOUR_TOKEN_VARIABLE \
+  --enroll clone
+```
+
+用服务提供的值替换示例身份和路径。CLI 以隐藏输入提示读取同步密码，不接受 argv 或环境变量中的密码。自动化可以通过受保护管道使用 `--password-stdin`；输入按精确 UTF-8 字节处理，末尾换行也属于密码。
+
+后续命令复用相同身份、工作区和状态目录，省略 `--enroll`。每次调用都显式解锁，退出时等待会话操作结束并断开。运行时失败返回结构化 JSON 和非零退出码。
+
+| 动作 | 结果 |
+| --- | --- |
+| `fetch` | 接收已验证历史，不替换工作区 |
+| `pull` | 获取历史并应用正常合并与物化规则 |
+| `push` | 发布已提交依赖，最后更新所选分支 |
+| `change-password` | 为同一个仓库根密钥更换密码包装 |
+| `resume-password-change` | 核对并恢复精确保留的改密候选 |
+
+push 前用普通本地 `add` 和 `commit` 记录变化。pull 前关闭受影响的应用 SQLite 连接。加密传输保留 Graft 既有的 WAL 快照与工作区安全规则。
+
+常驻原生会话在增量 fetch 时复用本地已验证的历史，并验证每个新依赖。锁定、断开或开启新的密钥会话会清除这份验证记录；先前根对象的元数据缺失或变化也会触发完整依赖验证。对象在读取时仍会检查。普通增量 fetch 不会逐一审计所有旧缓存文件是否被外部删除或损坏。验证备份或检查远端完整恢复能力时，应使用独立的新 clone。
+
+## 初始化与恢复
+
+对新注册的空加密远端，在已提交的源仓库中使用 `--enroll initialize --verification-directory /absolute/path/verification-clone`。验证目录必须为空或不存在，并与源仓库、宿主状态分开。只有独立新会话成功恢复所选分支后，CLI 才报告 `connected`。验证 clone 会保留在指定目录。
+
+中断后保留私有状态，使用相同源仓库和身份以及新的空验证目录运行 `resume-initialization`，省略 `--enroll`。不要删除恢复记录，把结果不确定的操作变成新操作。已分配的恢复状态缺失或冲突时会拒绝继续。
+
+大对象使用服务声明支持的分片传输。重启 CLI 后沿用保留的密文与上传身份。结果不确定的发布核对完成前，应保留宿主状态。旧宿主注册可以在解锁后通过 `enroll-config-recovery` 和 `enroll-multipart-recovery` 显式分配尚未使用的恢复空间。
+
+使用 `multipart-uploads` 列出保留上传的不透明键，通过 `resume-multipart --key KEY` 恢复现有候选。服务上传已过期或某个分片写入结果不确定时，`restart-multipart --key KEY` 会先确认中止旧服务会话，再重新发送同一份保留密文。这些操作不需要原始明文文件。恢复状态缺失时会报错，不会重新加密生成替代候选。
+
+## 迁移并切换当前宿主
+
+更改同步密码不会撤销已经持有根密钥的设备。替换泄露的根密钥需要迁移到新的加密远端。迁移固定显式的源引用映射，发布依赖和全部所选引用，并在切换前独立恢复目标。使用新注册目标的 endpoint、UUID 和新的私有状态目录；发布期间保持所选源引用不变。
+
+| 动作 | 结果 |
+| --- | --- |
+| `--enroll prepare-migration` | 离线固定明确选择的引用、完整历史、目标映射和新根密钥 |
+| `resume-migration` | 发布或恢复精确保留的配置、依赖、引用和 HEAD |
+| `verify-migration --verification-directory PATH` | 在新的私有存储中恢复每份所选历史，保持当前宿主配置不变 |
+| `cutover-migration --verification-directory PATH` | 持有原生本地写入锁，重新独立验证，再持久更新当前宿主的远端和映射分支的 upstream |
+
+验证目录必须全新、为空，并与源仓库和宿主状态分开。切换保留本地历史和普通文件。重复执行会核对同一份保留意图，包括先前已完成写入却未收到确认的情况。本地写入锁覆盖参与协议的 Graft 命令；外部 SQLite/文件写入者、旧二进制和其他设备需要各自协调。引用映射参数和恢复状态见 [CLI 工作流参考](/zh/docs/reference/encrypted-cli/)。离线设备需要分别切换；账户密码重置无法恢复丢失的加密密钥。
+
+## 运行加密服务
+
+服务必须显式注册并保持加密身份。Cloudflare 适配器用 Durable Object 执行精确引用更新并控制不可变对象何时可见，用 R2 保存不透明密文。配置方式见[后端说明](https://github.com/eidos-space/graft/tree/main/packages/graft-remote-cloudflare)。已发布对象可能位于适配器的 staging 前缀下，不要对该前缀设置 bucket 自动过期规则。已完成对象的垃圾回收需要客户端授权的可达性信息，当前不会自动执行。

@@ -1,0 +1,214 @@
+---
+title: Encrypted CLI
+description: Native encrypted synchronization, password recovery, multipart uploads and root migration.
+---
+
+Status: opt-in source implementation, not a production conformance claim.
+Unix source builds expose `graft e2ee` when compiled with the `e2ee` feature:
+
+```sh
+cargo build -p graft-cli --features e2ee --locked
+target/debug/graft e2ee --help
+```
+
+The sync commands connect to an initialized `encrypted-remote-v1` HTTP remote.
+Initialization starts from an empty remote identity registered by the service.
+Obtain its exact endpoint, UUID and authenticated account subject from the remote
+service's trusted account-management flow. Account management and bearer-token
+issuance are service-specific; `--account` binds local state and does not itself
+authenticate a user or establish that a token belongs to that subject.
+
+Omit `--password-stdin` for interactive entry in the foreground controlling
+terminal. The prompt hides all input. Enter finishes the password; its CR/LF
+delimiter is not part of the password. Spaces and Unicode are preserved, without
+normalization. Backspace deletes the preceding character, and Ctrl-U clears
+the input. Ctrl-C, Ctrl-D, Ctrl-Z and Escape cancel entry. While input is active,
+INT/TERM/HUP/QUIT/TSTP also cancel rather than leaving the terminal hidden.
+Original terminal attributes and signal handlers are restored before unlock;
+restoration failure stops the operation. Uncatchable termination is outside this
+graceful restoration guarantee. Passwords containing control/newline bytes need
+the protected automation input path.
+
+For automation, specify `--password-stdin` and supply the sync password through
+a protected child-process stdin pipe or an inherited protected input handle
+redirected to stdin. This option rejects terminal stdin to avoid echo. Bytes are
+read until EOF, must be valid UTF-8 and 1–1024 bytes, and are preserved exactly:
+spaces, CR and LF are part of the password. The input producer must not append
+a newline unless the password includes it. Sync passwords cannot be supplied
+as command arguments or environment variables. Input buffers are zeroized;
+this does not promise erasure of external producer, OS or dump copies.
+
+The account bearer token comes from the explicitly named `--token-env` variable;
+its value is not placed in repository config, URLs or result JSON. This is an
+account credential, separate from the sync password. Use the subject associated
+with that credential as `--account`; no environment token fallback is inferred.
+
+Choose an absolute worktree path and an absolute host-state path whose parent
+already exists. The state must be outside the worktree and `.graft` metadata,
+including discovered parent repositories and symlink aliases. Placement is
+checked before allocation, runtime mutation or network requests. A first device
+requires `--enroll` and a new state directory. Later invocations reopen the same
+directory without `--enroll`. Existing enrollment and missing/corrupt trust must
+not be silently replaced.
+
+With protected password input already supplied by the launcher, the command is:
+
+```sh
+graft e2ee \
+  --worktree /absolute/path/worktree \
+  --state-dir /absolute/private/host-state \
+  --url https://sync.example.org/account/repository \
+  --uuid 00010203-0405-4607-8809-0a0b0c0d0e0f \
+  --account YOUR_AUTHENTICATED_SUBJECT \
+  --token-env YOUR_ACCOUNT_TOKEN_VARIABLE \
+  --password-stdin --enroll clone
+```
+
+Replace the example identity and paths with your service's values. The example
+does not include a secret or a password-generating shell command. All four
+sync actions return JSON after the native SDK reports its result:
+
+Runtime failures return a nonzero exit status and a JSON error on stdout with
+`operation: "e2ee"` and `error.code`/`error.message`. Codes reuse native SDK
+classification; for example, wrong password is `GRAFT_SDK_E2EE_UNLOCK_FAILED`,
+missing trust is `GRAFT_SDK_E2EE_CHECKPOINT_UNAVAILABLE`, HTTP account denial is
+distinct from ciphertext integrity failure. Dispatch on the code rather than
+matching message text. CLI argument/parser failures keep standard usage errors.
+
+| Action | Behavior |
+| --- | --- |
+| `clone` | Unlock and verify the selected branch into an empty/absent target; registers `origin` |
+| `fetch` | Fetch verified remote history without changing the local branch/worktree |
+| `pull` | Fetch and apply existing Graft merge/materialization rules |
+| `push` | Publish encrypted dependencies and update the branch using exact observations and durable ref recovery |
+| `change-password` | Authenticate the current password again and publish a new wrapping envelope for the same root |
+| `resume-password-change` | Restore the exact retained candidate, reconcile it, and retry only if the authenticated old configuration remains current |
+| `enroll-config-recovery` | Explicitly allocate an unused configuration recovery slot for an older host enrollment after successful unlock |
+| `enroll-multipart-recovery` | Explicitly allocate an unused multipart recovery namespace for an older host enrollment after successful unlock |
+| `prepare-migration` | Freeze selected local history, explicit target ref mappings and one new encrypted root without contacting the service |
+| `resume-migration` | Reopen the exact retained migration and publish remaining configuration, dependency and ref phases |
+| `verify-migration --verification-directory PATH` | Independently recover every selected history using fresh credentials, checkpoints and local storage; reports pending cutover |
+| `cutover-migration --verification-directory PATH` | Fence local Graft history writers, independently verify again and durably switch this host's remote and mapped branch upstreams |
+| `multipart-uploads` | List retained uploads by opaque key and ciphertext size |
+| `resume-multipart --key OPAQUE_KEY` | Reconcile and resume the original retained ciphertext without preparing a replacement |
+| `restart-multipart --key OPAQUE_KEY` | Explicitly abort the recorded server session, then resend every retained ciphertext part in a new server session |
+| `initialize --verification-directory PATH` | Generate one random root, retain its wrapper and selected source, then publish and independently verify a new remote |
+| `resume-initialization --verification-directory PATH` | Reopen the exact initialization candidate/source and reconcile publication without replacing either |
+
+Before initialization, commit the local files using ordinary `add --all` and
+`commit`, and obtain an empty encrypted remote's identity through the trusted
+service account flow. `initialize` requires `--enroll` with a new private state
+directory. The selected `--branch` must be the checked-out committed branch.
+An absent local remote name is registered with the explicitly pinned encrypted
+configuration; an existing different configuration is refused. Interactive
+initialization asks for the new password twice without echo. Protected stdin
+can supply exact password bytes for automation.
+
+Large encrypted uploads use the service's advertised multipart transport and
+the private `multipart-recovery` namespace. Interrupted uploads resume the exact
+retained ciphertext and encryption upload ID, including after restarting the
+CLI. Keep this namespace when a result is unknown. Successful publication
+requires authenticating the entire winning object; only then is the large local
+ciphertext removed, while its small confirmation receipt remains. New host
+enrollment allocates the namespace. Older enrollment requires
+`enroll-multipart-recovery`; its durable allocation marker prevents this command
+from silently recreating lost recovery data.
+
+`--verification-directory` is required and must name an absolute empty/absent
+destination outside the source and private host state. It receives a plaintext
+local clone with a fresh native secret session, checkpoint and staging budget.
+Only verified default-branch clone with the retained source identity permits
+`status: "connected"`; confirming config alone remains pending. The temporary
+verification trust/staging state is drained and removed afterwards. The cloned
+files remain in the explicit destination.
+
+On failure, keep the host state and use `resume-initialization` without `--enroll`,
+the same identity/password/branch, and another empty verification destination.
+Recovery uses the exact retained root/config/source. Missing recovery or a changed
+local source stops publication. Restore the original committed source before
+resuming, or use normal sync after completed initialization. An occupied or
+partially cloned verification directory is never automatically cleared. Once
+password changes advance config trust, do not reuse the generation-1
+initialization workflow; use ordinary encrypted sync instead. Account registration
+and token issuance are not implemented by these CLI commands.
+
+`change-password` prompts for the new password twice with hidden terminal input.
+Automation can supply `change-password --new-password-fd N`, where N is an
+inherited non-terminal descriptor of at least 3. The descriptor is read until
+EOF with the same exact UTF-8 rules as protected stdin. The current password
+still uses the normal unlock input. No password value is accepted in arguments
+or environment variables. Confirmation mismatch or cancellation publishes nothing.
+
+New host enrollments allocate `config-recovery`. Older enrollments must explicitly
+run `enroll-config-recovery` before changing a password; existing slots are never
+replaced. Durable `config-recovery-enrolled` evidence is written before slot
+allocation; interrupted allocation or an allocated slot's loss cannot be repaired
+by repeating enrollment. A missing or damaged recovery slot is not silently recreated by change
+or resume. Keep the directory after any uncertain result. Resume uses the current
+remote password, which may be the new password if publication already happened.
+It never generates another envelope. Confirmed readback can recover a retained
+retirement receipt without another CAS. Unconfirmed and unknown publication
+return nonzero with `GRAFT_SDK_REMOTE_PUBLICATION_UNCONFIRMED` and
+`GRAFT_SDK_REMOTE_PUBLICATION_OUTCOME_UNKNOWN`, respectively. Changing the password
+does not revoke a device that already holds the repository root.
+
+`--branch` defaults to `main`. `--remote` defaults to `origin`; clone requires
+`origin`. Ordinary synchronization actions require the persisted remote to exactly match the
+explicit endpoint/UUID. Credentials also pin that profile and reject plaintext
+downgrade or another encrypted identity. Use ordinary local `add --all` and
+`commit` before push. `--db` is rejected for these commands; use `--worktree`.
+
+Migration targets a separately registered empty encrypted remote. Use a new
+private state directory and `--enroll prepare-migration`, selecting either
+`--all-refs` or repeated `--ref FULL_SOURCE_REF`. Supply one explicit
+`--map SOURCE_FULL_REF=TARGET_FULL_REF` for every selected ref and
+`--target-head refs/heads/TARGET_BRANCH`. Branches and remote-tracking refs map
+to target branches; tags map to target tags. Preparation validates the complete
+mapping before allocating state and does not modify the source's configured
+remote. Interactive preparation confirms the new password twice.
+
+Resume with the same endpoint, UUID, account, remote name, state and password,
+without `--enroll`, using `resume-migration`. The retained source, mappings, root,
+wrapper and budgets are reused; source changes or missing recovery stop the
+operation. `ready-for-independent-verification` means publication was confirmed.
+Then run `verify-migration --verification-directory /absolute/empty/path`.
+It authenticates every mapped ref and selected repository object, payload and
+SQLite storage dependency using fresh verification storage and password unlock.
+The destination is a verification object repository, not a materialized checkout.
+A failed verification consumes that destination; retry with a new empty one.
+
+Verification reports `independently-verified`, with `host_cutover` and
+`offline_devices` still pending. To switch this host, run
+`cutover-migration --verification-directory /another/absolute/empty/path`.
+It acquires the canonical repository mutation gate, performs fresh independent
+verification, revalidates the retained source, then atomically syncs the target
+remote and each mapped local branch's upstream configuration. The gate excludes
+supported local Graft history mutations across processes throughout this sequence.
+It preserves the physical worktree and local refs; arbitrary application SQLite
+or file writes are not paused. Success reports `host_cutover: confirmed` while
+`offline_devices: pending`. Coordinate those devices separately before resuming
+their synchronization. Replaying cutover re-verifies the same retained intent;
+use a new empty verification directory after failure or response loss.
+
+For an interrupted large upload, `multipart-uploads` lists opaque recovery keys.
+Use `resume-multipart --key KEY` first. If the server retains an unknown part or
+an expired session, explicitly use `restart-multipart --key KEY`. This requires
+an acknowledged abort before creating a new server session and sends the exact
+retained ciphertext again. Lost abort responses retain the old session pin;
+repeat the explicit command. An unknown first start response must be recovered
+with resume before restart. These commands also work before migration cutover,
+using the original enrolled endpoint and account. They never allocate a missing
+candidate. Re-run the original push or migration after the upload is confirmed.
+
+Host state contains owner-only configuration checkpoints, durable ref-publication
+recovery records and disposable staging. It is bound to the endpoint, application,
+account and encrypted repository; it contains no remembered root key or password.
+Missing state requires an explicit trust-reconstruction workflow, not adding
+`--enroll` to the same existing directory. Keep recovery state until pending
+publications are reconciled. The process disconnects/drains its secret session
+on completion or error; each invocation explicitly unlocks again.
+
+System-backed key remembering, service account and remote registration,
+password reset, automatic device migration cutover, force/all-ref sync flags,
+Windows and browser CLI E2EE are outside this CLI surface. Local files remain
+plaintext.

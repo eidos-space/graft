@@ -22,6 +22,7 @@ adapter 只映射行为，不重新定义行为。
 | Diff 与历史检查 | [Graft Diff 1.0](./graft-diff-1.0.md) | [中文](./graft-diff-1.0.zh.md) | repository diff + `graft-sqlite` row diff |
 | Merge 与冲突恢复 | [Graft Merge 1.0](./graft-merge-1.0.md) | [中文](./graft-merge-1.0.zh.md) | repository merge + SQLite row merge |
 | Remote 与同步 | [Graft Remote Sync 1.0](./graft-remote-sync-1.0.md) | [中文](./graft-remote-sync-1.0.zh.md) | repository sync + remote protocol |
+| E2EE 远端与不透明同步提示（可选原生源码 profile） | [Graft E2EE Remote 1.0](./graft-e2ee-remote-1.0.md) | [中文](./graft-e2ee-remote-1.0.zh.md) | encrypted remote + trusted key host |
 | Runtime、CLI 与 SDK adapter | [Graft Runtime and Adapters 1.0](./graft-runtime-adapters-1.0.md) | [中文](./graft-runtime-adapters-1.0.zh.md) | command service + SDK adapter |
 | 物理 worktree 投影 | [Graft Worktree Materialization 1.0](./graft-worktree-materialization-1.0.md) | [中文](./graft-worktree-materialization-1.0.zh.md) | SQLite worktree adapter |
 
@@ -49,8 +50,12 @@ Storage snapshots         Diff + Merge
 ## 规格状态与语言
 
 英文文档是规范来源；中文文档按章节对齐，仅作信息性参考，不能改变英文含义。
-所有 1.0 文档都是**与当前实现对齐的规范草案**：要求必须有当前源码与测试证据；
+现有 1.0 baseline 文档是**与当前实现对齐的规范草案**：要求必须有当前源码与测试证据；
 已知缺口和兼容边界会明确列出，不会伪装成更强保证。
+
+[Graft E2EE Remote 1.0](./graft-e2ee-remote-1.0.md) 单独标注为**定稿设计规范，
+提供 Unix 原生宿主可选源码实现，尚未完成生产验证**。它定义额外 conformance
+目标，不改变 plain 远端行为，也不代表默认发布支持。其明确状态优先于上述 baseline 分类。
 
 英文文档中以全大写出现的 **MUST**、**MUST NOT**、**REQUIRED**、**SHALL**、
 **SHALL NOT**、**SHOULD**、**SHOULD NOT**、**RECOMMENDED**、
@@ -66,6 +71,7 @@ Storage snapshots         Diff + Merge
 | path/content/row/schema/opaque 比较与有界检查 | Diff |
 | topology、merge state、conflict、resolution、continue/abort | Merge |
 | Remote URI/backend、wire protocol、fetch/push/pull/clone 与 publication | Remote Sync |
+| 加密远端编码、不透明路由披露、密钥生命周期与加密 HTTP 扩展 | E2EE Remote |
 | 操作名、session 生命周期、串行化、取消、错误与 host 映射 | Runtime and Adapters |
 | 实时 SQLite VFS、extension 注册、锁状态与生产 PRAGMA | SQLite Integration |
 | 普通 SQLite 文件、WAL/sidecar、replacement lock 与恢复 | Worktree Materialization |
@@ -100,6 +106,8 @@ GRAFT-Browser-1.0    WASM/OPFS host 组合与能力披露
 GRAFT-VFS-1.0        实时 SQLite VFS 与 extension surface
 GRAFT-Worktree-1.0   普通文件物化与恢复
 GRAFT-Delta-1.0      可移植 SQLite page delta 的创建与应用
+GRAFT-E2EE-Remote-1.0 加密远端基础与生命周期；可选原生源码实现
+GRAFT-E2EE-Sync-1.0   优化加密批量同步；可选原生源码实现
 ```
 
 实现必须分别声明 profile。Profile 描述行为，不绑定某个 crate 或语言。当前仓库
@@ -116,6 +124,7 @@ release claim。
 | Diff | repository diff/history 与 `row_level_diff.rs` | rowid/PK/schema/opaque/bounded/SDK test |
 | Merge | core merge 与 SQLite row merge/output | topology/conflict/resolution/reopen/browser fixture |
 | Remote | repository sync、remote/runtime action、`packages/graft-remote` | Rust 与 framework/Hono/Cloudflare protocol test |
+| E2EE Remote | 原生 encrypted remote + trusted key host | 不作生产 conformance 声明；要求见其第 20 节 |
 | Runtime/Adapter | command service、Rust/Node SDK、web worker | lifecycle/cache/cancel/error/contract/Playwright |
 | Materialization | checkout/snapshot/merge worktree path | WAL/replacement/recovery/gate integration test |
 

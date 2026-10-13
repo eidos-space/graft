@@ -176,6 +176,75 @@ current contract, not a second implementation.
 | `merge` + `conflicts` + `resolve` | `planMerge`, `applyMerge`, merge status/list/version, path/row/text/provider resolution, `continueMerge`, `abortMerge` | typed plan/state/provider tokens plus command outcome |
 | branch/tag/switch/reset/export/audit/payload/GC/SQL/low-level remote commands | — | CLI-only 1.0 surface |
 
+`listRemotes` distinguishes encrypted HTTP configuration with kind
+`encrypted_http`. This is public profile metadata; it does not indicate that a
+session is unlocked or that an adapter implements encrypted enrollment. Its URL
+projection excludes credentials, passwords, keys and host staging state.
+
+The native Rust SDK's `RepositorySession::new_with_remote_credentials` accepts
+explicit shared `RemoteCredentials` and an optional identity override. The native
+`e2ee` feature permits host-registered encrypted sessions through that provider.
+Repository runtime close/reopen does not disconnect a secret session shared with
+other repositories. The host owns secret-session locking, draining and credential
+disconnect; this constructor does not enroll a remote or remember its key.
+
+With the native `e2ee` feature, `graft_sdk::e2ee` exposes the core's opaque secret
+session, checkpoint and trusted-provider interfaces. Hosts may explicitly use
+`EncryptedHttpClient::unlock_remembered` to retrieve the pinned remote's public
+descriptor/config, load its bound remembered root, authenticate config and persist
+the checkpoint before admitting data operations. Missing/unavailable storage and
+identity/authentication/checkpoint failures preserve the locked state. Online
+unlock never saves or deletes credentials. The caller's cancellation and session
+lock retain the core task-draining contract. This Rust surface does not expose a
+Node secret API by itself or approve a host/platform remembering claim.
+
+The Rust encrypted HTTP client also exposes `publish_initial_config` and the
+non-mutating `reconcile_initial_config`. These take a trusted
+`InitializationJournal`; the host first unlocks from its exact local candidate.
+`InitialConfigPublicationOutcome::Confirmed` means config-published after exact
+authenticated readback and durable journal advancement. It does not mean
+connected or publish initial objects/refs. Known published config disappearance
+never triggers another create. The Unix `FileInitializationJournal` requires a
+private directory, explicit create/open and owner-only records. Its blocking
+persistence stays in the key-owning operation's draining boundary. Complete
+enrollment, platform storage, host authentication and CLI/Node orchestration
+remain separate requirements of E2EE Remote section 17.
+
+The Node binding's opt-in `e2ee` feature adds a trusted-host
+`EncryptedRemoteSession`, with an immutable remote name/URL/UUID and host-verified
+authentication domain/account subject. Constructor options select explicit
+checkpoint creation or existing opening; missing existing state is not recreated.
+Current native checkpoint support requires Unix owner-only private directories.
+`macos-keychain` additionally permits the approved native provider; unavailable
+storage never falls back. Default native artifacts do not enable this API.
+
+`unlock(Buffer)` consumes and clears its caller-owned, exclusive password Buffer
+synchronously, registers the unlock before async scheduling and retains only a
+controlled native copy. It rejects strings, invalid UTF-8 and out-of-bound input;
+the API cannot promise to erase prior JS copies. No key/password JSON is returned.
+`unlockRemembered`, `remember`, `lock`, `pause`, `disconnect`, `reconnect`,
+`refreshBearerToken` and `forget` preserve core lifecycle/storage contracts.
+Dropping a JS Promise is not cancellation; explicit lock/disconnect cancels and
+drains admitted work. Account switching requires a new identity-bound handle.
+Hosts must verify refreshed token identity and coordinate every session sharing
+an OS entry. Ordinary plugin RPC must not expose this authority.
+
+`RepositorySessionOptions.encryptedRemote` shares that handle's explicit
+credentials with its retained runtime. `addEncryptedRemote` adds its typed config
+without overwrite or profile inference; `cloneEncryptedRemote` uses the same
+typed clone/destination contract. Runtime close/reopen does not lock the shared
+authority. Repository methods retain their existing AbortSignal contract. Remote
+enrollment, password update/recovery authorization and signed OS-host remembering
+evidence remain separate delivery requirements.
+
+`clone_repository_with_config` accepts a typed `RemoteConfig` and optional branch,
+using the same command-service clone and destination safety contract as the URI
+API. An encrypted config preserves its profile/UUID and uses the host's registered
+`origin` session before network data access. It does not infer encryption from a
+plain URL or accept keys in the config. HTTP credentials, query parameters and
+fragments in URLs are rejected before destination initialization. This is a Rust
+SDK entry point; Node/CLI enrollment remains separately required.
+
 The stable operation classification is:
 
 ```text
@@ -366,6 +435,35 @@ native packages.
 Error messages MUST redact configured in-memory credentials. Adapters MUST
 preserve meaningful repository/remote conflict detail instead of collapsing
 every failure into one generic exception.
+
+Encrypted operations MUST classify typed causes before message-based fallback.
+Rust exposes `SdkErrorCode::Encrypted(EncryptedErrorCode)`; its `as_str()` and
+Node's `GraftSdkError.code` use the `GRAFT_SDK_E2EE_` family. This classification
+also applies to repository push/fetch/clone, not only secret-session methods.
+An unavailable encrypted feature returns
+`GRAFT_SDK_E2EE_UNSUPPORTED_ENCRYPTED_PROFILE`, including in default builds.
+
+| Code | Meaning and host handling |
+| --- | --- |
+| `GRAFT_SDK_E2EE_LOCKED` | Explicit unlock is required; this is not a repository writer lock. |
+| `GRAFT_SDK_E2EE_DISCONNECTED` | Explicit reconnection is required before unlock. |
+| `GRAFT_SDK_E2EE_PAUSED` | Sync admission is paused; the host retains the user's pause intent. |
+| `GRAFT_SDK_E2EE_AUTHENTICATION_FAILED` | HTTP 401/403 account authentication or authorization failure. |
+| `GRAFT_SDK_E2EE_INTEGRITY_FAILED` | Cryptographic authentication of encrypted data failed; account token refresh cannot repair it. |
+| `GRAFT_SDK_E2EE_UNLOCK_FAILED` | Password unwrap failed; does not distinguish an incorrect password from damaged wrapping data. |
+| `GRAFT_SDK_E2EE_CONFIG_ROLLBACK_DETECTED` | Observed config violates the retained checkpoint. |
+| `GRAFT_SDK_E2EE_CHECKPOINT_UNAVAILABLE` | Required trust state cannot be read or durably advanced. |
+| `GRAFT_SDK_E2EE_REMEMBERED_KEY_MISSING` | No remembered entry exists for the bound identity. |
+| `GRAFT_SDK_E2EE_SECURE_STORAGE_UNAVAILABLE` | Approved secure storage is unavailable or unauthorized. |
+
+The core's cryptographic `AuthenticationFailed` maps to SDK `INTEGRITY_FAILED`;
+it MUST NOT be confused with HTTP account authentication. Hosts MUST NOT silently
+reset trust state, overwrite remote data or switch to plaintext after integrity,
+identity or rollback failures. Remaining typed encrypted causes retain distinct
+codes from `EncryptedErrorCode`; messages are diagnostic, not a dispatch API.
+Publication outcome unknown/unconfirmed takes precedence over nested cancellation
+or transport failures and retains the existing `GRAFT_SDK_REMOTE_PUBLICATION_*`
+codes. Only an ordinary cancellation becomes `GRAFT_SDK_CANCELLED`/`AbortError`.
 
 ## 11. Node-API and package boundary
 

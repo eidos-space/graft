@@ -135,6 +135,11 @@ export const sidebar = [
         slug: "docs/guides/sync-remotes",
       },
       {
+        label: "Encrypted Sync",
+        translations: { "zh-CN": "加密同步" },
+        slug: "docs/guides/encrypted-sync",
+      },
+      {
         label: "Build An HTTP Remote",
         translations: { "zh-CN": "构建 HTTP 远端" },
         slug: "docs/guides/http-remote",
