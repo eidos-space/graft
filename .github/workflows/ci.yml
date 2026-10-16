@@ -122,7 +122,8 @@ jobs:
           GRAFT_E2EE_CARGO_FEATURES=e2ee,native-crypto GRAFT_E2EE_VERIFY_PYTHON=/tmp/graft-e2ee-verifier/bin/python bash scripts/test-e2ee-vectors.sh
 
       - name: Initialization persistence subprocess matrix
-        run: cargo test -p graft --lib --features e2ee --locked e2ee::initialization::tests:: -- --ignored --test-threads=1
+        run: |
+          cargo test -p graft --lib --features e2ee --locked e2ee::initialization::tests:: -- --ignored --test-threads=1
 
       - name: Migration intent persistence subprocess matrix
         run: cargo test -p graft --lib --features e2ee --locked migration_creation_process_exit_recovers_only_exact_installed_intent -- --ignored --test-threads=1
