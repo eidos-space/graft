@@ -276,6 +276,15 @@ jobs:
           GRAFT_E2EE_NODE_TEST_BINDING: ${{ github.workspace }}/sdk-artifact/graft-sdk.${{ matrix.suffix }}.node
         run: cargo test -p graft-sdk --features e2ee --test e2ee_node --locked -- --ignored --test-threads=1
 
+      - name: Retain synthetic privacy evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: e2ee-privacy-sdk-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/e2ee-privacy-evidence
+          if-no-files-found: warn
+          retention-days: 14
+
   package:
     name: Verify npm package assembly
     needs: [metadata, test, test-encrypted]

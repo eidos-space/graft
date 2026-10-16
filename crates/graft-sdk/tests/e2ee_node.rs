@@ -40,6 +40,48 @@ fn native_node_secret_sessions_sync_sqlite_and_files() {
 
 #[test]
 #[ignore = "requires built native Node E2EE addon and TypeScript remote; run test:e2ee-node"]
+fn native_node_bounded_privacy_evidence_covers_remote_bytes_and_diagnostics() {
+    let addon =
+        std::env::var_os("GRAFT_E2EE_NODE_TEST_BINDING").expect("native addon path required");
+    assert!(Path::new(&addon).is_file());
+    let directory = tempfile::tempdir().unwrap();
+    let nonce = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let password = format!("privacy-password-{nonce}");
+    let repository =
+        RepositoryId::from_bytes([0, 1, 2, 3, 4, 5, 0x46, 7, 0x88, 9, 10, 11, 12, 13, 14, 15])
+            .unwrap();
+    let root = RootKey::import(repository, Zeroizing::new([42; 32]));
+    let config = EncryptedConfig::create(&root, password.as_bytes()).unwrap();
+    let fixture = directory.path().join("fixture.json");
+    fs::write(&fixture, serde_json::to_vec(&serde_json::json!({
+        "encryption": { "profile":"encrypted-remote-v1", "version":1, "suite":1, "uuid":"00010203-0405-4607-8809-0a0b0c0d0e0f" },
+        "objects": [["e2ee/config", config.as_bytes()]],
+        "privacyEvidence": true,
+        "privacyCase": { "nonce": nonce, "password": password },
+        "enableMultipart": true, "maxRequestBytes": 32768, "multipartPartBytes": 16384,
+        "serviceLifetimeMs": 120000,
+    })).unwrap()).unwrap();
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let status = Command::new("node")
+        .arg(workspace.join("tests/e2ee/privacy-runner.mjs"))
+        .arg(&fixture)
+        .arg(directory.path())
+        .env("GRAFT_SDK_NATIVE_PATH", addon)
+        .current_dir(workspace)
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+#[test]
+#[ignore = "requires built native Node E2EE addon and TypeScript remote; run test:e2ee-node"]
 fn native_node_migration_reopens_and_cuts_over_with_real_writer_fence() {
     use graft::repo::Repository;
     use graft_sdk::RepositorySession;
@@ -87,6 +129,7 @@ fn native_node_migration_reopens_and_cuts_over_with_real_writer_fence() {
         &fixture,
         serde_json::to_vec(&serde_json::json!({
             "encryption":encryption,"migrationEncryption":encryption,"objects":[],
+            "privacyObjectIds":[first],
             "dropMigrationConfigAcknowledgements":true,
             "enableMultipart":true,"maxRequestBytes":1024*1024,"multipartPartBytes":512*1024,
             "multipartFault":"part-and-complete-loss",

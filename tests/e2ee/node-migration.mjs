@@ -7,6 +7,7 @@ import { createInterface } from "node:readline";
 import { once } from "node:events";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { assertLegacyRequestPrivacy } from "./privacy-evidence.mjs";
 const require = createRequire(import.meta.url);
 const { EncryptedRemoteSession, RepositorySession } = require("../../packages/graft-sdk");
 const [fixture, directory] = process.argv.slice(2);
@@ -33,6 +34,7 @@ try {
   };
   authority = new EncryptedRemoteSession(options);
   source = await RepositorySession.open(join(directory, "source"), { encryptedRemote: authority });
+  const sourceHead = (await source.repositoryMetadata()).current_head;
   const originalConfig = readFileSync(join(directory, "source/.graft/config.toml"));
   const preparation = { allRefs: true, mappings: [
     { source: "refs/heads/main", target: "refs/heads/moved" },
@@ -115,11 +117,11 @@ try {
   const beforeMissing = captured().length;
   await assert.rejects(authority.restartRetainedUpload(`e2ee/objects/${"00".repeat(32)}`));
   assert.ok(captured().slice(beforeMissing).every((entry) => entry.method === "GET" || entry.method === "HEAD"));
-  const wire = JSON.stringify(captured());
-  for (const privateValue of ["Node migration 密码", "attachment.txt", "large-private.bin", "first private migration commit", "refs/heads/old-history", "Node migration first WAL row"]) {
-    assert.ok(!wire.includes(privateValue), `private input appeared in remote traffic: ${privateValue}`);
-    assert.ok(!wire.includes(Buffer.from(privateValue).toString("hex")), `private input appeared in captured binary body: ${privateValue}`);
-  }
+  const rawIds = [sourceHead, ...(JSON.parse(readFileSync(fixture)).privacyObjectIds ?? [])];
+  for (const id of rawIds) assert.match(id, /^[0-9a-f]{64}$/);
+  assertLegacyRequestPrivacy(captured(), ["Node migration 密码 raw \r\n", "attachment.txt", "large-private.bin", "state.db", "Node migration private file", "first private migration commit", "second private migration commit", "private tag", "Node migration first WAL row", "second WAL row",
+    ...preparation.mappings.flatMap(({ source, target }) => [source, target]),
+    ...rawIds, ...rawIds.map((id) => Buffer.from(id, "hex"))]);
   console.log("Native Node migration: 4 refs, retained resume, fresh recovery, native fenced cutover and replay passed");
 } finally {
   if (source) await source.close();

@@ -7,6 +7,7 @@ import { createInterface } from "node:readline";
 import { once } from "node:events";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { assertLegacyRequestPrivacy } from "./privacy-evidence.mjs";
 
 const require = createRequire(import.meta.url);
 const { EncryptedRemoteSession, RepositorySession } = require("../../packages/graft-sdk");
@@ -396,14 +397,9 @@ try {
   assert.ok(receiptRequests.length > 0 && receiptRequests.every((request) => request.method === "GET"));
   const requests = JSON.parse(readFileSync(capture));
   assert.equal(requests.filter((request) => !request.authenticated).length, 2);
-  const encoded = JSON.stringify(requests);
-  for (const marker of ["node synthetic sync password", "node private WAL value", "node updated WAL value", "node private attachment marker", "node private commit message", "node updated private commit message", "private-records.sqlite", "private-note.txt", head, currentSourceHead, "2a".repeat(32)]) {
-    assert.ok(!encoded.includes(marker), marker);
-    assert.ok(!encoded.includes(Buffer.from(marker).toString("hex")), marker);
-  }
-  for (const marker of ["node changed sync password", "node later sync password", "wrong node current password", "node random enrollment password", "wrong node enrollment password", "node replacement enrollment password", "node competing enrollment password", "node initial private attachment", "node initial private commit", "initial-node-private.txt", initialHead]) {
-    assert.ok(!encoded.includes(marker) && !encoded.includes(Buffer.from(marker).toString("hex")), marker);
-  }
+  assertLegacyRequestPrivacy(requests, ["node synthetic sync password", "node private WAL value", "node updated WAL value", "node private attachment marker", "node private commit message", "node updated private commit message", "private-records.sqlite", "private-note.txt", head, currentSourceHead,
+    "node changed sync password", "node later sync password", "wrong node current password", "node random enrollment password", "wrong node enrollment password", "node replacement enrollment password", "node competing enrollment password", "node initial private attachment", "node initial private commit", "initial-node-private.txt", initialHead,
+    Buffer.alloc(32, 42), ...[head, currentSourceHead, initialHead].map((id) => Buffer.from(id, "hex"))]);
   console.log("Native Node E2EE SQLite/WAL, password change/recovery, lifecycle and leakage checks passed");
 } finally {
   clearTimeout(timeout);

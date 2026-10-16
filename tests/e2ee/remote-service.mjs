@@ -4,6 +4,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { Readable } from "node:stream";
 import { createHash, createHmac, hkdfSync, randomUUID } from "node:crypto";
+import { PrivacyEvidence } from "./privacy-evidence.mjs";
 import {
   createGraftRemoteHandler,
   GraftProtocolError,
@@ -11,6 +12,10 @@ import {
 
 const [fixturePath, capturePath] = process.argv.slice(2);
 const fixture = JSON.parse(readFileSync(fixturePath, "utf8"));
+// Only the small privacy acceptance fixture opts in. Default/performance runs
+// retain their original capture format and perform no additional body reads.
+const privacy = fixture.privacyEvidence === true
+  ? new PrivacyEvidence(`${capturePath}.privacy.jsonl`) : null;
 const objects = new Map(fixture.objects.map(([key, bytes]) => [key, Uint8Array.from(bytes)]));
 const captures = [];
 const equal = (left, right) =>
@@ -36,7 +41,9 @@ const syntheticEncode = (fields) => {
     return [size, field];
   })]);
 };
-function createBackend(objects, faults = {}, encryption = fixture.encryption) {
+function createBackend(objects, faults = {}, encryption = fixture.encryption, repository = "repo") {
+  if (privacy) for (const [key, bytes] of objects)
+    if (bytes !== undefined) privacy.record("storage", repository, "initial", { key }, bytes);
   const uploads = new Map();
   const multipart = fixture.enableMultipart === true ? {
     supportsEncryption: true,
@@ -53,6 +60,7 @@ function createBackend(objects, faults = {}, encryption = fixture.encryption) {
         upload = { uploadId: randomUUID(), totalBytes, partBytes, encryption: { ...identity }, parts: new Map() };
         uploads.set(path, upload);
       }
+      privacy?.record("multipart", repository, "start", { path, uploadId: upload.uploadId, totalBytes, partBytes, identity });
       return { ...upload, uploadedParts: [...upload.parts].sort(([a], [b]) => a - b)
         .map(([partNumber, body]) => ({ partNumber, bytes: body.length })) };
     },
@@ -64,6 +72,7 @@ function createBackend(objects, faults = {}, encryption = fixture.encryption) {
       if (partNumber < 1 || partNumber > Math.ceil(upload.totalBytes / upload.partBytes) || body.length !== expected || contentLength !== expected)
         throw new GraftProtocolError(400, "invalid_part", "Synthetic upload part mismatch");
       const previous = upload.parts.get(partNumber);
+      privacy?.record("multipart", repository, "uploadPart", { path, uploadId, partNumber }, body);
       if (previous && !equal(previous, body)) throw new GraftProtocolError(409, "part_conflict", "Synthetic upload part conflict");
       upload.parts.set(partNumber, body);
     },
@@ -72,14 +81,19 @@ function createBackend(objects, faults = {}, encryption = fixture.encryption) {
       if (!upload || upload.uploadId !== uploadId) throw new GraftProtocolError(409, "upload_conflict", "Synthetic upload session mismatch");
       if (upload.parts.size !== Math.ceil(upload.totalBytes / upload.partBytes)) throw new GraftProtocolError(409, "incomplete_upload", "Synthetic upload incomplete");
       const body = Buffer.concat([...upload.parts].sort(([a], [b]) => a - b).map(([, bytes]) => bytes));
+      privacy?.record("multipart", repository, "complete", { path, uploadId }, body);
       if (body.length !== upload.totalBytes || createHash("sha256").update(body).digest("hex") !== upload.encryption.ciphertextSha256)
         throw new GraftProtocolError(409, "upload_integrity", "Synthetic upload digest mismatch");
       if (objects.has(path)) return false;
+      privacy?.record("storage", repository, "multipart-complete", { key: path }, body);
       objects.set(path, Uint8Array.from(body));
       uploads.delete(path);
       return true;
     },
     abort(path, uploadId) {
+      if (privacy && uploads.get(path)?.uploadId === uploadId)
+        for (const [partNumber, body] of uploads.get(path).parts)
+          privacy.record("multipart", repository, "abort", { path, uploadId, partNumber }, body);
       if (uploads.get(path)?.uploadId === uploadId) uploads.delete(path);
     },
   } : undefined;
@@ -88,18 +102,22 @@ function createBackend(objects, faults = {}, encryption = fixture.encryption) {
     ...(multipart === undefined ? {} : { multipart }),
     head(key) {
       const body = objects.get(key);
+      privacy?.record("storage", repository, "head", { key }, body);
       return body === undefined ? null : { size: body.length };
     },
     get(key, range) {
       const bytes = objects.get(key);
       if (bytes === undefined) return null;
       const body = range === undefined ? bytes : bytes.slice(range.start, range.end + 1);
+      privacy?.record("storage", repository, "get", { key, range }, body);
       return { body, size: body.length };
     },
     put(key, value) {
+      privacy?.record("storage", repository, "put", { key }, value);
       objects.set(key, value.slice());
     },
     delete(key) {
+      privacy?.record("storage", repository, "delete", { key }, objects.get(key));
       objects.delete(key);
     },
     async putIfAbsent(key, value) {
@@ -107,11 +125,16 @@ function createBackend(objects, faults = {}, encryption = fixture.encryption) {
         value instanceof ReadableStream
           ? new Uint8Array(await new Response(value).arrayBuffer())
           : value;
+      privacy?.record("storage", repository, "putIfAbsent", { key }, bytes);
       if (objects.has(key)) return false;
       objects.set(key, bytes.slice());
       return true;
     },
     compareAndSwap(key, expected, replacement) {
+      if (privacy) {
+        privacy.record("storage", repository, "compareAndSwap-before", { key }, objects.get(key));
+        privacy.record("storage", repository, "compareAndSwap-candidate", { key }, replacement);
+      }
       if (faults.rejectHeadCreates > 0 && key.startsWith("e2ee/head/")) {
         faults.rejectHeadCreates -= 1;
         captures[captures.length - 1].rejectedInitialHeadCreate = true;
@@ -123,6 +146,7 @@ function createBackend(objects, faults = {}, encryption = fixture.encryption) {
       return true;
     },
     compareAndDelete(key, expected) {
+      privacy?.record("storage", repository, "compareAndDelete", { key }, objects.get(key));
       if (!equal(expected, objects.get(key))) return false;
       objects.delete(key);
       return true;
@@ -142,14 +166,14 @@ function createBackend(objects, faults = {}, encryption = fixture.encryption) {
 const backend = createBackend(objects);
 const integrationBackend = createBackend(new Map([["e2ee/config", objects.get("e2ee/config")]]), {
   rejectHeadCreates: fixture.failIntegrationHeadCreates === true ? 3 : 0,
-});
+}, fixture.encryption, "integration");
 const enrollmentBackend = createBackend(new Map(), {
   rejectHeadCreates: fixture.failInitialHeadCreates === true ? 3 : 0,
-});
+}, fixture.encryption, "enrollment");
 const terminalBackend = fixture.terminalEncryption
-  ? createBackend(new Map(), {}, fixture.terminalEncryption) : null;
+  ? createBackend(new Map(), {}, fixture.terminalEncryption, "terminal") : null;
 const migrationBackend = fixture.migrationEncryption
-  ? createBackend(new Map(), {}, fixture.migrationEncryption) : null;
+  ? createBackend(new Map(), {}, fixture.migrationEncryption, "migration") : null;
 let droppedMigrationConfigResponse = false;
 let dropMigrationConfigRead = false;
 let droppedInitialConfigResponse = false;
@@ -205,7 +229,9 @@ const handler = createGraftRemoteHandler({
   },
 });
 let smallPayloadMissingOnce = false;
+let privacyRequestSequence = 0;
 const server = createServer(async (incoming, outgoing) => {
+  const privacyRequestId = privacy ? ++privacyRequestSequence : 0;
   try {
     const origin = `http://127.0.0.1:${server.address().port}`;
     const url = new URL(incoming.url, origin);
@@ -219,6 +245,7 @@ const server = createServer(async (incoming, outgoing) => {
       headers,
       ...(hasBody ? { body: Readable.toWeb(incoming), duplex: "half" } : {}),
     });
+    if (privacy) await privacy.captureHttp("request", parts[1] ?? "unknown", request, privacyRequestId);
     const body = hasBody
       ? ["application/octet-stream", "application/vnd.graft.e2ee-bundle"].includes(headers.get("content-type"))
         ? Buffer.from(await request.clone().arrayBuffer()).toString("hex")
@@ -351,6 +378,7 @@ const server = createServer(async (incoming, outgoing) => {
       capture.droppedSmallPayload = true;
     }
     capture.responseStatus = response.status;
+    if (privacy) await privacy.captureHttp("response", parts[1] ?? "unknown", response, privacyRequestId);
     writeFileSync(capturePath, JSON.stringify(captures));
     if (!heldMigrationBoundaries.has(migrationBoundary) && response.status === 204 && (
       (migrationBoundary === "config-after" && migrationConfigCreate) ||
@@ -483,9 +511,16 @@ const server = createServer(async (incoming, outgoing) => {
         .on("error", () => outgoing.destroy())
         .pipe(outgoing);
   } catch {
+    if (privacy && !privacy.failed)
+      await privacy.captureHttp("response", "error", new Response(null, { status: 500 }), privacyRequestId);
     outgoing.writeHead(500);
     outgoing.end();
   }
+});
+if (privacy) process.once("SIGTERM", () => {
+  privacy.finish();
+  server.closeAllConnections();
+  server.close(() => process.exit(0));
 });
 server.listen(0, "127.0.0.1", () =>
   console.log(
