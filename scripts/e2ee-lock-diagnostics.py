@@ -133,7 +133,11 @@ def protected_parent(binary, root, graft, config, output):
     sentinel = graft / "synthetic-cleanup-sentinel"
     sentinel.write_text("synthetic diagnostic data\n")
     before_count = sum(1 for path in root.rglob("*") if path.is_file())
-    parent_fd = directory_fd(root)
+    # tmpfiles honors directory locks when recursing into children, not on the
+    # rule's directly configured root. This models a private TempDir below the
+    # system /tmp rule, with a separately lockable .graft business directory.
+    protected = graft.parent
+    parent_fd = directory_fd(protected)
     gate_fd = directory_fd(graft)
     try:
         fcntl.flock(parent_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
@@ -145,7 +149,10 @@ def protected_parent(binary, root, graft, config, output):
         assert after_count == before_count
         fcntl.flock(gate_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         fcntl.flock(gate_fd, fcntl.LOCK_UN)
-        result.update({"files_before": before_count, "files_after": after_count,
+        result.update({"configured_cleanup_root": str(root),
+                       "protected_private_child": str(protected),
+                       "directly_configured_root_protection_claimed": False,
+                       "files_before": before_count, "files_after": after_count,
                        "child_gate_available_with_parent_shared_lock": True,
                        "parent_shared_lock_prevented_cleanup": True})
     finally:
@@ -181,6 +188,7 @@ def main(output):
             graft = root / "source" / ".graft"
             objects = graft / "objects" / "pack"
             objects.mkdir(parents=True, mode=0o700)
+            graft.parent.chmod(0o700)
             for number in range(result["synthetic_file_count"]):
                 fd = os.open(objects / f"synthetic-{number:06d}", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                 os.close(fd)
