@@ -8,9 +8,12 @@ file content and ref values before sending them to an HTTP remote. Local
 worktrees and caches remain plaintext. The service can observe opaque object
 identifiers, sizes, timing and the routing relationships needed for synchronization.
 
-This is an opt-in source feature for Unix native hosts. Default CLI and Node
-builds do not enable it. Production conformance and OS-backed remembering require
-the evidence listed in the [E2EE specification](https://github.com/eidos-space/graft/blob/main/docs/specs/graft-e2ee-remote-1.0.md).
+E2EE is available to native macOS and Linux hosts. CLI source builds require the
+`e2ee` feature. The local Node build script defaults to `plain`; the SDK release
+workflow explicitly selects encrypted profiles for macOS and Linux. Check the
+installed SDK version's release notes and native capability before connecting.
+Production conformance and OS-backed remembering require
+the evidence listed in the [E2EE specification](https://github.com/eidos-space/graft/blob/20c276bc79fce766b13e18fa59a534de0d7df93d/docs/specs/graft-e2ee-remote-1.0.md).
 Windows and browser E2EE are not supported by this implementation.
 
 ## Build the CLI
