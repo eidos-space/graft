@@ -4389,7 +4389,18 @@ mod tests {
         );
         let cli = Cli::try_parse_from(["graft", "diff", "--json", "--content", "HEAD~1", "HEAD"])
             .unwrap();
-        assert!(run_command(cli.command, None).is_err());
+        // This form treats the second positional argument as a worktree path.
+        // Keep its revision lookup independent of tests that change the process cwd.
+        let directory = tempfile::tempdir().unwrap();
+        Repository::init(directory.path()).unwrap();
+        let db = directory.path().join("app.sqlite");
+        let error = run_command(cli.command, Some(&db)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("HEAD does not point at a commit yet"),
+            "{error:#}"
+        );
         assert!(
             Cli::try_parse_from([
                 "graft",
