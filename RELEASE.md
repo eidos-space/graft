@@ -152,6 +152,12 @@ Keep these versions equal:
 - `packages/graft-remote-hono/package.json`
 - `packages/graft-remote-cloudflare/package.json`
 
+Add a matching `## Graft Remote X.Y.Z — YYYY-MM-DD` section to
+`packages/graft-remote/CHANGELOG.md`. Before publication, the tag workflow requires
+that committed section to contain release notes, and uses it as the GitHub release
+body. A heading or comparison link alone is not a release description. Preview it
+with `node scripts/remote-release.mjs notes X.Y.Z`.
+
 The Remote release is independent from the CLI/SQLite and resident SDK versions. From a clean
 checkout of the merged `origin/main` commit:
 

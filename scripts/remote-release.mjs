@@ -35,6 +35,37 @@ export function releaseTagForVersion(version) {
   return version.includes("-") ? "next" : "latest";
 }
 
+export function extractRemoteReleaseNotes(changelog, version) {
+  if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version)) {
+    throw new Error(`Remote package version is not valid SemVer: ${version}`);
+  }
+  const lines = changelog.split(/\r?\n/);
+  const heading = `## Graft Remote ${version} — `;
+  const start = lines.findIndex((line) => line.startsWith(heading));
+  if (start === -1) {
+    throw new Error(`Missing release notes for Graft Remote ${version}`);
+  }
+  const relativeEnd = lines
+    .slice(start + 1)
+    .findIndex((line) => /^## /.test(line));
+  const end = relativeEnd === -1 ? lines.length : start + 1 + relativeEnd;
+  const body = lines.slice(start + 1, end).join("\n").trim();
+  const meaningfulLines = body.split("\n").filter((line) => {
+    const value = line.trim();
+    return (
+      value &&
+      !/^#/.test(value) &&
+      !/^\*\*Full Changelog\*\*:/i.test(value) &&
+      !/^https?:\/\/\S+$/.test(value) &&
+      !/^\[[^\]]*\]\(https?:\/\/[^)]+\)$/.test(value)
+    );
+  });
+  if (meaningfulLines.length === 0) {
+    throw new Error(`Release notes for Graft Remote ${version} are empty`);
+  }
+  return `${body}\n`;
+}
+
 export function archiveName(packageName, version) {
   return `${packageName.slice(1).replace("/", "-")}-${version}.tgz`;
 }
@@ -324,10 +355,17 @@ async function main() {
   ] = process.argv.slice(2);
   if (operation === undefined || expectedVersion === undefined) {
     throw new Error(
-      "Usage: node scripts/remote-release.mjs <validate|prepare|verify|publish> VERSION [OUTPUT_DIR]",
+      "Usage: node scripts/remote-release.mjs <validate|notes|prepare|verify|publish> VERSION [OUTPUT_DIR]",
     );
   }
   if (operation === "validate") await validate(expectedVersion);
+  else if (operation === "notes") {
+    const changelog = await fs.readFile(
+      path.join(repositoryRoot, "packages/graft-remote/CHANGELOG.md"),
+      "utf8",
+    );
+    process.stdout.write(extractRemoteReleaseNotes(changelog, expectedVersion));
+  }
   else if (operation === "prepare")
     await prepare(expectedVersion, outputDirectory);
   else if (operation === "verify")
