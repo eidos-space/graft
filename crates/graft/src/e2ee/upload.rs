@@ -1,4 +1,4 @@
-use super::download::{finish_staging, local_io_error};
+use super::download::{finish_staging, local_io_error, private_staging_file};
 use super::session::SessionEpoch;
 use super::{ChunkSize, EncryptedHttpError, EncryptionError, ObjectEncryptor, SessionOperation};
 use sha2::{Digest, Sha256};
@@ -68,7 +68,7 @@ impl PreparedEncryptedObject {
             return Err(EncryptionError::TooLarge.into());
         }
         let remote_key = encryptor.remote_key().to_owned();
-        let file = tempfile::tempfile_in(directory).map_err(local_io_error)?;
+        let file = private_staging_file(directory)?;
         let mut file = tokio::fs::File::from_std(file);
         let mut digest = Sha256::new();
         write_ciphertext(operation, &mut file, encryptor.header_bytes(), &mut digest).await?;

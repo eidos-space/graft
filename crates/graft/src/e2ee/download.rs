@@ -6,6 +6,19 @@ use zeroize::Zeroizing;
 
 type Result<T> = std::result::Result<T, EncryptedHttpError>;
 
+/// Tighten the unnamed file before writing either plaintext or ciphertext.
+/// Linux O_TMPFILE creation can otherwise inherit a permissive process umask.
+pub(super) fn private_staging_file(directory: &std::path::Path) -> Result<std::fs::File> {
+    let file = tempfile::tempfile_in(directory).map_err(local_io_error)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(local_io_error)?;
+    }
+    Ok(file)
+}
+
 /// Owns transport fragments, but assembles only one bounded AEAD block at a time.
 pub(super) struct CiphertextBody {
     response: reqwest::Response,

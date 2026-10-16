@@ -1,5 +1,7 @@
 use super::bundle;
-use super::download::{CiphertextBody, finish_staging, local_io_error, stream_plaintext};
+use super::download::{
+    CiphertextBody, finish_staging, local_io_error, private_staging_file, stream_plaintext,
+};
 use super::session::SessionEpoch;
 use super::{
     EncryptedBundleEntry, EncryptedConfig, EncryptionError, ObjectPublicationOutcome, ObjectReader,
@@ -1112,7 +1114,7 @@ impl EncryptedHttpClient {
         if reader.plaintext_length() > maximum_plaintext {
             return Err(EncryptionError::TooLarge.into());
         }
-        let file = tempfile::tempfile_in(directory).map_err(local_io_error)?;
+        let file = private_staging_file(directory)?;
         let mut file = tokio::fs::File::from_std(file);
         let range = reader.chunk_range(0)?.start..reader.chunk_range(reader.chunk_count() - 1)?.end;
         let (response, total) = self
@@ -3613,7 +3615,13 @@ mod tests {
                         object::remote_key(&fixture_root(), &logical).unwrap()
                     );
                     let mut output = Vec::new();
-                    value.into_file().read_to_end(&mut output).unwrap();
+                    let mut file = value.into_file();
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+                    }
+                    file.read_to_end(&mut output).unwrap();
                     assert_eq!(&output, fixture.plaintext.get(&logical).unwrap());
                 }
                 EncryptedBundleEntry::Hint(hint) => {

@@ -1,4 +1,4 @@
-use super::download::{CiphertextBody, finish_staging, local_io_error, stream_object_chunks};
+use super::download::{CiphertextBody, finish_staging, private_staging_file, stream_object_chunks};
 use super::{
     DownloadedEncryptedObject, EncryptedHttpError, EncryptedObjectMetadata, EncryptionError,
     ObjectReader, RoutingHint, SessionOperation, codec, hint, object,
@@ -286,7 +286,7 @@ async fn read_object(
     *remaining = remaining
         .checked_sub(reader.plaintext_length())
         .ok_or(EncryptionError::TooLarge)?;
-    let file = tempfile::tempfile_in(directory).map_err(local_io_error)?;
+    let file = private_staging_file(directory)?;
     let mut file = tokio::fs::File::from_std(file);
     stream_object_chunks(operation, &reader, body, &mut file).await?;
     let file = finish_staging(operation, file).await?;
