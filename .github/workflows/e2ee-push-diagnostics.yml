@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   history:
-    name: One traced history4097 pair
+    name: Fixed sampled history4097 diagnostics
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     env:
@@ -60,7 +60,7 @@ jobs:
           pnpm --filter @eidos.space/graft-remote build 2>&1 | tee "$EVIDENCE_DIR/remote-build.log"
           cargo build --release --locked -p graft --features native-crypto --example e2ee_load_benchmark \
             2>&1 | tee "$EVIDENCE_DIR/core-build.log"
-      - name: Run exactly one traced encrypted-first history pair
+      - name: Run three sampled pairs and one seccomp-filtered pair
         run: |
           python3 scripts/e2ee-push-wait-diagnostics.py run --output "$EVIDENCE_DIR" \
             --binary "$CARGO_TARGET_DIR/release/examples/e2ee_load_benchmark"
