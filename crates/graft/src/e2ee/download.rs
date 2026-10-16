@@ -7,7 +7,7 @@ use zeroize::Zeroizing;
 type Result<T> = std::result::Result<T, EncryptedHttpError>;
 
 /// Tighten the unnamed file before writing either plaintext or ciphertext.
-/// Linux O_TMPFILE creation can otherwise inherit a permissive process umask.
+/// Linux `O_TMPFILE` creation can otherwise inherit a permissive process umask.
 pub(super) fn private_staging_file(directory: &std::path::Path) -> Result<std::fs::File> {
     let file = tempfile::tempfile_in(directory).map_err(local_io_error)?;
     #[cfg(unix)]

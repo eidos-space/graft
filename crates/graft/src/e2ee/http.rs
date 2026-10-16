@@ -1,7 +1,5 @@
 use super::bundle;
-use super::download::{
-    CiphertextBody, finish_staging, local_io_error, private_staging_file, stream_plaintext,
-};
+use super::download::{CiphertextBody, finish_staging, private_staging_file, stream_plaintext};
 use super::session::SessionEpoch;
 use super::{
     EncryptedBundleEntry, EncryptedConfig, EncryptionError, ObjectPublicationOutcome, ObjectReader,
