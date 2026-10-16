@@ -396,13 +396,13 @@ mod tests {
 
     #[test]
     fn encrypted_staged_pack_matches_memory_verification_and_rejects_invalid_index() {
-        use std::io::{Seek, Write};
+        use std::io::Seek;
         let (id, bytes, index, expected) = fixture();
         let index_bytes = serde_json::to_vec(&index).unwrap();
         let mut pack = tempfile::tempfile().unwrap();
-        pack.write_all(&bytes).unwrap();
+        std::io::Write::write_all(&mut pack, &bytes).unwrap();
         let mut index_file = tempfile::tempfile().unwrap();
-        index_file.write_all(&index_bytes).unwrap();
+        std::io::Write::write_all(&mut index_file, &index_bytes).unwrap();
         let actual = verified_pack_file_topology(&id, &mut pack, &mut index_file, 4 << 20).unwrap();
         let topology = |entries: Vec<CommitTopology>| {
             entries
@@ -418,7 +418,7 @@ mod tests {
         ));
         // Buffered read-ahead must not hide additional JSON after the index.
         index_file.seek(std::io::SeekFrom::End(0)).unwrap();
-        index_file.write_all(b"{}").unwrap();
+        std::io::Write::write_all(&mut index_file, b"{}").unwrap();
         assert!(verified_pack_file_topology(&id, &mut pack, &mut index_file, 4 << 20).is_err());
     }
 
