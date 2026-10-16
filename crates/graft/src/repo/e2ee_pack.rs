@@ -26,8 +26,11 @@ pub(crate) fn verified_pack_file_topology(
     if index_file.metadata().map_err(|_| invalid())?.len() > maximum_object as u64 {
         return Err(EncryptionError::TooLarge);
     }
+    // serde_json does not buffer a Reader; a File here performs a read syscall
+    // for each byte of the index. Keep staged parsing bounded without paying
+    // that cost for every commit in a long history.
     let index: RemoteObjectPackIndex =
-        serde_json::from_reader(index_file).map_err(|_| invalid())?;
+        serde_json::from_reader(std::io::BufReader::new(index_file)).map_err(|_| invalid())?;
     let mut index =
         validate_remote_object_pack_index(&format!("{DIR_OBJECTS_PACK}/{id}.idx"), index)
             .map_err(|_| invalid())?;
@@ -389,6 +392,34 @@ mod tests {
         index: &RemoteObjectPackIndex,
     ) -> crate::e2ee::Result<Vec<CommitTopology>> {
         verified_pack_topology(id, pack, &serde_json::to_vec(index).unwrap())
+    }
+
+    #[test]
+    fn encrypted_staged_pack_matches_memory_verification_and_rejects_invalid_index() {
+        use std::io::{Seek, Write};
+        let (id, bytes, index, expected) = fixture();
+        let index_bytes = serde_json::to_vec(&index).unwrap();
+        let mut pack = tempfile::tempfile().unwrap();
+        pack.write_all(&bytes).unwrap();
+        let mut index_file = tempfile::tempfile().unwrap();
+        index_file.write_all(&index_bytes).unwrap();
+        let actual = verified_pack_file_topology(&id, &mut pack, &mut index_file, 4 << 20).unwrap();
+        let topology = |entries: Vec<CommitTopology>| {
+            entries
+                .into_iter()
+                .map(|entry| (entry.commit, entry.parents))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(topology(actual), topology(expected));
+        assert_eq!(pack.stream_position().unwrap(), 0);
+        assert!(matches!(
+            verified_pack_file_topology(&id, &mut pack, &mut index_file, index_bytes.len() - 1),
+            Err(EncryptionError::TooLarge)
+        ));
+        // Buffered read-ahead must not hide additional JSON after the index.
+        index_file.seek(std::io::SeekFrom::End(0)).unwrap();
+        index_file.write_all(b"{}").unwrap();
+        assert!(verified_pack_file_topology(&id, &mut pack, &mut index_file, 4 << 20).is_err());
     }
 
     #[test]
