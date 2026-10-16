@@ -51,6 +51,10 @@ jobs:
         run: |
           echo "CARGO_TARGET_DIR=$RUNNER_TEMP/graft-e2ee-performance-target" >> "$GITHUB_ENV"
           echo "EVIDENCE_DIR=$RUNNER_TEMP/graft-e2ee-performance-evidence" >> "$GITHUB_ENV"
+          # systemd-tmpfiles also locks directories while scanning /tmp. Keep
+          # every paired fixture under the same private workspace temp root.
+          install -d -m 700 "$RUNNER_TEMP/graft-e2ee-fixtures"
+          echo "TMPDIR=$RUNNER_TEMP/graft-e2ee-fixtures" >> "$GITHUB_ENV"
 
       - name: System dependencies
         uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1
@@ -76,6 +80,20 @@ jobs:
           python3 scripts/e2ee-performance-evidence.test.py
           python3 scripts/e2ee-performance-diagnose.test.py
           python3 scripts/e2ee-performance-evidence.py source --output "$EVIDENCE_DIR"
+          python3 - <<'PY'
+          import json, os, pathlib, stat, subprocess, tempfile
+          root = pathlib.Path(tempfile.gettempdir()).resolve()
+          assert root == pathlib.Path(os.environ["TMPDIR"]).resolve()
+          assert stat.S_IMODE(root.stat().st_mode) == 0o700
+          def identity(path):
+              metadata = path.stat()
+              return {"path": str(path), "device": metadata.st_dev, "inode": metadata.st_ino,
+                      "mode": oct(stat.S_IMODE(metadata.st_mode)),
+                      "mount": json.loads(subprocess.check_output(["findmnt", "--json", "--target", str(path)]))}
+          evidence = {"fixtures": identity(root), "system_tmp": identity(pathlib.Path("/tmp")),
+                      "scope": "All six groups and rounds share this private TMPDIR. Earlier /tmp runs are retained separately; timings across these environments are not a controlled comparison."}
+          (pathlib.Path(os.environ["EVIDENCE_DIR"]) / "fixture-environment.json").write_text(json.dumps(evidence, indent=2) + "\n")
+          PY
 
       # No Rust build cache: the binaries and Remote service are built from the
       # recorded clean checkout before any measured process starts.

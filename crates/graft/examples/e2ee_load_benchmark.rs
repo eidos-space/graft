@@ -18,14 +18,83 @@ mod benchmark {
     type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
     fn failure(stage: &str, error: impl std::fmt::Debug) -> Box<dyn std::error::Error> {
         eprintln!("benchmark failure during {stage}: {error:?}");
-        eprintln!("{}", std::backtrace::Backtrace::force_capture());
         // Retain the first failure's lock owners before process cleanup. This
         // diagnostic does not retry an operation or alter acceptance samples.
         #[cfg(target_os = "linux")]
-        if let Ok(locks) = fs::read_to_string("/proc/locks") {
-            eprintln!("kernel locks at failure:\n{locks}");
-        }
+        capture_lock_owners();
+        eprintln!("{}", std::backtrace::Backtrace::force_capture());
         format!("{stage}: {error:?}").into()
+    }
+    #[cfg(target_os = "linux")]
+    fn capture_lock_owners() {
+        eprintln!(
+            "failure identity: pid={} thread={:?} task={:?} time={:?}",
+            std::process::id(),
+            std::thread::current().id(),
+            fs::read_link("/proc/thread-self"),
+            std::time::SystemTime::now(),
+        );
+        let locks = match fs::read_to_string("/proc/locks") {
+            Ok(locks) => locks,
+            Err(error) => {
+                eprintln!("kernel lock snapshot unavailable: {error:?}");
+                return;
+            }
+        };
+        eprintln!("kernel locks at failure:\n{locks}");
+        let owners: std::collections::BTreeSet<u32> = locks
+            .lines()
+            .filter_map(|line| {
+                let fields: Vec<_> = line.split_whitespace().collect();
+                if fields.get(3) != Some(&"WRITE") {
+                    return None;
+                }
+                fields.get(4)?.parse().ok()
+            })
+            .collect();
+        for owner in owners {
+            let path = PathBuf::from(format!("/proc/{owner}"));
+            // Only error-path process identity, never environment variables.
+            // Retain read errors as a scanner may exit while we inspect it.
+            for name in ["comm", "cmdline"] {
+                eprintln!(
+                    "lock owner {owner} {name}: {:?}",
+                    fs::read(path.join(name))
+                        .map(|bytes| String::from_utf8_lossy(&bytes).replace('\0', " "))
+                );
+            }
+            eprintln!(
+                "lock owner {owner} exe: {:?}",
+                fs::read_link(path.join("exe"))
+            );
+            eprintln!(
+                "lock owner {owner} status: {:?}",
+                fs::read_to_string(path.join("status")).map(|status| status
+                    .lines()
+                    .filter(
+                        |line| ["Name:", "Tgid:", "Pid:", "PPid:", "Uid:", "Threads:"]
+                            .iter()
+                            .any(|prefix| line.starts_with(prefix))
+                    )
+                    .collect::<Vec<_>>()
+                    .join("; "))
+            );
+            match fs::read_dir(path.join("fd")) {
+                Ok(descriptors) => {
+                    for descriptor in descriptors.take(128) {
+                        match descriptor {
+                            Ok(descriptor) => eprintln!(
+                                "lock owner {owner} fd {:?}: {:?}",
+                                descriptor.file_name(),
+                                fs::read_link(descriptor.path())
+                            ),
+                            Err(error) => eprintln!("lock owner {owner} fd entry: {error:?}"),
+                        }
+                    }
+                }
+                Err(error) => eprintln!("lock owner {owner} fd directory: {error:?}"),
+            }
+        }
     }
     const UUID: &str = "00010203-0405-4607-8809-0a0b0c0d0e0f";
     const PASSWORD: &[u8] = b"synthetic load benchmark password";
