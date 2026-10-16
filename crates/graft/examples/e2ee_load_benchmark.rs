@@ -10,12 +10,23 @@ mod benchmark {
     use std::{
         fs,
         io::{BufRead, BufReader, Read, Write},
-        os::unix::fs::PermissionsExt,
+        os::unix::fs::{MetadataExt, PermissionsExt},
         path::{Path, PathBuf},
         process::{Child, ChildStdin, ChildStdout, Command, Stdio},
         time::Instant,
     };
     type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+    fn failure(stage: &str, error: impl std::fmt::Debug) -> Box<dyn std::error::Error> {
+        eprintln!("benchmark failure during {stage}: {error:?}");
+        eprintln!("{}", std::backtrace::Backtrace::force_capture());
+        // Retain the first failure's lock owners before process cleanup. This
+        // diagnostic does not retry an operation or alter acceptance samples.
+        #[cfg(target_os = "linux")]
+        if let Ok(locks) = fs::read_to_string("/proc/locks") {
+            eprintln!("kernel locks at failure:\n{locks}");
+        }
+        format!("{stage}: {error:?}").into()
+    }
     const UUID: &str = "00010203-0405-4607-8809-0a0b0c0d0e0f";
     const PASSWORD: &[u8] = b"synthetic load benchmark password";
     fn identity() -> RepositoryId {
@@ -79,7 +90,7 @@ mod benchmark {
             let before = self.command("snapshot")?;
             event("begin", name);
             let start = Instant::now();
-            let result = work()?;
+            let result = work().map_err(|error| failure(name, error))?;
             let milliseconds = start.elapsed().as_secs_f64() * 1000.;
             event("end", name);
             let mut metrics = self.command("snapshot")?;
@@ -132,8 +143,19 @@ mod benchmark {
                 std::sync::Arc::new(uploads),
             )?;
         }
-        let repo = Repository::init(root.join(name))?.with_remote_credentials(credentials);
-        repo.remote_add("origin", remote.clone())?;
+        let path = root.join(name);
+        let repo = Repository::init(&path)
+            .map_err(|error| failure(&format!("initialize {name} at {}", path.display()), error))?
+            .with_remote_credentials(credentials);
+        let metadata = fs::metadata(repo.graft_dir())?;
+        eprintln!(
+            "benchmark repository {name}: {} device={} inode={}",
+            repo.graft_dir().display(),
+            metadata.dev(),
+            metadata.ino()
+        );
+        repo.remote_add("origin", remote.clone())
+            .map_err(|error| failure(&format!("configure {name}"), error))?;
         Ok(repo)
     }
     fn commit(
@@ -318,7 +340,9 @@ mod benchmark {
         if scenario == "same-ref" || scenario == "different-ref" {
             let (tree, _) = file_tree(&source, 1)?;
             let base = commit(&source, tree, None, "base", 0)?;
-            source.branch_create("base", Some(base.as_str()))?;
+            source
+                .branch_create("base", Some(base.as_str()))
+                .map_err(|error| failure("prepare contention base", error))?;
             source.push_branch("origin", "base", "main")?;
             let left = repository(directory.path(), "left", &remote, &config, maximum)?;
             let right = repository(directory.path(), "right", &remote, &config, maximum)?;
@@ -328,8 +352,11 @@ mod benchmark {
             let (rt, _) = file_tree(&right, 3)?;
             let a = commit(&left, lt, Some(base.clone()), "left", 1)?;
             let b = commit(&right, rt, Some(base), "right", 2)?;
-            left.branch_create("next", Some(a.as_str()))?;
-            right.branch_create("next", Some(b.as_str()))?;
+            left.branch_create("next", Some(a.as_str()))
+                .map_err(|error| failure("prepare left contention branch", error))?;
+            right
+                .branch_create("next", Some(b.as_str()))
+                .map_err(|error| failure("prepare right contention branch", error))?;
             let right_branch = if scenario == "same-ref" {
                 "main"
             } else {
@@ -488,7 +515,9 @@ mod benchmark {
             let mut head = first.clone();
             let resident = repository(directory.path(), "resident", &remote, &config, maximum)?;
             if scenario == "history" {
-                source.branch_create("base", Some(first.as_str()))?;
+                source
+                    .branch_create("base", Some(first.as_str()))
+                    .map_err(|error| failure("prepare history base", error))?;
                 source.push_branch("origin", "base", "main")?;
                 resident.fetch_for_clone("origin", "main")?;
                 for index in 1..scale {
@@ -502,7 +531,9 @@ mod benchmark {
                     objects.push(head.clone());
                 }
             }
-            source.branch_create("next", Some(head.as_str()))?;
+            source
+                .branch_create("next", Some(head.as_str()))
+                .map_err(|error| failure("prepare initial branch", error))?;
             samples.push(
                 service
                     .measure(
@@ -550,7 +581,9 @@ mod benchmark {
                     (scale + round) as u64,
                 )?;
                 let branch = format!("update-{round}");
-                source.branch_create(&branch, Some(next.as_str()))?;
+                source
+                    .branch_create(&branch, Some(next.as_str()))
+                    .map_err(|error| failure(&format!("prepare update branch {round}"), error))?;
                 let mut push = service
                     .measure("warm_small_push", || {
                         source.push_branch("origin", &branch, "main")?;

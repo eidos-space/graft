@@ -55,7 +55,7 @@ jobs:
       - name: System dependencies
         uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1
         with:
-          packages: clang libclang-dev llvm libncurses-dev build-essential libreadline-dev
+          packages: clang libclang-dev llvm libncurses-dev build-essential libreadline-dev strace
           version: 1.0
 
       - name: Rust toolchain
@@ -74,6 +74,7 @@ jobs:
       - name: Validate evidence collector and capture source
         run: |
           python3 scripts/e2ee-performance-evidence.test.py
+          python3 scripts/e2ee-performance-diagnose.test.py
           python3 scripts/e2ee-performance-evidence.py source --output "$EVIDENCE_DIR"
 
       # No Rust build cache: the binaries and Remote service are built from the
@@ -140,6 +141,15 @@ jobs:
             --binary "$CARGO_TARGET_DIR/release/examples/e2ee_sqlite_hydration_benchmark" \
             --output "$EVIDENCE_DIR/hydration-encrypted-first" --rounds 5 --order encrypted-first \
             2>&1 | tee "$EVIDENCE_DIR/hydration-encrypted-first.log"
+
+      # Finish every measured group before tracing any failed native case.
+      # Replay results live only under diagnostics and never replace samples.
+      - name: Diagnose failed native core processes
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 35
+        run: |
+          python3 scripts/e2ee-performance-diagnose.py --output "$EVIDENCE_DIR" \
+            --binary "$CARGO_TARGET_DIR/release/examples/e2ee_load_benchmark"
 
       - name: Verify complete evidence and unchanged budgets
         if: always()
