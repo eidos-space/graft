@@ -994,10 +994,9 @@ pub struct NodeRepositorySession {
     session: Arc<CoreRepositorySession>,
 }
 
-#[cfg(feature = "e2ee")]
+#[cfg(all(feature = "e2ee", unix))]
 #[napi]
 impl NodeRepositorySession {
-    #[cfg(unix)]
     #[napi]
     pub fn prepare_encrypted_migration(
         &self,
@@ -1015,7 +1014,6 @@ impl NodeRepositorySession {
         )
     }
 
-    #[cfg(unix)]
     #[napi]
     pub fn resume_encrypted_migration(
         &self,
@@ -1032,7 +1030,6 @@ impl NodeRepositorySession {
         )
     }
 
-    #[cfg(unix)]
     #[napi]
     pub fn verify_encrypted_migration(
         &self,
@@ -1050,7 +1047,6 @@ impl NodeRepositorySession {
         )
     }
 
-    #[cfg(unix)]
     #[napi]
     pub fn cutover_encrypted_migration(
         &self,
@@ -1067,7 +1063,11 @@ impl NodeRepositorySession {
             e2ee::migration::Action::Cutover(options),
         )
     }
+}
 
+#[cfg(feature = "e2ee")]
+#[napi]
+impl NodeRepositorySession {
     #[napi(factory)]
     pub fn with_encrypted_remote(
         target: String,

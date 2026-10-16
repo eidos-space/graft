@@ -488,9 +488,14 @@ impl NodeEncryptedRemoteSession {
         })
         .build(&env)
     }
+}
 
+// Keep the platform gate outside the N-API impl so generated registrations do
+// not reference callbacks that Rust removes on unsupported hosts.
+#[cfg(unix)]
+#[napi]
+impl NodeEncryptedRemoteSession {
     /// List admitted local ciphertext recovery, without sending account data.
-    #[cfg(unix)]
     #[napi]
     pub fn retained_uploads(&self) -> Result<String> {
         let operation = self.secret.begin_operation().map_err(secret_error)?;
@@ -515,7 +520,6 @@ impl NodeEncryptedRemoteSession {
         serde_json::to_string(&entries).map_err(|_| secret_error(EncryptionError::InvalidEncoding))
     }
 
-    #[cfg(unix)]
     #[napi]
     pub fn resume_retained_upload(
         &self,
@@ -525,7 +529,6 @@ impl NodeEncryptedRemoteSession {
         retained_upload(self, env, opaque_key, false)
     }
 
-    #[cfg(unix)]
     #[napi]
     pub fn restart_retained_upload(
         &self,
@@ -534,7 +537,10 @@ impl NodeEncryptedRemoteSession {
     ) -> Result<AsyncBlock<String>> {
         retained_upload(self, env, opaque_key, true)
     }
+}
 
+#[napi]
+impl NodeEncryptedRemoteSession {
     #[napi]
     pub fn unlock_remembered(&self, env: Env) -> Result<AsyncBlock<()>> {
         let future = self
