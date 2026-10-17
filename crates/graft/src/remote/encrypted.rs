@@ -860,7 +860,7 @@ impl EncryptedRemote {
         observed: &RefObservation,
         replacement: Bytes,
     ) -> Result<()> {
-        self.validate_publication(path, &replacement, pack)?;
+        parse_target(path, &replacement)?;
         let packs = pack
             .map(|pack| {
                 crate::repo::split_verified_pack(
@@ -875,11 +875,10 @@ impl EncryptedRemote {
         let maximum_ciphertext_length = objects
             .iter()
             .map(|object| object.content_length as u64)
-            .chain(
-                packs
-                    .iter()
-                    .flat_map(|pack| [pack.pack.len() as u64, pack.index.len() as u64]),
-            )
+            .chain(packs.iter().flat_map(|verified| {
+                let pack = verified.pack();
+                [pack.pack.len() as u64, pack.index.len() as u64]
+            }))
             .try_fold(0_u64, |total, length| {
                 let tags = length
                     .max(1)
@@ -923,8 +922,9 @@ impl EncryptedRemote {
                 .ok_or(EncryptionError::TooLarge)?;
             bundle.objects.push(prepared);
         }
-        for pack in &packs {
-            let topology = crate::repo::verified_pack_topology(&pack.id, &pack.pack, &pack.index)?;
+        for verified in &packs {
+            let pack = verified.pack();
+            let topology = verified.topology();
             let pack_key = crate::e2ee::object::remote_key(operation.root()?, &pack.pack_path)?;
             let index_key = crate::e2ee::object::remote_key(operation.root()?, &pack.index_path)?;
             if !topology.is_empty()
@@ -936,7 +936,7 @@ impl EncryptedRemote {
                     operation.root()?,
                     &pack_key,
                     &index_key,
-                    &topology,
+                    topology,
                 )?);
             }
             for (path, bytes) in [
@@ -994,9 +994,10 @@ impl EncryptedRemote {
         Ok(())
     }
 
-    async fn publish_bounded_pack(&self, pack: &RemoteObjectPack) -> Result<()> {
+    async fn publish_bounded_pack(&self, verified: &crate::repo::VerifiedPack) -> Result<()> {
         let operation = self.client.operation().await?;
-        let topology = crate::repo::verified_pack_topology(&pack.id, &pack.pack, &pack.index)?;
+        let pack = verified.pack();
+        let topology = verified.topology();
         let pack_key = crate::e2ee::object::remote_key(operation.root()?, &pack.pack_path)?;
         let index_key = crate::e2ee::object::remote_key(operation.root()?, &pack.index_path)?;
         let hint = if topology.is_empty()
@@ -1010,7 +1011,7 @@ impl EncryptedRemote {
                 operation.root()?,
                 &pack_key,
                 &index_key,
-                &topology,
+                topology,
             )?)
         };
         self.put_chunks(&pack.pack_path, vec![pack.pack.clone()])
@@ -1021,19 +1022,6 @@ impl EncryptedRemote {
             self.client.publish_hint(&hint).await?;
         }
         operation.check_active()?;
-        Ok(())
-    }
-
-    pub(super) fn validate_publication(
-        &self,
-        path: &str,
-        replacement: &[u8],
-        pack: Option<&RemoteObjectPack>,
-    ) -> Result<()> {
-        parse_target(path, replacement)?;
-        if let Some(pack) = pack {
-            crate::repo::verified_pack_topology(&pack.id, &pack.pack, &pack.index)?;
-        }
         Ok(())
     }
 }

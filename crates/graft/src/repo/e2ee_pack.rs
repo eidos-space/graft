@@ -87,6 +87,29 @@ pub(crate) fn verified_pack_file_topology(
         .collect()
 }
 
+/// An immutable pack and the topology verified from its exact canonical bytes.
+/// Only this module can construct it; publication can borrow, but not replace,
+/// either half of the proof. It is never retained across repository operations.
+pub(crate) struct VerifiedPack {
+    pack: crate::remote::RemoteObjectPack,
+    topology: Vec<CommitTopology>,
+}
+
+impl VerifiedPack {
+    pub(crate) fn pack(&self) -> &crate::remote::RemoteObjectPack {
+        &self.pack
+    }
+
+    pub(crate) fn topology(&self) -> &[CommitTopology] {
+        &self.topology
+    }
+}
+
+struct ValidatedPack {
+    index: RemoteObjectPackIndex,
+    commits: BTreeMap<object::ObjectId, Vec<object::ObjectId>>,
+}
+
 /// Split only after the complete input has passed canonical identity validation.
 /// Pack layout is disposable; every object retains its authoritative identity.
 pub(crate) fn split_verified_pack(
@@ -94,11 +117,9 @@ pub(crate) fn split_verified_pack(
     pack: &[u8],
     index_bytes: &[u8],
     maximum: usize,
-) -> crate::e2ee::Result<Vec<crate::remote::RemoteObjectPack>> {
-    verified_pack_topology(id, pack, index_bytes)?;
-    let mut index: RemoteObjectPackIndex =
-        serde_json::from_slice(index_bytes).map_err(|_| EncryptionError::InvalidEncoding)?;
-    index.objects.sort_by_key(|entry| entry.offset);
+) -> crate::e2ee::Result<Vec<VerifiedPack>> {
+    let ValidatedPack { index, commits: mut verified_commits } =
+        validate_pack(id, pack, index_bytes)?;
     let mut output = Vec::new();
     let mut bytes = REMOTE_OBJECT_PACK_MAGIC.to_vec();
     let mut entries = Vec::new();
@@ -120,14 +141,9 @@ pub(crate) fn split_verified_pack(
         let start = usize::try_from(entry.offset).map_err(|_| EncryptionError::TooLarge)?;
         let length = usize::try_from(entry.len).map_err(|_| EncryptionError::TooLarge)?;
         let raw = &pack[start..start + length]; // Coverage was checked above.
-        let commit =
-            match object::Object::decode(raw).map_err(|_| EncryptionError::InvalidEncoding)? {
-                object::Object::Commit(commit) => Some(RemoteObjectPackCommit {
-                    id: entry.id.clone(),
-                    parents: commit.parents,
-                }),
-                _ => None,
-            };
+        let commit = verified_commits
+            .remove(&entry.id)
+            .map(|parents| RemoteObjectPackCommit { id: entry.id.clone(), parents });
         let hint_entry_length = commit
             .as_ref()
             .map_or(Some(0), |commit| {
@@ -183,9 +199,13 @@ fn finish_pack(
     pack: Vec<u8>,
     objects: Vec<RemoteObjectPackEntry>,
     mut commits: Vec<RemoteObjectPackCommit>,
-) -> crate::e2ee::Result<crate::remote::RemoteObjectPack> {
+) -> crate::e2ee::Result<VerifiedPack> {
     let id = blake3::hash(&pack).to_hex().to_string();
     commits.sort_by(|a, b| a.id.cmp(&b.id));
+    let topology = commits
+        .iter()
+        .map(|commit| commit_topology(&commit.id, &commit.parents))
+        .collect::<crate::e2ee::Result<_>>()?;
     let index = RemoteObjectPackIndex {
         version: REMOTE_OBJECT_PACK_VERSION,
         pack: format!("{DIR_OBJECTS_PACK}/{id}.pack"),
@@ -193,34 +213,42 @@ fn finish_pack(
         commits,
     };
     let index = serde_json::to_vec(&index).map_err(|_| EncryptionError::InvalidEncoding)?;
-    Ok(crate::remote::RemoteObjectPack::new(
-        id,
-        Bytes::from(pack),
-        Bytes::from(index),
-    ))
+    Ok(VerifiedPack {
+        pack: crate::remote::RemoteObjectPack::new(id, Bytes::from(pack), Bytes::from(index)),
+        topology,
+    })
 }
 
 /// Recover routing facts from canonical objects, never from index advertisements.
 /// Require complete pack coverage so no hidden commit can escape hint generation.
-pub(crate) fn verified_pack_topology(
+#[cfg(test)]
+fn verified_pack_topology(
     id: &str,
     pack: &[u8],
     index_bytes: &[u8],
 ) -> crate::e2ee::Result<Vec<CommitTopology>> {
+    validate_pack(id, pack, index_bytes)?
+        .commits
+        .iter()
+        .map(|(id, parents)| commit_topology(id, parents))
+        .collect()
+}
+
+fn validate_pack(id: &str, pack: &[u8], index_bytes: &[u8]) -> crate::e2ee::Result<ValidatedPack> {
     let invalid = || EncryptionError::InvalidEncoding;
     if !pack.starts_with(REMOTE_OBJECT_PACK_MAGIC) || blake3::hash(pack).to_hex().as_str() != id {
         return Err(invalid());
     }
     let index_path = format!("{DIR_OBJECTS_PACK}/{id}.idx");
-    let index = decode_remote_object_pack_index(&index_path, index_bytes).map_err(|_| invalid())?;
+    let mut index =
+        decode_remote_object_pack_index(&index_path, index_bytes).map_err(|_| invalid())?;
     if index.pack != format!("{DIR_OBJECTS_PACK}/{id}.pack") {
         return Err(invalid());
     }
-    let mut entries = index.objects.iter().collect::<Vec<_>>();
-    entries.sort_by_key(|entry| entry.offset);
+    index.objects.sort_by_key(|entry| entry.offset);
     let mut cursor = REMOTE_OBJECT_PACK_MAGIC.len();
     let mut commits = BTreeMap::new();
-    for entry in entries {
+    for entry in &index.objects {
         let offset = usize::try_from(entry.offset).map_err(|_| invalid())?;
         let length = usize::try_from(entry.len).map_err(|_| invalid())?;
         let end = offset.checked_add(length).ok_or_else(invalid)?;
@@ -242,28 +270,30 @@ pub(crate) fn verified_pack_topology(
     }
     // Older indexes may omit advertisements. Every present advertisement must
     // match the object, including parent order; omitted commits are recovered.
-    for advertised in index.commits {
+    for advertised in &index.commits {
         if commits.get(&advertised.id) != Some(&advertised.parents) {
             return Err(invalid());
         }
     }
+    Ok(ValidatedPack { index, commits })
+}
+
+fn commit_topology(
+    id: &object::ObjectId,
+    parents: &[object::ObjectId],
+) -> crate::e2ee::Result<CommitTopology> {
     let raw_id = |id: &object::ObjectId| {
         blake3::Hash::from_hex(id.as_str())
             .map(|hash| *hash.as_bytes())
-            .map_err(|_| invalid())
+            .map_err(|_| EncryptionError::InvalidEncoding)
     };
-    commits
-        .into_iter()
-        .map(|(id, parents)| {
-            Ok(CommitTopology {
-                commit: raw_id(&id)?,
-                parents: parents
-                    .iter()
-                    .map(raw_id)
-                    .collect::<crate::e2ee::Result<_>>()?,
-            })
-        })
-        .collect()
+    Ok(CommitTopology {
+        commit: raw_id(id)?,
+        parents: parents
+            .iter()
+            .map(raw_id)
+            .collect::<crate::e2ee::Result<_>>()?,
+    })
 }
 
 #[cfg(test)]
@@ -309,8 +339,12 @@ mod tests {
             let mut actual = BTreeMap::new();
             let mut total_commits = 0;
             for part in parts {
-                let (id, bytes, index_bytes) = part.encrypted_test_parts();
-                let topology = verified_pack_topology(id, bytes, index_bytes).unwrap();
+                let (id, bytes, index_bytes) = part.pack().encrypted_test_parts();
+                let topology = part.topology();
+                assert_same_topology(
+                    topology,
+                    &verified_pack_topology(id, bytes, index_bytes).unwrap(),
+                );
                 total_commits += topology.len();
                 let pack_key =
                     crate::e2ee::object::remote_key(&root, &format!("objects/pack/{id}.pack"))
@@ -318,9 +352,8 @@ mod tests {
                 let index_key =
                     crate::e2ee::object::remote_key(&root, &format!("objects/pack/{id}.idx"))
                         .unwrap();
-                let hint =
-                    crate::e2ee::RoutingHint::create(&root, &pack_key, &index_key, &topology)
-                        .unwrap();
+                let hint = crate::e2ee::RoutingHint::create(&root, &pack_key, &index_key, topology)
+                    .unwrap();
                 let expected_length = crate::e2ee::hint::EMPTY_HINT_LENGTH
                     + topology
                         .iter()
@@ -391,7 +424,51 @@ mod tests {
         pack: &[u8],
         index: &RemoteObjectPackIndex,
     ) -> crate::e2ee::Result<Vec<CommitTopology>> {
-        verified_pack_topology(id, pack, &serde_json::to_vec(index).unwrap())
+        let index = serde_json::to_vec(index).unwrap();
+        let verified = verified_pack_topology(id, pack, &index);
+        // Every adversarial fixture must also fail at the production split
+        // boundary before a VerifiedPack can reach publication.
+        let split = split_verified_pack(id, pack, &index, 64 * 1024 * 1024);
+        assert_eq!(verified.is_ok(), split.is_ok());
+        if let (Ok(topology), Ok(parts)) = (&verified, split) {
+            let split_topology = parts
+                .iter()
+                .flat_map(|part| part.topology().iter().cloned())
+                .collect::<Vec<_>>();
+            assert_same_topology(topology, &split_topology);
+        }
+        verified
+    }
+
+    fn assert_same_topology(actual: &[CommitTopology], expected: &[CommitTopology]) {
+        let normalize = |entries: &[CommitTopology]| {
+            let mut entries = entries
+                .iter()
+                .map(|entry| (entry.commit, entry.parents.clone()))
+                .collect::<Vec<_>>();
+            entries.sort();
+            entries
+        };
+        assert_eq!(normalize(actual), normalize(expected));
+    }
+
+    #[test]
+    fn encrypted_split_owns_verified_bytes_and_rejects_later_corruption() {
+        let (id, mut bytes, index, expected) = fixture();
+        let mut index_bytes = serde_json::to_vec(&index).unwrap();
+        let parts = split_verified_pack(&id, &bytes, &index_bytes, 64 * 1024 * 1024).unwrap();
+        assert_eq!(parts.len(), 1);
+        bytes.fill(0);
+        index_bytes.fill(0);
+        assert!(split_verified_pack(&id, &bytes, &index_bytes, 64 * 1024 * 1024).is_err());
+
+        let part = &parts[0];
+        let (id, bytes, index) = part.pack().encrypted_test_parts();
+        assert_same_topology(part.topology(), &expected);
+        assert_same_topology(
+            part.topology(),
+            &verified_pack_topology(id, bytes, index).unwrap(),
+        );
     }
 
     #[test]

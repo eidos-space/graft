@@ -495,9 +495,7 @@ mod e2ee_push;
 mod fetch_boundary;
 mod index_budget;
 #[cfg(all(feature = "e2ee", not(target_arch = "wasm32")))]
-pub(crate) use e2ee_pack::{
-    split_verified_pack, verified_pack_file_topology, verified_pack_topology,
-};
+pub(crate) use e2ee_pack::{VerifiedPack, split_verified_pack, verified_pack_file_topology};
 
 #[derive(Debug, Error)]
 pub enum RepoErr {
