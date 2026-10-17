@@ -129,6 +129,9 @@ jobs:
         with:
           key: cli-${{ matrix.target }}
 
+      - name: Build Web UI
+        uses: ./.github/actions/build-web-ui
+
       - name: Build CLI
         run: cargo build --release --package graft-cli --target "${{ matrix.target }}"
 

@@ -2165,6 +2165,24 @@ impl RepositorySession {
                 .chain(status_cache.artifacts.keys())
                 .cloned()
                 .collect::<Vec<_>>();
+            // Conflicted status deliberately bypasses the ordinary worktree cache.
+            // Inventory must still reflect the merge index, including unchanged files.
+            if status_cache.index.has_conflicts() {
+                let mut paths = BTreeSet::new();
+                if let Some(head) = repo.head_target().map_err(repo_error)? {
+                    let commit = repo.read_commit(&head).map_err(repo_error)?;
+                    paths.extend(commit.files.into_keys());
+                    paths.extend(commit.artifacts.into_keys());
+                }
+                for entry in &status_cache.index.entries {
+                    if entry.stage == IndexStage::Normal && entry.file.is_none() && entry.artifact.is_none() {
+                        paths.remove(&entry.path);
+                    } else {
+                        paths.insert(entry.path.clone());
+                    }
+                }
+                tracked = paths.into_iter().collect();
+            }
             tracked.sort();
             tracked.dedup();
             let mut paths_examined = 0;
@@ -2175,7 +2193,11 @@ impl RepositorySession {
                     tracked.clone()
                 }
                 InventoryKind::Untracked => {
-                    let paths = status_cache.untracked_fingerprints.keys().cloned().collect::<Vec<_>>();
+                    let paths = if status_cache.index.has_conflicts() {
+                        repo.untracked_paths().map_err(repo_error)?.into_iter().map(|entry| entry.path).collect::<Vec<_>>()
+                    } else {
+                        status_cache.untracked_fingerprints.keys().cloned().collect::<Vec<_>>()
+                    };
                     paths_examined = paths.len();
                     paths
                 }
@@ -2239,11 +2261,7 @@ impl RepositorySession {
                         .map_err(repo_error)?,
                 };
                 items.push(InventoryItem {
-                    tracked: cached_path_is_tracked(
-                        &status_cache.files,
-                        &status_cache.artifacts,
-                        &path,
-                    ),
+                    tracked: tracked.binary_search(&path).is_ok(),
                     path,
                     ignored,
                 });
@@ -7134,6 +7152,36 @@ mod tests {
         session.close().unwrap();
         session.open().unwrap();
         let reopened = session.get_merge_status().unwrap();
+        // A reopened merge has no normal status fingerprints yet. Inventory
+        // must still expose tracked and untracked files with correct flags.
+        fs::write(directory.path().join("scratch.txt"), "untracked").unwrap();
+        let tracked = session
+            .inventory(&InventoryOptions {
+                kind: InventoryKind::Tracked,
+                limit: 100,
+                after: None,
+            })
+            .unwrap();
+        assert!(
+            tracked
+                .items
+                .iter()
+                .any(|item| item.path == "note.txt" && item.tracked)
+        );
+        let untracked = session
+            .inventory(&InventoryOptions {
+                kind: InventoryKind::Untracked,
+                limit: 100,
+                after: None,
+            })
+            .unwrap();
+        assert!(
+            untracked
+                .items
+                .iter()
+                .any(|item| item.path == "scratch.txt" && !item.tracked)
+        );
+        fs::remove_file(directory.path().join("scratch.txt")).unwrap();
         let MergeStatus::Merging { state_token: reopened_token, .. } = reopened else {
             panic!("expected merge state after reopen");
         };

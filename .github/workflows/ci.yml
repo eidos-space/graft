@@ -74,7 +74,13 @@ jobs:
           node --test scripts/performance-report.test.mjs
           python3 scripts/e2ee-report-only.test.py
 
-      - name: Build
+      - name: Build Web UI
+        uses: ./.github/actions/build-web-ui
+
+      - name: Web UI tests
+        run: pnpm --dir web-ui test
+
+      - name: Build Rust workspace
         run: just build-all
 
       - name: Test
@@ -138,6 +144,9 @@ jobs:
       - name: Migration intent persistence subprocess matrix
         run: cargo test -p graft --lib --features e2ee --locked migration_creation_process_exit_recovers_only_exact_installed_intent -- --ignored --test-threads=1
 
+      - name: Build Web UI
+        uses: ./.github/actions/build-web-ui
+
       - name: Native E2EE CLI tests
         run: cargo test -p graft-cli --bin graft --features e2ee --locked
 
@@ -197,6 +206,9 @@ jobs:
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
         with:
           key: msrv-1.91
+
+      - name: Build Web UI
+        uses: ./.github/actions/build-web-ui
 
       - name: Cargo check
         run: cargo check --workspace --all-targets --locked

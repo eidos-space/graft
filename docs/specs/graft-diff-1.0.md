@@ -149,6 +149,14 @@ A row is identified by either:
 - signed 64-bit `rowid` for a rowid table; or
 - the declared ordered primary-key tuple for a `WITHOUT ROWID` table.
 
+JSON table changes expose `rowid_alias` when an `INTEGER PRIMARY KEY` column
+aliases the rowid. That column's stored record slot MAY be null; consumers
+MUST use the row change's `rowid` to display its logical column value.
+
+`primary_key_columns` identifies the declared primary-key columns in declaration
+order, including for rowid tables. This display metadata does not change row
+identity: ordinary tables still match rows by rowid.
+
 Primary-key parts are typed values:
 
 ```text

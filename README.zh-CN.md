@@ -62,6 +62,20 @@ graft log
 
 继续阅读 [CLI 快速开始](https://graft.eidos.space/zh/docs/quickstart/cli/)。
 
+在本地浏览器中打开已有仓库：
+
+```sh
+graft .
+```
+
+React 界面将文件内容和 diff 与目录树并排显示，通过 **All files**、**Changes**、
+**History** 切换。你可以查看文本与 SQLite 行级变更、浏览当前数据库表，并编辑
+较小的 UTF-8 文本文件。HTML 和 SVG 使用源码视图；工作区的位图、音频、视频
+和 PDF 提供专门预览。
+保存只修改工作区，暂存与提交仍通过 CLI 完成。服务仅监听
+本机，按 Ctrl+C 停止。使用 `graft ui . --no-open --port 4178` 可指定端口并只打印
+地址，不自动打开浏览器。
+
 ## 选择集成方式
 
 | 集成方式 | 适用场景 |

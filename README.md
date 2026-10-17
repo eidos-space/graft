@@ -66,6 +66,21 @@ graft log
 
 Continue with the [CLI quickstart](https://graft.eidos.space/docs/quickstart/cli/).
 
+Open an existing repository in the local browser viewer:
+
+```sh
+graft .
+```
+
+The React viewer keeps file contents and diffs beside an explorer with **All
+files**, **Changes**, and **History**. It previews text changes and SQLite row
+changes, browses current database tables, and can save small UTF-8 text files.
+HTML and SVG use the source viewer. Worktree raster images, audio, video, and
+PDF files have dedicated previews.
+Saving changes the worktree; use the CLI to stage and commit. The server runs
+on loopback until Ctrl+C. Use `graft ui . --no-open --port 4178` to choose a
+port and print the URL without opening a browser.
+
 ## Choose an Integration
 
 | Integration | Use it for |
