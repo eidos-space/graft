@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bind unchanged E2EE load gates to a clean CI source and complete raw evidence."""
+"""Bind versioned E2EE load gates to a clean CI source and complete raw evidence."""
 
 import argparse
 import collections
@@ -14,6 +14,7 @@ import subprocess
 import sys
 
 
+ACCEPTANCE_POLICY = json.loads(Path(__file__).with_name("e2ee-performance-policy.json").read_text())
 BINARIES = {
     "core": "e2ee_load_benchmark",
     "sdk": "e2ee_sync_benchmark",
@@ -27,6 +28,7 @@ GROUPS = {
         "reports": 36 if kind == "core" else 1,
         "operations": {"core": 210, "sdk": 50, "hydration": 360}[kind],
         "summaries": {"core": 38, "sdk": 10, "hydration": 72}[kind],
+        "checks": {"core": 85, "sdk": 20, "hydration": 144}[kind],
     }
     for kind in BINARIES
     for order in ("plain-first", "encrypted-first")
@@ -70,6 +72,7 @@ def capture_source(output):
     identity = source_identity()
     identity.update({
         "schema": "graft-e2ee-performance-source-v1",
+        "acceptance_policy": ACCEPTANCE_POLICY,
         "captured_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "scope": SCOPE,
         "runner": {
@@ -118,6 +121,8 @@ def capture_source(output):
 
 def require_unchanged_source(output):
     source = json.loads((output / "source.json").read_text())
+    if source.get("acceptance_policy") != ACCEPTANCE_POLICY:
+        raise RuntimeError("source acceptance policy differs; retain historical evidence separately")
     current = source_identity()
     for key in ("commit", "tree", "tracked_sha256"):
         if source[key] != current[key]:
@@ -147,6 +152,8 @@ def inspect_group(output, name, expected, binaries):
     directory = output / name
     summary = json.loads((directory / "summary.json").read_text())
     acceptance = json.loads((directory / "acceptance.json").read_text())
+    if any(value.get("acceptance_policy") != ACCEPTANCE_POLICY for value in (summary, acceptance)):
+        raise ValueError("wrong or missing acceptance policy; historical evidence cannot be relabeled")
     if summary["order"] != expected["order"] or summary["rounds"] != expected["rounds"]:
         raise ValueError("wrong pair order or round count")
     rows = summary["summaries"]
@@ -157,6 +164,8 @@ def inspect_group(output, name, expected, binaries):
     checks = acceptance["checks"]
     if not checks or any(type(check.get("passed")) is not bool for check in checks):
         raise ValueError("missing or invalid acceptance checks")
+    if len(checks) != expected["checks"] or len({check["name"] for check in checks}) != len(checks):
+        raise ValueError("incomplete or duplicate acceptance checks")
     if acceptance.get("passed") is not all(check["passed"] for check in checks):
         raise ValueError("acceptance result disagrees with retained checks")
     paths = sorted(path for path in directory.glob("*.json")
@@ -201,7 +210,7 @@ def inspect_group(output, name, expected, binaries):
 
 def finalize(output):
     output.mkdir(parents=True, exist_ok=True)
-    result = {"schema": "graft-e2ee-performance-evidence-v1", "scope": SCOPE, "groups": {}, "errors": []}
+    result = {"schema": "graft-e2ee-performance-evidence-v1", "acceptance_policy": ACCEPTANCE_POLICY, "scope": SCOPE, "groups": {}, "errors": []}
     binaries = {}
     try:
         source = require_unchanged_source(output)
@@ -230,7 +239,8 @@ def finalize(output):
     })
     lines = ["## E2EE performance evidence", "", SCOPE, "",
              f"Candidate: `{result.get('source_commit', 'unverified')}`", "",
-             "| Group | Complete | Existing budgets |",
+             f"Acceptance policy: `{ACCEPTANCE_POLICY['id']}`", "",
+             "| Group | Complete | Declared budgets |",
              "| --- | --- | --- |"]
     lines.extend(f"| {name} | {group['complete']} | {'pass' if group['passed'] else 'FAIL'} |"
                  for name, group in result["groups"].items())

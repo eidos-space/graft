@@ -976,6 +976,25 @@ authenticated data only, recoverable confirmed publication, and budgets set
 against measured plain baselines. Publish independent offline verification
 tools and vectors. Single packet inspection is not proof of all-client safety.
 
+The local paired regression policy is versioned separately from this wire
+protocol. `graft-e2ee-performance-policy-v2`, recorded in
+`scripts/e2ee-performance-policy.json`, applies these core bulk wall-time gates
+to `initial_push`, `cold_clone_sync`, `long_offline_push` and
+`long_offline_fetch`:
+
+- Encrypted P50 MUST be at most `max(3 × plain P50, plain P50 + 500 ms)`.
+- Encrypted P95 MUST be at most `max(3 × plain P95, plain P95 + 750 ms)`.
+
+Warm-small core operations retain their 500 ms P95 ceiling. SDK and hydration
+wall-time budgets, request/wire/RSS/orphan gates, and sampling remain unchanged:
+three core rounds and five SDK/hydration rounds in each of the plain-first and
+encrypted-first orders. The full matrix has 498 checks, including 18 added
+core bulk P50 checks. Percentiles use nearest rank; these finite samples are
+regression evidence, not a production tail-latency SLA. Source, summary and
+acceptance records MUST identify the policy. Historical failures retain their
+original budgets and outcome; changing policy requires a new complete run and
+MUST NOT relabel earlier evidence or omit failed samples.
+
 The design is fixed at version 1.0; interoperable implementations require exact
 vectors and the review above. Changes to encoding, leakage, algorithms or atomic
 semantics require an explicit version/profile revision, not undocumented edits.

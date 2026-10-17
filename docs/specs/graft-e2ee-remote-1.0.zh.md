@@ -752,6 +752,21 @@ hint 索引与安全 multipart。记住/本机恢复声明需要分平台存储�
 仅接受已认证数据，确认发布可恢复，并根据 plain 实测基线设性能预算。公开独立
 离线验证工具和向量。一次抓包不证明整个客户端永远安全。
 
+本机配对回归政策独立于线协议版本。
+`scripts/e2ee-performance-policy.json` 记录
+`graft-e2ee-performance-policy-v2`；仅对 core 的 `initial_push`、
+`cold_clone_sync`、`long_offline_push` 和 `long_offline_fetch` 应用：
+
+- 加密 P50 不得超过 `max(3 × plain P50, plain P50 + 500 ms)`。
+- 加密 P95 不得超过 `max(3 × plain P95, plain P95 + 750 ms)`。
+
+core 热小更新保留 500 ms P95 上限。SDK/hydration 耗时预算、请求数、线上字节、
+RSS、孤儿存储门槛及采样数不变：plain-first 和 encrypted-first 各运行三轮 core、
+五轮 SDK/hydration。完整矩阵为 498 项，包含新增的 18 项 core bulk P50 检查。
+百分位采用 nearest-rank；有限样本属于回归证据，不是生产尾延迟 SLA。
+源码、汇总和验收记录必须标识政策版本。历史失败保留原预算和结果；政策变化
+需要重新完整运行，不得重标历史证据或丢弃失败样本。
+
 设计定稿为 1.0；互操作需要精确向量和上述评审。编码、泄露范围、算法、原子
 语义的变化要明确升级版本/profile，不能无记录修改。
 

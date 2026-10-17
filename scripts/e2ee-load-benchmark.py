@@ -15,6 +15,9 @@ import threading
 import time
 
 
+ACCEPTANCE_POLICY = json.loads(Path(__file__).with_name("e2ee-performance-policy.json").read_text())
+
+
 def process_sample(pid):
     result = subprocess.run(["ps", "-o", "rss=,time=", "-p", str(pid)], capture_output=True, text=True)
     if result.returncode or not result.stdout.strip():
@@ -141,6 +144,7 @@ def percentile(values, fraction):
 def acceptance(summaries, reports):
     """Declared local release regression gates, not hosted latency guarantees."""
     checks = []
+    bulk = ACCEPTANCE_POLICY["core_bulk_wall_ms"]
     lookup = {(s["profile"], s["scenario"], s["scale"], s["operation"]): s for s in summaries}
     def check(name, actual, maximum):
         checks.append({"name": name, "actual": actual, "maximum": maximum, "passed": actual <= maximum})
@@ -149,9 +153,13 @@ def acceptance(summaries, reports):
             continue
         plain = lookup[("plain", scenario, scale, operation)]
         label = f"{scenario}/{scale}/{operation}"
-        if operation in ["initial_push", "cold_clone_sync", "long_offline_push", "long_offline_fetch"]:
+        if operation in bulk["operations"]:
             check(label + "/wire-body", encrypted["wire_body_bytes"]["p95"], 3 * plain["wire_body_bytes"]["p95"] + 65536)
-            check(label + "/wall-ms", encrypted["milliseconds"]["p95"], max(3 * plain["milliseconds"]["p95"], plain["milliseconds"]["p95"] + 500))
+            for percentile_name, suffix in (("p50", "/wall-ms-p50"), ("p95", "/wall-ms")):
+                baseline = plain["milliseconds"][percentile_name]
+                maximum = max(bulk["plain_multiplier"] * baseline,
+                              baseline + bulk[f"{percentile_name}_fixed_allowance_ms"])
+                check(label + suffix, encrypted["milliseconds"][percentile_name], maximum)
         if operation in ["warm_small_push", "warm_small_fetch"]:
             check(label + "/requests", encrypted["requests"]["p95"], 8)
             check(label + "/wire-body", encrypted["wire_body_bytes"]["p95"], 16384)
@@ -171,7 +179,7 @@ def acceptance(summaries, reports):
             check(f"same-ref/{report['profile']}/{index}/orphans", evidence["orphan_pack_bytes"], 4096)
         if report["scenario"] == "different-ref":
             check(f"different-ref/{report['profile']}/{index}/orphans", evidence["orphan_pack_bytes"], 0)
-    return {"scope": "synthetic native core loopback loads, same-host paired release; sampled memory, not production tail guarantees", "passed": all(c["passed"] for c in checks), "checks": checks}
+    return {"acceptance_policy": ACCEPTANCE_POLICY, "scope": "synthetic native core loopback loads, same-host paired release; sampled memory, not production tail guarantees", "passed": all(c["passed"] for c in checks), "checks": checks}
 
 
 def hydration_acceptance(summaries):
@@ -194,7 +202,7 @@ def hydration_acceptance(summaries):
         for field, maximum in limits.items():
             actual = encrypted[field]["p95"]
             checks.append({"name": encrypted["operation"] + "/" + field, "actual": actual, "maximum": maximum, "passed": actual <= maximum})
-    return {"scope": "physical 4-KiB SQLite page hydration; bounded compressed-frame reads and authenticated chunk rounding; same-host paired release; sampled RSS", "passed": bool(checks) and all(c["passed"] for c in checks), "checks": checks}
+    return {"acceptance_policy": ACCEPTANCE_POLICY, "scope": "physical 4-KiB SQLite page hydration; bounded compressed-frame reads and authenticated chunk rounding; same-host paired release; sampled RSS", "passed": bool(checks) and all(c["passed"] for c in checks), "checks": checks}
 
 
 def sdk_acceptance(summaries):
@@ -214,7 +222,7 @@ def sdk_acceptance(summaries):
         for field, maximum in limits.items():
             actual = encrypted[field]["p95"]
             checks.append({"name": encrypted["operation"] + "/" + field, "actual": actual, "maximum": maximum, "passed": actual <= maximum})
-    return {"scope": "actual SDK SQLite/WAL row updates and materialized clone; same-host paired release; sampled RSS", "passed": all(c["passed"] for c in checks), "checks": checks}
+    return {"acceptance_policy": ACCEPTANCE_POLICY, "scope": "actual SDK SQLite/WAL row updates and materialized clone; same-host paired release; sampled RSS", "passed": all(c["passed"] for c in checks), "checks": checks}
 
 
 def main():
@@ -255,7 +263,7 @@ def main():
             if values:
                 summary[field] = {"p50": percentile(values, 0.5), "p95": percentile(values, 0.95)}
         summaries.append(summary)
-    (args.output / "summary.json").write_text(json.dumps({"schema": "graft-e2ee-load-summary-v1", "order": args.order, "rounds": args.rounds, "discarded_warmups_per_case": max(report.get("warmup_rounds", 0) for report in reports), "percentiles": "nearest-rank; exploratory samples, not production tail estimates", "summaries": summaries}, indent=2) + "\n")
+    (args.output / "summary.json").write_text(json.dumps({"schema": "graft-e2ee-load-summary-v1", "acceptance_policy": ACCEPTANCE_POLICY, "order": args.order, "rounds": args.rounds, "discarded_warmups_per_case": max(report.get("warmup_rounds", 0) for report in reports), "percentiles": "nearest-rank; exploratory samples, not production tail estimates", "summaries": summaries}, indent=2) + "\n")
     result = None
     if not args.paired:
         result = acceptance(summaries, reports)

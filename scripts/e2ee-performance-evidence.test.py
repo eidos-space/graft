@@ -23,7 +23,8 @@ class EvidenceTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.output = Path(self.temporary.name)
-        self.source = {"commit": "candidate-sha", "tree": "tree-sha"}
+        self.source = {"commit": "candidate-sha", "tree": "tree-sha",
+                       "acceptance_policy": evidence.ACCEPTANCE_POLICY}
         evidence.write_json(self.output / "source.json", self.source)
         self.binaries = {
             "source_commit": self.source["commit"],
@@ -37,11 +38,14 @@ class EvidenceTests(unittest.TestCase):
             rows = [{"profile": "plain" if i % 2 else "encrypted", "samples": expected["rounds"]}
                     for i in range(expected["summaries"])]
             evidence.write_json(directory / "summary.json", {
+                "acceptance_policy": evidence.ACCEPTANCE_POLICY,
                 "order": expected["order"], "rounds": expected["rounds"], "summaries": rows,
             })
             evidence.write_json(directory / "acceptance.json", {
+                "acceptance_policy": evidence.ACCEPTANCE_POLICY,
                 "passed": True,
-                "checks": [{"name": "retained-budget", "actual": 1, "maximum": 2, "passed": True}],
+                "checks": [{"name": f"retained-budget-{i}", "actual": 1, "maximum": 2, "passed": True}
+                           for i in range(expected["checks"])],
             })
             common = {
                 "native_crypto_enabled": True,
@@ -88,6 +92,8 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(result["raw_reports"], 76)
         self.assertEqual(result["measured_operations"], 1240)
         self.assertEqual(len(result["groups"]), 6)
+        self.assertEqual(result["checks"], 498)
+        self.assertEqual(result["acceptance_policy"]["id"], "graft-e2ee-performance-policy-v2")
         hashes = json.loads((self.output / "sha256.json").read_text())
         self.assertEqual(hashes["result.json"], evidence.sha256(self.output / "result.json"))
         self.assertIn("core-plain-first/raw-0.json", hashes)
@@ -108,13 +114,40 @@ class EvidenceTests(unittest.TestCase):
     def test_budget_failure_is_complete_and_retained(self):
         failure = {"name": "wall-ms", "actual": 943, "maximum": 576, "passed": False}
         self.mutate("core-plain-first/acceptance.json",
-                    lambda value: value.update(passed=False, checks=[failure]))
+                    lambda value: value.update(passed=False, checks=[failure, *value["checks"][1:]]))
         passed, result = self.finalize()
         self.assertFalse(passed)
         group = result["groups"]["core-plain-first"]
         self.assertTrue(group["complete"])
         self.assertEqual(group["failed_checks"], [failure])
         self.assertTrue(result["groups"]["core-encrypted-first"]["passed"])
+
+    def test_old_or_missing_policy_cannot_relabel_historical_results(self):
+        for relative in ("core-plain-first/summary.json", "core-plain-first/acceptance.json"):
+            for old_policy in (None, {**evidence.ACCEPTANCE_POLICY, "id": "graft-e2ee-performance-policy-v1"}):
+                with self.subTest(relative=relative, policy=old_policy):
+                    self.mutate(relative, lambda value: value.update(acceptance_policy=old_policy))
+                    passed, result = self.finalize()
+                    self.assertFalse(passed)
+                    self.assertIn("historical evidence", result["groups"]["core-plain-first"]["error"])
+                    self.mutate(relative, lambda value: value.update(acceptance_policy=evidence.ACCEPTANCE_POLICY))
+
+    def test_missing_median_checks_cannot_pass_complete_matrix(self):
+        self.mutate("core-plain-first/acceptance.json", lambda value: value.update(checks=value["checks"][:76]))
+        passed, result = self.finalize()
+        self.assertFalse(passed)
+        self.assertIn("incomplete", result["groups"]["core-plain-first"]["error"])
+
+    def test_duplicate_checks_cannot_replace_missing_coverage(self):
+        self.mutate("core-plain-first/acceptance.json", lambda value: value["checks"].__setitem__(1, value["checks"][0]))
+        passed, result = self.finalize()
+        self.assertFalse(passed)
+        self.assertIn("duplicate", result["groups"]["core-plain-first"]["error"])
+
+    def test_historical_source_policy_is_rejected(self):
+        self.mutate("source.json", lambda value: value.pop("acceptance_policy"))
+        with self.assertRaisesRegex(RuntimeError, "historical evidence"):
+            evidence.require_unchanged_source(self.output)
 
     def test_binary_mismatch_fails(self):
         self.mutate("hydration-plain-first/raw-0.json",
