@@ -80,6 +80,13 @@ impl SegmentBuilder {
         self
     }
 
+    /// Drain completed compressed chunks while preserving the exact frame stream.
+    /// Calling this after each page bounds retained payload to the compressor buffer.
+    #[cfg(all(feature = "e2ee", unix))]
+    pub(crate) fn drain_chunks(&mut self) -> impl Iterator<Item = Bytes> {
+        std::mem::take(&mut self.chunks).into_iter()
+    }
+
     fn flush_chunk(&mut self) {
         let chunk = std::mem::replace(&mut self.chunk, Vec::with_capacity(CCtx::out_size()));
         if self.keep_chunks {
@@ -226,6 +233,61 @@ mod test {
         assert_eq!(frames[0].last_pageidx(), pageidx!(64));
         assert_eq!(frames[1].last_pageidx(), pageidx!(96));
         assert!(chunks.is_empty());
+    }
+
+    #[cfg(all(feature = "e2ee", unix))]
+    #[test]
+    fn draining_chunks_preserves_compressed_frames_with_bounded_retention() {
+        let mut buffered = SegmentBuilder::new();
+        let mut streamed = SegmentBuilder::new();
+        let mut output = Vec::new();
+        let mut pages = Vec::new();
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut drains = 0;
+        for index in 1..=385 {
+            let mut bytes = BytesMut::zeroed(PAGESIZE.as_usize());
+            for byte in bytes.iter_mut() {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                *byte = state as u8;
+            }
+            let page = Page::try_from(bytes).unwrap();
+            buffered.write(PageIdx::must_new(index), &page);
+            streamed.write(PageIdx::must_new(index), &page);
+            // A page may finish a compression frame; even then the completed
+            // payload remains within two compressor output buffers.
+            assert!(streamed.chunks.iter().map(Bytes::len).sum::<usize>() <= 2 * CCtx::out_size());
+            for chunk in streamed.drain_chunks() {
+                drains += 1;
+                output.extend_from_slice(&chunk);
+            }
+            assert!(streamed.chunks.is_empty());
+            pages.push(page);
+        }
+        let (expected_frames, expected_chunks) = buffered.finish();
+        let (frames, final_chunks) = streamed.finish();
+        for chunk in final_chunks {
+            output.extend_from_slice(&chunk);
+        }
+        assert!(drains > 8, "fixture must exercise incremental draining");
+        assert_eq!(frames, expected_frames);
+        assert_eq!(output, expected_chunks.concat());
+        let mut offset = 0;
+        let mut page_offset = 0;
+        for frame in frames {
+            let end = offset + frame.frame_size() as usize;
+            let count = (pages.len() - page_offset).min(64);
+            for (page, expected) in segment_frame_iter(&output[offset..end])
+                .take(count)
+                .zip(&pages[page_offset..])
+            {
+                assert_eq!(&page, expected);
+            }
+            offset = end;
+            page_offset += count;
+        }
+        assert_eq!(page_offset, pages.len());
     }
 
     #[test]

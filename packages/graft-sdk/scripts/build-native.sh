@@ -7,6 +7,13 @@ workspace_dir="$(cd "${package_dir}/../.." && pwd)"
 target_dir="${CARGO_TARGET_DIR:-${workspace_dir}/target}"
 rust_target="${1:-$(rustc -vV | sed -n 's/^host: //p')}"
 output_dir="${2:-${package_dir}/native}"
+native_profile="${3:-plain}"
+case "$native_profile" in
+  plain) feature_args=() ;;
+  e2ee) feature_args=(--features e2ee) ;;
+  macos-keychain) feature_args=(--features macos-keychain) ;;
+  *) echo "Unknown native build profile: $native_profile" >&2; exit 1 ;;
+esac
 
 case "${rust_target}" in
   aarch64-apple-darwin)
@@ -39,6 +46,7 @@ cargo build --manifest-path "${workspace_dir}/Cargo.toml" \
   --package graft-sdk-node \
   --release \
   --target "${rust_target}" \
+  "${feature_args[@]}" \
   --locked
 
 mkdir -p "${output_dir}"

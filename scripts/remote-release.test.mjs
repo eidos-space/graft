@@ -5,6 +5,7 @@ import test from "node:test";
 
 import {
   archiveName,
+  extractRemoteReleaseNotes,
   releaseTagForVersion,
   remotePackages,
   resolveReleaseRoot,
@@ -12,6 +13,50 @@ import {
 } from "./remote-release.mjs";
 
 const repositoryRoot = path.resolve(import.meta.dirname, "..");
+
+test("extracts only the matching curated Remote release section", () => {
+  const changelog = [
+    "# Graft Remote changelog",
+    "## Unreleased",
+    "## Graft Remote 0.2.5 — 2026-10-16",
+    "### Added",
+    "- Encrypted remote services.",
+    "### 中文",
+    "- 加密远端服务。",
+    "## Graft Remote 0.2.4 — 2026-09-08",
+    "- Previous release.",
+  ].join("\n");
+  assert.equal(
+    extractRemoteReleaseNotes(changelog, "0.2.5"),
+    "### Added\n- Encrypted remote services.\n### 中文\n- 加密远端服务。\n",
+  );
+  assert.throws(
+    () => extractRemoteReleaseNotes(changelog, "0.2.6"),
+    /Missing release notes/,
+  );
+  assert.throws(
+    () => extractRemoteReleaseNotes(changelog, "0.2.5.*"),
+    /SemVer/,
+  );
+});
+
+test("refuses an empty or compare-link-only Remote release body", () => {
+  for (const body of [
+    "",
+    "### Added\n\n### Compatibility",
+    "**Full Changelog**: https://github.com/eidos-space/graft/compare/a...b",
+    "[Full Changelog](https://github.com/eidos-space/graft/compare/a...b)",
+  ]) {
+    assert.throws(
+      () =>
+        extractRemoteReleaseNotes(
+          `## Graft Remote 0.2.5 — 2026-10-16\n${body}`,
+          "0.2.5",
+        ),
+      /are empty/,
+    );
+  }
+});
 
 test("defines a dependency-safe Remote publish order", () => {
   assert.deepEqual(

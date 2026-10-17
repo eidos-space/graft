@@ -695,7 +695,7 @@ export interface RepositoryMetadataResult {
 
 export interface SafeRemoteInfo {
   name: string
-  kind: "memory" | "fs" | "s3_compatible" | "http"
+  kind: "memory" | "fs" | "s3_compatible" | "http" | "encrypted_http"
   /** Credential-free configured remote URL. HTTP token_env is intentionally omitted. */
   url: string
 }
@@ -1049,11 +1049,84 @@ export interface RepositorySessionIdentity {
 export interface RepositorySessionOptions extends OperationOptions {
   /** In-memory identity override for commits and ref updates in this session. */
   identity?: RepositorySessionIdentity
+  /** Trusted native E2EE host handle; requires an opt-in E2EE build. */
+  encryptedRemote?: EncryptedRemoteSession
+}
+
+export interface EncryptedRemoteSessionOptions {
+  remoteName: string
+  url: string
+  uuid: string
+  /** Host-verified authenticated identity; account changes require a new handle. */
+  authenticationDomain: string
+  accountSubject: string
+  bearerToken: string
+  /** Absolute, owner-only directory outside the repository. */
+  checkpointDirectory: string
+  /** Explicit new checkpoint/recovery enrollment; false reopens both and fails if lost. */
+  createCheckpoint: boolean
+  /** Absolute, owner-only private staging directory. */
+  stagingDirectory: string
+  /** Durable owner-only ref/config journals and multipart ciphertext; retain the complete directory outside repository/staging. */
+  recoveryDirectory: string
+  keychainApplication?: string
+  keychainAccessGroup?: string
+}
+
+/** Trusted hosts only; unavailable in default native builds. Not a plugin API. */
+export class EncryptedRemoteSession {
+  constructor(options: EncryptedRemoteSessionOptions)
+  readonly state: "disconnected" | "locked" | "unlocking" | "unlocked" | "locking"
+  readonly paused: boolean
+  /** Consumes and clears the supplied Buffer synchronously, even on rejection. */
+  unlock(password: Buffer): Promise<void>
+  unlockRemembered(): Promise<void>
+  /** Requires locked state; consumes the Buffer. Config publication is not connected success. */
+  initializeConfig(password: Buffer): Promise<"config_published" | "unconfirmed" | "conflict" | "unknown">
+  /** Requires locked state; restores retained config bytes and consumes the Buffer. */
+  resumeInitialConfig(password: Buffer): Promise<"config_published" | "unconfirmed" | "conflict" | "unknown">
+  /** Consumes both Buffers synchronously; unknown/unconfirmed requires recovery. */
+  changePassword(currentPassword: Buffer, newPassword: Buffer): Promise<"confirmed" | "unconfirmed" | "conflict" | "unknown">
+  /** Requires explicit unlock; restores the retained transaction, never rewraps. */
+  resumePasswordChange(): Promise<"confirmed" | "unconfirmed" | "conflict" | "unknown">
+  /** Requires explicit unlock; only admitted local ciphertext slots are listed. */
+  retainedUploads(): Array<{ opaqueKey: string; ciphertextLength: number; serverSessionRecorded: boolean }>
+  resumeRetainedUpload(opaqueKey: string): Promise<"created" | "reused" | "unconfirmed" | "unknown">
+  /** Explicit abort/restart of the same retained ciphertext; unknown abort preserves old identity. */
+  restartRetainedUpload(opaqueKey: string): Promise<"created" | "reused" | "unconfirmed" | "unknown">
+  remember(): Promise<void>
+  lock(): Promise<void>
+  pause(paused: boolean): void
+  disconnect(): Promise<void>
+  reconnect(bearerToken: string): void
+  refreshBearerToken(authenticationDomain: string, accountSubject: string, bearerToken: string): void
+  forget(): Promise<void>
 }
 
 export class GraftSdkError extends Error {
   readonly code: string
   readonly cause?: unknown
+}
+
+export interface EncryptedMigrationPreparation {
+  allRefs?: boolean
+  references?: string[]
+  mappings: Array<{ source: string; target: string }>
+  targetHead: string
+}
+export interface EncryptedMigrationVerification {
+  /** Absolute empty/absent destination outside source and all host recovery state. */
+  verificationDirectory: string
+  /** Same host-verified account identity as the authority. */
+  bearerToken: string
+}
+export interface EncryptedMigrationResult {
+  status: "prepared" | "config-confirmed" | "dependencies-confirmed" | "publishing-refs" | "ready-for-independent-verification" | "independently-verified" | "host-cutover-confirmed"
+  hostCutover: "pending" | "confirmed"
+  offlineDevices: "pending"
+  references?: number
+  repositoryObjects?: number
+  dependencies?: unknown
 }
 
 export class RepositorySession {
@@ -1064,6 +1137,18 @@ export class RepositorySession {
   ): Promise<RepositorySession>
 
   readonly target: string
+  addEncryptedRemote(options?: OperationOptions): Promise<unknown>
+  /** Clones into an empty or absent destination, retaining the authority's remoteName and lifecycle. */
+  cloneEncryptedRemote(options?: OperationOptions & { branch?: string }): Promise<unknown>
+  /** Pins source; a fresh verificationDirectory gates durable connected success through independent clone. */
+  pushInitialBranch(options?: OperationOptions & { branch?: string; verificationDirectory?: string }): Promise<{ state: "branch_published" | "connected"; push: unknown }>
+  /** Native trusted host only. Requires locked authority; consumes password and relocks after completion. */
+  prepareEncryptedMigration(password: Buffer, options: EncryptedMigrationPreparation): Promise<EncryptedMigrationResult>
+  /** Retains original root, complete selection, mapping and budgets across process restart. */
+  resumeEncryptedMigration(password: Buffer): Promise<EncryptedMigrationResult>
+  verifyEncryptedMigration(password: Buffer, options: EncryptedMigrationVerification): Promise<EncryptedMigrationResult>
+  /** Native worker holds the actual canonical repository gate through verification and durable local config cutover. */
+  cutoverEncryptedMigration(password: Buffer, options: EncryptedMigrationVerification): Promise<EncryptedMigrationResult>
   readonly lifecycle: SessionLifecycle
 
   open(options?: OperationOptions): Promise<SessionLifecycle>

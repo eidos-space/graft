@@ -11,6 +11,10 @@
 ref CAS、refspec，以及 `fetch/push/pull/clone`，使 filesystem、S3-compatible、HTTP、
 native SDK 与 browser-capable 实现共享同一安全语义。
 
+[Graft E2EE Remote 1.0](./graft-e2ee-remote-1.0.md) 定义带不透明路由提示的独立
+加密 profile，提供可选原生源码实现。编码与批量端点仅在明确协商 profile 后适用，不改变
+本文当前 plain 协议，也不代表已支持 E2EE。
+
 ## 1. 分层
 
 Remote 传输三类状态：
@@ -42,6 +46,18 @@ CLI 的 `token_env` 可选择本地 env，但发请求前移除。1.0 拒绝 use
 其他 query。SDK 使用显式内存 credential，并拒绝 URL credential selector。
 
 Remote config 是 local-only；除非 adapter 明确提供 validation，不会自动联网。
+
+可选的 [E2EE Remote 1.0](./graft-e2ee-remote-1.0.md) profile 保存
+`type = "encrypted_http"`、不含凭据的 `url` 和规范 UUIDv4 `uuid`。此 variant
+固定为 `encrypted-remote-v1` 与 Suite 1，不能构造明文后端。缺原生模块或显式
+注册会话时，必须在数据请求前失败。原生会话注册绑定远端名、规范化后的完整
+地址与 UUID。秘密和私有 staging 路径不能进入仓库配置。账户/根密钥会话注册
+是可信宿主的显式操作，不证明接入、安全存储或恢复流程符合 E2EE Remote 1.0。
+
+会话注册期间，普通 bearer 替换/清除必须拒绝未经验证的账户变更。可信原生宿主
+验证认证域与账户主体不变，并精确核对两个会话绑定后，可以刷新 token。此刷新
+不能要求重新包装或锁定根密钥。换账户必须先排空任务并断开旧会话，再替换凭据。
+仅 bearer token 的内容不能作为已认证身份的证据。
 
 ## 3. Credential 与 transport
 
@@ -179,7 +195,15 @@ Fetch 下载所选 remote ref 的 commit graph/object，expected-state 更新 re
 ref；不能移动 local branch、改 index、merge 或 materialize。它不必 hydrate 全部
 SQLite segment/payload，因此 metadata 可用后细节读取仍可能 fetch。
 
-Push 拒绝非 FF（除非显式 force）；相同 head 不做多余 publication。顺序：
+Push 拒绝非 FF（除非显式 force）；相同 head 不重新发布不可变依赖或分支 ref。
+
+对于仓库配置的默认分支，即使远端已是同一提交，push 也必须完成远端 symbolic
+HEAD 的 create-if-absent，以恢复分支已发布而后续 HEAD 创建失败的情况。已有
+HEAD 不得覆盖；不重新发布不可变依赖，也不更新已有同一提交的分支 ref。非默认
+分支不初始化 HEAD。必需的 HEAD 步骤未确认时，此次 push 仍未完成，不推进其
+remote-tracking ref，保留原跟踪状态。
+
+数据发布顺序：
 
 1. SQLite commit/segment 与 external payload；
 2. repository object 或 pack/index；
@@ -187,6 +211,12 @@ Push 拒绝非 FF（除非显式 force）；相同 head 不做多余 publication
 
 CAS 失败可留下 unreachable immutable data，但不能暴露 incomplete commit。Branch
 delete 用 CAD。
+
+原生 observed-head API 同时携带读取时的精确 ref、远端实例、分支、本地仓库和
+远端配置绑定。绑定不同必须在发布依赖对象前拒绝。克隆远端保留观察身份，重新
+构造远端不转移句柄。观察值不可序列化，也不能从目标提交重建。原生观察式 ref
+读取限制为 16 KiB。这种绑定不证明读取后的最新状态；最终发布仍需精确 expected
+CAS/CAD。加密观察值还遵守 E2EE 规范的会话与密文字节规则。
 
 Pull 就是 fetch + 当前 branch 的 merge plan/apply，必须继承 up-to-date/FF/three-way/
 conflict/stale/materialization 语义，不能另写 overwrite 算法。

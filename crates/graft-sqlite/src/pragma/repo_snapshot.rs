@@ -558,7 +558,7 @@ pub(super) fn publish_repo_branch_snapshots(
     Ok(())
 }
 
-pub(super) fn prepare_repo_branch_snapshot_push(
+pub(crate) fn prepare_repo_branch_snapshot_push(
     runtime: &Runtime,
     repo: &Repository,
     remote: &str,

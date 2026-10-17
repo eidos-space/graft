@@ -214,6 +214,9 @@ pub(super) fn run_repo_push(
     } else {
         let (remote, local_branch, remote_branch) = repo_push_branches(repo, remote, branch)?;
         let remote_head_trace = graft::trace::PushTraceSpan::new("remote_head_read");
+        #[cfg(not(target_arch = "wasm32"))]
+        let remote_head = repo.observe_remote_branch_head(&remote, &remote_branch)?;
+        #[cfg(target_arch = "wasm32")]
         let remote_head = repo.remote_branch_head_state(&remote, &remote_branch)?;
         remote_head_trace.finish(&[]);
         let tracking_head = if !force {
@@ -222,17 +225,31 @@ pub(super) fn run_repo_push(
             None
         };
         let snapshot_trace = graft::trace::PushTraceSpan::new("snapshot_publish");
+        #[cfg(not(target_arch = "wasm32"))]
+        let observed_head = remote_head.head();
+        #[cfg(target_arch = "wasm32")]
+        let observed_head = remote_head.head.as_deref();
         let remote_store = Arc::new(repo.remote_store(&remote)?);
         let snapshots = prepare_repo_branch_snapshot_push(
             runtime,
             repo,
             &remote,
             &local_branch,
-            tracking_head.as_deref().or(remote_head.head.as_deref()),
+            tracking_head.as_deref().or(observed_head),
             remote_store,
         )?;
         snapshot_trace.finish(&[]);
         let object_trace = graft::trace::PushTraceSpan::new("object_and_ref_publish");
+        #[cfg(not(target_arch = "wasm32"))]
+        let outcome = repo.push_branch_with_observed_head_and_snapshots(
+            &remote,
+            &local_branch,
+            &remote_branch,
+            force,
+            remote_head,
+            snapshots,
+        )?;
+        #[cfg(target_arch = "wasm32")]
         let outcome = repo.push_branch_with_force_remote_head_and_snapshots(
             &remote,
             &local_branch,

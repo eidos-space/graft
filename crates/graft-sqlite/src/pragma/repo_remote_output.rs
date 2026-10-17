@@ -85,6 +85,7 @@ pub(super) fn format_ls_remote(
 
 pub(super) fn remote_config_uri(config: &RemoteConfig) -> String {
     match config {
+        RemoteConfig::EncryptedHttp { url, uuid } => format!("graft+e2ee:{url}#{uuid}"),
         RemoteConfig::Memory => "memory".to_string(),
         RemoteConfig::Fs { root } => format!("fs://{root}"),
         RemoteConfig::S3Compatible { bucket, prefix, endpoint } => {

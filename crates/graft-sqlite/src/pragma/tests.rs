@@ -406,6 +406,7 @@ fn parse_repo_clone_arg_supports_default_branch_and_branch_flags() {
     assert_eq!(
         parse_repo_clone_arg("fs:///srv/graft/app").unwrap(),
         RepoCloneSpec {
+            remote_name: "origin".into(),
             config: RemoteConfig::Fs { root: "/srv/graft/app".to_string() },
             branch: None,
             worktree: None,
@@ -414,6 +415,7 @@ fn parse_repo_clone_arg_supports_default_branch_and_branch_flags() {
     assert_eq!(
         parse_repo_clone_arg("fs:///srv/graft/app feature/search").unwrap(),
         RepoCloneSpec {
+            remote_name: "origin".into(),
             config: RemoteConfig::Fs { root: "/srv/graft/app".to_string() },
             branch: Some("feature/search".to_string()),
             worktree: None,
@@ -422,6 +424,7 @@ fn parse_repo_clone_arg_supports_default_branch_and_branch_flags() {
     assert_eq!(
         parse_repo_clone_arg("--branch feature/search memory").unwrap(),
         RepoCloneSpec {
+            remote_name: "origin".into(),
             config: RemoteConfig::Memory,
             branch: Some("feature/search".to_string()),
             worktree: None,
@@ -430,6 +433,7 @@ fn parse_repo_clone_arg_supports_default_branch_and_branch_flags() {
     assert_eq!(
         parse_repo_clone_arg("-b release/1.0 memory").unwrap(),
         RepoCloneSpec {
+            remote_name: "origin".into(),
             config: RemoteConfig::Memory,
             branch: Some("release/1.0".to_string()),
             worktree: None,
@@ -438,6 +442,7 @@ fn parse_repo_clone_arg_supports_default_branch_and_branch_flags() {
     assert_eq!(
         parse_repo_clone_arg("--worktree .. --branch feature/search memory").unwrap(),
         RepoCloneSpec {
+            remote_name: "origin".into(),
             config: RemoteConfig::Memory,
             branch: Some("feature/search".to_string()),
             worktree: Some(PathBuf::from("..")),
@@ -455,11 +460,12 @@ fn parse_repo_clone_arg_supports_default_branch_and_branch_flags() {
         GraftCommand::parse(&json_clone).unwrap(),
         GraftCommand::JsonRepoClone {
             spec: RepoCloneSpec {
+                remote_name,
                 config: RemoteConfig::Memory,
                 branch: Some(branch),
                 worktree: None,
             }
-        } if branch == "feature/search"
+        } if branch == "feature/search" && remote_name == "origin"
     ));
 }
 

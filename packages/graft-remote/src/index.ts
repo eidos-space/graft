@@ -1,4 +1,6 @@
 export { createGraftRemoteHandler } from "./handler.js";
+export type { EncryptedRoutingHint } from "./encrypted-routing.js";
+export { parseEncryptedRoutingHint } from "./encrypted.js";
 export {
   DEFAULT_LIST_LIMIT,
   GRAFT_REMOTE_CAPABILITIES,
@@ -24,12 +26,14 @@ export {
   isTransactionalPath,
 } from "./protocol.js";
 export type {
+  GraftEncryptionDescriptor,
   GraftByteRange,
   GraftHandlerRequest,
   GraftListQuery,
   GraftListEntry,
   GraftListResult,
   GraftMultipartBackend,
+  GraftMultipartEncryptionIdentity,
   GraftMultipartPart,
   GraftMultipartUpload,
   GraftObject,

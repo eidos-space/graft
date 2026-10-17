@@ -45,7 +45,19 @@ pub(super) fn run_repo_merge_continue(
     let Some(merge_head) = status.merge_head else {
         return pragma_err!("no merge in progress");
     };
-    let remote = repo_merge_remote_store(&repo, &merge_head, &merge_head)?;
+    // Resuming a hydrated merge must work after sync credentials are removed.
+    // Validate every index stage locally before selecting a remote fallback;
+    // checking only stage zero would miss unresolved base/ours/theirs inputs.
+    let remote = match verify_merge_index_file_states(runtime, &repo) {
+        Ok(()) => None,
+        Err(local_error) => {
+            let remote = repo_merge_remote_store(&repo, &merge_head, &merge_head)?;
+            if remote.is_none() {
+                return Err(local_error);
+            }
+            remote
+        }
+    };
     try_row_auto_merge_current_file_status_conflict(runtime, file, &repo, remote.clone())?;
     let conflicted = repo.status()?.conflicted;
     try_row_auto_merge_paths(runtime, file, &repo, &conflicted, remote.clone(), false)?;
@@ -61,6 +73,22 @@ pub(super) fn run_repo_merge_continue(
     file.clear_row_merge_table_summaries();
     let branch = repo.current_branch()?;
     Ok(RepoCommitOutcome { commit, branch, materialized })
+}
+
+fn verify_merge_index_file_states(runtime: &Runtime, repo: &Repository) -> Result<(), ErrCtx> {
+    let index = repo.read_index()?;
+    let resolver = RepoSnapshotResolver::local_then_remote(
+        runtime,
+        None,
+        RepoSnapshotPurpose::Merge,
+        SnapshotHashPolicy::Strict,
+    );
+    for entry in &index.entries {
+        if let Some(state) = &entry.file {
+            resolver.resolve_file_state(state)?;
+        }
+    }
+    Ok(())
 }
 
 fn verify_staged_merge_file_states(
@@ -103,8 +131,20 @@ pub(super) fn run_repo_merge(
     // A merge may target a fetched remote-tracking revision whose SQLite storage commits are
     // not hydrated yet. Prefer local storage for base/ours and fall back to the configured remote
     // for missing target commits, keeping ordinary local-branch merges offline-capable.
-    let remote = repo_merge_remote_store(&repo, rev, &plan.target)?;
-    let plan = prepare_repo_merge_plan(runtime, &plan, remote)?;
+    // A fully hydrated checkout must not need credentials merely because its
+    // commit is also advertised by a remote-tracking branch. Resolve locally
+    // before constructing any remote; retain authenticated remote fallback for
+    // incomplete snapshots.
+    let plan = match prepare_repo_merge_plan(runtime, &plan, None) {
+        Ok(prepared) => prepared,
+        Err(local_error) => {
+            let remote = repo_merge_remote_store(&repo, rev, &plan.target)?;
+            if remote.is_none() {
+                return Err(local_error);
+            }
+            prepare_repo_merge_plan(runtime, &plan, remote)?
+        }
+    };
     ensure_checkout_plan_preserves_untracked_paths_with_status(
         file,
         &repo,

@@ -1,0 +1,165 @@
+---
+title: 加密 CLI
+description: 原生加密同步、密码恢复、分段上传与根密钥迁移的命令参考。
+---
+
+状态：需要显式启用的源码实现，尚不声明生产 conformance。Unix 源码构建启用
+`e2ee` feature 后提供 `graft e2ee`：
+
+```sh
+cargo build -p graft-cli --features e2ee --locked
+target/debug/graft e2ee --help
+```
+
+同步命令连接已经初始化的 `encrypted-remote-v1` HTTP 远端；初始化从服务已登记的
+空加密远端身份开始。通过服务端可信账户管理
+流程取得精确端点、UUID，以及 bearer token 对应的已认证账户 subject。账户管理
+和 token 签发由具体服务定义；`--account` 绑定本机状态，本身不会认证用户，也不能
+证明 token 属于该 subject。
+
+交互输入时省略 `--password-stdin`，程序使用前台控制终端，所有输入都不回显。
+Enter 结束输入，其 CR／LF 分隔符不属于密码。空格与 Unicode 保持原样，不做规范化。
+退格删除前一个字符，Ctrl-U 清空输入。Ctrl-C、Ctrl-D、Ctrl-Z 和 Escape 取消输入。
+输入期间收到 INT／TERM／HUP／QUIT／TSTP 也会取消，避免终端停留在隐藏状态。
+解锁前必须恢复原始终端属性和信号处理器；恢复失败则停止操作。不可捕获的终止
+不在正常恢复保证内。包含控制或换行字节的密码需要使用受保护自动化输入。
+
+自动化使用 `--password-stdin`，通过受保护的子进程 stdin 管道，或重定向到 stdin
+的受保护输入句柄提供同步密码。该选项拒绝终端 stdin，避免回显。输入读到 EOF，必须
+是 1–1024 字节的有效 UTF-8；空格、CR、LF 全部保留。输入来源不能自行追加换行，
+除非密码本身包含换行。同步密码不能通过参数或环境变量传入。输入缓冲区会清零，
+但不保证清除外部输入来源、操作系统或内存转储中的副本。
+
+账户 bearer token 来自 `--token-env` 显式指定的环境变量。其值不会写入仓库配置、
+URL 或结果 JSON。它与同步密码是两种凭据。`--account` 必须使用该凭据对应的
+subject；程序不会自动选择其他环境 token。
+
+工作树和宿主状态路径必须是绝对路径，宿主状态路径的父目录需要预先存在。
+状态必须位于工作树和 `.graft` 元数据之外，并考虑父仓库发现与符号链接别名。
+程序在分配状态、修改 Runtime 或请求网络之前检查位置。首次设备接入使用
+`--enroll` 和一个新的状态目录；后续命令重开同一目录，省略 `--enroll`。
+已有接入记录、丢失或损坏的信任记录不能被自动替换。
+
+启动器已经提供受保护密码输入时，命令形式为：
+
+```sh
+graft e2ee \
+  --worktree /absolute/path/worktree \
+  --state-dir /absolute/private/host-state \
+  --url https://sync.example.org/account/repository \
+  --uuid 00010203-0405-4607-8809-0a0b0c0d0e0f \
+  --account YOUR_AUTHENTICATED_SUBJECT \
+  --token-env YOUR_ACCOUNT_TOKEN_VARIABLE \
+  --password-stdin --enroll clone
+```
+
+将示例身份和路径替换为实际服务提供的值。示例不包含秘密或生成密码的 shell 命令。
+原生 SDK 返回结果后，同步操作都输出 JSON：
+
+Runtime 失败返回非零退出状态，并在 stdout 输出包含 `operation: "e2ee"` 和
+`error.code`／`error.message` 的 JSON。错误码复用原生 SDK 分类：错误密码为
+`GRAFT_SDK_E2EE_UNLOCK_FAILED`，丢失信任状态为
+`GRAFT_SDK_E2EE_CHECKPOINT_UNAVAILABLE`；HTTP 账户拒绝与密文完整性错误分别报告。
+程序应根据错误码处理，不匹配诊断文字。参数与解析失败保留标准用法错误。
+
+| 操作 | 行为 |
+| --- | --- |
+| `clone` | 解锁并验证选定分支，复制到空或尚不存在的目标；注册 `origin` |
+| `fetch` | 获取已验证历史，不改变本地分支或工作树 |
+| `pull` | 获取历史并执行现有 Graft 合并及物化规则 |
+| `push` | 发布加密依赖，使用精确观察值与持久 ref 恢复记录更新分支 |
+| `change-password` | 再次认证当前密码，为同一个根密钥发布新密码包装 |
+| `resume-password-change` | 恢复保留的精确候选，核对远端；仅在已认证旧配置仍为当前配置时重试 |
+| `enroll-config-recovery` | 成功解锁后，为旧宿主接入显式分配尚未使用的配置恢复槽 |
+| `enroll-multipart-recovery` | 成功解锁后，为旧宿主接入显式分配尚未使用的 multipart 恢复命名空间 |
+| `prepare-migration` | 离线冻结所选本地历史、明确的目标 ref 映射和一个新加密根密钥 |
+| `resume-migration` | 重开精确保留的迁移，继续发布配置、依赖和 ref 阶段 |
+| `verify-migration --verification-directory PATH` | 使用新的凭据解锁、检查点和本地存储独立恢复所有所选历史；报告切换仍待完成 |
+| `cutover-migration --verification-directory PATH` | 隔离本地 Graft 历史写入，重新独立验证，再持久切换本机远端和映射分支的 upstream |
+| `multipart-uploads` | 按不透明键和密文长度列出保留的上传 |
+| `resume-multipart --key OPAQUE_KEY` | 不准备替代密文，直接核实并恢复原密文上传 |
+| `restart-multipart --key OPAQUE_KEY` | 显式中止已记录的服务端会话，再向新会话重传所有保留密文分片 |
+| `initialize --verification-directory PATH` | 生成随机根密钥，保留包装与选定源，发布并独立验证新远端 |
+| `resume-initialization --verification-directory PATH` | 重开精确初始化候选和源，核对发布结果，不替换二者 |
+
+初始化前，使用普通 `add --all` 和 `commit` 提交本地文件，通过可信服务账户流程
+取得空加密远端身份。`initialize` 要求 `--enroll` 和一个新的私有状态目录。
+`--branch` 必须是当前检出的已提交分支。不存在的本地远端名称会按明确固定的加密
+配置登记；已有不同配置则拒绝。交互初始化无回显输入新密码两次；自动化可以用
+受保护 stdin 提供精确密码字节。
+
+大对象加密上传使用服务声明的 multipart 传输和私有 `multipart-recovery`
+命名空间。上传中断后，即使重启 CLI，也继续使用保留的原始密文和加密 upload ID。
+结果未知时必须保留该命名空间。只有完整认证最终胜出对象后才确认发布成功，随后
+清理大块本地密文，保留小型确认收据。新宿主接入自动分配此命名空间；旧接入需要
+执行 `enroll-multipart-recovery`。持久分配标记防止该命令静默重建丢失的恢复数据。
+
+必须提供 `--verification-directory`：绝对路径、空或不存在，位于源和私有状态
+之外。它使用新的原生秘密会话、检查点和 staging 预算取得本地明文 clone。只有
+默认分支 clone 验证与保留源一致后，才报告 `status: "connected"`；仅确认配置
+仍是待完成状态。验证结束后排空并移除临时验证信任和 staging 状态；显式目标内
+的克隆文件保留。
+
+失败后保留宿主状态，使用 `resume-initialization`，省略 `--enroll`，保持同一
+身份、密码和分支，并选择另一个空验证目标。恢复使用精确根密钥、配置和源记录。
+恢复记录缺失或本地源变化时停止发布。恢复前还原最初选定的已提交源；初始化已
+完成后则使用正常同步。已有或部分克隆的验证目录不会自动清空。改密码推进配置
+信任后，不再使用 generation-1 初始化流程，应使用正常加密同步。这些命令不负责
+服务账户登记、空远端身份注册或 token 签发。
+
+`change-password` 使用终端无回显输入新密码两次。自动化可使用
+`change-password --new-password-fd N`，N 必须是继承的非终端描述符，且至少为 3。
+输入读到 EOF，与受保护 stdin 使用相同的原始 UTF-8 规则。当前密码继续使用正常
+解锁输入；密码值不能通过参数或环境变量传入。确认不一致或输入取消时不发布配置。
+
+新宿主接入分配 `config-recovery`。旧接入改密码前需要显式执行
+`enroll-config-recovery`，不会替换已有槽。分配槽之前先持久写入
+`config-recovery-enrolled` 记录；分配中断或已分配槽丢失后，重复接入不能修复。
+改密码和恢复命令不会自动修复丢失或损坏
+的恢复槽。结果不确定时保留状态目录。恢复使用远端当前密码；如果发布已发生，可能
+需要使用新密码。恢复不生成另一份包装。确认读回保留的已退休记录时，无需再次 CAS。
+未确认或结果未知分别以非零状态返回 `GRAFT_SDK_REMOTE_PUBLICATION_UNCONFIRMED` 或
+`GRAFT_SDK_REMOTE_PUBLICATION_OUTCOME_UNKNOWN`。改密码不会撤销已持有根密钥的设备。
+
+`--branch` 默认 `main`；`--remote` 默认 `origin`，clone 必须使用 `origin`。
+普通同步操作要求持久远端配置与明确指定的端点和 UUID 完全一致。凭据还会固定该
+profile，拒绝明文降级或不同加密身份。push 前使用普通本地 `add --all` 和 `commit`。
+这些命令拒绝 `--db`，需要使用 `--worktree`。
+
+迁移目标必须是独立登记的空加密远端。使用新的私有状态目录执行
+`--enroll prepare-migration`，通过 `--all-refs` 或重复的 `--ref FULL_SOURCE_REF`
+选择源。为每个所选 ref 显式提供一个
+`--map SOURCE_FULL_REF=TARGET_FULL_REF`，并指定
+`--target-head refs/heads/TARGET_BRANCH`。本地分支和远端跟踪 ref 映射到目标分支，
+tag 映射到目标 tag。准备阶段在分配状态前验证完整映射，不修改源仓库远端配置。
+交互准备会要求新密码确认两次。
+
+使用相同端点、UUID、账户、远端名、状态和密码，省略 `--enroll` 执行
+`resume-migration`。它复用保留的源、映射、根密钥、包装和预算；源变化或恢复记录
+丢失时停止。`ready-for-independent-verification` 表示发布已经确认。随后执行
+`verify-migration --verification-directory /absolute/empty/path`，通过新的验证存储
+和密码解锁，认证每个映射 ref 以及所选仓库对象、附件和 SQLite 存储依赖。目标目录
+是验证对象仓库，不是物化后的工作树。失败会占用该目标，重试需选择新的空目录。
+
+验证报告 `independently-verified`，`host_cutover` 和 `offline_devices` 仍为待完成。
+切换本机时执行 `cutover-migration --verification-directory /another/absolute/empty/path`。
+命令获取仓库统一修改锁，重新独立验证和核实保留的源，再原子同步目标远端以及
+每个映射本地分支的 upstream 配置。整个过程跨进程排除受支持的本地 Graft 历史修改。
+物理工作树和本地 refs 保持不变；任意应用 SQLite 或文件写入不会因此暂停。
+成功报告 `host_cutover: confirmed`，但 `offline_devices: pending`；恢复其他设备
+同步前必须另行协调。重复切换会重新验证同一保留意图；失败或响应丢失后使用新的空验证目录。
+
+大对象上传中断时，先用 `multipart-uploads` 获取不透明恢复键，再执行
+`resume-multipart --key KEY`。如果服务端保留结果未知的分片或已过期会话，显式执行
+`restart-multipart --key KEY`。只有确认中止成功后才建立新服务端会话，并原样重发
+保留密文。中止响应丢失会保留旧会话绑定，需要重复显式命令。首次 start 响应未知时，
+先 resume 恢复服务端会话身份，再 restart。这些命令也可在迁移切换前使用原登记的端点
+和账户运行，不会补建缺失候选。上传确认后重新执行原 push 或迁移操作。
+
+宿主状态包括仅所有者可访问的配置检查点、持久 ref 发布恢复记录和临时 staging。
+它绑定端点、应用、账户和加密仓库，不保存记住的根密钥或密码。丢失状态需要显式
+信任重建流程，不能对已有目录增加 `--enroll` 来绕过。待确认发布完成核对前，应保留
+恢复状态。进程完成或出错后会断开并等待秘密会话任务退出；每次调用都重新解锁。
+
+当前 CLI 不提供系统记住密钥、服务账户和远端注册、密码重设、自动跨设备迁移切换、
+force／all-ref 同步参数，以及 Windows 或浏览器 CLI E2EE。本地文件保持明文。

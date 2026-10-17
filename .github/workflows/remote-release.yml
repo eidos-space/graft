@@ -73,6 +73,9 @@ jobs:
           fi
 
           node scripts/remote-release.mjs validate "$version"
+          if [[ "$is_release" == "true" ]]; then
+            node scripts/remote-release.mjs notes "$version" >/dev/null
+          fi
           prerelease="false"
           [[ "$version" == *-* ]] && prerelease="true"
           echo "version=$version" >> "$GITHUB_OUTPUT"
@@ -154,7 +157,9 @@ jobs:
           path: release-assets/graft-remote
 
       - name: Verify downloaded release archives
-        run: node scripts/remote-release.mjs verify "${{ needs.metadata.outputs.version }}"
+        run: |
+          node scripts/remote-release.mjs verify "${{ needs.metadata.outputs.version }}"
+          node scripts/remote-release.mjs notes "${{ needs.metadata.outputs.version }}" > REMOTE_RELEASE_NOTES.md
 
       - name: Publish dependency-safe package sequence
         env:
@@ -170,7 +175,8 @@ jobs:
           prerelease: ${{ needs.metadata.outputs.prerelease }}
           make_latest: false
           fail_on_unmatched_files: true
-          generate_release_notes: true
+          generate_release_notes: false
+          body_path: REMOTE_RELEASE_NOTES.md
           files: release-assets/graft-remote/*
 
   verify-published:
@@ -200,9 +206,9 @@ jobs:
             "@eidos.space/graft-remote-hono@${REMOTE_VERSION}" \
             hono
           node --input-type=module <<'NODE'
-          import { createGraftRemoteHandler } from '@eidos.space/graft-remote'
+          import { createGraftRemoteHandler, parseEncryptedRoutingHint } from '@eidos.space/graft-remote'
           import { createGraftRemote } from '@eidos.space/graft-remote-hono'
-          if (typeof createGraftRemoteHandler !== 'function' || typeof createGraftRemote !== 'function') {
+          if (typeof createGraftRemoteHandler !== 'function' || typeof createGraftRemote !== 'function' || typeof parseEncryptedRoutingHint !== 'function') {
             throw new Error('published Remote packages did not expose the expected API')
           }
           NODE
@@ -230,9 +236,16 @@ jobs:
             "@eidos.space/graft-remote-cloudflare@${REMOTE_VERSION}" \
             wrangler@4.113.0
           cat > index.js <<'WORKER'
-          import { RepositoryDurableObject } from '@eidos.space/graft-remote-cloudflare'
+          import { RepositoryDurableObject, createEncryptedCloudflareRepository, openCloudflareRepository } from '@eidos.space/graft-remote-cloudflare'
           export { RepositoryDurableObject }
-          export default { fetch() { return new Response('ok') } }
+          export default {
+            fetch() {
+              if (typeof createEncryptedCloudflareRepository !== 'function' || typeof openCloudflareRepository !== 'function') {
+                throw new Error('published Cloudflare package did not expose encrypted repository APIs')
+              }
+              return new Response('ok')
+            }
+          }
           WORKER
           cat > wrangler.jsonc <<'CONFIG'
           {

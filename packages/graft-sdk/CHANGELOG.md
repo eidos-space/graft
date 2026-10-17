@@ -5,6 +5,29 @@ SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
 
 ## Unreleased
 
+## Graft SDK 0.3.31 — 2026-10-17
+
+### Added
+
+- Trusted Node hosts can use `EncryptedRemoteSession` for password-protected encrypted remotes. The native authority binds account identity and repository UUID, keeps root keys outside JavaScript, and supports unlock, lock, pause, token refresh and disconnect.
+- Encrypted initialization, initial branch publication and clone support independent read-back verification. Durable private checkpoints and recovery journals retain uncertain publication bytes across process restarts.
+- Explicit history migration supports selected refs, independent verification and a native repository mutation fence for local cutover. Password changes retain their transaction for reconciliation after interruption.
+- Official native packages include encrypted-session APIs. macOS packages include the optional native Keychain provider; Linux packages support private owner-only filesystem state. The release gates test each packaged addon on Node.js 20 and 24 and exercise real encrypted sync and migration on the four Unix targets.
+
+### Compatibility
+
+- Existing plain repositories remain supported. Encrypted remote creation and migration require an encrypted-capable service and explicit host enrollment; updating the SDK does not migrate an existing remote automatically.
+- Windows native packages export the API but reject encrypted enrollment with `GRAFT_SDK_E2EE_UNSUPPORTED_ENCRYPTED_HOST`. Windows encrypted synchronization is not supported in this release.
+- Hosts must retain private checkpoint and recovery directories outside the worktree, coordinate their own file/SQLite writers, and verify the account identity before token refresh. Password reset and revocation of offline devices are not provided. Keychain remembering requires a correctly signed and entitled macOS host.
+
+### 中文
+
+- 新增面向可信 Node 宿主的 `EncryptedRemoteSession`，支持密码解锁、锁定、暂停、令牌刷新和断开连接。原生会话绑定账户身份和仓库 UUID，根密钥不进入 JavaScript。
+- 加密仓库初始化、首次分支上传和克隆支持独立回读验证。私有检查点和恢复日志保留结果未确认的发布数据，使进程重启后能够继续核对和恢复。
+- 历史迁移支持显式选择引用、独立验证，以及由原生仓库写入锁保护的本地切换；修改密码也保留可恢复的事务记录。
+- 正式原生包包含加密会话 API。macOS 包包含可选的系统钥匙串支持，Linux 使用仅当前用户可访问的私有目录。Windows 包会明确拒绝加密注册，本版不支持 Windows 加密同步。
+- 普通仓库继续兼容，升级不会自动迁移已有连接。宿主仍负责账户校验、私有状态保存及普通文件/SQLite 写入协调；不提供忘记密码重置或离线设备撤销。使用钥匙串记住密码要求 macOS 宿主具备正确签名和所需权限。
+
 ## Graft SDK 0.3.30 — 2026-10-09
 
 ### Improved

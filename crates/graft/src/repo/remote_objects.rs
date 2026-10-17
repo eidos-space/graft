@@ -1,3 +1,4 @@
+use super::fetch_boundary::{GraphBudget, GraphRole};
 use super::*;
 
 pub(super) const LEGACY_PACK_PREFETCH_MAX_PACKS: usize = 128;
@@ -112,14 +113,8 @@ impl Repository {
         id: &object::ObjectId,
         pack_cache: &mut RemoteObjectPackCache,
     ) -> Result<Option<Bytes>> {
-        let hit = pack_cache.indexes(remote)?.iter().find_map(|index| {
-            index
-                .objects
-                .iter()
-                .find(|entry| &entry.id == id)
-                .map(|entry| (index.pack.clone(), entry.offset, entry.len))
-        });
-        let Some((pack, offset, len)) = hit else {
+        let hit = pack_cache.locate_object(remote, id)?;
+        let Some((pack, offset, len, size)) = hit else {
             return Ok(None);
         };
         let end = offset
@@ -128,6 +123,16 @@ impl Repository {
                 path: pack.clone(),
                 message: format!("pack entry for object {id} overflows u64 range"),
             })?;
+        if remote
+            .buffered_read_limit()
+            .is_some_and(|limit| size > limit as u64)
+        {
+            // AEAD authenticates every covering chunk. The caller independently
+            // validates the returned canonical object's authoritative BLAKE3 ID.
+            return Ok(Some(block_on_remote(
+                remote.get_raw_range(&pack, offset..end),
+            )?));
+        }
         let pack_bytes = pack_cache.pack_bytes(remote, &pack)?;
         let offset = usize::try_from(offset).map_err(|_| RepoErr::InvalidRemoteObject {
             path: pack.clone(),
@@ -143,7 +148,57 @@ impl Repository {
                 message: format!("pack entry for object {id} extends past pack length"),
             });
         }
+        if remote.buffered_read_limit().is_some() && !pack_cache.imported_packs.contains(&pack) {
+            self.import_buffered_remote_pack(&pack, &pack_bytes, pack_cache)?;
+        }
         Ok(Some(pack_bytes.slice(offset..end)))
+    }
+
+    fn import_buffered_remote_pack(
+        &self,
+        pack: &str,
+        pack_bytes: &[u8],
+        pack_cache: &mut RemoteObjectPackCache,
+    ) -> Result<()> {
+        // A graph's ID order does not follow pack placement. Merely retaining
+        // a bounded LRU causes repeated downloads when that graph exceeds the
+        // cache. Validate and publish each entry to the canonical loose store
+        // once while this admitted pack is resident; dependency/role validation
+        // still happens when the authoritative graph reaches each object.
+        if !pack_bytes.starts_with(REMOTE_OBJECT_PACK_MAGIC) {
+            return Err(RepoErr::InvalidRemoteObject {
+                path: pack.into(),
+                message: "pack header is invalid".into(),
+            });
+        }
+        let indexes = pack_cache
+            .indexes
+            .as_ref()
+            .expect("pack index initialized")
+            .iter()
+            .filter(|index| index.pack == pack);
+        for entry in indexes.flat_map(|index| &index.objects) {
+            cancellation_checkpoint()?;
+            let start = usize::try_from(entry.offset).ok();
+            let finish = entry
+                .offset
+                .checked_add(entry.len)
+                .and_then(|value| usize::try_from(value).ok());
+            let bytes = start
+                .zip(finish)
+                .and_then(|(start, finish)| pack_bytes.get(start..finish))
+                .ok_or_else(|| RepoErr::InvalidRemoteObject {
+                    path: pack.into(),
+                    message: format!("pack entry for object {} is out of bounds", entry.id),
+                })?;
+            let missing = !self.object_store().path_for(&entry.id).exists();
+            let object = self.object_store().write_raw_validated(&entry.id, bytes)?;
+            if missing && matches!(object, object::Object::Commit(_)) {
+                pack_cache.imported_commits.insert(entry.id.clone());
+            }
+        }
+        pack_cache.imported_packs.insert(pack.into());
+        Ok(())
     }
 
     /// Resolve and validate the complete immutable graph, collecting missing
@@ -152,19 +207,23 @@ impl Repository {
         &self,
         remote: &crate::remote::Remote,
         head: &str,
+        boundary: &fetch_boundary::FetchBoundary,
     ) -> Result<(usize, u64)> {
-        let mut stack = vec![object::ObjectId::from_str(head)?];
+        let budget = GraphBudget::new(remote);
+        let mut stack = vec![(object::ObjectId::from_str(head)?, GraphRole::Commit)];
         let mut seen = BTreeSet::new();
         let mut payloads = BTreeMap::new();
         let mut commits = 0;
         let mut pack_cache = RemoteObjectPackCache::persistent(
             self.graft_dir.join(DIR_CACHE_REMOTE_OBJECT_PACK_INDEXES),
         );
-        while let Some(id) = stack.pop() {
+        while let Some((id, role)) = stack.pop() {
             cancellation_checkpoint()?;
-            if !seen.insert(id.clone()) {
+            if boundary.contains(&id, role) || seen.contains(&(id.clone(), role)) {
                 continue;
             }
+            budget.admit(seen.len(), 1)?;
+            seen.insert((id.clone(), role));
             let object = match self.object_store().read_raw(&id)? {
                 Some(bytes) => {
                     let actual = object::ObjectId::for_bytes(&bytes);
@@ -180,17 +239,28 @@ impl Repository {
                     let object = self.fetch_remote_object(remote, &id, &mut pack_cache)?;
                     if matches!(object, object::Object::Commit(_)) {
                         commits += 1;
+                        pack_cache.imported_commits.remove(&id);
                     }
                     object
                 }
             };
+            if pack_cache.imported_commits.remove(&id) {
+                commits += 1;
+            }
+            role.validate(&id, &object)?;
             match object {
                 object::Object::Commit(commit) => {
-                    stack.push(commit.tree);
-                    stack.extend(commit.parents);
+                    budget.admit(stack.len(), commit.parents.len().saturating_add(1))?;
+                    stack.push((commit.tree, GraphRole::Tree));
+                    stack.extend(commit.parents.into_iter().map(|id| (id, GraphRole::Commit)));
                 }
                 object::Object::Tree(tree) => {
-                    stack.extend(tree.entries.into_iter().map(|entry| entry.oid))
+                    budget.admit(stack.len(), tree.entries.len())?;
+                    stack.extend(
+                        tree.entries
+                            .into_iter()
+                            .map(|entry| (entry.oid, GraphRole::entry(entry.mode))),
+                    );
                 }
                 object::Object::Blob(object::BlobObject::LargeFilePointer(pointer)) => {
                     if let Some(previous) = payloads.insert(pointer.content_hash, pointer.size)
@@ -208,7 +278,7 @@ impl Repository {
         let mut bytes = 0u64;
         for (id, size) in payloads {
             if self.large_file_content_path(&id).exists() {
-                self.read_large_file_content(&id, size)?;
+                self.verify_cached_large_file_content(remote, &id, size)?;
             } else {
                 bytes = bytes
                     .checked_add(size)
@@ -226,30 +296,74 @@ impl Repository {
         remote: &crate::remote::Remote,
         head: &str,
     ) -> Result<usize> {
-        let mut count = 0;
-        let mut stack = vec![head.to_string()];
-        let mut seen = BTreeMap::<String, ()>::new();
-        // Immutable subtrees are shared across commits. Validate their complete
-        // object graphs once per fetch, without retaining trust across requests.
-        let mut fetched_objects = BTreeSet::new();
+        self.fetch_commit_chain_with_boundary(
+            remote,
+            head,
+            &fetch_boundary::FetchBoundary::default(),
+        )
+    }
+
+    pub(super) fn fetch_commit_chain_with_boundary(
+        &self,
+        remote: &crate::remote::Remote,
+        head: &str,
+        boundary: &fetch_boundary::FetchBoundary,
+    ) -> Result<usize> {
+        self.fetch_commit_graph_with_boundary(remote, head, boundary)
+            .map(|(count, _)| count)
+    }
+
+    pub(super) fn fetch_commit_graph_with_boundary(
+        &self,
+        remote: &crate::remote::Remote,
+        head: &str,
+        boundary: &fetch_boundary::FetchBoundary,
+    ) -> Result<(usize, BTreeSet<String>)> {
         let mut pack_cache = RemoteObjectPackCache::persistent(
             self.graft_dir.join(DIR_CACHE_REMOTE_OBJECT_PACK_INDEXES),
         );
+        self.fetch_commit_chain_cached(remote, head, boundary, &mut pack_cache)
+    }
+
+    fn fetch_commit_chain_cached(
+        &self,
+        remote: &crate::remote::Remote,
+        head: &str,
+        boundary: &fetch_boundary::FetchBoundary,
+        pack_cache: &mut RemoteObjectPackCache,
+    ) -> Result<(usize, BTreeSet<String>)> {
+        let mut count = 0;
+        let budget = GraphBudget::new(remote);
+        let mut stack = vec![head.to_string()];
+        let mut seen = BTreeSet::<String>::new();
+        // Immutable subtrees are shared across commits. Validate their complete
+        // object graphs once per fetch, without retaining trust across requests.
+        let mut fetched_objects = BTreeSet::new();
         let head_id = object::ObjectId::from_str(head)?;
         if self.object_store().read_raw(&head_id)?.is_none() {
-            self.prefetch_commit_pack_chain(remote, &head_id, &mut pack_cache)?;
+            self.prefetch_commit_pack_chain(remote, &head_id, pack_cache)?;
         }
-        self.prefetch_local_large_file_contents(remote, &head_id)?;
+        if remote.buffered_read_limit().is_none() {
+            self.prefetch_local_large_file_contents(remote, &head_id, boundary)?;
+        }
         while let Some(id) = stack.pop() {
-            if seen.insert(id.clone(), ()).is_some() {
+            cancellation_checkpoint()?;
+            if boundary.contains(&id.parse()?, GraphRole::Commit) || seen.contains(&id) {
                 continue;
             }
+            budget.admit(seen.len().saturating_add(fetched_objects.len()), 1)?;
+            seen.insert(id.clone());
 
             let object_id = object::ObjectId::from_str(&id)?;
             let commit = match self.read_commit_object(&object_id)? {
-                Some(commit) => commit,
+                Some(commit) => {
+                    if pack_cache.imported_commits.remove(&object_id) {
+                        count += 1;
+                    }
+                    commit
+                }
                 None => {
-                    let object = self.fetch_remote_object(remote, &object_id, &mut pack_cache)?;
+                    let object = self.fetch_remote_object(remote, &object_id, pack_cache)?;
                     let object::Object::Commit(commit) = object else {
                         return Err(RepoErr::InvalidRemoteObject {
                             path: object::LooseObjectStore::relative_path(&object_id),
@@ -257,16 +371,39 @@ impl Repository {
                         });
                     };
                     count += 1;
+                    pack_cache.imported_commits.remove(&object_id);
                     commit
                 }
             };
 
-            self.fetch_object_graph(remote, &commit.tree, &mut pack_cache, &mut fetched_objects)?;
+            self.fetch_object_graph(
+                remote,
+                &commit.tree,
+                pack_cache,
+                &mut fetched_objects,
+                boundary,
+                seen.len(),
+            )?;
+            budget.admit(stack.len(), commit.parents.len())?;
             for parent in commit.parents {
                 stack.push(parent.to_string());
             }
         }
-        Ok(count)
+        if !pack_cache.pending_payloads.is_empty() {
+            // Payload concurrency shares the host's raw plaintext budget with
+            // resident packs. This graph no longer needs their backing buffers.
+            pack_cache.packs.clear();
+            pack_cache.pack_order.clear();
+            self.prefetch_large_file_payloads(
+                remote,
+                std::mem::take(&mut pack_cache.pending_payloads),
+            )?;
+        }
+        cancellation_checkpoint()?;
+        // Reuse the authoritative traversal for imported-commit accounting.
+        // A separate ancestry scan would reread and decode every commit solely
+        // to rediscover this same set. It is returned only after closure passes.
+        Ok((count, seen))
     }
 
     /// Imports repository packs from a verified fetch-bundle into the loose object store.
@@ -308,8 +445,12 @@ impl Repository {
                     message: "pack index points to a different bundle member".to_string(),
                 });
             }
-            let pack_bytes = fs::read(root.join(&index.pack))?;
-            if !pack_bytes.starts_with(REMOTE_OBJECT_PACK_MAGIC) {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut pack_file = fs::File::open(root.join(&index.pack))?;
+            let pack_length = pack_file.metadata()?.len();
+            let mut magic = vec![0; REMOTE_OBJECT_PACK_MAGIC.len()];
+            pack_file.read_exact(&mut magic)?;
+            if magic != REMOTE_OBJECT_PACK_MAGIC {
                 return Err(RepoErr::InvalidRemoteObject {
                     path: index.pack,
                     message: "pack header is invalid".to_string(),
@@ -322,35 +463,30 @@ impl Repository {
                 }
             }
             for entry in &index.objects {
-                let start =
-                    usize::try_from(entry.offset).map_err(|_| RepoErr::InvalidRemoteObject {
-                        path: index.pack.clone(),
-                        message: format!(
-                            "pack offset for object {} does not fit in usize",
-                            entry.id
-                        ),
-                    })?;
-                let end = entry
+                entry
                     .offset
                     .checked_add(entry.len)
-                    .and_then(|end| usize::try_from(end).ok())
-                    .filter(|end| *end <= pack_bytes.len())
+                    .filter(|end| *end <= pack_length)
                     .ok_or_else(|| RepoErr::InvalidRemoteObject {
                         path: index.pack.clone(),
                         message: format!("pack entry for object {} is out of bounds", entry.id),
                     })?;
-                self.object_store()
-                    .write_raw_validated(&entry.id, &pack_bytes[start..end])?;
+                let length =
+                    usize::try_from(entry.len).map_err(|_| RepoErr::InvalidRemoteObject {
+                        path: index.pack.clone(),
+                        message: "pack object length exceeds usize".into(),
+                    })?;
+                let mut bytes = vec![0; length];
+                pack_file.seek(SeekFrom::Start(entry.offset))?;
+                pack_file.read_exact(&mut bytes)?;
+                self.object_store().write_raw_validated(&entry.id, &bytes)?;
             }
 
             if let Some(cache_path) = remote_object_pack_index_cache_path(
                 &self.graft_dir.join(DIR_CACHE_REMOTE_OBJECT_PACK_INDEXES),
                 &remote_index_path,
             ) {
-                if let Some(parent) = cache_path.parent() {
-                    let _ = fs::create_dir_all(parent);
-                }
-                let _ = fs::write(cache_path, &index_bytes);
+                let _ = write_remote_object_pack_index_cache(&cache_path, &index_bytes);
             }
         }
         Ok(imported_commits)
@@ -368,17 +504,11 @@ impl Repository {
         pack_cache: &mut RemoteObjectPackCache,
     ) -> Result<()> {
         let chain_trace = crate::trace::PushTraceSpan::new("remote_pack_chain");
-        let indexes = pack_cache.indexes(remote)?.to_vec();
+        let budget = GraphBudget::new(remote);
+        let indexes = pack_cache.indexes(remote)?;
         let mut advertised = BTreeMap::<object::ObjectId, (String, Vec<object::ObjectId>)>::new();
-        let mut pack_sizes = BTreeMap::<String, u64>::new();
-        for index in &indexes {
-            let bytes = index
-                .objects
-                .iter()
-                .filter_map(|entry| entry.offset.checked_add(entry.len))
-                .max()
-                .unwrap_or(0);
-            pack_sizes.insert(index.pack.clone(), bytes);
+        let pack_sizes = remote_object_pack_extents(indexes);
+        for index in indexes {
             for commit in &index.commits {
                 advertised
                     .entry(commit.id.clone())
@@ -392,9 +522,11 @@ impl Repository {
         let mut discovered_packs = BTreeSet::new();
         let mut unresolved = false;
         while let Some(id) = stack.pop() {
-            if !seen.insert(id.clone()) || self.object_store().read_raw(&id)?.is_some() {
+            if seen.contains(&id) || self.object_store().read_raw(&id)?.is_some() {
                 continue;
             }
+            budget.admit(seen.len(), 1)?;
+            seen.insert(id.clone());
             let Some((pack, parents)) = advertised.get(&id) else {
                 unresolved = true;
                 continue;
@@ -402,6 +534,7 @@ impl Repository {
             if discovered_packs.insert(pack.clone()) {
                 pack_order.push(pack.clone());
             }
+            budget.admit(stack.len(), parents.len())?;
             stack.extend(parents.iter().cloned());
         }
 
@@ -415,7 +548,7 @@ impl Repository {
             for index in indexes.iter().filter(|index| index.commits.is_empty()) {
                 legacy.insert(
                     index.pack.clone(),
-                    pack_sizes.get(&index.pack).copied().unwrap_or(0),
+                    pack_sizes.get(index.pack.as_str()).copied().unwrap_or(0),
                 );
             }
             let legacy_bytes = legacy
@@ -438,12 +571,17 @@ impl Repository {
         let mut packs = BTreeSet::new();
         let mut selected_bytes = 0_u64;
         for pack in &pack_order {
-            let bytes = pack_sizes.get(pack).copied().unwrap_or(0);
+            let bytes = pack_sizes.get(pack.as_str()).copied().unwrap_or(0);
             let Some(next_bytes) = selected_bytes.checked_add(bytes) else {
                 break;
             };
             if packs.len() == LEGACY_PACK_PREFETCH_MAX_PACKS
-                || next_bytes > LEGACY_PACK_PREFETCH_MAX_BYTES
+                || next_bytes
+                    > remote
+                        .buffered_read_limit()
+                        .map_or(LEGACY_PACK_PREFETCH_MAX_BYTES, |limit| {
+                            LEGACY_PACK_PREFETCH_MAX_BYTES.min(limit as u64)
+                        })
             {
                 break;
             }
@@ -469,6 +607,10 @@ impl Repository {
         head: &str,
         stop_at: Option<&str>,
     ) -> Result<PreparedObjectPush> {
+        #[cfg(all(feature = "e2ee", unix))]
+        if remote.buffered_read_limit().is_some() {
+            return self.push_encrypted_commit_chain(remote, head, stop_at);
+        }
         let negotiation_trace = crate::trace::PushTraceSpan::new("object_negotiation");
         let remote_objects = match stop_at {
             Some(stop_at) => self.advertised_remote_object_ids(stop_at)?,
@@ -579,7 +721,7 @@ impl Repository {
         Ok(objects.into_keys().collect())
     }
 
-    fn missing_remote_large_file_payloads(
+    pub(super) fn missing_remote_large_file_payloads(
         &self,
         remote: &crate::remote::Remote,
         external_payloads: BTreeMap<object::ObjectId, u64>,
@@ -747,44 +889,61 @@ impl Repository {
         remote: &crate::remote::Remote,
         id: &object::ObjectId,
         pack_cache: &mut RemoteObjectPackCache,
-        fetched_objects: &mut BTreeSet<object::ObjectId>,
+        fetched_objects: &mut BTreeSet<(object::ObjectId, GraphRole)>,
+        boundary: &fetch_boundary::FetchBoundary,
+        visited_commits: usize,
     ) -> Result<()> {
-        if fetched_objects.contains(id) {
-            return Ok(());
+        let budget = GraphBudget::new(remote);
+        let mut pending = vec![(id.clone(), GraphRole::Tree)];
+        while let Some((id, role)) = pending.pop() {
+            if boundary.contains(&id, role) || fetched_objects.contains(&(id.clone(), role)) {
+                continue;
+            }
+            budget.admit(visited_commits.saturating_add(fetched_objects.len()), 1)?;
+            fetched_objects.insert((id.clone(), role));
+            let object = match self.object_store().read_raw(&id)? {
+                Some(bytes) => {
+                    let object = object::Object::decode(&bytes)?;
+                    let actual = object::ObjectId::for_bytes(&bytes);
+                    if actual != id {
+                        return Err(RepoErr::Object(object::ObjectErr::ObjectIdMismatch {
+                            expected: id.clone(),
+                            actual,
+                        }));
+                    }
+                    object
+                }
+                None => self.fetch_remote_object(remote, &id, pack_cache)?,
+            };
+            role.validate(&id, &object)?;
+            match object {
+                object::Object::Tree(tree) => {
+                    budget.admit(pending.len(), tree.entries.len())?;
+                    for entry in tree.entries {
+                        pending.push((entry.oid, GraphRole::entry(entry.mode)));
+                    }
+                }
+                object::Object::Blob(object::BlobObject::LargeFilePointer(pointer)) => {
+                    if let Some(maximum) = remote.buffered_read_limit()
+                        && pointer.size <= (maximum / 4).min(4 * 1024 * 1024) as u64
+                        && !self.large_file_content_path(&pointer.content_hash).exists()
+                    {
+                        // This graph walk has already authenticated the pointer
+                        // identity and role. Queue only bounded small payloads;
+                        // no second scan of all local commits/trees is needed.
+                        queue_large_file_payload(
+                            &mut pack_cache.pending_payloads,
+                            pointer.content_hash,
+                            pointer.size,
+                            budget,
+                        )?;
+                    } else {
+                        self.fetch_large_file_content(remote, &pointer.content_hash, pointer.size)?;
+                    }
+                }
+                object::Object::Blob(_) | object::Object::Tag(_) | object::Object::Commit(_) => {}
+            }
         }
-        let object = match self.object_store().read_raw(id)? {
-            Some(bytes) => {
-                let object = object::Object::decode(&bytes)?;
-                let actual = object::ObjectId::for_bytes(&bytes);
-                if actual != *id {
-                    return Err(RepoErr::Object(object::ObjectErr::ObjectIdMismatch {
-                        expected: id.clone(),
-                        actual,
-                    }));
-                }
-                object
-            }
-            None => self.fetch_remote_object(remote, id, pack_cache)?,
-        };
-
-        match object {
-            object::Object::Commit(commit) => {
-                self.fetch_object_graph(remote, &commit.tree, pack_cache, fetched_objects)?;
-                for parent in commit.parents {
-                    self.fetch_object_graph(remote, &parent, pack_cache, fetched_objects)?;
-                }
-            }
-            object::Object::Tree(tree) => {
-                for entry in tree.entries {
-                    self.fetch_object_graph(remote, &entry.oid, pack_cache, fetched_objects)?;
-                }
-            }
-            object::Object::Blob(object::BlobObject::LargeFilePointer(pointer)) => {
-                self.fetch_large_file_content(remote, &pointer.content_hash, pointer.size)?;
-            }
-            object::Object::Blob(_) | object::Object::Tag(_) => {}
-        }
-        fetched_objects.insert(id.clone());
         Ok(())
     }
 
@@ -814,11 +973,42 @@ impl Repository {
         size: u64,
     ) -> Result<()> {
         if self.large_file_content_path(id).exists() {
-            self.read_large_file_content(id, size)?;
+            self.verify_cached_large_file_content(remote, id, size)?;
             return Ok(());
         }
 
         let path = large_file_content_relative_path(id);
+        #[cfg(all(feature = "e2ee", not(target_arch = "wasm32")))]
+        if remote.buffered_read_limit().is_some() {
+            let mut file =
+                block_on_remote(remote.download_encrypted_file(&path))?.ok_or_else(|| {
+                    RepoErr::InvalidRemoteObject {
+                        path: path.clone(),
+                        message: format!("missing external payload {id}"),
+                    }
+                })?;
+            // The transport has checked the full envelope digest. Repository
+            // content identity is BLAKE3 and must also pass before publication.
+            let mut hasher = blake3::Hasher::new();
+            std::io::copy(&mut file, &mut hasher)?;
+            let actual = object::ObjectId::from_str(hasher.finalize().to_hex().as_str())?;
+            if file.metadata()?.len() != size || actual != *id {
+                return Err(RepoErr::InvalidRemoteObject {
+                    path,
+                    message: "external payload size or content identity mismatch".into(),
+                });
+            }
+            use std::io::Seek;
+            file.rewind()?;
+            let target = self.large_file_content_path(id);
+            let parent = target.parent().expect("large-file content has parent");
+            fs::create_dir_all(parent)?;
+            let mut staged = tempfile::NamedTempFile::new_in(parent)?;
+            std::io::copy(&mut file, staged.as_file_mut())?;
+            staged.as_file().sync_all()?;
+            staged.persist(&target).map_err(|error| error.error)?;
+            return Ok(());
+        }
         let bytes = block_on_remote(remote.get_raw(&path))?.ok_or_else(|| {
             RepoErr::InvalidRemoteObject {
                 path: path.clone(),
@@ -831,22 +1021,42 @@ impl Repository {
         Ok(())
     }
 
+    fn verify_cached_large_file_content(
+        &self,
+        remote: &crate::remote::Remote,
+        id: &object::ObjectId,
+        size: u64,
+    ) -> Result<()> {
+        #[cfg(all(feature = "e2ee", unix))]
+        if remote.buffered_read_limit().is_some() {
+            self.verify_encrypted_file_payload(id, size)?;
+            return Ok(());
+        }
+        let _ = remote;
+        self.read_large_file_content(id, size)?;
+        Ok(())
+    }
+
     /// Packs expose file pointers before their payloads are fetched. Download
-    /// small missing payloads concurrently; cap each at 4 MiB so four active
-    /// requests retain at most 16 MiB of payload data on mobile hosts. Larger
+    /// small missing payloads concurrently; four active requests share the
+    /// encrypted host's plaintext budget (or 16 MiB on other hosts). Larger
     /// files and graphs absent from the pack retain the authoritative fallback.
     fn prefetch_local_large_file_contents(
         &self,
         remote: &crate::remote::Remote,
         head: &object::ObjectId,
+        boundary: &fetch_boundary::FetchBoundary,
     ) -> Result<()> {
-        let mut stack = vec![head.clone()];
+        let budget = GraphBudget::new(remote);
+        let mut stack = vec![(head.clone(), GraphRole::Commit)];
         let mut seen = BTreeSet::new();
         let mut payloads = BTreeMap::new();
-        while let Some(id) = stack.pop() {
-            if !seen.insert(id.clone()) {
+        while let Some((id, role)) = stack.pop() {
+            if boundary.contains(&id, role) || seen.contains(&(id.clone(), role)) {
                 continue;
             }
+            budget.admit(seen.len(), 1)?;
+            seen.insert((id.clone(), role));
             let Some(bytes) = self.object_store().read_raw(&id)? else {
                 continue;
             };
@@ -857,16 +1067,28 @@ impl Repository {
                     actual,
                 }));
             }
-            match object::Object::decode(&bytes)? {
+            let value = object::Object::decode(&bytes)?;
+            role.validate(&id, &value)?;
+            match value {
                 object::Object::Commit(commit) => {
-                    stack.push(commit.tree);
-                    stack.extend(commit.parents);
+                    budget.admit(stack.len(), commit.parents.len().saturating_add(1))?;
+                    stack.push((commit.tree, GraphRole::Tree));
+                    stack.extend(commit.parents.into_iter().map(|id| (id, GraphRole::Commit)));
                 }
                 object::Object::Tree(tree) => {
-                    stack.extend(tree.entries.into_iter().map(|entry| entry.oid))
+                    budget.admit(stack.len(), tree.entries.len())?;
+                    stack.extend(
+                        tree.entries
+                            .into_iter()
+                            .map(|entry| (entry.oid, GraphRole::entry(entry.mode))),
+                    );
                 }
                 object::Object::Blob(object::BlobObject::LargeFilePointer(pointer))
-                    if pointer.size <= 4 * 1024 * 1024
+                    if pointer.size
+                        <= remote
+                            .buffered_read_limit()
+                            .map_or(4 * 1024 * 1024, |limit| (limit / 4).min(4 * 1024 * 1024))
+                            as u64
                         && !self.large_file_content_path(&pointer.content_hash).exists() =>
                 {
                     if let Some(previous) =
@@ -882,10 +1104,20 @@ impl Repository {
                 _ => {}
             }
         }
+        self.prefetch_large_file_payloads(remote, payloads)
+    }
+
+    fn prefetch_large_file_payloads(
+        &self,
+        remote: &crate::remote::Remote,
+        payloads: BTreeMap<object::ObjectId, u64>,
+    ) -> Result<()> {
+        cancellation_checkpoint()?;
         block_on_remote(async {
             let result = stream::iter(payloads)
                 .map(Ok::<_, RepoErr>)
                 .try_for_each_concurrent(4, |(id, size)| async move {
+                    cancellation_checkpoint()?;
                     let path = large_file_content_relative_path(&id);
                     let bytes = remote
                         .get_raw_bounded(&path, size as usize)
@@ -895,7 +1127,13 @@ impl Repository {
                             message: format!("missing external payload {id}"),
                         })?;
                     validate_large_file_content(&id, size, &bytes)?;
+                    cancellation_checkpoint()?;
                     self.write_large_file_content(&id, &bytes)?;
+                    drop(bytes);
+                    // Another local writer may have filled the path since it
+                    // was queued. Validate the actual canonical destination,
+                    // including the write-if-already-present case.
+                    self.verify_cached_large_file_content(remote, &id, size)?;
                     Ok(())
                 })
                 .await;
@@ -1028,9 +1266,327 @@ pub(super) struct PreparedObjectPush {
     pub(super) bundle_objects: Vec<crate::remote::RemoteBundleObject>,
 }
 
+fn queue_large_file_payload(
+    payloads: &mut BTreeMap<object::ObjectId, u64>,
+    id: object::ObjectId,
+    size: u64,
+    budget: GraphBudget,
+) -> Result<()> {
+    if let Some(previous) = payloads.get(&id) {
+        if *previous != size {
+            return Err(RepoErr::InvalidRemoteObject {
+                path: id.to_string(),
+                message: "external payload has conflicting sizes".into(),
+            });
+        }
+        return Ok(());
+    }
+    budget.admit(payloads.len(), 1)?;
+    payloads.insert(id, size);
+    Ok(())
+}
+
 #[cfg(test)]
 mod payload_prefetch_tests {
     use super::*;
+
+    #[test]
+    fn small_payload_collection_deduplicates_and_rejects_conflicting_sizes() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = Repository::init(root.path()).unwrap();
+        let remote = RemoteConfig::Fs {
+            root: root.path().to_string_lossy().into_owned(),
+        }
+        .build()
+        .unwrap();
+        let budget = GraphBudget::new(&remote);
+        let id = object::ObjectId::for_bytes(b"synthetic payload");
+        let mut payloads = BTreeMap::new();
+        queue_large_file_payload(&mut payloads, id.clone(), 128 * 1024, budget).unwrap();
+        queue_large_file_payload(&mut payloads, id.clone(), 128 * 1024, budget).unwrap();
+        assert_eq!(payloads.len(), 1);
+        assert!(
+            queue_large_file_payload(&mut payloads, id.clone(), 128 * 1024 + 1, budget).is_err()
+        );
+        assert_eq!(payloads[&id], 128 * 1024);
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert!(matches!(
+            with_cancellation(&cancelled, || repo
+                .prefetch_large_file_payloads(&remote, payloads)),
+            Err(RepoErr::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn small_payload_download_rejects_a_corrupt_existing_destination() {
+        let directory = tempfile::tempdir().unwrap();
+        let remote_directory = tempfile::tempdir().unwrap();
+        let repo = Repository::init(directory.path()).unwrap();
+        let remote = RemoteConfig::Fs {
+            root: remote_directory.path().to_string_lossy().into_owned(),
+        }
+        .build()
+        .unwrap();
+        let body = vec![7_u8; 128 * 1024];
+        let id = object::ObjectId::for_bytes(&body);
+        let path = remote_directory
+            .path()
+            .join(large_file_content_relative_path(&id));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, &body).unwrap();
+        let pending = BTreeMap::from([(id.clone(), body.len() as u64)]);
+        let cached = repo.large_file_content_path(&id);
+        fs::create_dir_all(cached.parent().unwrap()).unwrap();
+        fs::write(&cached, vec![8_u8; body.len()]).unwrap();
+        assert!(
+            repo.prefetch_large_file_payloads(&remote, pending.clone())
+                .is_err()
+        );
+        assert_eq!(fs::read(&cached).unwrap(), vec![8_u8; body.len()]);
+        fs::write(&cached, &body[..body.len() - 1]).unwrap();
+        assert!(
+            repo.prefetch_large_file_payloads(&remote, pending.clone())
+                .is_err()
+        );
+        assert_eq!(fs::metadata(&cached).unwrap().len(), body.len() as u64 - 1);
+        fs::write(&cached, &body).unwrap();
+        repo.prefetch_large_file_payloads(&remote, pending).unwrap();
+        assert_eq!(fs::read(&cached).unwrap(), body);
+    }
+
+    fn buffered_pack_fixture(
+        objects: Vec<(object::ObjectId, Vec<u8>)>,
+    ) -> (String, Vec<u8>, RemoteObjectPackCache) {
+        let mut bytes = REMOTE_OBJECT_PACK_MAGIC.to_vec();
+        let mut entries = Vec::new();
+        for (id, body) in objects {
+            entries.push(RemoteObjectPackEntry {
+                id,
+                offset: bytes.len() as u64,
+                len: body.len() as u64,
+            });
+            bytes.extend_from_slice(&body);
+        }
+        let path = format!("{DIR_OBJECTS_PACK}/{}.pack", blake3::hash(&bytes).to_hex());
+        let cache = RemoteObjectPackCache {
+            indexes: Some(vec![RemoteObjectPackIndex {
+                version: 1,
+                pack: path.clone(),
+                objects: entries,
+                commits: vec![],
+            }]),
+            ..RemoteObjectPackCache::default()
+        };
+        (path, bytes, cache)
+    }
+
+    #[test]
+    fn buffered_pack_import_counts_only_reached_commits_and_checks_their_closure() {
+        let local = tempfile::tempdir().unwrap();
+        let remote_dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(local.path()).unwrap();
+        repo.remote_add(
+            "origin",
+            RemoteConfig::Fs {
+                root: remote_dir.path().to_string_lossy().into_owned(),
+            },
+        )
+        .unwrap();
+        let tree = object::Object::Tree(object::TreeObject::new(vec![]).unwrap());
+        let tree_id = object::ObjectId::for_bytes(&tree.canonical_bytes());
+        let signature = object::Signature::new("Test", "test@example.invalid", 1, "+0000");
+        let commit = |tree, message: &str| {
+            object::Object::Commit(object::CommitObject {
+                tree,
+                parents: vec![],
+                author: signature.clone(),
+                committer: signature.clone(),
+                repo_format_version: 1,
+                tables: vec![],
+                path_changes: None,
+                message: message.into(),
+            })
+        };
+        let main = commit(tree_id.clone(), "reachable");
+        let other = commit(
+            object::ObjectId::for_bytes(b"missing tree"),
+            "unrelated branch",
+        );
+        let main_id = object::ObjectId::for_bytes(&main.canonical_bytes());
+        let other_id = object::ObjectId::for_bytes(&other.canonical_bytes());
+        let (pack, bytes, mut cache) = buffered_pack_fixture(vec![
+            (tree_id, tree.canonical_bytes()),
+            (main_id.clone(), main.canonical_bytes()),
+            (other_id.clone(), other.canonical_bytes()),
+        ]);
+        // Multiple admitted indexes may place entries in this same pack. All
+        // portions must be imported before marking that pack as complete.
+        let indexes = cache.indexes.as_mut().unwrap();
+        let second = RemoteObjectPackIndex {
+            version: 1,
+            pack: pack.clone(),
+            objects: indexes[0].objects.split_off(1),
+            commits: vec![],
+        };
+        indexes.push(second);
+        repo.import_buffered_remote_pack(&pack, &bytes, &mut cache)
+            .unwrap();
+        assert_eq!(cache.imported_commits.len(), 2);
+        let remote = repo.remote_store("origin").unwrap();
+        let boundary = fetch_boundary::FetchBoundary::default();
+        assert_eq!(
+            repo.fetch_commit_chain_cached(&remote, main_id.as_str(), &boundary, &mut cache)
+                .unwrap(),
+            (1, BTreeSet::from([main_id.to_string()]))
+        );
+        assert!(cache.imported_commits.contains(&other_id));
+        assert!(
+            repo.fetch_commit_chain_cached(&remote, other_id.as_str(), &boundary, &mut cache)
+                .is_err()
+        );
+        assert_eq!(repo.remote_tracking_ref("origin", "main").unwrap(), None);
+    }
+
+    #[test]
+    fn buffered_pack_import_rejects_malformed_objects_and_wrong_placements() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = Repository::init(directory.path()).unwrap();
+        let malformed = b"not a canonical object".to_vec();
+        let (path, bytes, mut cache) =
+            buffered_pack_fixture(vec![(object::ObjectId::for_bytes(&malformed), malformed)]);
+        assert!(
+            repo.import_buffered_remote_pack(&path, &bytes, &mut cache)
+                .is_err()
+        );
+        assert!(cache.imported_packs.is_empty());
+        let tree = object::Object::Tree(object::TreeObject::new(vec![]).unwrap()).canonical_bytes();
+        let (path, bytes, mut cache) = buffered_pack_fixture(vec![(
+            object::ObjectId::for_bytes(b"different object"),
+            tree,
+        )]);
+        assert!(matches!(
+            repo.import_buffered_remote_pack(&path, &bytes, &mut cache),
+            Err(RepoErr::Object(object::ObjectErr::ObjectIdMismatch { .. }))
+        ));
+        cache.indexes.as_mut().unwrap()[0].objects[0].offset = u64::MAX;
+        assert!(matches!(
+            repo.import_buffered_remote_pack(&path, &bytes, &mut cache),
+            Err(RepoErr::InvalidRemoteObject { .. })
+        ));
+        assert!(cache.imported_packs.is_empty());
+    }
+
+    #[test]
+    fn buffered_pack_extent_keeps_larger_fragment_for_prefetch_admission() {
+        let tree = object::Object::Tree(object::TreeObject::new(vec![]).unwrap()).canonical_bytes();
+        let (path, _, mut cache) =
+            buffered_pack_fixture(vec![(object::ObjectId::for_bytes(&tree), tree)]);
+        let indexes = cache.indexes.as_mut().unwrap();
+        let mut smaller = indexes[0].clone();
+        indexes[0].objects[0].len = 8 * 1024 * 1024;
+        smaller.objects[0].len = 128;
+        indexes.push(smaller);
+        assert_eq!(
+            remote_object_pack_extents(indexes)[path.as_str()],
+            REMOTE_OBJECT_PACK_MAGIC.len() as u64 + 8 * 1024 * 1024
+        );
+        indexes.reverse();
+        assert_eq!(
+            remote_object_pack_extents(indexes)[path.as_str()],
+            REMOTE_OBJECT_PACK_MAGIC.len() as u64 + 8 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn completed_graph_boundary_never_reuses_an_object_in_a_different_role() {
+        let directory = tempfile::tempdir().unwrap();
+        let remote_directory = tempfile::tempdir().unwrap();
+        let repo = Repository::init(directory.path()).unwrap();
+        repo.remote_add(
+            "origin",
+            RemoteConfig::Fs {
+                root: remote_directory.path().to_string_lossy().into_owned(),
+            },
+        )
+        .unwrap();
+        let path = directory.path().join("file.txt");
+        fs::write(&path, b"verified file").unwrap();
+        repo.stage_artifact_path(&path).unwrap();
+        let first = repo.commit_staged("verified").unwrap();
+        let mut commit = repo
+            .read_commit_object(&first.id.parse().unwrap())
+            .unwrap()
+            .unwrap();
+        let object::Object::Tree(tree) = repo.object_store().read(&commit.tree).unwrap() else {
+            panic!("tree")
+        };
+        let file = tree.entries[0].oid.clone();
+        let boundary = fetch_boundary::FetchBoundary::from_objects(BTreeMap::from([
+            (first.id.parse().unwrap(), GraphRole::Commit),
+            (commit.tree.clone(), GraphRole::Tree),
+            (file.clone(), GraphRole::File),
+        ]));
+        let remote = repo.remote_store("origin").unwrap();
+        commit.parents = vec![file.clone()];
+        let invalid_parent = repo
+            .object_store()
+            .write(&object::Object::Commit(commit.clone()))
+            .unwrap();
+        for prepare in [false, true] {
+            let result = if prepare {
+                repo.fetch_graph_metadata(&remote, &invalid_parent.to_string(), &boundary)
+                    .map(|_| ())
+            } else {
+                repo.fetch_commit_chain_with_boundary(
+                    &remote,
+                    &invalid_parent.to_string(),
+                    &boundary,
+                )
+                .map(|_| ())
+            };
+            assert!(
+                result.is_err(),
+                "cached file must not satisfy a commit parent"
+            );
+        }
+        assert!(
+            repo.fetched_commit_ancestors(&invalid_parent.to_string(), &boundary)
+                .is_err()
+        );
+        commit.parents = vec![first.id.parse().unwrap()];
+        commit.tree = file;
+        let invalid_tree = repo
+            .object_store()
+            .write(&object::Object::Commit(commit.clone()))
+            .unwrap();
+        assert!(
+            repo.fetch_graph_metadata(&remote, &invalid_tree.to_string(), &boundary)
+                .is_err()
+        );
+        assert!(
+            repo.fetch_commit_chain_with_boundary(&remote, &invalid_tree.to_string(), &boundary)
+                .is_err()
+        );
+        let mut invalid_tree = tree;
+        invalid_tree.entries[0].mode = object::TreeEntryMode::SqliteDatabase;
+        commit.tree = repo
+            .object_store()
+            .write(&object::Object::Tree(invalid_tree))
+            .unwrap();
+        let invalid_mode = repo
+            .object_store()
+            .write(&object::Object::Commit(commit))
+            .unwrap();
+        assert!(
+            repo.fetch_graph_metadata(&remote, &invalid_mode.to_string(), &boundary)
+                .is_err()
+        );
+        assert!(
+            repo.fetch_commit_chain_with_boundary(&remote, &invalid_mode.to_string(), &boundary)
+                .is_err()
+        );
+    }
 
     #[test]
     fn prepared_fetch_plans_deduplicated_payloads_before_download_and_keeps_refs_on_failure() {
@@ -1143,8 +1699,12 @@ mod payload_prefetch_tests {
         }
         let remote = repo.remote_store("origin").unwrap();
         let head = object::ObjectId::from_str(&head.id).unwrap();
-        repo.prefetch_local_large_file_contents(&remote, &head)
-            .unwrap();
+        repo.prefetch_local_large_file_contents(
+            &remote,
+            &head,
+            &fetch_boundary::FetchBoundary::default(),
+        )
+        .unwrap();
         for id in &payloads {
             let remote_path = remote_root
                 .path()
@@ -1158,14 +1718,22 @@ mod payload_prefetch_tests {
                 fs::remove_file(repo.large_file_content_path(id)).unwrap();
                 fs::write(&remote_path, vec![8u8; 1024]).unwrap();
                 assert!(
-                    repo.prefetch_local_large_file_contents(&remote, &head)
-                        .is_err()
+                    repo.prefetch_local_large_file_contents(
+                        &remote,
+                        &head,
+                        &fetch_boundary::FetchBoundary::default()
+                    )
+                    .is_err()
                 );
                 assert!(!repo.large_file_content_path(id).exists());
                 fs::write(&remote_path, vec![7u8; 2048]).unwrap();
                 assert!(
-                    repo.prefetch_local_large_file_contents(&remote, &head)
-                        .is_err()
+                    repo.prefetch_local_large_file_contents(
+                        &remote,
+                        &head,
+                        &fetch_boundary::FetchBoundary::default()
+                    )
+                    .is_err()
                 );
                 assert!(!repo.large_file_content_path(id).exists());
             }

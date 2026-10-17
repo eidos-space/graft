@@ -439,6 +439,41 @@ impl Runtime {
             .read_write()
             .cache_commit_hash(log, lsn, hash)?)
     }
+
+    /// Recompute a storage commit identity from actual local pages without trusting
+    /// or updating its cached hash. Missing pages fail even when metadata has a hash.
+    #[cfg(feature = "e2ee")]
+    pub fn recompute_commit_hash(&self, log: &LogId, lsn: LSN) -> Result<Option<CommitHash>> {
+        let reader = self.storage().read();
+        let Some(commit) = reader.get_commit(log, lsn)? else {
+            return Ok(None);
+        };
+        let segment = commit.segment_idx();
+        let mut builder = CommitHashBuilder::new(
+            commit.log.clone(),
+            commit.lsn,
+            commit.page_count,
+            segment.map_or(PageCount::ZERO, |index| index.page_count()),
+        );
+        let cancellation = crate::repo::active_cancellation_token();
+        if let Some(segment) = segment {
+            for pageidx in segment.pageset.iter() {
+                if cancellation
+                    .as_ref()
+                    .is_some_and(|token| token.is_cancelled())
+                {
+                    return Err(LogicalErr::Cancelled.into());
+                }
+                let page = reader
+                    .read_page(segment.sid.clone(), pageidx)?
+                    .ok_or_else(|| {
+                        LogicalErr::Other("storage commit references missing local page".into())
+                    })?;
+                builder.write_page(pageidx, &page);
+            }
+        }
+        Ok(Some(builder.build()))
+    }
 }
 
 // snapshot methods
@@ -823,6 +858,62 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "e2ee", unix))]
+    fn prepared_snapshot_push_inherits_secret_cancellation_in_worker_loops() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let tokio_rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let remote = Arc::new(RemoteConfig::Memory.build().unwrap());
+        let storage = Arc::new(FjallStorage::open_temporary().unwrap());
+        let runtime = Runtime::new(tokio_rt.handle().clone(), remote.clone(), storage, None);
+        let vid = runtime.volume_open(None, None, None).unwrap().vid;
+        let mut writer = runtime.volume_writer(vid.clone()).unwrap();
+        for page in 1..=64 {
+            writer
+                .write_page(PageIdx::must_new(page), Page::test_filled(57))
+                .unwrap();
+        }
+        writer.commit().unwrap();
+        let snapshot = runtime.volume_snapshot(&vid).unwrap();
+        let owner = std::thread::current().id();
+        // Zero cancels collection; sixteen reaches the page-building loop.
+        for threshold in [0, 16] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed = calls.clone();
+            let result = crate::repo::with_secret_cancellation(
+                Arc::new(move || {
+                    std::thread::current().id() != owner
+                        && observed.fetch_add(1, Ordering::SeqCst) >= threshold
+                }),
+                || runtime.snapshots_prepare_push_to(vec![snapshot.clone()], remote.clone()),
+            );
+            assert!(matches!(
+                result,
+                Err(crate::GraftErr::Logical(crate::LogicalErr::Cancelled))
+            ));
+            assert_eq!(calls.load(Ordering::SeqCst), threshold + 1);
+            assert!(crate::repo::active_secret_cancellation_probe().is_none());
+            assert!(
+                tokio_rt
+                    .block_on(async {
+                        tokio::task::spawn_blocking(|| {
+                            crate::repo::active_secret_cancellation_probe().is_none()
+                        })
+                        .await
+                    })
+                    .unwrap()
+            );
+            runtime
+                .snapshots_prepare_push_to(vec![snapshot.clone()], remote.clone())
+                .unwrap();
+        }
+    }
+
+    #[test]
     fn prepared_snapshot_push_observes_repository_cancellation() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
@@ -1026,7 +1117,24 @@ mod tests {
         assert_eq!(persisted.commit_hash(), Some(&hash));
 
         let segment = persisted.segment_idx().unwrap();
+        #[cfg(feature = "e2ee")]
+        {
+            assert_eq!(
+                runtime.recompute_commit_hash(log, lsn).unwrap(),
+                Some(hash.clone())
+            );
+            storage
+                .write_page(segment.sid.clone(), pageidx, Page::test_filled(9))
+                .unwrap();
+            assert_ne!(
+                runtime.recompute_commit_hash(log, lsn).unwrap(),
+                Some(hash.clone())
+            );
+            assert_eq!(runtime.commit_hash(log, lsn).unwrap(), Some(hash.clone()));
+        }
         storage.remove_page(segment.sid.clone(), pageidx).unwrap();
+        #[cfg(feature = "e2ee")]
+        assert!(runtime.recompute_commit_hash(log, lsn).is_err());
         assert_eq!(runtime.commit_hash(log, lsn).unwrap(), Some(hash));
     }
 

@@ -11,7 +11,10 @@ on:
       - "crates/graft-sdk-node/**"
       - "crates/graft-sqlite/**"
       - "crates/graft/**"
+      - "crates/graft-native-crypto/**"
       - "packages/graft-sdk/**"
+      - "tests/e2ee/**"
+      - "packages/graft-remote/**"
   push:
     tags:
       - "graft-sdk-v*"
@@ -102,18 +105,23 @@ jobs:
           - runner: macos-15
             target: aarch64-apple-darwin
             suffix: darwin-arm64
+            native-profile: macos-keychain
           - runner: macos-15-intel
             target: x86_64-apple-darwin
             suffix: darwin-x64
+            native-profile: macos-keychain
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             suffix: linux-arm64-gnu
+            native-profile: e2ee
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             suffix: linux-x64-gnu
+            native-profile: e2ee
           - runner: windows-2022
             target: x86_64-pc-windows-msvc
             suffix: win32-x64-msvc
+            native-profile: e2ee
     defaults:
       run:
         shell: bash
@@ -147,7 +155,7 @@ jobs:
           key: graft-sdk-${{ matrix.target }}
 
       - name: Build Node-API addon
-        run: packages/graft-sdk/scripts/build-native.sh "${{ matrix.target }}" "$PWD/sdk-artifact"
+        run: packages/graft-sdk/scripts/build-native.sh "${{ matrix.target }}" "$PWD/sdk-artifact" "${{ matrix.native-profile }}"
 
       - name: Upload addon
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -206,9 +214,80 @@ jobs:
           GRAFT_SDK_NATIVE_PATH: ${{ github.workspace }}/sdk-artifact/graft-sdk.${{ matrix.settings.suffix }}.node
         run: node --test packages/graft-sdk/test/*.test.js
 
+      - name: Require native E2EE release profile
+        env:
+          GRAFT_SDK_NATIVE_PATH: ${{ github.workspace }}/sdk-artifact/graft-sdk.${{ matrix.settings.suffix }}.node
+        run: node packages/graft-sdk/scripts/verify-e2ee-native.cjs
+
+  test-encrypted:
+    name: Encrypted sync and migration on ${{ matrix.suffix }}
+    needs: [metadata, build]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            suffix: darwin-arm64
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            suffix: darwin-x64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            suffix: linux-arm64-gnu
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            suffix: linux-x64-gnu
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - uses: pnpm/action-setup@41ff72655975bd51cab0327fa583b6e92b6d3061 # v4.2.0
+        with:
+          version: 10.14.0
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          key: graft-sdk-encrypted-${{ matrix.target }}
+      - name: Install Linux native dependencies
+        if: startsWith(matrix.runner, 'ubuntu')
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev build-essential
+      - name: Configure macOS libclang
+        if: startsWith(matrix.runner, 'macos')
+        run: |
+          brew install llvm
+          echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
+      - name: Build the protocol test service
+        run: pnpm install --frozen-lockfile && pnpm --filter @eidos.space/graft-remote build
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: graft-sdk-${{ matrix.target }}
+          path: sdk-artifact
+      - name: Test release addon against the actual encrypted protocol service
+        env:
+          GRAFT_E2EE_NODE_TEST_BINDING: ${{ github.workspace }}/sdk-artifact/graft-sdk.${{ matrix.suffix }}.node
+        run: cargo test -p graft-sdk --features e2ee --test e2ee_node --locked -- --ignored --test-threads=1
+
+      - name: Retain synthetic privacy evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: e2ee-privacy-sdk-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/e2ee-privacy-evidence
+          if-no-files-found: warn
+          retention-days: 14
+
   package:
     name: Verify npm package assembly
-    needs: [metadata, test]
+    needs: [metadata, test, test-encrypted]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -248,7 +327,7 @@ jobs:
 
   publish:
     name: Publish npm packages and GitHub release
-    needs: [metadata, test, package]
+    needs: [metadata, test, test-encrypted, package]
     if: needs.metadata.outputs.is_release == 'true'
     runs-on: ubuntu-24.04
     environment: npm
@@ -351,6 +430,9 @@ jobs:
       run:
         shell: bash
     steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
       - name: Setup Node.js
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
@@ -366,6 +448,7 @@ jobs:
           cd "$fixture"
           npm init -y >/dev/null
           npm install --ignore-scripts "@eidos.space/graft@${SDK_VERSION}"
+          node "$GITHUB_WORKSPACE/packages/graft-sdk/scripts/verify-e2ee-native.cjs" "$fixture/node_modules/@eidos.space/graft"
           node - <<'NODE'
           const fs = require('node:fs/promises')
           const os = require('node:os')

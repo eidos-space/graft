@@ -160,9 +160,10 @@ pub(crate) struct RepoExportSpec {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RepoCloneSpec {
-    pub(super) config: RemoteConfig,
-    pub(super) branch: Option<String>,
-    pub(super) worktree: Option<PathBuf>,
+    pub(crate) remote_name: String,
+    pub(crate) config: RemoteConfig,
+    pub(crate) branch: Option<String>,
+    pub(crate) worktree: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

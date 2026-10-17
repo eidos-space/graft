@@ -1,8 +1,5 @@
 import { GraftProtocolError, createGraftRemote } from "@eidos.space/graft-remote-hono";
-import {
-  CloudflareRepositoryBackend,
-  requireBearerToken,
-} from "@eidos.space/graft-remote-cloudflare";
+import { openCloudflareRepository, requireBearerToken } from "@eidos.space/graft-remote-cloudflare";
 
 export { RepositoryDurableObject } from "@eidos.space/graft-remote-cloudflare";
 
@@ -22,7 +19,7 @@ const app = createGraftRemote<AppEnv>({
     return undefined;
   },
   backend({ adapterContext, repository }) {
-    return new CloudflareRepositoryBackend(
+    return openCloudflareRepository(
       {
         objects: adapterContext.env.OBJECTS,
         repositories: adapterContext.env.REPOSITORIES,

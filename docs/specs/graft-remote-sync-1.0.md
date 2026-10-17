@@ -13,6 +13,11 @@ refspecs, and repository `fetch`, `push`, `pull`, and `clone`. Its purpose is to
 make remote synchronization safe across the filesystem, S3-compatible, HTTP,
 native SDK, and browser-capable implementations.
 
+[Graft E2EE Remote 1.0](./graft-e2ee-remote-1.0.md) defines a separate,
+opt-in native encrypted profile with opaque routing hints. Its encodings and
+aggregate endpoints apply only after explicit profile negotiation; they do not
+change this specification's current plain protocol or imply E2EE support.
+
 ## 1. Scope and layering
 
 Remote synchronization transports three distinct classes of state:
@@ -56,6 +61,23 @@ credentials and reject URL-carried credential selectors.
 Remote names, branch names, and refspec destinations MUST pass repository ref
 validation. Configuring a remote is local-only and does not contact it unless
 the adapter explicitly offers validation.
+
+The optional [E2EE Remote 1.0](./graft-e2ee-remote-1.0.md) profile persists
+`type = "encrypted_http"`, the credential-free `url` and canonical UUIDv4 `uuid`.
+This variant fixes `encrypted-remote-v1` and Suite 1; it MUST NOT construct a
+plaintext backend. Missing native support or an explicitly registered session
+MUST fail before data requests. Native session registration binds the remote
+name, normalized complete endpoint and UUID. Secrets and private staging paths
+MUST remain outside repository configuration. Registering an account/root session
+is an explicit trusted-host action, not evidence that the host's enrollment,
+secure storage or recovery workflow conforms to E2EE Remote 1.0.
+
+While a session is registered, generic bearer replacement/clearing MUST reject
+unverified account changes. A trusted native host MAY refresh a token after
+authenticating the unchanged domain and account subject and matching both exact
+session bindings. Such refresh MUST NOT require rewrapping or relocking the root.
+An account change MUST drain/disconnect the old session before replacing its
+credentials. Bearer-token contents alone are not authenticated identity evidence.
 
 ## 3. Credentials and transport policy
 
@@ -378,7 +400,16 @@ performs hydration or payload fetch.
 
 Push validates local source and observed remote destination. It rejects a
 non-fast-forward update unless explicitly forced. If the remote already names
-the same commit, it succeeds without unnecessary publication.
+the same commit, it skips immutable-data and branch-ref publication while
+completing the required default-HEAD step below.
+
+For the repository's configured default branch, an up-to-date push MUST still
+complete create-if-absent of the remote symbolic HEAD. This repairs a previous
+branch publication whose subsequent HEAD creation failed. It MUST NOT overwrite
+an existing HEAD, republish immutable dependencies or mutate the up-to-date
+branch ref. A non-default branch does not initialize HEAD. Failure to confirm
+the required HEAD step leaves that push incomplete and MUST NOT advance its
+remote-tracking ref. Existing tracking state is retained.
 
 Publication order is:
 
@@ -390,6 +421,16 @@ Thus a failed ref CAS may leave unreachable immutable objects but cannot expose
 an incomplete commit. Branch deletion uses CAD against expected bytes. Safe
 deletion MUST reject a mismatch with known remote-tracking state unless force
 policy explicitly allows a freshly observed expected value.
+
+Native observed-head APIs carry the exact read-time ref state together with its
+remote instance, branch, local repository and remote configuration binding.
+They MUST reject a different binding before publishing dependency objects.
+Cloning the remote preserves its observation identity; reconstructing another
+remote does not transfer a handle. Observations are not serialized or reconstructed
+from a target commit. Native observed ref reads are bounded to 16 KiB. This API
+binding does not prove freshness after the read; final publication still requires
+exact expected-state CAS/CAD. Encrypted observations additionally obey the
+session and ciphertext rules in the E2EE specification.
 
 ### 10.3 Pull
 

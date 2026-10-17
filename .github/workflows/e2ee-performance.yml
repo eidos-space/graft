@@ -1,0 +1,184 @@
+name: E2EE Performance
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: ["main"]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**"
+      - "vendor/**"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - "packages/graft-remote/**"
+      - "tests/e2ee/**"
+      - "scripts/e2ee-load-benchmark.py"
+      - "scripts/e2ee-performance-*"
+      - ".github/workflows/e2ee-performance.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2ee-performance-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  paired:
+    name: Clean Linux paired E2EE loads
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_BUILD_JOBS: 2
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_RELEASE_DEBUG: 0
+      PYTHONDONTWRITEBYTECODE: 1
+      RUST_BACKTRACE: 1
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout exact candidate
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Keep build output and evidence outside the checkout
+        run: |
+          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/graft-e2ee-performance-target" >> "$GITHUB_ENV"
+          echo "EVIDENCE_DIR=$RUNNER_TEMP/graft-e2ee-performance-evidence" >> "$GITHUB_ENV"
+          # systemd-tmpfiles also locks directories while scanning /tmp. Keep
+          # every paired fixture under the same private workspace temp root.
+          install -d -m 700 "$RUNNER_TEMP/graft-e2ee-fixtures"
+          echo "TMPDIR=$RUNNER_TEMP/graft-e2ee-fixtures" >> "$GITHUB_ENV"
+
+      - name: System dependencies
+        uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1
+        with:
+          packages: clang libclang-dev llvm libncurses-dev build-essential libreadline-dev strace
+          version: 1.0
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: "1.91"
+
+      - name: pnpm
+        uses: pnpm/action-setup@41ff72655975bd51cab0327fa583b6e92b6d3061 # v4.2.0
+
+      - name: Node.js
+        uses: actions/setup-node@395ad3262231945c25e8478fd5baf05154b1d79f # v6
+        with:
+          node-version: "24"
+
+      - name: Validate evidence collector and capture source
+        run: |
+          python3 scripts/e2ee-performance-policy.test.py
+          python3 scripts/e2ee-performance-evidence.test.py
+          python3 scripts/e2ee-performance-diagnose.test.py
+          python3 scripts/e2ee-performance-evidence.py source --output "$EVIDENCE_DIR"
+          python3 - <<'PY'
+          import json, os, pathlib, stat, subprocess, tempfile
+          root = pathlib.Path(tempfile.gettempdir()).resolve()
+          assert root == pathlib.Path(os.environ["TMPDIR"]).resolve()
+          assert stat.S_IMODE(root.stat().st_mode) == 0o700
+          def identity(path):
+              metadata = path.stat()
+              return {"path": str(path), "device": metadata.st_dev, "inode": metadata.st_ino,
+                      "mode": oct(stat.S_IMODE(metadata.st_mode)),
+                      "mount": json.loads(subprocess.check_output(["findmnt", "--json", "--target", str(path)]))}
+          evidence = {"fixtures": identity(root), "system_tmp": identity(pathlib.Path("/tmp")),
+                      "scope": "All six groups and rounds share this private TMPDIR. Earlier /tmp runs are retained separately; timings across these environments are not a controlled comparison."}
+          (pathlib.Path(os.environ["EVIDENCE_DIR"]) / "fixture-environment.json").write_text(json.dumps(evidence, indent=2) + "\n")
+          PY
+
+      # No Rust build cache: the binaries and Remote service are built from the
+      # recorded clean checkout before any measured process starts.
+      - name: Build release examples and loopback Remote
+        id: build
+        run: |
+          pnpm install --frozen-lockfile 2>&1 | tee "$EVIDENCE_DIR/install.log"
+          pnpm --filter @eidos.space/graft-remote build 2>&1 | tee "$EVIDENCE_DIR/remote-build.log"
+          cargo build --release --locked -p graft --features native-crypto \
+            --example e2ee_load_benchmark 2>&1 | tee "$EVIDENCE_DIR/core-build.log"
+          cargo build --release --locked -p graft-sdk --features native-crypto,bundled-sqlite \
+            --example e2ee_sync_benchmark --example e2ee_sqlite_hydration_benchmark \
+            2>&1 | tee "$EVIDENCE_DIR/sdk-build.log"
+          python3 scripts/e2ee-performance-evidence.py binaries --output "$EVIDENCE_DIR" \
+            --target "$CARGO_TARGET_DIR"
+
+      # Each group runs exactly once, serially, with the recorded versioned
+      # policy. A failed budget must not discard evidence or skip later groups.
+      - name: Core plain first (3 rounds)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          python3 scripts/e2ee-load-benchmark.py \
+            --binary "$CARGO_TARGET_DIR/release/examples/e2ee_load_benchmark" \
+            --output "$EVIDENCE_DIR/core-plain-first" --rounds 3 --order plain-first \
+            2>&1 | tee "$EVIDENCE_DIR/core-plain-first.log"
+
+      - name: Core encrypted first (3 rounds)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          python3 scripts/e2ee-load-benchmark.py \
+            --binary "$CARGO_TARGET_DIR/release/examples/e2ee_load_benchmark" \
+            --output "$EVIDENCE_DIR/core-encrypted-first" --rounds 3 --order encrypted-first \
+            2>&1 | tee "$EVIDENCE_DIR/core-encrypted-first.log"
+
+      - name: SDK plain first (5 rounds)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          python3 scripts/e2ee-load-benchmark.py --paired \
+            --binary "$CARGO_TARGET_DIR/release/examples/e2ee_sync_benchmark" \
+            --output "$EVIDENCE_DIR/sdk-plain-first" --rounds 5 --order plain-first \
+            2>&1 | tee "$EVIDENCE_DIR/sdk-plain-first.log"
+
+      - name: SDK encrypted first (5 rounds)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          python3 scripts/e2ee-load-benchmark.py --paired \
+            --binary "$CARGO_TARGET_DIR/release/examples/e2ee_sync_benchmark" \
+            --output "$EVIDENCE_DIR/sdk-encrypted-first" --rounds 5 --order encrypted-first \
+            2>&1 | tee "$EVIDENCE_DIR/sdk-encrypted-first.log"
+
+      - name: SQLite hydration plain first (5 rounds)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          python3 scripts/e2ee-load-benchmark.py --paired \
+            --binary "$CARGO_TARGET_DIR/release/examples/e2ee_sqlite_hydration_benchmark" \
+            --output "$EVIDENCE_DIR/hydration-plain-first" --rounds 5 --order plain-first \
+            2>&1 | tee "$EVIDENCE_DIR/hydration-plain-first.log"
+
+      - name: SQLite hydration encrypted first (5 rounds)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          python3 scripts/e2ee-load-benchmark.py --paired \
+            --binary "$CARGO_TARGET_DIR/release/examples/e2ee_sqlite_hydration_benchmark" \
+            --output "$EVIDENCE_DIR/hydration-encrypted-first" --rounds 5 --order encrypted-first \
+            2>&1 | tee "$EVIDENCE_DIR/hydration-encrypted-first.log"
+
+      # Finish every measured group before tracing any failed native case.
+      # Replay results live only under diagnostics and never replace samples.
+      - name: Diagnose failed native core processes
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 35
+        run: |
+          python3 scripts/e2ee-performance-diagnose.py --output "$EVIDENCE_DIR" \
+            --binary "$CARGO_TARGET_DIR/release/examples/e2ee_load_benchmark"
+
+      - name: Verify complete evidence and declared policy
+        if: always()
+        run: python3 scripts/e2ee-performance-evidence.py finalize --output "$EVIDENCE_DIR"
+
+      - name: Retain all performance evidence, including failures
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: e2ee-performance-${{ github.event.pull_request.head.sha || github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.EVIDENCE_DIR }}
+          if-no-files-found: error
+          retention-days: 30

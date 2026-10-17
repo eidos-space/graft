@@ -1,0 +1,16 @@
+{
+  "id": "graft-e2ee-performance-policy-v2",
+  "scope": "Same-host paired native regression gates, not a production latency SLA",
+  "core_bulk_wall_ms": {
+    "operations": [
+      "initial_push",
+      "cold_clone_sync",
+      "long_offline_push",
+      "long_offline_fetch"
+    ],
+    "plain_multiplier": 3,
+    "p50_fixed_allowance_ms": 500,
+    "p95_fixed_allowance_ms": 750
+  },
+  "revision": "Add core bulk P50 gates and raise only their P95 fixed allowance from 500 to 750 ms. Other gates and sample counts are unchanged. Historical results retain their original policy and outcome."
+}

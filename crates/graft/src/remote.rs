@@ -35,7 +35,11 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
+#[cfg(feature = "e2ee")]
+mod encrypted;
 pub mod segment;
+#[cfg(feature = "e2ee")]
+pub use encrypted::EncryptedTransferBudget;
 
 const REMOTE_CONCURRENCY: usize = 5;
 const GRAFT_PROTOCOL_HEADER: &str = "Graft-Protocol";
@@ -86,6 +90,20 @@ impl RemotePath<'_> {
 
 #[derive(Error, Debug)]
 pub enum RemoteErr {
+    #[error("encrypted HTTP remotes require the native e2ee feature")]
+    EncryptedRemoteUnavailable,
+    #[cfg(feature = "e2ee")]
+    #[error(transparent)]
+    Encryption(#[from] crate::e2ee::EncryptedHttpError),
+    #[cfg(feature = "e2ee")]
+    #[error("encrypted publication outcome could not be confirmed")]
+    EncryptedOutcomeUnknown {
+        #[source]
+        source: Option<crate::e2ee::EncryptedHttpError>,
+    },
+    #[cfg(feature = "e2ee")]
+    #[error("encrypted publication was not confirmed; retry of the fixed candidate is safe")]
+    EncryptedPublicationUnconfirmed,
     #[error("Object store error: {0}")]
     ObjectStore(#[from] opendal::Error),
 
@@ -146,6 +164,13 @@ pub enum RemoteErr {
     CompareAndSwap { path: String },
 }
 
+#[cfg(feature = "e2ee")]
+impl From<crate::e2ee::EncryptionError> for RemoteErr {
+    fn from(error: crate::e2ee::EncryptionError) -> Self {
+        Self::Encryption(error.into())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HttpTransportErrorKind {
     Timeout,
@@ -169,6 +194,10 @@ impl fmt::Display for HttpTransportErrorKind {
 
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
 pub enum RemoteCredentialErr {
+    #[error("disconnect the encrypted session before changing its account credentials")]
+    EncryptedSessionActive,
+    #[error("encrypted session account binding does not match the authenticated credential")]
+    EncryptedSessionBindingMismatch,
     #[error("remote credential name must be a non-empty repository remote name")]
     InvalidRemoteName,
 
@@ -216,6 +245,8 @@ pub struct RemoteCredentials {
     http_client: Arc<RwLock<Option<reqwest::Client>>>,
     http_probe_client: Arc<RwLock<Option<reqwest::Client>>>,
     http_upload_client: Arc<RwLock<Option<reqwest::Client>>>,
+    #[cfg(feature = "e2ee")]
+    encrypted_sessions: Arc<RwLock<HashMap<String, encrypted::SessionRegistration>>>,
 }
 
 impl fmt::Debug for RemoteCredentials {
@@ -250,6 +281,200 @@ impl Default for RemoteCredentials {
 }
 
 impl RemoteCredentials {
+    /// Derive isolated explicit credentials for a clone's local remote name.
+    /// Preserve the pinned encrypted registration; do not alter source names or
+    /// export the bearer token. The shared secret session still controls lifetime.
+    #[cfg(feature = "e2ee")]
+    pub fn for_encrypted_remote_alias(
+        &self,
+        source: &str,
+        target: &str,
+    ) -> std::result::Result<Self, RemoteCredentialErr> {
+        if self.mode != RemoteCredentialMode::Explicit {
+            return Err(RemoteCredentialErr::EnvironmentCredentialsReadOnly);
+        }
+        if !valid_credential_remote_name(source) || !valid_credential_remote_name(target) {
+            return Err(RemoteCredentialErr::InvalidRemoteName);
+        }
+        let registrations = self.encrypted_sessions.read();
+        let registration = registrations
+            .get(source)
+            .ok_or(RemoteCredentialErr::EncryptedSessionBindingMismatch)?;
+        let tokens = self.http_bearer_tokens.read();
+        let token = tokens
+            .get(source)
+            .ok_or(RemoteCredentialErr::EncryptedSessionBindingMismatch)?;
+        let derived = Self::explicit();
+        derived
+            .encrypted_sessions
+            .write()
+            .insert(target.into(), registration.clone());
+        derived
+            .http_bearer_tokens
+            .write()
+            .insert(target.into(), token.clone());
+        *derived.http_client.write() = self.http_client.read().clone();
+        *derived.http_probe_client.write() = self.http_probe_client.read().clone();
+        *derived.http_upload_client.write() = self.http_upload_client.read().clone();
+        Ok(derived)
+    }
+
+    /// Refresh a token whose unchanged authentication domain/subject was verified by the host.
+    /// Account changes require disconnect; same-account refresh preserves the unlocked root.
+    #[cfg(feature = "e2ee")]
+    pub fn set_bound_http_bearer_token(
+        &self,
+        remote_name: &str,
+        domain: &str,
+        account: &str,
+        token: String,
+    ) -> std::result::Result<(), RemoteCredentialErr> {
+        if self.mode != RemoteCredentialMode::Explicit {
+            return Err(RemoteCredentialErr::EnvironmentCredentialsReadOnly);
+        }
+        if !valid_credential_remote_name(remote_name) {
+            return Err(RemoteCredentialErr::InvalidRemoteName);
+        }
+        if token.is_empty() {
+            return Err(RemoteCredentialErr::EmptyBearerToken);
+        }
+        let registrations = self.encrypted_sessions.read();
+        let registration = registrations
+            .get(remote_name)
+            .ok_or(RemoteCredentialErr::EncryptedSessionBindingMismatch)?;
+        let binding = registration.session.binding();
+        if binding.domain() != domain || binding.account() != account {
+            return Err(RemoteCredentialErr::EncryptedSessionBindingMismatch);
+        }
+        self.http_bearer_tokens
+            .write()
+            .insert(remote_name.to_owned(), BearerToken::new(token));
+        Ok(())
+    }
+    /// Register a host-authorized account/domain/root session for one pinned remote.
+    /// The host must establish the bearer credential's account identity before this call.
+    /// Neither the key nor password is written to repository configuration.
+    #[cfg(feature = "e2ee")]
+    pub fn set_encrypted_session(
+        &self,
+        remote_name: &str,
+        config: &RemoteConfig,
+        session: crate::e2ee::SecretSession,
+        budget: EncryptedTransferBudget,
+    ) -> Result<()> {
+        self.register_encrypted_session(remote_name, config, session, budget, None, None)
+    }
+
+    /// Register durable per-ref recovery metadata supplied by a trusted host.
+    #[cfg(feature = "e2ee")]
+    pub fn set_encrypted_session_with_journals(
+        &self,
+        remote_name: &str,
+        config: &RemoteConfig,
+        session: crate::e2ee::SecretSession,
+        budget: EncryptedTransferBudget,
+        journals: Arc<dyn crate::e2ee::RefMutationJournalProvider>,
+    ) -> Result<()> {
+        self.register_encrypted_session(remote_name, config, session, budget, Some(journals), None)
+    }
+
+    /// Register durable ref recovery and ciphertext multipart recovery supplied
+    /// by the trusted native host. Both stores must be outside disposable staging.
+    #[cfg(feature = "e2ee")]
+    pub fn set_encrypted_session_with_recovery(
+        &self,
+        remote_name: &str,
+        config: &RemoteConfig,
+        session: crate::e2ee::SecretSession,
+        budget: EncryptedTransferBudget,
+        journals: Arc<dyn crate::e2ee::RefMutationJournalProvider>,
+        uploads: Arc<dyn crate::e2ee::MultipartJournalProvider>,
+    ) -> Result<()> {
+        self.register_encrypted_session(
+            remote_name,
+            config,
+            session,
+            budget,
+            Some(journals),
+            Some(uploads),
+        )
+    }
+
+    #[cfg(feature = "e2ee")]
+    fn register_encrypted_session(
+        &self,
+        remote_name: &str,
+        config: &RemoteConfig,
+        session: crate::e2ee::SecretSession,
+        budget: EncryptedTransferBudget,
+        journals: Option<Arc<dyn crate::e2ee::RefMutationJournalProvider>>,
+        uploads: Option<Arc<dyn crate::e2ee::MultipartJournalProvider>>,
+    ) -> Result<()> {
+        if self.mode != RemoteCredentialMode::Explicit || !valid_credential_remote_name(remote_name)
+        {
+            return Err(crate::e2ee::EncryptionError::InvalidSessionBinding.into());
+        }
+        let RemoteConfig::EncryptedHttp { url, uuid } = config else {
+            return Err(crate::e2ee::EncryptionError::InvalidSessionBinding.into());
+        };
+        if *uuid != encrypted::uuid_text(session.binding().repository()) {
+            return Err(crate::e2ee::EncryptionError::IdentityChanged.into());
+        }
+        let url = crate::e2ee::http::validate_endpoint(url)?.to_string();
+        budget.validate()?;
+        let mut registrations = self.encrypted_sessions.write();
+        if registrations.contains_key(remote_name) {
+            return Err(crate::e2ee::EncryptionError::SessionBusy.into());
+        }
+        registrations.insert(
+            remote_name.to_owned(),
+            encrypted::SessionRegistration {
+                identity: Arc::new(()),
+                url,
+                uuid: uuid.clone(),
+                session,
+                budget,
+                journals,
+                uploads,
+            },
+        );
+        Ok(())
+    }
+
+    /// Drain and disconnect the session before allowing account credentials to change.
+    /// Existing remotes retain a disconnected session, rather than an orphaned usable root.
+    #[cfg(feature = "e2ee")]
+    pub async fn clear_encrypted_session(&self, remote_name: &str) -> Result<()> {
+        if self.mode != RemoteCredentialMode::Explicit || !valid_credential_remote_name(remote_name)
+        {
+            return Err(crate::e2ee::EncryptionError::InvalidSessionBinding.into());
+        }
+        let registration = self.encrypted_sessions.read().get(remote_name).cloned();
+        if let Some(registration) = registration {
+            registration.session.disconnect().await;
+            let mut registrations = self.encrypted_sessions.write();
+            if registrations
+                .get(remote_name)
+                .is_some_and(|current| Arc::ptr_eq(&current.identity, &registration.identity))
+            {
+                registrations.remove(remote_name);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "e2ee")]
+    pub(crate) fn authorize_encrypted_request(
+        &self,
+        remote_name: &str,
+        request: reqwest::RequestBuilder,
+    ) -> reqwest::RequestBuilder {
+        match self.http_bearer_token(remote_name, None) {
+            Some(token) => request.bearer_auth(token.expose()),
+            None => request,
+        }
+    }
+
     /// Creates an explicit-only credential store that never falls back to process environment.
     pub fn explicit() -> Self {
         Self {
@@ -258,6 +483,8 @@ impl RemoteCredentials {
             http_client: Arc::default(),
             http_probe_client: Arc::default(),
             http_upload_client: Arc::default(),
+            #[cfg(feature = "e2ee")]
+            encrypted_sessions: Arc::default(),
         }
     }
 
@@ -272,6 +499,8 @@ impl RemoteCredentials {
             http_client: Arc::default(),
             http_probe_client: Arc::default(),
             http_upload_client: Arc::default(),
+            #[cfg(feature = "e2ee")]
+            encrypted_sessions: Arc::default(),
         }
     }
 
@@ -290,6 +519,12 @@ impl RemoteCredentials {
         if token.is_empty() {
             return Err(RemoteCredentialErr::EmptyBearerToken);
         }
+        #[cfg(feature = "e2ee")]
+        let registrations = self.encrypted_sessions.read();
+        #[cfg(feature = "e2ee")]
+        if registrations.contains_key(remote_name) {
+            return Err(RemoteCredentialErr::EncryptedSessionActive);
+        }
         self.http_bearer_tokens
             .write()
             .insert(remote_name.to_string(), BearerToken::new(token));
@@ -306,6 +541,12 @@ impl RemoteCredentials {
         }
         if !valid_credential_remote_name(remote_name) {
             return Err(RemoteCredentialErr::InvalidRemoteName);
+        }
+        #[cfg(feature = "e2ee")]
+        let registrations = self.encrypted_sessions.read();
+        #[cfg(feature = "e2ee")]
+        if registrations.contains_key(remote_name) {
+            return Err(RemoteCredentialErr::EncryptedSessionActive);
         }
         self.http_bearer_tokens.write().remove(remote_name);
         Ok(())
@@ -438,10 +679,18 @@ impl RemoteErr {
     }
 
     pub fn publication_unconfirmed(&self) -> bool {
+        #[cfg(feature = "e2ee")]
+        if matches!(self, Self::EncryptedPublicationUnconfirmed) {
+            return true;
+        }
         matches!(self, Self::PublicationUnconfirmed { .. })
     }
 
     pub fn publication_outcome_unknown(&self) -> bool {
+        #[cfg(feature = "e2ee")]
+        if matches!(self, Self::EncryptedOutcomeUnknown { .. }) {
+            return true;
+        }
         matches!(self, Self::PublicationOutcomeUnknown { .. })
     }
 
@@ -502,6 +751,8 @@ pub enum RemoteConfig {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         token_env: Option<String>,
     },
+    /// Fixed encrypted-remote-v1 / Suite 1 identity. Contains no secrets.
+    EncryptedHttp { url: String, uuid: String },
 }
 
 impl RemoteConfig {
@@ -522,12 +773,32 @@ impl RemoteConfig {
 #[derive(Debug, Clone)]
 pub struct Remote {
     backend: RemoteBackend,
+    observation_identity: Arc<()>,
+}
+
+/// Exact transport bytes read through one remote instance. Cloned remotes retain
+/// its identity; constructing another remote does not transfer this observation.
+/// No serialization or plaintext Debug output is provided.
+pub struct RemoteRefObservation {
+    identity: Arc<()>,
+    path: String,
+    bytes: Option<Bytes>,
+    #[cfg(feature = "e2ee")]
+    encrypted: Option<crate::e2ee::RefObservation>,
+}
+
+impl RemoteRefObservation {
+    pub fn bytes(&self) -> Option<&Bytes> {
+        self.bytes.as_ref()
+    }
 }
 
 #[derive(Debug, Clone)]
 enum RemoteBackend {
     ObjectStore(Operator),
     Http(HttpRemote),
+    #[cfg(feature = "e2ee")]
+    Encrypted(encrypted::EncryptedRemote),
 }
 
 #[derive(Debug, Clone)]
@@ -678,6 +949,11 @@ pub(crate) enum ReadBundleOutcome {
 }
 
 impl RemoteObjectPack {
+    #[cfg(all(feature = "e2ee", not(target_arch = "wasm32"), test))]
+    pub(crate) fn encrypted_test_parts(&self) -> (&str, &[u8], &[u8]) {
+        (&self.id, &self.pack, &self.index)
+    }
+
     pub(crate) fn new(id: String, pack: Bytes, index: Bytes) -> Self {
         Self {
             pack_path: format!("objects/pack/{id}.pack"),
@@ -696,11 +972,38 @@ enum HttpReceivePackResult {
 }
 
 impl Remote {
+    /// Construct a pinned encrypted backend with a native secret session.
+    /// Repository configuration and host enrollment must supply this explicitly.
+    #[cfg(feature = "e2ee")]
+    pub fn with_encrypted_http(
+        client: crate::e2ee::EncryptedHttpClient,
+        budget: EncryptedTransferBudget,
+    ) -> Result<Self> {
+        Self::with_encrypted_http_recovery(client, budget, None, None)
+    }
+
+    #[cfg(feature = "e2ee")]
+    fn with_encrypted_http_recovery(
+        client: crate::e2ee::EncryptedHttpClient,
+        budget: EncryptedTransferBudget,
+        journals: Option<Arc<dyn crate::e2ee::RefMutationJournalProvider>>,
+        uploads: Option<Arc<dyn crate::e2ee::MultipartJournalProvider>>,
+    ) -> Result<Self> {
+        Ok(Self {
+            backend: RemoteBackend::Encrypted(encrypted::EncryptedRemote::new(
+                client, budget, journals, uploads,
+            )?),
+            observation_identity: Arc::new(()),
+        })
+    }
+
     pub(crate) fn snapshot_upload_concurrency(&self) -> usize {
         match &self.backend {
             // A single HTTP/1 connection is materially more reliable through
             // high-latency proxies and lets the shared client reuse TLS state.
             RemoteBackend::Http(_) => 1,
+            #[cfg(feature = "e2ee")]
+            RemoteBackend::Encrypted(_) => 1,
             RemoteBackend::ObjectStore(_) => REMOTE_CONCURRENCY,
         }
     }
@@ -714,6 +1017,15 @@ impl Remote {
         remote_name: &str,
         credentials: &RemoteCredentials,
     ) -> Result<Self> {
+        #[cfg(feature = "e2ee")]
+        if !matches!(&config, RemoteConfig::EncryptedHttp { .. })
+            && credentials
+                .encrypted_sessions
+                .read()
+                .contains_key(remote_name)
+        {
+            return Err(crate::e2ee::EncryptionError::IdentityChanged.into());
+        }
         let backend = match config {
             RemoteConfig::Memory => Operator::new(Memory::default())?.finish(),
             RemoteConfig::Fs { root } => Operator::new(Fs::default().root(&root))?.finish(),
@@ -743,6 +1055,7 @@ impl Remote {
             RemoteConfig::Http { url, token_env } => {
                 let token = credentials.http_bearer_token(remote_name, token_env.as_deref());
                 return Ok(Self {
+                    observation_identity: Arc::new(()),
                     backend: RemoteBackend::Http(HttpRemote::with_clients(
                         url,
                         token,
@@ -752,11 +1065,341 @@ impl Remote {
                     )),
                 });
             }
+            RemoteConfig::EncryptedHttp { url, uuid } => {
+                #[cfg(feature = "e2ee")]
+                {
+                    let registration = credentials
+                        .encrypted_sessions
+                        .read()
+                        .get(remote_name)
+                        .cloned()
+                        .ok_or(crate::e2ee::EncryptionError::Locked)?;
+                    if registration.url != crate::e2ee::http::validate_endpoint(&url)?.as_str()
+                        || registration.uuid != uuid
+                    {
+                        return Err(crate::e2ee::EncryptionError::IdentityChanged.into());
+                    }
+                    let client = crate::e2ee::EncryptedHttpClient::new(
+                        &url,
+                        remote_name.to_owned(),
+                        credentials.clone(),
+                        registration.session,
+                    )?;
+                    return Self::with_encrypted_http_recovery(
+                        client,
+                        registration.budget,
+                        registration.journals,
+                        registration.uploads,
+                    );
+                }
+                #[cfg(not(feature = "e2ee"))]
+                {
+                    let _ = (url, uuid);
+                    return Err(RemoteErr::EncryptedRemoteUnavailable);
+                }
+            }
         };
 
         Ok(Self {
+            observation_identity: Arc::new(()),
             backend: RemoteBackend::ObjectStore(backend),
         })
+    }
+
+    pub async fn observe_ref(&self, path: &str) -> Result<RemoteRefObservation> {
+        if path != "HEAD" && crate::repo::validate_full_ref(path).is_err() {
+            return Err(RemoteErr::CompareAndSwap { path: path.to_owned() });
+        }
+        #[cfg(feature = "e2ee")]
+        if let RemoteBackend::Encrypted(remote) = &self.backend {
+            let (bytes, encrypted) = remote.observe_ref(path).await?;
+            return Ok(RemoteRefObservation {
+                identity: self.observation_identity.clone(),
+                path: path.to_owned(),
+                bytes,
+                encrypted: Some(encrypted),
+            });
+        }
+        Ok(RemoteRefObservation {
+            identity: self.observation_identity.clone(),
+            path: path.to_owned(),
+            bytes: self.get_raw_bounded(path, 16 * 1024).await?,
+            #[cfg(feature = "e2ee")]
+            encrypted: None,
+        })
+    }
+
+    pub(crate) fn validate_ref_observation(
+        &self,
+        path: &str,
+        observed: &RemoteRefObservation,
+    ) -> Result<()> {
+        if observed.path != path || !Arc::ptr_eq(&self.observation_identity, &observed.identity) {
+            return Err(RemoteErr::CompareAndSwap { path: path.to_owned() });
+        }
+        #[cfg(feature = "e2ee")]
+        if let RemoteBackend::Encrypted(remote) = &self.backend {
+            remote.validate_ref(
+                path,
+                observed
+                    .encrypted
+                    .as_ref()
+                    .ok_or(crate::e2ee::EncryptionError::StaleObservation)?,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "e2ee")]
+    pub(crate) async fn reconcile_observed_ref_journal(
+        &self,
+        path: &str,
+        observed: &RemoteRefObservation,
+    ) -> Result<()> {
+        self.validate_ref_observation(path, observed)?;
+        if let RemoteBackend::Encrypted(remote) = &self.backend {
+            remote
+                .reconcile_existing_ref(
+                    path,
+                    observed
+                        .encrypted
+                        .as_ref()
+                        .ok_or(crate::e2ee::EncryptionError::StaleObservation)?,
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    #[cfg(all(feature = "e2ee", unix))]
+    pub(crate) fn begin_encrypted_operation(&self) -> Result<crate::e2ee::SessionOperation> {
+        let RemoteBackend::Encrypted(remote) = &self.backend else {
+            return Err(crate::e2ee::EncryptionError::UnsupportedProfile.into());
+        };
+        remote.begin_operation()
+    }
+
+    /// Run trusted synchronous native work in this encrypted session's epoch.
+    /// Adds secret cancellation without replacing the host cancellation token.
+    /// Does not authenticate remote config or grant plugin access to secrets.
+    #[cfg(all(feature = "e2ee", unix))]
+    pub fn with_encrypted_operation<T, E>(
+        &self,
+        work: impl FnOnce() -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E>
+    where
+        E: From<crate::repo::RepoErr>,
+    {
+        let operation = Arc::new(
+            self.begin_encrypted_operation()
+                .map_err(crate::repo::RepoErr::from)?,
+        );
+        let probe = operation.clone();
+        crate::repo::with_secret_cancellation(
+            Arc::new(move || probe.check_active().is_err()),
+            || {
+                let result = work()?;
+                operation
+                    .check_active()
+                    .map_err(|error| crate::repo::RepoErr::from(RemoteErr::from(error)))?;
+                Ok(result)
+            },
+        )
+    }
+
+    #[cfg(all(feature = "e2ee", unix))]
+    pub(crate) async fn publish_verified_file(
+        &self,
+        path: &str,
+        source: &std::path::Path,
+        length: u64,
+        digest: [u8; 32],
+    ) -> Result<()> {
+        let RemoteBackend::Encrypted(remote) = &self.backend else {
+            return Err(crate::e2ee::EncryptionError::UnsupportedProfile.into());
+        };
+        remote.put_verified_file(path, source, length, digest).await
+    }
+
+    #[cfg(all(feature = "e2ee", unix))]
+    pub(crate) fn encrypted_plaintext_spool(&self) -> Result<(std::fs::File, u64)> {
+        let RemoteBackend::Encrypted(remote) = &self.backend else {
+            return Err(crate::e2ee::EncryptionError::UnsupportedProfile.into());
+        };
+        remote.plaintext_spool()
+    }
+
+    #[cfg(all(feature = "e2ee", unix))]
+    pub(crate) async fn publish_verified_handle(
+        &self,
+        path: &str,
+        file: std::fs::File,
+        length: u64,
+        digest: [u8; 32],
+    ) -> Result<()> {
+        let RemoteBackend::Encrypted(remote) = &self.backend else {
+            return Err(crate::e2ee::EncryptionError::UnsupportedProfile.into());
+        };
+        remote.put_verified_handle(path, file, length, digest).await
+    }
+
+    /// Publish an encrypted tag from exact annotated-tag or commit content.
+    /// The repository must publish/verify the full commit/storage/file closure first.
+    /// Uploads the target object before reusing exact ref CAS and recovery.
+    #[cfg(feature = "e2ee")]
+    pub async fn publish_observed_tag_ref(
+        &self,
+        ref_path: &str,
+        observed: &RemoteRefObservation,
+        target_object: Bytes,
+    ) -> Result<()> {
+        self.validate_ref_observation(ref_path, observed)?;
+        let RemoteBackend::Encrypted(remote) = &self.backend else {
+            return Err(crate::e2ee::EncryptionError::UnsupportedProfile.into());
+        };
+        let encrypted = observed
+            .encrypted
+            .as_ref()
+            .ok_or(crate::e2ee::EncryptionError::StaleObservation)?;
+        remote
+            .publish_tag_ref(ref_path, encrypted, target_object)
+            .await
+    }
+
+    /// Verify exact tag/commit content bound to an encrypted observation.
+    /// This is not a complete history restore or a remote freshness guarantee.
+    #[cfg(feature = "e2ee")]
+    pub async fn read_observed_tag_object(
+        &self,
+        ref_path: &str,
+        observed: &RemoteRefObservation,
+    ) -> Result<Option<Bytes>> {
+        self.validate_ref_observation(ref_path, observed)?;
+        let RemoteBackend::Encrypted(remote) = &self.backend else {
+            return Err(crate::e2ee::EncryptionError::UnsupportedProfile.into());
+        };
+        remote
+            .read_tag_object(
+                ref_path,
+                observed
+                    .encrypted
+                    .as_ref()
+                    .ok_or(crate::e2ee::EncryptionError::StaleObservation)?,
+            )
+            .await
+    }
+
+    /// Publish an encrypted branch through a registered durable mutation journal.
+    /// The caller must verify and publish the complete target dependency closure.
+    #[cfg(feature = "e2ee")]
+    pub async fn publish_observed_branch_ref(
+        &self,
+        ref_path: &str,
+        observed: &RemoteRefObservation,
+        commit: &str,
+    ) -> Result<()> {
+        let RemoteBackend::Encrypted(remote) = &self.backend else {
+            return Err(crate::e2ee::EncryptionError::UnsupportedProfile.into());
+        };
+        if !remote.has_mutation_journals() {
+            return Err(crate::e2ee::EncryptionError::UnsupportedProfile.into());
+        }
+        if !ref_path.starts_with("refs/heads/") {
+            return Err(crate::e2ee::EncryptionError::InvalidObjectKey.into());
+        }
+        encrypted::parse_id(commit)?;
+        self.publish_observed_object_bundle_and_ref(
+            Vec::new(),
+            None,
+            ref_path,
+            observed,
+            format!("{commit}\n"),
+        )
+        .await
+    }
+
+    /// Publish encrypted HEAD through an exact observed CAS and durable journal.
+    #[cfg(feature = "e2ee")]
+    pub async fn publish_observed_head_ref(
+        &self,
+        observed: &RemoteRefObservation,
+        head: &crate::repo::Head,
+    ) -> Result<()> {
+        self.require_encrypted_ref_journals()?;
+        self.publish_observed_object_bundle_and_ref(
+            Vec::new(),
+            None,
+            "HEAD",
+            observed,
+            head.serialize(),
+        )
+        .await
+    }
+
+    #[cfg(feature = "e2ee")]
+    pub fn require_encrypted_ref_journals(&self) -> Result<()> {
+        match &self.backend {
+            RemoteBackend::Encrypted(remote) if remote.has_mutation_journals() => Ok(()),
+            _ => Err(crate::e2ee::EncryptionError::UnsupportedProfile.into()),
+        }
+    }
+
+    pub(crate) async fn publish_observed_object_bundle_and_ref(
+        &self,
+        objects: Vec<RemoteBundleObject>,
+        pack: Option<RemoteObjectPack>,
+        ref_path: &str,
+        observed: &RemoteRefObservation,
+        replacement: impl Into<Bytes>,
+    ) -> Result<()> {
+        self.validate_ref_observation(ref_path, observed)?;
+        #[cfg(feature = "e2ee")]
+        if let RemoteBackend::Encrypted(remote) = &self.backend {
+            let replacement = replacement.into();
+            return remote
+                .publish_bundle_and_ref(
+                    &objects,
+                    pack.as_ref(),
+                    ref_path,
+                    observed
+                        .encrypted
+                        .as_ref()
+                        .ok_or(crate::e2ee::EncryptionError::StaleObservation)?,
+                    replacement,
+                )
+                .await;
+        }
+        self.publish_object_bundle_and_ref(
+            objects,
+            pack,
+            ref_path,
+            observed.bytes.as_deref(),
+            replacement,
+        )
+        .await
+    }
+
+    pub async fn compare_and_delete_observed_ref(
+        &self,
+        path: &str,
+        observed: &RemoteRefObservation,
+    ) -> Result<()> {
+        self.validate_ref_observation(path, observed)?;
+        #[cfg(feature = "e2ee")]
+        if let RemoteBackend::Encrypted(remote) = &self.backend {
+            return remote
+                .publish_ref(
+                    path,
+                    observed
+                        .encrypted
+                        .as_ref()
+                        .ok_or(crate::e2ee::EncryptionError::StaleObservation)?,
+                    None,
+                )
+                .await;
+        }
+        self.compare_and_delete_raw(path, observed.bytes.as_deref())
+            .await
     }
 
     /// Streams commits by LSN in the same order as the input iterator.
@@ -803,6 +1446,12 @@ impl Remote {
                 .await?
                 .map(Commit::decode)
                 .transpose()?),
+            #[cfg(feature = "e2ee")]
+            RemoteBackend::Encrypted(remote) => Ok(remote
+                .get_raw(&path, usize::MAX)
+                .await?
+                .map(Commit::decode)
+                .transpose()?),
         }
     }
 
@@ -834,8 +1483,34 @@ impl Remote {
                     .put_raw_if_not_exists(&path, commit.encode_to_bytes())
                     .await?;
             }
+            #[cfg(feature = "e2ee")]
+            RemoteBackend::Encrypted(remote) => {
+                remote
+                    .put_chunks(&path, vec![commit.encode_to_bytes()])
+                    .await?
+            }
         }
         Ok(())
+    }
+
+    /// Authenticate private retained initialization against the registered
+    /// transport root without publishing or advancing its checkpoint.
+    #[cfg(all(feature = "e2ee", unix))]
+    pub fn authenticate_encrypted_recovery_config(
+        &self,
+        config: &crate::e2ee::EncryptedConfig,
+    ) -> Result<()> {
+        self.begin_encrypted_operation()?
+            .authenticate_retained_config(config)?;
+        Ok(())
+    }
+
+    #[cfg(feature = "e2ee")]
+    pub fn encrypted_staging_directory(&self) -> Option<&Path> {
+        match &self.backend {
+            RemoteBackend::Encrypted(remote) => Some(remote.staging_directory()),
+            _ => None,
+        }
     }
 
     /// Uploads a segment to this Remote
@@ -851,6 +1526,10 @@ impl Remote {
         chunks: I,
     ) -> Result<()> {
         let path = RemotePath::Segment(sid).build();
+        #[cfg(feature = "e2ee")]
+        if let RemoteBackend::Encrypted(remote) = &self.backend {
+            return remote.put_chunks(&path, chunks.into_iter().collect()).await;
+        }
         if let RemoteBackend::Http(remote) = &self.backend {
             match remote.put_raw_if_not_exists_stream(&path, chunks).await {
                 Ok(()) => return Ok(()),
@@ -900,6 +1579,8 @@ impl Remote {
                 Err(err) => Err(err.into()),
             },
             RemoteBackend::Http(remote) => remote.has_raw(path).await,
+            #[cfg(feature = "e2ee")]
+            RemoteBackend::Encrypted(remote) => remote.has_raw(path).await,
         }
     }
 
@@ -919,6 +1600,39 @@ impl Remote {
                 Err(err) => Err(err.into()),
             },
             RemoteBackend::Http(remote) => remote.get_raw(path).await,
+            #[cfg(feature = "e2ee")]
+            RemoteBackend::Encrypted(remote) => remote.get_raw(path, usize::MAX).await,
+        }
+    }
+
+    /// Maximum plaintext retained by a buffered encrypted read. Other adapters
+    /// retain their existing repository-level prefetch policy.
+    pub(crate) fn buffered_read_limit(&self) -> Option<usize> {
+        #[cfg(feature = "e2ee")]
+        if let RemoteBackend::Encrypted(remote) = &self.backend {
+            return Some(remote.buffered_read_limit());
+        }
+        None
+    }
+
+    pub(crate) async fn buffered_read_batches(&self, paths: &[String]) -> Result<Vec<Vec<String>>> {
+        #[cfg(feature = "e2ee")]
+        if let RemoteBackend::Encrypted(remote) = &self.backend {
+            return remote.read_batches(paths).await;
+        }
+        Ok(vec![paths.to_vec()])
+    }
+
+    /// Stream and authenticate a complete encrypted payload in host-private
+    /// staging before exposing a file. Call only for an encrypted backend.
+    #[cfg(feature = "e2ee")]
+    pub(crate) async fn download_encrypted_file(
+        &self,
+        path: &str,
+    ) -> Result<Option<std::fs::File>> {
+        match &self.backend {
+            RemoteBackend::Encrypted(remote) => remote.download_file(path).await,
+            _ => unreachable!("encrypted download requires encrypted backend"),
         }
     }
 
@@ -958,6 +1672,8 @@ impl Remote {
                 }
             }
             RemoteBackend::Http(remote) => remote.get_raw_with_limit(path, Some(max_bytes)).await,
+            #[cfg(feature = "e2ee")]
+            RemoteBackend::Encrypted(remote) => remote.get_raw(path, max_bytes).await,
         }
     }
 
@@ -978,6 +1694,8 @@ impl Remote {
                 Ok(buffer.to_bytes())
             }
             RemoteBackend::Http(remote) => remote.get_raw_range(path, bytes).await,
+            #[cfg(feature = "e2ee")]
+            RemoteBackend::Encrypted(remote) => remote.get_range(path, bytes).await,
         }
     }
 
@@ -993,6 +1711,8 @@ impl Remote {
                 .map(|entry| entry.path().to_string())
                 .collect()),
             RemoteBackend::Http(remote) => remote.list_raw(prefix).await,
+            #[cfg(feature = "e2ee")]
+            RemoteBackend::Encrypted(remote) => remote.list_raw(prefix).await,
         }
     }
 
@@ -1029,6 +1749,10 @@ impl Remote {
                     .await?;
                 Ok(ReadBundleOutcome::Downloaded(objects))
             }
+            #[cfg(feature = "e2ee")]
+            RemoteBackend::Encrypted(remote) => Ok(ReadBundleOutcome::Downloaded(
+                remote.read_bundle(&paths).await?,
+            )),
         }
     }
 
@@ -1040,6 +1764,8 @@ impl Remote {
         match &self.backend {
             RemoteBackend::Http(remote) => remote.download_upload_bundle(ref_path, root).await,
             RemoteBackend::ObjectStore(_) => Ok(UploadBundleOutcome::Unsupported),
+            #[cfg(feature = "e2ee")]
+            RemoteBackend::Encrypted(_) => Ok(UploadBundleOutcome::Unsupported),
         }
     }
 
@@ -1052,6 +1778,14 @@ impl Remote {
         match &self.backend {
             RemoteBackend::Http(remote) => remote.download_fetch_bundle(ref_path, have, root).await,
             RemoteBackend::ObjectStore(_) => Ok(FetchBundleOutcome::Unsupported),
+            #[cfg(feature = "e2ee")]
+            RemoteBackend::Encrypted(remote) => {
+                Ok(if remote.fetch_bundle(ref_path, have, root).await? {
+                    FetchBundleOutcome::Downloaded
+                } else {
+                    FetchBundleOutcome::Unsupported
+                })
+            }
         }
     }
 
@@ -1062,6 +1796,10 @@ impl Remote {
                 store.write(path, bytes.into()).await?;
             }
             RemoteBackend::Http(remote) => remote.put_raw(path, bytes.into()).await?,
+            #[cfg(feature = "e2ee")]
+            RemoteBackend::Encrypted(_) => {
+                return Err(crate::e2ee::EncryptionError::InvalidObjectKey.into());
+            }
         }
         Ok(())
     }
@@ -1073,6 +1811,10 @@ impl Remote {
                 store.delete(path).await?;
             }
             RemoteBackend::Http(remote) => remote.delete_raw(path).await?,
+            #[cfg(feature = "e2ee")]
+            RemoteBackend::Encrypted(_) => {
+                return Err(crate::e2ee::EncryptionError::InvalidObjectKey.into());
+            }
         }
         Ok(())
     }
@@ -1094,6 +1836,14 @@ impl Remote {
                     .await?;
             }
             RemoteBackend::Http(remote) => remote.put_raw_if_not_exists(path, bytes.into()).await?,
+            #[cfg(feature = "e2ee")]
+            RemoteBackend::Encrypted(remote) => {
+                if path == "HEAD" || path.starts_with("refs/") {
+                    remote.create_ref(path, bytes.into()).await?;
+                } else {
+                    remote.put_chunks(path, vec![bytes.into()]).await?;
+                }
+            }
         }
         Ok(())
     }
@@ -1105,6 +1855,10 @@ impl Remote {
         expected: Option<&[u8]>,
         bytes: impl Into<Bytes>,
     ) -> Result<()> {
+        #[cfg(feature = "e2ee")]
+        if matches!(&self.backend, RemoteBackend::Encrypted(_)) {
+            return Err(crate::e2ee::EncryptionError::StaleObservation.into());
+        }
         if let RemoteBackend::Http(remote) = &self.backend {
             return remote
                 .compare_and_swap_raw(path, expected, bytes.into())
@@ -1146,6 +1900,17 @@ impl Remote {
         }
     }
 
+    #[cfg(all(feature = "e2ee", unix))]
+    pub(crate) async fn publish_encrypted_object_pack(
+        &self,
+        pack: &RemoteObjectPack,
+    ) -> Result<()> {
+        let RemoteBackend::Encrypted(remote) = &self.backend else {
+            return Err(crate::e2ee::EncryptionError::UnsupportedProfile.into());
+        };
+        remote.publish_pack(pack).await
+    }
+
     pub(crate) async fn publish_object_pack_and_ref(
         &self,
         pack: Option<RemoteObjectPack>,
@@ -1153,6 +1918,10 @@ impl Remote {
         expected: Option<&[u8]>,
         replacement: impl Into<Bytes>,
     ) -> Result<()> {
+        #[cfg(feature = "e2ee")]
+        if matches!(&self.backend, RemoteBackend::Encrypted(_)) {
+            return Err(crate::e2ee::EncryptionError::StaleObservation.into());
+        }
         let replacement = replacement.into();
         if let (RemoteBackend::Http(remote), Some(pack)) = (&self.backend, pack.as_ref()) {
             match remote
@@ -1199,6 +1968,10 @@ impl Remote {
         expected: Option<&[u8]>,
         replacement: impl Into<Bytes>,
     ) -> Result<()> {
+        #[cfg(feature = "e2ee")]
+        if matches!(&self.backend, RemoteBackend::Encrypted(_)) {
+            return Err(crate::e2ee::EncryptionError::StaleObservation.into());
+        }
         let replacement = replacement.into();
         if objects.is_empty() {
             return self
@@ -1278,6 +2051,10 @@ impl Remote {
                     self.put_raw_if_not_exists(&object.path, object.bytes())
                         .await
                 }
+                #[cfg(feature = "e2ee")]
+                RemoteBackend::Encrypted(remote) => {
+                    remote.put_chunks(&object.path, object.chunks.clone()).await
+                }
             };
             match upload {
                 Ok(()) => {}
@@ -1315,6 +2092,10 @@ impl Remote {
 
     #[tracing::instrument(level = "trace", err(level = "debug"), skip(self, expected))]
     pub async fn compare_and_delete_raw(&self, path: &str, expected: Option<&[u8]>) -> Result<()> {
+        #[cfg(feature = "e2ee")]
+        if matches!(&self.backend, RemoteBackend::Encrypted(_)) {
+            return Err(crate::e2ee::EncryptionError::StaleObservation.into());
+        }
         if let RemoteBackend::Http(remote) = &self.backend {
             return remote.compare_and_delete_raw(path, expected).await;
         }
@@ -1371,6 +2152,14 @@ impl Remote {
                 .unwrap()
                 .into_iter()
                 .map(|path| path.split("/").map(|s| s.to_string()).collect_vec())
+                .collect_vec(),
+            #[cfg(feature = "e2ee")]
+            RemoteBackend::Encrypted(_) => self
+                .list_raw("")
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|path| path.split('/').map(str::to_owned).collect_vec())
                 .collect_vec(),
         };
 
@@ -3028,6 +3817,110 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    #[tokio::test]
+    async fn observed_refs_reject_foreign_remotes_and_paths_before_upload() {
+        let remote = RemoteConfig::Memory.build().unwrap();
+        let observed = remote.observe_ref("refs/heads/main").await.unwrap();
+        assert!(observed.bytes().is_none());
+        let other = RemoteConfig::Memory.build().unwrap();
+        let objects = || {
+            vec![
+                RemoteBundleObject::new(
+                    "segments/protected".into(),
+                    [Bytes::from_static(b"data")],
+                    false,
+                )
+                .unwrap(),
+            ]
+        };
+        assert!(matches!(
+            other
+                .publish_observed_object_bundle_and_ref(
+                    objects(),
+                    None,
+                    "refs/heads/main",
+                    &observed,
+                    "tip"
+                )
+                .await,
+            Err(RemoteErr::CompareAndSwap { .. })
+        ));
+        assert!(other.get_raw("segments/protected").await.unwrap().is_none());
+        assert!(matches!(
+            remote
+                .publish_observed_object_bundle_and_ref(
+                    objects(),
+                    None,
+                    "refs/heads/other",
+                    &observed,
+                    "tip"
+                )
+                .await,
+            Err(RemoteErr::CompareAndSwap { .. })
+        ));
+        assert!(
+            remote
+                .get_raw("segments/protected")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        remote
+            .clone()
+            .publish_observed_object_bundle_and_ref(
+                objects(),
+                None,
+                "refs/heads/main",
+                &observed,
+                "tip",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            remote.get_raw("refs/heads/main").await.unwrap().unwrap(),
+            "tip"
+        );
+        assert!(matches!(
+            remote
+                .publish_observed_object_bundle_and_ref(
+                    Vec::new(),
+                    None,
+                    "refs/heads/main",
+                    &observed,
+                    "other"
+                )
+                .await,
+            Err(RemoteErr::CompareAndSwap { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn observed_ref_delete_uses_exact_bytes_and_original_remote() {
+        let remote = RemoteConfig::Memory.build().unwrap();
+        remote.put_raw("refs/heads/main", "first\n").await.unwrap();
+        let observed = remote.observe_ref("refs/heads/main").await.unwrap();
+        remote.put_raw("refs/heads/main", "second\n").await.unwrap();
+        assert!(matches!(
+            remote
+                .compare_and_delete_observed_ref("refs/heads/main", &observed)
+                .await,
+            Err(RemoteErr::CompareAndSwap { .. })
+        ));
+        let current = remote.observe_ref("refs/heads/main").await.unwrap();
+        remote
+            .clone()
+            .compare_and_delete_observed_ref("refs/heads/main", &current)
+            .await
+            .unwrap();
+        assert!(remote.get_raw("refs/heads/main").await.unwrap().is_none());
+        assert!(remote.observe_ref("segments/test").await.is_err());
+        remote
+            .put_raw("HEAD", Bytes::from(vec![0; 16 * 1024 + 1]))
+            .await
+            .unwrap();
+        assert!(remote.observe_ref("HEAD").await.is_err());
+    }
+
     #[test]
     fn http_snapshot_uploads_are_serialized() {
         let http = RemoteConfig::Http {
@@ -3883,6 +4776,7 @@ mod tests {
         });
         let client = build_http_client().unwrap();
         let remote = Remote {
+            observation_identity: Arc::new(()),
             backend: RemoteBackend::Http(HttpRemote::with_clients_and_request_timeout(
                 format!("http://{address}/org/repo"),
                 None,
@@ -3999,6 +4893,7 @@ mod tests {
             .unwrap();
         let fallback_client = build_http_client().unwrap();
         let remote = Remote {
+            observation_identity: Arc::new(()),
             backend: RemoteBackend::Http(HttpRemote::with_clients_and_request_timeout(
                 format!("http://{address}/org/repo"),
                 None,
@@ -5422,5 +6317,214 @@ mod tests {
             ));
             assert!(remote.get_raw("refs/heads/main").await.unwrap().is_none());
         });
+    }
+
+    #[test]
+    fn encrypted_config_persists_only_public_identity_and_never_builds_plain() {
+        let config = RemoteConfig::EncryptedHttp {
+            url: "https://encrypted.invalid/acme/repo".into(),
+            uuid: "00010203-0405-4607-8809-0a0b0c0d0e0f".into(),
+        };
+        let value = serde_json::to_value(&config).unwrap();
+        assert_eq!(value.as_object().unwrap().len(), 3);
+        assert_eq!(value["type"], "encrypted_http");
+        let restored: RemoteConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(restored, config);
+        let error = restored
+            .build_with_credentials("origin", &RemoteCredentials::explicit())
+            .unwrap_err();
+        #[cfg(feature = "e2ee")]
+        assert!(matches!(
+            error,
+            RemoteErr::Encryption(crate::e2ee::EncryptedHttpError::Encryption(
+                crate::e2ee::EncryptionError::Locked
+            ))
+        ));
+        #[cfg(not(feature = "e2ee"))]
+        assert!(matches!(error, RemoteErr::EncryptedRemoteUnavailable));
+    }
+
+    #[cfg(feature = "e2ee")]
+    #[tokio::test]
+    async fn encrypted_factory_binds_endpoint_uuid_and_disconnects_existing_clients() {
+        use crate::e2ee::{
+            EncryptionError, RepositoryId, SecretSession, SecretSessionState, SessionBinding,
+        };
+        let repository = RepositoryId::generate().unwrap();
+        let session = SecretSession::new(
+            SessionBinding::new(
+                "encrypted.invalid".into(),
+                "test-account".into(),
+                repository,
+            )
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+        let config = RemoteConfig::EncryptedHttp {
+            url: "https://encrypted.invalid/acme/repo".into(),
+            uuid: encrypted::uuid_text(repository),
+        };
+        let directory = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let budget = EncryptedTransferBudget {
+            private_directory: directory.path().to_path_buf(),
+            max_buffered_plaintext: 1024,
+            max_ciphertext_spool: 2048,
+        };
+        let credentials = RemoteCredentials::explicit();
+        credentials
+            .set_http_bearer_token("origin", "account-token".into())
+            .unwrap();
+        credentials
+            .set_encrypted_session("origin", &config, session.clone(), budget.clone())
+            .unwrap();
+        assert!(matches!(
+            credentials.set_encrypted_session("origin", &config, session.clone(), budget.clone()),
+            Err(RemoteErr::Encryption(
+                crate::e2ee::EncryptedHttpError::Encryption(EncryptionError::SessionBusy)
+            ))
+        ));
+        assert!(matches!(
+            credentials.set_http_bearer_token("origin", "other-account".into()),
+            Err(RemoteCredentialErr::EncryptedSessionActive)
+        ));
+        assert!(matches!(
+            credentials.clear_http_bearer_token("origin"),
+            Err(RemoteCredentialErr::EncryptedSessionActive)
+        ));
+        assert!(matches!(
+            credentials.set_bound_http_bearer_token(
+                "origin",
+                "encrypted.invalid",
+                "other-account",
+                "new-token".into()
+            ),
+            Err(RemoteCredentialErr::EncryptedSessionBindingMismatch)
+        ));
+        credentials
+            .set_bound_http_bearer_token(
+                "origin",
+                "encrypted.invalid",
+                "test-account",
+                "renewed-token".into(),
+            )
+            .unwrap();
+        assert_eq!(session.state(), SecretSessionState::Locked);
+        assert!(
+            config
+                .clone()
+                .build_with_credentials("other", &credentials)
+                .is_err()
+        );
+        assert!(
+            RemoteConfig::Http {
+                url: "https://encrypted.invalid/acme/repo".into(),
+                token_env: None
+            }
+            .build_with_credentials("origin", &credentials)
+            .is_err()
+        );
+        let different_endpoint = RemoteConfig::EncryptedHttp {
+            url: "https://encrypted.invalid/acme/other".into(),
+            uuid: encrypted::uuid_text(repository),
+        };
+        assert!(
+            different_endpoint
+                .build_with_credentials("origin", &credentials)
+                .is_err()
+        );
+        let different_identity = RemoteConfig::EncryptedHttp {
+            url: "https://encrypted.invalid/acme/repo".into(),
+            uuid: encrypted::uuid_text(RepositoryId::generate().unwrap()),
+        };
+        assert!(
+            different_identity
+                .build_with_credentials("origin", &credentials)
+                .is_err()
+        );
+        let remote = config
+            .clone()
+            .build_with_credentials("origin", &credentials)
+            .unwrap();
+        let alias = credentials
+            .for_encrypted_remote_alias("origin", "clone")
+            .unwrap();
+        assert!(
+            credentials
+                .for_encrypted_remote_alias("missing", "clone")
+                .is_err()
+        );
+        assert!(
+            credentials
+                .for_encrypted_remote_alias("origin", "bad/name")
+                .is_err()
+        );
+        assert!(
+            config
+                .clone()
+                .build_with_credentials("clone", &credentials)
+                .is_err()
+        );
+        assert!(
+            config
+                .clone()
+                .build_with_credentials("origin", &alias)
+                .is_err()
+        );
+        assert_eq!(
+            alias.set_bound_http_bearer_token(
+                "clone",
+                "encrypted.invalid",
+                "other-account",
+                "other-token".into()
+            ),
+            Err(RemoteCredentialErr::EncryptedSessionBindingMismatch)
+        );
+        assert!(!format!("{alias:?}").contains("renewed-token"));
+        assert!(
+            RemoteConfig::Http {
+                url: "https://encrypted.invalid/acme/repo".into(),
+                token_env: None
+            }
+            .build_with_credentials("clone", &alias)
+            .is_err()
+        );
+        let alias_remote = config
+            .clone()
+            .build_with_credentials("clone", &alias)
+            .unwrap();
+        assert!(matches!(
+            remote.get_raw("refs/heads/main").await,
+            Err(RemoteErr::Encryption(
+                crate::e2ee::EncryptedHttpError::Encryption(EncryptionError::Locked)
+            ))
+        ));
+        credentials.clear_encrypted_session("origin").await.unwrap();
+        assert_eq!(session.state(), SecretSessionState::Disconnected);
+        assert!(matches!(
+            alias_remote.get_raw("refs/heads/main").await,
+            Err(RemoteErr::Encryption(
+                crate::e2ee::EncryptedHttpError::Encryption(EncryptionError::Disconnected)
+            ))
+        ));
+        assert!(matches!(
+            remote.get_raw("refs/heads/main").await,
+            Err(RemoteErr::Encryption(
+                crate::e2ee::EncryptedHttpError::Encryption(EncryptionError::Disconnected)
+            ))
+        ));
+        assert!(
+            config
+                .build_with_credentials("origin", &credentials)
+                .is_err()
+        );
+        credentials
+            .set_http_bearer_token("origin", "other-account".into())
+            .unwrap();
     }
 }

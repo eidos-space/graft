@@ -1,4 +1,5 @@
 import {
+  GraftProtocolError,
   bytewiseCompare,
   isTransactionalPath,
   type GraftByteRange,
@@ -39,6 +40,7 @@ export class CloudflareRepositoryBackend implements GraftRepositoryBackend {
   }
 
   async head(path: string): Promise<GraftObjectMetadata | null> {
+    await this.requirePlainProfile();
     if (isTransactionalPath(path)) {
       const size = await this.#metadata.headMetadata(path);
       return size === null ? null : { size };
@@ -48,6 +50,7 @@ export class CloudflareRepositoryBackend implements GraftRepositoryBackend {
   }
 
   async get(path: string, range?: GraftByteRange): Promise<GraftObject | null> {
+    await this.requirePlainProfile();
     if (isTransactionalPath(path)) {
       const value = await this.#metadata.getMetadata(path);
       if (value === null) {
@@ -79,10 +82,12 @@ export class CloudflareRepositoryBackend implements GraftRepositoryBackend {
   }
 
   async put(path: string, value: Uint8Array<ArrayBuffer>): Promise<void> {
+    await this.requirePlainProfile();
     await this.#metadata.putMetadata(path, value);
   }
 
   async delete(path: string): Promise<void> {
+    await this.requirePlainProfile();
     await this.#metadata.deleteMetadata(path);
   }
 
@@ -92,6 +97,7 @@ export class CloudflareRepositoryBackend implements GraftRepositoryBackend {
     kind: "transactional" | "immutable",
     options?: GraftWriteOptions,
   ): Promise<boolean> {
+    await this.requirePlainProfile();
     if (kind === "transactional") {
       if (!(value instanceof Uint8Array)) {
         throw new TypeError("Transactional metadata must be buffered");
@@ -106,6 +112,7 @@ export class CloudflareRepositoryBackend implements GraftRepositoryBackend {
     expected: Uint8Array<ArrayBuffer> | undefined,
     replacement: Uint8Array<ArrayBuffer>,
   ): Promise<boolean> {
+    await this.requirePlainProfile();
     return await this.#metadata.compareAndSwapMetadata(path, expected, replacement);
   }
 
@@ -113,10 +120,12 @@ export class CloudflareRepositoryBackend implements GraftRepositoryBackend {
     path: string,
     expected: Uint8Array<ArrayBuffer> | undefined,
   ): Promise<boolean> {
+    await this.requirePlainProfile();
     return await this.#metadata.compareAndDeleteMetadata(path, expected);
   }
 
   async list(query: GraftListQuery): Promise<GraftListResult> {
+    await this.requirePlainProfile();
     const candidateLimit = query.limit + 1;
     const after = query.after ?? "";
     const [metadata, immutablePage] = await Promise.all([
@@ -136,8 +145,7 @@ export class CloudflareRepositoryBackend implements GraftRepositoryBackend {
         contentType: object.httpMetadata?.contentType,
       }))
       .filter(
-        (entry) =>
-          entry.path.startsWith(query.prefix) && bytewiseCompare(entry.path, after) > 0,
+        (entry) => entry.path.startsWith(query.prefix) && bytewiseCompare(entry.path, after) > 0,
       );
     const immutableByPath = new Map(immutableEntries.map((entry) => [entry.path, entry]));
     const immutable = immutableEntries.map((entry) => entry.path);
@@ -157,11 +165,17 @@ export class CloudflareRepositoryBackend implements GraftRepositoryBackend {
     return `repositories/${this.#repositoryId}/objects/${path}`;
   }
 
+  private async requirePlainProfile(): Promise<void> {
+    if (!(await this.#metadata.registerProfile({ profile: "plain" })))
+      throw new GraftProtocolError(409, "profile_mismatch", "Repository has an encrypted profile");
+  }
+
   private async startMultipart(
     path: string,
     totalBytes: number,
     partBytes: number,
   ): Promise<GraftMultipartUpload | null> {
+    await this.requirePlainProfile();
     validateR2MultipartShape(totalBytes, partBytes);
     const key = this.r2Key(path);
     if ((await this.#objects.head(key)) !== null) return null;
@@ -204,11 +218,7 @@ export class CloudflareRepositoryBackend implements GraftRepositoryBackend {
     }
 
     const winner = await this.#metadata.getMultipartUpload(path);
-    if (
-      winner === null ||
-      winner.totalBytes !== totalBytes ||
-      winner.partBytes !== partBytes
-    ) {
+    if (winner === null || winner.totalBytes !== totalBytes || winner.partBytes !== partBytes) {
       throw new Error("Multipart upload session changed while it was created");
     }
     return publicMultipartUpload(winner);
@@ -252,6 +262,7 @@ export class CloudflareRepositoryBackend implements GraftRepositoryBackend {
   }
 
   private async completeMultipart(path: string, uploadId: string): Promise<boolean> {
+    await this.requirePlainProfile();
     const key = this.r2Key(path);
     if ((await this.#objects.head(key)) !== null) {
       await this.discardMultipart(path, uploadId, key);
@@ -265,14 +276,12 @@ export class CloudflareRepositoryBackend implements GraftRepositoryBackend {
     ) {
       throw new RangeError("Multipart upload is incomplete");
     }
-    const object = await this.#objects
-      .resumeMultipartUpload(key, uploadId)
-      .complete(
-        state.uploadedParts.map((part) => ({
-          partNumber: part.partNumber,
-          etag: part.etag,
-        })),
-      );
+    const object = await this.#objects.resumeMultipartUpload(key, uploadId).complete(
+      state.uploadedParts.map((part) => ({
+        partNumber: part.partNumber,
+        etag: part.etag,
+      })),
+    );
     if (object.size !== state.totalBytes) {
       throw new Error("Completed multipart object has an unexpected size");
     }
@@ -281,12 +290,14 @@ export class CloudflareRepositoryBackend implements GraftRepositoryBackend {
   }
 
   private async abortMultipart(path: string, uploadId: string): Promise<void> {
+    await this.requirePlainProfile();
     const state = await this.#metadata.getMultipartUpload(path);
     if (state === null || state.uploadId !== uploadId) return;
     await this.discardMultipart(path, uploadId, this.r2Key(path));
   }
 
   private async requireMultipart(path: string, uploadId: string) {
+    await this.requirePlainProfile();
     const state = await this.#metadata.getMultipartUpload(path);
     if (state === null || state.uploadId !== uploadId) {
       throw new RangeError("Multipart upload session does not exist");
@@ -363,7 +374,7 @@ interface FixedR2Body {
   finish(consumed: boolean): Promise<void>;
 }
 
-function fixedR2Body(value: GraftWriteBody, contentLength: number | undefined): FixedR2Body {
+export function fixedR2Body(value: GraftWriteBody, contentLength: number | undefined): FixedR2Body {
   if (value instanceof Uint8Array || contentLength === undefined) {
     return {
       body: value,

@@ -1,0 +1,6 @@
+# Test-only independent implementation. No Graft runtime dependency.
+PyNaCl==1.6.2
+argon2-cffi==25.1.0
+argon2-cffi-bindings==26.1.0
+cffi==2.1.1
+pycparser==3.11

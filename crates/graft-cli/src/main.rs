@@ -23,8 +23,14 @@ use serde_json::Value;
 #[cfg(not(target_arch = "wasm32"))]
 mod upgrade;
 
+#[cfg(all(feature = "e2ee", unix))]
+mod encrypted;
+
 #[derive(Subcommand)]
 enum Command {
+    /// Use an explicitly pinned encrypted HTTP remote (session-only unlock).
+    #[cfg(all(feature = "e2ee", unix))]
+    E2ee(encrypted::EncryptedArgs),
     /// Generate an internal test identifier
     Id {
         /// Identifier kind to generate
@@ -1094,6 +1100,22 @@ fn run_cli(cli: Cli) -> Result<()> {
 fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
     validate_command_repo_paths(&command)?;
     match command {
+        #[cfg(all(feature = "e2ee", unix))]
+        Command::E2ee(args) => {
+            if db_override.is_some() {
+                bail!("e2ee commands use --worktree instead of --db");
+            }
+            match encrypted::run(args) {
+                Ok(value) => println!("{}", serde_json::to_string(&value)?),
+                Err(error) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&encrypted::error_output(&error))?
+                    );
+                    bail!("encrypted command failed");
+                }
+            }
+        }
         Command::Id { kind } => match kind {
             IdKind::Vid => println!("{}", VolumeId::random()),
             IdKind::Log => println!("{}", LogId::random()),
@@ -4367,7 +4389,18 @@ mod tests {
         );
         let cli = Cli::try_parse_from(["graft", "diff", "--json", "--content", "HEAD~1", "HEAD"])
             .unwrap();
-        assert!(run_command(cli.command, None).is_err());
+        // This form treats the second positional argument as a worktree path.
+        // Keep its revision lookup independent of tests that change the process cwd.
+        let directory = tempfile::tempdir().unwrap();
+        Repository::init(directory.path()).unwrap();
+        let db = directory.path().join("app.sqlite");
+        let error = run_command(cli.command, Some(&db)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("HEAD does not point at a commit yet"),
+            "{error:#}"
+        );
         assert!(
             Cli::try_parse_from([
                 "graft",
