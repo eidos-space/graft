@@ -1,6 +1,6 @@
 # Graft Remote changelog
 
-## Graft Remote 0.2.5 — 2026-10-16
+## Graft Remote 0.2.5 — 2026-10-17
 
 ### Added
 

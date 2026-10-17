@@ -5,7 +5,7 @@ SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
 
 ## Unreleased
 
-## Graft SDK 0.3.31 — 2026-10-16
+## Graft SDK 0.3.31 — 2026-10-17
 
 ### Added
 
@@ -26,7 +26,7 @@ SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
 - 加密仓库初始化、首次分支上传和克隆支持独立回读验证。私有检查点和恢复日志保留结果未确认的发布数据，使进程重启后能够继续核对和恢复。
 - 历史迁移支持显式选择引用、独立验证，以及由原生仓库写入锁保护的本地切换；修改密码也保留可恢复的事务记录。
 - 正式原生包包含加密会话 API。macOS 包包含可选的系统钥匙串支持，Linux 使用仅当前用户可访问的私有目录。Windows 包会明确拒绝加密注册，本版不支持 Windows 加密同步。
-- 普通仓库继续兼容，升级不会自动迁移已有连接。宿主仍负责账户校验、私有状态保存及普通文件/SQLite 写入协调；不提供忘记密码重置或离线设备撤销。
+- 普通仓库继续兼容，升级不会自动迁移已有连接。宿主仍负责账户校验、私有状态保存及普通文件/SQLite 写入协调；不提供忘记密码重置或离线设备撤销。使用钥匙串记住密码要求 macOS 宿主具备正确签名和所需权限。
 
 ## Graft SDK 0.3.30 — 2026-10-09
 
