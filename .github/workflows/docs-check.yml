@@ -55,6 +55,20 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-lychee-
 
+      - name: Resolve checked-out documentation source links
+        run: |
+          node --input-type=module <<'NODE'
+          import { appendFileSync } from 'node:fs';
+          import { resolve } from 'node:path';
+          import { pathToFileURL } from 'node:url';
+
+          const ref = process.env.GITHUB_HEAD_REF || process.env.GITHUB_REF_NAME;
+          const prefix = `https://github.com/eidos-space/graft/blob/${ref}/docs/`;
+          const pattern = prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          const source = pathToFileURL(resolve('docs')).href;
+          appendFileSync(process.env.GITHUB_ENV, `LYCHEE_SOURCE_REMAP=^${pattern} ${source}/\n`);
+          NODE
+
       - name: Check links
         uses: lycheeverse/lychee-action@8646ba30535128ac92d33dfc9133794bfdd9b411 # v2.8.0
         env:
@@ -70,6 +84,7 @@ jobs:
             --max-concurrency 4
             --no-progress
             --remap "https://graft.eidos.space file://$PWD/dist"
+            --remap "$LYCHEE_SOURCE_REMAP"
             --fallback-extensions html
             --exclude-path "llms-.*\.txt"
             --root-dir $PWD/dist
