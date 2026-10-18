@@ -130,6 +130,11 @@ pub fn recover_sealed_memtables(
 
     #[expect(clippy::expect_used)]
     let keyspaces_lock = db.supervisor.keyspaces.read().expect("lock is poisoned");
+    // The live ID mapping stays fixed while replaying all sealed journals.
+    let keyspaces_by_id: HashMap<_, _> = keyspaces_lock
+        .values()
+        .map(|keyspace| (keyspace.id, keyspace))
+        .collect();
 
     for journal_path in sealed_journal_paths {
         log::debug!("Recovering sealed journal: {}", journal_path.display());
@@ -147,11 +152,7 @@ pub fn recover_sealed_memtables(
             let batch = batch?;
 
             for item in batch.items {
-                let Some(keyspace_name) = db.meta_keyspace.resolve_id(item.keyspace_id)? else {
-                    continue;
-                };
-
-                let Some(handle) = keyspaces_lock.get(&keyspace_name) else {
+                let Some(&handle) = keyspaces_by_id.get(&item.keyspace_id) else {
                     continue;
                 };
 
@@ -184,11 +185,7 @@ pub fn recover_sealed_memtables(
             }
 
             for keyspace_id in &batch.cleared_keyspaces {
-                let Some(keyspace_name) = db.meta_keyspace.resolve_id(*keyspace_id)? else {
-                    continue;
-                };
-
-                let Some(handle) = keyspaces_lock.get(&keyspace_name) else {
+                let Some(&handle) = keyspaces_by_id.get(keyspace_id) else {
                     continue;
                 };
 

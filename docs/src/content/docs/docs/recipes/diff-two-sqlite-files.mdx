@@ -1,0 +1,62 @@
+---
+title: Diff Two SQLite Files
+description: Compare two ordinary SQLite database files with row-level detail, without initializing a Graft repository.
+---
+
+`graft diff --no-index` compares two physical SQLite files directly. No
+repository, no `init`, no staging.
+
+## 1. Create two database files
+
+```bash
+sqlite3 old.sqlite "CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT); INSERT INTO notes(body) VALUES('alpha'),('beta'),('gamma');"
+sqlite3 new.sqlite "CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT); INSERT INTO notes(body) VALUES('alpha'),('beta edited'),('gamma'),('delta');"
+```
+
+## 2. Compare the physical snapshots
+
+```bash
+graft diff --no-index old.sqlite new.sqlite
+```
+
+```text
+Diff --no-index old.sqlite..new.sqlite
+modified: old.sqlite -> new.sqlite
+  from: 2 page(s), physical file
+  to:   2 page(s), physical file
+```
+
+Without `--rows`, Graft reports that the physical snapshots differ. It does not
+expand the change into rows.
+
+## 3. Compare rows
+
+Add `--rows` to expand the changed pair into schema, table, and row changes:
+
+```bash
+graft diff --no-index --rows old.sqlite new.sqlite
+```
+
+```text
+Row Diff --no-index old.sqlite..new.sqlite
+modified: old.sqlite -> new.sqlite
+  Table 'notes': +1 inserts ~1 updates
+    + rowid 4: [Null, Text("delta")]
+    ~ rowid 2:
+      old: [Null, Text("beta")]
+      new: [Null, Text("beta edited")]
+```
+
+## 4. Emit JSON
+
+```bash
+graft diff --no-index --rows --json old.sqlite new.sqlite
+```
+
+## Notes
+
+- Both operands must be regular SQLite database files.
+- Each side is captured consistently through SQLite's online backup mechanism, including committed WAL frames.
+- Repository selectors such as `--staged`, `--root`, `--kind`, and `--content` do not apply.
+- To transfer the change instead of displaying it, use
+  [Generate and apply a Delta](/docs/recipes/generate-sqlite-delta/).

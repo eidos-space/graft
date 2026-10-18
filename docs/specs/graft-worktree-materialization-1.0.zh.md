@@ -313,7 +313,10 @@ materialization。
 `applyMerge` 之所以被保守地标为可能物化，是因为它能改变 checkout state：
 
 - up-to-date 会重新校验 plan，通常不做物理写入；
-- fast-forward 移动 `HEAD` 并应用 target checkout plan；当
+- fast-forward 移动 `HEAD` 并应用 target checkout plan；完成权威 clean-worktree
+  检查后，当前与目标不可变状态相同的路径必须保留原物理文件。SDK 的
+  `worktree_paths` 仅报告实际变更或删除的路径，不包含这些未变文件，供 host
+  按实际物化范围校验；当
   `materialize_sqlite=true` 时，变更的 SQLite path 会投影，artifact 与其他
   checkout-managed file 按自己的 policy 处理；
 - three-way 写入 merge index 和 durable merge state。无冲突 path 可以 checkout；

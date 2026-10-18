@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+## Graft 0.16.1 — 2026-10-19
+
+### Fixed
+
+- Republish complete SQLite history after a lazy clone by retrieving missing
+  historical snapshot data from an eligible original source remote. Publishing
+  to an empty destination no longer leaves old commits unreadable.
+- Resolve keyspace IDs once per journal recovery pass, reducing repeated
+  metadata lookups while retaining deleted and recreated keyspace behavior.
+
+### Changed
+
+- Group compact-folder, expand-folder, and collapse-folder controls in the
+  explorer header menu. Bulk expansion still excludes database tables.
+- Show read-only table status as a badge after the breadcrumb, reclaiming the
+  separate toolbar row.
+- Refresh bilingual CLI and SDK guides with SQLite comparison, incremental
+  delta, row-conflict, and snapshot-restore recipes.
+
+### Compatibility
+
+- Repository, snapshot, and remote formats and public APIs are unchanged.
+
+### 中文
+
+- 惰性克隆后向新远端发布历史时，从原来源补齐缺失的 SQLite 旧快照数据，避免旧提交无法读取。
+- 日志恢复复用 keyspace ID 映射，减少重复元数据查询，并保持删除后重建 keyspace 的恢复行为。
+- 目录紧凑、展开和收起操作移到目录树顶部菜单；批量展开仍不包含数据库表。
+- 只读状态改为面包屑后的 badge，移除独占一行的工具栏。
+- 更新双语指南，补充 SQLite 比较、增量数据、行冲突和快照恢复示例；数据格式和公共 API 不变。
+
 ## Graft 0.16.0 — 2026-10-19
 
 ### Added

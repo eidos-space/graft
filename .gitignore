@@ -15,6 +15,9 @@ packages/graft-sdk/node_modules/
 /.kosho**
 /.graft
 
+# Local proposal drafts and implementation evidence
+/docs/proposals/
+
 # Local design drafts and Web UI dependencies
 /design/
 /web-ui/node_modules/

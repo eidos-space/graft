@@ -1,0 +1,95 @@
+---
+title: 快照与恢复历史
+description: 提交 SQLite 数据与应用自有文件，查看历史，回到某个 revision，并恢复单个路径。
+---
+
+Graft 把 SQLite 数据库和相关的应用自有文件记录为同一个版本。本示例提交两个版本，
+检出历史，并恢复单个路径。
+
+## 1. 创建并提交应用状态
+
+```bash
+graft init
+sqlite3 data.sqlite "CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT); INSERT INTO notes(body) VALUES('alpha'),('beta');"
+printf '{"theme":"dark"}\n' > settings.json
+graft add -A && graft commit -m "initial state"
+```
+
+`graft add -A` 会同时 stage database snapshot 和普通文件，因此它们作为一个应用状态
+被版本化。
+
+## 2. 生成第二个版本
+
+```bash
+sqlite3 data.sqlite "UPDATE notes SET body='beta edited' WHERE id=2; INSERT INTO notes(body) VALUES('gamma');"
+graft add -A && graft commit -m "edit and add"
+```
+
+## 3. 查看历史
+
+```bash
+graft log
+graft diff HEAD~1 HEAD --rows
+```
+
+```text
+Row Diff d568d10fe41a..5fe730c035cf
+modified: data.sqlite
+  Table 'notes': +1 inserts ~1 updates
+    ~ rowid 2:
+      old: [Null, Text("beta")]
+      new: [Null, Text("beta edited")]
+    + rowid 3: [Null, Text("gamma")]
+```
+
+## 4. 回到某个 revision
+
+`graft checkout` 会把 worktree 移动到某个 revision，并让 `HEAD` 处于 detached 状态：
+
+```bash
+graft checkout HEAD~1
+sqlite3 -header -column data.sqlite "SELECT * FROM notes;"
+
+graft switch main
+```
+
+```text
+HEAD detached at d568d10fe41a
+id  body
+--  -----
+1   alpha
+2   beta
+```
+
+`graft checkout` 与 `graft switch` 都要求 worktree 干净。
+
+## 5. 恢复单个路径
+
+只从较早的 revision 恢复数据库，其他路径保持不变：
+
+```bash
+graft restore --source HEAD~1 data.sqlite
+sqlite3 -header -column data.sqlite "SELECT * FROM notes;"
+```
+
+```text
+Restored data.sqlite
+id  body
+--  -----
+1   alpha
+2   beta
+```
+
+这会修改 worktree，但不改历史；它相当于暂存了一个普通修改。用从 index 恢复来撤销：
+
+```bash
+graft restore data.sqlite
+```
+
+## 说明
+
+- `graft restore` 不带 `--source` 时从 index 恢复；`--source <rev>` 从 revision 恢复。
+- `graft restore --staged` 恢复 index entry，`--staged --all` 恢复所有 staged 路径。
+- 如果想得到独立的物理文件而不改动 worktree，可以使用
+  `graft export --source HEAD~1 --output before.sqlite data.sqlite`。
+- 上面的 hash 为缩写，每台机器可能不同。

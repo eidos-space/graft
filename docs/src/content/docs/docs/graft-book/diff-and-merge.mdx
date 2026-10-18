@@ -1,102 +1,101 @@
 ---
-title: 05 Diff And Merge
-description: Move from path identity to SQLite row, schema, and opaque analysis, then durable merge state.
+title: 05 Diff and Merge
+description: Read physical and logical differences, then predict when branches combine or conflict.
 ---
 
-## Diff compares identity before interpreting content
+**What changed, and can two changes combine?**
 
-Repository diff first compares trees and classifies added, deleted, and modified paths. SQLite uses
-snapshot identity; artifacts use content identity. An exact delete/add pair can be an exact move,
-but version 1.0 has no similarity rename heuristic.
+A path diff answers “which files changed?” A SQLite logical diff answers “which supported rows and schema entries changed?”
 
-A modified SQLite path is then interpreted across independent domains:
+From a repository with two commits:
 
-- row inserts, deletes, and updates;
-- schema entry changes;
-- opaque virtual, FTS, internal, and index B-tree changes;
-- capabilities, limitations, and execution scope.
-
-An empty row list does not prove the database is unchanged. Inspect logical status, schema, opaque
-changes, and limitations together.
-
-## Row identity and execution paths
-
-Ordinary tables use signed 64-bit `rowid`. `WITHOUT ROWID` tables use typed composite primary keys
-in declaration order. Generated columns may be displayed but are excluded from ordinary replay.
-
-Supported 4 KiB layouts can use streaming B-tree readers. Non-native page sizes and some
-`WITHOUT ROWID` layouts use isolated temporary databases and report `materialized_compat`. Both
-paths must produce equivalent observations. Diff never modifies refs, index, merge journal, or the
-tracked worktree.
-
-## Three-way inputs
-
-```text
-                 Base
-                /    \
-             Ours    Theirs
+```bash
+graft diff HEAD~1 HEAD
+graft diff --rows HEAD~1 HEAD app.sqlite
+graft diff --json --rows HEAD~1 HEAD app.sqlite
 ```
 
-Base is the common ancestor, Ours is local `HEAD` at plan time, and Theirs is the target revision.
-Unrelated histories use an explicit empty base with `merge_base = null`.
+The first command locates changed paths. The others expand database changes. Diff does not change refs, staged state, merge records, or tracked worktree files.
 
-| Outcome | Condition | Apply effect |
+## An empty row list is not “unchanged”
+
+A database can change because of schema, indexes, virtual tables, or other content that is not an ordinary row edit.
+
+Read `logical_status`, schema changes, opaque changes, capabilities, and limitations together. **Opaque** means Graft cannot fully interpret that changed surface. Keep that limitation visible in an application review UI.
+
+Ordinary tables normally use signed 64-bit `rowid` identity. `WITHOUT ROWID` tables use their declared primary key, including composite keys. Generated columns can appear in output but are excluded from ordinary replay.
+
+Supported layouts can be read directly. Other supported cases use an isolated temporary compatibility database and report `materialized_compat`. That temporary database is not the application worktree.
+
+## Merge compares three versions
+
+Suppose two branches start from the same notes:
+
+| id | Base body | Ours body | Theirs body | Result |
+| --- | --- | --- | --- | --- |
+| 1 | first | first, edited locally | first | Local edit |
+| 2 | second | second | second, edited remotely | Incoming edit |
+
+Each side changed a different row. A supported, validated merge can keep both edits.
+
+If both sides change row 1 incompatibly, Graft reports a conflict so you can choose a result.
+
+```text
+         Base: common ancestor
+          /                 \
+ Ours: local HEAD       Theirs: target revision
+          \                 /
+             merge result
+```
+
+This diagram describes ancestry and inputs. Merge uses row and schema meaning, not a comparison of storage LSN numbers.
+
+## Check the history relationship first
+
+| Relationship | Outcome | What happens |
 | --- | --- | --- |
-| up to date | Theirs is an Ours ancestor | no change |
-| fast-forward | Ours is a Theirs ancestor | move ref and checkout |
-| three-way | both diverged | durable index/journal, then resolve/continue or abort |
+| Target is already in local history | Up to date | No change |
+| Local HEAD is an ancestor of target | Fast-forward | Move to target and check out its content |
+| Both sides have new commits | Three-way | Combine changes or enter conflict state |
 
-`planMerge` is read-only. Its token binds heads, target, checkout actions, candidate index, and the
-frozen policy. Apply recomputes current state; stale input has no side effect.
+Unrelated histories use an empty base and report `merge_base = null`.
 
-## Path-level decisions
+The SDK separates read-only `planMerge` from `applyMerge`. The plan token binds the observed inputs and policy. Apply rejects a stale plan rather than applying it to changed state.
 
-| Relationship | Result |
-| --- | --- |
-| Ours == Theirs | shared version |
-| Ours == Base | Theirs |
-| Theirs == Base | Ours |
-| added on one side only | added side |
-| identical add/add | shared addition |
-| delete versus unchanged | deletion |
-| divergent modify or modify/delete | type-specific merge or conflict |
+## Know the limits of automatic merge
 
-Artifacts use conservative whole-path conflicts. Graft attempts row/schema-aware merge only when
-all three inputs are compatible SQLite snapshots. Malformed, unsupported, or opaque uncertainty
-falls back to a whole-path conflict rather than guessing.
+Graft attempts row/schema-aware merge for compatible SQLite inputs. It builds a private candidate, applies safe changes in a transaction, and validates the result, including constraints and foreign keys.
 
-## Constructing a SQLite result
+Incompatible row edits, conflicting schemas, unsupported SQLite surfaces, and modify/delete cases can require resolution. Ordinary files use conservative whole-path conflicts. Schema and internal resolvers are a bounded built-in set; they are not arbitrary SQL hooks.
 
-Graft seeds a private candidate from immutable Ours, validates its integrity, and replays safe
-changes inside one SQLite transaction. Independent row edits combine; incompatible edits to the
-same identity become conflicts. Schema and internal resolvers are a bounded built-in set, not
-arbitrary SQL hooks. Constraint maintenance and foreign-key validation run before publication.
+“Different rows” is a useful prediction, not an unconditional guarantee. Schema compatibility and constraints still matter.
 
-A WAL changed-page set can accelerate sparse import, but it is only a conservative set of output
-pages. It never defines cross-branch semantics or bypasses identity checks.
+## Complete or abort a three-way merge
 
-## Durable conflict state
+For branches you have created and recorded:
 
-Three-way apply persists:
-
-```text
-.graft/ORIG_HEAD
-.graft/MERGE_HEAD
-.graft/index/state.toml
-.graft/merge-resolution-session.json
+```bash
+graft --db app.sqlite merge feature/notes
+graft status
+graft --db app.sqlite conflicts --json
 ```
 
-The worktree is not the only conflict record. Reopening can recover original stages, frozen policy,
-row/cell choices, and unresolved counts. A `graft-merge-v1:` state token binds the complete merge
-state; any relevant change makes an old token stale.
+Close affected application connections before materializing operations.
 
-Whole-path or row/cell/table resolution eventually collapses a path to stage 0. `continue` requires
-no conflicts and creates a repository commit with parents `[Ours, Theirs]`. `abort` restores from
-`ORIG_HEAD` and clears records only after restoration succeeds.
+If the three-way merge has no unresolved conflicts, complete it:
 
-After interruption, the only safe paths are:
-
-```text
-inspect -> continue resolving -> continue
-inspect -> abort
+```bash
+graft merge --continue -m "merge notes"
 ```
+
+A fast-forward has already moved to the target and does not need a merge continuation.
+
+If conflicts remain, inspect and resolve them with the [conflict guide](/docs/guides/merge-conflicts/), then continue. To discard the active merge result and restore the pre-merge version:
+
+```bash
+graft merge --abort
+```
+
+Conflict state includes index stages and a durable resolution journal. Restarting the application does not itself resolve a conflict. After interruption, inspect that state and continue resolving or abort.
+
+Successful continuation creates a commit with both Ours and Theirs as parents. Abort clears merge records only after restoration succeeds.

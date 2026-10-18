@@ -1,0 +1,98 @@
+---
+title: Snapshot And Restore History
+description: Commit SQLite data and app-owned files, inspect history, time-travel to a revision, and restore a single path.
+---
+
+Graft records a SQLite database and related app-owned files as one version.
+This recipe commits two versions, checks out history, and restores one path.
+
+## 1. Create and commit app state
+
+```bash
+graft init
+sqlite3 data.sqlite "CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT); INSERT INTO notes(body) VALUES('alpha'),('beta');"
+printf '{"theme":"dark"}\n' > settings.json
+graft add -A && graft commit -m "initial state"
+```
+
+`graft add -A` stages the database snapshot and the ordinary file together, so
+they are versioned as one application state.
+
+## 2. Make a second version
+
+```bash
+sqlite3 data.sqlite "UPDATE notes SET body='beta edited' WHERE id=2; INSERT INTO notes(body) VALUES('gamma');"
+graft add -A && graft commit -m "edit and add"
+```
+
+## 3. Inspect history
+
+```bash
+graft log
+graft diff HEAD~1 HEAD --rows
+```
+
+```text
+Row Diff d568d10fe41a..5fe730c035cf
+modified: data.sqlite
+  Table 'notes': +1 inserts ~1 updates
+    ~ rowid 2:
+      old: [Null, Text("beta")]
+      new: [Null, Text("beta edited")]
+    + rowid 3: [Null, Text("gamma")]
+```
+
+## 4. Time-travel to a revision
+
+`graft checkout` moves the worktree to a revision and detaches `HEAD`:
+
+```bash
+graft checkout HEAD~1
+sqlite3 -header -column data.sqlite "SELECT * FROM notes;"
+
+graft switch main
+```
+
+```text
+HEAD detached at d568d10fe41a
+id  body
+--  -----
+1   alpha
+2   beta
+```
+
+`graft checkout` and `graft switch` require a clean worktree.
+
+## 5. Restore a single path
+
+Restore just the database from an earlier revision, leaving other paths alone:
+
+```bash
+graft restore --source HEAD~1 data.sqlite
+sqlite3 -header -column data.sqlite "SELECT * FROM notes;"
+```
+
+```text
+Restored data.sqlite
+id  body
+--  -----
+1   alpha
+2   beta
+```
+
+This changes the worktree but not history; it stages a normal modification.
+Undo it by restoring from the index:
+
+```bash
+graft restore data.sqlite
+```
+
+## Notes
+
+- `graft restore` with no `--source` restores from the index; `--source <rev>`
+  restores from a revision.
+- `graft restore --staged` restores the index entry, and `--staged --all`
+  restores every staged path.
+- To get a standalone physical file without changing the worktree, use
+  `graft export --source HEAD~1 --output before.sqlite data.sqlite`.
+- Hashes above are abbreviated and differ per machine.

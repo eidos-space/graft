@@ -111,9 +111,9 @@ graft log --json --limit 50 --after <commit-id>
 
 `add --json`, `rm --json`, `commit --json`, `checkout --json`,
 `restore --json`, and `reset --json` return structured path changes and the
-current repository position when available. `commit --json` also reports
-`materialized` SQLite database paths when snapshots are written back to the
-worktree.
+current repository position when available. Staging and commit do not replace
+tracked worktree databases; commit records the staged snapshot, including when
+the live database has changed since staging.
 
 `init --json`, `clone --json`, and `export --json` return lifecycle metadata
 such as repository paths, current branch/head, remote info, materialized paths,

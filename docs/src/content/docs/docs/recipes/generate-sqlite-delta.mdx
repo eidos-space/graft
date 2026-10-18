@@ -1,0 +1,71 @@
+---
+title: Generate And Apply A Delta
+description: Create a portable SQLite page delta, inspect it, and rebuild the target database from its exact base.
+---
+
+A Graft delta captures only the SQLite pages that changed between two database
+files. It is repository-independent: pass it around, then apply it to the exact
+base to reconstruct the target.
+
+## 1. Create a base and a target
+
+```bash
+sqlite3 old.sqlite "CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT); INSERT INTO notes(body) VALUES('alpha'),('beta');"
+sqlite3 new.sqlite "CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT); INSERT INTO notes(body) VALUES('alpha'),('beta edited'),('gamma');"
+```
+
+## 2. Create the delta
+
+```bash
+graft delta create --base old.sqlite --target new.sqlite --output change.delta
+```
+
+```text
+Created SQLite delta change.delta
+Base: old.sqlite (8192 bytes, 8a06d738...)
+Target: new.sqlite (8192 bytes, cc187dfb...)
+Changed pages: 1
+Delta bytes: 4204
+Smaller than target: yes
+```
+
+The delta is bound to the exact base and target content digests.
+
+## 3. Inspect without applying
+
+```bash
+graft delta inspect change.delta
+```
+
+`inspect` validates the delta and prints its format, base and target digests,
+changed page count, and size. It never writes a database.
+
+## 4. Apply to the exact base
+
+```bash
+graft delta apply --base old.sqlite --delta change.delta --output rebuilt.sqlite
+
+sqlite3 -header -column rebuilt.sqlite "SELECT * FROM notes;"
+```
+
+```text
+id  body
+--  -----------
+1   alpha
+2   beta edited
+3   gamma
+```
+
+## Notes
+
+- `apply` requires the exact base. A different base fails and writes nothing:
+
+  ```text
+  Error: Command error: SQLite delta does not match the supplied base image
+  ```
+
+- Neither `create` nor `apply` overwrites an existing output file.
+- The `delta` command group cannot be combined with `--db`.
+- For row-level review before you transfer anything, see
+  [Diff two SQLite files](/docs/recipes/diff-two-sqlite-files/).
+- Hashes above are shortened for readability.

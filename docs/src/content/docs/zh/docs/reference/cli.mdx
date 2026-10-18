@@ -96,8 +96,8 @@ graft log --json --limit 50 --after <commit-id>
 
 `add --json`、`rm --json`、`commit --json`、`checkout --json`、
 `restore --json` 和 `reset --json` 会返回结构化 path changes，并在可用时包含当前
-repository position。`commit --json` 还会在 SQLite snapshot 写回 worktree 时返回
-`materialized` database paths。
+仓库位置。暂存与提交不替换已跟踪的工作区数据库。即使数据库在暂存后又发生变化，
+commit 仍记录暂存快照。
 
 `init --json`、`clone --json` 和 `export --json` 会返回 lifecycle metadata，
 包括 repository paths、当前 branch/head、remote info、materialized paths 和导出的

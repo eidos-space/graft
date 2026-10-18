@@ -1,0 +1,70 @@
+---
+title: 生成并应用 Delta
+description: 创建一个可移植的 SQLite page delta，检查它，并从精确 base 重建 target 数据库。
+---
+
+Graft delta 只记录两个数据库文件之间发生变化的 SQLite page。它与 repository
+无关：可以随意传递，然后应用到精确 base 以重建 target。
+
+## 1. 创建 base 与 target
+
+```bash
+sqlite3 old.sqlite "CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT); INSERT INTO notes(body) VALUES('alpha'),('beta');"
+sqlite3 new.sqlite "CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT); INSERT INTO notes(body) VALUES('alpha'),('beta edited'),('gamma');"
+```
+
+## 2. 创建 delta
+
+```bash
+graft delta create --base old.sqlite --target new.sqlite --output change.delta
+```
+
+```text
+Created SQLite delta change.delta
+Base: old.sqlite (8192 bytes, 8a06d738...)
+Target: new.sqlite (8192 bytes, cc187dfb...)
+Changed pages: 1
+Delta bytes: 4204
+Smaller than target: yes
+```
+
+delta 绑定到精确的 base 与 target content digest。
+
+## 3. 只检查、不应用
+
+```bash
+graft delta inspect change.delta
+```
+
+`inspect` 会校验 delta，并输出格式、base/target digest、changed page 数量与大小，
+不会写入任何数据库。
+
+## 4. 应用到精确 base
+
+```bash
+graft delta apply --base old.sqlite --delta change.delta --output rebuilt.sqlite
+
+sqlite3 -header -column rebuilt.sqlite "SELECT * FROM notes;"
+```
+
+```text
+id  body
+--  -----------
+1   alpha
+2   beta edited
+3   gamma
+```
+
+## 说明
+
+- `apply` 要求精确 base。base 不匹配时会失败，并且不写入任何文件：
+
+  ```text
+  Error: Command error: SQLite delta does not match the supplied base image
+  ```
+
+- `create` 与 `apply` 都不会覆盖已存在的输出文件。
+- `delta` 命令组不能与 `--db` 组合使用。
+- 传输前若要先做行级检查，见
+  [比较两个 SQLite 文件](/zh/docs/recipes/diff-two-sqlite-files/)。
+- 上面的 hash 为了可读性做了截断。

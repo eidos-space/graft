@@ -1,135 +1,91 @@
 ---
-title: 01 Repository And Objects
-description: Open .graft and separate immutable objects, mutable refs, the index, and the worktree.
+title: 01 Repository and Objects
+description: Understand how a commit names files, how branches name commits, and which state to inspect.
 ---
 
-## A repository is not one database
+**Where is my application version?**
 
-A Graft repository is an ordinary worktree plus `.graft/`. Applications own the physical worktree
-files; `.graft/` stores history, staged state, refs, SQLite page storage, and recovery records.
+The worktree contains the files your application opens. Graft keeps repository state in `.graft/` beside them.
 
 ```text
 project/
-  app.sqlite
-  settings.json
-  attachments/report.pdf
-  .graft/
-    config.toml
-    HEAD
-    refs/
-    logs/
-    objects/
-    store/
-    index/
-    locks/
-    tmp/
+├── app.sqlite
+├── settings.json
+├── attachments/
+│   └── report.pdf
+└── .graft/          Graft history, staging, storage, and recovery state
 ```
 
-A repository path is normalized UTF-8 relative to the worktree. Empty paths, `.`, `..`, absolute
-paths, and paths addressing `.graft` are invalid identities.
+This is a physical directory tree. `app.sqlite` is one file. Its tables are logical contents inside that file.
 
-## Map of `.graft/`
+Use repository commands to inspect or change history. Do not edit files inside `.graft/` as an application API.
 
-| Path | Contents | Role |
-| --- | --- | --- |
-| `config.toml` | format, branch, files, merge, and remote settings | mutable metadata |
-| `HEAD` | symbolic branch ref or detached commit | mutable pointer |
-| `refs/heads/*` | local branch repository commit IDs | mutable pointers |
-| `refs/remotes/*` | last fetched remote positions | mutable pointers |
-| `refs/tags/*` | lightweight or annotated tags | mutable pointers |
-| `logs/HEAD`, `logs/refs/*` | ref update log | append-only recovery aid |
-| `objects/??/*` | blobs, trees, commits, tags | content-addressed immutable data |
-| `objects/pack/*` | packed repository objects | immutable data |
-| `store/fjall/` | SQLite volumes, logs, commits, segments, pages | storage engine data |
-| `store/files/` | bytes for external artifacts | content-addressed payloads |
-| `index/state.toml` | normal and merge stages | mutable staged truth |
-| `index/worktree.toml` | dirty/deleted observations | rebuildable optimization |
-| `MERGE_HEAD`, `ORIG_HEAD` | merge target and original head | recovery metadata |
-| `locks/`, `tmp/`, `cache/` | coordination, replacement, caches | non-canonical support state |
+## A commit names a complete version
 
-Not everything inside `.graft/` has the same status. Objects and snapshots have content identity;
-refs and the index are mutable control state; deleting a cache should only cost performance.
+Suppose commit C1 records one note and a paper theme. C2 records a second note and a dark theme.
 
-## The repository object graph
+The following diagram shows logical references, not directories. C1 and C2 are teaching labels; real commit IDs are content-derived hashes.
 
 ```text
-refs/heads/main
-       |
-       v
-commit C2 ----parent----> commit C1
-   |                         |
-   tree                      tree
-   |
-   +-- app.sqlite ----------> sqlite-snapshot-v1 blob
-   +-- settings.json -------> file-blob-v2
-   +-- report.pdf ----------> large-file-pointer-v1
+main -- points to --> C2 -- parent --> C1
+                      |
+                      +-- tree: paths in this version
+                           |
+                           +-- app.sqlite: database snapshot
+                           +-- settings.json: recorded file bytes
+                           +-- attachments/report.pdf: external payload pointer
 ```
 
-The canonical loose-object envelope is:
+A **tree** maps paths to recorded content. A **blob** describes one path's content. A commit references its tree and parents. Existing objects are immutable: new content produces new objects.
+
+Small text can be stored in its blob. Binary files, large text, and configured external files use an **external payload**: bytes stored separately and identified by content hash. A pointer can be present before those bytes have been downloaded.
+
+## A branch names a commit
+
+A **ref** is a mutable pointer. A branch such as `main` is a ref that moves when you commit.
 
 ```text
-graft-object 1 <kind> <payload-length>\0<payload>
+Before commit: main -> C1
+After commit:  main -> C2 -> C1
 ```
 
-`kind` is `blob`, `tree`, `commit`, or `tag`. The BLAKE3 of the whole envelope is a 64-character
-object ID. Loose objects use two-character fan-out. Reads recompute the ID, and an existing object
-with the same content never needs to be overwritten.
+Creating another branch at C2 does not copy the databases. It creates another pointer to the same version.
 
-### Three content representations
+**HEAD** identifies your current position. Normally it names the current branch. A detached HEAD names a commit directly. Before the first commit, HEAD can name `main` even though that branch has no commit yet.
 
-| Worktree content | Tree mode | Blob | Byte storage |
-| --- | ---: | --- | --- |
-| SQLite database | `160000` | `sqlite-snapshot-v1` | pages in `store/fjall` |
-| inline text/small file | `100644` | `file-blob-v2` | Base64 in the blob |
-| external file | `100644` | `large-file-pointer-v1` | content-hash fan-out under `store/files/` |
+Inspect these relationships with:
 
-An external pointer can exist while its bytes are not locally hydrated. Knowing an artifact's
-identity and being able to read its bytes are separate states.
-
-## Refs are mutable publication pointers
-
-Objects are never modified in place. A commit writes new objects and then replaces
-`refs/heads/main`:
-
-```text
-before: main -> C1
-write:          C2(parent=C1)
-after:  main -------------> C2
+```bash
+graft log
+graft show HEAD
+graft branch
 ```
 
-`HEAD` normally contains a symbolic ref such as `refs/heads/main`; a detached HEAD contains a
-commit ID. Before the first commit, that symbolic branch may not exist yet: an unborn branch.
+## The index selects changes to the current version
 
-Higher-level operations write immutable dependencies before moving a ref. Expected-value updates
-report stale state instead of overwriting a concurrent writer.
+Outside a merge, the index stores staged differences from HEAD. A staged path replaces or removes that path in the next commit. Paths without staged entries keep their HEAD versions.
 
-## The index is an overlay on HEAD
-
-Outside a merge, the index stores only staged differences from `HEAD`:
-
-- a stage-0 object adds or replaces a path;
-- a stage-0 entry without an object deletes a path;
-- no entry means inherit the `HEAD` version.
-
-During merge, one path can have:
+During a merge, it can also hold three versions of a conflicted path:
 
 | Stage | Meaning |
-| ---: | --- |
-| 1 | Base |
-| 2 | Ours |
-| 3 | Theirs |
-| 0 | Resolved next-commit result |
-
-Any unresolved stage prevents a normal commit. A missing stage can mean deletion; it is not by
-itself corruption.
-
-## Authority cheat sheet
-
-| Question | Authority |
 | --- | --- |
-| What is the app reading now? | physical worktree file |
-| What will the next commit contain? | `HEAD` plus stage-0 index overlay |
-| What is in a historical version? | commit → tree → blob graph |
-| What bytes does a SQLite blob represent? | descriptor → storage commits/pages |
-| Where is the current branch? | `HEAD` and `refs/heads/*` |
-| What were both sides of a conflict? | index stages plus merge journal |
+| 1 | Base: common ancestor |
+| 2 | Ours: local version |
+| 3 | Theirs: incoming version |
+| 0 | Selected result for the next commit |
+
+An unresolved conflict blocks completion. A missing side can mean the path was deleted.
+
+## Inspect the state that answers your question
+
+| Question | Inspect |
+| --- | --- |
+| What does the application read now? | Worktree file or SQL query |
+| What is staged? | `graft status` and `graft diff --staged` |
+| What did I record? | `graft show HEAD`, history diff, or export |
+| Which branch am I on? | `graft branch` |
+| What remains unresolved? | `graft conflicts` |
+
+Internal caches help Graft work faster. They do not define recorded versions. Refs, objects, staged state, and merge recovery records serve different purposes; do not treat the whole `.graft/` directory as a disposable cache.
+
+See the [repository specification](/docs/specifications/) for object encoding, path normalization, and ref update rules.

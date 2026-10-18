@@ -17,11 +17,14 @@ hero:
 
 import { CardGrid, LinkCard } from "@astrojs/starlight/components";
 
-Git 会把 SQLite 数据库作为不透明的二进制文件跟踪。Graft 创建存储高效的快照，
-展示表结构与行级变化，并合并受支持的数据库改动。
-相关文件也可以包含在同一次提交中。
+Graft 为 SQLite 数据库和相关应用文件记录版本。你可以查看行变化、恢复旧数据、
+合并受支持的分支修改，并把已记录历史传到远端。应用继续使用普通 SQLite 文件。
 
 Graft 采用类似 Git 的工作流，并使用独立的仓库格式与远端机制。
+
+先分清几个动作：保存应用事务改变当前数据，`graft add` 选定快照，
+`graft commit` 记录快照，push 发送已记录历史。
+[快速开始](/zh/docs/quickstart/cli/)会逐步验证这些关系。
 
 ## 选择接入方式
 

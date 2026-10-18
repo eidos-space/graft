@@ -1,79 +1,129 @@
 ---
 title: 远端同步
-description: 配置 Graft remotes、push/pull 分支、clone 仓库并选择 remote backend。
+description: 发布已记录历史，先 fetch 检查，再判断 pull 何时替换本地文件。
 ---
 
-Graft remote 存储 repository objects、refs、SQLite storage 和 external
-payloads。
+远端在本地 `.graft/` 之外保存已记录历史及所需数据库和文件内容。push 传输提交，不传输应用最新的未提交变化。
 
-支持的 URI：
+需显式开启的原生密码加密传输见[加密同步](/zh/docs/guides/encrypted-sync/)。
 
-```text
-memory
-fs:///absolute/path
-s3://bucket/prefix
-s3_compatible://bucket/prefix?endpoint=https://...
-https://host/org/space
-```
+## 先选择动作，再选择后端
 
-## 添加 Remote
+| 目标 | 命令 | 替换已跟踪文件吗？ |
+| --- | --- | --- |
+| 发布本地提交 | `graft push origin main` | 否 |
+| 获取远端历史供检查 | `graft fetch origin main` | 否 |
+| 获取并应用远端历史 | `graft pull origin main` | 可能 |
+| 创建新的本地仓库 | `graft clone <uri> main` | 写入检出的文件 |
 
-本地测试：
+pull 前关闭受影响的应用 SQLite 连接。出现冲突或失败后，先检查仓库状态，再重新打开连接。
+
+## 1. 配置远端
+
+隔离的本地测试应选择新的绝对路径：
 
 ```bash
 graft remote add origin fs:///tmp/graft-remote
+graft remote list
 ```
 
-S3-compatible：
+`origin` 是远端在本地的名称，不是分支。
+
+S3 兼容存储：
 
 ```bash
 export AWS_ACCESS_KEY_ID="..."
 export AWS_SECRET_ACCESS_KEY="..."
 export AWS_REGION="auto"
-
 graft remote add origin 's3_compatible://my-bucket/prod/app?endpoint=https://account.r2.cloudflarestorage.com'
 ```
 
-HTTP remote：
+Graft HTTP 服务：
 
 ```bash
 export GRAFT_REMOTE_TOKEN='grt_...'
 graft remote add origin 'https://example.com/acme/archive'
 ```
 
-自定义 token 变量：
+这些是不同的配置选项。凭据应通过显式环境变量或适配器输入提供，不写入 URL 值或仓库配置。
+
+使用其他 token 变量：
 
 ```bash
 export GRAFT_ARCHIVE_TOKEN='grt_...'
 graft remote add origin 'https://example.com/acme/archive?token_env=GRAFT_ARCHIVE_TOKEN'
 ```
 
-## Push / Fetch / Pull
+查询参数指定变量名，不包含 token 本身。
+
+支持的 URI 包括 `memory`、`fs://`、`s3://`、`s3_compatible://`、HTTP(S) 和显式的 `graft+http(s)://` 形式。见 [URI 规则](/zh/docs/reference/remote-uris/)。
+
+## 2. 发布已记录版本
+
+先在 `main` 上创建提交：
 
 ```bash
+graft status
 graft push origin main
-graft push --all origin
-graft fetch origin main
-graft fetch --all origin
-graft pull origin main
+graft ls-remote origin
 ```
 
-当前分支配置 upstream 后，可以直接：
+**检查：**远端分支指向预期提交。已暂存或未暂存的变化仍在本地，提交后才能成为远端历史。
+
+Graft 先上传所需的不可变内容，再更新远端分支。更新会检查之前观察到的值，因此并发写入可能导致拒绝。
+
+推送所有本地分支：
 
 ```bash
-graft push
-graft pull
+graft push --all origin
 ```
 
-非 fast-forward pull 会进入 merge state。
+`graft push --force origin main` 允许有意执行非快进更新。它仍检查预期值，也可能改变其他客户端看到的历史。
 
-## Clone
+## 3. 先获取、检查，再决定是否应用
+
+```bash
+graft fetch origin main
+graft diff HEAD origin/main
+```
+
+**检查：**当前分支与工作区保持原位，差异展示刚获取的远端版本与本地版本的区别。
+
+获取全部分支：
+
+```bash
+graft fetch --all origin
+```
+
+准备好应用远端分支后：
+
+```bash
+graft pull origin main
+graft status
+```
+
+pull 可能快进，也可能进入三方合并。仍有冲突时，使用[冲突指南](/zh/docs/guides/merge-conflicts/)。下载完成不等于合并完成。
+
+分支配置上游后，`graft push` 和 `graft pull` 可以省略显式名称。
+
+## 4. 克隆到新目录
 
 ```bash
 mkdir app-clone
 cd app-clone
 graft clone fs:///tmp/graft-remote main
+graft status
+graft log
 ```
 
-详见 [Remote URI](/zh/docs/reference/remote-uris/) 和
-[连接 HTTP 远端](/zh/docs/guides/http-remote/)。
+clone 配置 `origin`，获取分支，再写出已记录文件。使用空目标目录。
+
+**检查：**确认分支和提交，再查询恢复出的应用数据库。
+
+## push 响应丢失时
+
+请求发出后的超时或取消，不能证明远端更新失败。先重新读取并确认远端分支值，再发布另一个后继版本。
+
+远端副本可以参与备份策略，但不会定义保留与恢复政策。失败边界见[远端与恢复](/zh/docs/graft-book/remotes-and-recovery/)，服务要求见 [HTTP 集成](/zh/docs/guides/http-remote/)。
+
+使用 `remote get-url`、`set-url`、`rename`、`remove` 和 `prune` 管理配置。精确参数见 [CLI 参考](/zh/docs/reference/cli/)。

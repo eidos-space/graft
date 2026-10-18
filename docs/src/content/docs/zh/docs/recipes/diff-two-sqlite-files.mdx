@@ -1,0 +1,61 @@
+---
+title: 比较两个 SQLite 文件
+description: 直接以行级细节比较两个普通 SQLite 数据库文件，无需初始化 Graft repository。
+---
+
+`graft diff --no-index` 直接比较两个物理 SQLite 文件。不需要 repository、不需要
+`init`、不需要 staging。
+
+## 1. 创建两个数据库文件
+
+```bash
+sqlite3 old.sqlite "CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT); INSERT INTO notes(body) VALUES('alpha'),('beta'),('gamma');"
+sqlite3 new.sqlite "CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT); INSERT INTO notes(body) VALUES('alpha'),('beta edited'),('gamma'),('delta');"
+```
+
+## 2. 比较物理快照
+
+```bash
+graft diff --no-index old.sqlite new.sqlite
+```
+
+```text
+Diff --no-index old.sqlite..new.sqlite
+modified: old.sqlite -> new.sqlite
+  from: 2 page(s), physical file
+  to:   2 page(s), physical file
+```
+
+不加 `--rows` 时，Graft 只说明两个物理快照不同，不会把变化展开成行。
+
+## 3. 比较行
+
+加上 `--rows`，把 changed pair 展开为 schema、table 和 row 变化：
+
+```bash
+graft diff --no-index --rows old.sqlite new.sqlite
+```
+
+```text
+Row Diff --no-index old.sqlite..new.sqlite
+modified: old.sqlite -> new.sqlite
+  Table 'notes': +1 inserts ~1 updates
+    + rowid 4: [Null, Text("delta")]
+    ~ rowid 2:
+      old: [Null, Text("beta")]
+      new: [Null, Text("beta edited")]
+```
+
+## 4. 输出 JSON
+
+```bash
+graft diff --no-index --rows --json old.sqlite new.sqlite
+```
+
+## 说明
+
+- 两个操作数都必须是普通 SQLite database file。
+- 两侧都通过 SQLite online backup 取得一致 snapshot，并包含已提交的 WAL frames。
+- `--staged`、`--root`、`--kind`、`--content` 等 repository selector 不适用。
+- 如果要传递变化本身，而不是展示变化，请使用
+  [生成并应用 Delta](/zh/docs/recipes/generate-sqlite-delta/)。

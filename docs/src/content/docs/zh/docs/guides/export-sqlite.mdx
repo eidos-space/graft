@@ -1,62 +1,72 @@
 ---
 title: 导出 SQLite 文件
-description: 将 Graft SQLite snapshot 导出为普通数据库文件，并导入外部 SQLite 修改。
+description: 把已记录数据库写到独立文件供检查，保留当前应用数据。
 ---
 
-Graft 把 SQLite 历史存为 snapshot，但可以 materialize 和 export 普通 SQLite
-数据库文件。
+想检查或交付一个数据库版本，同时保留当前应用数据库时，使用 export。
 
-## Worktree Materialization
+`export` 把普通 SQLite 文件写到独立目标，不移动 HEAD，不改变暂存区，也不替换已跟踪数据库。
 
-默认情况下，commit、checkout、switch、pull 和 merge-continue 后，Graft 会把
-tracked SQLite snapshot 写回 worktree 的数据库路径：
+## 导出明确的版本
 
-```text
-project/
-  data.sqlite
-  .graft/
-```
-
-`data.sqlite` 是普通 SQLite 文件，可被标准工具读取。
-
-## Export Snapshot
-
-导出当前 worktree database state：
+在已跟踪 `app.sqlite` 的仓库中，选择工作区外的新输出路径：
 
 ```bash
-graft export --output data.inspect.sqlite data.sqlite
+graft export --source HEAD --output ../notes-head.sqlite app.sqlite
+graft export --source HEAD~1 --output ../notes-previous.sqlite app.sqlite
 ```
 
-导出指定 revision：
+`HEAD` 选择当前已记录版本，`HEAD~1` 选择它的第一个父提交。需要特定历史检查点时，显式指定来源。
+
+获取结构化结果：
 
 ```bash
-graft export --source HEAD --output data.head.sqlite data.sqlite
-graft export --source HEAD~1 --output data.previous.sqlite data.sqlite
+graft export --json --source HEAD --output ../notes-review.sqlite app.sqlite
 ```
 
-导出的文件是普通 SQLite 数据库，不再连接当前 Graft volume。
+结果描述导出的文件，不表示它与 Graft 存储保持实时连接。
 
-## 使用外部 SQLite 工具
-
-普通 SQLite 连接是默认写入方式。提交 SQLite transaction 后直接 stage：
+## 使用普通 SQLite 工具查询
 
 ```bash
-sqlite3 data.sqlite "INSERT INTO notes(body) VALUES ('external edit');"
-graft add data.sqlite
-graft commit -m "import external edit"
+sqlite3 ../notes-head.sqlite 'SELECT id, body FROM notes ORDER BY id;'
 ```
 
-`graft add` 使用 SQLite online backup 捕获一致的 committed state，包括已提交的
-WAL frames，不需要手动 checkpoint，也不会修改源数据库。随后它只把相对
-staged/HEAD 基线发生变化的 4 KiB Graft storage chunks 写入存储，这个粒度与物理
-数据库的 SQLite page size 无关。
+**检查：**查询结果是否符合要导出的版本。工作区可能还有更新的未暂存笔记，因此查询工作区文件可能得到不同结果。
 
-## 禁用 Materialization
+独立文件使用 `sqlite3` 或其他普通数据库查看器。`graft sql` 操作 Graft 工作区中的数据库。
+
+## 让应用使用该版本时，选择 restore
+
+`export` 保留当前已跟踪文件，restore 则替换它：
+
+```bash
+graft restore --source HEAD -- app.sqlite
+```
+
+restore 前关闭受影响的应用 SQLite 连接。恢复写入前，查询结果数据库并检查状态。
+
+switch、checkout、pull 和合并操作也可能把已记录数据库内容写回工作区。暂存与提交不会替换当前数据库。
+
+## 记录其他 SQLite 工具的修改
+
+对于包含 `notes` 表的已跟踪数据库：
+
+```bash
+sqlite3 app.sqlite "INSERT INTO notes(body) VALUES ('external edit');"
+graft add app.sqlite
+graft commit -m "record external edit"
+```
+
+先提交 SQLite 事务，再暂存。Graft 捕获已提交的 WAL 内容，无需手动 checkpoint，然后复用未变化的 4 KiB 存储块。
+
+## 仅在需要时配置检出投影
 
 ```toml
 [worktree]
 materialize_sqlite = true
 ```
 
-默认是 `true`。只有明确想要 volume-only database path 的集成才应设为
-`false`。
+默认是 `true`。设为 `false` 会关闭普通 checkout 计划中的 SQLite 投影。它不会让所有操作变成只读：显式冲突解决和普通文件仍可能写入工作区。
+
+管理数据库连接时，使用 SDK 的操作判断和实际路径结果。生命周期与失败限制见[切换与恢复](/zh/docs/graft-book/checkout-and-restore/)。

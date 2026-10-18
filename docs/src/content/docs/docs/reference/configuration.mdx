@@ -139,7 +139,11 @@ snapshots at their repo-relative database paths, such as `data.sqlite` or
 `sub-app/main.sqlite`. Staging and commit record repository state without
 replacing the live worktree file.
 
-Set it to `false` only for integrations that intentionally want volume-only database paths and do not want ordinary SQLite files in the worktree.
+Set it to `false` when an integration intentionally disables SQLite projection
+in ordinary checkout plans. This does not prevent every worktree write:
+explicit conflict resolution and ordinary file artifacts can still write paths.
+Manage SQLite connections using the operation's materialization gate and
+returned path effects, rather than this setting alone.
 
 ## Repository Storage
 

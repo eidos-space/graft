@@ -1,117 +1,116 @@
 ---
 title: CLI Quickstart
-description: Create a Graft repository, commit SQLite data and files, inspect a row diff, and restore state.
+description: Record two versions, inspect a row change, and verify a database restore.
 ---
 
-import { Aside, Steps } from "@astrojs/starlight/components";
+import { Aside } from "@astrojs/starlight/components";
 
-The CLI is the shortest path to a working Graft repository. This guide creates
-two versions of a SQLite database and an app-owned file, then verifies that the
-database can be restored.
+This guide records two versions of a notes database and a settings file. You will inspect the inserted row, discard a scratch deletion, and query the restored database.
 
-<Aside type="tip" title="Prefer zero install?">
-  Start with the [Playground](/docs/quickstart/playground/). It runs the same
-  v0.15.5 CLI in a browser-only OPFS worktree, then points back to this local
-  workflow.
+Install the [CLI](/docs/overview/installation/) first. Run this example in a new scratch directory.
+
+<Aside type="tip" title="Try in the browser">
+  The [Playground](/docs/quickstart/playground/) runs the browser CLI in an OPFS worktree. It is useful for local history exercises; it does not provide native remote synchronization.
 </Aside>
 
-## Create A Repository
-
-<Steps>
-
-1. Create a scratch app data directory.
-
-   ```bash
-   mkdir app-state-demo
-   cd app-state-demo
-   ```
-
-2. Initialize Graft.
-
-   ```bash
-   graft init
-   ```
-
-   This creates `.graft/`. It does not create a default SQLite database.
-
-3. Write SQLite data.
-
-   ```bash
-   graft sql --db data.sqlite "CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT);"
-   graft sql --db data.sqlite "INSERT INTO notes(body) VALUES ('first note');"
-   ```
-
-4. Inspect status.
-
-   ```bash
-   graft status
-   ```
-
-   `data.sqlite` appears as an unstaged SQLite database snapshot.
-
-   At this point it is still a normal SQLite file. Graft reads it only when a
-   repository command needs to inspect or stage the path.
-
-5. Commit the first app-state version.
-
-   ```bash
-   graft add --all
-   graft commit -m "seed notes"
-   ```
-
-6. Change the database and add an app file.
-
-   ```bash
-   graft sql --db data.sqlite "INSERT INTO notes(body) VALUES ('second note');"
-   mkdir -p attachments
-   printf 'draft\n' > attachments/readme.txt
-   ```
-
-7. See how Graft classifies paths.
-
-   ```bash
-   graft status --json
-   ```
-
-   Path entries include `kind` and `storage`, so apps can render database
-   snapshots and files differently.
-
-8. Commit and inspect a row diff.
-
-   ```bash
-   graft add --all
-   graft commit -m "add second note and attachment"
-   graft diff --rows HEAD~1 HEAD data.sqlite
-   ```
-
-9. Restore the database from the latest commit.
-
-   ```bash
-   graft sql --db data.sqlite "DELETE FROM notes;"
-   graft restore --source HEAD -- data.sqlite
-   graft status
-   ```
-
-   The final status should be clean.
-
-</Steps>
-
-## Run SQL From Stdin
-
-If no SQL argument is passed, `graft sql --db <path>` reads stdin:
+## 1. Create application data
 
 ```bash
-cat <<'SQL' | graft sql --db data.sqlite
-CREATE TABLE IF NOT EXISTS notes(id INTEGER PRIMARY KEY, body TEXT);
-INSERT INTO notes(body) VALUES ('hello from stdin');
-SELECT * FROM notes;
-SQL
+mkdir graft-notes-demo
+cd graft-notes-demo
+graft init
+graft sql --db app.sqlite \
+  "CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT NOT NULL);"
+graft sql --db app.sqlite \
+  "INSERT INTO notes VALUES (1, 'first');"
+printf '{"theme":"paper"}\n' > settings.json
+graft status
 ```
 
-## What To Read Next
+`init` creates `.graft/`, not a database. `graft sql` writes a normal SQLite file. You can use your application's existing SQLite library instead.
 
-- [Track databases and files](/docs/guides/track-databases-and-files/)
-- [Diff rows and files](/docs/guides/diff-rows-and-files/)
-- [Merge conflicts](/docs/guides/merge-conflicts/)
-- [Sync with remotes](/docs/guides/sync-remotes/)
-- [Run the extended app-state walkthrough](/docs/quickstart/app-state-walkthrough/)
+**Check:** status lists the database and settings as new paths. Neither is recorded in history yet.
+
+## 2. Record the first version
+
+```bash
+graft add app.sqlite
+graft add settings.json
+graft diff --staged
+graft commit -m "save first note and settings"
+graft status
+graft log
+```
+
+`add` captures the selected content in the **index**, or staging area. `commit` records that staged content in history.
+
+**Check:** status is clean and log contains your first commit.
+
+## 3. Record a second version
+
+```bash
+graft sql --db app.sqlite \
+  "INSERT INTO notes VALUES (2, 'second');"
+printf '{"theme":"dark"}\n' > settings.json
+graft add app.sqlite
+graft add settings.json
+graft diff --rows --staged app.sqlite
+graft commit -m "save second note and dark theme"
+graft diff HEAD~1 HEAD
+graft diff --rows HEAD~1 HEAD app.sqlite
+```
+
+**Check:** the path diff lists both files. The row diff reports insertion of note 2.
+
+`HEAD` means the current repository position. `HEAD~1` means its first parent, which is the first version in this example.
+
+## 4. Restore and verify
+
+Delete the notes only in this scratch database:
+
+```bash
+graft sql --db app.sqlite "DELETE FROM notes;"
+graft status
+graft restore --source HEAD -- app.sqlite
+graft sql --db app.sqlite "SELECT id, body FROM notes ORDER BY id;"
+graft status
+```
+
+**Check:** the query returns `1, first` and `2, second`; status is clean. Restore writes HEAD's database back to the tracked path without creating a commit.
+
+Each SQL command here closes its connection before returning. In a running application, close affected SQLite connections before restore or branch switching.
+
+## Review in the local WebUI
+
+Run `graft .` inside an existing repository to open its local browser viewer.
+The terminal hosts the server until you press Ctrl+C. **All files**, **Changes**,
+and **History** share the explorer on the right; selecting a path updates the
+content pane on the left. Changes compare the current worktree against HEAD;
+History compares a selected commit against its first parent.
+
+SQLite databases expose read-only table pages and bounded row diffs. In All
+files, hover over a text file's breadcrumb and select **Edit text file**. **Save**
+or Cmd/Ctrl+S writes the worktree without staging it. The viewer rejects a save
+if another process has changed the file. Text previews and edits are limited
+to 2 MB; binary files have no text preview.
+
+```sh
+graft ui . --no-open --port 4178
+```
+
+This prints a local session URL without launching the browser. Keep that URL
+for the running session; a restarted server creates a new session.
+
+## What you have learned
+
+Saving with SQLite changes the worktree. Staging selects content. Committing records that selection. Restore can replace a worktree file with recorded content.
+
+Changes made after `add` are not included automatically. Try the [staging lab](/docs/graft-book/hands-on-lab/) to verify that boundary.
+
+| Your next task | Read |
+| --- | --- |
+| Track attachments or choose paths | [Databases and files](/docs/guides/track-databases-and-files/) |
+| Inspect more kinds of changes | [Diff rows and files](/docs/guides/diff-rows-and-files/) |
+| Combine branch edits | [Merge conflicts](/docs/guides/merge-conflicts/) |
+| Send recorded history elsewhere | [Remote sync](/docs/guides/sync-remotes/) |
+| Integrate into an application | [Choose an integration](/docs/getting-started/) |

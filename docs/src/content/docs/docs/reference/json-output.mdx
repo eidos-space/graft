@@ -92,6 +92,10 @@ Each table entry includes `columns`, `changes`, and, for declared-primary-key
 tables, `primary_key_columns`. A row change uses `rowid` for an ordinary rowid
 table or `key` for a `WITHOUT ROWID` table:
 
+When a table has an `INTEGER PRIMARY KEY` alias, `rowid_alias` names that
+column. Its stored record slot can be `null`; render the logical value from
+the row change's `rowid` for that column.
+
 ```json
 {
   "name": "docs",

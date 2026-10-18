@@ -1,55 +1,57 @@
 ---
 title: 术语表
-description: 集成 Graft repository model 时常见的术语。
+description: 按问题整理 Graft 术语，并用具体例子说明它们的含义。
 ---
 
-## App State
+遇到不熟悉的术语时，查阅本页。[架构导读](/zh/docs/graft-book/)解释这些部分如何协作。
 
-应用需要一致打开的持久状态：SQLite 数据库、设置、附件、生成资产、导入文件等。
+## 当前文件与已记录版本
 
-## Artifact
+| 术语 | 含义 | 例子 |
+| --- | --- | --- |
+| 应用状态（application state） | 应用正常打开所需的持久数据 | 笔记数据库、设置和引用的附件 |
+| 工作区（worktree） | 当前应用文件所在目录 | `project/app.sqlite` 是应用打开的数据库 |
+| 仓库（repository） | 工作区加 `.graft/` 中的 Graft 状态 | 文件、历史、暂存变化、存储与恢复记录 |
+| 暂存区（index） | 为下一次提交选定的变化 | 写入第三条笔记前，暂存的两条笔记快照 |
+| 仓库提交（repository commit） | 不可变的版本记录，引用树和父提交 | `graft commit` 创建的版本 |
+| 树（tree） | 仓库路径到已记录内容的映射 | `app.sqlite`、`settings.json` 与附件 |
+| blob | 描述一个路径内容的仓库对象 | 数据库快照描述符或文件内容 |
+| 引用（ref） | 指向对象的可变指针 | 分支 `main` 指向当前提交 |
+| HEAD | 当前分支位置或直接选定的提交 | 通常跟随 `main`，也可以游离 |
+| 快照（snapshot） | 不可变、一致的已提交数据库状态 | `graft add app.sqlite` 捕获的数据库 |
 
-Graft tree 中跟踪的非 SQLite 文件 entry。文本可以 inline，二进制和配置资源
-路径使用 external payload。
+## 文件内容与存储
 
-## Commit
+| 术语 | 含义 |
+| --- | --- |
+| 普通文件（artifact） | 已跟踪的非 SQLite 文件，例如 `settings.json` |
+| 外部载荷（external payload） | 单独存储、用内容哈希标识的文件字节，由指针描述 |
+| 内容类型（kind） | `sqlite_database`、`text_file` 或 `binary_file` |
+| 存储方式（storage） | `sqlite_snapshot`、`inline` 或 `external` |
+| 存储提交（storage commit） | 存储引擎中的 4 KiB 块变化记录，与仓库提交不同 |
+| LSN | 一个存储日志内的序号，只能在同一日志内比较 |
 
-指向 tree 的不可变 repository object，记录一个 app-state version。
+内容类型与存储方式回答不同问题。JSON 文件可以是 `text_file`，同时使用 `external` 存储。
 
-## External Payload
+## 把已记录内容送到目标
 
-按 content hash 存储在普通 commit/tree object 外部的文件字节。
+| 术语 | 含义 | 改变已跟踪工作区文件吗？ |
+| --- | --- | --- |
+| 补齐内容（hydration） | 在本地 Graft 存储中获取缺失的不可变内容 | 否 |
+| 导出（export） | 把已记录数据库写到独立目标 | 否 |
+| 实体化（materialization） | 把已记录内容写到已跟踪的工作区路径 | 是 |
+| 远端（remote） | 在本地仓库外保存历史和所需内容的命名后端 | 添加远端不会；pull 可能会 |
 
-## Index
+## 组合版本
 
-worktree 和下一个 commit 之间的 staging area。冲突时也保存 base/ours/theirs
-stages。
+| 术语 | 含义 |
+| --- | --- |
+| Base | 三方合并的共同祖先；无共同历史时使用空基准 |
+| Ours | 规划合并时观察到的本地 HEAD |
+| Theirs | 要合并的目标版本 |
+| 快进（fast-forward） | 本地历史未分歧时，移动到后继版本 |
+| 冲突（conflict） | Graft 需要显式选择结果的变化 |
+| 不透明变化（opaque change） | Graft 无法完整解释的 SQLite 变化 |
+| 比较并交换（CAS） | 仅当可变指针仍等于预期值时，才更新它 |
 
-## Kind
-
-tracked path 的内容类型：`sqlite_database`、`text_file`、`binary_file`。
-
-## Materialization
-
-把 tracked SQLite snapshot 写回 worktree 中的普通 SQLite database file。
-
-## Remote
-
-repository objects、refs、SQLite storage 和 external payloads 的命名存储后端。
-
-## Repository
-
-worktree 加 `.graft/` metadata。保存 refs、objects、index、local SQLite
-storage、config 和 payload cache。
-
-## Snapshot
-
-可被 repository object 引用的不可变 SQLite database state。
-
-## Storage
-
-path 的存储策略：`sqlite_snapshot`、`inline`、`external`。
-
-## Worktree
-
-应用数据目录，包含 materialized SQLite files 和 Graft 跟踪的应用文件。
+提交 SQLite 事务、记录 Graft 提交和同步历史是独立操作。文档中出现“提交”时，留意它指的是前两者中的哪一种。
