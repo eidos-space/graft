@@ -111,16 +111,16 @@ class RepositorySession {
     return callJson(() => this.#native.addEncryptedRemote(handle, signal))
   }
 
-  async cloneEncryptedRemote({ branch, signal } = {}) {
+  async cloneEncryptedRemote({ branch, signal, onProgress } = {}) {
     const handle = encryptedHandles.get(this.#encryptedRemote)
     if (!handle) throw new GraftSdkError("Encrypted remote session required", "GRAFT_SDK_INVALID_ARGUMENT")
-    return callJson(() => this.#native.cloneEncryptedRemote(handle, branch, signal))
+    return callJsonWithProgress(() => this.#native.cloneEncryptedRemote(handle, branch, signal, onProgress), onProgress)
   }
 
-  async pushInitialBranch({ branch, verificationDirectory, signal } = {}) {
+  async pushInitialBranch({ branch, verificationDirectory, signal, onProgress } = {}) {
     const handle = encryptedHandles.get(this.#encryptedRemote)
     if (!handle) throw new GraftSdkError("Encrypted remote session required", "GRAFT_SDK_INVALID_ARGUMENT")
-    return callJson(() => this.#native.pushInitialBranch(handle, branch, verificationDirectory === undefined ? undefined : path.resolve(verificationDirectory), signal))
+    return callJsonWithProgress(() => this.#native.pushInitialBranch(handle, branch, verificationDirectory === undefined ? undefined : path.resolve(verificationDirectory), signal, onProgress), onProgress)
   }
 
   prepareEncryptedMigration(password, options) {

@@ -3,6 +3,27 @@
 This changelog covers the independently versioned `@eidos.space/graft` package. Core Graft CLI and
 SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
 
+## Graft SDK 0.3.33 — 2026-10-18
+
+### Fixed
+
+- Report actual encrypted HTTP upload and download bytes, including aggregate
+  bundles and multipart uploads, through the existing transfer callback.
+- Forward `onProgress` from `cloneEncryptedRemote` and `pushInitialBranch`.
+  Initial publication also reports its independent verification download.
+- Keep encrypted transfers indeterminate instead of treating plaintext checkout
+  budgets as final ciphertext totals. Hosts can show byte counts and speed
+  without an inaccurate percentage or remaining-time estimate.
+- Preserve cancellation and retry semantics; each new operation starts fresh
+  counters and callbacks drain before its promise settles.
+
+### 中文
+
+- 加密上传和下载现在报告真实传输字节数，覆盖聚合传输和分片上传。
+- `cloneEncryptedRemote` 和 `pushInitialBranch` 支持 `onProgress`；首次上传的独立回读验证也会报告下载进度。
+- 加密传输不再将明文预算当成最终密文总量，宿主可以显示字节数和速度，避免错误百分比或剩余时间。
+- 保留取消和重试语义；每次新操作重新计数，并在 Promise 完成前排空进度回调。
+
 ## Graft SDK 0.3.32 — 2026-10-18
 
 ### Added

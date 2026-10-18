@@ -1,6 +1,6 @@
 {
   "name": "@eidos.space/graft",
-  "version": "0.3.32",
+  "version": "0.3.33",
   "description": "Long-lived in-process Graft repository sessions for Node.js.",
   "license": "MIT OR Apache-2.0",
   "repository": {

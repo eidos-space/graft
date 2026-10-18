@@ -524,8 +524,8 @@ impl Runtime {
         snapshots: &[Snapshot],
         remote: Arc<Remote>,
     ) -> Result<u64> {
-        let bytes = self.snapshots_download_bytes(snapshots, remote)?;
-        crate::repo::plan_remaining_transfer(crate::repo::TransferDirection::Download, bytes);
+        let bytes = self.snapshots_download_bytes(snapshots, remote.clone())?;
+        remote.plan_download_progress(bytes);
         Ok(bytes)
     }
 

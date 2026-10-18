@@ -67,7 +67,7 @@ impl PreparedFetch<'_> {
                 path: self.outcome.head.clone(),
                 message: "download size exceeds u64".into(),
             })?;
-        plan_remaining_transfer(TransferDirection::Download, bytes);
+        self.remote.plan_download_progress(bytes);
         Ok(())
     }
 

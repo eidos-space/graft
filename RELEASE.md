@@ -10,12 +10,59 @@ Graft has three independent release trains:
   publishes the framework-neutral, Hono, and Cloudflare Remote packages from annotated
   `graft-remote-vX.Y.Z` tags.
 
-All release tag types must point to a commit already merged into `origin/main`. Never release from
-a side branch or a dirty checkout.
+Every release goes through a PR targeting `main`. All release tag types must
+point to that PR's exact merge commit, reachable from `origin/main`. Never
+release from a side branch or a dirty checkout. Keep annotated tags and never
+move a distributed tag. The CLI, SDK and Remote publishers check the merged-PR
+association before building and recheck recorded major regressions before
+publication.
+
+## Performance reports are independent of publishing
+
+`benchmark.yml` records one CLI sample, and `e2ee-performance.yml` records one
+round each for core sync, SDK sync and SQLite hydration. They run on PRs, not
+again on merge or release tags. The previous release is not rebuilt. Manual
+dispatch is available on a PR branch; use it for a failed measurement only,
+not to select a faster result.
+
+`performance-report.yml` reads the original run's artifacts and posts the
+measurements and comparison as a PR comment. It executes only default-branch
+code with write permissions; benchmark jobs have read-only tokens. Each release
+train compares with the latest published release in its own tag namespace,
+following its merge commit back to the previous PR's retained comment. Raw
+samples, resource observations, workload definitions and reference budget
+outcomes remain in the linked artifacts; machine-readable timing data remain
+in PR comments for the next release.
+
+When first installing the comment workflow, or if only posting failed, dispatch
+`performance-report.yml` with the completed performance run ID. This consumes
+the existing artifact and does not measure again.
+
+Only comparable elapsed-time observations block: same runner, architecture,
+Rust toolchain and workload fingerprint, **at least 2× slower and at least
+500 ms additional time**. Both conditions must hold. CLI, SDK and Remote
+release decisions are recorded separately. An old absolute-budget overrun alone
+does not block publication. One observation is not a statistical tail estimate
+or a production latency SLA.
+
+Without a compatible previous report, record a new baseline. Missing
+measurements are explicitly unavailable, not a performance pass. Preserve the
+first valid result per suite and PR head; an empty or faster rerun cannot clear
+a known major regression for that head. Fix a major regression in a new commit
+and measure that commit once. An API read error is not evidence that no report
+exists; retry the failed metadata operation without rebuilding successful jobs.
+
+Functional, security, compatibility, artifact and public-install checks remain
+required. Do not rerun successful performance jobs, build extra signed/native
+candidates or repeat the full source suite merely to chase a timing budget.
+Use `.agents/skills/graft-release/SKILL.md` for release coordination.
 
 ## Prepare the release commit
 
-Update every workspace crate and the `version` field in `sqlpkg.json` to the same version, then merge that change into `main`. Release tags must point at the current `origin/main` commit; do not release from a side branch.
+For a core/CLI release, align `graft-native-crypto`, `graft`, `graft-sqlite`,
+`graft-cli`, `graft-test` and `graft-tracing`, update the matching changelog
+section, then merge the release PR. The SDK and Remote versions are independent.
+The CLI preparation tool requires the current `origin/main` commit.
 
 The latest tag merged into `origin/main` can be found with:
 

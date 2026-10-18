@@ -198,11 +198,13 @@ JavaScript 使用 camelCase method；`diffSqlitePaths` 是 typed bounded SQLite 
 Input camelCase，JSON result 保持 snake_case，如 `expected_head`、`plan_token`、
 `state_token`、`materializes_worktree`。Binding 不能私自改 field。
 
-`push`、`fetch`、`pull`、`cloneRepository` 与 `applyMerge` 可接收 `onProgress`
+`push`、`fetch`、`pull`、`cloneRepository`、`cloneEncryptedRemote`、
+`pushInitialBranch` 与 `applyMerge` 可接收 `onProgress`
 callback。事件报告
 当前操作累计的 HTTP body bytes、`upload`/`download` direction，以及 transport 能可靠
-提供长度时的 `totalBytes`。总量缺失表示 indeterminate；host 不能用 command phase
-伪造 percentage。`applyMerge` 只报告 guarded plan 在 materialize 时仍需 hydration 的
+提供长度时的 `totalBytes`。总量缺失或 `totalIsFinal: false` 表示 indeterminate；host
+不能用递增的单次请求总量或 command phase 伪造 percentage 和剩余时间。
+`applyMerge` 只报告 guarded plan 在 materialize 时仍需 hydration 的
 snapshot bytes；若 plan 已完整 hydration，可以不产生 transfer event。
 
 会竞争的 mutation 使用 `expectedHead`、plan token 或 state token。Typed result
@@ -278,6 +280,13 @@ bytes。同一 operation 的多个 request 与 retry 累计计算；已知 reque
 total 随之增长。传输中事件会限频，成功消费完 body 后发送 final event。Progress 只
 用于观察，不改变 publication、recovery、cancellation 或 error semantics，也不能把
 uncertain remote publication 变成确定结果。
+
+加密 HTTP 操作必须通过同一 reporter 报告密文对象上传、聚合上传 framing、multipart
+分片和下载响应 body，不能暴露明文路径、内容或秘密。依赖是逐步发现的，无法确定
+操作的最终总量，因此事件省略 `totalBytes` 并设置 `totalIsFinal: false`。每次操作重新
+计数；同一次操作内的重试会累计再次消费的字节。上传 body 被消费不代表远端已持久
+保存。首次发布的独立验证 clone 可以在同一操作中报告下载进度。本地加密和工作目录
+materialization 不属于网络字节进度。
 
 ## 10. Stable error
 

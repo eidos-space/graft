@@ -1,0 +1,61 @@
+name: Graft PR Performance Comment
+
+on:
+  workflow_run:
+    workflows: ["Graft Performance", "E2EE Performance"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      performance_run_id:
+        description: "Completed performance run to comment on (no new measurement)"
+        required: true
+        type: string
+
+# PR benchmarks have read-only tokens. This privileged reporter only executes
+# default-branch code and reads bounded JSON; it never executes artifact code.
+permissions:
+  contents: read
+  actions: read
+  pull-requests: write
+  statuses: write
+
+concurrency:
+  group: graft-performance-comment-${{ github.event.workflow_run.head_sha || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  comment:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - uses: actions/setup-node@395ad3262231945c25e8478fd5baf05154b1d79f # v6
+        with:
+          node-version: "24"
+      - name: Resolve the originating PR and current commit
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PERF_RUN_ID: ${{ github.event.workflow_run.id || inputs.performance_run_id }}
+        run: node scripts/performance-report.mjs resolve
+      - name: Prepare report directory
+        if: steps.source.outputs.eligible == 'true'
+        run: mkdir -p "$RUNNER_TEMP/performance-reports"
+      - name: Download only the originating run's reports
+        if: steps.source.outputs.eligible == 'true'
+        continue-on-error: true
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ github.event.workflow_run.id || inputs.performance_run_id }}
+          pattern: graft-performance-*
+          path: ${{ runner.temp }}/performance-reports
+      - name: Retain comparison on the PR
+        if: steps.source.outputs.eligible == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PERF_RUN_ID: ${{ github.event.workflow_run.id || inputs.performance_run_id }}
+          PERF_REPORT_DIR: ${{ runner.temp }}/performance-reports
+        run: node scripts/performance-report.mjs comment

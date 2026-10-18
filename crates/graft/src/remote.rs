@@ -1607,6 +1607,16 @@ impl Remote {
         }
     }
 
+    /// Plaintext checkout budgets omit encryption envelopes and protocol reads.
+    /// They must not become a final denominator for encrypted HTTP transfers.
+    pub(crate) fn plan_download_progress(&self, bytes: u64) {
+        #[cfg(feature = "e2ee")]
+        if matches!(&self.backend, RemoteBackend::Encrypted(_)) {
+            return;
+        }
+        crate::repo::plan_remaining_transfer(TransferDirection::Download, bytes);
+    }
+
     /// Maximum plaintext retained by a buffered encrypted read. Other adapters
     /// retain their existing repository-level prefetch policy.
     pub(crate) fn buffered_read_limit(&self) -> Option<usize> {

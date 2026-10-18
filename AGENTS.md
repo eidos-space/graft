@@ -150,6 +150,12 @@ just benchmark-compare <baseline.json> <candidate.json>
 Do not overwrite checked-in benchmark baselines unless the task explicitly
 requires a new baseline and the environment is comparable.
 
+PR performance CI measures once and leaves results in PR comments. Release
+publishers compare with the previous published release's PR and block only a
+comparable major regression (at least 2× and +500 ms). Absolute-budget overruns
+alone are reports, not release gates. Keep the first observation; do not rerun
+to obtain a faster number. See `RELEASE.md` for the exact comparison policy.
+
 ## Architecture and behavior invariants
 
 - Repository paths are normalized UTF-8 paths relative to the worktree and
@@ -214,6 +220,9 @@ Follow `CONTRIBUTING.md` and the workspace lint configuration.
   updates, or force-push without explicit authorization and an exact target.
 - Pull requests target `main`. Run checks proportional to the changed surfaces
   before handing work back.
+- Every release uses a merged release PR; tags point to its exact merge commit.
+  Read `.agents/skills/graft-release/SKILL.md` for release work. Performance runs
+  independently and must not trigger extra release builds or repeated samples.
 - Core/CLI releases use a `vX.Y.Z` tag and `just run release X.Y.Z`; the
   `--execute` flag creates and pushes the tag, so use it only when explicitly
   authorized. SDK and remote packages have separate release workflows.

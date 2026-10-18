@@ -363,7 +363,7 @@ impl EncryptedHttpClient {
                     .header("Content-Length", end - begin)
                     .header("x-graft-upload-id", &start.upload_id)
                     .header("x-graft-part-number", index + 1)
-                    .body(reqwest::Body::wrap_stream(stream)),
+                    .body(super::super::upload::progress_body(stream)),
             );
             let response = tokio::select! {
                 response = request.send() => response.map_err(transport_error),

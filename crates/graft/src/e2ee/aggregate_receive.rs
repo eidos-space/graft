@@ -148,7 +148,7 @@ impl EncryptedHttpClient {
                 }
             }
         }
-        let body = reqwest::Body::wrap_stream(futures::stream::iter(streams).flatten());
+        let body = crate::e2ee::upload::progress_body(futures::stream::iter(streams).flatten());
         let mut url = self.base.clone();
         {
             let mut path = url
