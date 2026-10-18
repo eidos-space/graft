@@ -183,7 +183,7 @@ test("normalize consumes one real-format observation and refuses multi-round tai
   }
 });
 
-function githubFixture({ releases = true, untrustedMajor = false } = {}) {
+function githubFixture({ releases = true, untrustedMajor = false, maintainerPermission } = {}) {
   const current = {
     number: 34,
     head: { sha: head, repo: { full_name: "eidos-space/graft" } },
@@ -212,6 +212,12 @@ function githubFixture({ releases = true, untrustedMajor = false } = {}) {
       user: { login: "stranger" },
       body: body(report([measurement(900)], { sdk: true })),
     });
+  if (maintainerPermission)
+    comments.push({
+      user: { login: "maintainer" },
+      author_association: "MEMBER",
+      body: body(report([measurement(777, { suite: "e2ee-core" })])),
+    });
   const client = createClient({
     repository: "eidos-space/graft",
     token: "synthetic-test-token",
@@ -231,6 +237,8 @@ function githubFixture({ releases = true, untrustedMajor = false } = {}) {
       else if (route === `commits/${previousMerge}/pulls?per_page=100`) result = [prior];
       else if (route === "pulls/34") result = current;
       else if (route === "pulls/33") result = prior;
+      else if (route === "collaborators/maintainer/permission")
+        result = { permission: maintainerPermission };
       else if (route === "issues/34/comments?per_page=100&page=1") result = comments;
       else if (route === "issues/33/comments?per_page=100&page=1")
         result = [
@@ -277,6 +285,17 @@ test("repository metadata uses the GitHub root endpoint without a trailing slash
     "https://api.github.com/repos/eidos-space/graft",
     "https://api.github.com/repos/eidos-space/graft/actions/runs/71",
   ]);
+});
+
+test("recovered maintainer reports require verified write access and preserve the first observation", async () => {
+  for (const permission of ["admin", "maintain", "write", "read", "none"]) {
+    const fixture = githubFixture({ maintainerPermission: permission });
+    const data = await commentOnRun(fixture.client, 71, [measurement(123, { suite: "e2ee-core" })]);
+    assert.equal(
+      data.measurements[0].metrics.checkout,
+      ["admin", "maintain", "write"].includes(permission) ? 777 : 123,
+    );
+  }
 });
 
 test("actual API orchestration reads annotated releases and leaves machine-readable PR evidence", async () => {

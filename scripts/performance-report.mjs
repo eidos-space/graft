@@ -219,14 +219,27 @@ export function createClient({
     }
     throw new Error("PR comment pagination exceeded; cannot discard older regression records");
   };
-  const reports = async (pr) =>
-    (await comments(pr.number))
-      .filter(
-        (item) =>
-          item.user.login === "github-actions[bot]" || item.user.login === repository.split("/")[0],
-      )
-      .map((item) => readComment(item.body))
-      .filter((data) => data?.headSha === pr.head.sha);
+  const maintainers = new Map();
+  const reports = async (pr) => {
+    const result = [];
+    for (const item of await comments(pr.number)) {
+      const data = readComment(item.body);
+      if (data?.headSha !== pr.head.sha) continue;
+      const login = item.user.login;
+      if (login !== "github-actions[bot]" && login !== repository.split("/")[0]) {
+        // Maintainers can recover an observation from retained CI artifacts.
+        // Organization membership alone does not grant trust: verify write access.
+        if (!["OWNER", "MEMBER", "COLLABORATOR"].includes(item.author_association)) continue;
+        if (!maintainers.has(login)) {
+          const access = await api(`collaborators/${encodeURIComponent(login)}/permission`);
+          maintainers.set(login, ["admin", "maintain", "write"].includes(access.permission));
+        }
+        if (!maintainers.get(login)) continue;
+      }
+      result.push(data);
+    }
+    return result;
+  };
   const associatedPr = async (commit) => {
     assert.match(commit, sha);
     const items = await api(`commits/${commit}/pulls?per_page=100`);
