@@ -1721,8 +1721,9 @@ mod tests {
 
     // Download fixtures obey the same private staging policy as trusted hosts.
     fn private_tempdir() -> tempfile::TempDir {
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
         let directory = tempfile::tempdir().unwrap();
-        #[cfg(windows)]
         crate::native_fs::set_permissions(
             directory.path(),
             crate::native_fs::Permissions::from_mode(0o700),
@@ -4410,13 +4411,23 @@ mod tests {
             std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
                 .unwrap();
         }
-        let adapter = crate::remote::Remote::with_encrypted_http(
+        let adapter_journal_directory = private_tempdir();
+        let adapter_journals = Arc::new(
+            super::super::FileRefMutationJournalProvider::create(
+                adapter_journal_directory.path(),
+                client.session.binding(),
+            )
+            .unwrap(),
+        );
+        let adapter = crate::remote::Remote::with_encrypted_http_recovery(
             client.clone(),
             crate::remote::EncryptedTransferBudget {
                 private_directory: directory.path().to_path_buf(),
                 max_buffered_plaintext: 1024 * 1024,
                 max_ciphertext_spool: 2 * 1024 * 1024,
             },
+            Some(adapter_journals),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -5364,8 +5375,22 @@ mod tests {
             max_buffered_plaintext: 4 * 1024 * 1024,
             max_ciphertext_spool: 8 * 1024 * 1024,
         };
+        let source_journal_directory = private_tempdir();
+        let source_journals = Arc::new(
+            super::super::FileRefMutationJournalProvider::create(
+                source_journal_directory.path(),
+                session.binding(),
+            )
+            .unwrap(),
+        );
         source_credentials
-            .set_encrypted_session("origin", &remote_config, session.clone(), budget.clone())
+            .set_encrypted_session_with_journals(
+                "origin",
+                &remote_config,
+                session.clone(),
+                budget.clone(),
+                source_journals,
+            )
             .unwrap();
         let source_config = remote_config.clone();
         let repository_credentials = source_credentials.clone();
@@ -5431,8 +5456,22 @@ mod tests {
             .unlock(zeroize::Zeroizing::new(b"http sync password".to_vec()))
             .await
             .unwrap();
+        let target_journal_directory = private_tempdir();
+        let target_journals = Arc::new(
+            super::super::FileRefMutationJournalProvider::create(
+                target_journal_directory.path(),
+                target_session.binding(),
+            )
+            .unwrap(),
+        );
         target_credentials
-            .set_encrypted_session("origin", &remote_config, target_session.clone(), budget)
+            .set_encrypted_session_with_journals(
+                "origin",
+                &remote_config,
+                target_session.clone(),
+                budget,
+                target_journals,
+            )
             .unwrap();
         let target_config = remote_config;
         let repository_credentials = target_credentials.clone();

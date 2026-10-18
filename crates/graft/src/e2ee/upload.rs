@@ -296,8 +296,9 @@ async fn write_ciphertext(
 #[cfg(test)]
 mod tests {
     fn private_tempdir() -> tempfile::TempDir {
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
         let directory = tempfile::tempdir().unwrap();
-        #[cfg(windows)]
         crate::native_fs::set_permissions(
             directory.path(),
             crate::native_fs::Permissions::from_mode(0o700),

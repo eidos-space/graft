@@ -985,7 +985,7 @@ impl Remote {
     }
 
     #[cfg(feature = "e2ee")]
-    fn with_encrypted_http_recovery(
+    pub(crate) fn with_encrypted_http_recovery(
         client: crate::e2ee::EncryptedHttpClient,
         budget: EncryptedTransferBudget,
         journals: Option<Arc<dyn crate::e2ee::RefMutationJournalProvider>>,
