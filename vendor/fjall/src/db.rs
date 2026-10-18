@@ -679,6 +679,12 @@ impl Database {
         {
             #[expect(clippy::expect_used)]
             let keyspaces = db.supervisor.keyspaces.read().expect("lock is poisoned");
+            // Recovery has already resolved the live keyspaces. Reuse their IDs
+            // instead of reading the metadata LSM tree for every journal item.
+            let keyspaces_by_id: HashMap<_, _> = keyspaces
+                .values()
+                .map(|keyspace| (keyspace.id, keyspace))
+                .collect();
 
             // NOTE: If this triggers, the last sealed memtable
             // was not correctly rotated
@@ -700,12 +706,7 @@ impl Database {
                     let batch = batch?;
 
                     for item in batch.items {
-                        let Some(keyspace_name) = db.meta_keyspace.resolve_id(item.keyspace_id)?
-                        else {
-                            continue;
-                        };
-
-                        let Some(keyspace) = keyspaces.get(&keyspace_name) else {
+                        let Some(keyspace) = keyspaces_by_id.get(&item.keyspace_id) else {
                             continue;
                         };
 
@@ -728,11 +729,7 @@ impl Database {
                     }
 
                     for keyspace_id in &batch.cleared_keyspaces {
-                        let Some(keyspace_name) = db.meta_keyspace.resolve_id(*keyspace_id)? else {
-                            continue;
-                        };
-
-                        let Some(keyspace) = keyspaces.get(&keyspace_name) else {
+                        let Some(keyspace) = keyspaces_by_id.get(keyspace_id) else {
                             continue;
                         };
 

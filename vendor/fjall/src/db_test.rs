@@ -1,6 +1,51 @@
 use crate::{Database, KeyspaceCreateOptions, KvSeparationOptions};
 use test_log::test;
 
+#[test]
+fn recovery_keeps_live_ids_when_keyspaces_are_recreated() -> crate::Result<()> {
+    for sealed in [false, true] {
+        let folder = tempfile::tempdir()?;
+        {
+            let db = Database::builder(folder.path())
+                .worker_threads_unchecked(0)
+                .open()?;
+            let retained = db.keyspace("retained", KeyspaceCreateOptions::default)?;
+            let reused = db.keyspace("reused", KeyspaceCreateOptions::default)?;
+            let deleted = db.keyspace("deleted", KeyspaceCreateOptions::default)?;
+            let mut batch = db.batch();
+            for row in 0_u32..1000 {
+                batch.insert(&retained, row.to_be_bytes(), "old");
+                batch.insert(&reused, row.to_be_bytes(), "old");
+                batch.insert(&deleted, row.to_be_bytes(), "old");
+            }
+            batch.commit()?;
+            if sealed {
+                db.supervisor.journal.get_writer().rotate()?;
+            }
+            db.delete_keyspace(reused)?;
+            db.delete_keyspace(deleted)?;
+            let reused = db.keyspace("reused", KeyspaceCreateOptions::default)?;
+            reused.insert("new", "fresh")?;
+            retained.clear()?;
+            retained.insert("kept", "current")?;
+            retained.insert("removed", "obsolete")?;
+            retained.remove("removed")?;
+        }
+        let db = Database::builder(folder.path()).open()?;
+        let retained = db.keyspace("retained", KeyspaceCreateOptions::default)?;
+        let reused = db.keyspace("reused", KeyspaceCreateOptions::default)?;
+        assert_eq!(retained.len()?, 1);
+        assert_eq!(
+            retained.get("kept")?.as_deref(),
+            Some(b"current".as_slice())
+        );
+        assert_eq!(reused.len()?, 1);
+        assert_eq!(reused.get("new")?.as_deref(), Some(b"fresh".as_slice()));
+        assert!(!db.keyspace_exists("deleted"));
+    }
+    Ok(())
+}
+
 #[test_log::test]
 fn clear_recover_sealed() -> crate::Result<()> {
     use crate::{Database, KeyspaceCreateOptions};
