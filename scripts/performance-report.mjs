@@ -228,8 +228,8 @@ export function createClient({
       const login = item.user.login;
       if (login !== "github-actions[bot]" && login !== repository.split("/")[0]) {
         // Maintainers can recover an observation from retained CI artifacts.
-        // Organization membership alone does not grant trust: verify write access.
-        if (!["OWNER", "MEMBER", "COLLABORATOR"].includes(item.author_association)) continue;
+        // Association labels can differ by API viewer. Actual repository write
+        // access is the authority, including for private organization members.
         if (!maintainers.has(login)) {
           const access = await api(`collaborators/${encodeURIComponent(login)}/permission`);
           maintainers.set(login, ["admin", "maintain", "write"].includes(access.permission));
