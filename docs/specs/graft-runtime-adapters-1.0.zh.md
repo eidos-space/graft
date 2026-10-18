@@ -170,6 +170,11 @@ API 的 command-service clone 与目标目录安全契约。加密配置保留 p
 接受密钥。HTTP URL 中的凭据、query 和 fragment 在初始化目标目录前拒绝。
 这是 Rust SDK 入口；Node/CLI 接入仍须单独实现。
 
+`removeRemote(name)` 仅移除指定远程连接、其 upstream 配置与远程跟踪 refs，并清除
+该连接的内存 HTTP 凭据。连接不存在时返回 `removed: false`。本地文件（含未保存
+改动）、提交、本地分支、标签与其他远程连接必须保留。宿主负责在断开前吊销并排空
+对应的加密权限会话。该操作不改写工作区文件。
+
 稳定分类：
 
 ```text
@@ -178,7 +183,7 @@ UntrackPaths, Commit, Diff, DiffPaths, ReadPathContent, History,
 HistorySummaries, CommitDetails, CommitChangedPaths, IsIgnoredPath,
 IsIgnoredPaths, Inventory, RepositoryMetadata, ListRemotes, ConfigGet,
 ConfigList, ConfigSet, ConfigUnset, Restore,
-RestorePaths, RemoteConfigure, Push, Fetch, Pull, Clone, PlanMerge,
+RestorePaths, RemoteConfigure, RemoteRemove, Push, Fetch, Pull, Clone, PlanMerge,
 ApplyMerge, GetMergeStatus, ListMergePaths, ListMergeConflicts,
 ReadMergeVersion, SetMergePathResult, ResolveMergeRow,
 WriteAndStageTextResult, ContinueMerge, AbortMerge

@@ -3,7 +3,16 @@
 This changelog covers the independently versioned `@eidos.space/graft` package. Core Graft CLI and
 SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
 
-## Unreleased
+## Graft SDK 0.3.32 — 2026-10-18
+
+### Added
+
+- Add idempotent `RepositorySession.removeRemote(name)` for disconnecting a named
+  remote while preserving local files, unsaved edits, commits, branches and tags.
+
+### 中文
+
+- 新增 `RepositorySession.removeRemote(name)`，移除指定远程连接及其跟踪配置，保留本地文件、未保存改动与 Graft 历史。
 
 ## Graft SDK 0.3.31 — 2026-10-17
 

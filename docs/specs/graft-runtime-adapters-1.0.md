@@ -171,6 +171,7 @@ current contract, not a second implementation.
 | `config get/list/set/unset` | `configGet`, `configList`, `configSet`, `configUnset` | effective repository configuration entries |
 | `restore` | `restore`, `restorePaths` | affected paths and checkout outcome |
 | `remote add/set-url` subset | `configureRemote` | local config/upstream outcome |
+| `remote remove` | `removeRemote` | idempotent local disconnect; preserves worktree and local history |
 | `fetch`, `push`, `pull` | same method names | remote/ref plus merge outcome where applicable |
 | `clone` | `cloneRepository` | new repository/checkout outcome |
 | `merge` + `conflicts` + `resolve` | `planMerge`, `applyMerge`, merge status/list/version, path/row/text/provider resolution, `continueMerge`, `abortMerge` | typed plan/state/provider tokens plus command outcome |
@@ -180,6 +181,12 @@ current contract, not a second implementation.
 `encrypted_http`. This is public profile metadata; it does not indicate that a
 session is unlocked or that an adapter implements encrypted enrollment. Its URL
 projection excludes credentials, passwords, keys and host staging state.
+
+`removeRemote(name)` MUST remove only that named remote, its upstream configuration
+and remote-tracking refs, and clear its in-memory HTTP credential. A missing remote
+MUST succeed with `removed: false`. Local files (including unsaved edits), commits,
+local branches, tags and other remotes MUST be preserved. The host owns encrypted
+authority revocation and draining before disconnecting a connection.
 
 The native Rust SDK's `RepositorySession::new_with_remote_credentials` accepts
 explicit shared `RemoteCredentials` and an optional identity override. The native
@@ -253,7 +260,7 @@ UntrackPaths, Commit, Diff, DiffPaths, ReadPathContent, History,
 HistorySummaries, CommitDetails, CommitChangedPaths, IsIgnoredPath,
 IsIgnoredPaths, Inventory, RepositoryMetadata, ListRemotes, ConfigGet,
 ConfigList, ConfigSet, ConfigUnset, Restore,
-RestorePaths, RemoteConfigure, Push, Fetch, Pull, Clone, PlanMerge,
+RestorePaths, RemoteConfigure, RemoteRemove, Push, Fetch, Pull, Clone, PlanMerge,
 ApplyMerge, GetMergeStatus, ListMergePaths, ListMergeConflicts,
 ReadMergeVersion, DiffMergeSqlite, SetMergePathResult, ResolveMergeRow,
 ResolveMergeCell, ResolveMergeTable, StageMergeSqliteResult,

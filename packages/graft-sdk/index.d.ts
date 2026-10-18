@@ -1206,6 +1206,8 @@ export class RepositorySession {
   restore(options: RestoreOptions): Promise<GraftJson>
   restorePaths(options: RestorePathsOptions): Promise<BatchPathsResult>
   configureRemote(options: RemoteConfigureOptions): Promise<GraftJson>
+  /** Removes the named connection and its upstream/tracking refs. Preserves all local files, commits, branches and tags. Missing remotes succeed. */
+  removeRemote(name: string, options?: OperationOptions): Promise<{ removed: boolean }>
   push(options?: RemoteOperationOptions): Promise<GraftJson>
   fetch(options?: RemoteOperationOptions): Promise<GraftJson>
   pull(options?: RemoteOperationOptions): Promise<GraftJson>

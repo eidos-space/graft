@@ -73,6 +73,11 @@ Rust toolchain or system SQLite library, and the package has no install script.
 
 ## Use
 
+Disconnect a cloud connection with `await session.removeRemote("origin")`.
+Local files, unsaved changes and local Graft history remain intact; other named
+remotes are preserved. The operation is idempotent and does not delete cloud data.
+Hosts using an `EncryptedRemoteSession` must revoke and drain that authority first.
+
 ```js
 const { RepositorySession } = require("@eidos.space/graft")
 

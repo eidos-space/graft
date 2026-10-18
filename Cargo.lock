@@ -1097,7 +1097,7 @@ dependencies = [
 
 [[package]]
 name = "graft-sdk"
-version = "0.3.31"
+version = "0.3.32"
 dependencies = [
  "blake3",
  "graft",
@@ -1115,7 +1115,7 @@ dependencies = [
 
 [[package]]
 name = "graft-sdk-node"
-version = "0.3.31"
+version = "0.3.32"
 dependencies = [
  "graft-sdk",
  "napi",

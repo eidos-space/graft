@@ -431,6 +431,7 @@ pub enum RepositoryOperation {
     Restore,
     RestorePaths,
     RemoteConfigure,
+    RemoteRemove,
     Push,
     Fetch,
     Pull,
@@ -2334,6 +2335,28 @@ impl RepositorySession {
             status_cache.invalidate();
             operation
         })
+    }
+
+    /// Disconnects a named remote without changing local refs, objects or worktree files.
+    /// Missing remotes are accepted so hosts can resume an interrupted disconnect.
+    pub fn remove_remote(&self, name: &str) -> Result<Value> {
+        validate_remote_name(name)?;
+        let result = self.with_state(|state| {
+            let SessionState { service, status_cache } = state;
+            let service = service.as_mut().ok_or_else(session_closed_error)?;
+            let result = (|| {
+                let remotes = execute_json(service, "json_remotes", None)?;
+                let removed = remote_url(&remotes, name)?.is_some();
+                if removed {
+                    execute_json(service, "json_remote_remove", Some(name))?;
+                }
+                Ok(serde_json::json!({ "removed": removed }))
+            })();
+            status_cache.invalidate();
+            result
+        })?;
+        self.clear_http_bearer_token(name)?;
+        Ok(result)
     }
 
     pub fn configure_remote(&self, options: &RemoteConfigureOptions) -> Result<Value> {

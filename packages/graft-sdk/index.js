@@ -301,6 +301,10 @@ class RepositorySession {
     return callJson(() => this.#native.configureRemote(remoteOptions, signal))
   }
 
+  async removeRemote(name, options = {}) {
+    return callJson(() => this.#native.removeRemote(name, options.signal))
+  }
+
   async push(options = {}) {
     const { remote, branch, signal, onProgress } = options
     return callJsonWithProgress(
