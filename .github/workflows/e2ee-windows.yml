@@ -30,6 +30,8 @@ jobs:
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5
         with:
           cache-on-failure: true
+      - name: Build Web UI
+        uses: ./.github/actions/build-web-ui
       - name: Check CLI and Node E2EE on Windows
         run: cargo check -p graft-cli -p graft-sdk-node --features e2ee --all-targets --locked
       - name: Windows private storage regressions

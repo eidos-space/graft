@@ -143,6 +143,7 @@ jobs:
             binary="${binary}.exe"
           fi
           "$binary" --help >/dev/null
+          node web-ui/scripts/smoke-cli.mjs "$binary"
 
       - name: Stage CLI artifact
         run: |

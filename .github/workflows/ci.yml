@@ -83,6 +83,9 @@ jobs:
       - name: Build Rust workspace
         run: just build-all
 
+      - name: Smoke test embedded Web UI
+        run: node web-ui/scripts/smoke-cli.mjs target/debug/graft
+
       - name: Test
         run: cargo nextest run
 
