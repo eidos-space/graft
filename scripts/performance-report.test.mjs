@@ -215,7 +215,7 @@ function githubFixture({ releases = true, untrustedMajor = false, maintainerPerm
   if (maintainerPermission)
     comments.push({
       user: { login: "maintainer" },
-      author_association: "MEMBER",
+      author_association: "CONTRIBUTOR",
       body: body(report([measurement(777, { suite: "e2ee-core" })])),
     });
   const client = createClient({
@@ -237,8 +237,10 @@ function githubFixture({ releases = true, untrustedMajor = false, maintainerPerm
       else if (route === `commits/${previousMerge}/pulls?per_page=100`) result = [prior];
       else if (route === "pulls/34") result = current;
       else if (route === "pulls/33") result = prior;
-      else if (route === "collaborators/maintainer/permission")
+      else if (route === "collaborators/maintainer/permission") {
+        if (maintainerPermission === "fail") throw new Error("Permission lookup failed");
         result = { permission: maintainerPermission };
+      } else if (route === "collaborators/stranger/permission") result = { permission: "read" };
       else if (route === "issues/34/comments?per_page=100&page=1") result = comments;
       else if (route === "issues/33/comments?per_page=100&page=1")
         result = [
@@ -287,7 +289,7 @@ test("repository metadata uses the GitHub root endpoint without a trailing slash
   ]);
 });
 
-test("recovered maintainer reports require verified write access and preserve the first observation", async () => {
+test("recovered reports use verified write access regardless of association labels", async () => {
   for (const permission of ["admin", "maintain", "write", "read", "none"]) {
     const fixture = githubFixture({ maintainerPermission: permission });
     const data = await commentOnRun(fixture.client, 71, [measurement(123, { suite: "e2ee-core" })]);
@@ -296,6 +298,11 @@ test("recovered maintainer reports require verified write access and preserve th
       ["admin", "maintain", "write"].includes(permission) ? 777 : 123,
     );
   }
+});
+
+test("a failed author permission lookup cannot discard a recovered report", async () => {
+  const fixture = githubFixture({ maintainerPermission: "fail" });
+  await assert.rejects(commentOnRun(fixture.client, 71, []), /Permission lookup failed/);
 });
 
 test("actual API orchestration reads annotated releases and leaves machine-readable PR evidence", async () => {
