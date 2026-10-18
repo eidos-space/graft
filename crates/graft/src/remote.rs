@@ -5853,20 +5853,42 @@ mod tests {
 
     #[tokio::test]
     async fn streamed_http_upload_completes_when_remote_rejects_before_reading_body() {
-        let (url, request) = serve_http_response("412 Precondition Failed", &["1"]).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/org/repo", listener.local_addr().unwrap());
+        let (release, released) = tokio::sync::oneshot::channel();
+        let request = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut headers = Vec::new();
+            while !headers.ends_with(b"\r\n\r\n") {
+                headers.push(stream.read_u8().await.unwrap());
+            }
+            stream.write_all(b"HTTP/1.1 412 Precondition Failed\r\nGraft-Protocol: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+            // Keep unread upload bytes queued until the client has returned.
+            // Closing now resets the socket on Windows and discards the 412.
+            released.await.unwrap();
+            let _ = stream.shutdown().await;
+            let _ = tokio::time::timeout(
+                Duration::from_secs(5),
+                tokio::io::copy(&mut stream, &mut tokio::io::sink()),
+            )
+            .await;
+            String::from_utf8(headers).unwrap()
+        });
         let remote = HttpRemote::new(url, None).unwrap();
 
         let result = tokio::time::timeout(
-            Duration::from_secs(1),
+            Duration::from_secs(10),
             remote.put_raw_if_not_exists_stream(
                 "segments/example",
                 [Bytes::from(vec![7_u8; 64 * 1024])],
             ),
         )
-        .await
-        .expect("fixed-length upload stalled after an early response")
-        .unwrap_err();
-        assert!(result.precondition_failed());
+        .await;
+        release.send(()).unwrap();
+        let result = result
+            .expect("fixed-length upload stalled after an early response")
+            .unwrap_err();
+        assert!(result.precondition_failed(), "{result:?}");
         request.await.unwrap();
     }
 

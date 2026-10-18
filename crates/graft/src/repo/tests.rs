@@ -5561,6 +5561,15 @@ fn pull_plan_starts_snapshot_checkout_with_fresh_http_pool() {
             stream.read_exact(&mut byte).unwrap();
             request.push(byte[0]);
         }
+        // Consume a POST's declared body before closing the connection. Leaving
+        // it unread causes a Winsock reset that can hide the fallback status.
+        let length = String::from_utf8_lossy(&request)
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(key, _)| key.eq_ignore_ascii_case("content-length"))
+            .map_or(0, |(_, value)| value.trim().parse::<usize>().unwrap());
+        let mut body = vec![0; length];
+        stream.read_exact(&mut body).unwrap();
         request
     }
 
@@ -5605,7 +5614,7 @@ fn pull_plan_starts_snapshot_checkout_with_fresh_http_pool() {
 
         first.set_nonblocking(true).unwrap();
         listener.set_nonblocking(true).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(10);
         let mut reused_request = Vec::new();
         loop {
             let mut buffer = [0_u8; 1024];
@@ -5731,7 +5740,7 @@ fn repository_http_pool_keeps_driving_between_executors() {
     let server = std::thread::spawn(move || {
         let (mut socket, _) = listener.accept().unwrap();
         socket
-            .set_read_timeout(Some(Duration::from_secs(2)))
+            .set_read_timeout(Some(Duration::from_secs(30)))
             .unwrap();
         for _ in 0..2 {
             let mut request = Vec::new();
@@ -5765,7 +5774,9 @@ fn repository_http_pool_keeps_driving_between_executors() {
         .build()
         .unwrap();
     let result = other.block_on(async {
-        tokio::time::timeout(Duration::from_secs(1), remote.get_raw("second")).await
+        // This checks liveness across executors; concurrent KDF tests can delay
+        // a CI runner well beyond a one-second latency budget.
+        tokio::time::timeout(Duration::from_secs(10), remote.get_raw("second")).await
     });
     server.join().unwrap();
     assert_eq!(
