@@ -100,6 +100,37 @@ export const sidebar = [
     ],
   },
   {
+    label: "Recipes",
+    translations: { "zh-CN": "实用示例" },
+    items: [
+      {
+        label: "Recipes Overview",
+        translations: { "zh-CN": "实用示例概览" },
+        slug: "docs/recipes",
+      },
+      {
+        label: "Diff Two SQLite Files",
+        translations: { "zh-CN": "比较两个 SQLite 文件" },
+        slug: "docs/recipes/diff-two-sqlite-files",
+      },
+      {
+        label: "Generate And Apply A Delta",
+        translations: { "zh-CN": "生成并应用 Delta" },
+        slug: "docs/recipes/generate-sqlite-delta",
+      },
+      {
+        label: "Resolve Row Conflicts",
+        translations: { "zh-CN": "解决行冲突" },
+        slug: "docs/recipes/resolve-row-conflicts",
+      },
+      {
+        label: "Snapshot And Restore History",
+        translations: { "zh-CN": "快照与恢复历史" },
+        slug: "docs/recipes/snapshot-and-restore",
+      },
+    ],
+  },
+  {
     label: "Node.js SDK",
     translations: { "zh-CN": "Node.js SDK" },
     items: [

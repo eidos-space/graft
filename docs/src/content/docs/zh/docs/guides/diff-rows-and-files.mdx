@@ -1,40 +1,37 @@
 ---
-title: 比较行与文件
-description: 比较 Graft worktree、staged changes、commits、SQLite rows 和 file artifacts。
+title: 行与文件差异
+description: 先选择要比较的两个状态，再解释路径、行、表结构与不受支持的变化。
 ---
 
-Graft 有两层 diff：
+差异检查回答两个问题：**比较哪两个状态**，以及**解释多少内容**。
 
-- repository diff：比较 app-state tree 里的路径
-- row diff：把 modified SQLite snapshot 展开成 table/row/schema changes
+先选择状态：
 
-## 直接比较两个 SQLite 文件
+| 问题 | 命令 | 比较方向 |
+| --- | --- | --- |
+| 暂存之后又改了什么？ | `graft diff` | 暂存区到工作区 |
+| 将要提交什么？ | `graft diff --staged` | HEAD 到暂存区 |
+| 两个版本之间改了什么？ | `graft diff HEAD~1 HEAD` | 第一个父提交到当前提交 |
+| 两个分支有什么区别？ | `graft diff main experiment` | main 到 experiment |
 
-当数据库只是两个普通文件，而不是 Graft repository 的两个 side 时，使用
-`--no-index`：
+方向很重要。插入和删除描述从第一个状态变成第二个状态所需的变化。这些命令不改变引用、暂存区、合并记录或已跟踪文件。
 
-```bash
-graft diff --no-index old.sqlite new.sqlite
-graft diff --no-index --rows old.sqlite new.sqlite
-graft diff --no-index --rows --json old.sqlite new.sqlite
-```
-
-命令只接受两个普通 SQLite database file，不需要也不会发现 Graft repository。
-默认输出说明两个物理 SQLite snapshot 是否不同；`--rows` 会把 changed pair 展开为
-schema、table、row 和 opaque changes。两侧都通过 SQLite online backup 取得一致
-snapshot，并包含已提交的 WAL frames。`--staged`、`--root`、`--kind`、`--content`
-等 repository selector 不能与 `--no-index` 一起使用。
-
-## 比较 Worktree 和 Staged
+## 1. 定位变化路径
 
 ```bash
-graft diff
-graft diff --json
-graft diff --staged
-graft diff --json --staged
+graft diff HEAD~1 HEAD
+graft diff --json HEAD~1 HEAD
 ```
 
-按 kind 过滤：
+路径输出标识新增、删除和修改，还报告 `kind`（数据库、文本或二进制）与 `storage`（快照、内联或外部存储）。
+
+选择一个已记录的数据库：
+
+```bash
+graft diff HEAD~1 HEAD app.sqlite
+```
+
+选择一种内容类型：
 
 ```bash
 graft diff --kind sqlite_database
@@ -42,69 +39,49 @@ graft diff --kind text_file
 graft diff --kind binary_file
 ```
 
-## 比较 Commit
+## 2. 展开数据库变化
+
+添加 `--rows`：
 
 ```bash
-graft diff HEAD~1 HEAD
-graft diff HEAD~1 HEAD data.sqlite
-graft diff --json HEAD~1 HEAD
+graft diff --rows HEAD~1 HEAD app.sqlite
+graft diff --json --rows HEAD~1 HEAD app.sqlite
+graft diff --rows --staged app.sqlite
 ```
 
-path-level 输出会说明每个路径的 change、`kind` 和 `storage`。
+如果第二个版本新增第 2 条笔记，预期看到插入行。如果修改第 1 条，预期看到包含旧值与新值的更新。
 
-## SQLite Row Diff
+数据库结果可以包含表结构变化、行变化、不透明变化、能力和限制。行列表为空，不能证明整个数据库没变。
+
+## 3. 结合详细内容解读逻辑状态
+
+| `logical_status` | 含义 | 审查方式 |
+| --- | --- | --- |
+| `logical_changes` | 找到了受支持的行或表结构变化 | 显示变化及附带限制 |
+| `unsupported_logical_surface` | 无法完整解释变化的 SQLite 内容 | 显示限制，保留文件级审查 |
+| `file_changed_no_supported_logical_changes` | 字节变化，但受支持的逻辑内容没有净变化 | 描述文件变化，不虚构行修改 |
+| `row_diff_unavailable` | 该文件无法进行行分析 | 使用路径级信息 |
+
+**检查：**一起阅读行、表结构与不透明变化。二进制附件应使用路径元数据和合适的文件查看器。
+
+## 比较两个独立 SQLite 文件
+
+手上是数据库文件，而不是仓库版本时，使用 `--no-index`：
 
 ```bash
-graft diff --rows HEAD~1 HEAD data.sqlite
-graft diff --json --rows HEAD~1 HEAD data.sqlite
+graft diff --no-index old.sqlite new.sqlite
+graft diff --no-index --rows old.sqlite new.sqlite
+graft diff --no-index --rows --json old.sqlite new.sqlite
 ```
 
-JSON 中常见 `logical_status`：
+它只接受两个普通 SQLite 文件，不要求仓库。两边都进行一致捕获，包含已提交的 WAL 内容。
 
-| Status | 含义 |
-| --- | --- |
-| `logical_changes` | 找到支持的 row/schema changes。 |
-| `unsupported_logical_surface` | SQLite 变化触及无法完整解释的表面。 |
-| `file_changed_no_supported_logical_changes` | 文件变了，但支持的逻辑行和 schema 没有净变化。 |
-| `row_diff_unavailable` | 此文件无法产生 row diff。 |
+默认比较物理快照。`--rows` 展开逻辑表结构、表、行与不透明变化。`--staged`、`--root`、`--kind` 和 `--content` 等仓库选择参数不适用。
 
-## 真实 CLI 输出
+## 在应用中使用正确边界
 
-下面是一次真实 `graft` 运行捕获到的输出。你本机的 hash 和时间会不同。
+集成时使用 `--json`。用路径摘要导航，为选定数据库显示逻辑细节。保留能力与限制字段，不要把所有空行列表显示为“没有变化”。
 
-```bash
-$ graft diff --rows HEAD~1 HEAD app.sqlite
-Row Diff 55c99f73d879..d5cb39df069b
-modified: app.sqlite
-  Diff LSN 2 -> 4
-  ============================
+用户可见的历史使用仓库提交 ID、分支和标签。存储 LSN 属于特定日志，不是全局应用版本。
 
-  Table 'tasks': +1 inserts ~1 updates
-    ~ rowid 2:
-      old: [Null, Text("record cli output"), Text("open")]
-      new: [Null, Text("record cli output"), Text("blocked")]
-    + rowid 4: [Null, Text("publish docs"), Text("open")]
-```
-
-比较两个分支时，输出展示的是从 `main` 变成 `feature/progress` 需要的 row changes：
-
-```bash
-$ graft diff --rows main feature/progress app.sqlite
-Row Diff d5cb39df069b..89abefbeb063
-modified: app.sqlite
-  Diff LSN 4 -> 4
-  ============================
-
-  Table 'tasks': +1 inserts -1 deletes ~2 updates
-    - rowid 4: [Null, Text("publish docs"), Text("open")]
-    ~ rowid 2:
-      old: [Null, Text("record cli output"), Text("blocked")]
-      new: [Null, Text("record cli output"), Text("open")]
-    + rowid 3: [Null, Text("add screenshots"), Text("open")]
-    ~ rowid 1:
-      old: [Null, Text("write quickstart"), Text("open")]
-      new: [Null, Text("write quickstart"), Text("done")]
-```
-
-普通应用 UI 应使用 repository commits 和 revspecs。LSN 与底层 page history 见
-[SQLite 如何变成快照](/zh/docs/graft-book/sqlite-snapshots/)。
+[动手练习](/zh/docs/graft-book/hands-on-lab/)会分别观察已暂存的插入与后续未暂存的插入。

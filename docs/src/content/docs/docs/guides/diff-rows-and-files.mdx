@@ -1,50 +1,37 @@
 ---
-title: Diff Rows And Files
-description: Compare Graft worktree, staged changes, commits, SQLite rows, and file artifacts.
+title: Diff Rows and Files
+description: Select two states to compare, then interpret path, row, schema, and unsupported changes.
 ---
 
-Graft has two diff layers:
+A diff has two questions: **which states are being compared**, and **how much content should be interpreted**.
 
-- repository diffs compare paths in the app-state tree
-- row diffs expand modified SQLite database snapshots into table and row changes
+Start by selecting the states:
 
-Use repository diffs to answer "which app-state paths changed?" Use row diffs
-to answer "which SQLite rows changed?"
+| Question | Command | Comparison |
+| --- | --- | --- |
+| What changed after staging? | `graft diff` | Index to worktree |
+| What will I commit? | `graft diff --staged` | HEAD to index |
+| What changed between versions? | `graft diff HEAD~1 HEAD` | First parent to current commit |
+| How do branches differ? | `graft diff main experiment` | Main to experiment |
 
-## Compare Two SQLite Files Directly
+The direction matters: inserts and deletes describe the changes from the first state to the second. These commands inspect state without changing refs, the index, merge records, or tracked files.
 
-Use `--no-index` when the databases are ordinary files rather than two sides
-of a Graft repository:
-
-```bash
-graft diff --no-index old.sqlite new.sqlite
-graft diff --no-index --rows old.sqlite new.sqlite
-graft diff --no-index --rows --json old.sqlite new.sqlite
-```
-
-The command accepts exactly two regular SQLite database files and does not
-require or discover a Graft repository. The default output reports whether the
-physical SQLite snapshots differ; `--rows` expands a changed pair into logical
-schema, table, row, and opaque changes. Each side is captured consistently via
-SQLite's online backup mechanism, including committed WAL frames. Repository
-selectors such as `--staged`, `--root`, `--kind`, and `--content` do not apply
-to `--no-index`.
-
-## Compare Worktree Changes
+## 1. Locate changed paths
 
 ```bash
-graft diff
-graft diff --json
+graft diff HEAD~1 HEAD
+graft diff --json HEAD~1 HEAD
 ```
 
-Compare staged changes:
+Path output identifies additions, deletions, and modifications. It also reports `kind` (database, text, or binary) and `storage` (snapshot, inline, or external).
+
+To select one recorded database:
 
 ```bash
-graft diff --staged
-graft diff --json --staged
+graft diff HEAD~1 HEAD app.sqlite
 ```
 
-Filter by content kind:
+To select a content class:
 
 ```bash
 graft diff --kind sqlite_database
@@ -52,96 +39,49 @@ graft diff --kind text_file
 graft diff --kind binary_file
 ```
 
-## Compare Commits
+## 2. Expand database changes
+
+Add `--rows`:
 
 ```bash
-graft diff HEAD~1 HEAD
-graft diff HEAD~1 HEAD data.sqlite
-graft diff --json HEAD~1 HEAD
+graft diff --rows HEAD~1 HEAD app.sqlite
+graft diff --json --rows HEAD~1 HEAD app.sqlite
+graft diff --rows --staged app.sqlite
 ```
 
-Path-level output reports each changed path, its change type, `kind`, and
-`storage`.
+If the second version adds note 2, expect an inserted row. If it edits note 1, expect an update with old and new values.
 
-## Show SQLite Row Diffs
+The database result can include schema changes, row changes, opaque changes, capabilities, and limitations. An empty row list does not establish that the whole database is unchanged.
 
-Add `--rows` for SQLite database paths:
+## 3. Read logical status with the details
+
+| `logical_status` | What it tells you | Review treatment |
+| --- | --- | --- |
+| `logical_changes` | Supported row or schema changes were found | Show those changes and any accompanying limitations |
+| `unsupported_logical_surface` | Graft cannot fully interpret changed SQLite content | Keep the caveat visible and allow file-level review |
+| `file_changed_no_supported_logical_changes` | Bytes changed without a net change in supported logical content | Describe the file change without inventing row edits |
+| `row_diff_unavailable` | Row analysis is unavailable for that file | Use path-level information |
+
+**Check:** read schema and opaque changes together with row changes. For a binary attachment, use path metadata and an appropriate file viewer.
+
+## Compare two independent SQLite files
+
+Use `--no-index` when you have database files rather than repository revisions:
 
 ```bash
-graft diff --rows HEAD~1 HEAD data.sqlite
-graft diff --json --rows HEAD~1 HEAD data.sqlite
+graft diff --no-index old.sqlite new.sqlite
+graft diff --no-index --rows old.sqlite new.sqlite
+graft diff --no-index --rows --json old.sqlite new.sqlite
 ```
 
-With JSON output, database entries can include row changes, schema changes,
-capabilities, limitations, and a `logical_status`.
+This accepts exactly two regular SQLite files and does not require a repository. Each is captured consistently, including committed WAL content.
 
-Common logical statuses:
+Default output compares physical snapshots. `--rows` expands logical schema, table, row, and opaque changes. Repository selectors such as `--staged`, `--root`, `--kind`, and `--content` do not apply.
 
-| Status | Meaning |
-| --- | --- |
-| `logical_changes` | Supported row or schema changes were found. |
-| `unsupported_logical_surface` | SQLite changed in a way Graft cannot fully interpret. |
-| `file_changed_no_supported_logical_changes` | The file changed, but supported logical rows and schema have no net change. |
-| `row_diff_unavailable` | Row diff was not available for that file. |
+## Use the right boundary in an application
 
-## Captured CLI Output
+Use `--json` for integrations. Show path summaries for navigation and logical details for a selected database. Preserve capability and limitation fields rather than showing every empty row list as “no changes.”
 
-This transcript was captured from a real `graft` run. Hashes and timestamps
-will differ on your machine.
+Use repository commit IDs, branches, and tags for user-visible history. A storage LSN belongs to a specific storage log and is not a global application version.
 
-```bash
-$ graft diff --rows HEAD~1 HEAD app.sqlite
-Row Diff 55c99f73d879..d5cb39df069b
-modified: app.sqlite
-  Diff LSN 2 -> 4
-  ============================
-
-  Table 'tasks': +1 inserts ~1 updates
-    ~ rowid 2:
-      old: [Null, Text("record cli output"), Text("open")]
-      new: [Null, Text("record cli output"), Text("blocked")]
-    + rowid 4: [Null, Text("publish docs"), Text("open")]
-```
-
-Comparing two branches shows the row changes needed to transform `main` into
-`feature/progress`:
-
-```bash
-$ graft diff --rows main feature/progress app.sqlite
-Row Diff d5cb39df069b..89abefbeb063
-modified: app.sqlite
-  Diff LSN 4 -> 4
-  ============================
-
-  Table 'tasks': +1 inserts -1 deletes ~2 updates
-    - rowid 4: [Null, Text("publish docs"), Text("open")]
-    ~ rowid 2:
-      old: [Null, Text("record cli output"), Text("blocked")]
-      new: [Null, Text("record cli output"), Text("open")]
-    + rowid 3: [Null, Text("add screenshots"), Text("open")]
-    ~ rowid 1:
-      old: [Null, Text("write quickstart"), Text("open")]
-      new: [Null, Text("write quickstart"), Text("done")]
-```
-
-## How To Present Diffs In An App
-
-Use path summaries for navigation and row payloads for detail panes:
-
-```bash
-graft diff --json --rows HEAD~1 HEAD data.sqlite
-```
-
-Suggested UI treatment:
-
-| State | UI |
-| --- | --- |
-| file changed and `logical_changes` | Show table, row, and schema changes. |
-| file changed and `file_changed_no_supported_logical_changes` | Show as file-level change or logical no-op. |
-| `unsupported_logical_surface` | Show a caveat and keep a conservative review path. |
-| binary file changed | Show file-level metadata and allow open/replace/download. |
-
-Low-level LSN diffs are documented under
-[SQLite Snapshots](/docs/graft-book/sqlite-snapshots/) for storage
-debugging. Normal user-facing history should use repository commits and
-revspecs.
+Try the [lab](/docs/graft-book/hands-on-lab/) to observe a staged insertion and a later unstaged insertion separately.

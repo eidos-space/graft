@@ -1,91 +1,80 @@
 ---
-title: 03 Stage And Commit
-description: Trace init, SQLite and artifact staging, the index overlay, objects, and ref publication.
+title: 03 Stage and Commit
+description: Predict which edits a commit records, including edits made after staging.
 ---
 
-## `graft init` creates control state
+**Which edits will the next commit contain?**
 
-Initialization canonicalizes the worktree, creates `.graft`, writes defaults, and makes `HEAD`
-symbolically name `main`:
+A SQLite transaction saves application data. `graft add` selects a snapshot. `graft commit` records the selected version in repository history.
 
-```text
-HEAD = ref: refs/heads/main
-refs/heads/main = absent
-index = empty
-objects = empty
-storage = empty
+These are three separate actions.
+
+## Follow a note through the three actions
+
+Assume HEAD contains one note.
+
+| Action | Worktree | Staged database | HEAD |
+| --- | --- | --- | --- |
+| Insert and commit a second note with SQLite | Two notes | No staged change | One note |
+| `graft add app.sqlite` | Two notes | Two-note snapshot | One note |
+| Insert and commit a third note with SQLite | Three notes | Still two notes | One note |
+| `graft commit -m "save two notes"` | Still three notes | Staged change cleared | Two notes |
+
+The third note remains an unstaged change. Commit consumes staged content; it does not capture the live database again.
+
+Run `graft add app.sqlite` again before committing if you want the third note included.
+
+## Initialize, stage, review, record
+
+`graft init` creates `.graft/` and an initial branch position. It does not create a database or automatically track existing files.
+
+For an existing application directory:
+
+```bash
+graft init
+graft status
+graft add app.sqlite
+graft add settings.json
+graft diff --staged
+graft diff --rows --staged app.sqlite
+graft commit -m "save notes and settings"
+graft status
 ```
 
-This unborn state does not create a database or automatically track worktree files.
+Review the staged diff before committing. Afterward, status tells you whether newer worktree changes remain.
 
-## Full SQLite add sequence
+Use `graft add --all` to stage eligible additions, modifications, and deletions together. See [tracking databases and files](/docs/guides/track-databases-and-files/) for ignore rules and path selection.
 
-1. Normalize and validate repository-relative path identity.
-2. Classify the regular file and validate its SQLite header.
-3. Select the index snapshot, or `HEAD`, as the baseline.
-4. Capture a standalone private image through SQLite backup, including committed WAL.
-5. Compare 4 KiB chunks and reuse unchanged baseline pages.
-6. If needed, atomically batch new segment pages and a storage commit.
-7. Encode volume, page count, log ranges, and hashes in a `sqlite-snapshot-v1` blob.
-8. Write a stage-0 index entry with mode, object ID, and parsed snapshot state.
-9. Clear the path's observation marker; later status may still verify the physical file.
+## How files meet in one commit
 
-Immutable storage and a blob can now exist while the branch still points at the old commit.
-
-## Ordinary files take a separate staging path
-
-Graft reads exact bytes and chooses inline or external storage:
-
-- small text normally becomes a Base64 `file-blob-v2`;
-- binary, large text, or configured external paths put raw bytes under the content-hash fan-out in `store/files/`
-  and write a `large-file-pointer-v1` blob;
-- stage 0 names that blob object.
-
-Both pipelines end as a typed path-to-blob entry, so databases, settings, and attachments can form
-one application-state commit.
-
-## The index freezes the staged result
+A database takes the consistent-snapshot path. An ordinary file takes the exact-byte path.
 
 ```text
-10:00  app.sqlite = A
-10:01  graft add app.sqlite       index = snapshot(A)
-10:02  app commits transaction B  worktree = B, index remains A
-10:03  graft commit               repository commit contains A
+app.sqlite ------ consistent capture --> database snapshot --+
+settings.json --- read file bytes -----> file blob -----------+--> index
+report.pdf ------ read file bytes -----> external pointer ----+
+                                                               |
+                                                               | commit
+                                                               v
+                                                      application version
 ```
 
-B is not lost. It remains an unstaged worktree change after the commit. This is why a commit is
-repeatable and does not race a second application transaction.
+A commit combines the HEAD tree with staged replacements and deletions. Unstaged paths keep their recorded HEAD versions.
 
-## Full commit sequence
+The common commit is a version boundary. It does not make independently captured paths one transaction; your application must coordinate related writes if it needs that guarantee.
 
-1. Read `HEAD` and the index; reject unresolved stages.
-2. Apply stage 0 as an overlay to the `HEAD` tree.
-3. Ensure each SQLite path has its snapshot blob and each artifact its staged blob.
-4. Sort paths canonically and write the tree object.
-5. Write the commit object with tree, parents, signatures, message, and summaries.
-6. Update the attached branch ref, or detached `HEAD`.
-7. Append reflog information and clear completed merge state when applicable.
-8. Clear the index.
+## Why a branch moves last
 
-The safety order is immutable objects first, mutable ref last. Failure before ref movement can
-leave unreachable objects, but not a branch pointing at half a commit.
+Graft writes the required immutable objects before moving the branch to the new commit. Otherwise, the branch could name a version whose contents were not available.
 
-## What commit does not do
+A failure before the ref update can leave unreachable objects. The branch still identifies the previous version. If a later step fails, inspect status and history before deciding whether the commit happened.
 
-It does not re-backup the worktree, checkpoint application WAL, replace `app.sqlite`, stage newer
-changes, or push a remote.
+This ordering does not guarantee full crash durability. Some object, index, and merge-record writes are direct writes, and version 1.0 does not promise an end-to-end `fsync` contract. Reflog append and ref replacement are separate operations.
 
-| Point | Worktree | Index | Storage/objects | `main` |
-| --- | --- | --- | --- | --- |
-| after init | untracked files | empty | empty | unborn |
-| after SQLite transaction | bytes/WAL changed | empty | unchanged | unchanged |
-| after add | not replaced | snapshot A | delta + blob | unchanged |
-| after another transaction | B | still A | unchanged | unchanged |
-| after commit | still B | cleared | tree + commit(A) | commit(A) |
+## Check your prediction
 
-## Current durability boundary
+You stage two notes, then insert a third, then commit. How many notes are in HEAD?
 
-Refs, `HEAD`, config, observations, and external-payload replacement use sibling temp plus rename.
-Some loose object, index, and merge-record writes remain direct. Reads validate hashes or parse the
-whole record, but the current format does not promise crash atomicity or an end-to-end `fsync`
-contract for those writes. Reflog append is also not the same transaction as ref replacement.
+**Two.** Export HEAD and query it to verify. The [lab](/docs/graft-book/hands-on-lab/) performs exactly this experiment.
+
+Commit writes local history. Uploading that history requires a separate [push](/docs/graft-book/remotes-and-recovery/).

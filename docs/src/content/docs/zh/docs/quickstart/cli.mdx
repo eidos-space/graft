@@ -1,107 +1,114 @@
 ---
 title: CLI 快速开始
-description: 创建 Graft 仓库、提交 SQLite 数据和文件、查看行级差异并恢复状态。
+description: 记录两个版本，查看行变化，再通过查询验证数据库恢复。
 ---
 
-import { Aside, Steps } from "@astrojs/starlight/components";
+import { Aside } from "@astrojs/starlight/components";
 
-CLI 是建立可用 Graft 仓库的最短路径。本指南会创建 SQLite 数据库和应用文件的
-两个版本，然后验证数据库能够恢复。
+本指南记录笔记数据库与设置文件的两个版本。你会查看新增行，丢弃一次练习用的删除，再查询恢复后的数据库。
 
-<Aside type="tip" title="想要零安装体验？">
-  先打开 [Playground 导览](/zh/docs/quickstart/playground/)。它会在浏览器 OPFS
-  worktree 中运行同一个 v0.15.5 CLI，再引导你回到本地流程。
+先安装 [CLI](/zh/docs/overview/installation/)。在新的临时目录中运行示例。
+
+<Aside type="tip" title="在浏览器中体验">
+  [Playground](/zh/docs/quickstart/playground/) 在 OPFS 工作区中运行浏览器版 CLI。它适合练习本地历史操作，不提供原生远端同步能力。
 </Aside>
 
-## 创建仓库
-
-<Steps>
-
-1. 创建示例应用目录。
-
-   ```bash
-   mkdir app-state-demo
-   cd app-state-demo
-   ```
-
-2. 初始化 Graft。
-
-   ```bash
-   graft init
-   ```
-
-   这会创建 `.graft/`，但不会创建默认数据库。
-
-3. 写入 SQLite。
-
-   ```bash
-   graft sql --db data.sqlite "CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT);"
-   graft sql --db data.sqlite "INSERT INTO notes(body) VALUES ('first note');"
-   ```
-
-4. 查看状态。
-
-   ```bash
-   graft status
-   ```
-
-   `data.sqlite` 仍是普通 SQLite 文件。Graft 只在检查或暂存该路径时读取它。
-
-5. 提交第一个应用状态版本。
-
-   ```bash
-   graft add --all
-   graft commit -m "seed notes"
-   ```
-
-6. 修改数据库并添加文件。
-
-   ```bash
-   graft sql --db data.sqlite "INSERT INTO notes(body) VALUES ('second note');"
-   mkdir -p attachments
-   printf 'draft\n' > attachments/readme.txt
-   ```
-
-7. 查看路径分类。
-
-   ```bash
-   graft status --json
-   ```
-
-   JSON 中的路径条目会包含 `kind` 和 `storage`。
-
-8. 提交并查看行级差异。
-
-   ```bash
-   graft add --all
-   graft commit -m "add second note and attachment"
-   graft diff --rows HEAD~1 HEAD data.sqlite
-   ```
-
-9. 从最新提交恢复数据库。
-
-   ```bash
-   graft sql --db data.sqlite "DELETE FROM notes;"
-   graft restore --source HEAD -- data.sqlite
-   graft status
-   ```
-
-</Steps>
-
-## 从标准输入执行 SQL
+## 1. 创建应用数据
 
 ```bash
-cat <<'SQL' | graft sql --db data.sqlite
-CREATE TABLE IF NOT EXISTS notes(id INTEGER PRIMARY KEY, body TEXT);
-INSERT INTO notes(body) VALUES ('hello from stdin');
-SELECT * FROM notes;
-SQL
+mkdir graft-notes-demo
+cd graft-notes-demo
+graft init
+graft sql --db app.sqlite \
+  "CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT NOT NULL);"
+graft sql --db app.sqlite \
+  "INSERT INTO notes VALUES (1, 'first');"
+printf '{"theme":"paper"}\n' > settings.json
+graft status
 ```
 
-## 下一步
+`init` 创建 `.graft/`，不创建数据库。`graft sql` 写入普通 SQLite 文件，也可以换成应用已有的 SQLite 库。
 
-- [跟踪数据库和文件](/zh/docs/guides/track-databases-and-files/)
-- [比较行与文件](/zh/docs/guides/diff-rows-and-files/)
-- [合并冲突](/zh/docs/guides/merge-conflicts/)
-- [远端同步](/zh/docs/guides/sync-remotes/)
-- [运行完整的应用状态演练](/zh/docs/quickstart/app-state-walkthrough/)
+**检查：**status 把数据库和设置文件列为新路径。此时它们还没有进入历史。
+
+## 2. 记录第一个版本
+
+```bash
+graft add app.sqlite
+graft add settings.json
+graft diff --staged
+graft commit -m "save first note and settings"
+graft status
+graft log
+```
+
+`add` 把选定内容捕获到**暂存区（index）**。`commit` 把暂存内容记录到历史。
+
+**检查：**状态干净，log 包含第一次提交。
+
+## 3. 记录第二个版本
+
+```bash
+graft sql --db app.sqlite \
+  "INSERT INTO notes VALUES (2, 'second');"
+printf '{"theme":"dark"}\n' > settings.json
+graft add app.sqlite
+graft add settings.json
+graft diff --rows --staged app.sqlite
+graft commit -m "save second note and dark theme"
+graft diff HEAD~1 HEAD
+graft diff --rows HEAD~1 HEAD app.sqlite
+```
+
+**检查：**路径差异列出两个文件，行差异报告新增第 2 条笔记。
+
+`HEAD` 表示当前仓库位置。`HEAD~1` 表示它的第一个父提交，在本例中就是第一个版本。
+
+## 4. 恢复并验证
+
+只在练习数据库中删除笔记：
+
+```bash
+graft sql --db app.sqlite "DELETE FROM notes;"
+graft status
+graft restore --source HEAD -- app.sqlite
+graft sql --db app.sqlite "SELECT id, body FROM notes ORDER BY id;"
+graft status
+```
+
+**检查：**查询返回 `1, first` 与 `2, second`，状态干净。restore 把 HEAD 中的数据库写回已跟踪路径，没有创建新提交。
+
+这里每次 SQL 命令返回前都会关闭连接。接入正在运行的应用时，恢复或切换分支前，应关闭受影响的 SQLite 连接。
+
+## 在本地 WebUI 中审查
+
+在已有仓库中运行 `graft .`，即可在浏览器打开本地界面。终端持续运行服务，按
+Ctrl+C 停止。右侧通过 **All files**、**Changes**、**History** 切换，选择路径
+后，左侧更新内容。Changes 对比当前工作区与 HEAD；History 对比选中的提交与
+它的第一个父提交。
+
+SQLite 数据库支持只读表格分页与行级 diff。在 All files 中，将鼠标移到文本
+文件的路径栏，点击 **Edit text file**，即可编辑。**Save** 或 Cmd/Ctrl+S 只
+写入工作区，不自动暂存。若其他进程已经修改文件，界面会拒绝覆盖并保留草稿。
+文本预览与编辑限制为 2 MB，二进制文件不提供文本预览。
+
+```sh
+graft ui . --no-open --port 4178
+```
+
+此命令打印本地会话地址，不自动打开浏览器。地址只对应当前运行的服务，重启后
+会创建新的会话。
+
+## 你已经观察到的关系
+
+SQLite 保存改变工作区，暂存选择内容，提交记录选择，恢复用历史内容替换工作区文件。
+
+`add` 之后的新修改不会自动包含在提交中。[暂存练习](/zh/docs/graft-book/hands-on-lab/)会验证这个边界。
+
+| 下一步想做什么 | 阅读 |
+| --- | --- |
+| 跟踪附件或选择路径 | [数据库与文件](/zh/docs/guides/track-databases-and-files/) |
+| 查看更多变化类型 | [行与文件差异](/zh/docs/guides/diff-rows-and-files/) |
+| 组合分支修改 | [合并冲突](/zh/docs/guides/merge-conflicts/) |
+| 把已记录历史传到别处 | [远端同步](/zh/docs/guides/sync-remotes/) |
+| 接入应用 | [选择集成方式](/zh/docs/getting-started/) |

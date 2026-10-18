@@ -1,0 +1,34 @@
+---
+title: 实用示例
+description: 用简短、面向任务的 Graft 工作流比较 SQLite 文件、传递 delta、解决行冲突以及恢复历史。
+---
+
+import { CardGrid, LinkCard } from "@astrojs/starlight/components";
+
+实用示例是为单一任务准备的、可直接复制粘贴的工作流。它们假定 `graft` 与
+`sqlite3` 已在 `PATH` 中，并且只有在示例明确说明时才需要 repository。
+
+<CardGrid>
+  <LinkCard
+    title="比较两个 SQLite 文件"
+    href="/zh/docs/recipes/diff-two-sqlite-files/"
+    description="无需创建 repository，直接比较两个数据库文件。"
+  />
+  <LinkCard
+    title="生成并应用 Delta"
+    href="/zh/docs/recipes/generate-sqlite-delta/"
+    description="只传输发生变化的 SQLite page，并从精确 base 重建 target。"
+  />
+  <LinkCard
+    title="解决行冲突"
+    href="/zh/docs/recipes/resolve-row-conflicts/"
+    description="合并分支，并逐行选择 ours 或 theirs。"
+  />
+  <LinkCard
+    title="快照与恢复历史"
+    href="/zh/docs/recipes/snapshot-and-restore/"
+    description="提交应用状态、回到历史 revision，并恢复单个路径。"
+  />
+</CardGrid>
+
+这些命令背后的概念，请从 [CLI 快速开始](/zh/docs/quickstart/cli/) 读起。

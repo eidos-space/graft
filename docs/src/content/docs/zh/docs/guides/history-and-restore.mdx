@@ -1,74 +1,117 @@
 ---
 title: 历史与恢复
-description: 提交、查看、分支、切换、恢复、checkout 和 reset Graft app-state history。
+description: 先选择要改变文件、暂存区还是分支位置，再验证结果。
 ---
 
-Graft 使用 Git-like 模型：
+先判断你想改变什么，再选择历史命令。
 
-```text
-worktree -> index -> commit
-```
+| 目标 | 操作 | 效果 |
+| --- | --- | --- |
+| 记录选定变化 | add，再 commit | 创建本地历史 |
+| 单独检查旧数据库 | export | 写入独立文件 |
+| 替换一个当前文件 | 指定来源的 restore | 改变该工作区路径 |
+| 取消暂存选择 | restore staged | 保留应用文件 |
+| 使用另一个分支 | switch | 切换分支，可能替换已跟踪文件 |
+| 把当前分支移回旧版本 | reset | 效果取决于模式 |
 
-SQLite transaction 更新数据库状态；Graft commit 记录哪些 snapshot 和文件
-artifact 属于一个应用状态版本。
+替换文件前，关闭受影响的应用 SQLite 连接。见[替换生命周期](/zh/docs/graft-book/checkout-and-restore/)。
 
-## 提交历史
+## 记录并查看检查点
 
 ```bash
 graft status
 graft add --all
+graft diff --staged
 graft commit -m "save checkpoint"
-```
-
-查看：
-
-```bash
 graft log
-graft log --json
 graft show HEAD
-graft show --json HEAD
 ```
 
-## 分支和切换
+commit 记录暂存内容。`add` 之后的新变化留在工作区。集成时，为 status、log 和 show 添加 `--json`。
+
+## 检查旧数据库，不替换当前文件
+
+选择工作区外的新目标，并用 `sqlite3` 查询：
 
 ```bash
-graft branch feature/search
-graft switch feature/search
-graft switch -c experiment main
+graft export --source HEAD~1 --output ../previous.sqlite app.sqlite
+sqlite3 ../previous.sqlite 'SELECT * FROM notes ORDER BY id;'
 ```
 
-切换分支会把目标 commit 中的 SQLite snapshot 和文件 artifact materialize
-到 worktree。
+**检查：**输出数据库包含旧行，应用数据库仍在原处。
 
-## 恢复路径
+## 恢复一个路径
 
-从 `HEAD` 恢复 worktree path：
-
-```bash
-graft restore --source HEAD -- data.sqlite
-```
-
-从旧 revision 恢复：
+以下命令假设所选来源包含对应路径：
 
 ```bash
+graft restore --source HEAD -- app.sqlite
 graft restore --source HEAD~1 -- attachments/report.pdf
 ```
 
-取消 stage：
+选定路径的工作区内容会被替换，分支位置不移动。未指定 `--source` 时，工作区恢复使用暂存区。
+
+**检查：**查询或打开恢复后的路径，再执行 `graft status`。恢复旧版本后，内容可能与当前 HEAD 不同；如果希望把恢复记录为新版本，再暂存并提交。
+
+取消暂存，保留工作区内容：
 
 ```bash
-graft restore --staged -- data.sqlite
+graft restore --staged -- app.sqlite
 graft restore --staged --all --kind sqlite_database
 ```
 
-## Checkout 和 Reset
+## 创建并使用分支
+
+```bash
+graft branch experiment
+graft switch experiment
+```
+
+创建分支增加指向当前版本的指针。切换改变当前分支，并检出该分支的已跟踪内容。
+
+一步创建并切换：
+
+```bash
+graft switch -c feature/notes main
+```
+
+列出本地、远端或全部分支：
+
+```bash
+graft branch
+graft branch -r
+graft branch -a
+```
+
+**检查：**确认当前分支，再查询数据库验证内容。
+
+## 检出指定版本
 
 ```bash
 graft checkout HEAD~1
-graft checkout HEAD~1 data.sqlite
 ```
 
-Reset：
+这会直接选择旧提交，进入游离 HEAD。回到分支时使用 `graft switch main`。
+
+只检出一个路径：
+
+```bash
+graft checkout HEAD~1 app.sqlite
+```
+
+需要明确指定来源与目标状态时，使用 restore。
+
+## 选择 reset 模式
+
+reset 把当前分支移到目标，改变分支的可见位置，不会增加一次恢复提交。
+
+| 模式 | 分支位置 | 暂存状态 | 工作区 |
+| --- | --- | --- | --- |
+| `--soft` | 移动 | 保留当前选择 | 保留当前文件 |
+| `--mixed` | 移动 | 重置到目标 | 保留当前文件 |
+| `--hard` | 移动 | 重置到目标 | 用目标内容替换 |
+
+以下是可选命令，不应依次执行：
 
 ```bash
 graft reset --soft HEAD~1
@@ -76,13 +119,16 @@ graft reset --mixed HEAD~1
 graft reset --hard HEAD~1
 ```
 
-`--hard` 会丢弃 staged 和 unstaged worktree changes，只在明确需要时使用。
+hard reset 丢弃已暂存和未暂存变化。仅在确实需要替换时使用。
 
-## Tags
+## 用标签命名版本
 
 ```bash
-graft tag v0.1
-graft tag -a v0.1 -m "first checkpoint"
+graft tag checkpoint-1
+graft tag -a reviewed-1 -m "reviewed checkpoint"
 graft tag
-graft tag -d v0.1
 ```
+
+第一条创建轻量标签，第二条创建附注标签。标签让你可以用名称引用版本。
+
+替换失败后，先检查状态与受影响路径，再恢复应用写入。多路径替换不是文件系统级事务。

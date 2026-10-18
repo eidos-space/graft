@@ -1,0 +1,36 @@
+---
+title: Recipes
+description: Short, task-focused Graft workflows for differencing SQLite files, transferring deltas, resolving row conflicts, and restoring history.
+---
+
+import { CardGrid, LinkCard } from "@astrojs/starlight/components";
+
+Recipes are short, copy-pasteable workflows for a single job. They assume
+`graft` and `sqlite3` are on your `PATH`, and they only require a repository
+when the recipe says so.
+
+<CardGrid>
+  <LinkCard
+    title="Diff two SQLite files"
+    href="/docs/recipes/diff-two-sqlite-files/"
+    description="Compare two database files without creating a repository."
+  />
+  <LinkCard
+    title="Generate and apply a Delta"
+    href="/docs/recipes/generate-sqlite-delta/"
+    description="Ship only the changed SQLite pages and rebuild the target from its exact base."
+  />
+  <LinkCard
+    title="Resolve row conflicts"
+    href="/docs/recipes/resolve-row-conflicts/"
+    description="Merge branches and pick ours or theirs for each conflicting row."
+  />
+  <LinkCard
+    title="Snapshot and restore history"
+    href="/docs/recipes/snapshot-and-restore/"
+    description="Commit app state, time-travel to a revision, and restore one path."
+  />
+</CardGrid>
+
+For the concepts behind these commands, start with the
+[CLI quickstart](/docs/quickstart/cli/).

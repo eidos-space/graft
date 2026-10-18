@@ -1,46 +1,49 @@
 # Graft
 
-**Git for SQLite.**
+**Version history for SQLite databases and application files.**
 
 [Try the Playground](https://graft.eidos.space/playground/) ·
 [Documentation](https://graft.eidos.space/) ·
 [Releases](https://github.com/eidos-space/graft/releases) ·
 [简体中文](./README.zh-CN.md)
 
-Git tracks a SQLite database as an opaque binary file. Graft adds
-storage-efficient snapshots, schema-aware merges, and row-level diffs while
-keeping the worktree as ordinary SQLite files.
+Graft records versions of your application's SQLite databases and related
+files. You can inspect row changes, restore a recorded state, combine supported
+branch edits, and send history to a remote. Your application keeps using
+ordinary SQLite connections and file APIs.
 
-## Why Graft?
+## What gets recorded?
 
-A custom diff driver can render a readable view of `data.sqlite` for review.
-Git's storage and merge still operate at the file level, leaving SQLite
-storage, schemas, and rows invisible.
+Suppose a note in `app.sqlite` refers to `attachments/report.pdf`, and
+`settings.json` controls how the application displays it. You can record their
+selected versions in one commit, then return to that recorded combination.
 
-Graft adds those database semantics:
+Graft understands supported SQLite content:
 
 - Consistent snapshots, including committed WAL frames
 - Content-addressed chunks that reuse unchanged SQLite content across versions
 - Schema-, table-, and row-level diffs and merges
 - Git-like commits, branches, tags, restore, and remote sync
 
-Related files can be recorded in the same commit as the database:
-
 ```text
 app-data/
-  data.sqlite
-  settings.json
-  attachments/
+├── app.sqlite
+├── settings.json
+└── attachments/
+    └── report.pdf
 ```
 
-Graft uses a familiar Git-like workflow with its own repository and remote
-formats.
+A shared commit does not create a transaction across these files. Coordinate
+application writes when the files must represent the same checkpoint.
+
+Graft uses a Git-like workflow with its own repository and remote formats.
 
 ## Try Graft
 
-The [Graft Playground](https://graft.eidos.space/playground/) runs the real CLI
-in your browser. It is the fastest way to explore commits, branches, row-level
-diffs, and conflicts without installing anything.
+The [Graft Playground](https://graft.eidos.space/playground/) runs the browser
+CLI in an OPFS worktree. Try local commits, branches, row diffs, and conflicts
+without installing anything. Native remote synchronization is unavailable in
+the browser host.
 
 Install the latest release on macOS or Linux:
 
@@ -55,14 +58,17 @@ mkdir graft-demo
 cd graft-demo
 
 graft init
-graft sql --db data.sqlite \
+graft sql --db app.sqlite \
   "CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT NOT NULL);"
-graft sql --db data.sqlite \
+graft sql --db app.sqlite \
   "INSERT INTO notes(body) VALUES ('first note');"
-graft add --all
+graft add app.sqlite
 graft commit -m "Save initial state"
 graft log
+graft sql --db app.sqlite "SELECT id, body FROM notes;"
 ```
+
+The query returns the first note. The log contains the recorded version.
 
 Continue with the [CLI quickstart](https://graft.eidos.space/docs/quickstart/cli/).
 
@@ -113,15 +119,30 @@ The integration is open source in the
 
 Using Graft in a product? Open a pull request to add it here.
 
-## Core Model
+## Saving, staging, and recording
 
-1. Your application writes ordinary SQLite databases and files.
-2. `graft add` captures a consistent snapshot and stages related paths.
-3. `graft commit` records them as one application state.
-4. Diff, branch, merge, restore, and sync operate on that history.
+| Action | What changes |
+| --- | --- |
+| SQLite transaction or file write | Current application files in the worktree |
+| `graft add` | Selected snapshots and file bytes in the index (staging area) |
+| `graft commit` | Local repository history, using staged content |
+| `graft push` | Remote history, using recorded commits |
+| Restore or switch | Worktree files, using recorded content |
+
+If you insert a note after `add`, `commit` still records the earlier snapshot.
+The new note remains an unstaged worktree change. Push does not upload it as a
+new version until you stage and commit it.
 
 A repository stores its history in `.graft/` beside the normal worktree.
 Applications keep using their existing SQLite library and file APIs.
+
+Staging captures committed WAL content without a manual checkpoint. Restore
+and branch switching can replace database files; close affected application
+connections before those operations.
+
+The [architecture guide](https://graft.eidos.space/docs/graft-book/) explains
+these boundaries. Its [lab](https://graft.eidos.space/docs/graft-book/hands-on-lab/)
+lets you predict a result, run the command, and check it with a SQL query.
 
 ## Project Status
 

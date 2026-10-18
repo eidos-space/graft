@@ -128,7 +128,9 @@ candidate 的操作，可能把已跟踪 SQLite snapshot materialize 到对应�
 database path，例如 `data.sqlite` 或 `sub-app/main.sqlite`。Stage 与 commit 只记录
 repository state，不替换实时 worktree 文件。
 
-只有在集成方明确想要 volume-only database path、不希望 worktree 出现普通 SQLite 文件时，才把它设为 `false`。
+需要关闭普通 checkout 计划中的 SQLite 投影时，才把它设为 `false`。这个设置不能
+阻止所有工作区写入：显式冲突解决和普通文件仍可能写入路径。管理 SQLite 连接时，
+应检查操作是否可能替换文件及其返回的路径效果，不能只依赖这个设置。
 
 ## Repository Storage
 

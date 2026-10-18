@@ -1,0 +1,89 @@
+---
+title: 解决行冲突
+description: 合并两个修改了同一批 SQLite 行的分支，并逐行选择 ours 或 theirs。
+---
+
+当两个分支修改同一行时，`graft merge` 产生的是 row conflict，而不是二进制的冲突
+标记。每一行都可以单独解决。
+
+## 1. 创建包含三行的数据库
+
+```bash
+graft init
+sqlite3 data.sqlite "CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT); INSERT INTO notes(body) VALUES('alpha'),('beta'),('gamma');"
+graft add -A && graft commit -m init
+```
+
+## 2. 在两个分支上修改行
+
+```bash
+graft branch fix && graft switch fix
+sqlite3 data.sqlite "UPDATE notes SET body='alpha-fix' WHERE id=1; UPDATE notes SET body='beta-fix' WHERE id=2;"
+graft add -A && graft commit -m fix
+
+graft switch main
+sqlite3 data.sqlite "UPDATE notes SET body='alpha-main' WHERE id=1; UPDATE notes SET body='beta-main' WHERE id=2;"
+graft add -A && graft commit -m main
+```
+
+## 3. 合并前先查看差异
+
+```bash
+graft diff main fix --rows
+```
+
+```text
+Row Diff 71c68854b187..d833336e464c
+modified: data.sqlite
+  Table 'notes': ~2 updates
+    ~ rowid 1:
+      old: [Null, Text("alpha-main")]
+      new: [Null, Text("alpha-fix")]
+    ~ rowid 2:
+      old: [Null, Text("beta-main")]
+      new: [Null, Text("beta-fix")]
+```
+
+## 4. 合并
+
+```bash
+graft merge fix
+```
+
+```text
+Merged 3dd17df3b1dc
+Unmerged paths:
+  data.sqlite
+```
+
+冲突期间，worktree 保留 ours candidate，因此 `sqlite3` 看到的仍是 `main` 的值。
+
+## 5. 逐行解决
+
+`--row <table> <identity>` 选择单个 row conflict，再配合 `--ours` 或 `--theirs`。
+path 参数仍然必须提供。
+
+```bash
+graft resolve --theirs --row notes 1 data.sqlite
+graft resolve --ours   --row notes 2 data.sqlite
+graft merge --continue -m merge
+
+sqlite3 -header -column data.sqlite "SELECT * FROM notes;"
+```
+
+```text
+id  body
+--  ---------
+1   alpha-fix
+2   beta-main
+3   gamma
+```
+
+## 说明
+
+- worktree 文件会在最后一个 row conflict 解决后才写入，因此要在所有 `resolve`
+  之后再运行 `sqlite3`。
+- 只有一侧修改的行（例如此处的第 3 行）会自动合并。
+- 用 `graft conflicts --json` 可以列出 conflict identity 和两侧的值。
+- 要放弃这次合并，运行 `graft merge --abort`。
+- 上面的 hash 为缩写，每台机器可能不同。

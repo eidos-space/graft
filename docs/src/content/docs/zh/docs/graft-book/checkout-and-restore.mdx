@@ -1,105 +1,94 @@
 ---
-title: 04 从快照回到工作区
-description: 区分 hydration、materialization、export，并解释 SQLite replacement 的锁、WAL 和恢复流程。
+title: 04 切换与恢复
+description: 区分下载、导出与工作区替换，并在替换 SQLite 文件时正确管理连接。
 ---
 
-## 三个看似相近、实际不同的动作
+**你想查看旧版本，还是使用旧版本**
 
-| 动作 | 结果写在哪里 | 会移动 ref/index 吗 | 会替换 tracked worktree 吗 |
-| --- | --- | ---: | ---: |
-| hydration | local object/page/payload store | 否 | 否 |
-| materialization | repository-relative physical path | 视上层操作而定 | 是 |
-| export | caller 指定的独立目标 | 否 | 否（目标不应是 tracked path） |
+如果只想检查旧数据库，同时让应用继续使用当前版本，先**导出（export）**到独立路径。
 
-row diff 的 `materialized_compat` 还会创建临时 SQLite database，但它位于隔离的 temp
-目录，不是应用 worktree，因此也不是 checkout materialization。
+如果希望应用使用历史内容，**恢复（restore）**一个路径或**切换（switch）**分支。这些操作可能替换工作区文件。
 
-## checkout 的输入是 canonical state
+| 动作 | 内容写到哪里 | 对应用文件的影响 |
+| --- | --- | --- |
+| 补齐内容（hydration） | 本地 Graft 存储 | 下载缺失内容，不替换已跟踪文件 |
+| 导出（export） | 独立输出路径 | 保留工作区数据库 |
+| 实体化（materialization） | 已跟踪的工作区路径 | 把已记录内容写回该路径 |
 
-`switch`、revision `checkout`、`restore`、`reset --hard`、`pull`、`clone` 和若干 merge
-操作会先计算一个 checkout plan。plan 描述目标 commit 中每个 SQLite snapshot 和 file
-artifact，以及哪些旧 path 要删除。
+**实体化**指把记录的内容写成工作区文件。切换、checkout、恢复、hard reset、pull、clone 和部分合并操作都可能执行它。
 
-执行前需要：
+## 先导出，再检查
 
-1. 解析并校验目标 tree/blob；
-2. hydrate 本地缺失的 object、storage commit/page 或 external payload；
-3. 检查 untracked collision 和 path-type collision；
-4. 确定将被创建、替换或删除的路径；
-5. 在 repository state 改变前尽可能完成 SQLite replacement preflight。
+在已跟踪 `app.sqlite` 的仓库中：
 
-只读 planning 可以下载 immutable 内容，但不能移动 `HEAD`、改 index 或碰应用文件。
-
-## 为什么 materializing 操作前必须关闭应用 handle
-
-checkout 的结果是一个新的普通 SQLite 文件，不承诺保留旧 inode。即使 idle connection
-没有持有写 transaction，它也可能继续指向已被替换的旧文件描述符。因此 host 的安全
-生命周期是：
-
-```text
-drain transaction / checkpoint if desired
-          |
-close affected application SQLite handles
-          |
-run materializing Graft operation
-          |
-success: reopen handles
-failure: inspect status/paths, reconcile, then reopen or retry
+```bash
+graft export --source HEAD~1 --output ../previous.sqlite app.sqlite
+sqlite3 ../previous.sqlite 'SELECT * FROM notes ORDER BY id;'
 ```
 
-SDK 的 `operationMaterializesWorktree(name)` 是保守 gate：`true` 表示该类操作在某些合法
-输入下可能 materialize，不表示本次调用一定写了文件。调用后的 `worktree_paths` 才是精确
-效果。
+选择工作区外尚未使用的输出路径，避免导出文件成为新的应用文件候选。导出不移动 HEAD，也不改变暂存区。
 
-## 单个 SQLite path 的 replacement
+## 恢复已记录的路径
 
-对已经存在的目标文件，adapter 会：
+先关闭应用对这个数据库的连接，再执行：
 
-1. 确认目标是 regular file；
-2. 用有界 busy timeout 打开并探测 exclusive transaction；
-3. 若是 WAL mode，执行 `wal_checkpoint(TRUNCATE)`，要求没有 busy reader/writer；
-4. 切回 rollback-journal mode；
-5. 删除 regular `-wal`、`-shm`、`-journal`，遇到同名非普通文件则拒绝；
-6. 保持 replacement guard，阻止新 writer 插入 preflight 与替换之间；
-7. 在同目录创建唯一临时文件，按 snapshot page 顺序写出完整 image 并 flush；
-8. 用 rename/replace 原子替换单个目标 path；
-9. 更新该 worktree path 对应的 volume binding。
+```bash
+graft restore --source HEAD -- app.sqlite
+graft sql --db app.sqlite "SELECT * FROM notes ORDER BY id;"
+graft status
+```
 
-活跃 writer、长 transaction、无法 checkpoint 的 WAL 或 path collision 都必须在不覆盖主
-文件的情况下失败。
+这会从 HEAD 恢复该路径，不移动分支。该路径的工作区变化会被替换。显式指定 `--source HEAD` 很重要：没有指定来源时，工作区恢复使用暂存内容。
 
-## 多路径 checkout 不是一个 filesystem transaction
+取消暂存是另一种操作：
 
-Graft 会先把受影响的旧 SQLite 文件移到 `.graft/tmp/workspace-checkout-*` 下的私有 backup，
-再逐路径 materialize SQLite、普通 artifact 和 volume binding。后续路径失败时会倒序尝试
-恢复 backup、artifact 和 binding。
+```bash
+graft restore --staged -- app.sqlite
+```
 
-单个 rename 可以是原子的；多个 path 的整个 checkout 不是。失败后不要根据“某个文件看
-起来已经更新”猜测仓库状态，应重新运行 `graft status`，检查返回的 path actions，再决定
-retry 或人工恢复。
+它从 HEAD 重置暂存条目，保留工作区数据库。
 
-## `worktree.materialize_sqlite = false`
+## 替换前关闭连接
 
-关闭这个配置后，普通 checkout plan 不再把 SQLite snapshot 投影为 physical database；
-repository canonical state 和 volume/path binding 仍会更新。它适合明确采用 volume-only
-数据库路径的 host。
+替换后，即使连接处于空闲状态，也可能继续引用旧文件。检查写入锁不能代替应用管理连接生命周期。
 
-但这不是跳过 handle gate 的许可证：显式 merge resolution 等操作仍可能写物理结果，普通
-file artifact 也仍可能 materialize。应依据操作 gate 和返回的精确 path actions，而不是只
-看这一项配置。
+采用以下顺序：
 
-## 常见操作对照
+```text
+暂停新的应用写入
+        |
+完成事务，关闭受影响的 SQLite 连接
+        |
+执行会替换文件的操作
+        |
+检查操作结果与仓库状态
+        |
+重新连接到结果文件
+```
 
-| 操作 | 是否可能 materialize | 核心变化 |
-| --- | ---: | --- |
-| `status`、`log`、`diff`、`fetch` | 否 | 只读或只写 local repository store |
-| `add`、`commit` | 否 | index/objects/ref；不替换 worktree |
-| `restore --staged`、`reset --mixed` | 否 | 只改 index/ref 分类 |
-| `switch`、revision `checkout`、`restore <path>` | 是 | 应用 checkout plan |
-| `reset --hard`、`pull`、`clone` | 是 | 更新 canonical state 并投影 |
-| `planMerge` | 否 | 只读 plan，可 hydrate |
-| `applyMerge`、resolution、abort | 是 | 可能写 merge result 或恢复文件 |
-| `export` | 否 | 只写独立 destination |
+Graft 会检查 SQLite 替换条件，并处理 WAL 附属文件。活跃写入者、忙碌的 WAL、无效附属文件或路径冲突都可能阻止替换。先处理报告的问题，再重试。
 
-“不 materialize”不等于“完全不写磁盘”：`fetch` 会写 object/page store，`commit` 会写
-objects 和 refs。这里的分类只回答是否会替换应用拥有的 tracked worktree path。
+## 一次重命名不等于多文件事务
+
+Graft 使用临时文件和受保护的替换。多路径 checkout 可以使用备份，并在失败后尝试恢复。但每个替换独立执行，操作系统错误可能留下部分效果。
+
+失败后检查 `graft status`、返回的路径动作和受影响的数据。确认结果后再恢复应用写入。不要根据一个文件推断整个操作的结果。
+
+## 集成时检查操作效果
+
+SDK 的 `operationMaterializesWorktree(name)` 是调用前的保守判断：返回 `true` 表示这类操作在某些输入下可能替换已跟踪路径。结果中的 `worktree_paths` 报告实际受影响的路径。
+
+| 操作 | 可能替换已跟踪的工作区文件吗？ |
+| --- | --- |
+| status、log、diff、fetch、add、commit | 否 |
+| 取消暂存、mixed reset | 否 |
+| switch、checkout、路径恢复、hard reset、pull、clone | 是 |
+| 合并规划（`planMerge`） | 否，但可能补齐所需内容 |
+| 应用合并、解决冲突、中止合并 | 是 |
+| export | 否，它写入独立目标 |
+
+这里的“否”表示不替换已跟踪的应用文件。fetch 仍会写入仓库存储，commit 仍会写入对象和引用。
+
+`worktree.materialize_sqlite = false` 关闭普通 checkout 计划中的 SQLite 投影。显式冲突解决和普通文件仍可能写入工作区。管理连接时应使用操作判断。
+
+分支和 reset 命令见[历史与恢复](/zh/docs/guides/history-and-restore/)，精确替换规则见[工作区规范](/zh/docs/specifications/)。

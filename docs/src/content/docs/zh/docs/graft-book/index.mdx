@@ -1,103 +1,63 @@
 ---
 title: 架构导读
-description: 跟随一次应用变更经过 Graft 的仓库、SQLite 存储、合并、远端与恢复层。
+description: 用同一个笔记例子理解应用保存、暂存、历史、合并、同步与恢复。
 ---
 
-本指南回答一个问题：**应用提交了一次 SQLite 事务以后，那次变化如何变成可比较、
-可合并、可同步、可恢复的 Graft 历史？**
+**一条笔记，三个位置**
 
-它不是 CLI 命令手册，也不要求你先熟悉源码。我们会一直使用同一个例子：仓库里有
-`app.sqlite`、`settings.json` 和一个较大的 `attachments/report.pdf`。你会看到这三类
-内容如何经过不同的数据通道，最后在同一个 repository commit 中汇合。
+应用把笔记写入 `app.sqlite`，同时读取 `settings.json` 和 `attachments/` 中的文件。Graft 可以把这些路径选定的版本记录在同一次提交中。
 
-## 先记住：Graft 同时维护两层历史
+先分清三个位置：
 
-这是理解整个项目最重要的一句话。
-
-```text
-应用层历史（repository history）
-branch/ref -> repository commit -> tree -> path blob
-                                           |
-                                           +-- file bytes / external pointer
-                                           +-- SQLite snapshot descriptor
-
-SQLite 存储历史（storage history）
-snapshot descriptor -> VolumeId + ordered log ranges
-                                  |
-                                  +-- (LogId, LSN) storage commits
-                                                 |
-                                                 +-- changed 4 KiB pages
-```
-
-repository commit 回答“这个应用版本包含哪些路径”；storage commit 回答“某个 SQLite
-快照相对前态改变了哪些 4 KiB 页”。二者不是同一个 commit，也没有一一对应关系：
-
-- 一次 repository commit 可以同时引用多个 SQLite 快照和普通文件；
-- 一次 `graft add app.sqlite` 可能先产生 storage commit，但还没有 repository commit；
-- 如果数据库没有净变化，`add` 可以直接复用旧 snapshot，不产生新的 storage commit；
-- branch ref 只指向 repository commit，不直接指向 LSN。
-
-## 一次变化经过的五个状态
-
-以向 `notes` 表插入一行为例：
+| 位置 | 回答的问题 | 谁改变它 |
+| --- | --- | --- |
+| 工作区（worktree） | 应用现在读到什么？ | SQLite 事务和普通文件写入 |
+| 暂存区（index） | 我为下一次提交选好了什么？ | `graft add`、取消暂存、解决冲突 |
+| 历史（history） | 我记录过哪些版本？ | `graft commit` |
 
 ```text
-1. worktree
-   app.sqlite 与可能存在的 app.sqlite-wal 被普通 SQLite 修改
-          |
-          | graft add
-          v
-2. consistent private image（临时）
-   SQLite online backup 得到只含已提交 transaction 的独立镜像
-          |
-          | 4 KiB chunk comparison
-          v
-3. storage snapshot
-   变化页进入 immutable segment，产生 (LogId, LSN) storage commit
-          |
-          | snapshot descriptor
-          v
-4. index
-   path app.sqlite 的 stage 0 指向这份精确 snapshot
-          |
-          | graft commit
-          v
-5. repository history
-   写 blob -> tree -> commit，最后移动 refs/heads/main
+应用写入
+   |
+   v
+工作区 -- graft add --> 暂存区 -- graft commit --> 历史
+   ^                                                |
+   |-------------- 从历史恢复或切换 ----------------|
 ```
 
-第 2 步只是捕获边界，不是新的工作区文件。第 4 步才是“下一次 commit 会提交什么”的
-权威答案。`commit` 不会重新读取后来又发生变化的 `app.sqlite`。
+箭头表示捕获、记录或替换。它们不是持续同步。
 
-## 用四个问题读任何操作
+如果你在 `graft add` 之后又写入一条笔记，下一次提交仍包含之前暂存的数据库。新笔记留在工作区。如果你推送这次提交，远端收到的是已记录的版本。
 
-当你不确定一条命令是否安全，依次问：
+## 读完后，你应该能判断什么
 
-1. **它读哪个状态？** worktree、index、某个 commit，还是 active merge 的一侧？
-2. **它写哪个状态？** storage、objects、index、ref、merge journal、remote，还是物理 worktree？
-3. **谁是结果的 identity？** 文件字节 hash、object ID、snapshot descriptor，还是 `(LogId, LSN)`？
-4. **失败后哪个记录仍是权威的？** ref、index、merge journal，还是可重建的 cache？
+- 一条命令改变应用文件、暂存内容，还是历史。
+- 为什么提交 SQLite 事务不会自动创建 Graft 提交。
+- 什么时候使用导出、恢复、fetch 或 pull。
+- 遇到冲突或操作中断后，应该检查哪些状态。
 
-后续各章都会沿用这四个问题。
+[动手练习](/zh/docs/graft-book/hands-on-lab/) 会让你先预测结果，再用 SQL 查询和仓库命令验证。
 
-完成 CLI 或 SDK 快速开始后再阅读本节。这里解释安全接入所需的系统边界；具体操作
-顺序以任务指南为准，精确契约以规范为准。
+## 按问题选择章节
 
-## 阅读路线
+| 你的问题 | 对应章节 |
+| --- | --- |
+| 文件与版本存在哪里？ | [仓库与对象](/zh/docs/graft-book/repository-and-objects/) |
+| 使用 WAL 的数据库如何生成一致快照？ | [SQLite 快照](/zh/docs/graft-book/sqlite-snapshots/) |
+| 下一次提交会包含哪些修改？ | [暂存与提交](/zh/docs/graft-book/stage-and-commit/) |
+| 什么时候需要关闭数据库连接？ | [切换与恢复](/zh/docs/graft-book/checkout-and-restore/) |
+| 两个分支的修改能否合在一起？ | [差异与合并](/zh/docs/graft-book/diff-and-merge/) |
+| 远端收到什么，失败后如何处理？ | [远端与恢复](/zh/docs/graft-book/remotes-and-recovery/) |
 
-1. [仓库、对象与引用](/zh/docs/graft-book/repository-and-objects/)：先看 `.graft/` 里谁是数据、谁是指针、谁只是 cache。
-2. [SQLite 如何变成快照](/zh/docs/graft-book/sqlite-snapshots/)：理解一致备份、4 KiB page、log 与 LSN。
-3. [从 add 到 commit](/zh/docs/graft-book/stage-and-commit/)：逐文件观察命令前后的状态变化。
-4. [从快照回到工作区](/zh/docs/graft-book/checkout-and-restore/)：理解 hydrate 与 materialize，以及为什么要关闭数据库 handle。
-5. [Diff、Merge 与冲突](/zh/docs/graft-book/diff-and-merge/)：看物理 page 如何重新被解释成 row/schema 变化。
-6. [远端、失败与恢复](/zh/docs/graft-book/remotes-and-recovery/)：理解发布顺序、CAS 和可恢复边界。
-7. [动手观察每一次变化](/zh/docs/graft-book/hands-on-lab/)：亲手建立一个仓库并检查 `.graft/`。
+## 数据库页还有一层存储记录
 
-## 什么是契约，什么只是当前实现
+**仓库提交（repository commit）** 记录一个应用版本：包含哪些路径、各路径的内容，以及父提交。**存储提交（storage commit）** 记录 Graft 存储引擎中的数据库块变化。
 
-路径身份、object/ref/index 语义、快照内容、merge 结果和 remote publication 顺序是
-可观察契约。Fjall 的私有 key encoding、cache 文件名、Rust 模块边界和临时文件命名是
-实现细节。调试时可以观察它们，但不要让产品集成依赖它们。
+二者不同。一次仓库提交可以包含多个数据库和普通文件。暂存数据库时，可能已经产生存储记录，但还没有仓库提交。分支指向仓库提交。
 
-当前代码中也不存在“通过 SQLite PRAGMA 控制仓库”这条兼容层。受支持的集成面是
-`graft` CLI 及其 JSON 输出、Node.js SDK 和 HTTP remote packages。
+使用 Graft 不需要先理解存储日志编号或页布局。快照章节会在解释复用与重建时介绍它们。
+
+## 精确规则在哪里
+
+本指南解释模型。[任务指南](/zh/docs/guides/track-databases-and-files/) 提供操作步骤。[规范](/zh/docs/specifications/) 定义精确契约与限制。
+
+集成时使用 CLI 及其 JSON 输出、Node.js SDK，或 HTTP 远程服务包。内部存储键、缓存文件名和 Rust 模块边界属于实现细节。

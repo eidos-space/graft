@@ -1,101 +1,110 @@
 ---
 title: 02 SQLite Snapshots
-description: Follow WAL-aware capture into 4 KiB pages, segments, storage commits, logs, and snapshot descriptors.
+description: Understand what staging captures, why WAL matters, and how changed chunks reconstruct a full database.
 ---
 
-## Graft does not copy a moving file
+**What does a database snapshot contain?**
 
-Committed SQLite state may live in both the main database and `-wal`. Copying only the main file
-can miss committed frames or capture torn state. `graft add` first creates a private, standalone,
-consistent image through a SQLite backup boundary. It includes committed WAL frames and excludes
-uncommitted transactions; the application does not need to checkpoint manually.
+A **snapshot** is one consistent, committed SQLite database state. It can be restored as an ordinary SQLite file.
 
-On macOS a safe rollback-journal case can use a file-clone fast path. Other cases use SQLite online
-backup. Both must produce the same logical result.
+Suppose your application inserts a note and commits its SQLite transaction. In WAL mode, that note may be in `app.sqlite-wal` rather than the main `app.sqlite` file. Copying only the main file can miss it.
 
-## SQLite page size is not Graft page size
-
-SQLite supports physical page sizes from 512 B through 64 KiB. Graft storage always uses fixed
-4096-byte pages. An 8 KiB SQLite page therefore occupies two Graft chunks. Checkout concatenates
-the chunks into the original file; row analysis can use a compatibility database when it cannot
-interpret a layout directly.
-
-## First add: create a lineage
-
-For a five-page image:
+When you run `graft add app.sqlite`, Graft captures a private, consistent database image. The capture includes committed WAL frames and excludes uncommitted transactions. You do not need to checkpoint manually.
 
 ```text
-physical image: [P1][P2][P3][P4][P5]
-                         |
-                         v
-new Volume V
-local Log L
-storage commit (L, 1)
-segment S1 = {1:P1, 2:P2, 3:P3, 4:P4, 5:P5}
-page_count = 5
+app.sqlite + committed app.sqlite-wal content
+                   |
+                   | consistent capture
+                   v
+          private database image
+                   |
+                   | store changed chunks
+                   v
+          staged snapshot
 ```
 
-A storage commit is addressed by `(LogId, LSN)`. LSNs start at one and are ordered only within a
-log. Two different logs at LSN 3 are not chronologically comparable.
+The private image is temporary. Staging does not replace the application's database.
 
-## Second add: append changed pages
+Each database capture is consistent. A commit containing several databases and files does not create an application-wide transaction across them. Coordinate application writes when those paths must represent the same checkpoint.
 
-If pages 1 and 4 change and the file grows:
+## How Graft reuses unchanged content
+
+Graft divides the captured image into 4 KiB storage chunks. It compares them with the staged or committed baseline and records changed chunks.
+
+This simplified example shows chunk reuse. Letters stand for byte contents, not SQL rows.
 
 ```text
-base @ (L,1):     [P1 ][P2][P3][P4 ][P5]
-new image:        [P1'][P2][P3][P4'][P5][P6]
-                      |          |       |
-                      +----------+-------+
-                                 v
-storage commit (L,2)
-segment S2 = {1:P1', 4:P4', 6:P6}
-page_count = 6
+Snapshot A: [A][B][C][D]
+Snapshot B: [A][B][X][D][E]
+
+New content for B: chunk 3 = X, chunk 5 = E
+Reused content:    chunks 1, 2, and 4
 ```
 
-Reading page 4 finds it in the newer segment. Reading page 2 falls back to the older commit. A
-snapshot is a complete logical database even when its physical representation overlays immutable
-deltas.
+Snapshot B still represents a complete database. Reading it combines new chunks with unchanged chunks from earlier storage records. Restoring it reconstructs the file.
 
-Import hashes chunks against the staged or `HEAD` baseline. A rebuildable page-hash cache can skip
-unchanged chunks, but candidate changes are still confirmed by byte comparison.
+Think of a loose-leaf book: a later edition can keep unchanged pages and replace others. The first capture needs all chunks. Later captures can reuse unchanged content; a snapshot is a description of a complete state, not a standalone file containing only the changes.
 
-## A snapshot is an ordered overlay path
+For the example above, reading B selects these contents:
 
-```text
-page_count = 6
-ranges = [ (log L, start 1, end 2) ]
+| Position | Content selected for B |
+| --- | --- |
+| 1, 2, 4 | Unchanged A, B, D from earlier storage |
+| 3 | Replacement X |
+| 5 | New content E |
+
+Selecting B does not change A. Stored contents are immutable, and each snapshot selects its own contents and logical size. Restoring B reconstructs the complete SQLite file; the application then opens that ordinary file. It does not replay the SQL that produced B.
+
+One row edit can affect several chunks because SQLite also maintains indexes and metadata. Directory size includes storage overhead; it does not measure the number of row changes.
+
+## Two meanings of “page”
+
+SQLite has its own physical page size. Graft storage chunks are always 4096 bytes. An 8 KiB SQLite page occupies two Graft chunks.
+
+The chunk boundary determines storage reuse. It does not determine row identity or merge decisions. Logical diff and merge interpret SQLite tables and schemas separately.
+
+## From stored chunks to understandable changes
+
+Suppose two captured versions contain a `projects` table:
+
+| Record | Snapshot A | Snapshot B |
+| --- | --- | --- |
+| `id = 1` | `budget = 100` | `budget = 120` |
+| `id = 2` | Absent | `budget = 200` |
+
+Physical comparison identifies changed storage content. Row comparison identifies one update and one insertion. Those are different questions: several rows can occupy one SQLite page, and one row change can affect several pages.
+
+```bash
+graft diff HEAD~1 HEAD app.sqlite
+graft diff --rows HEAD~1 HEAD app.sqlite
 ```
 
-More complex rebind and synchronization paths can contain several log ranges. Earlier ranges have
-higher priority; later ranges provide fallback pages. The repository blob includes an expected
-content hash for every LSN:
+The first command identifies a changed path. The second also explains supported database changes. Row analysis aligns records by identity: `rowid` for ordinary rowid tables, or the declared primary key for `WITHOUT ROWID` tables. An `INTEGER PRIMARY KEY` such as the example's `id` aliases the rowid.
 
-```text
-sqlite-snapshot-v1
-volume <V>
-page_count 6
-range <L> 1 2
-commit 1 <storage-commit-hash-1>
-commit 2 <storage-commit-hash-2>
-```
+Schema, opaque changes, and limitations accompany the row result where applicable. An empty row diff is not evidence that all database content is unchanged. See [diff rows and files](/docs/guides/diff-rows-and-files/).
 
-`VolumeId` is a mutable lineage handle. The descriptor is the canonical SQLite content referenced
-by repository history. Checking out an old snapshot can create a new volume without making history
-mutable.
+## Capture comes before recording history
 
-## No net change
+`graft add app.sqlite` captures and stages a database version. `graft commit` records that staged version; it does not capture the live database again. Writes made after staging remain outside the commit until another `add`.
 
-When all chunks and the page count match the baseline, Graft does not append a storage commit. The
-index can reuse the same file state and snapshot blob. Merely opening a database does not invent an
-application-state change.
+Storage chunks answer “how can this version be reconstructed?” Repository commits answer “which application checkpoint is this?” SQLite diff answers “what changed?” Keep these three roles separate when presenting history in an application.
 
-Shrinking page count is a soft truncate: old frames may remain in storage but are outside the
-logical file. It is not secure erase; storage GC later removes unreachable data.
+## Storage coordinates, when you need them
 
-## Two commits compared
+A storage commit records changed chunks and the resulting chunk count. Its coordinate is `(LogId, LSN)`: a log identifier and a sequence number within that log.
 
-| Name | Identity | Relationship | Normal user reference |
-| --- | --- | --- | --- |
-| storage commit | `(LogId, LSN)` plus hash | changed 4 KiB pages | internal coordinate |
-| repository commit | BLAKE3 object ID | app-state tree and parents | branch, tag, revspec |
+LSNs are ordered only inside one log. LSN 3 in two different logs does not identify the same version or establish their chronological order.
+
+A snapshot descriptor records a volume, logical size, ordered log ranges, and expected storage-commit hashes. The ranges describe how to find each chunk. A volume is a lineage handle; the immutable descriptor identifies the database state referenced by history.
+
+Use repository commits, branches, and tags in application history. Reserve storage coordinates for storage debugging.
+
+## What happens when nothing changed?
+
+If chunks and logical size match the baseline, Graft can reuse the snapshot without appending a storage commit.
+
+When a database shrinks, older stored chunks may remain outside the new logical size. Truncation is not secure erasure. Unreachable storage data is a separate garbage-collection concern.
+
+The current capture implementation uses SQLite online backup, with a guarded file-clone optimization for suitable macOS rollback-journal databases. Both paths must capture consistent committed state.
+
+Continue with [stage and commit](/docs/graft-book/stage-and-commit/). Exact snapshot identity and range rules belong to the [storage specification](/docs/specifications/).

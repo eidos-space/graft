@@ -360,6 +360,10 @@ out state:
 - fast-forward moves `HEAD` and applies the target checkout plan; changed
   SQLite paths are projected when `materialize_sqlite=true`, while artifacts
   and other checkout-managed files follow their own projection rules;
+  after the authoritative clean-worktree check, paths with identical current
+  and target immutable states MUST retain their physical files. The SDK's
+  `worktree_paths` reports the changed or removed paths, excluding these
+  unchanged files, so hosts can validate the actual materialization scope;
 - three-way writes the merge index and durable merge state. Non-conflicting
   paths can be checked out. Conflicted paths retain conflict stages and may
   remain at the current ours worktree content until a resolution operation

@@ -39,6 +39,15 @@ a SQLite connection or route production repository operations through PRAGMA.
 Repository semantics belong to their domain specifications; this document owns
 adapter mapping and host lifecycle.
 
+Native repository I/O MUST keep pooled HTTP connection drivers active between
+synchronous calls and when snapshot hydration runs on another executor. This
+is a Graft runtime responsibility; hosts MUST NOT need route-specific
+connection closing to make otherwise valid keep-alive requests complete.
+Hosts own platform TLS relays and their resource lifecycle. Transfer scheduling,
+payload integrity checks, and repository materialization remain owned by Graft.
+Independent request pools MUST bound idle connection retention so a completed
+probe burst does not exhaust transport capacity required by subsequent writes.
+
 ## 2. Command service
 
 ### 2.1 Opening and target resolution
@@ -430,6 +439,27 @@ for each operation; retries within one operation count bytes consumed again.
 Upload consumption does not acknowledge remote durability. Initial publication's
 verification clone may report download events in the same operation. Local
 encryption and materialization are not network-byte progress.
+
+`totalIsFinal` (`total_is_final` in Rust) distinguishes a planned transfer total
+from the running sum of response lengths. Hosts MUST NOT present an unplanned
+total as a whole-operation percentage. Plaintext HTTP snapshot checkout fetches metadata for
+all selected SQLite snapshots before downloading missing frames, unions shared
+segment byte ranges and excludes locally cached frames. This preparation MUST
+NOT hydrate page bodies, move refs or replace worktree files. It declares the
+remaining compressed bytes before hydration starts. Planning emits an immediate
+event; requests covered by the plan MUST NOT grow its denominator. An unexpected
+request or retry outside the plan invalidates `totalIsFinal`. A transfer reaching
+its total does not imply worktree materialization or host validation is complete.
+
+For plaintext HTTP, the embedded Rust `fetch_for_checkout(remote, branch)` operation prepares the
+immutable repository graph and target SQLite log metadata first. It declares a
+combined budget for missing external file payloads (deduplicated by content ID)
+and missing compressed SQLite segment ranges before downloading either. Inline
+blob data can arrive with graph metadata. It validates and caches the target
+snapshots and external payloads before publishing the remote-tracking ref;
+HEAD, index, and worktree files remain unchanged. A subsequent fast-forward of
+that target uses the prepared local data. Ordinary `fetch` retains its existing
+behavior and does not eagerly hydrate SQLite snapshots.
 
 ## 10. Stable errors
 

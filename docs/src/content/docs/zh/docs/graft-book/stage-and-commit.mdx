@@ -1,108 +1,80 @@
 ---
-title: 03 从 add 到 commit
-description: 按执行顺序解释 init、SQLite/file staging、index overlay、tree/commit object 和 ref 更新。
+title: 03 暂存与提交
+description: 判断一次提交包含哪些修改，尤其是暂存之后发生的新修改。
 ---
 
-## `graft init`：只建立控制结构
+**下一次提交会包含哪些修改**
 
-`init` canonicalize worktree 根目录，创建 `.graft` 布局和默认配置，并让 `HEAD` symbolic
-指向默认 branch `main`。此时：
+SQLite 事务保存应用数据。`graft add` 选定一份快照。`graft commit` 把选定的版本记录到仓库历史。
 
-```text
-HEAD = ref: refs/heads/main
-refs/heads/main = 尚不存在
-index = empty
-objects = empty
-storage = empty
+这是三个独立动作。
+
+## 跟随一条笔记观察变化
+
+假设 HEAD 中有一条笔记。
+
+| 动作 | 工作区 | 暂存的数据库 | HEAD |
+| --- | --- | --- | --- |
+| 用 SQLite 插入第二条笔记并提交事务 | 两条笔记 | 没有暂存变化 | 一条笔记 |
+| `graft add app.sqlite` | 两条笔记 | 两条笔记的快照 | 一条笔记 |
+| 用 SQLite 插入第三条笔记并提交事务 | 三条笔记 | 仍是两条笔记 | 一条笔记 |
+| `graft commit -m "save two notes"` | 仍是三条笔记 | 已提交的暂存变化被清除 | 两条笔记 |
+
+第三条笔记仍是未暂存变化。commit 使用暂存内容，不会再次捕获当前数据库。
+
+如果希望包含第三条笔记，提交前再次执行 `graft add app.sqlite`。
+
+## 初始化、暂存、检查、记录
+
+`graft init` 创建 `.graft/` 和初始分支位置。它不会创建数据库，也不会自动跟踪现有文件。
+
+在已有应用目录中：
+
+```bash
+graft init
+graft status
+graft add app.sqlite
+graft add settings.json
+graft diff --staged
+graft diff --rows --staged app.sqlite
+graft commit -m "save notes and settings"
+graft status
 ```
 
-这叫 unborn `HEAD`。`init` 不会创建 `app.sqlite`，也不会扫描并自动跟踪工作区。
+提交前检查暂存差异。提交后的 status 会告诉你是否还有更新的工作区变化。
 
-## `graft add app.sqlite` 的完整顺序
+使用 `graft add --all` 可以一起暂存符合条件的新增、修改和删除。忽略规则与路径选择见[跟踪数据库与文件](/zh/docs/guides/track-databases-and-files/)。
 
-1. **解析 path identity**：把参数归一为仓库相对 UTF-8 path，拒绝 `.graft` 内部和 sidecar。
-2. **识别内容类型**：检查普通文件与 SQLite header；已跟踪 SQLite 路径若变成非 SQLite
-   内容，会报错而不是静默改成普通文件。
-3. **选择 baseline**：优先使用 index 中已 staged snapshot，否则使用 `HEAD` 版本。
-4. **一致捕获**：通过 SQLite backup 得到 standalone private image，合并已提交 WAL。
-5. **比较 4 KiB chunk**：复用 baseline 中未变 page，只为净变化建立 storage delta。
-6. **提交 storage state**：若有变化，批量写 segment pages 与 storage commit，得到新 snapshot。
-7. **写 snapshot blob**：把 volume、page count、log ranges 与 commit hashes 编码成
-   `sqlite-snapshot-v1` repository blob。
-8. **更新 index**：为 `app.sqlite` 写 stage 0 entry，包含 mode、blob object ID 和解析后的
-   snapshot state。
-9. **清理 observation**：该 path 的 dirty marker 被清除；后续 status 仍可验证物理文件。
+## 不同文件如何进入同一次提交
 
-这里已经写入了 immutable storage 和 blob object，但 branch ref 仍停在旧 commit。
-
-## 普通文件走另一条 staging 通道
-
-`graft add settings.json` 会读取精确 bytes，判断 UTF-8/text 或 binary，再按配置选择：
-
-- 小文本通常写 `file-blob-v2`，bytes 以 Base64 包在 blob 中；
-- binary、超过阈值的文本、或匹配 `files.external_paths` 的路径，先把原始 bytes 写入
-  `store/files/??/*`（按 content hash fan-out），再写 `large-file-pointer-v1` blob；
-- index stage 0 指向相应 blob object ID。
-
-这两条通道最后都变成“path → typed blob”的 staged entry，所以一个 commit 可以原子地
-表达数据库、配置和附件属于同一应用版本。
-
-## 为什么 add 以后还可以继续改数据库
-
-因为 index 保存的是 add 时已经捕获的 snapshot，而不是“稍后再读取这个路径”的承诺：
+数据库经过一致快照捕获；普通文件读取精确的字节内容。
 
 ```text
-10:00  app.sqlite = A
-10:01  graft add app.sqlite       index = snapshot(A)
-10:02  app writes transaction B   worktree = B, index 仍是 A
-10:03  graft commit               commit = A
+app.sqlite ------ 一致捕获 --> 数据库快照 ------+
+settings.json --- 读取字节 --> 文件 blob -------+--> 暂存区
+report.pdf ------ 读取字节 --> 外部载荷指针 -----+
+                                                  |
+                                                  | commit
+                                                  v
+                                               应用版本
 ```
 
-结果不是丢数据：B 仍留在 worktree，并在 commit 后被 status 报告为 unstaged change。
-这与 Git 的 index 语义一致，也是可重复 commit 的关键。
+一次提交把 HEAD 中的树与暂存的替换、删除组合起来。未暂存的路径沿用 HEAD 中已记录的版本。
 
-## `graft commit` 的完整顺序
+共同的提交提供版本边界，但不会把各路径的独立捕获变成一个事务。需要这种保证时，应用必须协调相关写入。
 
-1. 读取 `HEAD` tree 和 index；若有 stage 1/2/3 conflict，立即拒绝。
-2. 把 stage 0 当作 `HEAD` overlay：添加、替换或删除 path，得到完整 next tree state。
-3. 为所有 SQLite path 确认/写入 snapshot blob；普通 artifact blob 已在 add 时写好。
-4. 按 canonical path 排序，写 tree object。
-5. 写 commit object，记录 tree、parents、签名、message、表摘要与 path change counts。
-6. attached HEAD 时更新当前 branch ref；detached HEAD 时更新 `HEAD` 本身。
-7. 追加相应 reflog，清 active merge state（如这是 merge completion）。
-8. 清空 index。
+## 为什么最后才移动分支
 
-关键顺序是“**先 immutable objects，后 mutable ref**”。如果在移动 ref 前失败，新 object
-最多成为暂时不可达数据；branch 不会指向缺少 tree/blob 的半个 commit。
+Graft 先写入所需的不可变对象，再把分支移动到新提交。否则，分支可能指向内容尚不可用的版本。
 
-## commit 不做的事
+引用更新前失败，可能留下不可达对象，但分支仍指向旧版本。如果后续步骤失败，先检查状态和历史，再判断提交是否已发生。
 
-普通 `commit` 不会：
+这种顺序不保证完整的崩溃持久性。部分对象、暂存区和合并记录仍直接写入，1.0 不承诺端到端的 `fsync` 契约。引用日志追加与引用替换也是独立操作。
 
-- 重新读取或重新 backup SQLite worktree；
-- checkpoint 应用的 WAL；
-- 替换 `app.sqlite` 的 inode；
-- 自动 stage 10:02 以后发生的变化；
-- push remote；
-- 把多个本地 metadata 文件提升成一个 filesystem transaction。
+## 验证你的判断
 
-## 状态变化表
+你暂存了两条笔记，又插入第三条，然后提交。HEAD 中有几条？
 
-| 时刻 | worktree | index | storage/objects | `main` ref |
-| --- | --- | --- | --- | --- |
-| init 后 | 未跟踪文件 | empty | empty | unborn |
-| SQLite transaction 后 | 新 bytes/WAL | empty | unchanged | unchanged |
-| add 后 | 不改写 | snapshot A | 写 page delta + blob | unchanged |
-| add 后又 transaction | snapshot B | 仍是 A | unchanged | unchanged |
-| commit 后 | 仍是 B | cleared | tree + commit(A) | 移到 commit(A) |
-| 再 add/commit | B | B 后 cleared | 新 delta/blob/tree/commit | 移到 commit(B) |
+**两条。** 导出 HEAD 并查询即可验证。[动手练习](/zh/docs/graft-book/hands-on-lab/) 会执行这个实验。
 
-## 当前持久性边界
-
-refs、`HEAD`、config、worktree observation 与 external payload replacement 使用 sibling
-temp + rename。loose object、index 和 merge record 的某些写入仍是 direct write；读取时
-会校验 object hash 或完整 parse，但当前不承诺这些写入 crash-atomic，也没有全链路
-`fsync` durability 契约。reflog append 与 ref replacement 也不是同一 transaction。
-
-所以“进程返回成功后的逻辑顺序”和“突然断电时每个目录项都已落盘”不是同一保证。
-这会在[远端、失败与恢复](/zh/docs/graft-book/remotes-and-recovery/)中继续讨论。
+commit 写入本地历史。上传历史需要另外执行 [push](/zh/docs/graft-book/remotes-and-recovery/)。

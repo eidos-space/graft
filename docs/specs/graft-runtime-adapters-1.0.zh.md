@@ -30,6 +30,12 @@ Browser UI -> Worker -> real graft-cli WASM -> 同一 Rust command path
 Command service 直接执行 typed `RepositoryCommand`，retain runtime/storage lock；
 它不打开 SQLite connection，也不通过 SQL 路由 repository command。
 
+Native repository I/O 必须在同步调用之间，以及 snapshot hydration 使用另一执行器时，
+持续驱动池内 HTTP 连接。这属于 Graft runtime 的职责；宿主不应为了让有效的 keep-alive
+请求完成而按路由关闭连接。宿主负责平台 TLS relay 及其资源生命周期；传输调度、payload
+完整性校验和 repository materialization 仍由 Graft 负责。
+独立请求池必须限制空闲连接保留量，避免已结束的一批探测占满后续写入需要的传输容量。
+
 ## 2. Command service
 
 Target 可以是 `.graft`、worktree 内路径或可 discover repository 的 database path。
@@ -287,6 +293,20 @@ uncertain remote publication 变成确定结果。
 计数；同一次操作内的重试会累计再次消费的字节。上传 body 被消费不代表远端已持久
 保存。首次发布的独立验证 clone 可以在同一操作中报告下载进度。本地加密和工作目录
 materialization 不属于网络字节进度。
+
+`totalIsFinal`（Rust 为 `total_is_final`）区分预先规划的传输总量与逐个响应累加的长度。
+Host 不得将未规划的总量显示为整次操作的百分比。明文 HTTP 的 snapshot checkout 在下载缺失帧之前，
+先获取所有选中 SQLite snapshot 的元数据，对共享 segment 字节区间去重，并排除本地缓存帧。
+准备过程不得下载 page body、移动 ref 或替换工作目录文件；它在 hydration 开始前声明剩余
+压缩字节数。规划完成立即发送事件，计划内请求不得增加分母。计划外请求或重试使
+`totalIsFinal` 失效。传输达到总量不代表工作目录写入或 host 校验已经完成。
+
+在明文 HTTP 路径中，嵌入式 Rust 的 `fetch_for_checkout(remote, branch)` 操作先准备不可变仓库对象图和目标
+SQLite 日志元数据。在下载外部文件内容或 SQLite 数据段之前，统一声明缺失外部文件
+内容（按内容 ID 去重）与缺失 SQLite 压缩段字节范围的总量。内联 blob 数据可能随对象图
+元数据一起到达。该操作先校验并缓存目标快照和外部文件内容，再更新远程跟踪引用；
+HEAD、索引和工作目录文件保持不变。随后快进到该目标使用已准备好的本地数据。
+普通 `fetch` 保持原有行为，不主动预取 SQLite 快照内容。
 
 ## 10. Stable error
 

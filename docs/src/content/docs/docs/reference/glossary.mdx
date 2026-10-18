@@ -1,65 +1,57 @@
 ---
 title: Glossary
-description: Common Graft terms for developers integrating with the repository model.
+description: Graft terms grouped by the questions they answer, with concrete examples.
 ---
 
-## App State
+Use this page when a term blocks your reading. The [architecture guide](/docs/graft-book/) explains how these pieces work together.
 
-The durable state an application needs to open coherently: SQLite databases,
-settings, attachments, generated assets, imports, and related app-owned files.
+## Current files and recorded versions
 
-## Artifact
+| Term | Meaning | Example |
+| --- | --- | --- |
+| Application state | Durable data the application needs to open coherently | Notes database, settings, and referenced attachments |
+| Worktree | Directory of current application files | `project/app.sqlite` is the database the application opens |
+| Repository | Worktree plus Graft state in `.graft/` | Files, history, staged changes, storage, and recovery records |
+| Index / staging area | Selected changes for the next commit | A two-note snapshot staged before a third note was written |
+| Repository commit | Immutable record of a version's tree and parent commits | The version created by `graft commit` |
+| Tree | Mapping from repository paths to recorded content | `app.sqlite`, `settings.json`, and an attachment |
+| Blob | Repository object describing one path's content | Database snapshot descriptor or file content |
+| Ref | Mutable pointer to an object | Branch `main` points to its current commit |
+| HEAD | Current branch position or a directly selected commit | Normally follows `main`; can be detached |
+| Snapshot | Immutable, consistent committed database state | The database captured by `graft add app.sqlite` |
 
-A tracked non-SQLite file entry in a Graft tree. Text files can be inline.
-Binary files and configured resource paths use external payload storage.
+## File content and storage
 
-## Commit
+| Term | Meaning |
+| --- | --- |
+| Artifact | A tracked ordinary file rather than a SQLite database, such as `settings.json` |
+| External payload | File bytes stored separately and identified by content hash; a pointer describes them |
+| Kind | Content classification: `sqlite_database`, `text_file`, or `binary_file` |
+| Storage | Representation: `sqlite_snapshot`, `inline`, or `external` |
+| Storage commit | Record of changed 4 KiB chunks inside the storage engine; distinct from a repository commit |
+| LSN | Sequence number within one storage log; comparable only inside that log |
 
-An immutable repository object that points to a tree and records one app-state
-version.
+Kind and storage answer different questions. A JSON file can be `text_file` with `external` storage.
 
-## External Payload
+## Getting recorded content to a destination
 
-File bytes stored by content hash outside normal commit/tree objects. Used for
-binary files and configured external paths.
+| Term | Meaning | Changes tracked worktree files? |
+| --- | --- | --- |
+| Hydration | Obtain missing immutable content in local Graft storage | No |
+| Export | Write a recorded database to an independent destination | No |
+| Materialization | Write recorded content to tracked worktree paths | Yes |
+| Remote | Named backend that stores history and required content outside the local repository | Connecting one does not; pull can |
 
-## Index
+## Combining versions
 
-The staging area between the worktree and the next commit. During conflicts,
-the index can also hold base, ours, and theirs stages.
+| Term | Meaning |
+| --- | --- |
+| Base | Common ancestor used for a three-way merge; an empty base when histories are unrelated |
+| Ours | Local HEAD observed when the merge is planned |
+| Theirs | Target revision being merged |
+| Fast-forward | Move to a descendant version when the local history has not diverged |
+| Conflict | A change for which Graft needs an explicit resolution |
+| Opaque change | Changed SQLite content Graft cannot fully interpret |
+| CAS / compare-and-swap | Update a mutable pointer only if it still equals an expected value |
 
-## Kind
-
-The content class of a tracked path: `sqlite_database`, `text_file`, or
-`binary_file`.
-
-## Materialization
-
-Writing a tracked SQLite snapshot back to a normal SQLite database file in the
-worktree.
-
-## Remote
-
-A named storage backend for repository objects, refs, SQLite storage, and
-external payloads. Examples include `fs://`, `s3_compatible://`, and
-`https://` (or the explicit `graft+https://` compatibility form).
-
-## Repository
-
-A worktree plus `.graft/` metadata. The repository stores refs, objects, index
-state, local SQLite storage, config, and payload cache.
-
-## Snapshot
-
-An immutable SQLite database state that can be referenced by a repository
-object.
-
-## Storage
-
-The representation strategy for a path: `sqlite_snapshot`, `inline`, or
-`external`.
-
-## Worktree
-
-The app data directory containing materialized SQLite files and app-owned files
-that Graft tracks.
+Saving a SQLite transaction, recording a Graft commit, and synchronizing history are separate operations. When a guide says “commit,” check which of the first two it means.

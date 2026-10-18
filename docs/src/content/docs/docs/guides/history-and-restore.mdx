@@ -1,51 +1,81 @@
 ---
-title: History And Restore
-description: Commit, inspect, branch, switch, restore, checkout, and reset Graft app-state history.
+title: History and Restore
+description: Choose the operation that changes files, staging, or branch position, then verify the result.
 ---
 
-Graft uses a Git-like repository model for app data:
+Decide what you want to change before choosing a history command.
 
-```text
-worktree -> index -> commit
-```
+| Goal | Operation | Effect |
+| --- | --- | --- |
+| Record selected changes | Add, then commit | Creates local history |
+| Inspect an old database separately | Export | Writes an independent file |
+| Replace one current file | Restore with an explicit source | Changes that worktree path |
+| Remove a staged selection | Restore staged | Leaves application files in place |
+| Use another branch | Switch | Changes branch and can replace tracked files |
+| Move the current branch backward | Reset | Effects depend on the reset mode |
 
-SQLite transactions update the current database state. Graft commits record
-which database snapshots and file artifacts should be treated as a named app
-state.
+Close affected application SQLite connections before operations that replace files. See [replacement lifecycle](/docs/graft-book/checkout-and-restore/).
 
-## Commit A Version
+## Record and inspect a checkpoint
 
 ```bash
 graft status
 graft add --all
+graft diff --staged
 graft commit -m "save checkpoint"
-```
-
-Inspect history:
-
-```bash
 graft log
-graft log --json
 graft show HEAD
-graft show --json HEAD
 ```
 
-## Branch And Switch
+Commit records staged content. Newer changes made after `add` remain in the worktree. Use `--json` on status, log, and show for integrations.
 
-Create a branch:
+## Inspect an older database without replacing it
+
+Use a fresh destination outside the worktree and query it with `sqlite3`:
 
 ```bash
-graft branch feature/search
-graft switch feature/search
+graft export --source HEAD~1 --output ../previous.sqlite app.sqlite
+sqlite3 ../previous.sqlite 'SELECT * FROM notes ORDER BY id;'
 ```
 
-Create and switch in one command:
+**Check:** the output database contains the old rows; your application database remains in place.
+
+## Restore one path
+
+These commands assume the paths exist in the selected source:
 
 ```bash
-graft switch -c feature/search main
+graft restore --source HEAD -- app.sqlite
+graft restore --source HEAD~1 -- attachments/report.pdf
 ```
 
-List branches:
+The selected worktree content is replaced. The branch position does not move. Without `--source`, worktree restore uses the index.
+
+**Check:** query or open the restored path, then run `graft status`. Restoring an older version may leave a change relative to current HEAD; commit it if you want a new version recording that restoration.
+
+To cancel staging while keeping worktree content:
+
+```bash
+graft restore --staged -- app.sqlite
+graft restore --staged --all --kind sqlite_database
+```
+
+## Create and use branches
+
+```bash
+graft branch experiment
+graft switch experiment
+```
+
+Creating a branch adds a pointer to the current version. Switching changes the current branch and checks out its tracked content.
+
+To create and switch in one command:
+
+```bash
+graft switch -c feature/notes main
+```
+
+List local, remote, or all branches:
 
 ```bash
 graft branch
@@ -53,92 +83,52 @@ graft branch -r
 graft branch -a
 ```
 
-Switching branches materializes the target commit's tracked SQLite snapshots
-and file artifacts into the worktree.
+**Check:** confirm the selected branch, then query the database to verify its content.
 
-## Restore One Path
-
-Restore a worktree path from `HEAD`:
-
-```bash
-graft restore --source HEAD -- data.sqlite
-```
-
-Restore a path from an older revision:
-
-```bash
-graft restore --source HEAD~1 -- attachments/report.pdf
-```
-
-Unstage a staged path:
-
-```bash
-graft restore --staged -- data.sqlite
-```
-
-Unstage every staged path of one kind:
-
-```bash
-graft restore --staged --all --kind sqlite_database
-```
-
-## Checkout A Revision Or Path
-
-Check out an entire revision:
+## Checkout a revision
 
 ```bash
 graft checkout HEAD~1
 ```
 
-Restore one path from a revision:
+This selects the older commit directly, producing a detached HEAD. To return to a branch, use `graft switch main`.
+
+For a single path:
 
 ```bash
-graft checkout HEAD~1 data.sqlite
+graft checkout HEAD~1 app.sqlite
 ```
 
-Use `checkout` for revision movement or Git-style path restore. Use `restore`
-for explicit staged/worktree restore operations.
+Use restore when you want to specify the source and destination state explicitly.
 
-## Reset HEAD
+## Choose a reset mode
 
-Move the current branch while keeping staged and worktree state:
+Reset moves the current branch to the target. It rewrites that branch's visible position rather than adding a restoration commit.
+
+| Mode | Branch position | Staged state | Worktree |
+| --- | --- | --- | --- |
+| `--soft` | Moves | Keeps current selection | Keeps current files |
+| `--mixed` | Moves | Resets to target | Keeps current files |
+| `--hard` | Moves | Resets to target | Replaces with target content |
+
+Example commands are alternatives, not a sequence:
 
 ```bash
 graft reset --soft HEAD~1
-```
-
-Move the branch and reset the index:
-
-```bash
 graft reset --mixed HEAD~1
-```
-
-Move the branch, reset the index, and materialize the target revision:
-
-```bash
 graft reset --hard HEAD~1
 ```
 
-`--hard` discards staged and unstaged worktree changes. Use it only when that is
-the intended operation.
+Hard reset discards staged and unstaged changes. Use it only when replacement is intended.
 
-## Tags
-
-Create a lightweight tag:
+## Name a version with a tag
 
 ```bash
-graft tag v0.1
-```
-
-Create an annotated tag:
-
-```bash
-graft tag -a v0.1 -m "first checkpoint"
-```
-
-List or delete tags:
-
-```bash
+graft tag checkpoint-1
+graft tag -a reviewed-1 -m "reviewed checkpoint"
 graft tag
-graft tag -d v0.1
 ```
+
+The first creates a lightweight tag; the second records an annotated tag. A tag lets you refer to a version by name.
+
+After any failed replacement, inspect status and affected paths before resuming application writes. Multi-path replacement is not a filesystem-wide transaction.

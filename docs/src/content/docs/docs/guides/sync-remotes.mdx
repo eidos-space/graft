@@ -1,128 +1,129 @@
 ---
-title: Sync With Remotes
-description: Configure Graft remotes, push and pull branches, clone repositories, and choose a remote backend.
+title: Sync with Remotes
+description: Send recorded history to a remote, fetch for inspection, and understand when pull replaces local files.
 ---
 
-Graft remotes store repository objects, refs, SQLite storage, and external file
-payloads outside the local `.graft/` directory.
+A remote stores recorded history and its required database and file content outside the local `.graft/` directory. Push transfers commits, not the application's latest uncommitted changes.
 
-Supported URI families:
+For the opt-in native password-based transport, see [Encrypted Sync](/docs/guides/encrypted-sync/).
 
-```text
-memory
-fs:///absolute/path
-s3://bucket/prefix
-s3_compatible://bucket/prefix?endpoint=https://...
-https://host/org/space
-graft+http://127.0.0.1:8787/org/space
-```
+## Choose the action before the backend
 
-## Add A Remote
+| Goal | Command | Replaces tracked files? |
+| --- | --- | --- |
+| Publish local commits | `graft push origin main` | No |
+| Obtain remote history for inspection | `graft fetch origin main` | No |
+| Obtain and apply remote history | `graft pull origin main` | Can |
+| Start a new local repository | `graft clone <uri> main` | Writes checked-out files |
 
-Use a filesystem remote for local testing:
+Close affected application SQLite connections before pull. After conflicts or failure, inspect repository state before reopening them.
+
+## 1. Configure a remote
+
+For an isolated local test, choose a fresh absolute path:
 
 ```bash
 graft remote add origin fs:///tmp/graft-remote
 graft remote list
 ```
 
-Use S3-compatible storage:
+`origin` is a local name for the remote. It is not a branch.
+
+For S3-compatible storage:
 
 ```bash
 export AWS_ACCESS_KEY_ID="..."
 export AWS_SECRET_ACCESS_KEY="..."
 export AWS_REGION="auto"
-
 graft remote add origin 's3_compatible://my-bucket/prod/app?endpoint=https://account.r2.cloudflarestorage.com'
 ```
 
-Use a Graft HTTP remote:
+For a Graft HTTP service:
 
 ```bash
 export GRAFT_REMOTE_TOKEN='grt_...'
 graft remote add origin 'https://example.com/acme/archive'
 ```
 
-For a non-default token variable:
+These are alternative configurations. Keep credentials in explicit environment or adapter inputs, not URL values or repository configuration.
+
+To use a different token variable:
 
 ```bash
 export GRAFT_ARCHIVE_TOKEN='grt_...'
 graft remote add origin 'https://example.com/acme/archive?token_env=GRAFT_ARCHIVE_TOKEN'
 ```
 
-## Push
+The query names a variable; it does not contain the token.
 
-Push the current branch:
+Supported URI families include `memory`, `fs://`, `s3://`, `s3_compatible://`, HTTP(S), and the explicit `graft+http(s)://` form. See [URI rules](/docs/reference/remote-uris/).
+
+## 2. Publish a recorded version
+
+Start with a commit on `main`:
 
 ```bash
+graft status
 graft push origin main
+graft ls-remote origin
 ```
 
-Push the current branch to its configured upstream:
+**Check:** the remote branch names the intended commit. Unstaged or staged changes remain local until committed.
 
-```bash
-graft push
-```
+Graft uploads required immutable content before updating the remote branch. The branch update checks the previously observed value, so a concurrent writer can cause rejection.
 
-Push every local branch:
+To push all local branches:
 
 ```bash
 graft push --all origin
 ```
 
-Force push is available for deliberate non-fast-forward updates:
+`graft push --force origin main` permits a deliberate non-fast-forward update. It still uses expected-value checks and can change history visible to other clients.
 
-```bash
-graft push --force origin main
-```
-
-Use it with the same care you would use `git push --force`.
-
-## Fetch And Pull
-
-Fetch updates remote-tracking refs without changing your current branch:
+## 3. Fetch, inspect, then decide whether to apply
 
 ```bash
 graft fetch origin main
+graft diff HEAD origin/main
+```
+
+**Check:** your branch and worktree remain in place; the diff shows how the fetched remote version differs.
+
+To fetch all branches:
+
+```bash
 graft fetch --all origin
 ```
 
-Pull fast-forwards or enters merge state:
+When ready to apply the remote branch:
 
 ```bash
 graft pull origin main
+graft status
 ```
 
-If the branch has an upstream, you can omit the remote and branch:
+Pull can fast-forward or enter a three-way merge. If conflicts remain, use the [conflict guide](/docs/guides/merge-conflicts/). Do not treat a completed download as a completed merge.
 
-```bash
-graft pull
-```
+Once a branch has a configured upstream, `graft push` and `graft pull` can use it without explicit names.
 
-## Clone
-
-Clone a remote repository into an empty worktree:
+## 4. Clone into a new directory
 
 ```bash
 mkdir app-clone
 cd app-clone
 graft clone fs:///tmp/graft-remote main
+graft status
+graft log
 ```
 
-Clone picks the requested branch, materializes tracked database snapshots and
-files, and configures `origin`.
+Clone configures `origin`, obtains the branch, and materializes its recorded files. Use an empty destination.
 
-## Manage Remotes
+**Check:** confirm the branch and commit, then query the restored application database.
 
-```bash
-graft remote list
-graft remote get-url origin
-graft remote set-url origin fs:///srv/graft/new-app
-graft remote rename origin archive
-graft remote remove archive
-graft remote prune origin
-graft ls-remote origin
-```
+## If a push response is lost
 
-See [Remote URIs](/docs/reference/remote-uris/) for exact URI parsing rules and
-[Connect An HTTP Remote](/docs/guides/http-remote/) for the HTTP client workflow.
+Timeout or cancellation after dispatch does not prove the remote update failed. Read the remote branch again and reconcile its value before publishing another successor.
+
+A remote copy is part of a backup strategy, but does not define retention or recovery policy. See [remotes and recovery](/docs/graft-book/remotes-and-recovery/) for failure boundaries, and [HTTP integration](/docs/guides/http-remote/) for service requirements.
+
+Manage configured remotes with `remote get-url`, `set-url`, `rename`, `remove`, and `prune`; exact arguments are in the [CLI reference](/docs/reference/cli/).

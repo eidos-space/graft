@@ -1,155 +1,118 @@
 ---
 title: 07 Hands-On Lab
-description: Observe worktree, index, objects, storage, refs, diff, and checkout in a minimal repository.
+description: Predict and verify how staging, commit, export, branch switching, and restore affect one notes database.
 ---
 
-The point of this lab is to predict which of worktree, index, immutable stores, and refs will change
-before each command, then verify the prediction.
+**Predict first, then query the result**
 
-## 0. Initialize an isolated repository
+This lab checks the three-place model: worktree, index, and history. It uses real local commands, not a simulation.
+
+You need the [Graft CLI](/docs/overview/installation/) and `sqlite3` to query the exported database. Run the commands in a new scratch directory. Each `graft sql` call opens and closes its own database connection; close any other application connections before switching or restoring.
+
+## 1. Record one note
 
 ```bash
 mkdir graft-book-lab
 cd graft-book-lab
 graft init
-find .graft -maxdepth 3 -print | sort
-cat .graft/HEAD
-```
-
-`HEAD` should name `refs/heads/main`, while that branch has no commit ID yet.
-
-## 1. Change only the worktree
-
-```bash
 graft sql --db app.sqlite \
   "CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT NOT NULL);"
 graft sql --db app.sqlite \
-  "INSERT INTO notes(body) VALUES ('first');"
+  "INSERT INTO notes VALUES (1, 'first');"
 printf '{"theme":"paper"}\n' > settings.json
-graft status --json
-```
-
-Storage-engine files created during initialization do not imply a staged snapshot. Status and the
-index are the authorities.
-
-## 2. Stage a consistent snapshot
-
-```bash
 graft add app.sqlite
 graft add settings.json
-graft status --json
-sed -n '1,240p' .graft/index/state.toml
-find .graft/objects -type f | sort
-du -sh .graft/store/fjall .graft/store/files .graft/objects
+graft commit -m "save first note"
+graft status
 ```
 
-The index now has two stage-0 paths. SQLite names a snapshot blob, settings names an inline blob,
-and `main` still has no repository commit.
+**Check:** status is clean. HEAD records one note and the settings file.
 
-## 3. Prove commit consumes the index
+## 2. Stage two notes, then write a third
 
-```bash
-graft sql --db app.sqlite \
-  "INSERT INTO notes(body) VALUES ('second, not staged yet');"
-graft commit -m "seed app state"
-graft status --json
-cat .graft/HEAD
-cat .graft/refs/heads/main
-graft show --json HEAD
-graft diff --json
-```
-
-The commit contains the first staged snapshot. The second row remains unstaged. Export the history
-to verify it directly:
+Before committing, predict how many notes the commit will contain.
 
 ```bash
-graft export --source HEAD --output head.sqlite app.sqlite
-sqlite3 head.sqlite 'SELECT * FROM notes;'
-sqlite3 app.sqlite 'SELECT * FROM notes;'
-```
-
-## 4. Observe a page delta and repository commit
-
-```bash
-du -sk .graft/store/fjall .graft/objects
+graft sql --db app.sqlite "INSERT INTO notes VALUES (2, 'second');"
 graft add app.sqlite
-graft commit -m "add second note"
-du -sk .graft/store/fjall .graft/objects
-graft log --json
-graft diff --json --rows HEAD~1 HEAD app.sqlite
+graft sql --db app.sqlite "INSERT INTO notes VALUES (3, 'third');"
+graft diff --rows --staged app.sqlite
+graft diff --rows
+graft commit -m "save two notes"
 ```
 
-Do not expect directory size to increase by exactly one page; Fjall and indexes have overhead. The
-semantic observation is one inserted row and a new repository commit whose parent is the old one.
+**Check:** the staged diff shows the second note. The unstaged diff shows the third. Commit records the staged two-note snapshot.
 
-## 5. A branch is another ref
+## 3. Compare recorded and live content
+
+Export to a fresh path outside the worktree:
+
+```bash
+graft export --source HEAD --output ../graft-book-head.sqlite app.sqlite
+sqlite3 ../graft-book-head.sqlite 'SELECT id, body FROM notes ORDER BY id;'
+graft sql --db app.sqlite "SELECT id, body FROM notes ORDER BY id;"
+graft status
+```
+
+**Check:** the exported database contains rows 1 and 2. The worktree contains rows 1, 2, and 3. Status reports the remaining worktree change.
+
+If both queries return three rows, check whether you ran `add` again after inserting the third note.
+
+## 4. Record the third note and compare commits
+
+```bash
+graft add app.sqlite
+graft commit -m "save third note"
+graft diff --rows HEAD~1 HEAD app.sqlite
+graft log
+```
+
+**Check:** the diff reports insertion of row 3. HEAD now records three notes.
+
+## 5. Change a branch and switch back
+
+Predict whether creating a branch changes the live note.
 
 ```bash
 graft branch experiment
-find .graft/refs/heads -type f -maxdepth 2 -print -exec sed -n '1p' {} \;
+graft sql --db app.sqlite "SELECT body FROM notes WHERE id=1;"
 graft switch experiment
-cat .graft/HEAD
-```
-
-Two branches naming one commit do not duplicate objects or SQLite pages.
-
-```bash
-graft sql --db app.sqlite \
-  "UPDATE notes SET body='changed on experiment' WHERE id=1;"
+graft sql --db app.sqlite "UPDATE notes SET body='edited on experiment' WHERE id=1;"
 graft add app.sqlite
 graft commit -m "edit first note"
-graft diff --json --rows main experiment app.sqlite
-```
-
-## 6. Observe materialization
-
-Close long-lived application connections first:
-
-```bash
 graft switch main
-sqlite3 app.sqlite 'SELECT * FROM notes ORDER BY id;'
+graft sql --db app.sqlite "SELECT body FROM notes WHERE id=1;"
 graft switch experiment
-sqlite3 app.sqlite 'SELECT * FROM notes ORDER BY id;'
+graft sql --db app.sqlite "SELECT body FROM notes WHERE id=1;"
 ```
 
-Switch reconstructs an ordinary database from the target snapshot and updates its binding. Use
-refs, snapshot identity, and query results—not inode stability—to identify the version.
+**Check:** branch creation leaves the note unchanged. On `main`, row 1 is `first`. On `experiment`, it is `edited on experiment`. Switching installs the selected version's database.
 
-## 7. Optional filesystem remote
+## 6. Replace an unrecorded edit
+
+The following deletion affects only this scratch database:
 
 ```bash
-mkdir ../graft-book-remote
-graft remote add origin "fs://$(cd ../graft-book-remote && pwd)"
-graft push origin experiment
-find ../graft-book-remote -maxdepth 4 -type f | sort | sed -n '1,120p'
+graft sql --db app.sqlite "DELETE FROM notes WHERE id=3;"
+graft status
+graft restore --source HEAD -- app.sqlite
+graft sql --db app.sqlite "SELECT id, body FROM notes ORDER BY id;"
+graft status
 ```
 
-The target keeps immutable data separate from mutable refs; the successful ref update makes the
-uploaded graph reachable.
+**Check:** row 3 returns and status is clean. Restore replaced the unrecorded deletion with HEAD's content; it did not create a new commit.
 
-## Debugging checklist
+## Explain the result
 
-```text
-1. Is HEAD symbolic or detached?
-2. Which repository commit does the branch ref name?
-3. Does the index override the path or contain stages 1/2/3?
-4. Have worktree bytes diverged from the staged snapshot?
-5. Are required objects, payloads, and pages hydrated?
-6. Can this operation materialize, and are application handles closed?
-7. After failure, which ref/index/journal remains canonical?
-```
+You should now be able to answer:
 
-## Source map
+1. Why did the two-note commit leave three notes in the worktree?
+2. Why did creating a branch leave the database unchanged?
+3. Why could export inspect HEAD without changing application data?
+4. Which operation brought the deleted row back?
 
-| Question | Normative owner | Main implementation entry points |
-| --- | --- | --- |
-| `.graft`, objects, refs, index | `docs/specs/graft-repository-1.0.md` | `crates/graft/src/repo.rs`, `repo/object.rs`, `repo/staging.rs`, `repo/worktree_state.rs` |
-| 4 KiB pages, logs, LSNs, snapshots | `docs/specs/graft-storage-snapshots-1.0.md` | `snapshot.rs`, `volume_reader.rs`, `volume_writer.rs`, `local/fjall_storage.rs` |
-| consistent physical capture and replacement | `docs/specs/graft-worktree-materialization-1.0.md` | `crates/graft-sqlite/src/pragma/sqlite_worktree.rs`, `repo_checkout.rs` |
-| path, row, and schema diff | `docs/specs/graft-diff-1.0.md` | `crates/graft-sqlite/src/row_level_diff.rs` |
-| three-way merge and durable conflicts | `docs/specs/graft-merge-1.0.md` | `crates/graft/src/repo/merge.rs`, `crates/graft-sqlite/src/row_merge.rs` |
-| push, fetch, pull, and remote CAS | `docs/specs/graft-remote-sync-1.0.md` | `crates/graft/src/repo/sync.rs`, `repo/remote_objects.rs`, `packages/graft-remote` |
+Answers: commit used the staged snapshot; a branch is a pointer; export wrote an independent file; restore materialized HEAD at the tracked path.
 
-Read the specification to learn what must hold, the entry point to learn the present implementation,
-and tests to find executable evidence. Do not derive a public contract from Fjall private keys or
-temporary filenames.
+These checks validate behavior. They do not require reading private index files, interpreting cache layouts, or measuring storage-directory size.
+
+Continue with [merge conflicts](/docs/guides/merge-conflicts/) to try changes on both branches, or [remote sync](/docs/guides/sync-remotes/) to transfer recorded history.

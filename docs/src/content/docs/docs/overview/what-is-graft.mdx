@@ -1,79 +1,66 @@
 ---
-title: What Is Graft
-description: Learn how Graft versions SQLite databases and related files, where it fits, and how to integrate it.
+title: What Is Graft?
+description: Understand what Graft records and how application saves, versions, and remote sync differ.
 ---
 
-Think of Graft as **Git for SQLite**. It adds the database semantics that Git
-lacks: storage-efficient snapshots, schema-aware merges, and row-level diffs.
+Graft records versions of SQLite databases and related application files. You can compare versions, restore a recorded state, branch, merge supported changes, and transfer history to a remote.
 
-Graft uses a familiar Git-like workflow with its own repository and remote
-formats.
+Your application keeps using ordinary SQLite connections and file APIs.
 
-## The problem
-
-A custom diff driver can render a `.sqlite` file as readable text for review.
-Git's storage and merge still operate on one binary file, with no native model
-for SQLite pages, schemas, tables, or rows.
-
-That leaves three database-specific gaps:
-
-- **Storage:** capture a consistent database state, including committed WAL
-  frames, and address changed chunks independently of a whole-file blob.
-- **Diff:** explain changes in terms of schemas, tables, and rows instead of
-  only changed file bytes.
-- **Merge:** combine compatible schema and row changes, then expose precise
-  conflicts when automatic merge is unsafe.
-
-Graft implements those SQLite-aware operations behind familiar commits,
-branches, restore, and remotes. The worktree still contains ordinary SQLite
-files, so applications keep using their existing SQLite libraries.
-
-Graft can also version files that belong with the database:
+## Start with one application directory
 
 ```text
 app-data/
-  data.sqlite
-  settings.json
-  attachments/
-    invoice.pdf
+├── app.sqlite
+├── settings.json
+└── attachments/
+    └── report.pdf
 ```
 
-A row in `data.sqlite` may refer to `attachments/invoice.pdf`. Restoring,
-branching, or synchronizing only one of those paths can produce a state the
-application cannot use.
+A note in `app.sqlite` may refer to `attachments/report.pdf`. If you restore only the database, the referenced file may be missing or have different contents.
 
-Graft records the selected databases and files in one repository commit, so a
-database row and the file it references can move through history together.
+Graft can record selected database and file versions in one commit. Restoring or switching the relevant paths together lets you return to their recorded combination. The application still has to coordinate writes and decide which paths belong together.
 
-## What Graft adds
+## Saving, recording, and syncing are separate
 
-- storage-efficient SQLite snapshots, including committed WAL frames;
-- schema-, table-, row-, and path-level diffs;
-- schema-aware three-way merge and structured row conflicts;
-- immutable commits, branches, restore, and remote sync;
-- local, object-storage, and HTTP remotes;
-- structured CLI output and an in-process Node.js SDK.
+| You want to… | Action | Result |
+| --- | --- | --- |
+| Save a note in the application | Commit a SQLite transaction | The current database changes |
+| Select a checkpoint | `graft add` | A consistent database snapshot and selected file bytes are staged |
+| Record that checkpoint | `graft commit` | The staged content becomes repository history |
+| Send recorded history elsewhere | `graft push` | The remote receives the recorded version and required content |
+| Use recorded content locally | Restore or switch | Tracked worktree files can be replaced |
 
-## Where it fits
+There is no automatic commit or push each time the application saves a note.
 
-Use Graft when your application needs user-visible history, checkpoints,
-change review, branch-like workflows, recovery, or synchronization for a set of
-related databases and files.
+## What makes it SQLite-aware?
 
-Graft does not replace:
+A file-level comparison can tell you that a database's bytes changed. Graft can also interpret supported changes as schema, table, and row changes.
 
-- SQLite transactions;
-- application authentication or authorization;
-- real-time operation-log replication;
-- a general source-code repository;
-- a separate backup and retention policy.
+- **Capture:** include committed WAL content in a consistent snapshot.
+- **Storage:** reuse unchanged 4 KiB chunks across database versions.
+- **Diff:** show supported row and schema changes.
+- **Merge:** combine compatible changes and report conflicts where a safe automatic result is unavailable.
 
-## Developer surfaces
+Unsupported or opaque SQLite content remains a visible limitation. An empty row diff does not prove that the whole database is unchanged.
 
-| Surface | Use it for |
+Graft offers a Git-like workflow with its own repository and remote formats. Its history lives in `.graft/` beside the application files.
+
+## Is it suitable for your application?
+
+Use Graft when users need checkpoints, change review, earlier versions, branch workflows, or optional history synchronization for local application data.
+
+Keep SQLite transactions for transactional writes. Keep application authentication and authorization in the application or service. Plan backups and retention separately. Graft's commit-based synchronization is not real-time operation-log replication.
+
+Graft is experimental. Read [project status](/docs/overview/status/) for release and stability boundaries.
+
+## Choose a first step
+
+| Situation | Start here |
 | --- | --- |
-| Graft CLI | Evaluation, scripts, automation, and JSON subprocess integration. |
-| Node.js SDK | Resident in-process repository sessions. |
-| Remote packages | Authenticated HTTP synchronization through infrastructure you operate. |
+| You want to try a complete workflow | [CLI quickstart](/docs/quickstart/cli/) |
+| You want an in-process Node.js integration | [SDK quickstart](/docs/sdk/quickstart/) |
+| You operate a synchronization service | [Remote integration](/docs/remotes/) |
+| You want to predict what commands change | [Architecture guide](/docs/graft-book/) |
 
-Continue with [Choose An Integration](/docs/getting-started/).
+For subprocess integrations, consume structured JSON output. For resident Node.js applications, use the SDK. The [integration guide](/docs/getting-started/) explains the choice.

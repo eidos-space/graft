@@ -17,13 +17,17 @@ hero:
 
 import { CardGrid, LinkCard } from "@astrojs/starlight/components";
 
-Git tracks a SQLite database as an opaque binary file. Graft understands
-SQLite: it creates storage-efficient snapshots, shows schema and row-level
-changes, and merges supported database changes. Related files can travel in the
-same commit.
+Graft records versions of SQLite databases and related application files. You
+can inspect row changes, restore earlier data, combine supported branch edits,
+and send recorded history to a remote. Your application keeps using ordinary
+SQLite files.
 
 Graft uses a familiar Git-like workflow with its own repository and remote
 formats.
+
+Start with one distinction: saving an application transaction changes current
+data; `graft add` selects a snapshot; `graft commit` records it. Pushing sends
+recorded history. The [quickstart](/docs/quickstart/cli/) lets you verify each step.
 
 ## Choose your integration
 

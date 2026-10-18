@@ -1,116 +1,105 @@
 ---
-title: 06 远端、失败与恢复
-description: 理解 immutable data、mutable ref publication、CAS、pull=fetch+merge，以及本地和远端失败边界。
+title: 06 远端与恢复
+description: 分清 push、fetch、pull 和 clone，并判断失败后应该检查哪些状态。
 ---
 
-## Remote 传输三种不同的状态
+**哪个版本会到达远端**
 
-```text
-repository objects / packs       immutable
-SQLite commits / segments/files  immutable
-HEAD / refs/**                    mutable transactional metadata
+远端保存已经记录的仓库历史，以及读取历史所需的内容。它不会监听应用的实时数据库。
+
+| 动作 | 本地历史 | 远端历史 | 工作区 |
+| --- | --- | --- | --- |
+| SQLite 事务 | 不变 | 不变 | 改变数据库 |
+| add 和 commit | 记录选定版本 | 不变 | 保留当前文件 |
+| push | 保留本地版本 | 发布已记录历史 | 不替换文件 |
+| fetch | 下载历史，更新远端跟踪引用 | 读取 | 不替换文件 |
+| pull | 先 fetch，再合并 | 读取 | 可能替换文件 |
+| clone | 从远端创建本地仓库 | 读取 | 写入检出的文件 |
+
+仅仅执行 push，不会让未提交的笔记进入远端历史。
+
+## 试用文件系统远端
+
+先在 `main` 上创建一次提交，再为独立的测试远端选择绝对路径：
+
+```bash
+graft remote add origin fs:///tmp/graft-book-remote
+graft push origin main
+graft ls-remote origin
 ```
 
-这一区分决定了 push 的安全顺序。immutable data 可以用 content identity 去重和重传；branch
-ref 是“让别人看见新历史”的 publication point，必须 compare-and-swap（CAS）。
+隔离测试应选择新的远端路径。Graft 也支持对象存储和 HTTP 远端，见[远端后端](/zh/docs/remotes/)。
 
-## Push：依赖先到，ref 最后动
+远端提供另一份历史副本。备份仍需要独立的保留、访问和恢复策略。
 
-一次 push 概念上按以下顺序：
+## 先上传内容，最后更新分支
 
-1. 发布 commit 引用的 SQLite storage commits、segments/pages；
-2. 发布 external payload bytes；
-3. 发布 blob/tree/commit object 或 pack/index；
-4. 用开始时观察到的远端 ref 值作为 expected value，CAS 更新目标 branch。
-
-如果第 1–3 步后第 4 步 CAS 失败，远端可能留下不可达 immutable data，但 branch 仍指向一
-条完整旧历史。反过来的顺序会让 ref 暂时指向缺 page/blob 的 commit，因此不允许。
-
-force push 只放宽 non-fast-forward policy，不取消 expected-value CAS。另一位 writer 在你
-上传期间移动了 branch 时，你仍必须重新 fetch/判断，不能盲目覆盖。
-
-## Fetch、Pull、Clone 分别做什么
-
-### Fetch
-
-下载所选 remote ref 的 repository graph/object，并以 expected state 更新
-`refs/remotes/<remote>/<branch>`。它不会移动当前本地 branch、改 index、触发 merge 或
-materialize worktree。
-
-fetch 可以只拿 metadata 和必要 object；历史 SQLite page 或 external payload 仍可能在
-真正 diff/checkout 时 lazy hydrate。所以“能看到 log”不保证“所有历史 bytes 已离线”。
-
-### Pull
-
-pull 不是一条特殊覆盖算法，而是：
+远端分支应指向所需内容已经发布的版本。
 
 ```text
-fetch -> merge plan -> apply
+上传数据库存储与外部文件载荷
+              |
+上传描述版本的仓库对象
+              |
+有条件地更新远端分支
 ```
 
-因此它继承 up-to-date、fast-forward、three-way、conflict、stale token、SQLite
-materialization 和 handle 关闭规则。
+最后一步使用**比较并交换（CAS）**：只有分支仍等于开始时观察到的值，才执行更新。
 
-### Clone
+如果另一个客户端已经移动分支，更新会失败。已上传的不可变内容可能暂时不可达，但分支不会暴露这次未完成的发布。
 
-clone 初始化新 repository，配置 remote，取得一个稳定 ref 及其 immutable dependencies，
-建立 tracking/upstream，最后 checkout。已有非空 destination 不会被静默覆盖。
+强制推送放宽快进规则，仍会通过 CAS 检查远端的预期值。
 
-## Publication outcome unknown
+## fetch 让你先检查，pull 还会应用变化
 
-最难的失败发生在“CAS 请求已发送，但 ACK 丢了”：
+fetch 下载选定历史，并更新 `origin/main` 这样的远端跟踪引用。它不移动当前分支、不改变暂存区，也不替换已跟踪文件。
 
-```text
-client ---- CAS(new head) ----> remote
-client <--- connection lost ---X
+```bash
+graft fetch origin main
+graft log
+graft diff HEAD origin/main
 ```
 
-远端可能拒绝、可能已成功，也可能结果未知。此时不能直接发布另一个 successor。正确做法是
-保留 pending/recovery state，重新读取 remote ref：
+最后一条比较本地版本与刚获取的远端位置。
 
-- ref 等于预期新值：把本地状态 reconcile 为成功；
-- ref 仍是旧值：可以按明确失败处理；
-- ref 是其他值：视为并发/divergence，重新 fetch/plan。
+pull 执行 fetch、合并规划和合并应用。它可能快进、进入冲突状态，并替换数据库。先关闭受影响的应用连接。
 
-timeout 和 cancellation 也只能保证 safe boundary；请求发出后，取消不等于远端没有执行。
+元数据可能先于全部历史页或外部载荷到达。后续读取可以补齐缺失内容。“能看到提交”与“所有字节都已在本地”是两种状态。
 
-## 本地失败时哪些东西可信
+clone 初始化新仓库，获取远端历史，设置跟踪关系，再检出文件。它不会静默覆盖非空目标目录。
 
-| 失败位置 | 可能留下什么 | 仍应信任什么 |
-| --- | --- | --- |
-| add 的 private backup | temp file | worktree、旧 index；temp 可清理 |
-| storage commit 后、index 前 | unreachable storage delta/blob | 旧 index/ref |
-| tree/commit 写完、ref 前 | unreachable repository objects | 旧 ref |
-| ref 替换后、reflog append 前 | 新 branch，缺一条 reflog | ref 与 object graph |
-| 多路径 checkout 中途 | 部分 temp/backup，恢复可能不完整 | repository canonical state + status/reconcile |
-| active merge 中途 | stages、journal、可能的 candidate | index + merge journal，不猜 worktree |
-| push immutable 完成、CAS 失败 | remote unreachable immutable data | remote ref |
+## 响应丢失时，结果可能未知
 
-object read 会验证 requested ID；snapshot descriptor 会验证 expected storage commit hash；
-external payload 会验证 content hash 与 size。发现 mismatch 时必须报 corruption，不能用零页
-或空文件顶替。
+分支更新请求已发送，但响应丢失时，服务端可能已经执行。超时或取消不能证明服务端没有动作。
 
-## 三种清理不是一回事
+重新读取远端分支：
 
-| 维护域 | 追踪的 root | 清理目标 |
-| --- | --- | --- |
-| SQLite storage GC | index snapshots、HEAD/branches、merge/orig head、remote refs、tags 等 | unreachable volume/log/segment/page |
-| payload prune | index 与 refs/tags 可达的 external pointers | `store/files` 中不可达 bytes |
-| repository object GC | commit/tree/blob reachability | 当前 1.0 没有 public loose-object GC |
+| 观察到的值 | 含义 |
+| --- | --- |
+| 预期的新提交 | 当前分支已处于预期位置 |
+| 原提交 | 当前引用未体现预期更新 |
+| 其他提交 | 需要处理其他写入者或历史分歧 |
 
-不要用“这个 object 不在当前 branch”直接推导它可删除：index、其他 branch、remote-tracking
-ref、tag 和 active merge 都可能仍引用它。pending remote publication 和恢复记录也需要进入
-相应 storage roots。
+必要时 fetch 最新状态并重新规划。不要直接发布另一个后继版本。
 
-## 面对异常时的恢复顺序
+## 根据仍有效的状态恢复
 
-1. 停止继续写入，尤其不要删除 `.graft/tmp`、merge record 或 WAL 来“试试看”。
-2. 关闭可能受影响的应用 SQLite handles。
-3. 运行只读 `graft status --json`，确认 branch、index、merge 和 path actions。
-4. 若 active merge，使用 inspection 后继续 resolve/continue，或明确 abort。
-5. 若 remote publication 不确定，先 fetch/inspect remote ref，再决定 retry。
-6. 对 missing/corrupt object、payload 或 page 使用 audit/remote repair；不要制造替代 bytes。
-7. 只有 canonical state 已确认后，才清理由它证明不可达的 cache/temp/data。
+| 失败 | 先检查什么 |
+| --- | --- |
+| 捕获或暂存失败 | 工作区与已有暂存状态 |
+| 提交报告失败 | 当前引用、历史与暂存区 |
+| 切换或恢复中途停止 | 状态、返回的路径动作与受影响文件 |
+| 合并中断 | 暂存区冲突阶段与解决记录 |
+| push 响应丢失 | 远端分支值 |
 
-掌控感来自知道每一层的 publication point：SQLite transaction、index、repository ref 和
-remote ref 各自完成一次独立的“现在可以被下一层看见”。
+如果恢复可能替换文件，先停止应用写入并关闭受影响的 SQLite 连接。检查 `graft status --json`，完成或中止活跃合并，确认不确定的远端结果，再恢复写入。
+
+缺失或损坏的内容必须报告。缺失页不能当作全零页，缺失载荷不能当作空文件。
+
+## 清理是独立操作
+
+SQLite 存储垃圾回收、外部载荷清理与仓库对象维护有不同的根和限制。1.0 集成面没有公开的松散对象垃圾回收操作。
+
+不要通过删除内部存储来处理未完成合并或不确定的推送。先恢复有效版本，再使用对应维护命令。
+
+精确的发布与恢复规则见[远端和仓库规范](/zh/docs/specifications/)。

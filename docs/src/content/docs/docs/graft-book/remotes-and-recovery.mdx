@@ -1,83 +1,105 @@
 ---
-title: 06 Remotes And Recovery
-description: Understand immutable dependencies, CAS ref publication, pull as fetch plus merge, and recovery boundaries.
+title: 06 Remotes and Recovery
+description: Distinguish push, fetch, pull, and clone, then identify the state to inspect after a failure.
 ---
 
-## Three remote state classes
+**Which version reaches the remote?**
 
-```text
-repository objects / packs       immutable
-SQLite commits / segments/files  immutable
-HEAD / refs/**                    mutable transactional metadata
+A remote stores recorded repository history and the content needed to read it. It does not watch your application's live database.
+
+| Action | Local history | Remote history | Worktree |
+| --- | --- | --- | --- |
+| SQLite transaction | Unchanged | Unchanged | Changes database |
+| Add and commit | Records selected version | Unchanged | Keeps current files |
+| Push | Keeps local version | Publishes recorded history | No replacement |
+| Fetch | Downloads history and updates remote-tracking refs | Read | No replacement |
+| Pull | Fetches, then merges | Read | Can replace files |
+| Clone | Creates local repository from remote | Read | Writes checked-out files |
+
+An uncommitted note does not become remote history just because you push.
+
+## Try a filesystem remote
+
+After creating a repository with a commit on `main`, choose an absolute path for a separate test remote:
+
+```bash
+graft remote add origin fs:///tmp/graft-book-remote
+graft push origin main
+graft ls-remote origin
 ```
 
-Immutable data can be content-verified and retried. A branch ref is the publication point that
-makes a history visible, so it requires compare-and-swap (CAS).
+Use a fresh remote path for an isolated test. Graft also supports object storage and HTTP remotes; see [remote backends](/docs/remotes/).
 
-## Push dependencies first, ref last
+A remote is an additional copy of history. Backup still needs its own retention, access, and recovery policy.
 
-1. Publish SQLite commits, segments, and pages.
-2. Publish external payload bytes.
-3. Publish repository objects or pack/index.
-4. CAS the destination branch against the value observed at start.
+## Push publishes content before the branch
 
-If CAS fails, the remote may retain unreachable immutable data while its branch still names a
-complete old history. Publishing the ref first would expose a commit with missing dependencies and
-is forbidden. Force only relaxes fast-forward policy; it does not remove expected-value CAS.
-
-## Fetch, pull, and clone
-
-Fetch downloads the selected graph and updates `refs/remotes/<remote>/<branch>` with expected state.
-It does not move the current branch, modify the index, merge, or materialize. Metadata can arrive
-before all historical pages or payload bytes; later reads may hydrate lazily.
-
-Pull is exactly:
+A remote branch must identify a version whose required content has been published.
 
 ```text
-fetch -> merge plan -> apply
+Upload database storage + external file payloads
+                       |
+Upload repository objects that describe the version
+                       |
+Conditionally update the remote branch
 ```
 
-It inherits fast-forward, three-way, conflicts, stale checks, materialization, and handle rules.
+The final update uses **compare-and-swap (CAS)**: update the branch only if it still has the value observed at the start.
 
-Clone initializes a new repository, configures the remote, obtains a stable ref and immutable
-dependencies, establishes tracking/upstream, then checks out. It does not silently overwrite a
-non-empty destination.
+If another client moved the branch, the update fails. Uploaded immutable content may remain unreachable, but the branch does not expose the proposed incomplete publication.
 
-## Unknown publication outcome
+Force push relaxes the fast-forward rule. It still checks the expected remote value with CAS.
 
-When a CAS request was sent but its acknowledgement is lost, the server may have rejected or
-committed it. Do not publish a different successor blindly. Read the remote ref and reconcile:
+## Fetch is a chance to inspect; pull also applies
 
-- expected new value means success;
-- unchanged old value means known failure;
-- another value means concurrency/divergence and requires fetch plus a new plan.
+Fetch downloads the selected history and updates a remote-tracking ref such as `origin/main`. It does not move your current branch, change the index, or replace tracked files.
 
-Timeout and cancellation also only guarantee safe boundaries. Cancellation after request dispatch
-does not prove the server did nothing.
+```bash
+graft fetch origin main
+graft log
+graft diff HEAD origin/main
+```
 
-## Failure authority table
+The last command compares your version with the fetched remote position.
 
-| Failure point | Possible residue | Authority |
-| --- | --- | --- |
-| private add backup | temp file | worktree and old index |
-| storage commit before index | unreachable storage/blob | old index/ref |
-| tree/commit before ref | unreachable objects | old ref |
-| ref before reflog append | new branch, missing reflog line | ref and object graph |
-| multi-path checkout | backups or partial restoration | canonical repository state plus status |
-| active merge | stages, journal, candidate | index and merge journal |
-| remote immutable upload before CAS failure | unreachable remote data | remote ref |
+Pull performs fetch, merge planning, and merge application. It can fast-forward, enter conflict state, and replace databases. Close affected application connections first.
 
-Reads validate object IDs, expected storage commit hashes, and payload content hash/size. Corruption
-must be reported; a missing page cannot be synthesized as zero and a missing payload is not empty.
+Metadata may arrive before every historical page or external payload. A later read can hydrate missing content. “I can see the commit” and “all its bytes are local” are separate observations.
 
-## Separate maintenance domains
+Clone initializes a new repository, obtains remote history, sets tracking, and checks out files. It does not silently overwrite a non-empty destination.
 
-| Domain | Roots | Removes |
-| --- | --- | --- |
-| SQLite storage GC | index, heads, branches, merge state, remote refs, tags | unreachable storage data |
-| payload prune | index and reachable external pointers | unreachable `store/files` bytes |
-| repository object GC | object graph | no public loose-object GC in 1.0 |
+## A lost response leaves the outcome unknown
 
-Recovery order: stop writes, close affected SQLite handles, inspect `status --json`, finish or abort
-an active merge from its journal, reconcile uncertain remote refs, repair verified missing content,
-and only then clean data proven unreachable.
+If a branch-update request was sent but its response was lost, the server may have applied it. Timeout or cancellation does not prove it did nothing.
+
+Read the remote branch again:
+
+| Observed value | Meaning |
+| --- | --- |
+| Intended new commit | The intended branch position is present |
+| Original commit | The intended update is not reflected in the current ref |
+| Another commit | Another writer or divergence must be reconciled |
+
+Fetch current state and make a new plan when needed. Do not blindly publish a different successor.
+
+## Recover from the state that remains authoritative
+
+| Failure | Inspect first |
+| --- | --- |
+| Capture or stage fails | Worktree and existing staged state |
+| Commit reports failure | Current ref, history, and index |
+| Checkout or restore stops partway | Status, returned path actions, and affected files |
+| Merge is interrupted | Index conflict stages and resolution journal |
+| Push loses its response | Remote branch value |
+
+Stop application writes and close affected SQLite connections when recovery can replace files. Inspect `graft status --json`, complete or abort an active merge, and reconcile uncertain remote results before resuming writes.
+
+Missing or corrupt content must be reported. A missing page is not a zero page; a missing payload is not an empty file.
+
+## Cleanup is a separate operation
+
+SQLite storage GC, external-payload pruning, and repository-object maintenance have different roots and limits. The 1.0 surface has no public loose-object GC.
+
+Do not delete internal storage to fix an unresolved merge or uncertain push. First recover a valid version; then use the appropriate maintenance command.
+
+Exact publication and recovery rules are in the [remote and repository specifications](/docs/specifications/).

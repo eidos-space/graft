@@ -60,6 +60,9 @@ diff 的顶层 `paths` 适合做导航；SQLite database entries 在 `--rows` �
 `primary_key_columns`。普通 rowid table 的 row change 使用 `rowid`；
 `WITHOUT ROWID` table 使用 `key`：
 
+如果 table 有 `INTEGER PRIMARY KEY` 别名，`rowid_alias` 会提供该列名。
+存储记录中对应的值可能为 `null`，渲染该列的逻辑值时应使用 row change 的 `rowid`。
+
 ```json
 {
   "name": "docs",
