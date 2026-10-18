@@ -143,12 +143,18 @@ export async function normalize(suite, input, output, environment = process.env)
     assert.equal(report.rounds, 1);
     assert.equal(report.order, "plain-first");
     for (const row of report.summaries) {
-      assert.equal(row.samples, 1);
+      // The core workload performs three small edits inside a single round.
+      // Keep their median as the workload result; this is not a second run.
+      const expectedSamples =
+        suite === "e2ee-core" && ["warm_small_push", "warm_small_fetch"].includes(row.operation)
+          ? 3
+          : 1;
+      assert.equal(row.samples, expectedSamples);
       const name = [row.profile, row.scenario, row.scale, row.operation].join("/");
       assert.ok(!Object.hasOwn(metrics, name), "Duplicate operation");
       // One observation is not a tail estimate. Keep raw P50/P95 and resources
       // in the artifact, and compare the single elapsed-time observation here.
-      assert.equal(row.milliseconds.p50, row.milliseconds.p95);
+      if (expectedSamples === 1) assert.equal(row.milliseconds.p50, row.milliseconds.p95);
       metrics[name] = row.milliseconds.p50;
     }
     workload = { order: report.order, cases: Object.keys(metrics).sort() };

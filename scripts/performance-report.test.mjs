@@ -167,6 +167,17 @@ test("normalize consumes one real-format observation and refuses multi-round tai
     await assert.rejects(
       normalize("e2ee-core", input, output, { PERF_RUNNER: "ubuntu-24.04", PERF_ARCH: "x64" }),
     );
+    paired.summaries[0].operation = "warm_small_push";
+    paired.summaries[0].samples = 3;
+    await fs.writeFile(input, JSON.stringify(paired));
+    const warm = await normalize("e2ee-core", input, output, {
+      PERF_RUNNER: "ubuntu-24.04",
+      PERF_ARCH: "x64",
+    });
+    assert.equal(warm.metrics["encrypted/objects/100000/warm_small_push"], 747);
+    await assert.rejects(
+      normalize("e2ee-sdk", input, output, { PERF_RUNNER: "ubuntu-24.04", PERF_ARCH: "x64" }),
+    );
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }
