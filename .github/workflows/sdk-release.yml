@@ -5,6 +5,7 @@ on:
     branches: ["main"]
     paths:
       - ".github/workflows/sdk-release.yml"
+      - "scripts/performance-report*"
       - "Cargo.lock"
       - "Cargo.toml"
       - "crates/graft-sdk/**"
@@ -26,6 +27,7 @@ concurrency:
 
 permissions:
   contents: read
+  pull-requests: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -45,6 +47,13 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Require merged PR and reject recorded major regressions
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GRAFT_RELEASE_SURFACE: sdk
+        run: node scripts/performance-report.mjs guard
 
       - name: Validate tag, commit, and package versions
         id: meta
@@ -340,6 +349,7 @@ jobs:
     permissions:
       contents: write
       id-token: write
+      pull-requests: read
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -399,7 +409,13 @@ jobs:
           (cd release-assets && sha256sum *.node > SHA256SUMS)
 
       - name: Publish platform packages then root package
-        run: pnpm --dir packages/graft-sdk release:publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GRAFT_RELEASE_SURFACE: sdk
+        run: |
+          node scripts/performance-report.mjs guard
+          pnpm --dir packages/graft-sdk release:publish
+
 
       - name: Create or update SDK GitHub release
         uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2

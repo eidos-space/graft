@@ -64,6 +64,16 @@ jobs:
       - name: Installer script tests
         run: sh scripts/install-script.test.sh
 
+      - name: Node.js for release policy tests
+        uses: actions/setup-node@395ad3262231945c25e8478fd5baf05154b1d79f # v6
+        with:
+          node-version: "24"
+
+      - name: Release performance policy tests (no native benchmark)
+        run: |
+          node --test scripts/performance-report.test.mjs
+          python3 scripts/e2ee-report-only.test.py
+
       - name: Build
         run: just build-all
 

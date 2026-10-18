@@ -37,10 +37,9 @@ of file lengths), which is more reproducible across filesystems than allocated
 block counts.
 
 All generated content uses fixed seeds. Each metric records every fresh-repository
-sample plus its median and median absolute deviation. The CI comparison keeps
-base/candidate samples aligned, reports the median per-pair percentage change,
-and reports the paired median absolute deviation so shared runner drift is not
-mistaken for treatment noise.
+sample plus its median and median absolute deviation. Local paired comparisons
+keep base/candidate samples aligned and report per-pair changes and deviation.
+PR CI uses the single-observation release policy described below.
 
 ## Running locally
 
@@ -80,23 +79,23 @@ enough runner-noise data has been collected.
 
 ## GitHub Actions methodology
 
-The benchmark workflow builds the base revision's `graft` executable and the
-candidate revision's `graft` executable on the same `ubuntu-24.04` runner. It
-then uses the candidate revision's benchmark harness for both executables. This
-keeps the dataset and measurement code identical and permits the first benchmark
-change to compare against a base revision that did not yet contain this crate.
-The six measured samples are paired and alternate `base → candidate` with
-`candidate → base`, balancing time-dependent runner drift between revisions.
-Paired mode requires an even sample count and writes a shared run ID, harness and
-host provenance, and execution order into both reports; the comparator rejects
-mismatched pairs.
+The PR workflow builds only the candidate and records one CI-sized observation
+with `--samples 1 --warmups 0`. It does not rebuild the previous release or run
+again for merge and tag pushes. A separate reporter posts the result on the PR
+and reads the previous published release's PR comment for comparison. Only
+matching runner, architecture, toolchain and workload definitions are compared.
+The first observation is retained rather than selecting a faster rerun.
 
-For pull requests, the base is the PR base SHA. For pushes to `main`, it is the
-pre-push SHA (falling back to the first parent when necessary). The comparison
-is written to the GitHub job summary, and the raw JSON plus Markdown reports are
-uploaded as workflow artifacts. The workflow is read-only and does not execute
-through `pull_request_target`, so it is safe for fork pull requests. Superseded
-PR runs are cancelled, while every `main` push keeps its own run and report.
+Only a duration at least 2× the baseline and at least 500 ms slower blocks the
+corresponding release train. Missing or incompatible baselines are explicitly
+reported; they do not produce a performance-pass claim. See `RELEASE.md` for the
+publication policy. Single samples cannot establish a P95 or latency SLA.
+Raw resources and samples remain available as artifacts. Benchmark jobs have
+read-only tokens; the privileged comment workflow never executes PR code.
+
+The local paired comparison commands above remain useful for a specifically
+requested investigation. Their six-sample alternating methodology is an
+experimental tool, not part of every release.
 
 Changing the workload, metric meaning, or result schema requires incrementing
 `REPORT_SCHEMA_VERSION`. Reports with different schemas or dataset parameters

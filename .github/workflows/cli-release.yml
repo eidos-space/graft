@@ -11,6 +11,7 @@ concurrency:
 
 permissions:
   contents: read
+  pull-requests: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -30,6 +31,12 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Require merged PR and reject recorded major regressions
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GRAFT_RELEASE_SURFACE: cli
+        run: node scripts/performance-report.mjs guard
 
       - name: Resolve release metadata
         id: meta
@@ -164,10 +171,17 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+      pull-requests: read
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
+
+      - name: Recheck recorded major regressions before publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GRAFT_RELEASE_SURFACE: cli
+        run: node scripts/performance-report.mjs guard
 
       - name: Prepare changelog release notes
         env:

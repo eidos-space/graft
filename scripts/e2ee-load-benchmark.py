@@ -235,6 +235,7 @@ def main():
     parser.add_argument("--scenario", choices=["objects", "history", "attachment", "same-ref", "different-ref"])
     parser.add_argument("--order", choices=["plain-first", "encrypted-first"], default="plain-first")
     parser.add_argument("--paired", action="store_true", help="sample a paired SDK/hydration example accepting REPORT ROUNDS ORDER")
+    parser.add_argument("--report-only", action="store_true", help="retain reference budget outcomes without enforcing them; native failures still fail")
     args = parser.parse_args()
     if args.rounds < 1 or args.interval < 0.02:
         parser.error("rounds >= 1 and interval >= 0.02 required")
@@ -273,7 +274,7 @@ def main():
         result = hydration_acceptance(summaries)
     if result is not None:
         (args.output / "acceptance.json").write_text(json.dumps(result, indent=2) + "\n")
-        if not result["passed"]:
+        if not result["passed"] and not args.report_only:
             raise RuntimeError("load acceptance budgets failed; inspect acceptance.json and retained raw reports")
 
 
