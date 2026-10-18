@@ -59,4 +59,4 @@ jobs:
         shell: pwsh
         run: |
           $env:GRAFT_E2EE_NODE_TEST_BINDING = Join-Path $env:RUNNER_TEMP 'graft-sdk.node'
-          cargo test -p graft-sdk --features e2ee --test e2ee_node --locked -- --ignored --test-threads=1
+          cargo test -p graft-sdk --features e2ee,bundled-sqlite --test e2ee_node --locked -- --ignored --test-threads=1
