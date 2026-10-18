@@ -77,6 +77,9 @@ tokio = { workspace = true, features = ["sync", "rt", "time", "macros"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = { workspace = true, optional = true }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
+
 [dev-dependencies]
 assert_matches = { workspace = true }
 rand = { workspace = true }

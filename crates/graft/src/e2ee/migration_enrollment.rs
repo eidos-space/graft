@@ -60,7 +60,7 @@ impl MigrationEnrollmentRecord {
 /// Initialization journal guarded by the exact retained migration enrollment.
 /// The host must serialize preparation before publication and validate private
 /// directory placement. This guard revalidates source intent, not a write fence.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub struct MigrationInitializationJournal {
     repository: crate::repo::Repository,
     enrollment: super::FileMigrationEnrollmentJournal,
@@ -69,7 +69,7 @@ pub struct MigrationInitializationJournal {
     initialization: std::sync::Arc<dyn super::InitializationJournal>,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl MigrationInitializationJournal {
     pub fn new(
         repository: crate::repo::Repository,
@@ -93,7 +93,7 @@ impl MigrationInitializationJournal {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl super::InitializationJournal for MigrationInitializationJournal {
     fn load(&self, binding: &super::SessionBinding) -> Result<super::InitializationRecord> {
         if binding.domain() != self.session.binding().domain()

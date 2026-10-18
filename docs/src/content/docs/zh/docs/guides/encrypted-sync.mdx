@@ -5,7 +5,7 @@ description: 构建原生加密传输，使用同步密码连接设备，并恢�
 
 Graft 原生加密传输会先加密已记录历史、SQLite 快照、文件内容和引用值，再发送到 HTTP 远端。本地工作区与缓存仍是明文。服务可以观察不透明对象标识、大小、时间，以及同步需要的路由关系。
 
-E2EE 可用于 macOS 和 Linux 原生宿主。从源码构建 CLI 时需开启 `e2ee` feature；本地 Node 构建脚本默认使用 `plain`，SDK 发布工作流则为 macOS 和 Linux 显式选择加密构建配置。连接前请核对所安装 SDK 版本的发布说明与原生能力。生产符合性与系统安全存储能力需要提供 [E2EE 规范](https://github.com/eidos-space/graft/blob/20c276bc79fce766b13e18fa59a534de0d7df93d/docs/specs/graft-e2ee-remote-1.0.zh.md)列出的验证证据。当前实现不支持 Windows 和浏览器 E2EE。
+E2EE 可用于 macOS、Linux 和 Windows 原生宿主。从源码构建 CLI 时需开启 `e2ee` feature；本地 Node 构建脚本默认使用 `plain`，SDK 发布工作流为原生平台显式选择加密配置。连接前请核对所安装 SDK 版本的发布说明与原生能力。生产符合性与系统安全存储能力需要提供 [E2EE 规范](https://github.com/eidos-space/graft/blob/20c276bc79fce766b13e18fa59a534de0d7df93d/docs/specs/graft-e2ee-remote-1.0.zh.md)列出的验证证据。浏览器 E2EE 尚不支持。Windows 使用私有状态 ACL 和仅会话口令解锁；记住密钥需要获准的宿主系统 provider。Node 宿主可用 `EncryptedRemoteSession.createPrivateDirectory(path)` 创建私有状态目录。
 
 ## 构建 CLI
 

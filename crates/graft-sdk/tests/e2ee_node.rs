@@ -1,4 +1,4 @@
-#![cfg(all(feature = "e2ee", unix))]
+#![cfg(all(feature = "e2ee", any(unix, windows)))]
 
 use graft_sdk::e2ee::{EncryptedConfig, RepositoryId, RootKey};
 use std::{fs, path::Path, process::Command};

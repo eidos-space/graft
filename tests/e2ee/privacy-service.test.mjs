@@ -19,7 +19,7 @@ for (const enabled of [false, true]) test(`actual service privacy capture opt-in
   const code = `${enabled ? "" : 'Response.prototype.clone = () => { throw new Error("Opt-out cloned a response"); };'}
     process.argv = [process.execPath, "tests/e2ee/remote-service.mjs", ...process.argv.slice(1)];
     await import("./tests/e2ee/remote-service.mjs");`;
-  const child = spawn(process.execPath, ["--input-type=module", "-e", code, fixture, capture], { stdio: ["ignore", "pipe", "pipe"] });
+  const child = spawn(process.execPath, ["--input-type=module", "-e", code, fixture, capture], { stdio: ["ignore", "pipe", "pipe", "ipc"] });
   const closed = once(child, "close");
   let errors = "";
   child.stderr.on("data", (chunk) => { errors += chunk; });
@@ -36,7 +36,7 @@ for (const enabled of [false, true]) test(`actual service privacy capture opt-in
     const legacy = JSON.parse(readFileSync(capture));
     assert.ok(Array.isArray(legacy) && legacy.length === 1);
     assert.equal(legacy[0].responseStatus, 200);
-    child.kill();
+    child.send("graft-e2ee-shutdown");
     const [code] = await closed;
     if (enabled) {
       assert.equal(code, 0, errors);

@@ -1092,11 +1092,18 @@ fn encrypted_cli_clones_fetches_pulls_and_pushes_using_protected_input() {
         .unlock_with_root(&config, RootKey::import(id, Zeroizing::new([42; 32])))
         .unwrap();
     let credentials = RemoteCredentials::explicit();
+    let journals = Arc::new(
+        graft::e2ee::FileRefMutationJournalProvider::create(
+            private("source-recovery"),
+            secret.binding(),
+        )
+        .unwrap(),
+    );
     credentials
         .set_http_bearer_token("origin", "benchmark-token".into())
         .unwrap();
     credentials
-        .set_encrypted_session(
+        .set_encrypted_session_with_journals(
             "origin",
             &remote,
             secret,
@@ -1105,6 +1112,7 @@ fn encrypted_cli_clones_fetches_pulls_and_pushes_using_protected_input() {
                 max_buffered_plaintext: 4 * 1024 * 1024,
                 max_ciphertext_spool: 32 * 1024 * 1024,
             },
+            journals,
         )
         .unwrap();
     let source = private("source");

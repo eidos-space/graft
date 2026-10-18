@@ -9,10 +9,37 @@ SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
 
 - Add idempotent `RepositorySession.removeRemote(name)` for disconnecting a named
   remote while preserving local files, unsaved edits, commits, branches and tags.
+- Enable encrypted synchronization and migration on Windows, with protected
+  private directories, durable replacement and native file identity checks.
+- Add `EncryptedRemoteSession.createPrivateDirectory(path)` for native private
+  host storage on Unix and Windows.
+
+### Fixed
+
+- Require retained initial branch/commit intent before source publication,
+  and durable recovery journals before encrypted ref mutations.
+- Bound encrypted transfers by a finite total deadline as well as read inactivity
+  timeouts. Preserve uncertain publication state for reconciliation.
+- Fence and drain all sessions sharing a remembered-key identity during removal.
+- Harden private staging, recovery replacement and password input buffers.
+
+### Compatibility
+
+- Hosts publishing an initial branch must pass `{ branch, commit }` to
+  `initializeConfig(password, source)` before configuration publication. A later
+  HEAD must never substitute for missing retained intent.
+- Windows hosts must create checkpoint, recovery and staging directories with
+  `EncryptedRemoteSession.createPrivateDirectory`. Windows sessions use explicit
+  passwords; no built-in Windows persistent key store is provided.
 
 ### 中文
 
 - 新增 `RepositorySession.removeRemote(name)`，移除指定远程连接及其跟踪配置，保留本地文件、未保存改动与 Graft 历史。
+- Windows 支持加密同步与迁移，使用受保护的私有目录、持久替换及原生文件身份检查。
+- 新增 `EncryptedRemoteSession.createPrivateDirectory(path)`，用于创建满足 Unix / Windows 权限要求的宿主状态目录。
+- 首次源分支发布必须使用预先保留的分支和提交意图，加密引用修改必须有持久恢复日志；传输同时受总期限和读取超时限制，结果未知时保留恢复状态。
+- 移除记住的密钥时会阻止并排空所有共享同一身份的会话；加固私有暂存、恢复替换和密码输入缓冲区。
+- 发布首次分支的宿主需在配置发布前调用 `initializeConfig(password, { branch, commit })`，不能从后来变化的 HEAD 补建意图。Windows 宿主需通过新目录 API 创建私有状态；Windows 目前使用显式密码，不提供内置持久密钥存储。
 
 ## Graft SDK 0.3.31 — 2026-10-17
 

@@ -139,16 +139,19 @@ Rust 加密 HTTP 客户端还提供 `publish_initial_config` 和不发送 mutati
 `reconcile_initial_config`，接受可信 `InitializationJournal`。宿主先用 journal
 中的精确本机候选配置解锁。`InitialConfigPublicationOutcome::Confirmed` 表示
 已读回并认证精确配置，且 journal 已持久推进到 config-published；不表示已连接，
-也不发布初始对象/ref。已知发布的配置丢失时，不重新 create。Unix 的
+也不发布初始对象/ref。已知发布的配置丢失时，不重新 create。原生
 `FileInitializationJournal` 要求私有目录、明确 create/open 和 owner-only 文件。
 其阻塞持久化任务留在持钥操作的排空边界内。完整接入、平台存储、宿主认证与
 CLI/Node 编排仍需满足 E2EE Remote 第 17 节。
 
 Node 绑定的可选 `e2ee` feature 增加可信宿主的 `EncryptedRemoteSession`，固定
 远端 name/URL/UUID 与宿主已认证的 domain/account subject。构造选项明确选择
-新建检查点或打开已有状态；已有状态丢失时不重建。目前原生检查点要求 Unix 的
-owner-only 私有目录。`macos-keychain` 额外启用获准的原生 provider；存储不可用
-不回退。默认 native artifact 不启用此 API。
+新建检查点或打开已有状态；已有状态丢失时不重建。原生检查点支持 Unix 的
+owner-only 权限以及 Windows 的仅所有者/SYSTEM DACL、原生身份校验和文件锁。
+宿主可用 `EncryptedRemoteSession.createPrivateDirectory(path)` 创建新的私有目录。
+Windows 无需记住密钥的 provider 即可使用仅会话口令解锁。
+`macos-keychain` 额外启用获准的原生 provider；存储不可用
+不回退。未开启 `e2ee` 的 native 构建不启用此 API。
 
 `unlock(Buffer)` 同步消费并清零调用方独占的密码 Buffer，在异步调度前登记解锁，
 只保留受控原生副本。拒绝字符串、无效 UTF-8 和越界输入；不承诺擦除之前的 JS
@@ -174,6 +177,7 @@ API 的 command-service clone 与目标目录安全契约。加密配置保留 p
 该连接的内存 HTTP 凭据。连接不存在时返回 `removed: false`。本地文件（含未保存
 改动）、提交、本地分支、标签与其他远程连接必须保留。宿主负责在断开前吊销并排空
 对应的加密权限会话。该操作不改写工作区文件。
+若仍附着未断开的加密权限会话，必须在移除持久远程配置前拒绝；仅锁定会话并不足够。
 
 稳定分类：
 

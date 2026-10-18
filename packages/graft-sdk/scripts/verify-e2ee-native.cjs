@@ -20,7 +20,8 @@ async function main() {
       await Promise.all(
         ["staging", "checkpoint", "recovery", "repository"].map(async (name) => {
           const target = path.join(directory, name);
-          await fs.mkdir(target, { mode: 0o700 });
+          if (name === "repository") await fs.mkdir(target);
+          else EncryptedRemoteSession.createPrivateDirectory(target);
           return [name, target];
         }),
       ),
@@ -42,17 +43,6 @@ async function main() {
     assert.throws(() => new EncryptedRemoteSession({ ...options, uuid: "invalid" }), {
       code: "GRAFT_SDK_E2EE_INVALID_SESSION_BINDING",
     });
-    if (process.platform === "win32") {
-      assert.throws(() => new EncryptedRemoteSession(options), {
-        code: "GRAFT_SDK_E2EE_UNSUPPORTED_ENCRYPTED_HOST",
-      });
-      for (const name of ["checkpoint", "recovery", "staging"])
-        assert.deepEqual(await fs.readdir(paths[name]), []);
-      console.log(
-        `Verified Graft ${sdkVersion()} native E2EE API and explicit unsupported Windows storage boundary`,
-      );
-      return;
-    }
     authority = new EncryptedRemoteSession(options);
     assert.equal(authority.state, "locked");
     authority.pause(true);
@@ -81,6 +71,14 @@ async function main() {
     await assert.rejects(repository.fetch({ remote: "origin", branch: "main" }), {
       code: "GRAFT_SDK_E2EE_LOCKED",
     });
+    await assert.rejects(repository.removeRemote("origin"), {
+      code: "GRAFT_SDK_INVALID_ARGUMENT",
+    });
+    assert.equal((await repository.listRemotes()).remotes[0].kind, "encrypted_http");
+    await authority.disconnect();
+    assert.deepEqual(await repository.removeRemote("origin"), { removed: true });
+    assert.deepEqual((await repository.listRemotes()).remotes, []);
+    assert.deepEqual(await repository.removeRemote("origin"), { removed: false });
     await repository.close();
     repository = undefined;
     await authority.disconnect();

@@ -4,7 +4,7 @@ use super::*;
 #[path = "multipart_tests.rs"]
 mod tests;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Clone, Copy)]
 enum MultipartSource<'a> {
     Prepared(&'a PreparedEncryptedObject),
@@ -35,7 +35,7 @@ impl EncryptedHttpClient {
 
     /// Durable exact-ciphertext multipart publication. Every completion (including
     /// 412 or response loss) authenticates all winning object chunks and SHA-256.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub async fn publish_object_multipart(
         &self,
         candidate: &PreparedEncryptedObject,
@@ -54,7 +54,7 @@ impl EncryptedHttpClient {
     /// Explicitly abort the recorded server session, durably retain that result,
     /// then send every part under a new server session using the same ciphertext.
     /// An unacknowledged abort never clears the previous session identity.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub async fn restart_object_multipart(
         &self,
         candidate: &PreparedEncryptedObject,
@@ -72,7 +72,7 @@ impl EncryptedHttpClient {
 
     /// Trusted-host recovery from an existing private slot. No plaintext snapshot
     /// or replacement ciphertext is prepared; an absent allocation fails closed.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub async fn resume_retained_object_multipart(
         &self,
         opaque_key: &str,
@@ -90,7 +90,7 @@ impl EncryptedHttpClient {
 
     /// Explicitly abort and restart the exact retained upload without reconstructing
     /// plaintext or re-encrypting. Lost abort acknowledgements preserve the old pin.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub async fn restart_retained_object_multipart(
         &self,
         opaque_key: &str,
@@ -106,7 +106,7 @@ impl EncryptedHttpClient {
         .await
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     async fn publish_multipart_inner(
         &self,
         source: MultipartSource<'_>,
@@ -324,7 +324,7 @@ impl EncryptedHttpClient {
         .await
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     async fn send_multipart_parts(
         &self,
         operation: SessionOperation,
@@ -418,7 +418,7 @@ impl EncryptedHttpClient {
         .await
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     async fn confirm_multipart(
         &self,
         operation: SessionOperation,
@@ -466,8 +466,9 @@ impl EncryptedHttpClient {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MultipartStart {
     upload_id: String,
     total_bytes: u64,
@@ -476,21 +477,23 @@ struct MultipartStart {
     uploaded_parts: Vec<MultipartPart>,
     encryption: MultipartIdentity,
 }
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MultipartPart {
     part_number: u64,
     bytes: u64,
 }
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MultipartIdentity {
     uuid: String,
     upload_id: String,
     ciphertext_sha256: String,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn validate_start(
     start: &MultipartStart,
     uuid: &str,
@@ -525,7 +528,7 @@ fn validate_start(
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 async fn persist(
     operation: SessionOperation,
     lease: crate::e2ee::multipart_journal::Lease,
@@ -540,15 +543,15 @@ async fn persist(
     .map_err(|_| EncryptionError::CheckpointUnavailable(std::io::ErrorKind::Other))?
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn unknown(error: EncryptedHttpError) -> Result<ObjectPublicationOutcome> {
     Ok(ObjectPublicationOutcome::OutcomeUnknown { error: Some(error) })
 }
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn uuid_text(repository: crate::e2ee::RepositoryId) -> String {
     let hex = hex(repository.as_bytes());
     format!(
@@ -559,4 +562,28 @@ fn uuid_text(repository: crate::e2ee::RepositoryId) -> String {
         &hex[16..20],
         &hex[20..]
     )
+}
+
+#[cfg(all(test, any(unix, windows)))]
+mod decoding_tests {
+    use super::*;
+
+    #[test]
+    fn multipart_control_responses_reject_unknown_fields_at_every_level() {
+        let valid = serde_json::json!({
+            "upload_id":"server-session", "total_bytes":100, "part_bytes":10,
+            "uploaded_parts":[{"part_number":0,"bytes":10}],
+            "encryption":{"uuid":"repository", "upload_id":"encryption-upload", "ciphertext_sha256":"digest"}
+        });
+        assert!(serde_json::from_value::<MultipartStart>(valid.clone()).is_ok());
+        for level in 0..3 {
+            let mut value = valid.clone();
+            match level {
+                0 => value["unexpected"] = true.into(),
+                1 => value["uploaded_parts"][0]["unexpected"] = true.into(),
+                _ => value["encryption"]["unexpected"] = true.into(),
+            }
+            assert!(serde_json::from_value::<MultipartStart>(value).is_err());
+        }
+    }
 }

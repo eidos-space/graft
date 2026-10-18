@@ -1075,14 +1075,16 @@ export interface EncryptedRemoteSessionOptions {
 
 /** Trusted hosts only; unavailable in default native builds. Not a plugin API. */
 export class EncryptedRemoteSession {
+  /** Creates a new owner-only directory, with a protected DACL on Windows. */
+  static createPrivateDirectory(directory: string): void
   constructor(options: EncryptedRemoteSessionOptions)
   readonly state: "disconnected" | "locked" | "unlocking" | "unlocked" | "locking"
   readonly paused: boolean
   /** Consumes and clears the supplied Buffer synchronously, even on rejection. */
   unlock(password: Buffer): Promise<void>
   unlockRemembered(): Promise<void>
-  /** Requires locked state; consumes the Buffer. Config publication is not connected success. */
-  initializeConfig(password: Buffer): Promise<"config_published" | "unconfirmed" | "conflict" | "unknown">
+  /** Requires locked state; consumes the Buffer. Supply the initial source before config publication to enable pushInitialBranch. */
+  initializeConfig(password: Buffer, source?: { branch: string; commit: string }): Promise<"config_published" | "unconfirmed" | "conflict" | "unknown">
   /** Requires locked state; restores retained config bytes and consumes the Buffer. */
   resumeInitialConfig(password: Buffer): Promise<"config_published" | "unconfirmed" | "conflict" | "unknown">
   /** Consumes both Buffers synchronously; unknown/unconfirmed requires recovery. */

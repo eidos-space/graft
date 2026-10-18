@@ -129,7 +129,7 @@ impl Repository {
     }
 
     pub fn branch_rename(&self, old: &str, new: &str, force: bool) -> Result<BranchInfo> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let _mutation = self.mutation_guard()?;
         validate_ref_name(old)?;
         validate_ref_name(new)?;
@@ -674,7 +674,7 @@ impl Repository {
     }
 
     pub(super) fn write_head_with_message(&self, head: &Head, message: &str) -> Result<()> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let _mutation = self.mutation_guard()?;
         if let Head::Branch { name } = head {
             validate_ref_name(name)?;
@@ -1079,7 +1079,7 @@ impl Repository {
     }
 
     pub(super) fn delete_tag_ref(&self, name: &str) -> Result<()> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let _mutation = self.mutation_guard()?;
         validate_ref_name(name)?;
         let path = self.graft_dir.join(DIR_REFS_TAGS).join(name);
@@ -1116,7 +1116,7 @@ impl Repository {
         target: &str,
         message: &str,
     ) -> Result<()> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let _mutation = self.mutation_guard()?;
         validate_full_ref(reference)?;
         self.ensure_ref_namespace_available(reference)?;
@@ -1127,7 +1127,7 @@ impl Repository {
     }
 
     pub(super) fn write_ref(&self, reference: &str, target: &str) -> Result<()> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let _mutation = self.mutation_guard()?;
         validate_full_ref(reference)?;
         self.ensure_ref_namespace_available(reference)?;
@@ -1206,7 +1206,7 @@ impl Repository {
     }
 
     pub(super) fn delete_ref(&self, reference: &str) -> Result<()> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let _mutation = self.mutation_guard()?;
         validate_full_ref(reference)?;
         let path = self.graft_dir.join(reference);
@@ -1219,7 +1219,7 @@ impl Repository {
     }
 
     pub(super) fn delete_ref_if_exists(&self, reference: &str) -> Result<()> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let _mutation = self.mutation_guard()?;
         validate_full_ref(reference)?;
         let path = self.graft_dir.join(reference);
@@ -1268,7 +1268,7 @@ impl Repository {
     }
 
     pub(super) fn delete_ref_log(&self, reference: &str) -> Result<()> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let _mutation = self.mutation_guard()?;
         validate_full_ref(reference)?;
         let path = self.graft_dir.join(DIR_LOGS_REFS).join(reference);
@@ -1284,7 +1284,7 @@ impl Repository {
         old_reference: &str,
         new_reference: &str,
     ) -> Result<()> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let _mutation = self.mutation_guard()?;
         validate_full_ref(old_reference)?;
         validate_full_ref(new_reference)?;

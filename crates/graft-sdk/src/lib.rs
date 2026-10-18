@@ -19,17 +19,17 @@ pub use graft::e2ee;
 #[cfg(all(feature = "e2ee", not(target_arch = "wasm32")))]
 pub use graft::remote::EncryptedTransferBudget;
 pub use graft::remote::{RemoteConfig, RemoteCredentials};
-#[cfg(all(feature = "e2ee", unix))]
+#[cfg(all(feature = "e2ee", any(unix, windows)))]
 pub use graft::repo::{
     Head, MigrationPlanningBudget, MigrationPublicationBudget, MigrationRefSelection,
 };
 mod encrypted_errors;
-#[cfg(all(feature = "e2ee", unix))]
+#[cfg(all(feature = "e2ee", any(unix, windows)))]
 mod encrypted_migration;
 pub use encrypted_errors::EncryptedErrorCode;
 #[cfg(all(feature = "e2ee", not(target_arch = "wasm32")))]
 pub use encrypted_errors::{encrypted_http_error_code, encryption_error_code};
-#[cfg(all(feature = "e2ee", unix))]
+#[cfg(all(feature = "e2ee", any(unix, windows)))]
 pub use encrypted_migration::{
     EncryptedMigrationCoordinator, IndependentMigrationVerification, MigrationCoordinatorOptions,
     MigrationCutoverIntent, MigrationJournalPaths, MigrationPublicationState,
@@ -2341,7 +2341,10 @@ impl RepositorySession {
     /// Missing remotes are accepted so hosts can resume an interrupted disconnect.
     pub fn remove_remote(&self, name: &str) -> Result<Value> {
         validate_remote_name(name)?;
-        let result = self.with_state(|state| {
+        // The encrypted authority must be disconnected before credentials can
+        // change. Reject before removing durable configuration, not afterward.
+        self.clear_http_bearer_token(name)?;
+        self.with_state(|state| {
             let SessionState { service, status_cache } = state;
             let service = service.as_mut().ok_or_else(session_closed_error)?;
             let result = (|| {
@@ -2354,9 +2357,7 @@ impl RepositorySession {
             })();
             status_cache.invalidate();
             result
-        })?;
-        self.clear_http_bearer_token(name)?;
-        Ok(result)
+        })
     }
 
     pub fn configure_remote(&self, options: &RemoteConfigureOptions) -> Result<Value> {
@@ -2530,7 +2531,7 @@ impl RepositorySession {
 
     /// Retain target mapping/HEAD and frozen source in a dedicated private directory.
     /// Binding does not enroll a target or prove a fresh root/config.
-    #[cfg(all(feature = "e2ee", unix, not(target_arch = "wasm32")))]
+    #[cfg(all(feature = "e2ee", any(unix, windows), not(target_arch = "wasm32")))]
     pub fn create_migration_target_journal(
         &self,
         directory: &Path,
@@ -2558,7 +2559,7 @@ impl RepositorySession {
     }
 
     /// Reopen exact target intent; never adopt changed source refs or a new HEAD.
-    #[cfg(all(feature = "e2ee", unix, not(target_arch = "wasm32")))]
+    #[cfg(all(feature = "e2ee", any(unix, windows), not(target_arch = "wasm32")))]
     pub fn restore_migration_target_journal(
         &self,
         directory: &Path,
@@ -2586,7 +2587,7 @@ impl RepositorySession {
 
     /// Bind a retained target plan to the exact prepared initialization config.
     /// This local preparation does not publish config or prove a fresh remote.
-    #[cfg(all(feature = "e2ee", unix, not(target_arch = "wasm32")))]
+    #[cfg(all(feature = "e2ee", any(unix, windows), not(target_arch = "wasm32")))]
     pub fn create_migration_enrollment_journal(
         &self,
         directory: &Path,
@@ -2633,7 +2634,7 @@ impl RepositorySession {
 
     /// Recover exact enrollment intent under an admitted root, without changing
     /// config trust or reporting any remote publication stage as confirmed.
-    #[cfg(all(feature = "e2ee", unix, not(target_arch = "wasm32")))]
+    #[cfg(all(feature = "e2ee", any(unix, windows), not(target_arch = "wasm32")))]
     pub fn restore_migration_enrollment_journal(
         &self,
         directory: &Path,
@@ -2680,7 +2681,7 @@ impl RepositorySession {
 
     /// Guard online initialization with retained migration config/target/source.
     /// Pass this journal to `EncryptedHttpClient` configuration publication or reconciliation.
-    #[cfg(all(feature = "e2ee", unix, not(target_arch = "wasm32")))]
+    #[cfg(all(feature = "e2ee", any(unix, windows), not(target_arch = "wasm32")))]
     pub fn migration_initialization_journal(
         &self,
         directory: &Path,
@@ -2715,7 +2716,7 @@ impl RepositorySession {
 
     /// Persist the exact frozen source in an existing owner-only host directory.
     /// Target binding does not enroll a remote or prove that its root key is new.
-    #[cfg(all(feature = "e2ee", unix, not(target_arch = "wasm32")))]
+    #[cfg(all(feature = "e2ee", any(unix, windows), not(target_arch = "wasm32")))]
     pub fn create_migration_source_journal(
         &self,
         directory: &Path,
@@ -2746,7 +2747,7 @@ impl RepositorySession {
     }
 
     /// Reopen retained source bytes; a changed HEAD or selected inventory fails closed.
-    #[cfg(all(feature = "e2ee", unix, not(target_arch = "wasm32")))]
+    #[cfg(all(feature = "e2ee", any(unix, windows), not(target_arch = "wasm32")))]
     pub fn restore_migration_source_journal(
         &self,
         directory: &Path,
@@ -2802,7 +2803,7 @@ impl RepositorySession {
     }
 
     /// Publish the frozen historical `SQLite` storage dependencies only.
-    #[cfg(all(feature = "e2ee", unix))]
+    #[cfg(all(feature = "e2ee", any(unix, windows)))]
     pub fn publish_migration_storage_dependencies(
         &self,
         plan: &graft::repo::MigrationSourcePlan,
@@ -2818,7 +2819,7 @@ impl RepositorySession {
     }
 
     /// Publish the frozen storage, external files and repository objects only.
-    #[cfg(all(feature = "e2ee", unix))]
+    #[cfg(all(feature = "e2ee", any(unix, windows)))]
     pub fn publish_migration_dependencies(
         &self,
         plan: &graft::repo::MigrationSourcePlan,
@@ -2833,7 +2834,7 @@ impl RepositorySession {
     }
 
     /// Publish one branch from the retained target mapping after dependency transfer.
-    #[cfg(all(feature = "e2ee", unix))]
+    #[cfg(all(feature = "e2ee", any(unix, windows)))]
     pub fn publish_migration_target_branch(
         &self,
         plan: &graft::repo::MigrationTargetPlan,
@@ -2850,7 +2851,7 @@ impl RepositorySession {
     }
 
     /// Publish a mapped tag with verified exact object bytes and durable recovery.
-    #[cfg(all(feature = "e2ee", unix))]
+    #[cfg(all(feature = "e2ee", any(unix, windows)))]
     pub fn publish_migration_target_tag(
         &self,
         plan: &graft::repo::MigrationTargetPlan,
@@ -2867,7 +2868,7 @@ impl RepositorySession {
     }
 
     /// Publish the retained target HEAD after verified dependency/ref publication.
-    #[cfg(all(feature = "e2ee", unix))]
+    #[cfg(all(feature = "e2ee", any(unix, windows)))]
     pub fn publish_migration_target_head(
         &self,
         plan: &graft::repo::MigrationTargetPlan,
@@ -2883,7 +2884,7 @@ impl RepositorySession {
     }
 
     /// Publish all frozen mapped refs and then HEAD, with durable per-ref recovery.
-    #[cfg(all(feature = "e2ee", unix))]
+    #[cfg(all(feature = "e2ee", any(unix, windows)))]
     pub fn publish_migration_target_refs(
         &self,
         plan: &graft::repo::MigrationTargetPlan,
@@ -3978,7 +3979,7 @@ impl RepositorySession {
         if self.lifecycle.load(Ordering::Acquire) != LIFECYCLE_OPEN {
             return Err(session_closing_error());
         }
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let _mutation = state
             .service
             .as_ref()

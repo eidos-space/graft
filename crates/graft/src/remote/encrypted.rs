@@ -22,13 +22,7 @@ impl EncryptedTransferBudget {
         {
             return Err(EncryptionError::TooLarge.into());
         }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if metadata.permissions().mode() & 0o077 != 0 {
-                return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied).into());
-            }
-        }
+        crate::e2ee::native_fs::validate_private_directory(&self.private_directory)?;
         Ok(())
     }
 }
@@ -451,14 +445,14 @@ impl EncryptedRemote {
         Ok(prepared)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(super) fn begin_operation(&self) -> Result<crate::e2ee::SessionOperation> {
         Ok(self.client.session().begin_operation()?)
     }
 
     /// The repository has verified source identity; preparation rechecks exact
     /// length/SHA while encrypting without retaining the full plaintext file.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(super) async fn put_verified_file(
         &self,
         path: &str,
@@ -471,16 +465,16 @@ impl EncryptedRemote {
             .await
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(super) fn plaintext_spool(&self) -> Result<(std::fs::File, u64)> {
         self.budget.validate()?;
         Ok((
-            tempfile::tempfile_in(&self.budget.private_directory)?,
+            crate::e2ee::download::private_staging_file(&self.budget.private_directory)?,
             self.budget.max_ciphertext_spool,
         ))
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(super) async fn put_verified_handle(
         &self,
         path: &str,
@@ -521,7 +515,7 @@ impl EncryptedRemote {
             .requires_multipart(prepared.ciphertext_length())
             .await?
         {
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             {
                 let provider =
                     self.uploads
@@ -547,7 +541,7 @@ impl EncryptedRemote {
                     }
                 };
             }
-            #[cfg(not(unix))]
+            #[cfg(not(any(unix, windows)))]
             return Err(EncryptionError::UnsupportedProfile.into());
         }
         for _ in 0..3 {
@@ -682,9 +676,16 @@ impl EncryptedRemote {
         target: Option<RefTarget>,
         bundle: Option<&crate::e2ee::PreparedReceiveBundle>,
     ) -> Result<()> {
+        if self.journals.is_none() {
+            return Err(
+                EncryptionError::CheckpointUnavailable(std::io::ErrorKind::NotFound).into(),
+            );
+        }
         let operation = self.client.operation().await?;
         operation.validate_observation(path, observed)?;
-        let journal = self.ref_journal(observed).await?;
+        let journal = Some(self.ref_journal(observed).await?.ok_or(
+            EncryptionError::CheckpointUnavailable(std::io::ErrorKind::NotFound),
+        )?);
         let retained = if let Some(journal) = &journal {
             self.client.load_ref_mutation(path, journal.clone()).await?
         } else {
@@ -767,7 +768,9 @@ impl EncryptedRemote {
                     .publish_ref_durable(&candidate, journal.clone())
                     .await?
             } else {
-                self.client.publish_ref(&candidate).await?
+                return Err(
+                    EncryptionError::CheckpointUnavailable(std::io::ErrorKind::NotFound).into(),
+                );
             };
             match outcome {
                 RefPublicationOutcome::Confirmed => {
@@ -1126,6 +1129,68 @@ impl AsyncRead for Chunks {
 #[cfg(test)]
 mod ref_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn ref_mutation_without_journal_fails_before_any_http_request() {
+        use crate::e2ee::{EncryptedConfig, RepositoryId, RootKey, SecretSession, SessionBinding};
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        crate::native_fs::set_permissions(
+            directory.path(),
+            crate::native_fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let root = RootKey::generate(RepositoryId::generate().unwrap()).unwrap();
+        let config = EncryptedConfig::create(&root, b"journal regression password").unwrap();
+        let session = SecretSession::new(
+            SessionBinding::new(
+                "journal-regression".into(),
+                "account".into(),
+                root.repository(),
+            )
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+        session.unlock_with_root(&config, root).unwrap();
+        let observed = session
+            .begin_operation()
+            .unwrap()
+            .observe_ref("refs/heads/main", None)
+            .unwrap();
+        let remote = EncryptedRemote::new(
+            EncryptedHttpClient::new(
+                "http://127.0.0.1:1/repo",
+                "origin".into(),
+                RemoteCredentials::explicit(),
+                session,
+            )
+            .unwrap(),
+            EncryptedTransferBudget {
+                private_directory: directory.path().to_owned(),
+                max_buffered_plaintext: 1024,
+                max_ciphertext_spool: 4096,
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        let error = remote
+            .publish_typed_ref(
+                "refs/heads/main",
+                &observed,
+                Some(RefTarget::Commit([1; 32])),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            RemoteErr::Encryption(crate::e2ee::EncryptedHttpError::Encryption(
+                EncryptionError::CheckpointUnavailable(std::io::ErrorKind::NotFound)
+            ))
+        ));
+    }
 
     #[cfg(unix)]
     #[test]

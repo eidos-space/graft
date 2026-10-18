@@ -607,7 +607,7 @@ impl Repository {
         head: &str,
         stop_at: Option<&str>,
     ) -> Result<PreparedObjectPush> {
-        #[cfg(all(feature = "e2ee", unix))]
+        #[cfg(all(feature = "e2ee", any(unix, windows)))]
         if remote.buffered_read_limit().is_some() {
             return self.push_encrypted_commit_chain(remote, head, stop_at);
         }
@@ -1027,7 +1027,7 @@ impl Repository {
         id: &object::ObjectId,
         size: u64,
     ) -> Result<()> {
-        #[cfg(all(feature = "e2ee", unix))]
+        #[cfg(all(feature = "e2ee", any(unix, windows)))]
         if remote.buffered_read_limit().is_some() {
             self.verify_encrypted_file_payload(id, size)?;
             return Ok(());

@@ -415,7 +415,7 @@ impl Repository {
     /// Publish one explicitly mapped branch after complete dependency transfer.
     /// An occupied foreign target fails; the registered journal retains exact CAS
     /// intent for recovery. Does not advance migration stages or source refs.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn publish_migration_target_branch(
         &self,
         plan: &MigrationTargetPlan,
@@ -430,7 +430,7 @@ impl Repository {
         })
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn publish_frozen_target_branch(
         &self,
         plan: &MigrationTargetPlan,
@@ -467,7 +467,7 @@ impl Repository {
 
     /// Publish one mapped tag with exact object and commit identities.
     /// Requires complete dependencies and registered durable ref recovery.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn publish_migration_target_tag(
         &self,
         plan: &MigrationTargetPlan,
@@ -482,7 +482,7 @@ impl Repository {
         })
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn publish_frozen_target_tag(
         &self,
         plan: &MigrationTargetPlan,
@@ -526,7 +526,7 @@ impl Repository {
 
     /// Publish the retained HEAD after dependency/ref publication. A symbolic
     /// target is verified before and after CAS; no global target fence is implied.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn publish_migration_target_head(
         &self,
         plan: &MigrationTargetPlan,
@@ -540,7 +540,7 @@ impl Repository {
         })
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn publish_frozen_target_head(
         &self,
         plan: &MigrationTargetPlan,
@@ -563,7 +563,7 @@ impl Repository {
 
     /// Publish every frozen mapped branch/tag, followed by HEAD. Each mutation
     /// has durable ref recovery; the returned count is not migration progress.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn publish_migration_target_refs(
         &self,
         plan: &MigrationTargetPlan,
@@ -590,7 +590,7 @@ impl Repository {
         })
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn verify_migration_head_branch(
         &self,
         plan: &MigrationTargetPlan,
@@ -711,7 +711,7 @@ impl Repository {
     /// Restore every frozen object and external payload through the encrypted
     /// target into an independent, newly initialized repository. The caller must
     /// also verify `SQLite` storage; repository objects alone are not a receipt.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn hydrate_migration_verification_objects(
         &self,
         plan: &MigrationSourcePlan,
@@ -766,7 +766,7 @@ impl Repository {
     /// Authenticate every selected branch/tag (including expected absence for
     /// an unborn branch), then the exact selected HEAD. Extra target refs do not
     /// change this explicit selection.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn verify_migration_target_references(
         plan: &MigrationTargetPlan,
         remote: &crate::remote::Remote,
@@ -872,7 +872,7 @@ impl Repository {
     /// Publish only the frozen plan's external file payloads to an encrypted
     /// target. No refs/stages are advanced; storage/repository transfer remains
     /// a separate prerequisite of final migration publication.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn publish_migration_file_dependencies(
         &self,
         plan: &MigrationSourcePlan,
@@ -900,7 +900,7 @@ impl Repository {
 
     /// Publish the frozen repository-object closure in bounded packs with
     /// authenticated routing hints. Does not publish refs or storage/files.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn publish_migration_repository_objects(
         &self,
         plan: &MigrationSourcePlan,
@@ -951,7 +951,7 @@ impl Repository {
         })
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn read_verified_migration_object(
         &self,
         plan: &MigrationSourcePlan,

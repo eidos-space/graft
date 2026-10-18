@@ -31,6 +31,9 @@ zeroize = { workspace = true, optional = true }
 libc = { version = "=0.2.180", optional = true }
 rustix = { version = "=1.1.3", features = ["termios", "process"], optional = true }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Threading"] }
+
 [features]
 default = []
 e2ee = ["graft/native-crypto", "graft-sdk/native-crypto", "graft-sqlite/e2ee", "dep:tokio", "dep:zeroize", "dep:libc", "dep:rustix"]

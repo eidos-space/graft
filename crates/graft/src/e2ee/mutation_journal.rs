@@ -1,3 +1,7 @@
+use crate::e2ee::native_fs::Metadata;
+#[cfg(unix)]
+use std::os::unix::fs::DirBuilderExt;
+
 use super::{RefMutationRecord, Result, SessionBinding};
 
 /// Blocking host-private metadata provider. Bind an empty slot; identical
@@ -22,14 +26,12 @@ pub trait RefMutationJournalProvider: Send + Sync {
     ) -> Result<std::sync::Arc<dyn RefMutationJournal>>;
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod file {
     use super::*;
     use crate::e2ee::{EncryptionError, PROFILE, codec};
     use sha2::{Digest, Sha256};
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
     use std::{
-        fs::{self, File, Metadata, OpenOptions},
         io::{Read, Write},
         path::{Path, PathBuf},
     };
@@ -123,7 +125,7 @@ mod file {
             migration_crash("allocation-synced", &journal.store.directory);
             #[cfg(test)]
             migration_io("allocation-directory-sync", &journal.store.directory).map_err(io)?;
-            directory.sync_all().map_err(io)?;
+            fs::sync_directory(&directory).map_err(io)?;
             #[cfg(test)]
             migration_crash("allocation-durable", &journal.store.directory);
             let mut encoded = Vec::with_capacity(bytes.len() + 80);
@@ -132,9 +134,8 @@ mod file {
             encoded.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
             encoded.extend_from_slice(bytes);
             encoded.extend_from_slice(&Sha256::digest(&encoded));
-            let mut staging =
-                tempfile::NamedTempFile::new_in(&journal.store.directory).map_err(io)?;
-            let metadata = staging.as_file().metadata().map_err(io)?;
+            let mut staging = fs::private_named_tempfile(&journal.store.directory).map_err(io)?;
+            let metadata = fs::file_metadata(staging.as_file()).map_err(io)?;
             if metadata.mode() & 0o077 != 0 || metadata.uid() != journal.store.identity.2 {
                 return Err(permission());
             }
@@ -159,14 +160,12 @@ mod file {
             migration_crash("temporary-synced", &journal.store.directory);
             #[cfg(test)]
             migration_io("record-install", &journal.store.directory).map_err(io)?;
-            staging
-                .persist_noclobber(journal.store.directory.join(Self::NAME))
-                .map_err(|error| io(error.error))?;
+            fs::persist(staging, &journal.store.directory.join(Self::NAME), false).map_err(io)?;
             #[cfg(test)]
             migration_crash("record-installed", &journal.store.directory);
             #[cfg(test)]
             migration_io("record-directory-sync", &journal.store.directory).map_err(io)?;
-            directory.sync_all().map_err(io)?;
+            fs::sync_directory(&directory).map_err(io)?;
             #[cfg(test)]
             migration_crash("record-durable", &journal.store.directory);
             Ok(journal)
@@ -185,7 +184,7 @@ mod file {
             if self.store.read_record()?.1.is_some() {
                 return Err(EncryptionError::InvalidEncoding);
             }
-            let allocation = File::open(self.store.directory.join(Self::ALLOCATION)).map_err(io)?;
+            let allocation = fs::open(self.store.directory.join(Self::ALLOCATION)).map_err(io)?;
             let metadata = self.store.validate_file(&allocation, Self::ALLOCATION)?;
             if metadata.len() != 40 {
                 return Err(EncryptionError::InvalidEncoding);
@@ -201,7 +200,7 @@ mod file {
             {
                 return Err(EncryptionError::IdentityChanged);
             }
-            let file = File::open(self.store.directory.join(Self::NAME)).map_err(io)?;
+            let file = fs::open(self.store.directory.join(Self::NAME)).map_err(io)?;
             let metadata = self.store.validate_file(&file, Self::NAME)?;
             if metadata.len() < 81 || metadata.len() > (Self::MAX_BYTES + 80) as u64 {
                 return Err(EncryptionError::InvalidEncoding);
@@ -235,7 +234,7 @@ mod file {
             file.sync_all().map_err(io)?;
             #[cfg(test)]
             migration_io("recovery-directory-sync", &self.store.directory).map_err(io)?;
-            directory.sync_all().map_err(io)?;
+            fs::sync_directory(&directory).map_err(io)?;
             Ok(encoded[48..end].to_vec())
         }
     }
@@ -280,9 +279,9 @@ mod file {
             allocation.write_all(b"GRAFTCA1").map_err(io)?;
             allocation.write_all(&journal.store.binding).map_err(io)?;
             allocation.sync_all().map_err(io)?;
-            directory.sync_all().map_err(io)?;
+            fs::sync_directory(&directory).map_err(io)?;
             journal.write(None, false, true)?;
-            directory.sync_all().map_err(io)?;
+            fs::sync_directory(&directory).map_err(io)?;
             Ok(journal)
         }
         pub fn open(directory: impl AsRef<Path>, binding: &SessionBinding) -> Result<Self> {
@@ -295,7 +294,7 @@ mod file {
         fn read(&self) -> Result<(File, Option<super::super::ConfigMutationRecord>, bool)> {
             self.store.path_metadata("config-mutation.allocated")?;
             let allocation =
-                File::open(self.store.directory.join("config-mutation.allocated")).map_err(io)?;
+                fs::open(self.store.directory.join("config-mutation.allocated")).map_err(io)?;
             if self
                 .store
                 .validate_file(&allocation, "config-mutation.allocated")?
@@ -319,7 +318,7 @@ mod file {
             if !(73..=585).contains(&length) {
                 return Err(EncryptionError::InvalidEncoding);
             }
-            let file = File::open(self.store.directory.join("config-mutation")).map_err(io)?;
+            let file = fs::open(self.store.directory.join("config-mutation")).map_err(io)?;
             if self.store.validate_file(&file, "config-mutation")?.len() != length {
                 return Err(EncryptionError::InvalidEncoding);
             }
@@ -366,21 +365,23 @@ mod file {
                 bytes.extend_from_slice(&record.to_local_bytes()?);
             }
             bytes.extend_from_slice(&Sha256::digest(&bytes));
-            let mut staging = tempfile::NamedTempFile::new_in(&self.store.directory).map_err(io)?;
-            let metadata = staging.as_file().metadata().map_err(io)?;
+            let mut staging = fs::private_named_tempfile(&self.store.directory).map_err(io)?;
+            let metadata = fs::file_metadata(staging.as_file()).map_err(io)?;
             if metadata.mode() & 0o077 != 0 || metadata.uid() != self.store.identity.2 {
                 return Err(permission());
             }
             staging.write_all(&bytes).map_err(io)?;
             staging.as_file().sync_all().map_err(io)?;
             if initial {
-                staging
-                    .persist_noclobber(self.store.directory.join("config-mutation"))
-                    .map_err(|error| io(error.error))?;
+                fs::persist(
+                    staging,
+                    &self.store.directory.join("config-mutation"),
+                    false,
+                )
+                .map_err(io)?;
             } else {
-                staging
-                    .persist(self.store.directory.join("config-mutation"))
-                    .map_err(|error| io(error.error))?;
+                fs::persist(staging, &self.store.directory.join("config-mutation"), true)
+                    .map_err(io)?;
             }
             Ok(())
         }
@@ -428,15 +429,19 @@ mod file {
                     if expected.generation() < previous.generation() {
                         return Err(EncryptionError::StaleObservation);
                     }
+                    drop(file);
                     self.write(Some(record), false, false)?;
                 }
                 Some(previous) if previous != *record => {
                     return Err(EncryptionError::StaleObservation);
                 }
                 Some(_) => file.sync_all().map_err(io)?,
-                None => self.write(Some(record), false, false)?,
+                None => {
+                    drop(file);
+                    self.write(Some(record), false, false)?;
+                }
             }
-            directory.sync_all().map_err(io)
+            fs::sync_directory(&directory).map_err(io)
         }
         fn retire(
             &self,
@@ -452,11 +457,18 @@ mod file {
                 Some(previous) if previous != *record => {
                     return Err(EncryptionError::StaleObservation);
                 }
-                Some(_) if !retired => self.write(Some(record), true, false)?,
+                Some(_) if !retired => {
+                    drop(file);
+                    self.write(Some(record), true, false)?;
+                }
                 Some(_) => file.sync_all().map_err(io)?,
-                None => file.sync_all().map_err(io)?,
+                None => {
+                    return Err(EncryptionError::CheckpointUnavailable(
+                        std::io::ErrorKind::NotFound,
+                    ));
+                }
             }
-            directory.sync_all().map_err(io)
+            fs::sync_directory(&directory).map_err(io)
         }
     }
 
@@ -496,7 +508,7 @@ mod file {
             let (directory, _lock) = root.transaction(binding)?;
             let provider = Self { root };
             provider.write_allocations(&[], true)?;
-            directory.sync_all().map_err(io)?;
+            fs::sync_directory(&directory).map_err(io)?;
             Ok(provider)
         }
 
@@ -515,7 +527,7 @@ mod file {
             if length < 72 || length > maximum as u64 {
                 return Err(EncryptionError::InvalidEncoding);
             }
-            let file = File::open(self.root.directory.join(ALLOCATIONS)).map_err(io)?;
+            let file = fs::open(self.root.directory.join(ALLOCATIONS)).map_err(io)?;
             if self.root.validate_file(&file, ALLOCATIONS)?.len() != length {
                 return Err(EncryptionError::InvalidEncoding);
             }
@@ -583,17 +595,13 @@ mod file {
                 bytes.push(u8::from(entry.admitted));
             }
             bytes.extend_from_slice(&Sha256::digest(&bytes));
-            let mut staging = tempfile::NamedTempFile::new_in(&self.root.directory).map_err(io)?;
+            let mut staging = fs::private_named_tempfile(&self.root.directory).map_err(io)?;
             staging.write_all(&bytes).map_err(io)?;
             staging.as_file().sync_all().map_err(io)?;
             if initial {
-                staging
-                    .persist_noclobber(self.root.directory.join(ALLOCATIONS))
-                    .map_err(|error| io(error.error))?;
+                fs::persist(staging, &self.root.directory.join(ALLOCATIONS), false).map_err(io)?;
             } else {
-                staging
-                    .persist(self.root.directory.join(ALLOCATIONS))
-                    .map_err(|error| io(error.error))?;
+                fs::persist(staging, &self.root.directory.join(ALLOCATIONS), true).map_err(io)?;
             }
             Ok(())
         }
@@ -668,14 +676,14 @@ mod file {
                     let store = FileRefMutationJournal::open(&path, binding)?;
                     // Reconfirm a visible admission whose previous directory sync
                     // may have failed; never let a later bind outrun durable admission.
-                    parent.sync_all().map_err(io)?;
+                    fs::sync_directory(&parent).map_err(io)?;
                     return Ok(store);
                 }
                 Ok(index) => index,
                 Err(index) => {
                     allocations.insert(index, Allocation { digest, admitted: false });
                     self.write_allocations(&allocations, false)?;
-                    parent.sync_all().map_err(io)?;
+                    fs::sync_directory(&parent).map_err(io)?;
                     #[cfg(test)]
                     allocation_crash("reserved", &self.root.directory);
                     index
@@ -696,7 +704,7 @@ mod file {
             self.write_allocations(&allocations, false)?;
             #[cfg(test)]
             allocation_crash("admission-written", &self.root.directory);
-            parent.sync_all().map_err(io)?;
+            fs::sync_directory(&parent).map_err(io)?;
             #[cfg(test)]
             allocation_crash("admitted", &self.root.directory);
             Ok(store)
@@ -787,7 +795,7 @@ mod file {
                 }
                 Err(error) => return Err(io(error)),
             }
-            directory.sync_all().map_err(io)?;
+            fs::sync_directory(&directory).map_err(io)?;
             #[cfg(test)]
             allocation_crash(
                 "empty-record",
@@ -816,7 +824,7 @@ mod file {
             store.write_record(None, true)?;
             #[cfg(test)]
             migration_crash("namespace-anchor-installed", &store.directory);
-            directory.sync_all().map_err(io)?;
+            fs::sync_directory(&directory).map_err(io)?;
             Ok(store)
         }
 
@@ -849,8 +857,8 @@ mod file {
             {
                 return Err(permission());
             }
-            let directory = File::open(&self.directory).map_err(io)?;
-            let opened = directory.metadata().map_err(io)?;
+            let directory = fs::open(&self.directory).map_err(io)?;
+            let opened = fs::file_metadata(&directory).map_err(io)?;
             if (opened.dev(), opened.ino(), opened.uid()) != self.identity {
                 return Err(permission());
             }
@@ -859,7 +867,7 @@ mod file {
 
         fn validate_file(&self, file: &File, name: &str) -> Result<Metadata> {
             let path = self.path_metadata(name)?;
-            let opened = file.metadata().map_err(io)?;
+            let opened = fs::file_metadata(file).map_err(io)?;
             if !path.is_file()
                 || !opened.is_file()
                 || opened.mode() & 0o077 != 0
@@ -904,11 +912,16 @@ mod file {
         }
 
         fn read_record(&self) -> Result<(File, Option<RefMutationRecord>)> {
+            let (file, record, retired) = self.read_record_state()?;
+            Ok((file, if retired { None } else { record }))
+        }
+
+        fn read_record_state(&self) -> Result<(File, Option<RefMutationRecord>, bool)> {
             let length = self.path_metadata(RECORD)?.len();
             if !(73..=MAX_SIZE as u64).contains(&length) {
                 return Err(EncryptionError::InvalidEncoding);
             }
-            let file = File::open(self.directory.join(RECORD)).map_err(io)?;
+            let file = fs::open(self.directory.join(RECORD)).map_err(io)?;
             if self.validate_file(&file, RECORD)?.len() != length {
                 return Err(EncryptionError::InvalidEncoding);
             }
@@ -929,10 +942,10 @@ mod file {
             }
             let record = match bytes[40] {
                 0 if end == 41 => None,
-                1 => Some(RefMutationRecord::from_local_bytes(&bytes[41..end])?),
+                1 | 2 => Some(RefMutationRecord::from_local_bytes(&bytes[41..end])?),
                 _ => return Err(EncryptionError::InvalidEncoding),
             };
-            Ok((file, record))
+            Ok((file, record, bytes[40] == 2))
         }
 
         fn write_record(
@@ -940,10 +953,23 @@ mod file {
             checkpoint: Option<&RefMutationRecord>,
             initial: bool,
         ) -> Result<()> {
+            self.write_record_state(checkpoint, initial, false)
+        }
+
+        fn write_record_state(
+            &self,
+            checkpoint: Option<&RefMutationRecord>,
+            initial: bool,
+            retired: bool,
+        ) -> Result<()> {
             let mut bytes = Vec::new();
             bytes.extend_from_slice(b"GRAFTRJ1");
             bytes.extend_from_slice(&self.binding);
-            bytes.push(u8::from(checkpoint.is_some()));
+            bytes.push(if retired {
+                2
+            } else {
+                u8::from(checkpoint.is_some())
+            });
             if let Some(record) = checkpoint {
                 bytes.extend_from_slice(&record.to_local_bytes()?);
             }
@@ -951,21 +977,17 @@ mod file {
             if bytes.len() > MAX_SIZE {
                 return Err(EncryptionError::TooLarge);
             }
-            let mut staging = tempfile::NamedTempFile::new_in(&self.directory).map_err(io)?;
-            let metadata = staging.as_file().metadata().map_err(io)?;
+            let mut staging = fs::private_named_tempfile(&self.directory).map_err(io)?;
+            let metadata = fs::file_metadata(staging.as_file()).map_err(io)?;
             if metadata.mode() & 0o077 != 0 || metadata.uid() != self.identity.2 {
                 return Err(permission());
             }
             staging.write_all(&bytes).map_err(io)?;
             staging.as_file().sync_all().map_err(io)?;
             if initial {
-                staging
-                    .persist_noclobber(self.directory.join(RECORD))
-                    .map_err(|error| io(error.error))?;
+                fs::persist(staging, &self.directory.join(RECORD), false).map_err(io)?;
             } else {
-                staging
-                    .persist(self.directory.join(RECORD))
-                    .map_err(|error| io(error.error))?;
+                fs::persist(staging, &self.directory.join(RECORD), true).map_err(io)?;
             }
             Ok(())
         }
@@ -986,20 +1008,32 @@ mod file {
                 }
                 file.sync_all().map_err(io)?;
             } else {
+                drop(file);
                 self.write_record(Some(candidate), false)?;
             }
-            directory.sync_all().map_err(io)?;
+            fs::sync_directory(&directory).map_err(io)?;
             Ok(())
         }
         fn retire(&self, binding: &SessionBinding, candidate: &RefMutationRecord) -> Result<()> {
             let (directory, _lock) = self.transaction(binding)?;
-            let (file, previous) = self.read_record()?;
+            let (file, previous, retired) = self.read_record_state()?;
             match previous {
-                Some(previous) if previous == *candidate => self.write_record(None, false)?,
+                Some(previous) if previous == *candidate => {
+                    if retired {
+                        file.sync_all().map_err(io)?;
+                    } else {
+                        drop(file);
+                        self.write_record_state(Some(candidate), false, true)?;
+                    }
+                }
                 Some(_) => return Err(EncryptionError::StaleObservation),
-                None => file.sync_all().map_err(io)?,
+                None => {
+                    return Err(EncryptionError::CheckpointUnavailable(
+                        std::io::ErrorKind::NotFound,
+                    ));
+                }
             }
-            directory.sync_all().map_err(io)?;
+            fs::sync_directory(&directory).map_err(io)?;
             Ok(())
         }
     }
@@ -1093,7 +1127,7 @@ mod file {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub use file::{
     FileConfigMutationJournal, FileMigrationEnrollmentJournal, FileMigrationSourceJournal,
     FileMigrationTargetJournal, FileRefMutationJournal, FileRefMutationJournalProvider,
@@ -1631,6 +1665,12 @@ mod tests {
         let old = record();
         let next = record();
         let slot = provider.journal(&binding("account"), &old.key).unwrap();
+        assert!(matches!(
+            slot.retire(&binding("account"), &old),
+            Err(EncryptionError::CheckpointUnavailable(
+                std::io::ErrorKind::NotFound
+            ))
+        ));
         slot.bind(&binding("account"), &old).unwrap();
         assert_eq!(
             slot.retire(&binding("account"), &next),
@@ -1638,6 +1678,10 @@ mod tests {
         );
         slot.retire(&binding("account"), &old).unwrap();
         slot.retire(&binding("account"), &old).unwrap();
+        assert_eq!(
+            slot.retire(&binding("account"), &next),
+            Err(EncryptionError::StaleObservation)
+        );
         slot.bind(&binding("account"), &next).unwrap();
         let reopened = provider.journal(&binding("account"), &old.key).unwrap();
         assert_eq!(
@@ -2019,3 +2063,6 @@ mod tests {
         assert!(store.load(&binding("account")).is_err());
     }
 }
+use crate::e2ee::native_fs::{self as fs, File, OpenOptions};
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};

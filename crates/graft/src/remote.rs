@@ -329,13 +329,14 @@ impl RemoteCredentials {
         account: &str,
         token: String,
     ) -> std::result::Result<(), RemoteCredentialErr> {
+        let token = BearerToken::new(token);
         if self.mode != RemoteCredentialMode::Explicit {
             return Err(RemoteCredentialErr::EnvironmentCredentialsReadOnly);
         }
         if !valid_credential_remote_name(remote_name) {
             return Err(RemoteCredentialErr::InvalidRemoteName);
         }
-        if token.is_empty() {
+        if token.expose().is_empty() {
             return Err(RemoteCredentialErr::EmptyBearerToken);
         }
         let registrations = self.encrypted_sessions.read();
@@ -348,7 +349,7 @@ impl RemoteCredentials {
         }
         self.http_bearer_tokens
             .write()
-            .insert(remote_name.to_owned(), BearerToken::new(token));
+            .insert(remote_name.to_owned(), token);
         Ok(())
     }
     /// Register a host-authorized account/domain/root session for one pinned remote.
@@ -510,13 +511,14 @@ impl RemoteCredentials {
         remote_name: &str,
         token: String,
     ) -> std::result::Result<(), RemoteCredentialErr> {
+        let token = BearerToken::new(token);
         if self.mode != RemoteCredentialMode::Explicit {
             return Err(RemoteCredentialErr::EnvironmentCredentialsReadOnly);
         }
         if !valid_credential_remote_name(remote_name) {
             return Err(RemoteCredentialErr::InvalidRemoteName);
         }
-        if token.is_empty() {
+        if token.expose().is_empty() {
             return Err(RemoteCredentialErr::EmptyBearerToken);
         }
         #[cfg(feature = "e2ee")]
@@ -527,7 +529,7 @@ impl RemoteCredentials {
         }
         self.http_bearer_tokens
             .write()
-            .insert(remote_name.to_string(), BearerToken::new(token));
+            .insert(remote_name.to_string(), token);
         Ok(())
     }
 
@@ -983,7 +985,7 @@ impl Remote {
     }
 
     #[cfg(feature = "e2ee")]
-    fn with_encrypted_http_recovery(
+    pub(crate) fn with_encrypted_http_recovery(
         client: crate::e2ee::EncryptedHttpClient,
         budget: EncryptedTransferBudget,
         journals: Option<Arc<dyn crate::e2ee::RefMutationJournalProvider>>,
@@ -1171,7 +1173,7 @@ impl Remote {
         Ok(())
     }
 
-    #[cfg(all(feature = "e2ee", unix))]
+    #[cfg(all(feature = "e2ee", any(unix, windows)))]
     pub(crate) fn begin_encrypted_operation(&self) -> Result<crate::e2ee::SessionOperation> {
         let RemoteBackend::Encrypted(remote) = &self.backend else {
             return Err(crate::e2ee::EncryptionError::UnsupportedProfile.into());
@@ -1182,7 +1184,7 @@ impl Remote {
     /// Run trusted synchronous native work in this encrypted session's epoch.
     /// Adds secret cancellation without replacing the host cancellation token.
     /// Does not authenticate remote config or grant plugin access to secrets.
-    #[cfg(all(feature = "e2ee", unix))]
+    #[cfg(all(feature = "e2ee", any(unix, windows)))]
     pub fn with_encrypted_operation<T, E>(
         &self,
         work: impl FnOnce() -> std::result::Result<T, E>,
@@ -1207,7 +1209,7 @@ impl Remote {
         )
     }
 
-    #[cfg(all(feature = "e2ee", unix))]
+    #[cfg(all(feature = "e2ee", any(unix, windows)))]
     pub(crate) async fn publish_verified_file(
         &self,
         path: &str,
@@ -1221,7 +1223,7 @@ impl Remote {
         remote.put_verified_file(path, source, length, digest).await
     }
 
-    #[cfg(all(feature = "e2ee", unix))]
+    #[cfg(all(feature = "e2ee", any(unix, windows)))]
     pub(crate) fn encrypted_plaintext_spool(&self) -> Result<(std::fs::File, u64)> {
         let RemoteBackend::Encrypted(remote) = &self.backend else {
             return Err(crate::e2ee::EncryptionError::UnsupportedProfile.into());
@@ -1229,7 +1231,7 @@ impl Remote {
         remote.plaintext_spool()
     }
 
-    #[cfg(all(feature = "e2ee", unix))]
+    #[cfg(all(feature = "e2ee", any(unix, windows)))]
     pub(crate) async fn publish_verified_handle(
         &self,
         path: &str,
@@ -1495,7 +1497,7 @@ impl Remote {
 
     /// Authenticate private retained initialization against the registered
     /// transport root without publishing or advancing its checkpoint.
-    #[cfg(all(feature = "e2ee", unix))]
+    #[cfg(all(feature = "e2ee", any(unix, windows)))]
     pub fn authenticate_encrypted_recovery_config(
         &self,
         config: &crate::e2ee::EncryptedConfig,
@@ -1900,7 +1902,7 @@ impl Remote {
         }
     }
 
-    #[cfg(all(feature = "e2ee", unix))]
+    #[cfg(all(feature = "e2ee", any(unix, windows)))]
     pub(crate) async fn publish_encrypted_object_pack(
         &self,
         pack: &RemoteObjectPack,
@@ -5851,20 +5853,42 @@ mod tests {
 
     #[tokio::test]
     async fn streamed_http_upload_completes_when_remote_rejects_before_reading_body() {
-        let (url, request) = serve_http_response("412 Precondition Failed", &["1"]).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/org/repo", listener.local_addr().unwrap());
+        let (release, released) = tokio::sync::oneshot::channel();
+        let request = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut headers = Vec::new();
+            while !headers.ends_with(b"\r\n\r\n") {
+                headers.push(stream.read_u8().await.unwrap());
+            }
+            stream.write_all(b"HTTP/1.1 412 Precondition Failed\r\nGraft-Protocol: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+            // Keep unread upload bytes queued until the client has returned.
+            // Closing now resets the socket on Windows and discards the 412.
+            released.await.unwrap();
+            let _ = stream.shutdown().await;
+            let _ = tokio::time::timeout(
+                Duration::from_secs(5),
+                tokio::io::copy(&mut stream, &mut tokio::io::sink()),
+            )
+            .await;
+            String::from_utf8(headers).unwrap()
+        });
         let remote = HttpRemote::new(url, None).unwrap();
 
         let result = tokio::time::timeout(
-            Duration::from_secs(1),
+            Duration::from_secs(10),
             remote.put_raw_if_not_exists_stream(
                 "segments/example",
                 [Bytes::from(vec![7_u8; 64 * 1024])],
             ),
         )
-        .await
-        .expect("fixed-length upload stalled after an early response")
-        .unwrap_err();
-        assert!(result.precondition_failed());
+        .await;
+        release.send(()).unwrap();
+        let result = result
+            .expect("fixed-length upload stalled after an early response")
+            .unwrap_err();
+        assert!(result.precondition_failed(), "{result:?}");
         request.await.unwrap();
     }
 
@@ -6366,6 +6390,12 @@ mod tests {
             uuid: encrypted::uuid_text(repository),
         };
         let directory = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
+        crate::native_fs::set_permissions(
+            directory.path(),
+            crate::native_fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
