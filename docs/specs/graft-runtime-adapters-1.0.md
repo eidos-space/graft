@@ -279,11 +279,13 @@ as the typed bounded SQLite-diff specialization and `cloneRepository` avoiding
 the reserved/general meaning of `clone`. `packages/graft-sdk/index.d.ts` is the
 canonical JavaScript type contract for exact option and result fields.
 
-`push`, `fetch`, `pull`, `cloneRepository`, and `applyMerge` accept an optional
+`push`, `fetch`, `pull`, `cloneRepository`, `cloneEncryptedRemote`,
+`pushInitialBranch`, and `applyMerge` accept an optional
 `onProgress` callback. Its events report cumulative HTTP body bytes for the
 current operation, a direction of `upload` or `download`, and `totalBytes` when
 the transport provides a trustworthy length. A host MUST treat an absent total
-as indeterminate and MUST NOT derive a percentage from command phases.
+or `totalIsFinal: false` as indeterminate and MUST NOT derive a percentage or
+remaining time from a growing per-request total or command phases.
 For `applyMerge`, events cover only snapshot hydration required by the guarded
 plan; an already hydrated plan may emit no transfer event.
 
@@ -418,6 +420,16 @@ transfer and include a final event for a successfully consumed body. Progress
 is observational: callbacks do not change publication, recovery, cancellation,
 or error semantics, and callback delivery does not make an uncertain remote
 publication certain.
+
+Encrypted HTTP operations MUST report streamed ciphertext object uploads,
+aggregate upload framing, multipart parts, and downloaded response bodies through
+the same reporter. They MUST NOT expose plaintext paths, content, or secrets.
+Their incrementally discovered dependencies do not establish a final aggregate
+length: events omit `totalBytes` and set `totalIsFinal` to false. Counters reset
+for each operation; retries within one operation count bytes consumed again.
+Upload consumption does not acknowledge remote durability. Initial publication's
+verification clone may report download events in the same operation. Local
+encryption and materialization are not network-byte progress.
 
 ## 10. Stable errors
 

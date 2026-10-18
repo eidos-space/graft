@@ -1118,6 +1118,7 @@ impl NodeRepositorySession {
         branch: Option<String>,
         verification_directory: Option<String>,
         signal: Option<AbortSignal>,
+        progress: Option<TransferProgressCallback>,
     ) -> Result<AsyncTask<JsonTask>> {
         self.session
             .validate_encrypted_host_directories(&remote.host_directories)
@@ -1130,10 +1131,11 @@ impl NodeRepositorySession {
             )?;
         }
         let context = remote.initial_branch_context()?;
-        Ok(json_task(
+        Ok(json_task_with_progress(
             self,
             JsonOperation::PushInitialBranch { context, branch, verification_directory },
             signal,
+            progress,
         ))
     }
 
@@ -1143,11 +1145,12 @@ impl NodeRepositorySession {
         remote: &e2ee::NodeEncryptedRemoteSession,
         branch: Option<String>,
         signal: Option<AbortSignal>,
+        progress: Option<TransferProgressCallback>,
     ) -> Result<AsyncTask<JsonTask>> {
         self.session
             .validate_encrypted_host_directories(&remote.host_directories)
             .map_err(e2ee::secret_error)?;
-        Ok(json_task(
+        Ok(json_task_with_progress(
             self,
             JsonOperation::CloneEncryptedRemote {
                 remote_name: remote.remote_name.clone(),
@@ -1155,6 +1158,7 @@ impl NodeRepositorySession {
                 branch,
             },
             signal,
+            progress,
         ))
     }
 }

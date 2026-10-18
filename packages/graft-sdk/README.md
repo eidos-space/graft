@@ -616,12 +616,13 @@ tokens or absolute user paths.
 
 ## Remote transfer progress
 
-`push`, `fetch`, `pull`, `cloneRepository`, and `applyMerge` accept an `onProgress` callback:
+`push`, `fetch`, `pull`, `cloneRepository`, `cloneEncryptedRemote`,
+`pushInitialBranch`, and `applyMerge` accept an `onProgress` callback:
 
 ```js
 await session.push({
-  onProgress({ direction, transferredBytes, totalBytes }) {
-    const percent = totalBytes
+  onProgress({ direction, transferredBytes, totalBytes, totalIsFinal }) {
+    const percent = totalIsFinal && totalBytes
       ? Math.round((transferredBytes / totalBytes) * 100)
       : undefined
     renderTransfer({ direction, transferredBytes, totalBytes, percent })
@@ -629,10 +630,20 @@ await session.push({
 })
 ```
 
-Events count cumulative HTTP body bytes for the current operation. `totalBytes` is omitted when
-the server does not provide a trustworthy length, so hosts should keep the progress indicator
-indeterminate while still showing transferred bytes and a locally calculated speed. Multiple
-requests and retries are cumulative; command phases are not transfer percentages.
+Events count cumulative HTTP body bytes for the current operation. A known request length
+does not establish the size of the whole operation: show a percentage or remaining time only
+when `totalIsFinal` is true and `totalBytes` is present. Otherwise keep the indicator
+indeterminate while showing transferred bytes and a locally calculated speed. Multiple
+requests and retries are cumulative; a new operation starts fresh counters. Command phases
+are not transfer percentages. Upload bytes have been consumed by the HTTP transport;
+they do not confirm durable remote storage or successful completion.
+
+E2EE reports ciphertext object uploads (including aggregate framing and multipart parts)
+and downloaded response bodies. Dependencies are discovered incrementally, so these events
+omit `totalBytes` and set `totalIsFinal` to false. They expose only direction and byte counts,
+without plaintext paths, content, keys, or passwords. Initial publication can also report
+downloads from its independent verification clone. Local encryption, password derivation,
+and final worktree materialization are separate phases and have no transfer percentage.
 For `applyMerge`, events cover only snapshot bytes that still need hydration while materializing
 the guarded plan. A fully hydrated plan can complete without emitting a transfer event.
 

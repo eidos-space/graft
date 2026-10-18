@@ -1687,6 +1687,8 @@ async fn read_body(
         return Err(EncryptionError::TooLarge.into());
     }
     let mut bytes = Vec::new();
+    let mut progress =
+        crate::repo::begin_transfer_progress(crate::repo::TransferDirection::Download, None);
     loop {
         let chunk = tokio::select! {
             result = response.chunk() => result.map_err(transport_error)?,
@@ -1703,6 +1705,9 @@ async fn read_body(
             return Err(EncryptionError::TooLarge.into());
         }
         bytes.extend_from_slice(&chunk);
+        if let Some(progress) = &mut progress {
+            progress.advance(chunk.len() as u64);
+        }
     }
     operation.check_task_active()?;
     Ok(bytes)

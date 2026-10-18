@@ -32,6 +32,7 @@ pub(super) struct CiphertextBody {
     pending: Bytes,
     expected: u64,
     received: u64,
+    progress: Option<crate::repo::TransferProgressHandle>,
 }
 
 impl CiphertextBody {
@@ -41,6 +42,10 @@ impl CiphertextBody {
             pending: Bytes::new(),
             expected,
             received: 0,
+            progress: crate::repo::begin_transfer_progress(
+                crate::repo::TransferDirection::Download,
+                None,
+            ),
         }
     }
 
@@ -58,6 +63,9 @@ impl CiphertextBody {
                 .ok_or(EncryptedHttpError::ProtocolMismatch)?;
         }
         operation.check_active()?;
+        if let (Some(progress), Some(chunk)) = (&mut self.progress, &next) {
+            progress.advance(chunk.len() as u64);
+        }
         Ok(next)
     }
 

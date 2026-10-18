@@ -121,7 +121,7 @@ impl PreparedEncryptedObject {
 
     pub(super) fn body(&self) -> (reqwest::Body, CancelUpload) {
         let (stream, cancelled) = self.ciphertext_stream();
-        (reqwest::Body::wrap_stream(stream), cancelled)
+        (progress_body(stream), cancelled)
     }
 
     pub(super) fn ciphertext_stream(
@@ -179,6 +179,23 @@ impl PreparedEncryptedObject {
             });
         (stream, CancelUpload(cancelled))
     }
+}
+
+/// Capture the operation's reporter before reqwest polls the body on its runtime.
+/// E2EE discovers dependencies incrementally, so a request length is not a final
+/// operation total. Count only bytes handed to the transport, including retries.
+pub(super) fn progress_body(
+    stream: impl futures::Stream<Item = std::io::Result<Vec<u8>>> + Send + 'static,
+) -> reqwest::Body {
+    use futures::StreamExt;
+    let mut progress =
+        crate::repo::begin_transfer_progress(crate::repo::TransferDirection::Upload, None);
+    reqwest::Body::wrap_stream(stream.map(move |chunk| {
+        if let (Some(progress), Ok(bytes)) = (&mut progress, &chunk) {
+            progress.advance(bytes.len() as u64);
+        }
+        chunk
+    }))
 }
 
 /// The body stream holds ciphertext only; its owner cancels it on return or abort.
