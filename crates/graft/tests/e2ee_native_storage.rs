@@ -16,6 +16,19 @@ fn private(parent: &Path, name: &str) -> std::path::PathBuf {
     path
 }
 
+#[test]
+fn temporary_verification_directory_has_native_private_ownership_and_permissions() {
+    let temp = tempfile::tempdir().unwrap();
+    let staging = private(temp.path(), "staging");
+    let verification = native_fs::private_tempdir("verification-", &staging).unwrap();
+    let path = verification.path().to_owned();
+    native_fs::validate_private_directory(&path).unwrap();
+    let nested = private(&path, "checkpoint");
+    native_fs::validate_private_directory(&nested).unwrap();
+    drop(verification);
+    assert!(!path.exists());
+}
+
 #[cfg(windows)]
 #[test]
 fn windows_private_storage_rejects_broad_acls_and_directory_junctions() {

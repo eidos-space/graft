@@ -793,10 +793,10 @@ fn retained_upload(
     let staging = authority.budget.private_directory.clone();
     AsyncBlockBuilder::new(async move {
         admission.check_active().map_err(secret_error)?;
-        let verification = tempfile::Builder::new()
-            .prefix("retained-upload-")
-            .tempdir_in(staging)
-            .map_err(|error| secret_error(EncryptionError::CheckpointUnavailable(error.kind())))?;
+        let verification =
+            graft_sdk::e2ee::native_fs::private_tempdir("retained-upload-", &staging).map_err(
+                |error| secret_error(EncryptionError::CheckpointUnavailable(error.kind())),
+            )?;
         let outcome = if restart {
             client
                 .restart_retained_object_multipart(&key, provider, verification.path())

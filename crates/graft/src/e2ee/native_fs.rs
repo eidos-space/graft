@@ -63,3 +63,20 @@ pub fn private_named_tempfile(
     set_permissions(file.path(), Permissions::from_mode(0o600))?;
     Ok(file)
 }
+
+/// Protect temporary verification state before creating files or admitting it
+/// as private storage, including with an elevated Windows token.
+pub fn private_tempdir(
+    prefix: &str,
+    directory: &std::path::Path,
+) -> std::io::Result<tempfile::TempDir> {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    validate_private_directory(directory)?;
+    let temporary = tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir_in(directory)?;
+    set_permissions(temporary.path(), Permissions::from_mode(0o700))?;
+    validate_private_directory(temporary.path())?;
+    Ok(temporary)
+}

@@ -967,6 +967,8 @@ replacement on every supported platform. Unix uses owner-only modes and
 device/inode identity. Windows uses owner/SYSTEM-only DACLs, volume/file identity,
 reparse-point rejection, native file locks, flushed records and write-through
 same-volume replacement. Unsupported ACL or identity operations MUST fail closed.
+Temporary verification directories MUST establish the same private owner and
+permissions before use, including when created by an elevated Windows process.
 Windows password entry MUST disable console echo and restore its original mode.
 Remembering is optional; Windows hosts without an approved OS key provider use
 explicit password-based session unlock.

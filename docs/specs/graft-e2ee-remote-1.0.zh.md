@@ -739,7 +739,8 @@ CLI 用无回显输入、受保护句柄或可信 provider。跨进程记住需�
 原生恢复存储必须在所有支持平台保留身份校验、互斥及持久替换。Unix 使用仅所有者
 权限及 device/inode 身份。Windows 使用仅所有者/SYSTEM 的 DACL、volume/file
 身份、拒绝 reparse point、原生文件锁、记录刷盘及同卷 write-through 替换。
-ACL 或身份操作不受支持时必须拒绝。Windows 口令输入必须关闭控制台回显，
+ACL 或身份操作不受支持时必须拒绝。临时验证目录必须在使用前设置相同的私有
+所有者及权限，使用提升权限的 Windows 进程创建时也不例外。Windows 口令输入必须关闭控制台回显，
 并恢复原模式。记住密钥是可选能力；没有获准系统密钥 provider 的 Windows 宿主
 使用显式口令进行仅会话解锁。
 

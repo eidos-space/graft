@@ -17,7 +17,7 @@ assert.equal(fixture.privacyEvidence, true);
 const { nonce, password } = fixture.privacyCase;
 const capture = join(directory, "privacy-requests.json");
 const diagnostic = new PrivacyEvidence(join(directory, "service-diagnostics.jsonl"), { maxBytes: 1024 * 1024 });
-const service = spawn(process.execPath, ["tests/e2ee/remote-service.mjs", fixturePath, capture], { stdio: ["ignore", "pipe", "pipe"] });
+const service = spawn(process.execPath, ["tests/e2ee/remote-service.mjs", fixturePath, capture], { stdio: ["ignore", "pipe", "pipe", "ipc"] });
 const serviceClosed = once(service, "close");
 for (const [name, stream] of [["stdout", service.stdout], ["stderr", service.stderr]])
   stream.on("data", (chunk) => diagnostic.record("diagnostic", "service", name, {}, chunk));
@@ -99,7 +99,7 @@ try {
   // The native loop is quiescent before the service finalizes its evidence.
   for (const repository of repositories.splice(0)) await repository.close();
   for (const value of authorities.splice(0)) await value.disconnect();
-  service.kill();
+  service.send("graft-e2ee-shutdown");
   // "close" also drains both diagnostic pipes; "exit" alone can precede them.
   assert.deepEqual(await serviceClosed, [0, null]);
   diagnostic.finish();
