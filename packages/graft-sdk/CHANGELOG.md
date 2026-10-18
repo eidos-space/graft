@@ -3,6 +3,28 @@
 This changelog covers the independently versioned `@eidos.space/graft` package. Core Graft CLI and
 SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
 
+## Graft SDK 0.3.34 — 2026-10-19
+
+### Fixed
+
+- Republish complete SQLite history from a lazy clone to a new remote. Missing
+  historical snapshot data is hydrated from an eligible original source before
+  publication, so another device can read the published old commits.
+- Reuse live keyspace-ID mappings during journal recovery to avoid repeated
+  metadata lookups while preserving deleted and recreated keyspaces.
+
+### Compatibility
+
+- Public SDK APIs, repository formats, and remote protocols are unchanged.
+- Native packages retain support for macOS arm64/x64, Linux glibc arm64/x64,
+  and Windows x64 on Node.js 20 and newer.
+
+### 中文
+
+- 修复惰性克隆后向新远端发布 SQLite 历史时缺失旧快照数据的问题：从原来源补齐后再发布，确保另一设备能读取历史提交。
+- 日志恢复复用有效 keyspace ID 映射，减少元数据查询，并保持删除后重建 keyspace 的行为。
+- 公共 API、仓库格式和远端协议不变；继续支持 macOS arm64/x64、Linux glibc arm64/x64、Windows x64 和 Node.js 20 及以上版本。
+
 ## Graft SDK 0.3.33 — 2026-10-18
 
 ### Fixed
