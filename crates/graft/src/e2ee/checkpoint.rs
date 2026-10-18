@@ -52,6 +52,14 @@ mod file {
 
     impl FileCheckpointStore {
         pub fn create(directory: impl AsRef<Path>, binding: &SessionBinding) -> Result<Self> {
+            Self::create_with_writer(directory, binding, |store| store.write_record(None, true))
+        }
+
+        fn create_with_writer(
+            directory: impl AsRef<Path>,
+            binding: &SessionBinding,
+            write: impl FnOnce(&Self) -> Result<()>,
+        ) -> Result<Self> {
             let store = Self::prepare(directory.as_ref(), binding)?;
             let directory = store.directory_handle()?;
             let lock = OpenOptions::new()
@@ -65,15 +73,18 @@ mod file {
                 store.validate_file(&lock, LOCK)?;
                 lock.try_lock().map_err(lock_error)?;
                 lock.sync_all().map_err(io)?;
-                store.write_record(None, true)
+                write(&store)
             })();
             if let Err(error) = result {
                 // Only this live creator may remove its own unadmitted lock.
                 // Existing/missing enrolled trust is never repaired on reopen.
-                if store.directory_handle().is_ok()
+                let removable = store.directory_handle().is_ok()
                     && matches!(fs::symlink_metadata(store.directory.join(RECORD)), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
-                    && store.validate_file(&lock, LOCK).is_ok()
-                {
+                    && store.validate_file(&lock, LOCK).is_ok();
+                // Release the creating handle before unlinking its validated,
+                // unadmitted lock, including on hosts with restrictive sharing.
+                drop(lock);
+                if removable {
                     let _ = fs::remove_file(store.directory.join(LOCK));
                     let _ = fs::sync_directory(&directory);
                 }
@@ -259,6 +270,7 @@ mod file {
                 // Reconfirm durability after a possibly lost/failed prior fsync acknowledgement.
                 file.sync_all().map_err(io)?;
             } else {
+                drop(file);
                 self.write_record(Some(candidate), false)?;
             }
             fs::sync_directory(&directory).map_err(io)?;
@@ -304,6 +316,38 @@ mod file {
     }
     fn permission() -> EncryptionError {
         EncryptionError::CheckpointUnavailable(std::io::ErrorKind::PermissionDenied)
+    }
+
+    #[cfg(test)]
+    mod creation_tests {
+        use super::*;
+
+        #[test]
+        fn failed_initial_write_releases_unadmitted_lock_and_allows_retry() {
+            let temporary = tempfile::tempdir().unwrap();
+            let directory = temporary.path().join("checkpoint");
+            fs::create_private_directory(&directory).unwrap();
+            let binding = SessionBinding::new(
+                "create-failure".into(),
+                "account".into(),
+                crate::e2ee::RepositoryId::generate().unwrap(),
+            )
+            .unwrap();
+            let failed = FileCheckpointStore::create_with_writer(&directory, &binding, |_| {
+                Err(EncryptionError::CheckpointUnavailable(
+                    std::io::ErrorKind::Interrupted,
+                ))
+            });
+            assert!(matches!(
+                failed,
+                Err(EncryptionError::CheckpointUnavailable(
+                    std::io::ErrorKind::Interrupted
+                ))
+            ));
+            assert!(!directory.join(LOCK).exists());
+            let store = FileCheckpointStore::create(&directory, &binding).unwrap();
+            assert!(store.load(&binding).unwrap().is_none());
+        }
     }
 }
 

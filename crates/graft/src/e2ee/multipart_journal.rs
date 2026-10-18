@@ -450,6 +450,8 @@ mod file {
                 .map_err(io)?;
             manifest.write_all(&bytes).map_err(io)?;
             manifest.sync_all().map_err(io)?;
+            drop(manifest);
+            drop(output);
             fs::sync_directory(&fs::open(staging.path()).map_err(io)?).map_err(io)?;
             operation.check_active()?;
             fs::rename(staging.path(), self.path.join("candidate")).map_err(io)?;

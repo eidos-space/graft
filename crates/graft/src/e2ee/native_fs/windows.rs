@@ -375,6 +375,12 @@ fn move_file(from: &Path, to: &Path, replace: bool) -> io::Result<()> {
     Ok(())
 }
 pub fn persist(staging: tempfile::NamedTempFile, path: &Path, replace: bool) -> io::Result<()> {
+    // A named temporary file carries FILE_ATTRIBUTE_TEMPORARY on Windows.
+    // Clear it before flushing and installing durable recovery state.
+    let source = wide(staging.path())?;
+    if unsafe { SetFileAttributesW(source.as_ptr(), FILE_ATTRIBUTE_NORMAL) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
     staging.as_file().sync_all()?;
     move_file(staging.path(), path, replace)?;
     Ok(())

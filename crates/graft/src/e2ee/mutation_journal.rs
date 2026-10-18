@@ -429,13 +429,17 @@ mod file {
                     if expected.generation() < previous.generation() {
                         return Err(EncryptionError::StaleObservation);
                     }
+                    drop(file);
                     self.write(Some(record), false, false)?;
                 }
                 Some(previous) if previous != *record => {
                     return Err(EncryptionError::StaleObservation);
                 }
                 Some(_) => file.sync_all().map_err(io)?,
-                None => self.write(Some(record), false, false)?,
+                None => {
+                    drop(file);
+                    self.write(Some(record), false, false)?;
+                }
             }
             fs::sync_directory(&directory).map_err(io)
         }
@@ -453,7 +457,10 @@ mod file {
                 Some(previous) if previous != *record => {
                     return Err(EncryptionError::StaleObservation);
                 }
-                Some(_) if !retired => self.write(Some(record), true, false)?,
+                Some(_) if !retired => {
+                    drop(file);
+                    self.write(Some(record), true, false)?;
+                }
                 Some(_) => file.sync_all().map_err(io)?,
                 None => {
                     return Err(EncryptionError::CheckpointUnavailable(
@@ -1001,6 +1008,7 @@ mod file {
                 }
                 file.sync_all().map_err(io)?;
             } else {
+                drop(file);
                 self.write_record(Some(candidate), false)?;
             }
             fs::sync_directory(&directory).map_err(io)?;
@@ -1014,6 +1022,7 @@ mod file {
                     if retired {
                         file.sync_all().map_err(io)?;
                     } else {
+                        drop(file);
                         self.write_record_state(Some(candidate), false, true)?;
                     }
                 }

@@ -68,6 +68,18 @@ fn native_checkpoint_and_initialization_reopen_preserve_trust_and_source() {
     let config = EncryptedConfig::create(&root, b"native journal password").unwrap();
     let checkpoint = config.checkpoint(&root).unwrap();
     let store = FileCheckpointStore::create(&path, &binding).unwrap();
+    assert!(store.load(&binding).unwrap().is_none());
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        assert_eq!(
+            std::fs::metadata(path.join("checkpoint"))
+                .unwrap()
+                .file_attributes()
+                & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_TEMPORARY,
+            0
+        );
+    }
     store.advance(&binding, &checkpoint).unwrap();
     drop(store);
     let store = FileCheckpointStore::open(&path, &binding).unwrap();

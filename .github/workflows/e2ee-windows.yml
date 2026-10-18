@@ -28,11 +28,16 @@ jobs:
         with:
           node-version: 24
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5
+        with:
+          cache-on-failure: true
       - name: Check CLI and Node E2EE on Windows
         run: cargo check -p graft-cli -p graft-sdk-node --features e2ee --all-targets --locked
+      - name: Windows private storage regressions
+        timeout-minutes: 10
+        run: cargo test -p graft --features e2ee --test e2ee_native_storage --locked -- --nocapture
       - name: Native E2EE regressions
         timeout-minutes: 15
-        run: cargo test -p graft --features e2ee --lib --test e2ee_native_storage --locked -- --nocapture
+        run: cargo test -p graft --features e2ee --lib --locked -- --nocapture
       - name: CLI input regressions
         run: |
           cargo test -p graft-cli --features e2ee --bin graft encrypted::tests:: --locked

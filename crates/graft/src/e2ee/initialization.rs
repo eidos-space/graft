@@ -524,6 +524,7 @@ mod file {
             fs::sync_directory(&directory).map_err(io)?;
             #[cfg(test)]
             persistence_crash("directory-synced", INTENT, &self.directory);
+            drop(record_file);
             self.write_record(record.stage, Some(intent), false)?;
             #[cfg(test)]
             persistence_failure("directory-sync", RECORD, &self.directory).map_err(io)?;
@@ -556,6 +557,7 @@ mod file {
                 persistence_failure("file-sync", RECORD, &self.directory).map_err(io)?;
                 file.sync_all().map_err(io)?;
             } else if record.stage == expected {
+                drop(file);
                 self.write_record(next, record.intent.as_ref(), false)?;
             } else {
                 return Err(EncryptionError::StaleObservation);
