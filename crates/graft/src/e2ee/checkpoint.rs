@@ -216,7 +216,7 @@ mod file {
             }
             let checksum = Sha256::digest(&bytes[..LEGACY_SIZE]);
             bytes[LEGACY_SIZE..].copy_from_slice(&checksum);
-            let mut staging = tempfile::NamedTempFile::new_in(&self.directory).map_err(io)?;
+            let mut staging = fs::private_named_tempfile(&self.directory).map_err(io)?;
             let metadata = fs::file_metadata(staging.as_file()).map_err(io)?;
             if metadata.mode() & 0o077 != 0 || metadata.uid() != self.identity.2 {
                 return Err(permission());

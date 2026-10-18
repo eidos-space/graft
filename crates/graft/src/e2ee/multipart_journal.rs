@@ -540,7 +540,7 @@ mod file {
         if bytes.len() as u64 > MAX_RECORD {
             return Err(EncryptionError::TooLarge);
         }
-        let mut staging = tempfile::NamedTempFile::new_in(path).map_err(io)?;
+        let mut staging = fs::private_named_tempfile(path).map_err(io)?;
         staging.write_all(&bytes).map_err(io)?;
         staging.as_file().sync_all().map_err(io)?;
         if initial {

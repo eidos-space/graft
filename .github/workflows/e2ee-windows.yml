@@ -28,7 +28,8 @@ jobs:
       - name: Check CLI and Node E2EE on Windows
         run: cargo check -p graft-cli -p graft-sdk-node --features e2ee --all-targets --locked
       - name: Native E2EE regressions
-        run: cargo test -p graft --features e2ee --lib --test e2ee_native_storage --locked
+        timeout-minutes: 15
+        run: cargo test -p graft --features e2ee --lib --test e2ee_native_storage --locked -- --nocapture
       - name: CLI input regressions
         run: |
           cargo test -p graft-cli --features e2ee --bin graft encrypted::tests:: --locked

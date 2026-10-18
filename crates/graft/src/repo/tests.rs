@@ -1530,7 +1530,12 @@ fn status_rejects_paths_with_ambiguous_whitespace_identity() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = Repository::init(tmp.path()).unwrap();
     fs::write(tmp.path().join("note.md"), b"plain").unwrap();
-    fs::write(tmp.path().join(" note.md "), b"spaced").unwrap();
+    // Windows' verbatim canonical path preserves the trailing space under test.
+    fs::write(
+        fs::canonicalize(tmp.path()).unwrap().join(" note.md "),
+        b"spaced",
+    )
+    .unwrap();
 
     let err = repo.status().unwrap_err();
 

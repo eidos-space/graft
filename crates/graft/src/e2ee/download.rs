@@ -11,6 +11,11 @@ type Result<T> = std::result::Result<T, EncryptedHttpError>;
 pub(crate) fn private_staging_file(directory: &std::path::Path) -> Result<std::fs::File> {
     #[cfg(windows)]
     super::native_fs::validate_private_directory(directory).map_err(local_io_error)?;
+    #[cfg(windows)]
+    let file = super::native_fs::private_named_tempfile(directory)
+        .map_err(local_io_error)?
+        .into_file();
+    #[cfg(not(windows))]
     let file = tempfile::tempfile_in(directory).map_err(local_io_error)?;
     #[cfg(unix)]
     {

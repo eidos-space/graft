@@ -134,8 +134,7 @@ mod file {
             encoded.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
             encoded.extend_from_slice(bytes);
             encoded.extend_from_slice(&Sha256::digest(&encoded));
-            let mut staging =
-                tempfile::NamedTempFile::new_in(&journal.store.directory).map_err(io)?;
+            let mut staging = fs::private_named_tempfile(&journal.store.directory).map_err(io)?;
             let metadata = fs::file_metadata(staging.as_file()).map_err(io)?;
             if metadata.mode() & 0o077 != 0 || metadata.uid() != journal.store.identity.2 {
                 return Err(permission());
@@ -366,7 +365,7 @@ mod file {
                 bytes.extend_from_slice(&record.to_local_bytes()?);
             }
             bytes.extend_from_slice(&Sha256::digest(&bytes));
-            let mut staging = tempfile::NamedTempFile::new_in(&self.store.directory).map_err(io)?;
+            let mut staging = fs::private_named_tempfile(&self.store.directory).map_err(io)?;
             let metadata = fs::file_metadata(staging.as_file()).map_err(io)?;
             if metadata.mode() & 0o077 != 0 || metadata.uid() != self.store.identity.2 {
                 return Err(permission());
@@ -589,7 +588,7 @@ mod file {
                 bytes.push(u8::from(entry.admitted));
             }
             bytes.extend_from_slice(&Sha256::digest(&bytes));
-            let mut staging = tempfile::NamedTempFile::new_in(&self.root.directory).map_err(io)?;
+            let mut staging = fs::private_named_tempfile(&self.root.directory).map_err(io)?;
             staging.write_all(&bytes).map_err(io)?;
             staging.as_file().sync_all().map_err(io)?;
             if initial {
@@ -971,7 +970,7 @@ mod file {
             if bytes.len() > MAX_SIZE {
                 return Err(EncryptionError::TooLarge);
             }
-            let mut staging = tempfile::NamedTempFile::new_in(&self.directory).map_err(io)?;
+            let mut staging = fs::private_named_tempfile(&self.directory).map_err(io)?;
             let metadata = fs::file_metadata(staging.as_file()).map_err(io)?;
             if metadata.mode() & 0o077 != 0 || metadata.uid() != self.identity.2 {
                 return Err(permission());

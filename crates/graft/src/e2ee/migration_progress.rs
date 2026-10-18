@@ -255,7 +255,7 @@ impl MigrationProgressLease {
         bytes.extend_from_slice(&record.total.to_be_bytes());
         bytes.extend_from_slice(&record.intent);
         bytes.extend_from_slice(&Sha256::digest(&bytes));
-        let mut staging = tempfile::NamedTempFile::new_in(&self.path).map_err(io)?;
+        let mut staging = fs::private_named_tempfile(&self.path).map_err(io)?;
         let metadata = fs::file_metadata(staging.as_file()).map_err(io)?;
         if metadata.mode() & 0o077 != 0 || metadata.uid() != self.owner || metadata.nlink() != 1 {
             return Err(EncryptionError::CheckpointUnavailable(

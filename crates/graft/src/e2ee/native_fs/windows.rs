@@ -316,7 +316,9 @@ pub fn set_permissions(path: impl AsRef<Path>, _: Permissions) -> io::Result<()>
     if unsafe {
         SetFileSecurityW(
             path.as_ptr(),
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            OWNER_SECURITY_INFORMATION
+                | DACL_SECURITY_INFORMATION
+                | PROTECTED_DACL_SECURITY_INFORMATION,
             sd.0,
         )
     } == 0

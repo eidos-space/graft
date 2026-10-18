@@ -6368,6 +6368,12 @@ mod tests {
             uuid: encrypted::uuid_text(repository),
         };
         let directory = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
+        crate::native_fs::set_permissions(
+            directory.path(),
+            crate::native_fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

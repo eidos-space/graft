@@ -52,3 +52,14 @@ pub fn validate_private_directory(path: &std::path::Path) -> std::io::Result<()>
     }
     Ok(())
 }
+
+/// Install the owner and DACL before any recovery bytes are written. Elevated
+/// Windows tokens can otherwise assign Administrators as a temporary file owner.
+pub fn private_named_tempfile(
+    directory: &std::path::Path,
+) -> std::io::Result<tempfile::NamedTempFile> {
+    let file = tempfile::NamedTempFile::new_in(directory)?;
+    #[cfg(windows)]
+    set_permissions(file.path(), Permissions::from_mode(0o600))?;
+    Ok(file)
+}
