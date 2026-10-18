@@ -54,7 +54,7 @@ jobs:
       - name: Build actual HTTP remote
         run: |
           pnpm install --frozen-lockfile
-          pnpm --filter @eidos.space/graft-remote build
+          pnpm --filter '@eidos.space/graft-remote' build
       - name: Native Windows SQLite sync and migration over HTTP
         shell: pwsh
         run: |
