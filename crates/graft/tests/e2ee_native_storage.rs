@@ -20,6 +20,18 @@ fn private(parent: &Path, name: &str) -> std::path::PathBuf {
 #[test]
 fn windows_private_storage_rejects_broad_acls_and_directory_junctions() {
     let temp = tempfile::tempdir().unwrap();
+    let parent = private(temp.path(), "private-parent");
+    let inheriting = private(&parent, "inheriting");
+    assert!(
+        std::process::Command::new("icacls")
+            .arg(&inheriting)
+            .arg("/inheritance:e")
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert!(native_fs::validate_private_directory(&inheriting).is_err());
     let broad = private(temp.path(), "broad");
     assert!(
         std::process::Command::new("icacls")

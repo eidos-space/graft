@@ -124,6 +124,14 @@ fn is_private(file: &File) -> io::Result<bool> {
             return Err(io::Error::from_raw_os_error(status as i32));
         }
         let _allocation = Local(sd);
+        let mut control = 0;
+        let mut revision = 0;
+        if GetSecurityDescriptorControl(sd, &mut control, &mut revision) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if control & SE_DACL_PROTECTED == 0 {
+            return Ok(false);
+        }
         let sid = user()?;
         if owner.is_null() || dacl.is_null() || EqualSid(owner, sid.as_ptr() as _) == 0 {
             return Ok(false);
@@ -311,19 +319,35 @@ impl Permissions {
     }
 }
 pub fn set_permissions(path: impl AsRef<Path>, _: Permissions) -> io::Result<()> {
-    let path = wide(path.as_ref())?;
+    let mut path = wide(path.as_ref())?;
     let sd = descriptor()?;
-    if unsafe {
-        SetFileSecurityW(
-            path.as_ptr(),
+    unsafe {
+        let mut owner = ptr::null_mut();
+        let mut dacl = ptr::null_mut();
+        let mut present = 0;
+        let mut defaulted = 0;
+        if GetSecurityDescriptorOwner(sd.0, &mut owner, &mut defaulted) == 0
+            || GetSecurityDescriptorDacl(sd.0, &mut present, &mut dacl, &mut defaulted) == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if owner.is_null() || present == 0 || dacl.is_null() {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        let status = SetNamedSecurityInfoW(
+            path.as_mut_ptr(),
+            SE_FILE_OBJECT,
             OWNER_SECURITY_INFORMATION
                 | DACL_SECURITY_INFORMATION
                 | PROTECTED_DACL_SECURITY_INFORMATION,
-            sd.0,
-        )
-    } == 0
-    {
-        return Err(io::Error::last_os_error());
+            owner,
+            ptr::null_mut(),
+            dacl,
+            ptr::null_mut(),
+        );
+        if status != 0 {
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
     }
     Ok(())
 }
