@@ -4,11 +4,12 @@
 //! pathname can be removed/recreated to split participating writers. Reentrancy
 //! is thread-scoped; the guard cannot move to another thread or a JavaScript host.
 use super::{RepoErr, Repository, Result};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::{
     cell::RefCell,
     collections::HashMap,
     fs::File,
-    os::unix::fs::MetadataExt,
     path::PathBuf,
     rc::{Rc, Weak},
 };
@@ -30,8 +31,14 @@ impl Gate {
         if self.creator_pid != std::process::id() {
             return Err(RepoErr::MutationFenceStale);
         }
+        #[cfg(unix)]
         let path = std::fs::metadata(&self.directory)?;
+        #[cfg(unix)]
         let opened = self.file.metadata()?;
+        #[cfg(windows)]
+        let path = crate::native_fs::symlink_metadata(&self.directory)?;
+        #[cfg(windows)]
+        let opened = crate::native_fs::file_metadata(&crate::native_fs::open(&self.directory)?)?;
         if !path.is_dir()
             || !opened.is_dir()
             || path.dev() != self.device
@@ -91,12 +98,36 @@ impl Repository {
             gate.check()?;
             return Ok(RepositoryMutationGuard { gate });
         }
+        #[cfg(unix)]
         let file = File::open(&directory)?;
+        #[cfg(windows)]
+        let file = {
+            use std::os::windows::fs::OpenOptionsExt;
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .share_mode(
+                    windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ
+                        | windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE,
+                )
+                .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(directory.join("mutation.lock"))?;
+            let metadata = crate::native_fs::file_metadata(&file)?;
+            if !metadata.is_file() || metadata.nlink() != 1 {
+                return Err(RepoErr::MutationFenceStale);
+            }
+            file
+        };
         file.try_lock().map_err(|error| match error {
             std::fs::TryLockError::WouldBlock => RepoErr::MutationBusy,
             std::fs::TryLockError::Error(error) => RepoErr::Io(error),
         })?;
+        #[cfg(unix)]
         let metadata = file.metadata()?;
+        #[cfg(windows)]
+        let metadata = crate::native_fs::symlink_metadata(&directory)?;
         let gate = Rc::new(Gate {
             creator_pid: std::process::id(),
             directory: directory.clone(),
@@ -112,7 +143,7 @@ impl Repository {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

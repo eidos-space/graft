@@ -12,6 +12,9 @@ use sha2::{Digest, Sha256};
 use std::{collections::HashSet, fmt, ops::Range, path::Path, sync::Arc, time::Duration};
 
 const MAX_RANGE_PLAINTEXT: u64 = 64 * 1024 * 1024;
+// Includes upload, headers and the complete streamed response, even when a peer
+// keeps sending fragments more frequently than the per-read timeout.
+const TRANSFER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 #[path = "http/multipart.rs"]
 mod multipart;
@@ -77,6 +80,7 @@ pub struct EncryptedHttpClient {
     credentials: RemoteCredentials,
     session: SecretSession,
     client: reqwest::Client,
+    transfer_timeout: Duration,
     verified: Arc<tokio::sync::Mutex<Option<VerifiedProfile>>>,
 }
 
@@ -525,7 +529,7 @@ impl EncryptedHttpClient {
                 self.client
                     .get(url)
                     .header("Graft-Protocol", "1")
-                    .timeout(Duration::from_secs(60)),
+                    .timeout(Duration::from_secs(60).min(self.transfer_timeout)),
             );
             operation.check_active()?;
             let response = tokio::select! {
@@ -662,24 +666,28 @@ impl EncryptedHttpClient {
         {
             return Err(EncryptedHttpError::InvalidEndpoint);
         }
-        let client = reqwest::ClientBuilder::new()
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .http1_only()
-            .hickory_dns(!cfg!(target_os = "android"))
-            .pool_max_idle_per_host(1)
-            .connect_timeout(Duration::from_secs(5))
-            .read_timeout(Duration::from_secs(60))
-            .build()
-            .map_err(transport_error)?;
+        let client = transfer_client(TRANSFER_TIMEOUT)?;
         Ok(Self {
             base,
             remote_name,
             credentials,
             session,
             client,
+            transfer_timeout: TRANSFER_TIMEOUT,
             verified: Arc::default(),
         })
+    }
+
+    /// Host-selected wall-clock limit for each HTTP exchange, including streamed
+    /// upload and download bodies. Retry and multipart requests each get a fresh
+    /// limit; mutation timeouts retain the exact journal candidate for recovery.
+    pub fn with_transfer_timeout(mut self, timeout: Duration) -> Result<Self> {
+        if timeout.is_zero() {
+            return Err(EncryptionError::TooLarge.into());
+        }
+        self.client = transfer_client(timeout)?;
+        self.transfer_timeout = timeout;
+        Ok(self)
     }
 
     /// First online use in each unlock epoch authenticates the current config.
@@ -794,10 +802,7 @@ impl EncryptedHttpClient {
 
     /// Retry this same candidate; never prepare a new ciphertext for an uncertain request.
     /// Admission errors happen before dispatch. After dispatch, unknown outcomes retain causes.
-    pub async fn publish_ref(
-        &self,
-        candidate: &PreparedRefMutation,
-    ) -> Result<RefPublicationOutcome> {
+    async fn publish_ref(&self, candidate: &PreparedRefMutation) -> Result<RefPublicationOutcome> {
         let admission = self.session.begin_operation()?;
         candidate.validate(&admission)?;
         drop(admission);
@@ -1401,7 +1406,7 @@ impl EncryptedHttpClient {
             self.client
                 .get(url)
                 .header("Graft-Protocol", "1")
-                .timeout(Duration::from_secs(60)),
+                .timeout(Duration::from_secs(60).min(self.transfer_timeout)),
         );
         let response = tokio::select! {
             result = request.send() => result.map_err(transport_error)?,
@@ -1429,16 +1434,37 @@ pub(crate) fn validate_endpoint(url: &str) -> Result<reqwest::Url> {
     Ok(base)
 }
 
+fn transfer_client(timeout: Duration) -> Result<reqwest::Client> {
+    if timeout.is_zero() || std::time::Instant::now().checked_add(timeout).is_none() {
+        return Err(EncryptionError::TooLarge.into());
+    }
+    reqwest::ClientBuilder::new()
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .http1_only()
+        .hickory_dns(!cfg!(target_os = "android"))
+        .pool_max_idle_per_host(1)
+        .connect_timeout(Duration::from_secs(5))
+        .read_timeout(Duration::from_secs(60))
+        .timeout(timeout)
+        .build()
+        .map_err(transport_error)
+}
+
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Descriptor {
     protocol: String,
     version: u16,
+    #[serde(default, rename = "repository")]
+    _repository: Option<String>,
     encryption: EncryptionDescriptor,
     capabilities: HashSet<String>,
     #[serde(default)]
     limits: Limits,
 }
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct EncryptionDescriptor {
     profile: String,
     version: u16,
@@ -1446,6 +1472,7 @@ struct EncryptionDescriptor {
     uuid: String,
 }
 #[derive(Clone, Copy, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Limits {
     max_request_bytes: Option<u64>,
     multipart_part_bytes: Option<u64>,
@@ -1692,6 +1719,19 @@ mod tests {
     use std::sync::OnceLock;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    // Download fixtures obey the same private staging policy as trusted hosts.
+    fn private_tempdir() -> tempfile::TempDir {
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        crate::native_fs::set_permissions(
+            directory.path(),
+            crate::native_fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        directory
+    }
+
     static CONFIG: OnceLock<EncryptedConfig> = OnceLock::new();
     fn config() -> EncryptedConfig {
         CONFIG
@@ -1716,7 +1756,7 @@ mod tests {
     #[cfg(unix)]
     fn persistent_session() -> (tempfile::TempDir, SecretSession) {
         use std::os::unix::fs::PermissionsExt;
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_tempdir();
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let binding = SessionBinding::new(
             "native.test".into(),
@@ -1782,6 +1822,124 @@ mod tests {
         EncryptedHttpClient::new(url, "origin".into(), credentials, session).unwrap()
     }
 
+    #[tokio::test]
+    async fn total_transfer_timeout_stops_a_peer_that_keeps_sending_bytes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let serving = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request(&mut stream).await;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n")
+                .await
+                .unwrap();
+            for _ in 0..100 {
+                if stream.write_all(b"x").await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        let client = transfer_client(Duration::from_millis(150)).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            client
+                .get(format!("http://{address}/"))
+                .send()
+                .await
+                .unwrap()
+                .bytes()
+                .await
+        })
+        .await
+        .expect("an active slow peer must not defeat the total deadline");
+        assert!(result.unwrap_err().is_timeout());
+        serving.abort();
+    }
+
+    #[test]
+    fn descriptor_rejects_unknown_control_fields() {
+        let repository = fixture_root().repository();
+        let mut supported = descriptor();
+        supported["repository"] = "acme/repository".into();
+        assert!(validate_descriptor(&serde_json::to_vec(&supported).unwrap(), repository).is_ok());
+        let mut value = descriptor();
+        value["unexpected"] = true.into();
+        assert!(validate_descriptor(&serde_json::to_vec(&value).unwrap(), repository).is_err());
+        let mut value = descriptor();
+        value["encryption"]["unexpected"] = true.into();
+        assert!(validate_descriptor(&serde_json::to_vec(&value).unwrap(), repository).is_err());
+        let mut value = descriptor();
+        value["limits"] = serde_json::json!({"unexpected":1});
+        assert!(validate_descriptor(&serde_json::to_vec(&value).unwrap(), repository).is_err());
+    }
+
+    #[tokio::test]
+    async fn total_transfer_timeout_also_covers_a_streamed_upload() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let serving = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        });
+        let body = futures::stream::unfold(0_u32, |index| async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Some((Ok::<_, std::io::Error>(vec![1_u8]), index + 1))
+        });
+        let client = transfer_client(Duration::from_millis(150)).unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            client
+                .post(format!("http://{address}/"))
+                .body(reqwest::Body::wrap_stream(body))
+                .send(),
+        )
+        .await
+        .expect("the upload must obey the total deadline");
+        assert!(result.unwrap_err().is_timeout());
+        serving.abort();
+    }
+
+    #[tokio::test]
+    async fn fetch_bundle_accepts_authenticated_annotated_tag_refs() {
+        let target = RefTarget::AnnotatedTag { object: [7; 32], commit: [9; 32] };
+        let reference =
+            super::super::EncryptedRef::seal(&fixture_root(), "refs/tags/release", &target)
+                .unwrap();
+        let frames = super::super::codec::encode(&[]).unwrap();
+        let manifest = super::super::codec::encode(&[
+            &1_u16.to_be_bytes(),
+            reference.remote_key().as_bytes(),
+            reference.as_bytes(),
+            &frames,
+        ])
+        .unwrap();
+        let mut body = b"GRAFTEB1".to_vec();
+        body.extend_from_slice(&(manifest.len() as u32).to_be_bytes());
+        body.extend_from_slice(&manifest);
+        let mut descriptor = descriptor();
+        descriptor["capabilities"]
+            .as_array_mut()
+            .unwrap()
+            .push("e2ee-fetch-bundle".into());
+        let mut bundled = reply(body);
+        bundled.headers.push_str(&format!("Content-Type: application/vnd.graft.e2ee-bundle\r\nx-graft-bundle-objects: 0\r\nx-graft-bundle-total-bytes: {}\r\n", bundled.bytes.len()));
+        let (url, requests) = server(vec![
+            reply(serde_json::to_vec(&descriptor).unwrap()),
+            reply(config().as_bytes().to_vec()),
+            bundled,
+        ])
+        .await;
+        let directory = private_tempdir();
+        let fetched = client(&url, session())
+            .fetch_bundle("refs/tags/release", None, directory.path(), 1024)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(fetched.reference.target() == Some(&target));
+        assert!(fetched.entries.is_empty());
+        assert_eq!(requests.await.unwrap().len(), 3);
+    }
+
     #[cfg(unix)]
     fn initial_journal(
         session: &SecretSession,
@@ -1790,7 +1948,7 @@ mod tests {
         Arc<super::super::FileInitializationJournal>,
     ) {
         use std::os::unix::fs::PermissionsExt;
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_tempdir();
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let journal = super::super::FileInitializationJournal::create(
             directory.path(),
@@ -1877,7 +2035,7 @@ mod tests {
                 .unwrap()
                 .restore_config_mutation(record.clone())
                 .unwrap();
-            let directory = tempfile::tempdir().unwrap();
+            let directory = private_tempdir();
             std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
                 .unwrap();
             let journal = Arc::new(
@@ -2098,7 +2256,7 @@ mod tests {
                 .unwrap()
                 .restore_config_mutation(record.clone())
                 .unwrap();
-            let directory = tempfile::tempdir().unwrap();
+            let directory = private_tempdir();
             std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
                 .unwrap();
             let journal = Arc::new(
@@ -2159,8 +2317,8 @@ mod tests {
             InitializationStage,
         };
         use std::os::unix::fs::PermissionsExt;
-        let checkpoint = tempfile::tempdir().unwrap();
-        let recovery = tempfile::tempdir().unwrap();
+        let checkpoint = private_tempdir();
+        let recovery = private_tempdir();
         for directory in [&checkpoint, &recovery] {
             std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
                 .unwrap();
@@ -2309,8 +2467,8 @@ mod tests {
         let previous = config().checkpoint(&fixture_root()).unwrap();
         let replacement = next.checkpoint(&fixture_root()).unwrap();
         for persist_before_error in [false, true] {
-            let checkpoint_directory = tempfile::tempdir().unwrap();
-            let journal_directory = tempfile::tempdir().unwrap();
+            let checkpoint_directory = private_tempdir();
+            let journal_directory = private_tempdir();
             for directory in [&checkpoint_directory, &journal_directory] {
                 std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
                     .unwrap();
@@ -2831,7 +2989,7 @@ mod tests {
         ));
         let other_root = super::super::RootKey::generate(fixture_root().repository()).unwrap();
         let foreign = EncryptedConfig::create(&other_root, b"foreign synthetic password").unwrap();
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_tempdir();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let journal = super::super::FileInitializationJournal::create(
@@ -3070,7 +3228,7 @@ mod tests {
     async fn native_object_publication_authenticates_existing_identity_after_response_loss() {
         for (status, kind) in [(0, 0), (412, 0), (412, 1), (412, 2)] {
             let session = session();
-            let directory = tempfile::tempdir().unwrap();
+            let directory = private_tempdir();
             let candidate = PreparedEncryptedObject::prepare(
                 &session.begin_operation().unwrap(),
                 super::super::ObjectSnapshot {
@@ -3141,7 +3299,7 @@ mod tests {
     #[tokio::test]
     async fn native_object_publication_checks_budget_and_unlock_epoch_before_dispatch() {
         let session = session();
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_tempdir();
         let candidate = PreparedEncryptedObject::prepare(
             &session.begin_operation().unwrap(),
             super::super::ObjectSnapshot {
@@ -3379,7 +3537,7 @@ mod tests {
     async fn native_ref_journal_reopen_preserves_ciphertext_after_response_loss() {
         use super::super::{FileRefMutationJournal, RefMutationJournal};
         use std::{fs, os::unix::fs::PermissionsExt};
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_tempdir();
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let first_session = session();
         let candidate = mutation_fixture(&first_session);
@@ -3598,7 +3756,7 @@ mod tests {
         ];
         let (url, served) =
             fragmented_download_server(prefix, response, FullBodyFraming::Chunked).await;
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_tempdir();
         let entries = client(&url, session())
             .read_bundle(&keys, directory.path(), 32772)
             .await
@@ -3691,7 +3849,7 @@ mod tests {
             ];
             let (url, served) =
                 fragmented_download_server(prefix, response, FullBodyFraming::Chunked).await;
-            let directory = tempfile::tempdir().unwrap();
+            let directory = private_tempdir();
             let maximum = if case == 7 { 3 } else { 32772 };
             assert!(
                 client(&url, session())
@@ -3716,7 +3874,7 @@ mod tests {
             reply(config().as_bytes().to_vec()),
         ])
         .await;
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_tempdir();
         assert!(matches!(
             client(&url, session())
                 .read_bundle(&keys, directory.path(), 32772)
@@ -3770,7 +3928,7 @@ mod tests {
             });
             let session = session();
             let client = client(&url, session.clone());
-            let directory = tempfile::tempdir().unwrap();
+            let directory = private_tempdir();
             let path = directory.path().to_path_buf();
             let reading =
                 tokio::spawn(async move { client.read_bundle(&keys, &path, 32772).await });
@@ -3827,7 +3985,7 @@ mod tests {
             format!("{:x}", Sha256::digest(record.replacement.as_ref().unwrap())),
             digest
         );
-        let staging = tempfile::tempdir().unwrap();
+        let staging = private_tempdir();
         std::fs::set_permissions(staging.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let config = crate::remote::RemoteConfig::EncryptedHttp {
             url,
@@ -3892,7 +4050,7 @@ mod tests {
         let mut objects = fixture.frames.clone();
         objects.push(("e2ee/config".to_owned(), config().as_bytes().to_vec()));
         objects.push((sealed.remote_key().to_owned(), sealed.as_bytes().to_vec()));
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_tempdir();
         let fixture_path = directory.path().join("encrypted-fixture.json");
         let capture_path = directory.path().join("requests.json");
         let migration_id = super::super::RepositoryId::generate().unwrap();
@@ -3951,7 +4109,7 @@ mod tests {
                 super::super::RootKey::generate(initial_session.binding().repository()).unwrap();
             let candidate =
                 EncryptedConfig::create(&root, b"initial enrollment synthetic password").unwrap();
-            let journal_directory = tempfile::tempdir().unwrap();
+            let journal_directory = private_tempdir();
             std::fs::set_permissions(
                 journal_directory.path(),
                 std::fs::Permissions::from_mode(0o700),
@@ -4139,7 +4297,7 @@ mod tests {
             .await
             .unwrap();
         #[cfg(unix)]
-        let head_journal_directory = tempfile::tempdir().unwrap();
+        let head_journal_directory = private_tempdir();
         #[cfg(unix)]
         let head_journal = {
             use std::os::unix::fs::PermissionsExt;
@@ -4253,13 +4411,23 @@ mod tests {
             std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
                 .unwrap();
         }
-        let adapter = crate::remote::Remote::with_encrypted_http(
+        let adapter_journal_directory = private_tempdir();
+        let adapter_journals = Arc::new(
+            super::super::FileRefMutationJournalProvider::create(
+                adapter_journal_directory.path(),
+                client.session.binding(),
+            )
+            .unwrap(),
+        );
+        let adapter = crate::remote::Remote::with_encrypted_http_recovery(
             client.clone(),
             crate::remote::EncryptedTransferBudget {
                 private_directory: directory.path().to_path_buf(),
                 max_buffered_plaintext: 1024 * 1024,
                 max_ciphertext_spool: 2 * 1024 * 1024,
             },
+            Some(adapter_journals),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -4289,7 +4457,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        let repo_dir = tempfile::tempdir().unwrap();
+        let repo_dir = private_tempdir();
         let repo = crate::repo::Repository::init(repo_dir.path()).unwrap();
         repo.mark_dirty_path(repo_dir.path().join("app.db"))
             .unwrap();
@@ -4441,7 +4609,7 @@ mod tests {
             let capture = capture_path.clone();
             let (source_directory, id, content, expected_objects, pack_paths) =
                 tokio::task::spawn_blocking(move || {
-                    let source_directory = tempfile::tempdir().unwrap();
+                    let source_directory = private_tempdir();
                     let source = crate::repo::Repository::init(source_directory.path()).unwrap();
                     let path = source_directory.path().join("migration-private-large.bin");
                     let mut content = vec![57; 1048609];
@@ -4814,7 +4982,7 @@ mod tests {
         {
             use super::super::{FileRefMutationJournalProvider, RefMutationJournalProvider};
             use std::os::unix::fs::PermissionsExt;
-            let journal_directory = tempfile::tempdir().unwrap();
+            let journal_directory = private_tempdir();
             std::fs::set_permissions(
                 journal_directory.path(),
                 std::fs::Permissions::from_mode(0o700),
@@ -5020,9 +5188,9 @@ mod tests {
                 InitializationStage, MigrationEnrollmentRecord, MigrationInitializationJournal,
             };
             use std::os::unix::fs::PermissionsExt;
-            let initial_directory = tempfile::tempdir().unwrap();
-            let target_directory = tempfile::tempdir().unwrap();
-            let enrollment_directory = tempfile::tempdir().unwrap();
+            let initial_directory = private_tempdir();
+            let target_directory = private_tempdir();
+            let enrollment_directory = private_tempdir();
             for path in [
                 initial_directory.path(),
                 target_directory.path(),
@@ -5207,14 +5375,28 @@ mod tests {
             max_buffered_plaintext: 4 * 1024 * 1024,
             max_ciphertext_spool: 8 * 1024 * 1024,
         };
+        let source_journal_directory = private_tempdir();
+        let source_journals = Arc::new(
+            super::super::FileRefMutationJournalProvider::create(
+                source_journal_directory.path(),
+                session.binding(),
+            )
+            .unwrap(),
+        );
         source_credentials
-            .set_encrypted_session("origin", &remote_config, session.clone(), budget.clone())
+            .set_encrypted_session_with_journals(
+                "origin",
+                &remote_config,
+                session.clone(),
+                budget.clone(),
+                source_journals,
+            )
             .unwrap();
         let source_config = remote_config.clone();
         let repository_credentials = source_credentials.clone();
         let (source_dir, first_id, source_id, expected_content) =
             tokio::task::spawn_blocking(move || {
-                let source_dir = tempfile::tempdir().unwrap();
+                let source_dir = private_tempdir();
                 let source = crate::repo::Repository::init(source_dir.path())
                     .unwrap()
                     .with_remote_credentials(repository_credentials.clone());
@@ -5274,15 +5456,29 @@ mod tests {
             .unlock(zeroize::Zeroizing::new(b"http sync password".to_vec()))
             .await
             .unwrap();
+        let target_journal_directory = private_tempdir();
+        let target_journals = Arc::new(
+            super::super::FileRefMutationJournalProvider::create(
+                target_journal_directory.path(),
+                target_session.binding(),
+            )
+            .unwrap(),
+        );
         target_credentials
-            .set_encrypted_session("origin", &remote_config, target_session.clone(), budget)
+            .set_encrypted_session_with_journals(
+                "origin",
+                &remote_config,
+                target_session.clone(),
+                budget,
+                target_journals,
+            )
             .unwrap();
         let target_config = remote_config;
         let repository_credentials = target_credentials.clone();
         let expected_first = first_id.clone();
         let expected_second = source_id.clone();
         tokio::task::spawn_blocking(move || {
-            let target_dir = tempfile::tempdir().unwrap();
+            let target_dir = private_tempdir();
             let target = crate::repo::Repository::init(target_dir.path())
                 .unwrap()
                 .with_remote_credentials(repository_credentials.clone());
@@ -5434,7 +5630,7 @@ mod tests {
                 .unlock(zeroize::Zeroizing::new(b"http sync password".to_vec()))
                 .await
                 .unwrap();
-            let journal_directory = tempfile::tempdir().unwrap();
+            let journal_directory = private_tempdir();
             std::fs::set_permissions(
                 journal_directory.path(),
                 std::fs::Permissions::from_mode(0o700),
@@ -5770,7 +5966,7 @@ mod tests {
             let (prefix, payload) = download_replies(&header, &chunks);
             let (url, served) =
                 fragmented_download_server(prefix, payload, FullBodyFraming::Chunked).await;
-            let directory = tempfile::tempdir().unwrap();
+            let directory = private_tempdir();
             let downloaded = client(&url, session())
                 .download_object("segments/private", directory.path(), length as u64)
                 .await
@@ -5818,7 +6014,7 @@ mod tests {
             if case == 2 {
                 payload.bytes.push(0);
             }
-            let directory = tempfile::tempdir().unwrap();
+            let directory = private_tempdir();
             let result = if matches!(case, 3 | 4) {
                 let (url, served) = server(prefix).await;
                 let path = if case == 3 {
@@ -5860,7 +6056,7 @@ mod tests {
         let (prefix, payload) = download_replies(&header, &[chunk]);
         let (url, served) =
             fragmented_download_server(prefix, payload, FullBodyFraming::ContentLength).await;
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_tempdir();
         assert!(matches!(
             client(&url, session())
                 .download_object("segments/private", directory.path(), 7)
@@ -5945,7 +6141,7 @@ mod tests {
                 .unwrap();
             writer.finish().unwrap();
         });
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_tempdir();
         let downloaded = client(&url, session())
             .download_object("segments/large", directory.path(), length)
             .await
@@ -6366,7 +6562,7 @@ mod tests {
             });
             let session = session();
             let client = client(&url, session.clone());
-            let directory = tempfile::tempdir().unwrap();
+            let directory = private_tempdir();
             let path = directory.path().to_path_buf();
             let reading = tokio::spawn(async move {
                 if full {

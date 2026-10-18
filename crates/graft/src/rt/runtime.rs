@@ -858,7 +858,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(all(feature = "e2ee", unix))]
+    #[cfg(all(feature = "e2ee", any(unix, windows)))]
     fn prepared_snapshot_push_inherits_secret_cancellation_in_worker_loops() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let tokio_rt = tokio::runtime::Builder::new_multi_thread()

@@ -73,6 +73,11 @@ Rust toolchain or system SQLite library, and the package has no install script.
 
 ## Use
 
+Disconnect a cloud connection with `await session.removeRemote("origin")`.
+Local files, unsaved changes and local Graft history remain intact; other named
+remotes are preserved. The operation is idempotent and does not delete cloud data.
+Hosts using an `EncryptedRemoteSession` must revoke and drain that authority first.
+
 ```js
 const { RepositorySession } = require("@eidos.space/graft")
 
@@ -781,8 +786,12 @@ Trusted Node hosts can opt into the native `e2ee` feature. Default native builds
 do not include it. The build script's third argument selects `plain`, `e2ee` or
 `macos-keychain`, after its target and output directory. `pnpm test:e2ee-node`
 builds a temporary addon and verifies it against the actual HTTP remote handler.
-Current checkpoint storage requires Unix owner-only private directories outside
-the repository; unsupported hosts fail rather than using weaker storage.
+Native checkpoint storage supports Unix owner-only modes and Windows protected
+owner/SYSTEM-only DACLs outside the repository. Use
+`EncryptedRemoteSession.createPrivateDirectory(absolutePath)` to allocate each
+new checkpoint, recovery and staging directory. Existing directories are checked,
+never silently made less restrictive. Windows supports password-based session
+unlock; remembering keys requires an approved host provider.
 
 For an existing encrypted remote, first authenticate the account and verify its
 domain/subject and pinned UUID. Create a host handle with explicit private-state
@@ -851,9 +860,10 @@ not yet supported.
 the same verified account identity and remains locked until explicit unlock.
 
 For a newly account-registered empty encrypted remote, a locked authority can
-call `authority.initializeConfig(passwordBuffer)`. The native entry clears the
+call `authority.initializeConfig(passwordBuffer, { branch, commit })`, using the
+source repository's committed branch and HEAD. The native entry clears the
 exclusive caller-owned Buffer synchronously, generates a random root and writes
-one locally verified wrapped candidate in `recoveryDirectory` before publishing
+one locally verified wrapped candidate and the source intent in `recoveryDirectory` before publishing
 it create-if-absent. No root key or config bytes pass through JavaScript. Existing
 local config trust prevents a replacement initialization.
 
@@ -870,9 +880,10 @@ rather than reuse the losing root or overwrite its config. Empty remote identity
 registration is an account-service responsibility outside these SDK APIs.
 
 After config publication, an unlocked authority-bound repository can call
-`source.pushInitialBranch()`. Native recovery first binds the checked-out branch
-and committed HEAD to the initialization journal. Retries and reopened sessions
-load that same intent; another source commit is rejected before network discovery.
+`source.pushInitialBranch()`. Native recovery requires the checked-out branch
+and committed HEAD to match the retained initialization intent. Missing intent
+stops publication; config-only initialization cannot reconstruct it later.
+Retries and reopened sessions load that same intent; another source commit is rejected before network discovery.
 The repository service rechecks the source before dependency publication and
 uses the retained ref/HEAD recovery slots. A failed HEAD update does not replace
 the intent or upload a different initial history.
@@ -973,8 +984,10 @@ A `macos-keychain` build accepts `keychainApplication` and
 `keychainAccessGroup` for a correctly signed/entitled host's default application
 group. `remember`, `unlockRemembered` and `forget` use that native provider.
 Unavailable storage disables remembering without a plaintext fallback; a host
-may continue with session-only password unlock. Hosts must coordinate all sessions
-sharing an entry before forgetting it. Successful remembering/restart in a signed
+may continue with session-only password unlock. Forget fences and drains all
+process-local sessions sharing the binding, including through caller cancellation.
+Those handles require explicit reconnect and unlock afterward. Hosts sharing an
+entry across processes must coordinate those processes. Successful remembering/restart in a signed
 host still requires platform validation. Keep this authority in the trusted host;
 never expose it or its key-management methods through ordinary plugin RPC.
 

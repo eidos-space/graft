@@ -517,10 +517,16 @@ const server = createServer(async (incoming, outgoing) => {
     outgoing.end();
   }
 });
-if (privacy) process.once("SIGTERM", () => {
-  privacy.finish();
+function shutdown() {
+  privacy?.finish();
   server.closeAllConnections();
   server.close(() => process.exit(0));
+}
+if (privacy) process.once("SIGTERM", shutdown);
+// Windows terminates a child on kill() without delivering its SIGTERM handler.
+// Finalize the evidence through the parent's private IPC channel on every OS.
+process.on("message", (message) => {
+  if (message === "graft-e2ee-shutdown") shutdown();
 });
 server.listen(0, "127.0.0.1", () =>
   console.log(
@@ -534,7 +540,4 @@ server.listen(0, "127.0.0.1", () =>
   ),
 );
 // Prevent a failed parent test from leaving an orphaned loopback listener.
-setTimeout(() => {
-  server.closeAllConnections();
-  server.close();
-}, fixture.serviceLifetimeMs ?? 120000).unref();
+setTimeout(shutdown, fixture.serviceLifetimeMs ?? 120000).unref();

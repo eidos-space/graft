@@ -426,6 +426,9 @@ enum JsonOperation {
     ConfigureRemote {
         options: CoreRemoteConfigureOptions,
     },
+    RemoveRemote {
+        name: String,
+    },
     Push {
         remote: Option<String>,
         branch: Option<String>,
@@ -895,6 +898,7 @@ impl JsonTask {
                 unreachable!("handled before JSON value dispatch")
             }
             JsonOperation::ConfigureRemote { options } => self.session.configure_remote(options),
+            JsonOperation::RemoveRemote { name } => self.session.remove_remote(name),
             JsonOperation::Push { remote, branch } => {
                 self.session.push(remote.as_deref(), branch.as_deref())
             }
@@ -994,7 +998,7 @@ pub struct NodeRepositorySession {
     session: Arc<CoreRepositorySession>,
 }
 
-#[cfg(all(feature = "e2ee", unix))]
+#[cfg(all(feature = "e2ee", any(unix, windows)))]
 #[napi]
 impl NodeRepositorySession {
     #[napi]
@@ -1630,6 +1634,11 @@ impl NodeRepositorySession {
     }
 
     #[napi]
+    pub fn remove_remote(&self, name: String, signal: Option<AbortSignal>) -> AsyncTask<JsonTask> {
+        json_task(self, JsonOperation::RemoveRemote { name }, signal)
+    }
+
+    #[napi]
     pub fn configure_remote(
         &self,
         options: RemoteConfigureOptions,
@@ -2216,6 +2225,7 @@ pub fn operation_materializes_worktree(operation: String) -> Result<bool> {
         "restore" => RepositoryOperation::Restore,
         "restore_paths" | "restorePaths" => RepositoryOperation::RestorePaths,
         "remote_configure" | "configureRemote" => RepositoryOperation::RemoteConfigure,
+        "remote_remove" | "removeRemote" => RepositoryOperation::RemoteRemove,
         "push" => RepositoryOperation::Push,
         "fetch" => RepositoryOperation::Fetch,
         "pull" => RepositoryOperation::Pull,

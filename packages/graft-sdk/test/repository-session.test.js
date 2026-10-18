@@ -26,6 +26,40 @@ const {
   sdkVersion,
 } = require("..")
 
+test("disconnecting a remote preserves dirty files and complete local history", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "graft-disconnect-"))
+  const session = await RepositorySession.open(root)
+  try {
+    await session.init()
+    await fs.writeFile(path.join(root, "note.md"), "first\n")
+    await session.addAll()
+    await session.commit("first version")
+    await fs.writeFile(path.join(root, "note.md"), "second\n")
+    await session.addAll()
+    await session.commit("second version")
+    await session.configureRemote({ name: "origin", url: "https://example.test/deleted", upstreamBranch: "main" })
+    await session.configureRemote({ name: "peer", url: "memory" })
+    await fs.writeFile(path.join(root, "note.md"), "unsaved local edits\n")
+    const history = await session.history()
+    const head = (await session.repositoryMetadata()).current_head
+    assert.equal((await session.removeRemote("origin")).removed, true)
+    assert.deepEqual(await session.history(), history)
+    assert.equal((await session.repositoryMetadata()).current_head, head)
+    assert.equal((await session.repositoryMetadata()).upstream, null)
+    assert.equal(await fs.readFile(path.join(root, "note.md"), "utf8"), "unsaved local edits\n")
+    assert.deepEqual((await session.listRemotes()).remotes.map((r) => r.name), ["peer"])
+    assert.equal((await session.removeRemote("origin")).removed, false)
+    assert.equal(operationMaterializesWorktree("removeRemote"), false)
+    await assert.rejects(session.removeRemote("../origin"))
+    await session.close()
+    await session.open()
+    assert.deepEqual(await session.history(), history)
+  } finally {
+    await session.close()
+    await fs.rm(root, { recursive: true, force: true })
+  }
+})
+
 test(
   "restoring a deleted SQLite file does not resurrect it on another device",
   nodeSqliteTest,

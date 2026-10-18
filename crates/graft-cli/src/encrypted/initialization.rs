@@ -197,9 +197,7 @@ fn verify(
     runtime: &tokio::runtime::Runtime,
     intent: &InitializationIntent,
 ) -> Result<()> {
-    let state = tempfile::Builder::new()
-        .prefix("initialization-verification-")
-        .tempdir_in(&args.state_dir)?;
+    let state = fs::private_tempdir("initialization-verification-", &args.state_dir)?;
     let checkpoint = state.path().join("checkpoint");
     let staging = state.path().join("staging");
     for path in [&checkpoint, &staging] {

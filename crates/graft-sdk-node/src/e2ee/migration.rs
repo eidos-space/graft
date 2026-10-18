@@ -1,4 +1,8 @@
 //! Trusted Node host migration operations. Capabilities never cross into JS.
+use graft_sdk::e2ee::native_fs as fs;
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
 use super::*;
 use graft_sdk::{
     EncryptedMigrationCoordinator, Head, MigrationCoordinatorOptions, MigrationJournalPaths,
@@ -6,11 +10,7 @@ use graft_sdk::{
     MigrationRefSelection, MigrationVerificationOptions, RepositoryMigrationFence,
     RepositorySession,
 };
-use std::{
-    fs,
-    os::unix::fs::{DirBuilderExt, PermissionsExt},
-    path::Path,
-};
+use std::path::Path;
 
 #[napi(object)]
 pub struct MigrationRefMapping {
@@ -57,14 +57,14 @@ fn private_directory(path: &Path) -> Result<()> {
         .mode(0o700)
         .create(path)
         .map_err(io_error)?;
-    fs::File::open(path)
-        .and_then(|file| file.sync_all())
+    fs::open(path)
+        .and_then(|file| fs::sync_directory(&file))
         .map_err(io_error)?;
-    fs::File::open(
+    fs::open(
         path.parent()
             .ok_or_else(|| secret_error(EncryptionError::InvalidEncoding))?,
     )
-    .and_then(|file| file.sync_all())
+    .and_then(|file| fs::sync_directory(&file))
     .map_err(io_error)
 }
 
@@ -78,8 +78,14 @@ pub(crate) fn run(
     source: Arc<RepositorySession>,
     authority: &NodeEncryptedRemoteSession,
     mut password: Buffer,
-    action: Action,
+    mut action: Action,
 ) -> Result<AsyncBlock<String>> {
+    let protected_token = match &mut action {
+        Action::Verify(options) | Action::Cutover(options) => {
+            Some(Zeroizing::new(std::mem::take(&mut options.bearer_token)))
+        }
+        _ => None,
+    };
     let valid =
         !password.is_empty() && password.len() <= 1024 && std::str::from_utf8(&password).is_ok();
     if !valid {
@@ -172,7 +178,7 @@ pub(crate) fn run(
                         private_directory(&checkpoint)?;
                         private_directory(&staging)?;
                         let options = MigrationVerificationOptions { worktree, checkpoint,
-                            transfer: EncryptedTransferBudget { private_directory: staging, ..budget }, bearer_token: options.bearer_token };
+                            transfer: EncryptedTransferBudget { private_directory: staging, ..budget }, bearer_token: protected_token.as_ref().map(|token| token.to_string()).unwrap_or_default() };
                         let proof = if let Some(fence) = fence.as_mut() {
                             coordinator.verify_and_cutover(fence, verification_password, options)
                         } else { coordinator.verify_independently(verification_password, options) }.map_err(crate::napi_error)?;

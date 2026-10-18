@@ -9,16 +9,18 @@ mod codec;
 mod config;
 mod config_mutation;
 mod discovery;
-mod download;
+pub(crate) mod download;
 pub(crate) mod hint;
 pub(crate) mod http;
 mod initialization;
 mod migration_enrollment;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod migration_progress;
 mod multipart_journal;
 mod mutation;
 mod mutation_journal;
+#[doc(hidden)]
+pub use crate::native_fs;
 pub(crate) mod object;
 mod provider;
 mod reference;
@@ -27,7 +29,7 @@ mod upload;
 
 pub use bundle::EncryptedBundleEntry;
 pub use checkpoint::CheckpointStore;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub use checkpoint::FileCheckpointStore;
 pub use config::{ConfigCheckpoint, EncryptedConfig};
 pub use config_mutation::{
@@ -39,24 +41,24 @@ pub use http::{
     DownloadedEncryptedObject, EncryptedHttpClient, EncryptedHttpError, EncryptedObjectMetadata,
 };
 pub(crate) use http::{PreparedReceiveBundle, ReceiveBundleOutcome};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub use initialization::FileInitializationJournal;
 pub use initialization::{
     InitialConfigPublicationOutcome, InitializationIntent, InitializationJournal,
     InitializationRecord, InitializationStage,
 };
 pub use migration_enrollment::MigrationEnrollmentRecord;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub use migration_enrollment::MigrationInitializationJournal;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub use migration_progress::{
     FileMigrationProgressJournal, MigrationProgressLease, MigrationProgressRecord,
 };
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub use multipart_journal::{FileMultipartJournal, FileMultipartJournalProvider};
 pub use multipart_journal::{MultipartJournalProvider, RetainedMultipartUpload};
 pub use mutation::{PreparedRefMutation, RefMutationRecord, RefPublicationOutcome};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub use mutation_journal::{
     FileConfigMutationJournal, FileMigrationEnrollmentJournal, FileMigrationSourceJournal,
     FileMigrationTargetJournal, FileRefMutationJournal, FileRefMutationJournalProvider,
@@ -195,7 +197,7 @@ impl RootKey {
     }
 
     pub(crate) fn derive(&self, purpose: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
-        let info = codec::encode(&[b"graft/e2ee/v1", PROFILE, &SUITE.to_be_bytes(), purpose])?;
+        let info = codec::encode(&[b"graft/e2ee/v1", PROFILE, &1_u16.to_be_bytes(), purpose])?;
         let mut output = Zeroizing::new([0; 32]);
         Hkdf::<Sha256>::new(Some(self.repository.as_bytes()), self.secret.as_ref())
             .expand(&info, output.as_mut())

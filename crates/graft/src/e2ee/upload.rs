@@ -295,6 +295,18 @@ async fn write_ciphertext(
 
 #[cfg(test)]
 mod tests {
+    fn private_tempdir() -> tempfile::TempDir {
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        crate::native_fs::set_permissions(
+            directory.path(),
+            crate::native_fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        directory
+    }
+
     use super::*;
     use crate::e2ee::{
         EncryptedConfig, ObjectReader, SecretSession, SessionBinding, tests::fixture_root,
@@ -344,7 +356,7 @@ mod tests {
         let operation = session.begin_operation().unwrap();
         for size in [ChunkSize::KiB16, ChunkSize::KiB64, ChunkSize::KiB256] {
             for length in [0, 1, 262145] {
-                let directory = tempfile::tempdir().unwrap();
+                let directory = private_tempdir();
                 let bytes = vec![91; length];
                 let prepared = PreparedEncryptedObject::prepare(
                     &operation,
@@ -402,7 +414,7 @@ mod tests {
             (b"dataextra".as_slice(), 10000, false),
             (b"data".as_slice(), 1, true),
         ] {
-            let directory = tempfile::tempdir().unwrap();
+            let directory = private_tempdir();
             let result = PreparedEncryptedObject::prepare(
                 &operation,
                 snapshot(b"data", ChunkSize::KiB64),
@@ -427,7 +439,7 @@ mod tests {
             writer.write_all(b"d").await.unwrap();
             let (started, receiving) = tokio::sync::oneshot::channel();
             let mut reader = StartedReader { source: reader, started: Some(started) };
-            let directory = tempfile::tempdir().unwrap();
+            let directory = private_tempdir();
             let path = directory.path().to_owned();
             let preparing = tokio::spawn(async move {
                 PreparedEncryptedObject::prepare(

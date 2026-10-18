@@ -224,6 +224,9 @@ jobs:
     needs: [metadata, build]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
@@ -240,6 +243,9 @@ jobs:
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             suffix: linux-x64-gnu
+          - runner: windows-2022
+            target: x86_64-pc-windows-msvc
+            suffix: win32-x64-msvc
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -266,7 +272,7 @@ jobs:
           brew install llvm
           echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
       - name: Build the protocol test service
-        run: pnpm install --frozen-lockfile && pnpm --filter @eidos.space/graft-remote build
+        run: pnpm install --frozen-lockfile && pnpm --filter '@eidos.space/graft-remote' build
       - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           name: graft-sdk-${{ matrix.target }}
@@ -274,7 +280,7 @@ jobs:
       - name: Test release addon against the actual encrypted protocol service
         env:
           GRAFT_E2EE_NODE_TEST_BINDING: ${{ github.workspace }}/sdk-artifact/graft-sdk.${{ matrix.suffix }}.node
-        run: cargo test -p graft-sdk --features e2ee --test e2ee_node --locked -- --ignored --test-threads=1
+        run: cargo test -p graft-sdk --features e2ee,bundled-sqlite --test e2ee_node --locked -- --ignored --test-threads=1
 
       - name: Retain synthetic privacy evidence
         if: always()

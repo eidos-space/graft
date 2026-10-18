@@ -13,9 +13,7 @@ use graft::{
 use graft_sdk::RepositorySession;
 use serde_json::Value;
 use std::{
-    fs,
     io::{IsTerminal, Read, Write},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -23,7 +21,15 @@ use zeroize::Zeroizing;
 
 mod initialization;
 mod migration;
+#[cfg(unix)]
 mod terminal_password;
+#[cfg(windows)]
+#[path = "encrypted/terminal_password_windows.rs"]
+mod terminal_password;
+
+use graft::e2ee::native_fs as fs;
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 #[derive(Args)]
 pub struct EncryptedArgs {
@@ -142,7 +148,7 @@ fn new_password(descriptor: Option<u32>) -> Result<Zeroizing<Vec<u8>>> {
         if descriptor < 3 {
             bail!("new-password descriptor must be an inherited descriptor >= 3");
         }
-        let input = fs::File::open(format!("/dev/fd/{descriptor}"))
+        let input = inherited_password_input(descriptor)
             .map_err(|_| anyhow::anyhow!("protected new-password descriptor is unavailable"))?;
         if input.is_terminal() {
             bail!("new-password descriptor must not refer to a terminal");
@@ -155,6 +161,46 @@ fn new_password(descriptor: Option<u32>) -> Result<Zeroizing<Vec<u8>>> {
         bail!("new sync-password confirmation does not match");
     }
     Ok(first)
+}
+
+#[cfg(unix)]
+fn inherited_password_input(descriptor: u32) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(format!("/dev/fd/{descriptor}"))
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn inherited_password_input(descriptor: u32) -> std::io::Result<std::fs::File> {
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::{
+        Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle},
+        System::Threading::GetCurrentProcess,
+    };
+    unsafe extern "C" {
+        fn _get_osfhandle(descriptor: i32) -> isize;
+    }
+    let descriptor = i32::try_from(descriptor).map_err(|_| std::io::ErrorKind::InvalidInput)?;
+    // Duplicate the inherited CRT descriptor; never close the host's original.
+    unsafe {
+        let handle = _get_osfhandle(descriptor);
+        if handle == -1 {
+            return Err(std::io::ErrorKind::InvalidInput.into());
+        }
+        let mut duplicate = std::ptr::null_mut();
+        if DuplicateHandle(
+            GetCurrentProcess(),
+            handle as _,
+            GetCurrentProcess(),
+            &mut duplicate,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        ) == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(std::fs::File::from_raw_handle(duplicate))
+    }
 }
 
 fn config_publication_result(outcome: ConfigPublicationOutcome) -> Result<Value> {
@@ -186,7 +232,8 @@ impl std::fmt::Display for ConfigPublicationError {
 impl std::error::Error for ConfigPublicationError {}
 
 fn password(mut input: impl Read) -> Result<Zeroizing<Vec<u8>>> {
-    let mut bytes = Zeroizing::new(Vec::new());
+    // Allocate the bounded input and overflow sentinel before reading secrets.
+    let mut bytes = Zeroizing::new(Vec::with_capacity(1025));
     input
         .by_ref()
         .take(1025)
@@ -226,11 +273,10 @@ fn repository_id(text: &str) -> Result<RepositoryId> {
 }
 
 fn create_private(path: &Path) -> Result<()> {
-    fs::create_dir(path).context("cannot allocate new encrypted host state")?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    fs::File::open(path)?.sync_all()?;
+    fs::create_private_directory(path).context("cannot allocate new encrypted host state")?;
+    fs::sync_directory(&fs::open(path)?)?;
     if let Some(parent) = path.parent() {
-        fs::File::open(parent)?.sync_all()?;
+        fs::sync_directory(&fs::open(parent)?)?;
     }
     Ok(())
 }
@@ -251,7 +297,7 @@ fn enroll_config_recovery(
         )?;
     (&marker).write_all(b"graft-cli/config-recovery/v1\n")?;
     marker.sync_all()?;
-    fs::File::open(state)?.sync_all()?;
+    fs::sync_directory(&fs::open(state)?)?;
     let slot = state.join("config-recovery");
     create_private(&slot)?;
     Ok(FileConfigMutationJournal::create(&slot, binding)?)
@@ -271,7 +317,7 @@ fn enroll_multipart_recovery(
         )?;
     (&marker).write_all(b"graft-cli/multipart-recovery/v1\n")?;
     marker.sync_all()?;
-    fs::File::open(state)?.sync_all()?;
+    fs::sync_directory(&fs::open(state)?)?;
     let slot = state.join("multipart-recovery");
     create_private(&slot)?;
     Ok(FileMultipartJournalProvider::create(&slot, binding)?)
@@ -723,13 +769,16 @@ mod tests {
         }
         fs::create_dir(&worktree).unwrap();
         Repository::init(&worktree).unwrap();
-        let alias = fixture.path().join("alias");
-        std::os::unix::fs::symlink(&worktree, &alias).unwrap();
-        assert!(
-            session
-                .validate_encrypted_host_directory_targets(&[alias.join("future-private")])
-                .is_err()
-        );
+        #[cfg(unix)]
+        {
+            let alias = fixture.path().join("alias");
+            std::os::unix::fs::symlink(&worktree, &alias).unwrap();
+            assert!(
+                session
+                    .validate_encrypted_host_directory_targets(&[alias.join("future-private")])
+                    .is_err()
+            );
+        }
         let child = RepositorySession::new(worktree.join("future-child"));
         assert!(
             child

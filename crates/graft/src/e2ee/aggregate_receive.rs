@@ -108,7 +108,10 @@ impl EncryptedHttpClient {
             return Ok(ReceiveBundleOutcome::Fallback);
         }
         // Bind exact retained ref bytes before the aggregate can dispatch CAS.
-        if let Some(journal) = journal {
+        {
+            let journal = journal.ok_or(EncryptionError::CheckpointUnavailable(
+                std::io::ErrorKind::NotFound,
+            ))?;
             let journal_operation = self.session.begin_operation()?;
             let record = candidate.record(&journal_operation)?;
             let session = self.session.clone();

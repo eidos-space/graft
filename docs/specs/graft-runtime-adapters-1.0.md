@@ -171,6 +171,7 @@ current contract, not a second implementation.
 | `config get/list/set/unset` | `configGet`, `configList`, `configSet`, `configUnset` | effective repository configuration entries |
 | `restore` | `restore`, `restorePaths` | affected paths and checkout outcome |
 | `remote add/set-url` subset | `configureRemote` | local config/upstream outcome |
+| `remote remove` | `removeRemote` | idempotent local disconnect; preserves worktree and local history |
 | `fetch`, `push`, `pull` | same method names | remote/ref plus merge outcome where applicable |
 | `clone` | `cloneRepository` | new repository/checkout outcome |
 | `merge` + `conflicts` + `resolve` | `planMerge`, `applyMerge`, merge status/list/version, path/row/text/provider resolution, `continueMerge`, `abortMerge` | typed plan/state/provider tokens plus command outcome |
@@ -180,6 +181,14 @@ current contract, not a second implementation.
 `encrypted_http`. This is public profile metadata; it does not indicate that a
 session is unlocked or that an adapter implements encrypted enrollment. Its URL
 projection excludes credentials, passwords, keys and host staging state.
+
+`removeRemote(name)` MUST remove only that named remote, its upstream configuration
+and remote-tracking refs, and clear its in-memory HTTP credential. A missing remote
+MUST succeed with `removed: false`. Local files (including unsaved edits), commits,
+local branches, tags and other remotes MUST be preserved. The host owns encrypted
+authority revocation and draining before disconnecting a connection.
+An attached encrypted authority that has not disconnected MUST cause rejection
+before durable remote configuration is removed; locking alone is insufficient.
 
 The native Rust SDK's `RepositorySession::new_with_remote_credentials` accepts
 explicit shared `RemoteCredentials` and an optional identity override. The native
@@ -204,7 +213,7 @@ non-mutating `reconcile_initial_config`. These take a trusted
 `InitialConfigPublicationOutcome::Confirmed` means config-published after exact
 authenticated readback and durable journal advancement. It does not mean
 connected or publish initial objects/refs. Known published config disappearance
-never triggers another create. The Unix `FileInitializationJournal` requires a
+never triggers another create. The native `FileInitializationJournal` requires a
 private directory, explicit create/open and owner-only records. Its blocking
 persistence stays in the key-owning operation's draining boundary. Complete
 enrollment, platform storage, host authentication and CLI/Node orchestration
@@ -214,9 +223,12 @@ The Node binding's opt-in `e2ee` feature adds a trusted-host
 `EncryptedRemoteSession`, with an immutable remote name/URL/UUID and host-verified
 authentication domain/account subject. Constructor options select explicit
 checkpoint creation or existing opening; missing existing state is not recreated.
-Current native checkpoint support requires Unix owner-only private directories.
+Native checkpoints support Unix owner-only modes and Windows protected
+owner/SYSTEM-only DACLs, native identity checks and file locks. Hosts can allocate
+new private directories with `EncryptedRemoteSession.createPrivateDirectory(path)`.
+Windows permits session-only password unlock without a remembered-key provider.
 `macos-keychain` additionally permits the approved native provider; unavailable
-storage never falls back. Default native artifacts do not enable this API.
+storage never falls back. Native builds without `e2ee` do not enable this API.
 
 `unlock(Buffer)` consumes and clears its caller-owned, exclusive password Buffer
 synchronously, registers the unlock before async scheduling and retains only a
@@ -253,7 +265,7 @@ UntrackPaths, Commit, Diff, DiffPaths, ReadPathContent, History,
 HistorySummaries, CommitDetails, CommitChangedPaths, IsIgnoredPath,
 IsIgnoredPaths, Inventory, RepositoryMetadata, ListRemotes, ConfigGet,
 ConfigList, ConfigSet, ConfigUnset, Restore,
-RestorePaths, RemoteConfigure, Push, Fetch, Pull, Clone, PlanMerge,
+RestorePaths, RemoteConfigure, RemoteRemove, Push, Fetch, Pull, Clone, PlanMerge,
 ApplyMerge, GetMergeStatus, ListMergePaths, ListMergeConflicts,
 ReadMergeVersion, DiffMergeSqlite, SetMergePathResult, ResolveMergeRow,
 ResolveMergeCell, ResolveMergeTable, StageMergeSqliteResult,

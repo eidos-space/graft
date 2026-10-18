@@ -1,3 +1,5 @@
+use crate::e2ee::native_fs::Metadata;
+
 use super::{ConfigCheckpoint, Result, SessionBinding};
 
 /// Trusted native, blocking metadata provider. Never receives a key or password.
@@ -24,21 +26,20 @@ pub trait CheckpointStore: Send + Sync {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod file {
     use super::*;
     use crate::e2ee::{EncryptionError, PROFILE, codec};
     use sha2::{Digest, Sha256};
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     use std::{
-        fs::{self, File, Metadata, OpenOptions},
         io::{Read, Write},
         path::{Path, PathBuf},
     };
 
     const RECORD: &str = "checkpoint";
     const LOCK: &str = "checkpoint.lock";
-    const SIZE: usize = 105;
+    const LEGACY_SIZE: usize = 105;
+    const SIZE: usize = LEGACY_SIZE + 32;
 
     /// Unix owner-only checkpoint slot outside the repository. Explicit creation
     /// and existing opening are separate; missing enrollment is never recreated.
@@ -51,6 +52,14 @@ mod file {
 
     impl FileCheckpointStore {
         pub fn create(directory: impl AsRef<Path>, binding: &SessionBinding) -> Result<Self> {
+            Self::create_with_writer(directory, binding, |store| store.write_record(None, true))
+        }
+
+        fn create_with_writer(
+            directory: impl AsRef<Path>,
+            binding: &SessionBinding,
+            write: impl FnOnce(&Self) -> Result<()>,
+        ) -> Result<Self> {
             let store = Self::prepare(directory.as_ref(), binding)?;
             let directory = store.directory_handle()?;
             let lock = OpenOptions::new()
@@ -60,11 +69,28 @@ mod file {
                 .mode(0o600)
                 .open(store.directory.join(LOCK))
                 .map_err(io)?;
-            store.validate_file(&lock, LOCK)?;
-            lock.try_lock().map_err(lock_error)?;
-            lock.sync_all().map_err(io)?;
-            store.write_record(None, true)?;
-            directory.sync_all().map_err(io)?;
+            let result = (|| {
+                store.validate_file(&lock, LOCK)?;
+                lock.try_lock().map_err(lock_error)?;
+                lock.sync_all().map_err(io)?;
+                write(&store)
+            })();
+            if let Err(error) = result {
+                // Only this live creator may remove its own unadmitted lock.
+                // Existing/missing enrolled trust is never repaired on reopen.
+                let removable = store.directory_handle().is_ok()
+                    && matches!(fs::symlink_metadata(store.directory.join(RECORD)), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+                    && store.validate_file(&lock, LOCK).is_ok();
+                // Release the creating handle before unlinking its validated,
+                // unadmitted lock, including on hosts with restrictive sharing.
+                drop(lock);
+                if removable {
+                    let _ = fs::remove_file(store.directory.join(LOCK));
+                    let _ = fs::sync_directory(&directory);
+                }
+                return Err(error);
+            }
+            fs::sync_directory(&directory).map_err(io)?;
             Ok(store)
         }
 
@@ -97,8 +123,8 @@ mod file {
             {
                 return Err(permission());
             }
-            let directory = File::open(&self.directory).map_err(io)?;
-            let opened = directory.metadata().map_err(io)?;
+            let directory = fs::open(&self.directory).map_err(io)?;
+            let opened = fs::file_metadata(&directory).map_err(io)?;
             if (opened.dev(), opened.ino(), opened.uid()) != self.identity {
                 return Err(permission());
             }
@@ -107,7 +133,7 @@ mod file {
 
         fn validate_file(&self, file: &File, name: &str) -> Result<Metadata> {
             let path = self.path_metadata(name)?;
-            let opened = file.metadata().map_err(io)?;
+            let opened = fs::file_metadata(file).map_err(io)?;
             if !path.is_file()
                 || !opened.is_file()
                 || opened.mode() & 0o077 != 0
@@ -152,12 +178,13 @@ mod file {
         }
 
         fn read_record(&self) -> Result<(File, Option<ConfigCheckpoint>)> {
-            if self.path_metadata(RECORD)?.len() != SIZE as u64 {
+            let length = self.path_metadata(RECORD)?.len();
+            if length != SIZE as u64 && length != LEGACY_SIZE as u64 {
                 return Err(EncryptionError::InvalidEncoding);
             }
-            let file = File::open(self.directory.join(RECORD)).map_err(io)?;
+            let file = fs::open(self.directory.join(RECORD)).map_err(io)?;
             let metadata = self.validate_file(&file, RECORD)?;
-            if metadata.len() != SIZE as u64 {
+            if metadata.len() != length {
                 return Err(EncryptionError::InvalidEncoding);
             }
             let mut bytes = Vec::with_capacity(SIZE);
@@ -165,9 +192,20 @@ mod file {
                 .take(SIZE as u64 + 1)
                 .read_to_end(&mut bytes)
                 .map_err(io)?;
-            if bytes.len() != SIZE || &bytes[..8] != b"GRAFTCS1" {
+            if bytes.len() as u64 != length
+                || !matches!(
+                    (&bytes[..8], bytes.len()),
+                    (b"GRAFTCS1", LEGACY_SIZE) | (b"GRAFTCS2", SIZE)
+                )
+            {
                 return Err(EncryptionError::InvalidEncoding);
             }
+            if bytes.len() == SIZE
+                && bytes[LEGACY_SIZE..] != Sha256::digest(&bytes[..LEGACY_SIZE])[..]
+            {
+                return Err(EncryptionError::InvalidEncoding);
+            }
+            let bytes = &bytes[..LEGACY_SIZE];
             if bytes[8..40] != self.binding {
                 return Err(EncryptionError::IdentityChanged);
             }
@@ -181,27 +219,25 @@ mod file {
 
         fn write_record(&self, checkpoint: Option<&ConfigCheckpoint>, initial: bool) -> Result<()> {
             let mut bytes = [0_u8; SIZE];
-            bytes[..8].copy_from_slice(b"GRAFTCS1");
+            bytes[..8].copy_from_slice(b"GRAFTCS2");
             bytes[8..40].copy_from_slice(&self.binding);
             if let Some(checkpoint) = checkpoint {
                 bytes[40] = 1;
-                bytes[41..].copy_from_slice(&checkpoint.to_local_bytes());
+                bytes[41..LEGACY_SIZE].copy_from_slice(&checkpoint.to_local_bytes());
             }
-            let mut staging = tempfile::NamedTempFile::new_in(&self.directory).map_err(io)?;
-            let metadata = staging.as_file().metadata().map_err(io)?;
+            let checksum = Sha256::digest(&bytes[..LEGACY_SIZE]);
+            bytes[LEGACY_SIZE..].copy_from_slice(&checksum);
+            let mut staging = fs::private_named_tempfile(&self.directory).map_err(io)?;
+            let metadata = fs::file_metadata(staging.as_file()).map_err(io)?;
             if metadata.mode() & 0o077 != 0 || metadata.uid() != self.identity.2 {
                 return Err(permission());
             }
             staging.write_all(&bytes).map_err(io)?;
             staging.as_file().sync_all().map_err(io)?;
             if initial {
-                staging
-                    .persist_noclobber(self.directory.join(RECORD))
-                    .map_err(|error| io(error.error))?;
+                fs::persist(staging, &self.directory.join(RECORD), false).map_err(io)?;
             } else {
-                staging
-                    .persist(self.directory.join(RECORD))
-                    .map_err(|error| io(error.error))?;
+                fs::persist(staging, &self.directory.join(RECORD), true).map_err(io)?;
             }
             Ok(())
         }
@@ -228,13 +264,16 @@ mod file {
             if let Some(previous) = &previous {
                 previous.require_successor(candidate)?;
             }
-            if previous.as_ref() == Some(candidate) {
+            if previous.as_ref() == Some(candidate)
+                && fs::file_metadata(&file).map_err(io)?.len() == SIZE as u64
+            {
                 // Reconfirm durability after a possibly lost/failed prior fsync acknowledgement.
                 file.sync_all().map_err(io)?;
             } else {
+                drop(file);
                 self.write_record(Some(candidate), false)?;
             }
-            directory.sync_all().map_err(io)?;
+            fs::sync_directory(&directory).map_err(io)?;
             Ok(())
         }
 
@@ -278,9 +317,41 @@ mod file {
     fn permission() -> EncryptionError {
         EncryptionError::CheckpointUnavailable(std::io::ErrorKind::PermissionDenied)
     }
+
+    #[cfg(test)]
+    mod creation_tests {
+        use super::*;
+
+        #[test]
+        fn failed_initial_write_releases_unadmitted_lock_and_allows_retry() {
+            let temporary = tempfile::tempdir().unwrap();
+            let directory = temporary.path().join("checkpoint");
+            fs::create_private_directory(&directory).unwrap();
+            let binding = SessionBinding::new(
+                "create-failure".into(),
+                "account".into(),
+                crate::e2ee::RepositoryId::generate().unwrap(),
+            )
+            .unwrap();
+            let failed = FileCheckpointStore::create_with_writer(&directory, &binding, |_| {
+                Err(EncryptionError::CheckpointUnavailable(
+                    std::io::ErrorKind::Interrupted,
+                ))
+            });
+            assert!(matches!(
+                failed,
+                Err(EncryptionError::CheckpointUnavailable(
+                    std::io::ErrorKind::Interrupted
+                ))
+            ));
+            assert!(!directory.join(LOCK).exists());
+            let store = FileCheckpointStore::create(&directory, &binding).unwrap();
+            assert!(store.load(&binding).unwrap().is_none());
+        }
+    }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub use file::FileCheckpointStore;
 
 #[cfg(all(test, unix))]
@@ -354,7 +425,7 @@ mod tests {
             Some(next.checkpoint(&fixture_root()).unwrap())
         );
         let bytes = fs::read(directory.path().join("checkpoint")).unwrap();
-        assert_eq!(bytes.len(), 105);
+        assert_eq!(bytes.len(), 137);
         let secret: Vec<u8> = (0..32).collect();
         assert!(!bytes.windows(32).any(|window| window == secret));
     }
@@ -524,3 +595,6 @@ mod tests {
         ));
     }
 }
+use crate::e2ee::native_fs::{self as fs, File, OpenOptions};
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};

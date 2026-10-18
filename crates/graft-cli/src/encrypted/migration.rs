@@ -237,8 +237,10 @@ pub(super) fn run(
                 let staging = temporary.path().join("staging");
                 create_private(&checkpoint)?;
                 create_private(&staging)?;
-                let bearer_token = std::env::var(&args.token_env)
-                    .context("account bearer token is unavailable")?;
+                let bearer_token = Zeroizing::new(
+                    std::env::var(&args.token_env)
+                        .context("account bearer token is unavailable")?,
+                );
                 let verification = MigrationVerificationOptions {
                     worktree: verification_directory.clone(),
                     checkpoint,
@@ -247,7 +249,7 @@ pub(super) fn run(
                         max_buffered_plaintext: 4 * 1024 * 1024,
                         max_ciphertext_spool: 8 * 1024 * 1024 * 1024,
                     },
-                    bearer_token,
+                    bearer_token: bearer_token.to_string(),
                 };
                 let proof = if let Some(fence) = fence.as_mut() {
                     coordinator.verify_and_cutover(fence, verification_password, verification)?
