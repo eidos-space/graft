@@ -205,7 +205,9 @@ function githubFixture({ releases = true, untrustedMajor = false } = {}) {
     repository: "eidos-space/graft",
     token: "synthetic-test-token",
     fetcher: async (url, options) => {
-      const route = url.split("/repos/eidos-space/graft/")[1];
+      const parsed = new URL(url);
+      const route =
+        parsed.pathname.slice("/repos/eidos-space/graft".length).replace(/^\//, "") + parsed.search;
       requests.push({ route, method: options.method });
       let result;
       if (options.method === "POST") {
@@ -247,6 +249,24 @@ function githubFixture({ releases = true, untrustedMajor = false } = {}) {
   });
   return { client, current, run, comments, requests };
 }
+
+test("repository metadata uses the GitHub root endpoint without a trailing slash", async () => {
+  const urls = [];
+  const client = createClient({
+    repository: "eidos-space/graft",
+    token: "synthetic-test-token",
+    fetcher: async (url) => {
+      urls.push(url);
+      return { ok: true, json: async () => ({ id: 123 }) };
+    },
+  });
+  await client.api("");
+  await client.api("actions/runs/71");
+  assert.deepEqual(urls, [
+    "https://api.github.com/repos/eidos-space/graft",
+    "https://api.github.com/repos/eidos-space/graft/actions/runs/71",
+  ]);
+});
 
 test("actual API orchestration reads annotated releases and leaves machine-readable PR evidence", async () => {
   const fixture = githubFixture({ untrustedMajor: true });

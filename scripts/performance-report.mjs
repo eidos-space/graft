@@ -190,7 +190,7 @@ export function createClient({
   assert.match(repository ?? "", /^[\w.-]+\/[\w.-]+$/);
   assert.ok(token, "Missing GitHub credential");
   const api = async (route, method = "GET", body) => {
-    const response = await fetcher(`${origin}/repos/${repository}/${route}`, {
+    const response = await fetcher(`${origin}/repos/${repository}${route ? `/${route}` : ""}`, {
       method,
       headers: {
         Authorization: `Bearer ${token}`,
