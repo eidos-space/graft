@@ -36,8 +36,8 @@ jobs:
       - name: CLI input regressions
         run: |
           cargo test -p graft-cli --features e2ee --bin graft encrypted::tests:: --locked
-      - name: Build native Node adapter
-        run: cargo build -p graft-sdk-node --features e2ee --locked
+      - name: Build native CLI and Node adapters
+        run: cargo build -p graft-cli -p graft-sdk-node --features e2ee --locked
       - name: Initial source intent regression
         run: cargo test -p graft-sdk-node --features e2ee --lib --locked
       - name: Verify Windows native storage and Node session lifecycle
