@@ -593,7 +593,43 @@ fn repo_branch_snapshots(
             if runtime_snapshot.is_empty() {
                 continue;
             }
-            prepare_repo_snapshot_for_push(runtime, &snapshot, Some(remote_store.clone()))?;
+            if let Err(destination_error) =
+                prepare_repo_snapshot_for_push(runtime, &snapshot, Some(remote_store.clone()))
+            {
+                // A clone materializes the current snapshot, not every historical
+                // page. Republishing its history to a new remote may need bytes
+                // that only the original source retains. The new destination
+                // cannot supply those bytes before its first publication.
+                let mut hydrated = false;
+                let mut sources = BTreeSet::new();
+                for source in repo.remote_tracking_branches()? {
+                    if source.remote == remote || sources.contains(&source.remote) {
+                        continue;
+                    }
+                    if !repo_reachable_commits_known_locally(repo, [source.head])
+                        .contains(&commit.id)
+                    {
+                        continue;
+                    }
+                    sources.insert(source.remote.clone());
+                    let Ok(source_store) = repo.remote_store(&source.remote) else {
+                        continue;
+                    };
+                    if prepare_repo_snapshot_for_push(
+                        runtime,
+                        &snapshot,
+                        Some(Arc::new(source_store)),
+                    )
+                    .is_ok()
+                    {
+                        hydrated = true;
+                        break;
+                    }
+                }
+                if !hydrated {
+                    return Err(destination_error);
+                }
+            }
             snapshots.push(runtime_snapshot);
         }
     }
