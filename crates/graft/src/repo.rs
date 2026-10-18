@@ -29,9 +29,9 @@ pub use path_history::{
 pub mod index;
 mod inventory;
 mod merge;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod mutation_gate;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub use mutation_gate::RepositoryMutationGuard;
 #[cfg(all(feature = "e2ee", not(target_arch = "wasm32")))]
 mod migration;
@@ -108,7 +108,7 @@ const ARTIFACT_STAT_CACHE_MAX_ENTRIES: usize = 100_000;
 
 thread_local! {
     static ACTIVE_CANCELLATION: RefCell<Option<CancellationToken>> = const { RefCell::new(None) };
-    #[cfg(all(feature = "e2ee", unix))]
+    #[cfg(all(feature = "e2ee", any(unix, windows)))]
     static ACTIVE_SECRET_CANCELLATION: RefCell<Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>> = const { RefCell::new(None) };
     static ACTIVE_TRANSFER_PROGRESS: RefCell<Option<TransferProgressReporter>> = const { RefCell::new(None) };
 }
@@ -420,7 +420,7 @@ pub fn with_cancellation<T>(token: &CancellationToken, operation: impl FnOnce() 
 
 /// Returns [`RepoErr::Cancelled`] when the current operation's token was cancelled.
 pub fn cancellation_checkpoint() -> Result<()> {
-    #[cfg(all(feature = "e2ee", unix))]
+    #[cfg(all(feature = "e2ee", any(unix, windows)))]
     if ACTIVE_SECRET_CANCELLATION
         .with(|active| active.borrow().as_ref().is_some_and(|probe| probe()))
     {
@@ -439,7 +439,7 @@ pub fn cancellation_checkpoint() -> Result<()> {
 }
 
 /// Add a scoped native session check while retaining the host's cancellation token.
-#[cfg(all(feature = "e2ee", unix))]
+#[cfg(all(feature = "e2ee", any(unix, windows)))]
 pub(crate) fn with_secret_cancellation<T>(
     probe: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
     operation: impl FnOnce() -> T,
@@ -458,7 +458,7 @@ pub(crate) fn active_cancellation_token() -> Option<CancellationToken> {
     ACTIVE_CANCELLATION.with(|active| active.borrow().clone())
 }
 
-#[cfg(all(feature = "e2ee", unix))]
+#[cfg(all(feature = "e2ee", any(unix, windows)))]
 pub(crate) fn active_secret_cancellation_probe()
 -> Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>> {
     ACTIVE_SECRET_CANCELLATION.with(|active| active.borrow().clone())
@@ -490,7 +490,7 @@ const REMOTE_OBJECT_PACK_MAGIC: &[u8] = b"graft-object-pack-v1\n";
 
 #[cfg(all(feature = "e2ee", not(target_arch = "wasm32")))]
 mod e2ee_pack;
-#[cfg(all(feature = "e2ee", unix))]
+#[cfg(all(feature = "e2ee", any(unix, windows)))]
 mod e2ee_push;
 mod fetch_boundary;
 mod index_budget;
@@ -2220,7 +2220,7 @@ impl Repository {
             user_identity: None,
         };
 
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let _mutation = {
             fs::create_dir_all(&repo.graft_dir)?;
             repo.mutation_guard()?

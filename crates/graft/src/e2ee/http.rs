@@ -12,6 +12,9 @@ use sha2::{Digest, Sha256};
 use std::{collections::HashSet, fmt, ops::Range, path::Path, sync::Arc, time::Duration};
 
 const MAX_RANGE_PLAINTEXT: u64 = 64 * 1024 * 1024;
+// Includes upload, headers and the complete streamed response, even when a peer
+// keeps sending fragments more frequently than the per-read timeout.
+const TRANSFER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 #[path = "http/multipart.rs"]
 mod multipart;
@@ -77,6 +80,7 @@ pub struct EncryptedHttpClient {
     credentials: RemoteCredentials,
     session: SecretSession,
     client: reqwest::Client,
+    transfer_timeout: Duration,
     verified: Arc<tokio::sync::Mutex<Option<VerifiedProfile>>>,
 }
 
@@ -525,7 +529,7 @@ impl EncryptedHttpClient {
                 self.client
                     .get(url)
                     .header("Graft-Protocol", "1")
-                    .timeout(Duration::from_secs(60)),
+                    .timeout(Duration::from_secs(60).min(self.transfer_timeout)),
             );
             operation.check_active()?;
             let response = tokio::select! {
@@ -662,24 +666,28 @@ impl EncryptedHttpClient {
         {
             return Err(EncryptedHttpError::InvalidEndpoint);
         }
-        let client = reqwest::ClientBuilder::new()
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .http1_only()
-            .hickory_dns(!cfg!(target_os = "android"))
-            .pool_max_idle_per_host(1)
-            .connect_timeout(Duration::from_secs(5))
-            .read_timeout(Duration::from_secs(60))
-            .build()
-            .map_err(transport_error)?;
+        let client = transfer_client(TRANSFER_TIMEOUT)?;
         Ok(Self {
             base,
             remote_name,
             credentials,
             session,
             client,
+            transfer_timeout: TRANSFER_TIMEOUT,
             verified: Arc::default(),
         })
+    }
+
+    /// Host-selected wall-clock limit for each HTTP exchange, including streamed
+    /// upload and download bodies. Retry and multipart requests each get a fresh
+    /// limit; mutation timeouts retain the exact journal candidate for recovery.
+    pub fn with_transfer_timeout(mut self, timeout: Duration) -> Result<Self> {
+        if timeout.is_zero() {
+            return Err(EncryptionError::TooLarge.into());
+        }
+        self.client = transfer_client(timeout)?;
+        self.transfer_timeout = timeout;
+        Ok(self)
     }
 
     /// First online use in each unlock epoch authenticates the current config.
@@ -794,10 +802,7 @@ impl EncryptedHttpClient {
 
     /// Retry this same candidate; never prepare a new ciphertext for an uncertain request.
     /// Admission errors happen before dispatch. After dispatch, unknown outcomes retain causes.
-    pub async fn publish_ref(
-        &self,
-        candidate: &PreparedRefMutation,
-    ) -> Result<RefPublicationOutcome> {
+    async fn publish_ref(&self, candidate: &PreparedRefMutation) -> Result<RefPublicationOutcome> {
         let admission = self.session.begin_operation()?;
         candidate.validate(&admission)?;
         drop(admission);
@@ -1401,7 +1406,7 @@ impl EncryptedHttpClient {
             self.client
                 .get(url)
                 .header("Graft-Protocol", "1")
-                .timeout(Duration::from_secs(60)),
+                .timeout(Duration::from_secs(60).min(self.transfer_timeout)),
         );
         let response = tokio::select! {
             result = request.send() => result.map_err(transport_error)?,
@@ -1429,16 +1434,37 @@ pub(crate) fn validate_endpoint(url: &str) -> Result<reqwest::Url> {
     Ok(base)
 }
 
+fn transfer_client(timeout: Duration) -> Result<reqwest::Client> {
+    if timeout.is_zero() || std::time::Instant::now().checked_add(timeout).is_none() {
+        return Err(EncryptionError::TooLarge.into());
+    }
+    reqwest::ClientBuilder::new()
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .http1_only()
+        .hickory_dns(!cfg!(target_os = "android"))
+        .pool_max_idle_per_host(1)
+        .connect_timeout(Duration::from_secs(5))
+        .read_timeout(Duration::from_secs(60))
+        .timeout(timeout)
+        .build()
+        .map_err(transport_error)
+}
+
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Descriptor {
     protocol: String,
     version: u16,
+    #[serde(default, rename = "repository")]
+    _repository: Option<String>,
     encryption: EncryptionDescriptor,
     capabilities: HashSet<String>,
     #[serde(default)]
     limits: Limits,
 }
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct EncryptionDescriptor {
     profile: String,
     version: u16,
@@ -1446,6 +1472,7 @@ struct EncryptionDescriptor {
     uuid: String,
 }
 #[derive(Clone, Copy, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Limits {
     max_request_bytes: Option<u64>,
     multipart_part_bytes: Option<u64>,
@@ -1780,6 +1807,124 @@ mod tests {
             .set_http_bearer_token("origin", "account-token".into())
             .unwrap();
         EncryptedHttpClient::new(url, "origin".into(), credentials, session).unwrap()
+    }
+
+    #[tokio::test]
+    async fn total_transfer_timeout_stops_a_peer_that_keeps_sending_bytes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let serving = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request(&mut stream).await;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n")
+                .await
+                .unwrap();
+            for _ in 0..100 {
+                if stream.write_all(b"x").await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        let client = transfer_client(Duration::from_millis(150)).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            client
+                .get(format!("http://{address}/"))
+                .send()
+                .await
+                .unwrap()
+                .bytes()
+                .await
+        })
+        .await
+        .expect("an active slow peer must not defeat the total deadline");
+        assert!(result.unwrap_err().is_timeout());
+        serving.abort();
+    }
+
+    #[test]
+    fn descriptor_rejects_unknown_control_fields() {
+        let repository = fixture_root().repository();
+        let mut supported = descriptor();
+        supported["repository"] = "acme/repository".into();
+        assert!(validate_descriptor(&serde_json::to_vec(&supported).unwrap(), repository).is_ok());
+        let mut value = descriptor();
+        value["unexpected"] = true.into();
+        assert!(validate_descriptor(&serde_json::to_vec(&value).unwrap(), repository).is_err());
+        let mut value = descriptor();
+        value["encryption"]["unexpected"] = true.into();
+        assert!(validate_descriptor(&serde_json::to_vec(&value).unwrap(), repository).is_err());
+        let mut value = descriptor();
+        value["limits"] = serde_json::json!({"unexpected":1});
+        assert!(validate_descriptor(&serde_json::to_vec(&value).unwrap(), repository).is_err());
+    }
+
+    #[tokio::test]
+    async fn total_transfer_timeout_also_covers_a_streamed_upload() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let serving = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        });
+        let body = futures::stream::unfold(0_u32, |index| async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Some((Ok::<_, std::io::Error>(vec![1_u8]), index + 1))
+        });
+        let client = transfer_client(Duration::from_millis(150)).unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            client
+                .post(format!("http://{address}/"))
+                .body(reqwest::Body::wrap_stream(body))
+                .send(),
+        )
+        .await
+        .expect("the upload must obey the total deadline");
+        assert!(result.unwrap_err().is_timeout());
+        serving.abort();
+    }
+
+    #[tokio::test]
+    async fn fetch_bundle_accepts_authenticated_annotated_tag_refs() {
+        let target = RefTarget::AnnotatedTag { object: [7; 32], commit: [9; 32] };
+        let reference =
+            super::super::EncryptedRef::seal(&fixture_root(), "refs/tags/release", &target)
+                .unwrap();
+        let frames = super::super::codec::encode(&[]).unwrap();
+        let manifest = super::super::codec::encode(&[
+            &1_u16.to_be_bytes(),
+            reference.remote_key().as_bytes(),
+            reference.as_bytes(),
+            &frames,
+        ])
+        .unwrap();
+        let mut body = b"GRAFTEB1".to_vec();
+        body.extend_from_slice(&(manifest.len() as u32).to_be_bytes());
+        body.extend_from_slice(&manifest);
+        let mut descriptor = descriptor();
+        descriptor["capabilities"]
+            .as_array_mut()
+            .unwrap()
+            .push("e2ee-fetch-bundle".into());
+        let mut bundled = reply(body);
+        bundled.headers.push_str(&format!("Content-Type: application/vnd.graft.e2ee-bundle\r\nx-graft-bundle-objects: 0\r\nx-graft-bundle-total-bytes: {}\r\n", bundled.bytes.len()));
+        let (url, requests) = server(vec![
+            reply(serde_json::to_vec(&descriptor).unwrap()),
+            reply(config().as_bytes().to_vec()),
+            bundled,
+        ])
+        .await;
+        let directory = tempfile::tempdir().unwrap();
+        let fetched = client(&url, session())
+            .fetch_bundle("refs/tags/release", None, directory.path(), 1024)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(fetched.reference.target() == Some(&target));
+        assert!(fetched.entries.is_empty());
+        assert_eq!(requests.await.unwrap().len(), 3);
     }
 
     #[cfg(unix)]

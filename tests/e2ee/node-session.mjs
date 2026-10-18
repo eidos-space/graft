@@ -1,6 +1,6 @@
 // Real native Node addon + actual TypeScript remote. All values are synthetic.
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
@@ -30,21 +30,31 @@ try {
   const [line] = await once(lines, "line");
   const ready = JSON.parse(line);
   const uuid = "00010203-0405-4607-8809-0a0b0c0d0e0f";
-  function privateDirectory(name) { const path = join(directory, name); mkdirSync(path, { mode: 0o700 }); return path; }
+  function privateDirectory(name) { const path = join(directory, name); EncryptedRemoteSession.createPrivateDirectory(path); return path; }
   function options(name, extra = {}) { return { remoteName: "origin", url: ready.integrationUrl, uuid, authenticationDomain: "native.test", accountSubject: "test-account", bearerToken: "account-token", checkpointDirectory: privateDirectory(`${name}-checkpoint`), createCheckpoint: true, stagingDirectory: privateDirectory(`${name}-staging`), recoveryDirectory: privateDirectory(`${name}-recovery`), ...extra }; }
   const enrollmentOptions = options("enrollment", { url: ready.enrollmentUrl, remoteName: "vault" });
   enrollmentAuthority = new EncryptedRemoteSession(enrollmentOptions);
   const invalidInitial = Buffer.from([0xff]);
   await assert.rejects(enrollmentAuthority.initializeConfig(invalidInitial), { code: "GRAFT_SDK_E2EE_INVALID_PASSWORD" });
   assert.ok(invalidInitial.every((value) => value === 0));
+  const initialSourceDirectory = privateDirectory("initial-source");
+  initialSource = new RepositorySession(initialSourceDirectory, { encryptedRemote: enrollmentAuthority });
+  await initialSource.open();
+  await initialSource.init();
+  await initialSource.addEncryptedRemote();
+  writeFileSync(join(initialSourceDirectory, "initial-node-private.txt"), "node initial private attachment");
+  await initialSource.addAll();
+  await initialSource.commit("node initial private commit");
+  const initialHead = (await initialSource.repositoryMetadata()).current_head;
   const initialPassword = Buffer.from("node random enrollment password");
-  const initializing = enrollmentAuthority.initializeConfig(initialPassword);
+  const initializing = enrollmentAuthority.initializeConfig(initialPassword, { branch: "main", commit: initialHead });
   assert.ok(initialPassword.every((value) => value === 0));
   assert.equal(enrollmentAuthority.state, "unlocking");
   assert.equal(await initializing, "unknown");
   assert.equal(enrollmentAuthority.state, "unlocked");
   const initialPut = JSON.parse(readFileSync(capture)).find((request) => request.path === "/acme/enrollment/raw-if-not-exists/e2ee/config");
   assert.ok(initialPut.droppedInitialConfigResponse);
+  await initialSource.close();
   await enrollmentAuthority.disconnect();
   enrollmentAuthority = new EncryptedRemoteSession({ ...enrollmentOptions, createCheckpoint: false });
   const wrongInitial = Buffer.from("wrong node enrollment password");
@@ -67,16 +77,9 @@ try {
   assert.equal(initialPuts.length, 2);
   assert.notEqual(initialPuts[0].body, initialPuts[1].body);
   await enrollmentAuthority.unlock(Buffer.from("node random enrollment password"));
-  const initialSourceDirectory = privateDirectory("initial-source");
   initialSource = new RepositorySession(initialSourceDirectory, { encryptedRemote: enrollmentAuthority });
   await initialSource.open();
-  await initialSource.init();
-  await initialSource.addEncryptedRemote();
-  writeFileSync(join(initialSourceDirectory, "initial-node-private.txt"), "node initial private attachment");
-  await initialSource.addAll();
-  await initialSource.commit("node initial private commit");
-  const initialHead = (await initialSource.repositoryMetadata()).current_head;
-  // Reject unsafe verifiers before even retaining initialization intent.
+  // Reject unsafe verifiers before any source publication or journal mutation.
   function snapshotFiles(path) {
     return readdirSync(path, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name)).map((entry) => [entry.name, entry.isDirectory() ? snapshotFiles(join(path, entry.name)) : readFileSync(join(path, entry.name)).toString("hex")]);
   }
@@ -155,7 +158,8 @@ try {
   await namedPeer.fetch({ remote: "vault", branch: "main" });
   const firstOptions = options("source");
   const unsafeOptions = options("unsafe-recovery");
-  chmodSync(unsafeOptions.recoveryDirectory, 0o755);
+  if (process.platform === "win32") execFileSync("icacls", [unsafeOptions.recoveryDirectory, "/grant", "*S-1-1-0:(OI)(CI)F"]);
+  else chmodSync(unsafeOptions.recoveryDirectory, 0o755);
   assert.throws(() => new EncryptedRemoteSession(unsafeOptions), { code: "GRAFT_SDK_E2EE_CHECKPOINT_UNAVAILABLE" });
   assert.equal(existsSync(join(unsafeOptions.checkpointDirectory, "checkpoint")), false);
   const disposableOptions = options("disposable-recovery");
@@ -165,7 +169,7 @@ try {
   const lostAuthority = new EncryptedRemoteSession(lostOptions);
   await lostAuthority.disconnect();
   rmSync(lostOptions.recoveryDirectory, { recursive: true });
-  mkdirSync(lostOptions.recoveryDirectory, { mode: 0o700 });
+  EncryptedRemoteSession.createPrivateDirectory(lostOptions.recoveryDirectory);
   const beforeLostReopen = existsSync(capture) ? readFileSync(capture, "utf8") : null;
   assert.throws(() => new EncryptedRemoteSession({ ...lostOptions, createCheckpoint: false }), { code: "GRAFT_SDK_E2EE_CHECKPOINT_UNAVAILABLE" });
   // Failed enrollment cannot manufacture a replacement namespace next to an
@@ -330,6 +334,11 @@ try {
     await assert.rejects(unentitled.unlockRemembered(), { code: "GRAFT_SDK_E2EE_SECURE_STORAGE_UNAVAILABLE" });
     await assert.rejects(unentitled.forget(), { code: "GRAFT_SDK_E2EE_SECURE_STORAGE_UNAVAILABLE" });
     assert.equal(unentitled.state, "disconnected");
+    // Forget drains every session sharing the exact credential binding, even
+    // when the provider refuses deletion. Further sync needs explicit admission.
+    assert.equal(peerAuthority.state, "disconnected");
+    peerAuthority.reconnect("account-token");
+    await peerAuthority.unlock(Buffer.from("node synthetic sync password"));
   }
   // A malicious service can store a structurally valid but unauthenticated ref.
   // Exercise that through the actual handler, then restore the exact ciphertext.

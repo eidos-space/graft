@@ -20,7 +20,7 @@ let source;
 try {
   const [line] = await once(lines, "line");
   const ready = JSON.parse(line);
-  function privateDirectory(name) { const path = join(directory, name); mkdirSync(path, { mode: 0o700 }); return path; }
+  function privateDirectory(name) { const path = join(directory, name); EncryptedRemoteSession.createPrivateDirectory(path); return path; }
   const options = { remoteName: "vault", url: ready.migrationUrl,
     uuid: "40010203-0405-4607-8809-0a0b0c0d0e0f", authenticationDomain: "native.test", accountSubject: "test-account", bearerToken: "account-token",
     checkpointDirectory: privateDirectory("checkpoint"), recoveryDirectory: privateDirectory("recovery"), stagingDirectory: privateDirectory("staging"), createCheckpoint: true };

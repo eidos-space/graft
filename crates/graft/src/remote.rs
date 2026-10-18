@@ -329,13 +329,14 @@ impl RemoteCredentials {
         account: &str,
         token: String,
     ) -> std::result::Result<(), RemoteCredentialErr> {
+        let token = BearerToken::new(token);
         if self.mode != RemoteCredentialMode::Explicit {
             return Err(RemoteCredentialErr::EnvironmentCredentialsReadOnly);
         }
         if !valid_credential_remote_name(remote_name) {
             return Err(RemoteCredentialErr::InvalidRemoteName);
         }
-        if token.is_empty() {
+        if token.expose().is_empty() {
             return Err(RemoteCredentialErr::EmptyBearerToken);
         }
         let registrations = self.encrypted_sessions.read();
@@ -348,7 +349,7 @@ impl RemoteCredentials {
         }
         self.http_bearer_tokens
             .write()
-            .insert(remote_name.to_owned(), BearerToken::new(token));
+            .insert(remote_name.to_owned(), token);
         Ok(())
     }
     /// Register a host-authorized account/domain/root session for one pinned remote.
@@ -510,13 +511,14 @@ impl RemoteCredentials {
         remote_name: &str,
         token: String,
     ) -> std::result::Result<(), RemoteCredentialErr> {
+        let token = BearerToken::new(token);
         if self.mode != RemoteCredentialMode::Explicit {
             return Err(RemoteCredentialErr::EnvironmentCredentialsReadOnly);
         }
         if !valid_credential_remote_name(remote_name) {
             return Err(RemoteCredentialErr::InvalidRemoteName);
         }
-        if token.is_empty() {
+        if token.expose().is_empty() {
             return Err(RemoteCredentialErr::EmptyBearerToken);
         }
         #[cfg(feature = "e2ee")]
@@ -527,7 +529,7 @@ impl RemoteCredentials {
         }
         self.http_bearer_tokens
             .write()
-            .insert(remote_name.to_string(), BearerToken::new(token));
+            .insert(remote_name.to_string(), token);
         Ok(())
     }
 
@@ -1171,7 +1173,7 @@ impl Remote {
         Ok(())
     }
 
-    #[cfg(all(feature = "e2ee", unix))]
+    #[cfg(all(feature = "e2ee", any(unix, windows)))]
     pub(crate) fn begin_encrypted_operation(&self) -> Result<crate::e2ee::SessionOperation> {
         let RemoteBackend::Encrypted(remote) = &self.backend else {
             return Err(crate::e2ee::EncryptionError::UnsupportedProfile.into());
@@ -1182,7 +1184,7 @@ impl Remote {
     /// Run trusted synchronous native work in this encrypted session's epoch.
     /// Adds secret cancellation without replacing the host cancellation token.
     /// Does not authenticate remote config or grant plugin access to secrets.
-    #[cfg(all(feature = "e2ee", unix))]
+    #[cfg(all(feature = "e2ee", any(unix, windows)))]
     pub fn with_encrypted_operation<T, E>(
         &self,
         work: impl FnOnce() -> std::result::Result<T, E>,
@@ -1207,7 +1209,7 @@ impl Remote {
         )
     }
 
-    #[cfg(all(feature = "e2ee", unix))]
+    #[cfg(all(feature = "e2ee", any(unix, windows)))]
     pub(crate) async fn publish_verified_file(
         &self,
         path: &str,
@@ -1221,7 +1223,7 @@ impl Remote {
         remote.put_verified_file(path, source, length, digest).await
     }
 
-    #[cfg(all(feature = "e2ee", unix))]
+    #[cfg(all(feature = "e2ee", any(unix, windows)))]
     pub(crate) fn encrypted_plaintext_spool(&self) -> Result<(std::fs::File, u64)> {
         let RemoteBackend::Encrypted(remote) = &self.backend else {
             return Err(crate::e2ee::EncryptionError::UnsupportedProfile.into());
@@ -1229,7 +1231,7 @@ impl Remote {
         remote.plaintext_spool()
     }
 
-    #[cfg(all(feature = "e2ee", unix))]
+    #[cfg(all(feature = "e2ee", any(unix, windows)))]
     pub(crate) async fn publish_verified_handle(
         &self,
         path: &str,
@@ -1495,7 +1497,7 @@ impl Remote {
 
     /// Authenticate private retained initialization against the registered
     /// transport root without publishing or advancing its checkpoint.
-    #[cfg(all(feature = "e2ee", unix))]
+    #[cfg(all(feature = "e2ee", any(unix, windows)))]
     pub fn authenticate_encrypted_recovery_config(
         &self,
         config: &crate::e2ee::EncryptedConfig,
@@ -1900,7 +1902,7 @@ impl Remote {
         }
     }
 
-    #[cfg(all(feature = "e2ee", unix))]
+    #[cfg(all(feature = "e2ee", any(unix, windows)))]
     pub(crate) async fn publish_encrypted_object_pack(
         &self,
         pack: &RemoteObjectPack,

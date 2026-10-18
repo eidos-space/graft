@@ -1,6 +1,6 @@
 # Graft E2EE Remote 1.0
 
-Status: Final design specification; opt-in Unix native source implementation; production validation pending
+Status: Final design specification; opt-in Unix and Windows native source implementation; production validation pending
 Version: 1.0
 Design date: 2026-10-12
 Canonical language: English
@@ -265,6 +265,10 @@ another defined chunk size without changing plaintext identity.
 Local decrypted caches follow the local-plaintext model with private file
 permissions. Sync lock does not erase already delivered plaintext or encrypt
 temporary SQLite databases. Server and upload spools SHOULD retain ciphertext.
+An upper-layer immutable snapshot MAY use an ephemeral plaintext spool before
+encryption. Such a spool MUST be bounded, owner-private before its first write,
+and deleted when its final handle closes. It MUST NOT become durable recovery
+state; retained upload candidates remain ciphertext.
 
 A session-local discovery cache MAY retain bounded encrypted headers to recover
 immutable logical identities during listing. It MUST be scoped to the pinned
@@ -593,12 +597,20 @@ key/logical-ref association before binding a new observation handle. Missing or
 corrupt records MUST fail, never silently create a replacement candidate. A
 durable journal bind MUST precede mutation dispatch. Key-owning persistence work
 MUST remain inside the session lock/drain boundary if its caller exits.
+Host registration without a durable ref journal permits encrypted reads, but
+MUST NOT authorize mutable ref publication.
+Every branch, tag, HEAD and aggregate receive mutation MUST reject missing
+recovery storage before dispatch; no primitive publication fallback may bypass it.
 
 An active per-ref recovery slot MUST NOT be replaced by a different operation
 while its outcome remains unknown or unconfirmed. Retirement requires confirmed
 publication or conclusive conflict, exact comparison with the retained candidate
 and durable acknowledgement. A delayed retirement MUST NOT clear a newer
 candidate. Independent refs MUST retain independent recovery slots.
+Idempotent retirement MUST compare an exact retained retirement record;
+an empty slot is not evidence that the requested candidate was retired. Native
+checkpoint checksums detect accidental local corruption, not a malicious local
+administrator; existing trust MUST never be recreated after record loss.
 
 Recovery namespaces MUST distinguish explicit first enrollment from reopening.
 Durable identity-bound allocation evidence MUST precede admission of a new slot.
@@ -715,6 +727,14 @@ MUST drain all sessions sharing the entry before deletion and prevent reconnect
 until deletion exits. A failed deletion MUST NOT be reported as forgotten;
 cancelling a save/delete caller does not prove that the OS mutation failed.
 
+The native session coordinator MUST fence all process-local sessions with the
+same exact authentication domain, account and repository binding, including
+distinct provider instances. New session construction, reconnect, unlock and
+remember admission MUST remain closed until deletion exits. Cancellation of
+the forget caller, including while draining sibling sessions, MUST NOT release
+this fence. Hosts sharing one credential entry across processes MUST coordinate
+those processes before invoking deletion.
+
 Offline startup may use validated local bindings/checkpoints, not claim current
 remote validation. The first online operation MUST verify current config.
 System lock/suspend SHOULD lock sync; resume respects saved-device policy.
@@ -799,6 +819,11 @@ from a subsequently changed local HEAD. Missing or inconsistent retained intent
 MUST stop source publication and stage advancement. A changed source MUST fail
 before remote discovery and be rechecked before publishing dependencies. Intent
 metadata stays outside the repository, plugin storage and default diagnostics.
+
+The Node host accepts `{ branch, commit }` with `initializeConfig` and persists
+that intent before dispatching the config. Config-only enrollment without source
+intent cannot later publish an initial branch; `pushInitialBranch` MUST reject
+missing intent without binding the then-current HEAD.
 
 The source repository's persisted remote config MUST exactly match the trusted
 authority's intended config before binding initialization intent, and MUST be
@@ -936,6 +961,22 @@ structured results only. Native SDK/host adapters MUST preserve this spec rather
 than implementing encryption only around JS fetch/push calls.
 
 ## 20. Conformance and production gates
+
+Native recovery storage MUST preserve identity, exclusive access and durable
+replacement on every supported platform. Unix uses owner-only modes and
+device/inode identity. Windows uses owner/SYSTEM-only DACLs, volume/file identity,
+reparse-point rejection, native file locks, flushed records and write-through
+same-volume replacement. Unsupported ACL or identity operations MUST fail closed.
+Windows password entry MUST disable console echo and restore its original mode.
+Remembering is optional; Windows hosts without an approved OS key provider use
+explicit password-based session unlock.
+
+Every HTTP exchange, including aggregate, range, object and multipart bodies,
+MUST have a finite total deadline in addition to connect and read inactivity
+limits. Receiving periodic fragments MUST NOT reset that deadline. The native
+default is 15 minutes per data exchange; hosts MAY select another finite limit.
+Control requests may use a shorter deadline. A timed-out mutation retains its
+exact durable candidate and follows the unknown-outcome recovery rules.
 
 `GRAFT-E2EE-Remote-1.0` covers encrypted base operations, key/config/object/ref/
 hint codecs, lifecycle and verified fallback. `GRAFT-E2EE-Sync-1.0` additionally

@@ -10,6 +10,13 @@ const encryptedHandles = new WeakMap()
 class EncryptedRemoteSession {
   #native
 
+  static createPrivateDirectory(directory) {
+    if (!native.EncryptedRemoteSession?.createPrivateDirectory) {
+      throw new GraftSdkError("Native private storage is unavailable", "GRAFT_SDK_E2EE_UNSUPPORTED_ENCRYPTED_PROFILE")
+    }
+    return callSync(() => native.EncryptedRemoteSession.createPrivateDirectory(directory))
+  }
+
   constructor(options) {
     if (!native.EncryptedRemoteSession) {
       throw new GraftSdkError("Native E2EE support is unavailable", "GRAFT_SDK_E2EE_UNSUPPORTED_ENCRYPTED_PROFILE")
@@ -27,9 +34,9 @@ class EncryptedRemoteSession {
     return call(() => this.#native.unlock(password))
   }
   unlockRemembered() { return call(() => this.#native.unlockRemembered()) }
-  initializeConfig(password) {
+  initializeConfig(password, source) {
     if (!Buffer.isBuffer(password)) throw new GraftSdkError("Password input must be a Buffer", "GRAFT_SDK_INVALID_ARGUMENT")
-    return call(() => this.#native.initializeConfig(password))
+    return call(() => this.#native.initializeConfig(password, source))
   }
   resumeInitialConfig(password) {
     if (!Buffer.isBuffer(password)) throw new GraftSdkError("Password input must be a Buffer", "GRAFT_SDK_INVALID_ARGUMENT")

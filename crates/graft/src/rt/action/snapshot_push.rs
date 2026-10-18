@@ -25,7 +25,7 @@ use crate::{
 
 const SEGMENT_EXISTS_CONCURRENCY: usize = 5;
 
-#[cfg(all(feature = "e2ee", unix))]
+#[cfg(all(feature = "e2ee", any(unix, windows)))]
 mod encrypted;
 
 #[derive(Debug)]
@@ -97,15 +97,15 @@ pub(crate) async fn prepare_snapshots(
     }
 
     let collect_trace = crate::trace::PushTraceSpan::new("sqlite_snapshot_collect");
-    #[cfg(all(feature = "e2ee", unix))]
+    #[cfg(all(feature = "e2ee", any(unix, windows)))]
     let secret_cancellation = crate::repo::active_secret_cancellation_probe();
     let commits = spawn_blocking({
         let storage = storage.clone();
         let cancellation = cancellation.clone();
-        #[cfg(all(feature = "e2ee", unix))]
+        #[cfg(all(feature = "e2ee", any(unix, windows)))]
         let secret_cancellation = secret_cancellation.clone();
         move || {
-            #[cfg(all(feature = "e2ee", unix))]
+            #[cfg(all(feature = "e2ee", any(unix, windows)))]
             if let Some(probe) = secret_cancellation {
                 return crate::repo::with_secret_cancellation(probe, || {
                     collect_snapshots_commits(storage, snapshots, cancellation)
@@ -135,13 +135,13 @@ pub(crate) async fn prepare_snapshots(
         BTreeSet::new()
     };
     negotiation_trace.finish(&[("existing_segments", existing_segments.len() as u64)]);
-    #[cfg(all(feature = "e2ee", unix))]
+    #[cfg(all(feature = "e2ee", any(unix, windows)))]
     if remote.buffered_read_limit().is_some() {
         return encrypted::prepare(storage, remote, commits, existing_segments, cancellation).await;
     }
     let build_trace = crate::trace::PushTraceSpan::new("sqlite_snapshot_build");
     let uploads = spawn_blocking(move || {
-        #[cfg(all(feature = "e2ee", unix))]
+        #[cfg(all(feature = "e2ee", any(unix, windows)))]
         if let Some(probe) = secret_cancellation {
             return crate::repo::with_secret_cancellation(probe, || {
                 build_uploads(storage, commits, existing_segments, cancellation)
@@ -378,7 +378,7 @@ fn build_segment_for_commit(
 fn cancellation_checkpoint(
     cancellation: &Option<CancellationToken>,
 ) -> std::result::Result<(), GraftErr> {
-    #[cfg(all(feature = "e2ee", unix))]
+    #[cfg(all(feature = "e2ee", any(unix, windows)))]
     if crate::repo::cancellation_checkpoint().is_err() {
         return Err(LogicalErr::Cancelled.into());
     }

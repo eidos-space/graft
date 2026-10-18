@@ -7,7 +7,7 @@ use super::*;
 pub(super) struct FetchBoundary {
     pub objects: BTreeMap<object::ObjectId, GraphRole>,
     budget: GraphBudget,
-    #[cfg(all(feature = "e2ee", unix))]
+    #[cfg(all(feature = "e2ee", any(unix, windows)))]
     receipt: Option<(crate::e2ee::SessionOperation, String)>,
 }
 
@@ -90,7 +90,7 @@ impl FetchBoundary {
     }
 
     pub fn remember(&self, head: &str) -> Result<()> {
-        #[cfg(all(feature = "e2ee", unix))]
+        #[cfg(all(feature = "e2ee", any(unix, windows)))]
         if let Some((operation, scope)) = &self.receipt {
             operation
                 .remember_verified_graph_head(scope, head)
@@ -109,11 +109,11 @@ impl Repository {
         branch: &str,
         have: Option<&str>,
     ) -> Result<FetchBoundary> {
-        #[cfg(all(feature = "e2ee", unix))]
+        #[cfg(all(feature = "e2ee", any(unix, windows)))]
         if remote.buffered_read_limit().is_some() {
             let operation = remote.begin_encrypted_operation()?;
             let directory = fs::canonicalize(&self.graft_dir)?;
-            let metadata = fs::metadata(&directory)?;
+            let metadata = crate::native_fs::symlink_metadata(&directory)?;
             let config = self.config()?;
             let Some(RemoteConfig::EncryptedHttp { url, .. }) = config.remotes.get(name) else {
                 return Ok(FetchBoundary::default());
@@ -147,7 +147,7 @@ impl Repository {
         })
     }
 
-    #[cfg(all(feature = "e2ee", unix))]
+    #[cfg(all(feature = "e2ee", any(unix, windows)))]
     fn verified_boundary_objects(
         &self,
         head: &object::ObjectId,

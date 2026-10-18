@@ -32,7 +32,7 @@ try {
     throw new Error("Synthetic privacy service exited before readiness");
   })]);
   const ready = JSON.parse(line);
-  function privateDirectory(name) { const path = join(directory, name); mkdirSync(path, { mode: 0o700 }); return path; }
+  function privateDirectory(name) { const path = join(directory, name); EncryptedRemoteSession.createPrivateDirectory(path); return path; }
   function authority(name) {
     const value = new EncryptedRemoteSession({ remoteName: "origin", url: ready.integrationUrl,
       uuid: fixture.encryption.uuid, authenticationDomain: "native.test", accountSubject: "test-account", bearerToken: "account-token",

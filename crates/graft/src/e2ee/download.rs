@@ -8,7 +8,9 @@ type Result<T> = std::result::Result<T, EncryptedHttpError>;
 
 /// Tighten the unnamed file before writing either plaintext or ciphertext.
 /// Linux `O_TMPFILE` creation can otherwise inherit a permissive process umask.
-pub(super) fn private_staging_file(directory: &std::path::Path) -> Result<std::fs::File> {
+pub(crate) fn private_staging_file(directory: &std::path::Path) -> Result<std::fs::File> {
+    #[cfg(windows)]
+    super::native_fs::validate_private_directory(directory).map_err(local_io_error)?;
     let file = tempfile::tempfile_in(directory).map_err(local_io_error)?;
     #[cfg(unix)]
     {

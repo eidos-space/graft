@@ -40,7 +40,7 @@ pub(super) async fn prepare(
             )
         })
         .await
-        .expect("encrypted snapshot compressor failed")?;
+        .map_err(|_| LogicalErr::Other("encrypted snapshot compressor failed".into()))??;
         cancellation_checkpoint(&cancellation)?;
         if remote
             .buffered_read_limit()

@@ -82,7 +82,7 @@ impl SegmentBuilder {
 
     /// Drain completed compressed chunks while preserving the exact frame stream.
     /// Calling this after each page bounds retained payload to the compressor buffer.
-    #[cfg(all(feature = "e2ee", unix))]
+    #[cfg(all(feature = "e2ee", any(unix, windows)))]
     pub(crate) fn drain_chunks(&mut self) -> impl Iterator<Item = Bytes> {
         std::mem::take(&mut self.chunks).into_iter()
     }
@@ -235,7 +235,7 @@ mod test {
         assert!(chunks.is_empty());
     }
 
-    #[cfg(all(feature = "e2ee", unix))]
+    #[cfg(all(feature = "e2ee", any(unix, windows)))]
     #[test]
     fn draining_chunks_preserves_compressed_frames_with_bounded_retention() {
         let mut buffered = SegmentBuilder::new();

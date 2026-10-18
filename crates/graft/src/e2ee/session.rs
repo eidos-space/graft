@@ -6,7 +6,7 @@ use parking_lot::Mutex;
 use std::{
     collections::{BTreeMap, VecDeque},
     fmt,
-    sync::Arc,
+    sync::{Arc, OnceLock, Weak},
 };
 use tokio::sync::Notify;
 use zeroize::Zeroizing;
@@ -15,6 +15,7 @@ use zeroize::Zeroizing;
 static UNLOCK_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 
 /// Exact host identity for future secure-storage providers. Never normalize it.
+#[derive(Clone, PartialEq, Eq)]
 pub struct SessionBinding {
     domain: String,
     account: String,
@@ -75,6 +76,45 @@ struct Inner {
     checkpoint_gate: Mutex<()>,
     changed: Notify,
     checkpoint_store: Option<Arc<dyn CheckpointStore>>,
+    group: Arc<SessionGroup>,
+}
+
+// Conservative process-wide grouping by exact credential binding also covers
+// separate provider instances referring to the same OS entry.
+struct SessionGroup {
+    binding: SessionBinding,
+    state: Mutex<GroupState>,
+}
+#[derive(Default)]
+struct GroupState {
+    forgetting: bool,
+    sessions: Vec<Weak<Inner>>,
+}
+static SESSION_GROUPS: OnceLock<Mutex<Vec<Weak<SessionGroup>>>> = OnceLock::new();
+
+fn session_group(binding: &SessionBinding) -> Arc<SessionGroup> {
+    let mut groups = SESSION_GROUPS.get_or_init(Mutex::default).lock();
+    groups.retain(|group| group.strong_count() != 0);
+    if let Some(group) = groups
+        .iter()
+        .filter_map(Weak::upgrade)
+        .find(|group| group.binding == *binding)
+    {
+        return group;
+    }
+    let group = Arc::new(SessionGroup {
+        binding: binding.clone(),
+        state: Mutex::new(GroupState::default()),
+    });
+    groups.push(Arc::downgrade(&group));
+    group
+}
+
+struct ForgetGuard(Arc<SessionGroup>);
+impl Drop for ForgetGuard {
+    fn drop(&mut self) {
+        self.0.state.lock().forgetting = false;
+    }
 }
 
 /// Shared native session. No key/password serialization or provider auto-reload.
@@ -148,31 +188,40 @@ impl SecretSession {
         {
             return Err(EncryptionError::IdentityChanged);
         }
-        Ok(Self {
-            inner: Arc::new(Inner {
-                creator_pid: std::process::id(),
-                id: random::<32>()?,
-                binding,
-                state: Mutex::new(State {
-                    owners: 1,
-                    phase: SecretSessionState::Locked,
-                    close_target: SecretSessionState::Locked,
-                    generation: 0,
-                    paused: false,
-                    root: None,
-                    checkpoint,
-                    tasks: 0,
-                    discovery_headers: BTreeMap::new(),
-                    discovery_order: VecDeque::new(),
-                    discovery_bytes: 0,
-                    verified_graph_heads: BTreeMap::new(),
-                    verified_graph_order: VecDeque::new(),
-                }),
-                changed: Notify::new(),
-                checkpoint_gate: Mutex::new(()),
-                checkpoint_store,
+        let group = session_group(&binding);
+        let mut group_state = group.state.lock();
+        if group_state.forgetting {
+            return Err(EncryptionError::SessionBusy);
+        }
+        let inner = Arc::new(Inner {
+            creator_pid: std::process::id(),
+            id: random::<32>()?,
+            binding,
+            state: Mutex::new(State {
+                owners: 1,
+                phase: SecretSessionState::Locked,
+                close_target: SecretSessionState::Locked,
+                generation: 0,
+                paused: false,
+                root: None,
+                checkpoint,
+                tasks: 0,
+                discovery_headers: BTreeMap::new(),
+                discovery_order: VecDeque::new(),
+                discovery_bytes: 0,
+                verified_graph_heads: BTreeMap::new(),
+                verified_graph_order: VecDeque::new(),
             }),
-        })
+            changed: Notify::new(),
+            checkpoint_gate: Mutex::new(()),
+            checkpoint_store,
+            group: group.clone(),
+        });
+        group_state
+            .sessions
+            .retain(|session| session.strong_count() != 0);
+        group_state.sessions.push(Arc::downgrade(&inner));
+        Ok(Self { inner })
     }
 
     pub fn state(&self) -> SecretSessionState {
@@ -226,7 +275,7 @@ impl SecretSession {
     /// explicit trusted-host enrollment, not online unlock or remote publication.
     /// Admission happens synchronously; KDF, root generation and persistence stay
     /// owned by the unlock ticket even if the returned future is abandoned.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn prepare_native_initial_config(
         &self,
         password: Zeroizing<Vec<u8>>,
@@ -242,7 +291,7 @@ impl SecretSession {
 
     /// Source-bound enrollment and recovery, including later confirmed stages.
     /// Reopening rejects a changed source before KDF admission completes.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn prepare_native_initial_config_with_intent(
         &self,
         password: Zeroizing<Vec<u8>>,
@@ -257,7 +306,7 @@ impl SecretSession {
         self.prepare_native_initial_config_inner(password, directory, create, Some(intent))
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn prepare_native_initial_config_inner(
         &self,
         password: Zeroizing<Vec<u8>>,
@@ -467,37 +516,65 @@ impl SecretSession {
         .map_err(|_| EncryptionError::SecureStorageUnavailable)?
     }
 
-    /// Disconnect/drain this secret session, then delete its remembered entry.
-    /// Reconnect remains blocked until deletion exits, even if the caller aborts.
-    /// The host must also drain any other session sharing this provider entry.
+    /// Fence and drain every process-local session with the exact binding, then
+    /// delete the OS entry. The fence survives cancellation of this caller.
     pub async fn forget_key(&self, provider: Arc<dyn RememberedKeyProvider>) -> Result<()> {
         if self.inner.creator_pid != std::process::id() {
             return Err(EncryptionError::Cancelled);
         }
-        self.disconnect().await;
-        let ticket = {
-            let mut state = self.inner.state.lock();
-            if state.phase != SecretSessionState::Disconnected {
+        let (guard, sessions) = {
+            let mut group = self.inner.group.state.lock();
+            if group.forgetting {
                 return Err(EncryptionError::SessionBusy);
             }
-            let generation = state
-                .generation
-                .checked_add(1)
-                .ok_or(EncryptionError::GenerationExhausted)?;
-            state.generation = generation;
-            state.phase = SecretSessionState::Locking;
-            state.close_target = SecretSessionState::Disconnected;
-            state.tasks = 1;
-            SessionOperation {
-                inner: self.inner.clone(),
-                generation,
-                root: None,
-            }
+            group.forgetting = true;
+            let sessions = group
+                .sessions
+                .iter()
+                .filter_map(Weak::upgrade)
+                .filter(|inner| inner.creator_pid == std::process::id())
+                .map(|inner| {
+                    inner.state.lock().owners += 1;
+                    SecretSession { inner }
+                })
+                .collect::<Vec<_>>();
+            (ForgetGuard(self.inner.group.clone()), sessions)
         };
-        tokio::task::spawn_blocking(move || {
-            let result = provider.forget(&ticket.inner.binding);
-            drop(ticket);
-            result
+        let initiating = self.inner.clone();
+        // A detached task owns the fence before the first await in this method.
+        tokio::spawn(async move {
+            for session in &sessions {
+                let mut state = session.inner.state.lock();
+                state.close_target = SecretSessionState::Disconnected;
+                state.phase = SecretSessionState::Locking;
+                complete_close(&mut state);
+                session.inner.changed.notify_waiters();
+            }
+            for session in &sessions {
+                session.disconnect().await;
+            }
+            // Keep the initiating session visibly draining while provider work
+            // is outstanding, as well as preventing every sibling's admission.
+            let inner = initiating;
+            let ticket = {
+                let mut state = inner.state.lock();
+                state.phase = SecretSessionState::Locking;
+                state.tasks = 1;
+                SessionOperation {
+                    inner: inner.clone(),
+                    generation: state.generation,
+                    root: None,
+                }
+            };
+            tokio::task::spawn_blocking(move || {
+                let result = provider.forget(&inner.binding);
+                drop(ticket);
+                drop(sessions);
+                drop(guard);
+                result
+            })
+            .await
+            .map_err(|_| EncryptionError::SecureStorageUnavailable)?
         })
         .await
         .map_err(|_| EncryptionError::SecureStorageUnavailable)?
@@ -567,6 +644,10 @@ impl SecretSession {
         if self.inner.creator_pid != std::process::id() {
             return Err(EncryptionError::Cancelled);
         }
+        let group = self.inner.group.state.lock();
+        if group.forgetting {
+            return Err(EncryptionError::SessionBusy);
+        }
         let mut state = self.inner.state.lock();
         match state.phase {
             SecretSessionState::Disconnected => return Err(EncryptionError::Disconnected),
@@ -621,6 +702,10 @@ impl SecretSession {
     pub fn begin_operation(&self) -> Result<SessionOperation> {
         if self.inner.creator_pid != std::process::id() {
             return Err(EncryptionError::Cancelled);
+        }
+        let group = self.inner.group.state.lock();
+        if group.forgetting {
+            return Err(EncryptionError::Locked);
         }
         let mut state = self.inner.state.lock();
         match state.phase {
@@ -692,6 +777,10 @@ impl SecretSession {
     pub fn reconnect(&self) -> Result<()> {
         if self.inner.creator_pid != std::process::id() {
             return Err(EncryptionError::Cancelled);
+        }
+        let group = self.inner.group.state.lock();
+        if group.forgetting {
+            return Err(EncryptionError::SessionBusy);
         }
         let mut state = self.inner.state.lock();
         if state.phase != SecretSessionState::Disconnected {
@@ -1132,7 +1221,7 @@ impl RefObservation {
 mod tests {
     use super::*;
     use crate::e2ee::tests::fixture_root;
-    use std::sync::{OnceLock, mpsc};
+    use std::sync::mpsc;
     use std::time::Duration;
 
     static CONFIG: OnceLock<EncryptedConfig> = OnceLock::new();
@@ -1144,10 +1233,14 @@ mod tests {
     }
 
     fn session() -> SecretSession {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         SecretSession::new(
             SessionBinding::new(
                 "domain-secret".into(),
-                "account-secret".into(),
+                format!(
+                    "account-secret-{}",
+                    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                ),
                 fixture_root().repository(),
             )
             .unwrap(),
@@ -1159,6 +1252,7 @@ mod tests {
     #[tokio::test]
     async fn inherited_native_session_rejects_admission_before_touching_locks() {
         let mut session = session();
+        session.inner.group.state.lock().sessions.clear();
         Arc::get_mut(&mut session.inner).unwrap().creator_pid = std::process::id().wrapping_add(1);
         assert_eq!(session.state(), SecretSessionState::Disconnected);
         assert!(matches!(
@@ -1618,6 +1712,62 @@ mod tests {
     struct BlockingProvider {
         started: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
         release: std::sync::Mutex<mpsc::Receiver<()>>,
+    }
+
+    #[tokio::test]
+    async fn forget_fences_sibling_sessions_and_survives_abort_during_drain() {
+        let sibling = session();
+        let session = SecretSession::new(sibling.binding().clone(), None).unwrap();
+        session.unlock_with_root(&config(), fixture_root()).unwrap();
+        sibling.unlock_with_root(&config(), fixture_root()).unwrap();
+        let held = sibling.begin_operation().unwrap();
+        let (started_tx, mut started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let provider = Arc::new(BlockingProvider {
+            started: std::sync::Mutex::new(Some(started_tx)),
+            release: std::sync::Mutex::new(release_rx),
+        });
+        let caller = {
+            let session = session.clone();
+            let provider = provider.clone();
+            tokio::spawn(async move { session.forget_key(provider).await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while sibling.state() != SecretSessionState::Locking {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        assert!(started_rx.try_recv().is_err());
+        assert!(held.check_active().is_err());
+        assert!(sibling.remember_key(provider.clone()).await.is_err());
+        assert_eq!(sibling.reconnect(), Err(EncryptionError::SessionBusy));
+        assert!(matches!(
+            SecretSession::new(session.binding().clone(), None),
+            Err(EncryptionError::SessionBusy)
+        ));
+        drop(held);
+        started_rx.await.unwrap();
+        assert_eq!(session.state(), SecretSessionState::Locking);
+        assert!(sibling.unlock_remembered(config(), provider).await.is_err());
+        assert_eq!(sibling.reconnect(), Err(EncryptionError::SessionBusy));
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match sibling.reconnect() {
+                    Ok(()) => break,
+                    Err(EncryptionError::SessionBusy) => tokio::task::yield_now().await,
+                    other => panic!("unexpected reconnect result: {other:?}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(session.state(), SecretSessionState::Disconnected);
+        assert_eq!(sibling.state(), SecretSessionState::Locked);
     }
     impl BlockingProvider {
         fn wait(&self) -> Result<()> {

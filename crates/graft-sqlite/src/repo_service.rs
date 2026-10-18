@@ -386,7 +386,7 @@ impl RepositoryCommandService {
             repo.with_remote_credentials(credentials.clone())
                 .with_user_identity(user_identity.clone())
         });
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let _mutation = repo.as_ref().map(Repository::mutation_guard).transpose()?;
         let runtime = match &repo {
             Some(repo) => runtimes.runtime_for(repo)?,
@@ -414,7 +414,7 @@ impl RepositoryCommandService {
 
     /// Executes one parsed repository command against the retained runtime.
     pub fn execute(&mut self, command: RepositoryCommand) -> Result<Option<String>, ErrCtx> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let _mutation = self.mutation_guard()?;
         self.credentials.reset_http_clients();
         let runtime = self.file.runtime().clone();
@@ -424,7 +424,7 @@ impl RepositoryCommandService {
     /// Native operation gate shared by typed commands and embedded SDK methods.
     /// An absent repository has no committed history to fence; initialization
     /// claims its metadata directory before its first persistent mutation.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn mutation_guard(&self) -> Result<Option<graft::repo::RepositoryMutationGuard>, ErrCtx> {
         self.file
             .repo
@@ -446,7 +446,7 @@ impl RepositoryCommandService {
         remote: &str,
         intent: &graft::e2ee::InitializationIntent,
     ) -> Result<graft::repo::PushOutcome, ErrCtx> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let _mutation = self.mutation_guard()?;
         self.credentials.reset_http_clients();
         let repo = self.repository()?;
@@ -490,7 +490,7 @@ impl RepositoryCommandService {
         plan: &graft::repo::MigrationSourcePlan,
         budget: graft::repo::MigrationVerificationBudget,
     ) -> Result<graft::repo::MigrationDependencyVerification, ErrCtx> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let _mutation = self.mutation_guard()?;
         use graft::core::lsn::LSNRangeExt;
         let repo = self.repository()?;
@@ -592,7 +592,7 @@ impl RepositoryCommandService {
 
     /// Publish all frozen historical storage commits in bounded page batches.
     /// Does not publish repository refs/objects/files or advance migration stages.
-    #[cfg(all(feature = "e2ee", unix))]
+    #[cfg(all(feature = "e2ee", any(unix, windows)))]
     pub fn publish_migration_storage_dependencies(
         &mut self,
         plan: &graft::repo::MigrationSourcePlan,
@@ -600,7 +600,7 @@ impl RepositoryCommandService {
         budget: graft::repo::MigrationVerificationBudget,
         max_batch_pages: u64,
     ) -> Result<graft::repo::MigrationDependencyVerification, ErrCtx> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let _mutation = self.mutation_guard()?;
         remote.with_encrypted_operation(|| {
             if max_batch_pages == 0 {
@@ -676,14 +676,14 @@ impl RepositoryCommandService {
     }
 
     /// Publish all frozen dependencies without publishing refs or changing stages.
-    #[cfg(all(feature = "e2ee", unix))]
+    #[cfg(all(feature = "e2ee", any(unix, windows)))]
     pub fn publish_migration_dependencies(
         &mut self,
         plan: &graft::repo::MigrationSourcePlan,
         remote: Arc<graft::remote::Remote>,
         budget: graft::repo::MigrationPublicationBudget,
     ) -> Result<graft::repo::MigrationDependencyPublication, ErrCtx> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let _mutation = self.mutation_guard()?;
         remote.with_encrypted_operation(|| {
             if budget.max_pack_bytes == 0 || budget.max_storage_batch_pages == 0 {
@@ -723,7 +723,7 @@ impl RepositoryCommandService {
         remote: &str,
         branch: &str,
     ) -> Result<graft::repo::FetchOutcome, ErrCtx> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let _mutation = self.mutation_guard()?;
         let repo = self.repository()?;
         let runtime = self.file.runtime().clone();
@@ -749,7 +749,7 @@ impl RepositoryCommandService {
 
     /// Computes the repository status while retaining the service runtime.
     pub fn status(&mut self) -> Result<RepoStatus, ErrCtx> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let _mutation = self.mutation_guard()?;
         let runtime = self.file.runtime().clone();
         let repo = repo_for_file(&mut self.file)?;
@@ -784,7 +784,7 @@ impl RepositoryCommandService {
         &mut self,
         options: RepositoryResolveCellOptions,
     ) -> Result<RepositoryResolveOutcome, ErrCtx> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let _mutation = self.mutation_guard()?;
         let side = match options.side {
             RepositoryResolveSide::Ours => ResolveSide::Ours,
@@ -814,7 +814,7 @@ impl RepositoryCommandService {
 
     /// Validates and stages the current physical `SQLite` file as the resolved merge result.
     pub fn stage_worktree_sqlite_result(&mut self, path: &Path) -> Result<String, ErrCtx> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let _mutation = self.mutation_guard()?;
         let runtime = self.file.runtime().clone();
         let repo = repo_for_file(&mut self.file)?;
@@ -828,7 +828,7 @@ impl RepositoryCommandService {
         path: &Path,
         output: &Path,
     ) -> Result<String, ErrCtx> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let _mutation = self.mutation_guard()?;
         let runtime = self.file.runtime().clone();
         let repo = repo_for_file(&mut self.file)?;
@@ -854,7 +854,7 @@ impl RepositoryCommandService {
         base_sha256: Option<&str>,
         delta_output: Option<&Path>,
     ) -> Result<RepositorySqliteCapture, ErrCtx> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let _mutation = self.mutation_guard()?;
         let runtime = self.file.runtime().clone();
         let repo = repo_for_file(&mut self.file)?;
@@ -923,7 +923,7 @@ impl RepositoryCommandService {
         path: &Path,
         candidate_path: &Path,
     ) -> Result<String, ErrCtx> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let _mutation = self.mutation_guard()?;
         let runtime = self.file.runtime().clone();
         let repo = repo_for_file(&mut self.file)?;
@@ -937,7 +937,7 @@ impl RepositoryCommandService {
         candidate_path: &Path,
         managed_tables: &std::collections::BTreeSet<String>,
     ) -> Result<RepositorySemanticMergeSeed, ErrCtx> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let _mutation = self.mutation_guard()?;
         let runtime = self.file.runtime().clone();
         let repo = repo_for_file(&mut self.file)?;

@@ -1,4 +1,8 @@
 //! Host-private initialization recovery. Records contain wrapped config, never secrets.
+use crate::e2ee::native_fs::{self as fs, File, OpenOptions};
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
 use super::EncryptionError;
 use super::{EncryptedConfig, Result, SessionBinding};
 
@@ -48,7 +52,7 @@ pub enum InitializationStage {
     Connected = 4,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl InitializationStage {
     fn parse(value: u8) -> Result<Self> {
         match value {
@@ -101,15 +105,13 @@ pub trait InitializationJournal: Send + Sync {
     ) -> Result<()>;
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod file {
     use super::*;
     use crate::e2ee::{PROFILE, codec};
     use sha2::{Digest, Sha256};
     use std::{
-        fs::{self, File, OpenOptions},
         io::{Read, Write},
-        os::unix::fs::{MetadataExt, OpenOptionsExt},
         path::{Path, PathBuf},
     };
 
@@ -182,14 +184,14 @@ mod file {
                 store.install_bytes(INTENT, &store.intent_bytes(intent)?, true)?;
                 #[cfg(test)]
                 persistence_failure("directory-sync", INTENT, &store.directory).map_err(io)?;
-                directory.sync_all().map_err(io)?;
+                fs::sync_directory(&directory).map_err(io)?;
                 #[cfg(test)]
                 persistence_crash("directory-synced", INTENT, &store.directory);
             }
             store.write_record(InitializationStage::Prepared, intent, true)?;
             #[cfg(test)]
             persistence_failure("directory-sync", RECORD, &store.directory).map_err(io)?;
-            directory.sync_all().map_err(io)?;
+            fs::sync_directory(&directory).map_err(io)?;
             #[cfg(test)]
             persistence_crash("directory-synced", RECORD, &store.directory);
             Ok(store)
@@ -230,8 +232,8 @@ mod file {
             {
                 return Err(permission());
             }
-            let file = File::open(&self.directory).map_err(io)?;
-            let opened = file.metadata().map_err(io)?;
+            let file = fs::open(&self.directory).map_err(io)?;
+            let opened = fs::file_metadata(&file).map_err(io)?;
             if (opened.dev(), opened.ino(), opened.uid()) != self.identity {
                 return Err(permission());
             }
@@ -240,7 +242,7 @@ mod file {
 
         fn validate_file(&self, file: &File, name: &str, length: u64) -> Result<()> {
             let path = self.path_metadata(name, length)?;
-            let opened = file.metadata().map_err(io)?;
+            let opened = fs::file_metadata(file).map_err(io)?;
             if !path.is_file()
                 || !opened.is_file()
                 || opened.mode() & 0o077 != 0
@@ -295,7 +297,7 @@ mod file {
                 return Err(EncryptionError::InvalidEncoding);
             }
             self.path_metadata(RECORD, length)?;
-            let file = File::open(self.directory.join(RECORD)).map_err(io)?;
+            let file = fs::open(self.directory.join(RECORD)).map_err(io)?;
             self.validate_file(&file, RECORD, length)?;
             let mut bytes = Vec::with_capacity(SIZE);
             (&file)
@@ -374,7 +376,7 @@ mod file {
 
         fn install_bytes(&self, name: &str, bytes: &[u8], initial: bool) -> Result<()> {
             let mut staging = tempfile::NamedTempFile::new_in(&self.directory).map_err(io)?;
-            let metadata = staging.as_file().metadata().map_err(io)?;
+            let metadata = fs::file_metadata(staging.as_file()).map_err(io)?;
             if metadata.mode() & 0o077 != 0 || metadata.uid() != self.identity.2 {
                 return Err(permission());
             }
@@ -396,13 +398,9 @@ mod file {
             #[cfg(test)]
             persistence_failure("install", name, &self.directory).map_err(io)?;
             if initial {
-                staging
-                    .persist_noclobber(self.directory.join(name))
-                    .map_err(|error| io(error.error))?;
+                fs::persist(staging, &self.directory.join(name), false).map_err(io)?;
             } else {
-                staging
-                    .persist(self.directory.join(name))
-                    .map_err(|error| io(error.error))?;
+                fs::persist(staging, &self.directory.join(name), true).map_err(io)?;
             }
             #[cfg(test)]
             persistence_crash("installed", name, &self.directory);
@@ -434,7 +432,7 @@ mod file {
                 return Err(EncryptionError::InvalidEncoding);
             }
             self.path_metadata(INTENT, metadata.len())?;
-            let file = File::open(self.directory.join(INTENT)).map_err(io)?;
+            let file = fs::open(self.directory.join(INTENT)).map_err(io)?;
             self.validate_file(&file, INTENT, metadata.len())?;
             let mut bytes = Vec::with_capacity(metadata.len() as usize);
             (&file)
@@ -501,7 +499,7 @@ mod file {
                 record_file.sync_all().map_err(io)?;
                 #[cfg(test)]
                 persistence_failure("directory-sync", RECORD, &self.directory).map_err(io)?;
-                return directory.sync_all().map_err(io);
+                return fs::sync_directory(&directory).map_err(io);
             }
             if !matches!(
                 record.stage,
@@ -523,13 +521,13 @@ mod file {
             }
             #[cfg(test)]
             persistence_failure("directory-sync", INTENT, &self.directory).map_err(io)?;
-            directory.sync_all().map_err(io)?;
+            fs::sync_directory(&directory).map_err(io)?;
             #[cfg(test)]
             persistence_crash("directory-synced", INTENT, &self.directory);
             self.write_record(record.stage, Some(intent), false)?;
             #[cfg(test)]
             persistence_failure("directory-sync", RECORD, &self.directory).map_err(io)?;
-            directory.sync_all().map_err(io)?;
+            fs::sync_directory(&directory).map_err(io)?;
             #[cfg(test)]
             persistence_crash("directory-synced", RECORD, &self.directory);
             Ok(())
@@ -564,7 +562,7 @@ mod file {
             }
             #[cfg(test)]
             persistence_failure("directory-sync", RECORD, &self.directory).map_err(io)?;
-            directory.sync_all().map_err(io)?;
+            fs::sync_directory(&directory).map_err(io)?;
             #[cfg(test)]
             persistence_crash("directory-synced", RECORD, &self.directory);
             Ok(())
@@ -663,7 +661,7 @@ mod file {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub use file::FileInitializationJournal;
 
 #[cfg(all(test, unix))]

@@ -158,7 +158,10 @@ pub(super) async fn read_fetch(
         return Err(EncryptedHttpError::ProtocolMismatch);
     }
     let reference = operation.observe_ref(logical_ref, Some(fields[2]))?;
-    if !matches!(reference.target(), Some(super::RefTarget::Commit(_))) {
+    if !matches!(
+        reference.target(),
+        Some(super::RefTarget::Commit(_) | super::RefTarget::AnnotatedTag { .. })
+    ) {
         return Err(EncryptedHttpError::ProtocolMismatch);
     }
     let descriptors = codec::decode_bounded(fields[3], MAX_FETCH_FRAMES, MAX_MANIFEST_BYTES)?;

@@ -1,10 +1,12 @@
 //! Durable exact-intent migration progress and exclusive native coordination.
+use crate::e2ee::native_fs::{self as fs, File, OpenOptions};
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
 use super::{EncryptionError, FileRefMutationJournal, Result, SessionBinding};
 use sha2::{Digest, Sha256};
 use std::{
-    fs::{File, OpenOptions},
     io::{Read, Write},
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -96,7 +98,7 @@ impl FileMigrationProgressJournal {
             store.validate_private_file(&file, ALLOCATION)?;
             file.write_all(&allocation).map_err(io)?;
             file.sync_all().map_err(io)?;
-            directory.sync_all().map_err(io)?;
+            fs::sync_directory(&directory).map_err(io)?;
             checkpoint("allocation-durable", &path);
             let lease = MigrationProgressLease {
                 creator_pid: std::process::id(),
@@ -135,7 +137,7 @@ impl FileMigrationProgressJournal {
         let (directory, lock, path, digest, owner) = self.store.private_transaction(binding)?;
         let path = path.to_owned();
         let mut allocation = [0; 76];
-        let mut file = File::open(path.join(ALLOCATION)).map_err(io)?;
+        let mut file = fs::open(path.join(ALLOCATION)).map_err(io)?;
         if self.store.validate_private_file(&file, ALLOCATION)?.len() != 76 {
             return Err(EncryptionError::InvalidEncoding);
         }
@@ -164,7 +166,7 @@ impl MigrationProgressLease {
         if self.creator_pid != std::process::id() {
             return Err(EncryptionError::StaleObservation);
         }
-        let allocation = File::open(self.path.join(ALLOCATION)).map_err(io)?;
+        let allocation = fs::open(self.path.join(ALLOCATION)).map_err(io)?;
         if self
             .store
             .validate_private_file(&allocation, ALLOCATION)?
@@ -180,7 +182,7 @@ impl MigrationProgressLease {
         if current_allocation != self.allocation {
             return Err(EncryptionError::StaleObservation);
         }
-        let file = File::open(self.path.join(RECORD)).map_err(io)?;
+        let file = fs::open(self.path.join(RECORD)).map_err(io)?;
         let size = self.store.validate_private_file(&file, RECORD)?.len();
         if !(81..=(MAX_INTENT + 80) as u64).contains(&size) {
             return Err(EncryptionError::InvalidEncoding);
@@ -216,7 +218,7 @@ impl MigrationProgressLease {
         }
         allocation.sync_all().map_err(io)?;
         file.sync_all().map_err(io)?;
-        self.directory.sync_all().map_err(io)?;
+        fs::sync_directory(&self.directory).map_err(io)?;
         Ok(MigrationProgressRecord {
             intent: intent.to_vec(),
             completed,
@@ -254,7 +256,7 @@ impl MigrationProgressLease {
         bytes.extend_from_slice(&record.intent);
         bytes.extend_from_slice(&Sha256::digest(&bytes));
         let mut staging = tempfile::NamedTempFile::new_in(&self.path).map_err(io)?;
-        let metadata = staging.as_file().metadata().map_err(io)?;
+        let metadata = fs::file_metadata(staging.as_file()).map_err(io)?;
         if metadata.mode() & 0o077 != 0 || metadata.uid() != self.owner || metadata.nlink() != 1 {
             return Err(EncryptionError::CheckpointUnavailable(
                 std::io::ErrorKind::PermissionDenied,
@@ -264,19 +266,15 @@ impl MigrationProgressLease {
         staging.as_file().sync_all().map_err(io)?;
         checkpoint("temporary-synced", &self.path);
         // Revalidate the pinned directory using the still-present allocation.
-        let allocation = File::open(self.path.join(ALLOCATION)).map_err(io)?;
+        let allocation = fs::open(self.path.join(ALLOCATION)).map_err(io)?;
         self.store.validate_private_file(&allocation, ALLOCATION)?;
         if initial {
-            staging
-                .persist_noclobber(self.path.join(RECORD))
-                .map_err(|error| io(error.error))?;
+            fs::persist(staging, &self.path.join(RECORD), false).map_err(io)?;
         } else {
-            staging
-                .persist(self.path.join(RECORD))
-                .map_err(|error| io(error.error))?;
+            fs::persist(staging, &self.path.join(RECORD), true).map_err(io)?;
         }
         checkpoint("record-installed", &self.path);
-        self.directory.sync_all().map_err(io)?;
+        fs::sync_directory(&self.directory).map_err(io)?;
         checkpoint("record-durable", &self.path);
         Ok(())
     }
@@ -291,7 +289,7 @@ fn checkpoint(_phase: &str, _path: &Path) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::e2ee::RepositoryId;

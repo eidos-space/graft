@@ -1,4 +1,10 @@
 //! Host-private durable ciphertext and exact multipart identity recovery.
+use crate::e2ee::native_fs::{self as fs, File, OpenOptions};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
 use super::{Result, SessionBinding};
 use std::path::PathBuf;
 
@@ -21,7 +27,7 @@ pub struct RetainedMultipartUpload {
     pub server_session_recorded: bool,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod file {
     use super::*;
     use crate::e2ee::{
@@ -31,9 +37,7 @@ mod file {
     use serde::{Deserialize, Serialize};
     use sha2::{Digest, Sha256};
     use std::{
-        fs::{self, File, OpenOptions},
         io::{Read, Seek, Write},
-        os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
         path::Path,
         sync::{Arc, Mutex},
     };
@@ -106,6 +110,22 @@ mod file {
                         Err(error) => return Err(io(error)),
                     },
                 };
+                // An advertised retry must still have its exact identity and a
+                // complete private ciphertext candidate. Full hashing remains
+                // mandatory when restoring it for transport.
+                if lease.read_identity()? != identity {
+                    return Err(EncryptionError::InvalidEncoding);
+                }
+                let ciphertext =
+                    fs::open(lease.candidate_directory()?.join("ciphertext")).map_err(io)?;
+                if lease
+                    .store
+                    .validate_private_file(&ciphertext, "candidate/ciphertext")?
+                    .len()
+                    != identity.total
+                {
+                    return Err(EncryptionError::SnapshotMismatch);
+                }
                 crate::e2ee::object::opaque_class(&identity.key)?;
                 retained.push(RetainedMultipartUpload {
                     opaque_key: identity.key,
@@ -198,7 +218,7 @@ mod file {
 
         fn read_identity(&self) -> Result<Identity> {
             let path = self.candidate_directory()?;
-            let file = File::open(path.join("identity")).map_err(io)?;
+            let file = fs::open(path.join("identity")).map_err(io)?;
             let size = self
                 .store
                 .validate_private_file(&file, "candidate/identity")?
@@ -298,8 +318,7 @@ mod file {
             if self.read_identity()? != *identity {
                 return Err(EncryptionError::InvalidEncoding);
             }
-            let mut file =
-                File::open(self.candidate_directory()?.join("ciphertext")).map_err(io)?;
+            let mut file = fs::open(self.candidate_directory()?.join("ciphertext")).map_err(io)?;
             if self
                 .store
                 .validate_private_file(&file, "candidate/ciphertext")?
@@ -345,10 +364,7 @@ mod file {
             };
             file.rewind().map_err(io)?;
             file.sync_all().map_err(io)?;
-            File::open(self.candidate_directory()?)
-                .map_err(io)?
-                .sync_all()
-                .map_err(io)?;
+            fs::sync_directory(&fs::open(self.candidate_directory()?).map_err(io)?).map_err(io)?;
             self.persist()?;
             operation.check_active()?;
             Ok(Some(PreparedEncryptedObject {
@@ -434,13 +450,10 @@ mod file {
                 .map_err(io)?;
             manifest.write_all(&bytes).map_err(io)?;
             manifest.sync_all().map_err(io)?;
-            File::open(staging.path())
-                .map_err(io)?
-                .sync_all()
-                .map_err(io)?;
+            fs::sync_directory(&fs::open(staging.path()).map_err(io)?).map_err(io)?;
             operation.check_active()?;
             fs::rename(staging.path(), self.path.join("candidate")).map_err(io)?;
-            self.directory.sync_all().map_err(io)?;
+            fs::sync_directory(&self.directory).map_err(io)?;
             Ok(())
         }
 
@@ -469,9 +482,9 @@ mod file {
                 }
                 Err(error) => return Err(error),
             };
-            let directory = File::open(&path).map_err(io)?;
+            let directory = fs::open(&path).map_err(io)?;
             for name in ["ciphertext", "identity"] {
-                let file = match File::open(path.join(name)) {
+                let file = match fs::open(path.join(name)) {
                     Ok(file) => file,
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                     Err(error) => return Err(io(error)),
@@ -480,9 +493,9 @@ mod file {
                     .validate_private_file(&file, &format!("candidate/{name}"))?;
                 fs::remove_file(path.join(name)).map_err(io)?;
             }
-            directory.sync_all().map_err(io)?;
+            fs::sync_directory(&directory).map_err(io)?;
             fs::remove_dir(path).map_err(io)?;
-            self.directory.sync_all().map_err(io)?;
+            fs::sync_directory(&self.directory).map_err(io)?;
             Ok(())
         }
     }
@@ -492,7 +505,7 @@ mod file {
         path: &Path,
         binding: [u8; 32],
     ) -> Result<Option<Record>> {
-        let file = File::open(path.join(RECORD)).map_err(io)?;
+        let file = fs::open(path.join(RECORD)).map_err(io)?;
         let size = store.validate_private_file(&file, RECORD)?.len();
         if !(76..=MAX_RECORD).contains(&size) {
             return Err(EncryptionError::InvalidEncoding);
@@ -531,15 +544,11 @@ mod file {
         staging.write_all(&bytes).map_err(io)?;
         staging.as_file().sync_all().map_err(io)?;
         if initial {
-            staging
-                .persist_noclobber(path.join(RECORD))
-                .map_err(|error| io(error.error))?;
+            fs::persist(staging, &path.join(RECORD), false).map_err(io)?;
         } else {
-            staging
-                .persist(path.join(RECORD))
-                .map_err(|error| io(error.error))?;
+            fs::persist(staging, &path.join(RECORD), true).map_err(io)?;
         }
-        directory.sync_all().map_err(io)
+        fs::sync_directory(directory).map_err(io)
     }
 
     fn io(error: std::io::Error) -> EncryptionError {
@@ -549,7 +558,7 @@ mod file {
         EncryptionError::CheckpointUnavailable(std::io::ErrorKind::PermissionDenied)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     mod tests {
         use super::*;
         use crate::e2ee::{EncryptedConfig, SecretSession, tests::fixture_root};
@@ -598,6 +607,35 @@ mod file {
             let directory = tempfile::tempdir().unwrap();
             fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
             directory
+        }
+
+        #[tokio::test]
+        async fn retained_upload_listing_rejects_a_missing_ciphertext_file() {
+            let recovery = directory();
+            let staging = directory();
+            let session = session();
+            let operation = session.begin_operation().unwrap();
+            let provider =
+                FileMultipartJournalProvider::create(recovery.path(), session.binding()).unwrap();
+            let prepared =
+                candidate(&operation, b"retained regression bytes", staging.path()).await;
+            let path = provider
+                .directory(session.binding(), prepared.remote_key())
+                .unwrap();
+            let mut lease = FileMultipartJournal::open(&path, session.binding())
+                .unwrap()
+                .acquire(session.binding())
+                .unwrap();
+            lease
+                .retain(&operation, "https://test.invalid/repo", &prepared)
+                .unwrap();
+            drop(lease);
+            assert_eq!(
+                provider.retained_uploads(session.binding()).unwrap().len(),
+                1
+            );
+            fs::remove_file(path.join("candidate/ciphertext")).unwrap();
+            assert!(provider.retained_uploads(session.binding()).is_err());
         }
 
         #[tokio::test]
@@ -784,7 +822,7 @@ mod file {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub use file::{FileMultipartJournal, FileMultipartJournalProvider};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(in crate::e2ee) use file::{Identity, Lease};

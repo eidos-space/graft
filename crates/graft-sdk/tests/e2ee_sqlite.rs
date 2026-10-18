@@ -982,20 +982,29 @@ fn native_session(
 
 fn credentials(config: &RemoteConfig, session: SecretSession, staging: &Path) -> RemoteCredentials {
     fs::set_permissions(staging, fs::Permissions::from_mode(0o700)).unwrap();
+    // The fixture root owns durable recovery separately from disposable transfer data.
+    let transfer = staging.join("transfer");
+    let recovery = staging.join("recovery");
+    graft::native_fs::create_private_directory(&transfer).unwrap();
+    graft::native_fs::create_private_directory(&recovery).unwrap();
+    let journals = std::sync::Arc::new(
+        graft::e2ee::FileRefMutationJournalProvider::create(&recovery, session.binding()).unwrap(),
+    );
     let credentials = RemoteCredentials::explicit();
     credentials
         .set_http_bearer_token("origin", "account-token".into())
         .unwrap();
     credentials
-        .set_encrypted_session(
+        .set_encrypted_session_with_journals(
             "origin",
             config,
             session,
             EncryptedTransferBudget {
-                private_directory: staging.to_path_buf(),
+                private_directory: transfer,
                 max_buffered_plaintext: 4 * 1024 * 1024,
                 max_ciphertext_spool: 16 * 1024 * 1024,
             },
+            journals,
         )
         .unwrap();
     credentials
@@ -1036,6 +1045,31 @@ fn durable_credentials(
             "native.test",
             "test-account",
             "account-token".into(),
+        )
+        .unwrap();
+    credentials
+}
+
+// Deliberately omit recovery to prove mutable publication rejects read-only hosts.
+fn credentials_without_ref_journal(
+    config: &RemoteConfig,
+    session: SecretSession,
+    staging: &Path,
+) -> RemoteCredentials {
+    let credentials = RemoteCredentials::explicit();
+    credentials
+        .set_http_bearer_token("origin", "account-token".into())
+        .unwrap();
+    credentials
+        .set_encrypted_session(
+            "origin",
+            config,
+            session,
+            EncryptedTransferBudget {
+                private_directory: staging.to_owned(),
+                max_buffered_plaintext: 4 * 1024 * 1024,
+                max_ciphertext_spool: 16 * 1024 * 1024,
+            },
         )
         .unwrap();
     credentials
@@ -1588,7 +1622,8 @@ fn encrypted_sdk_wal_snapshot_fetch_and_offline_apply_interoperate() {
             .publish_migration_target_head(&target_plan, storage_remote.clone())
             .unwrap();
     }
-    let unregistered = credentials(&storage_config, migration_secret, storage_staging.path());
+    let unregistered =
+        credentials_without_ref_journal(&storage_config, migration_secret, storage_staging.path());
     let unregistered = std::sync::Arc::new(
         storage_config
             .clone()
@@ -1912,15 +1947,22 @@ fn encrypted_sdk_wal_snapshot_fetch_and_offline_apply_interoperate() {
         .unlock_with_root(&encrypted_config, reopened_root)
         .unwrap();
     cloned_credentials
-        .set_encrypted_session(
+        .set_encrypted_session_with_journals(
             "origin",
             &config,
             cloned_secret.clone(),
             EncryptedTransferBudget {
-                private_directory: cloned_staging.path().to_path_buf(),
+                private_directory: cloned_staging.path().join("transfer"),
                 max_buffered_plaintext: 4 * 1024 * 1024,
                 max_ciphertext_spool: 16 * 1024 * 1024,
             },
+            std::sync::Arc::new(
+                graft::e2ee::FileRefMutationJournalProvider::open(
+                    cloned_staging.path().join("recovery"),
+                    cloned_secret.binding(),
+                )
+                .unwrap(),
+            ),
         )
         .unwrap();
     cloned.push(Some("origin"), Some("main")).unwrap();
@@ -2142,15 +2184,22 @@ fn encrypted_sdk_wal_snapshot_fetch_and_offline_apply_interoperate() {
             )
             .unwrap();
         cloned_credentials
-            .set_encrypted_session(
+            .set_encrypted_session_with_journals(
                 "origin",
                 &config,
                 cloned_secret.clone(),
                 EncryptedTransferBudget {
-                    private_directory: cloned_staging.path().to_path_buf(),
+                    private_directory: cloned_staging.path().join("transfer"),
                     max_buffered_plaintext: 4 * 1024 * 1024,
                     max_ciphertext_spool: 16 * 1024 * 1024,
                 },
+                std::sync::Arc::new(
+                    graft::e2ee::FileRefMutationJournalProvider::open(
+                        cloned_staging.path().join("recovery"),
+                        cloned_secret.binding(),
+                    )
+                    .unwrap(),
+                ),
             )
             .unwrap();
         cloned.push(Some("origin"), Some("main")).unwrap();

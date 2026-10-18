@@ -8,13 +8,15 @@ file content and ref values before sending them to an HTTP remote. Local
 worktrees and caches remain plaintext. The service can observe opaque object
 identifiers, sizes, timing and the routing relationships needed for synchronization.
 
-E2EE is available to native macOS and Linux hosts. CLI source builds require the
+E2EE is available to native macOS, Linux and Windows hosts. CLI source builds require the
 `e2ee` feature. The local Node build script defaults to `plain`; the SDK release
-workflow explicitly selects encrypted profiles for macOS and Linux. Check the
+workflow explicitly selects encrypted profiles for native platforms. Check the
 installed SDK version's release notes and native capability before connecting.
 Production conformance and OS-backed remembering require
 the evidence listed in the [E2EE specification](https://github.com/eidos-space/graft/blob/20c276bc79fce766b13e18fa59a534de0d7df93d/docs/specs/graft-e2ee-remote-1.0.md).
-Windows and browser E2EE are not supported by this implementation.
+Browser E2EE is not supported. Windows uses protected private-state ACLs and
+session-only password unlock; OS-backed key remembering requires an approved host provider.
+Node hosts can create private state with `EncryptedRemoteSession.createPrivateDirectory(path)`.
 
 ## Build the CLI
 

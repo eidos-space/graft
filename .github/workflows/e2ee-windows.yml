@@ -1,0 +1,52 @@
+name: Windows E2EE
+on:
+  push:
+    branches: [main, codex/e2ee-hardening-windows]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
+        with:
+          toolchain: '1.91'
+      - uses: pnpm/action-setup@41ff72655975bd51cab0327fa583b6e92b6d3061
+        with:
+          version: 10
+      - uses: actions/setup-node@395ad3262231945c25e8478fd5baf05154b1d79f
+        with:
+          node-version: 24
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5
+      - name: Check CLI and Node E2EE on Windows
+        run: cargo check -p graft-cli -p graft-sdk-node --features e2ee --all-targets --locked
+      - name: Native E2EE regressions
+        run: cargo test -p graft --features e2ee --lib --test e2ee_native_storage --locked
+      - name: CLI input regressions
+        run: cargo test -p graft-cli --features e2ee --bin graft encrypted::tests:: --locked
+      - name: Build native Node adapter
+        run: cargo build -p graft-sdk-node --features e2ee --locked
+      - name: Initial source intent regression
+        run: cargo test -p graft-sdk-node --features e2ee --lib --locked
+      - name: Verify Windows native storage and Node session lifecycle
+        shell: pwsh
+        run: |
+          $env:GRAFT_SDK_NATIVE_PATH = Join-Path $env:RUNNER_TEMP 'graft-sdk.node'
+          Copy-Item target/debug/graft_sdk_node.dll $env:GRAFT_SDK_NATIVE_PATH
+          node packages/graft-sdk/scripts/verify-e2ee-native.cjs
+      - name: Build actual HTTP remote
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm --filter @eidos.space/graft-remote build
+      - name: Native Windows SQLite sync and migration over HTTP
+        shell: pwsh
+        run: |
+          $env:GRAFT_E2EE_NODE_TEST_BINDING = Join-Path $env:RUNNER_TEMP 'graft-sdk.node'
+          cargo test -p graft-sdk --features e2ee --test e2ee_node --locked -- --ignored --test-threads=1

@@ -1439,6 +1439,8 @@ pub(super) fn split_pragma_words(arg: &str) -> Result<Vec<String>, PragmaErr> {
 }
 
 fn reject_ambiguous_posix_path_escape(arg: &str) -> Result<(), PragmaErr> {
+    #[cfg(windows)]
+    let _ = arg;
     #[cfg(not(windows))]
     {
         let mut chars = arg.chars().peekable();

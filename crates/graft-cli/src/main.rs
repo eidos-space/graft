@@ -23,13 +23,13 @@ use serde_json::Value;
 #[cfg(not(target_arch = "wasm32"))]
 mod upgrade;
 
-#[cfg(all(feature = "e2ee", unix))]
+#[cfg(all(feature = "e2ee", any(unix, windows)))]
 mod encrypted;
 
 #[derive(Subcommand)]
 enum Command {
     /// Use an explicitly pinned encrypted HTTP remote (session-only unlock).
-    #[cfg(all(feature = "e2ee", unix))]
+    #[cfg(all(feature = "e2ee", any(unix, windows)))]
     E2ee(encrypted::EncryptedArgs),
     /// Generate an internal test identifier
     Id {
@@ -1100,7 +1100,7 @@ fn run_cli(cli: Cli) -> Result<()> {
 fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
     validate_command_repo_paths(&command)?;
     match command {
-        #[cfg(all(feature = "e2ee", unix))]
+        #[cfg(all(feature = "e2ee", any(unix, windows)))]
         Command::E2ee(args) => {
             if db_override.is_some() {
                 bail!("e2ee commands use --worktree instead of --db");

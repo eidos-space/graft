@@ -12,7 +12,7 @@ use napi_derive::napi;
 use std::{path::PathBuf, sync::Arc};
 use zeroize::Zeroizing;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(super) mod migration;
 
 #[napi(object)]
@@ -59,6 +59,22 @@ pub(super) struct InitialBranchContext {
     host_directories: [PathBuf; 3],
 }
 
+#[napi(object)]
+pub struct InitialSource {
+    pub branch: String,
+    pub commit: String,
+}
+
+fn retained_initial_intent(
+    intent: Option<graft_sdk::e2ee::InitializationIntent>,
+    branch: &str,
+    head: &str,
+) -> std::result::Result<graft_sdk::e2ee::InitializationIntent, EncryptionError> {
+    let intent = intent.ok_or(EncryptionError::StaleObservation)?;
+    intent.require_source(branch, head)?;
+    Ok(intent)
+}
+
 impl NodeEncryptedRemoteSession {
     pub(super) fn initial_branch_context(&self) -> Result<Arc<InitialBranchContext>> {
         Ok(Arc::new(InitialBranchContext {
@@ -96,11 +112,10 @@ pub(super) fn push_initial_branch(
     branch: Option<&str>,
     verification_directory: Option<&str>,
 ) -> Result<serde_json::Value> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         use graft_sdk::e2ee::{
-            FileInitializationJournal, InitializationIntent, InitializationJournal,
-            InitializationStage,
+            FileInitializationJournal, InitializationJournal, InitializationStage,
         };
         context.operation.check_active().map_err(secret_error)?;
         if let Some(directory) = verification_directory {
@@ -135,22 +150,8 @@ pub(super) fn push_initial_branch(
             .current_head
             .as_deref()
             .ok_or_else(|| secret_error(EncryptionError::InvalidEncoding))?;
-        let intent = if let Some(intent) = record.intent {
-            intent
-                .require_source(selected, head)
-                .map_err(secret_error)?;
-            intent
-        } else {
-            if record.stage != InitializationStage::ConfigPublished {
-                return Err(secret_error(EncryptionError::StaleObservation));
-            }
-            let intent =
-                InitializationIntent::new(selected.into(), head.into()).map_err(secret_error)?;
-            journal
-                .bind_intent(context.secret.binding(), &intent)
-                .map_err(secret_error)?;
-            intent
-        };
+        let intent =
+            retained_initial_intent(record.intent, selected, head).map_err(secret_error)?;
         context.operation.check_active().map_err(secret_error)?;
         // The repository service rechecks source after remote discovery and
         // before dependencies. Failed publication leaves the same durable intent.
@@ -226,7 +227,7 @@ pub(super) fn push_initial_branch(
             Ok(serde_json::json!({"state": "branch_published", "push": pushed}))
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (session, context, branch, verification_directory);
         Err(secret_error(EncryptionError::SecureStorageUnavailable))
@@ -235,8 +236,20 @@ pub(super) fn push_initial_branch(
 
 #[napi]
 impl NodeEncryptedRemoteSession {
+    /// Allocate host state with owner-only native permissions (protected DACL on Windows).
+    #[napi]
+    pub fn create_private_directory(path: String) -> Result<()> {
+        let path = std::path::Path::new(&path);
+        if !path.is_absolute() {
+            return Err(secret_error(EncryptionError::InvalidSessionBinding));
+        }
+        graft_sdk::e2ee::native_fs::create_private_directory(path)
+            .map_err(|error| secret_error(EncryptionError::CheckpointUnavailable(error.kind())))
+    }
+
     #[napi(constructor)]
     pub fn new(options: EncryptedRemoteSessionOptions) -> Result<Self> {
+        let bearer_token = Zeroizing::new(options.bearer_token);
         let repository = parse_uuid(&options.uuid)?;
         let binding = SessionBinding::new(
             options.authentication_domain,
@@ -247,7 +260,7 @@ impl NodeEncryptedRemoteSession {
         let provider = key_provider(options.keychain_application, options.keychain_access_group)?;
         let credentials = RemoteCredentials::explicit();
         credentials
-            .set_http_bearer_token(&options.remote_name, options.bearer_token)
+            .set_http_bearer_token(&options.remote_name, bearer_token.to_string())
             .map_err(|_| error("invalid_credential", "invalid remote credential"))?;
         // Validate the endpoint before creating durable enrollment. This temporary
         // locked session never has a key, provider, checkpoint or network operation.
@@ -284,7 +297,7 @@ impl NodeEncryptedRemoteSession {
         {
             return Err(secret_error(EncryptionError::InvalidSessionBinding));
         }
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         graft_sdk::e2ee::FileRefMutationJournalProvider::validate_directory(
             &options.recovery_directory,
             &binding,
@@ -394,14 +407,19 @@ impl NodeEncryptedRemoteSession {
     /// Prepare a new fixed config and publish it create-if-absent. Config
     /// publication does not mean the repository's initial branch is connected.
     #[napi]
-    pub fn initialize_config(&self, env: Env, password: Buffer) -> Result<AsyncBlock<String>> {
-        initial_config(self, env, password, true)
+    pub fn initialize_config(
+        &self,
+        env: Env,
+        password: Buffer,
+        source: Option<InitialSource>,
+    ) -> Result<AsyncBlock<String>> {
+        initial_config(self, env, password, true, source)
     }
 
     /// Requires Locked admission; password restores the exact native journal.
     #[napi]
     pub fn resume_initial_config(&self, env: Env, password: Buffer) -> Result<AsyncBlock<String>> {
-        initial_config(self, env, password, false)
+        initial_config(self, env, password, false, None)
     }
 
     /// Both buffers are copied and wiped before validation or async scheduling.
@@ -492,7 +510,7 @@ impl NodeEncryptedRemoteSession {
 
 // Keep the platform gate outside the N-API impl so generated registrations do
 // not reference callbacks that Rust removes on unsupported hosts.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[napi]
 impl NodeEncryptedRemoteSession {
     /// List admitted local ciphertext recovery, without sending account data.
@@ -582,11 +600,27 @@ impl NodeEncryptedRemoteSession {
     /// Same immutable host identity only; account changes require a new handle.
     #[napi]
     pub fn reconnect(&self, bearer_token: String) -> Result<()> {
+        let bearer_token = Zeroizing::new(bearer_token);
         if self.secret.state() != SecretSessionState::Disconnected {
             return Err(secret_error(EncryptionError::SessionBusy));
         }
+        // Group-wide forget disconnects the secret without unregistering this
+        // sibling's host credentials. Reuse its exact pinned registration.
+        let binding = self.secret.binding();
+        if self
+            .credentials
+            .set_bound_http_bearer_token(
+                &self.remote_name,
+                binding.domain(),
+                binding.account(),
+                bearer_token.to_string(),
+            )
+            .is_ok()
+        {
+            return self.secret.reconnect().map_err(secret_error);
+        }
         self.credentials
-            .set_http_bearer_token(&self.remote_name, bearer_token)
+            .set_http_bearer_token(&self.remote_name, bearer_token.to_string())
             .map_err(|_| error("invalid_credential", "credential replacement failed"))?;
         self.credentials
             .set_encrypted_session_with_recovery(
@@ -669,7 +703,7 @@ fn recovery_provider(
     binding: &SessionBinding,
     create: bool,
 ) -> Result<Arc<dyn graft_sdk::e2ee::RefMutationJournalProvider>> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         let provider = if create {
             graft_sdk::e2ee::FileRefMutationJournalProvider::create(path, binding)
@@ -678,7 +712,7 @@ fn recovery_provider(
         };
         Ok(Arc::new(provider.map_err(secret_error)?))
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (path, binding, create);
         Err(error(
@@ -693,7 +727,7 @@ fn config_journal(
     binding: &SessionBinding,
     create: bool,
 ) -> Result<Arc<dyn graft_sdk::e2ee::ConfigMutationJournal>> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         let journal = if create {
             graft_sdk::e2ee::FileConfigMutationJournal::create_in_namespace(path, binding)
@@ -702,7 +736,7 @@ fn config_journal(
         };
         Ok(Arc::new(journal.map_err(secret_error)?))
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (path, binding, create);
         Err(secret_error(EncryptionError::SecureStorageUnavailable))
@@ -714,21 +748,22 @@ fn multipart_provider(
     binding: &SessionBinding,
     create: bool,
 ) -> Result<Arc<dyn graft_sdk::e2ee::MultipartJournalProvider>> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
+        #[cfg(unix)]
         use std::os::unix::fs::DirBuilderExt;
         let path = PathBuf::from(recovery).join("multipart");
         let provider = if create {
             // This path is allocated only after claiming a new checkpoint. An
             // existing enrollment must open the exact retained namespace.
-            std::fs::DirBuilder::new()
+            graft_sdk::e2ee::native_fs::DirBuilder::new()
                 .mode(0o700)
                 .create(&path)
                 .map_err(|error| {
                     secret_error(EncryptionError::CheckpointUnavailable(error.kind()))
                 })?;
-            std::fs::File::open(recovery)
-                .and_then(|directory| directory.sync_all())
+            graft_sdk::e2ee::native_fs::open(recovery)
+                .and_then(|directory| graft_sdk::e2ee::native_fs::sync_directory(&directory))
                 .map_err(|error| {
                     secret_error(EncryptionError::CheckpointUnavailable(error.kind()))
                 })?;
@@ -738,14 +773,14 @@ fn multipart_provider(
         };
         Ok(Arc::new(provider.map_err(secret_error)?))
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (recovery, binding, create);
         Err(secret_error(EncryptionError::SecureStorageUnavailable))
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn retained_upload(
     authority: &NodeEncryptedRemoteSession,
     env: Env,
@@ -793,6 +828,7 @@ fn initial_config(
     env: Env,
     mut password: Buffer,
     create: bool,
+    source: Option<InitialSource>,
 ) -> Result<AsyncBlock<String>> {
     if password.is_empty() || password.len() > 1024 {
         password.fill(0);
@@ -800,12 +836,35 @@ fn initial_config(
     }
     let input = Zeroizing::new(password.to_vec());
     password.fill(0);
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         let secret = authority.secret.clone();
-        let future = secret
-            .prepare_native_initial_config(input, authority.host_directories[1].clone(), create)
-            .map_err(secret_error)?;
+        type Preparation = std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = std::result::Result<
+                            Arc<graft_sdk::e2ee::FileInitializationJournal>,
+                            EncryptionError,
+                        >,
+                    > + Send,
+            >,
+        >;
+        let directory = authority.host_directories[1].clone();
+        let future: Preparation = if let Some(source) = source {
+            let intent = graft_sdk::e2ee::InitializationIntent::new(source.branch, source.commit)
+                .map_err(secret_error)?;
+            Box::pin(
+                secret
+                    .prepare_native_initial_config_with_intent(input, directory, create, intent)
+                    .map_err(secret_error)?,
+            )
+        } else {
+            Box::pin(
+                secret
+                    .prepare_native_initial_config(input, directory, create)
+                    .map_err(secret_error)?,
+            )
+        };
         let client = authority.client.clone();
         AsyncBlockBuilder::new(async move {
             use graft_sdk::e2ee::InitialConfigPublicationOutcome as Outcome;
@@ -849,9 +908,9 @@ fn initial_config(
         })
         .build(&env)
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
-        let _ = (authority, env, create, input);
+        let _ = (authority, env, create, input, source);
         Err(secret_error(EncryptionError::SecureStorageUnavailable))
     }
 }
@@ -876,7 +935,7 @@ fn checkpoint_store(
     binding: &SessionBinding,
     create: bool,
 ) -> Result<Arc<dyn graft_sdk::e2ee::CheckpointStore>> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         use graft_sdk::e2ee::FileCheckpointStore;
         let store = if create {
@@ -887,7 +946,7 @@ fn checkpoint_store(
         .map_err(secret_error)?;
         Ok(Arc::new(store))
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (path, binding, create);
         Err(error(
@@ -898,23 +957,8 @@ fn checkpoint_store(
 }
 
 fn validate_private_directory(path: &std::path::Path) -> Result<()> {
-    let metadata = std::fs::symlink_metadata(path).map_err(|_| {
-        error(
-            "invalid_session_binding",
-            "private staging directory unavailable",
-        )
-    })?;
-    if !path.is_absolute() || !metadata.is_dir() {
-        return Err(secret_error(EncryptionError::InvalidSessionBinding));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o077 != 0 {
-            return Err(secret_error(EncryptionError::InvalidSessionBinding));
-        }
-    }
-    Ok(())
+    graft_sdk::e2ee::native_fs::validate_private_directory(path)
+        .map_err(|_| secret_error(EncryptionError::InvalidSessionBinding))
 }
 
 fn key_provider(
@@ -965,4 +1009,25 @@ fn http_error(value: graft_sdk::e2ee::EncryptedHttpError) -> Error {
         Status::GenericFailure,
         format!("[{}] encrypted remote operation failed", code.as_str()),
     )
+}
+
+#[cfg(test)]
+mod initialization_tests {
+    use super::*;
+
+    #[test]
+    fn source_publication_requires_retained_intent_even_before_first_push() {
+        let head = "11".repeat(32);
+        assert!(matches!(
+            retained_initial_intent(None, "main", &head),
+            Err(EncryptionError::StaleObservation)
+        ));
+        let intent =
+            graft_sdk::e2ee::InitializationIntent::new("main".into(), head.clone()).unwrap();
+        assert!(matches!(
+            retained_initial_intent(Some(intent.clone()), "main", &"22".repeat(32)),
+            Err(EncryptionError::StaleObservation)
+        ));
+        assert!(retained_initial_intent(Some(intent), "main", &head).is_ok());
+    }
 }

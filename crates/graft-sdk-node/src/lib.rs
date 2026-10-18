@@ -994,7 +994,7 @@ pub struct NodeRepositorySession {
     session: Arc<CoreRepositorySession>,
 }
 
-#[cfg(all(feature = "e2ee", unix))]
+#[cfg(all(feature = "e2ee", any(unix, windows)))]
 #[napi]
 impl NodeRepositorySession {
     #[napi]
