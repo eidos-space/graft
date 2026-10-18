@@ -165,16 +165,15 @@ export function Database({
   };
   return (
     <div className="database">
-      <div className="table-bar">
-        {summary && (
+      {summary && (
+        <div className="table-bar">
           <span className="row-counts">
             <span className="added">+{summary.inserts}</span>
             <span>~{summary.updates}</span>
             <span className="removed">−{summary.deletes}</span>
           </span>
-        )}
-        {!compare && <span className="subtle">Read only</span>}
-      </div>
+        </div>
+      )}
       {(resource.error || error) && (
         <div className="notice" role="alert">
           {resource.error || error}

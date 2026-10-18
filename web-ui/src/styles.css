@@ -132,7 +132,7 @@ button:hover {
   background: var(--bg);
 }
 .file-header,
-.tabs {
+.explorer-header {
   height: 52px;
   flex: none;
   border-bottom: 1px solid var(--border);
@@ -143,10 +143,17 @@ button:hover {
   gap: 16px;
   padding: 0 24px;
 }
-.breadcrumb {
+.file-heading {
   display: flex;
   flex: 1;
   align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.breadcrumb {
+  display: flex;
+  align-items: center;
+  flex: 0 1 auto;
   min-width: 0;
   font-size: 13px;
   white-space: nowrap;
@@ -166,6 +173,16 @@ button:hover {
   padding: 0 7px;
   color: var(--fg-faint);
   font-style: normal;
+}
+.read-only-badge {
+  flex: none;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--bg-badge);
+  color: var(--fg-muted);
+  font-size: 11px;
+  line-height: 16px;
+  white-space: nowrap;
 }
 .revision {
   font:
@@ -269,6 +286,10 @@ button:hover {
   flex-direction: column;
 }
 .tabs {
+  display: flex;
+  align-items: center;
+  flex: 1;
+  min-width: 0;
   overflow-x: auto;
   scrollbar-width: none;
   gap: 2px;
@@ -343,12 +364,11 @@ button:hover {
   line-height: 1;
 }
 .tree-controls {
-  display: inline-flex;
-  align-items: center;
-  gap: 1px;
+  position: relative;
   flex: none;
+  margin-right: 8px;
 }
-.tree-controls button {
+.tree-menu-trigger {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -357,13 +377,44 @@ button:hover {
   color: var(--fg-muted);
   border-radius: 4px;
 }
-.tree-controls button:hover {
+.tree-menu-trigger:hover,
+.tree-menu-trigger[aria-expanded="true"] {
   background: var(--bg-hover);
   color: var(--fg-strong);
 }
-.tree-controls button[aria-pressed="true"] {
-  background: var(--bg-selected);
+.tree-menu {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 20;
+  min-width: 190px;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-panel);
+  box-shadow: 0 6px 20px #0002;
+}
+.tree-menu button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 8px;
+  border-radius: 3px;
+  text-align: left;
+  font-size: 12px;
+  color: var(--fg);
+}
+.tree-menu button:hover,
+.tree-menu button:focus-visible {
+  background: var(--bg-hover);
   color: var(--fg-strong);
+}
+.tree-menu button > svg {
+  flex: none;
+}
+.tree-menu-check {
+  margin-left: auto;
 }
 .shortcut-dialog {
   width: min(480px, calc(100vw - 32px));

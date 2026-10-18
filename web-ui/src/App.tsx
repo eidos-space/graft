@@ -537,6 +537,14 @@ export default function App() {
   };
   const displayedPath = conflictsOpen ? conflictPath : selected;
   const breadcrumb = displayedPath.split("/");
+  const readOnlyTable = conflictsOpen
+    ? merge.data?.paths.some(
+        (item) =>
+          item.path === conflictPath &&
+          item.state === "resolved" &&
+          item.kind === "sqlite_database",
+      )
+    : mode === "files" && selectedTable !== undefined;
   if (!snapshot.data && snapshot.error)
     return (
       <main className="session-error">
@@ -553,23 +561,26 @@ export default function App() {
     >
       <section ref={detailPane} tabIndex={-1} className="detail" aria-label="File details">
         <header className="file-header">
-          <div className="breadcrumb" title={displayedPath || snapshot.data?.root}>
-            {displayedPath ? (
-              breadcrumb.map((part, index) => (
-                <span key={index} className={index === breadcrumb.length - 1 ? "filename" : ""}>
-                  {index > 0 && <i>/</i>}
-                  {part}
+          <div className="file-heading">
+            <div className="breadcrumb" title={displayedPath || snapshot.data?.root}>
+              {displayedPath ? (
+                breadcrumb.map((part, index) => (
+                  <span key={index} className={index === breadcrumb.length - 1 ? "filename" : ""}>
+                    {index > 0 && <i>/</i>}
+                    {part}
+                  </span>
+                ))
+              ) : (
+                <span>{snapshot.data?.root ?? "Graft"}</span>
+              )}
+              {!conflictsOpen && selectedTable !== undefined && (
+                <span className="filename">
+                  <i>/</i>
+                  {selectedTable || "(unnamed table)"}
                 </span>
-              ))
-            ) : (
-              <span>{snapshot.data?.root ?? "Graft"}</span>
-            )}
-            {!conflictsOpen && selectedTable !== undefined && (
-              <span className="filename">
-                <i>/</i>
-                {selectedTable || "(unnamed table)"}
-              </span>
-            )}
+              )}
+            </div>
+            {readOnlyTable && <span className="read-only-badge">Read only</span>}
           </div>
           {!conflictsOpen && mode === "history" && selected && (
             <span
@@ -770,65 +781,91 @@ export default function App() {
       </section>
       {!sidebarCollapsed && layout.separator}
       <aside className="explorer" aria-label="Repository browser" hidden={sidebarCollapsed}>
-        <div
-          className="tabs"
-          role="tablist"
-          aria-label="Browse repository"
-          onKeyDown={(event) => {
-            const buttons = Array.from(
-              event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="tab"]'),
-            );
-            const index = buttons.indexOf(event.target as HTMLButtonElement);
-            if (index < 0) return;
-            const next =
-              event.key === "ArrowRight"
-                ? (index + 1) % buttons.length
-                : event.key === "ArrowLeft"
-                  ? (index + buttons.length - 1) % buttons.length
-                  : event.key === "Home"
-                    ? 0
-                    : event.key === "End"
-                      ? buttons.length - 1
-                      : undefined;
-            if (next === undefined) return;
-            event.preventDefault();
-            if (editing || document.body.dataset.reviewSaving) return;
-            buttons[next].click();
-            buttons[next].focus();
-          }}
-        >
-          {tabs.map((tab) => (
-            <button
-              key={tab.mode}
-              role="tab"
-              aria-selected={!conflictsOpen && mode === tab.mode}
-              tabIndex={!conflictsOpen && mode === tab.mode ? 0 : -1}
-              aria-controls={`panel-${tab.mode}`}
-              id={`tab-${tab.mode}`}
-              onClick={() =>
-                navigate(() => {
-                  setConflictsOpen(false);
-                  setMode(tab.mode);
-                })
+        <div className="explorer-header">
+          <div
+            className="tabs"
+            role="tablist"
+            aria-label="Browse repository"
+            onKeyDown={(event) => {
+              const buttons = Array.from(
+                event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="tab"]'),
+              );
+              const index = buttons.indexOf(event.target as HTMLButtonElement);
+              if (index < 0) return;
+              const next =
+                event.key === "ArrowRight"
+                  ? (index + 1) % buttons.length
+                  : event.key === "ArrowLeft"
+                    ? (index + buttons.length - 1) % buttons.length
+                    : event.key === "Home"
+                      ? 0
+                      : event.key === "End"
+                        ? buttons.length - 1
+                        : undefined;
+              if (next === undefined) return;
+              event.preventDefault();
+              if (editing || document.body.dataset.reviewSaving) return;
+              buttons[next].click();
+              buttons[next].focus();
+            }}
+          >
+            {tabs.map((tab) => (
+              <button
+                key={tab.mode}
+                role="tab"
+                aria-selected={!conflictsOpen && mode === tab.mode}
+                tabIndex={!conflictsOpen && mode === tab.mode ? 0 : -1}
+                aria-controls={`panel-${tab.mode}`}
+                id={`tab-${tab.mode}`}
+                onClick={() =>
+                  navigate(() => {
+                    setConflictsOpen(false);
+                    setMode(tab.mode);
+                  })
+                }
+              >
+                {tab.label}
+                {tab.mode === "changes" && changes.length > 0 && (
+                  <span className="count">{changes.length}</span>
+                )}
+              </button>
+            ))}
+            {(snapshot.data?.merge?.state === "merging" || conflictsOpen) && (
+              <button
+                role="tab"
+                id="tab-conflicts"
+                aria-controls="panel-conflicts"
+                aria-selected={conflictsOpen}
+                tabIndex={conflictsOpen ? 0 : -1}
+                onClick={() => navigate(() => setConflictsOpen(true))}
+              >
+                Conflicts <span className="count">{snapshot.data?.merge?.unmerged_count ?? 0}</span>
+              </button>
+            )}
+          </div>
+          {!conflictsOpen && (
+            <TreeControls
+              key={mode}
+              compact={compactFolders}
+              onCompactChange={setCompactFolders}
+              onExpand={() => {
+                if (mode === "history") setHistoryExpanded(true);
+                (mode === "files"
+                  ? filesTree
+                  : mode === "changes"
+                    ? changesTree
+                    : historyTree
+                ).current?.expandAll();
+              }}
+              onCollapse={() =>
+                (mode === "files"
+                  ? filesTree
+                  : mode === "changes"
+                    ? changesTree
+                    : historyTree
+                ).current?.collapseAll()
               }
-            >
-              {tab.label}
-              {tab.mode === "changes" && changes.length > 0 && (
-                <span className="count">{changes.length}</span>
-              )}
-            </button>
-          ))}
-          {(snapshot.data?.merge?.state === "merging" || conflictsOpen) && (
-            <button
-              role="tab"
-              id="tab-conflicts"
-              aria-controls="panel-conflicts"
-              aria-selected={conflictsOpen}
-              tabIndex={conflictsOpen ? 0 : -1}
-              onClick={() => navigate(() => setConflictsOpen(true))}
-            >
-              Conflicts <span className="count">{snapshot.data?.merge?.unmerged_count ?? 0}</span>
-            </button>
+            />
           )}
         </div>
         {filterOpen && !conflictsOpen && (
@@ -1104,29 +1141,6 @@ export default function App() {
             canSwitch={() => navigate(() => {})}
           />
           <KeyboardHelp />
-          {!conflictsOpen && (
-            <TreeControls
-              compact={compactFolders}
-              onCompactChange={setCompactFolders}
-              onExpand={() => {
-                if (mode === "history") setHistoryExpanded(true);
-                (mode === "files"
-                  ? filesTree
-                  : mode === "changes"
-                    ? changesTree
-                    : historyTree
-                ).current?.expandAll();
-              }}
-              onCollapse={() =>
-                (mode === "files"
-                  ? filesTree
-                  : mode === "changes"
-                    ? changesTree
-                    : historyTree
-                ).current?.collapseAll()
-              }
-            />
-          )}
           <button
             className="sidebar-toggle"
             onClick={layout.toggle}
