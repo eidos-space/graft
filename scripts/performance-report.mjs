@@ -143,12 +143,18 @@ export async function normalize(suite, input, output, environment = process.env)
     assert.equal(report.rounds, 1);
     assert.equal(report.order, "plain-first");
     for (const row of report.summaries) {
-      assert.equal(row.samples, 1);
+      // The core workload performs three small edits inside a single round.
+      // Keep their median as the workload result; this is not a second run.
+      const expectedSamples =
+        suite === "e2ee-core" && ["warm_small_push", "warm_small_fetch"].includes(row.operation)
+          ? 3
+          : 1;
+      assert.equal(row.samples, expectedSamples);
       const name = [row.profile, row.scenario, row.scale, row.operation].join("/");
       assert.ok(!Object.hasOwn(metrics, name), "Duplicate operation");
       // One observation is not a tail estimate. Keep raw P50/P95 and resources
       // in the artifact, and compare the single elapsed-time observation here.
-      assert.equal(row.milliseconds.p50, row.milliseconds.p95);
+      if (expectedSamples === 1) assert.equal(row.milliseconds.p50, row.milliseconds.p95);
       metrics[name] = row.milliseconds.p50;
     }
     workload = { order: report.order, cases: Object.keys(metrics).sort() };
@@ -190,7 +196,7 @@ export function createClient({
   assert.match(repository ?? "", /^[\w.-]+\/[\w.-]+$/);
   assert.ok(token, "Missing GitHub credential");
   const api = async (route, method = "GET", body) => {
-    const response = await fetcher(`${origin}/repos/${repository}/${route}`, {
+    const response = await fetcher(`${origin}/repos/${repository}${route ? `/${route}` : ""}`, {
       method,
       headers: {
         Authorization: `Bearer ${token}`,
@@ -213,14 +219,27 @@ export function createClient({
     }
     throw new Error("PR comment pagination exceeded; cannot discard older regression records");
   };
-  const reports = async (pr) =>
-    (await comments(pr.number))
-      .filter(
-        (item) =>
-          item.user.login === "github-actions[bot]" || item.user.login === repository.split("/")[0],
-      )
-      .map((item) => readComment(item.body))
-      .filter((data) => data?.headSha === pr.head.sha);
+  const maintainers = new Map();
+  const reports = async (pr) => {
+    const result = [];
+    for (const item of await comments(pr.number)) {
+      const data = readComment(item.body);
+      if (data?.headSha !== pr.head.sha) continue;
+      const login = item.user.login;
+      if (login !== "github-actions[bot]" && login !== repository.split("/")[0]) {
+        // Maintainers can recover an observation from retained CI artifacts.
+        // Organization membership alone does not grant trust: verify write access.
+        if (!["OWNER", "MEMBER", "COLLABORATOR"].includes(item.author_association)) continue;
+        if (!maintainers.has(login)) {
+          const access = await api(`collaborators/${encodeURIComponent(login)}/permission`);
+          maintainers.set(login, ["admin", "maintain", "write"].includes(access.permission));
+        }
+        if (!maintainers.get(login)) continue;
+      }
+      result.push(data);
+    }
+    return result;
+  };
   const associatedPr = async (commit) => {
     assert.match(commit, sha);
     const items = await api(`commits/${commit}/pulls?per_page=100`);
