@@ -1936,7 +1936,8 @@ mod tests {
             &crate::e2ee::codec::encode(&[config().as_bytes(), next.as_bytes()]).unwrap(),
         )
         .unwrap();
-        for abort in [false, true] {
+        for (abort, start_observer) in [(false, false), (false, true), (true, false), (true, true)]
+        {
             let session = session();
             session.unlock_with_root(&config(), fixture_root()).unwrap();
             let (started_tx, started_rx) = tokio::sync::oneshot::channel();
@@ -1961,7 +1962,11 @@ mod tests {
                 .unwrap()
                 .unwrap();
             let peer = session.begin_operation().unwrap();
-            let observing = tokio::spawn(peer.observe_config_durable(next.clone()));
+            assert!(session.inner.checkpoint_gate.try_lock().is_none());
+            let mut observing = std::pin::pin!(peer.observe_config_durable(next.clone()));
+            if start_observer {
+                assert!(futures::poll!(&mut observing).is_pending());
+            }
             let closing_session = session.clone();
             let closing = tokio::spawn(async move { closing_session.lock().await });
             tokio::time::timeout(Duration::from_secs(2), async {
@@ -1972,7 +1977,9 @@ mod tests {
             .await
             .unwrap();
             assert!(!closing.is_finished());
-            assert!(!observing.is_finished());
+            // Closing can cancel the observer's admission check before its
+            // blocking task reaches the checkpoint gate. Both schedules must
+            // preserve trust and drain the key-owning retirement task.
             assert_eq!(
                 session.checkpoint(),
                 Some(config().checkpoint(&fixture_root()).unwrap())
@@ -1986,10 +1993,7 @@ mod tests {
             } else {
                 assert_eq!(caller.await.unwrap(), Err(EncryptionError::Cancelled));
             }
-            assert!(matches!(
-                observing.await.unwrap(),
-                Err(EncryptionError::Cancelled)
-            ));
+            assert!(matches!(observing.await, Err(EncryptionError::Cancelled)));
             tokio::time::timeout(Duration::from_secs(2), closing)
                 .await
                 .unwrap()
