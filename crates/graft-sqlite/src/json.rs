@@ -96,6 +96,9 @@ pub struct JsonRowChange {
 #[derive(Debug, Clone, Serialize)]
 pub struct JsonTableChanges {
     pub name: String,
+    /// Column whose logical value is the rowid, rather than a stored record value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rowid_alias: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub columns: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]

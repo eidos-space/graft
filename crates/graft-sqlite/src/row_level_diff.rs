@@ -254,6 +254,22 @@ pub struct TableChanges {
     pub changes: Vec<RowChange>,
 }
 
+fn declared_primary_key_columns(entry: &MasterEntry) -> Vec<String> {
+    if let Some(constraint) = entry
+        .parse_key_constraints()
+        .into_iter()
+        .find(|constraint| constraint.kind == KeyConstraintKind::PrimaryKey)
+    {
+        return constraint.columns;
+    }
+    entry
+        .parse_columns()
+        .into_iter()
+        .filter(|column| column.pk)
+        .map(|column| column.name)
+        .collect()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InsertRowidMode {
     Preserve,
@@ -1080,7 +1096,11 @@ fn bounded_row_diff_from_readers(
                 rowid_alias,
                 generated_columns,
                 semantic_key_columns: Vec::new(),
-                primary_key_columns: page.primary_key_columns,
+                primary_key_columns: if page.primary_key_columns.is_empty() {
+                    declared_primary_key_columns(entry)
+                } else {
+                    page.primary_key_columns
+                },
                 changes: page.changes,
             });
         }
@@ -2598,7 +2618,14 @@ fn row_level_diff_from_readers(
                 rowid_alias,
                 generated_columns,
                 semantic_key_columns,
-                primary_key_columns,
+                primary_key_columns: if primary_key_columns.is_empty() {
+                    to_entry
+                        .or(from_entry)
+                        .map(declared_primary_key_columns)
+                        .unwrap_or_default()
+                } else {
+                    primary_key_columns
+                },
                 changes,
             });
         }
@@ -3834,6 +3861,30 @@ mod tests {
         assert_eq!(inserts, 2);
         assert_eq!(deletes, 1);
         assert_eq!(updates, 1);
+    }
+
+    #[test]
+    fn declared_keys_include_rowid_table_primary_keys() {
+        for (sql, expected) in [
+            (
+                "CREATE TABLE records (_id TEXT PRIMARY KEY, body TEXT)",
+                vec!["_id"],
+            ),
+            (
+                "CREATE TABLE records (tenant TEXT, id INT, PRIMARY KEY(id, tenant))",
+                vec!["id", "tenant"],
+            ),
+            ("CREATE TABLE records (body TEXT)", vec![]),
+        ] {
+            let entry = MasterEntry {
+                entry_type: "table".into(),
+                name: "records".into(),
+                table_name: "records".into(),
+                root_page: 2,
+                sql: sql.into(),
+            };
+            assert_eq!(declared_primary_key_columns(&entry), expected);
+        }
     }
 
     #[test]

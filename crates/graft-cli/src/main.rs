@@ -23,11 +23,17 @@ use serde_json::Value;
 #[cfg(not(target_arch = "wasm32"))]
 mod upgrade;
 
+#[cfg(not(target_arch = "wasm32"))]
+mod webui;
+
 #[cfg(all(feature = "e2ee", any(unix, windows)))]
 mod encrypted;
 
 #[derive(Subcommand)]
 enum Command {
+    /// Open the local React worktree viewer in your browser.
+    #[cfg(not(target_arch = "wasm32"))]
+    Ui(webui::UiArgs),
     /// Use an explicitly pinned encrypted HTTP remote (session-only unlock).
     #[cfg(all(feature = "e2ee", any(unix, windows)))]
     E2ee(encrypted::EncryptedArgs),
@@ -1045,6 +1051,9 @@ struct Cli {
 }
 
 fn main() -> Result<()> {
+    #[cfg(not(target_arch = "wasm32"))]
+    let cli = Cli::parse_from(webui::arguments());
+    #[cfg(target_arch = "wasm32")]
     let cli = Cli::parse();
     #[cfg(target_arch = "wasm32")]
     enter_browser_worktree(&cli.browser_cwd)?;
@@ -1100,6 +1109,8 @@ fn run_cli(cli: Cli) -> Result<()> {
 fn run_command(command: Command, db_override: Option<&Path>) -> Result<()> {
     validate_command_repo_paths(&command)?;
     match command {
+        #[cfg(not(target_arch = "wasm32"))]
+        Command::Ui(args) => webui::run(args)?,
         #[cfg(all(feature = "e2ee", any(unix, windows)))]
         Command::E2ee(args) => {
             if db_override.is_some() {

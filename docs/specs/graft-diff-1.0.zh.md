@@ -91,6 +91,13 @@ response scope。Row 为空不代表 SQLite file unchanged。
 Row identity：普通 table 使用 signed 64-bit `rowid`；`WITHOUT ROWID` 使用声明顺序
 的 typed composite primary key。Key part 类型：
 
+如果 `INTEGER PRIMARY KEY` 列是 rowid 的别名，JSON table change 会通过
+`rowid_alias` 提供该列名。该列的存储记录位置可能为 null；展示其逻辑值时必须
+使用 row change 的 `rowid`。
+
+`primary_key_columns` 按声明顺序列出主键列，普通 rowid table 也提供此元数据。
+该展示元数据不改变 row identity：普通 table 仍然通过 rowid 匹配行。
+
 ```text
 null | integer | real | text | blob
 ```

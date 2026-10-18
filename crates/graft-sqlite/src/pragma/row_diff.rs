@@ -325,6 +325,7 @@ pub(crate) fn json_table_changes(
         .iter()
         .map(|table| crate::json::JsonTableChanges {
             name: table.table_name.clone(),
+            rowid_alias: table.rowid_alias.clone(),
             columns: table.columns.clone(),
             primary_key_columns: table.primary_key_columns.clone(),
             changes: table.changes.iter().map(json_row_change).collect(),

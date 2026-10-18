@@ -69,6 +69,14 @@ pnpm --dir web-demo install --frozen-lockfile
 
 ### Rust workspace
 
+Before building or testing the CLI (including workspace-wide commands), generate
+its embedded Web UI. These assets are ignored by Git and generated in CI:
+
+```bash
+pnpm --dir web-ui install --frozen-lockfile
+pnpm --dir web-ui build
+```
+
 ```bash
 cargo build --workspace
 cargo check --workspace --all-targets

@@ -61,6 +61,15 @@ To build and run Graft, ensure you have the following dependencies installed:
 [nodejs.org]: https://nodejs.org/
 [pnpm]: https://pnpm.io/installation
 
+Before building or testing the CLI or the full Rust workspace, generate the embedded Web UI:
+
+```bash
+pnpm --dir web-ui install --frozen-lockfile
+pnpm --dir web-ui build
+```
+
+The generated assets are ignored by Git. CI generates them before Rust checks and CLI releases. Rebuild them after changing frontend sources. SDK-only builds do not require this step.
+
 The easiest way to ensure everything works is to run the tests. This can be done via `just test` for a single command that runs everything, or you can run individual test suites like so:
 
 ```bash

@@ -2,6 +2,47 @@
 
 ## Unreleased
 
+## Graft 0.16.0 — 2026-10-19
+
+### Added
+
+- `graft .` and `graft ui <folder>` open a local browser workspace for reviewing
+  files, working changes, and commit history. The CLI embeds the complete React
+  UI; prebuilt releases do not require Node.js or a separate web server.
+- SQLite files expose tables as manually expanded explorer nodes. Glide Data
+  Grid provides virtual rows and columns, version-checked page reads, row diffs,
+  and full-text cell inspection. Text, including HTML and SVG, uses the source
+  viewer; images, audio, video, and PDF have dedicated worktree previews.
+- Text editing, branch creation and switching, and merge conflict resolution
+  are available in the workspace. Text conflicts support current, incoming, or
+  both per block; database conflicts support current or incoming per row or cell.
+  Review drafts survive navigation and refresh. Completing a resolved merge
+  creates its merge commit.
+- Resizable left/right explorer panes, compact folders, scoped filtering, theme
+  switching, and a keyboard shortcut reference keep review navigation compact.
+
+### Fixed
+
+- Repository inventory remains available after reopening an active merge.
+- Row diffs expose declared primary-key columns and rowid aliases so viewers
+  can show logical IDs without duplicating key columns.
+- Saving protects pending writes and rejects externally changed files. Startup
+  prints loading feedback immediately; stale sessions and failed reads provide
+  recovery instructions.
+
+### Compatibility
+
+- Repository and snapshot formats are unchanged. Diff JSON adds `rowid_alias`
+  and fills declared `primary_key_columns` for ordinary rowid tables without
+  changing how rows are matched.
+- The viewer binds to loopback and requires its per-process session token.
+  Database browsing is read only; conflict resolution uses repository commands.
+  Structural database conflicts still require the CLI. Text previews and full
+  cell details are limited to 2 MB.
+- Frontend assets are generated in CI and release builds. Local source builds
+  must build `web-ui` before compiling the CLI; generated assets and design
+  drafts are excluded from version control.
+
 ## Graft 0.15.5 — 2026-08-28
 
 ### Fixed
