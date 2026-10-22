@@ -355,7 +355,7 @@ unless its operation explicitly defines a no-op.
 
 The retained SDK keeps an in-memory classification cache and MAY persist
 content-addressed status snapshots under `.graft/cache/sdk-status`. Current
-persistent schema version is 3, with at most four snapshots; each accepted or
+persistent schema version is 4, with at most four snapshots; each accepted or
 newly persisted snapshot is limited to 256 MiB.
 
 A cache identity covers SDK schema, repository/object format, `HEAD`, index,
@@ -363,6 +363,10 @@ refs, config, ignore sources, tracked paths, and visible-untracked metadata/
 content fingerprints needed for classification. Before returning a persistent
 hit, the SDK rechecks relevant fingerprints. Any mismatch, missing input,
 schema difference, or corrupt snapshot invalidates the whole candidate.
+
+A classification MUST NOT be published with fingerprints from a different
+worktree state. Changes during collection cause a bounded retry or
+`REPOSITORY_STALE`.
 
 Writes use a same-directory temporary file, file sync, atomic rename, and
 directory sync. Absolute worktree paths and credentials MUST NOT be serialized.

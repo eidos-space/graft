@@ -80,8 +80,8 @@ const MAX_SEMANTIC_MANAGED_TABLES: usize = 256;
 const SEMANTIC_MERGE_WORKSPACE_DIRECTORY: &str = "semantic-merge";
 const MAX_SEMANTIC_PROVIDER_NAME_BYTES: usize = 128;
 const MAX_SEMANTIC_MERGE_RECORD_BYTES: usize = 1024 * 1024;
-// Bump whenever persisted path classification semantics change.
-const STATUS_SNAPSHOT_SCHEMA_VERSION: u32 = 3;
+// Bump whenever persisted classification or worktree-proof semantics change.
+const STATUS_SNAPSHOT_SCHEMA_VERSION: u32 = 4;
 const MAX_STATUS_SNAPSHOTS: usize = 4;
 const STATUS_SNAPSHOT_MAX_BYTES: u64 = 256 * 1024 * 1024;
 const WORKTREE_STABILITY_ATTEMPTS: usize = 3;
@@ -4065,7 +4065,9 @@ fn refresh_incremental_status(
     cache: &mut IncrementalStatusCache,
 ) -> Result<IncrementalStatusResult> {
     for attempt in 0..WORKTREE_STABILITY_ATTEMPTS {
-        match refresh_incremental_status_once(service, cache) {
+        match refresh_incremental_status_once(service, cache, |service| {
+            service.status().map_err(repository_command_error)
+        }) {
             Ok(mut result) => {
                 result.telemetry.stability_retries = attempt;
                 return Ok(result);
@@ -4122,6 +4124,7 @@ fn seed_validated_merge_completion_status_cache(
 fn refresh_incremental_status_once(
     service: &mut RepositoryCommandService,
     cache: &mut IncrementalStatusCache,
+    collect_status: impl FnOnce(&mut RepositoryCommandService) -> Result<RepoStatus>,
 ) -> Result<IncrementalStatusResult> {
     let started = Instant::now();
     let repo = service.repository().map_err(repository_command_error)?;
@@ -4207,7 +4210,7 @@ fn refresh_incremental_status_once(
     let before_artifacts = repo.index_artifacts().map_err(repo_error)?;
     let (before_tracked, before_untracked) =
         worktree_fingerprints(&repo, &before_files, &before_artifacts)?;
-    let status = service.status().map_err(repository_command_error)?;
+    let status = collect_status(service)?;
     let after_head = repo.head_target().map_err(repo_error)?;
     let after_index = repo.read_index().map_err(repo_error)?;
     if after_head != head_target || after_index != index {
@@ -4218,14 +4221,12 @@ fn refresh_incremental_status_once(
     cache.files = repo.index_files().map_err(repo_error)?;
     cache.artifacts = repo.index_artifacts().map_err(repo_error)?;
     let (tracked, untracked) = stable_worktree_fingerprints(&repo, &cache.files, &cache.artifacts)?;
+    // Never bind a classification from before a write to fingerprints from after it.
+    // Unchanged path names and file types do not establish an unchanged worktree.
     if before_files != cache.files
         || before_artifacts != cache.artifacts
-        || !worktree_fingerprint_shapes_equal(
-            &before_tracked,
-            &before_untracked,
-            &tracked,
-            &untracked,
-        )
+        || before_tracked != tracked
+        || before_untracked != untracked
     {
         return Err(repository_stale_error(
             "worktree changed while status was being collected",
@@ -4429,46 +4430,12 @@ fn stable_worktree_fingerprints(
 )> {
     let first = worktree_fingerprints(repo, files, artifacts)?;
     let second = worktree_fingerprints(repo, files, artifacts)?;
-    if !worktree_fingerprint_shapes_equal(&first.0, &first.1, &second.0, &second.1) {
+    if first != second {
         return Err(repository_stale_error(
             "worktree changed while path metadata was being sampled",
         ));
     }
     Ok(second)
-}
-
-fn worktree_fingerprint_shapes_equal(
-    first_tracked: &BTreeMap<String, TrackedFingerprint>,
-    first_untracked: &BTreeMap<String, FileFingerprint>,
-    second_tracked: &BTreeMap<String, TrackedFingerprint>,
-    second_untracked: &BTreeMap<String, FileFingerprint>,
-) -> bool {
-    first_tracked.len() == second_tracked.len()
-        && first_tracked.iter().all(|(key, first)| {
-            second_tracked.get(key).is_some_and(|second| {
-                optional_fingerprint_shape_equal(&first.main, &second.main)
-                    && optional_fingerprint_shape_equal(&first.wal, &second.wal)
-                    && optional_fingerprint_shape_equal(&first.shm, &second.shm)
-                    && optional_fingerprint_shape_equal(&first.journal, &second.journal)
-            })
-        })
-        && first_untracked.len() == second_untracked.len()
-        && first_untracked.iter().all(|(key, first)| {
-            second_untracked
-                .get(key)
-                .is_some_and(|second| first.is_file == second.is_file)
-        })
-}
-
-fn optional_fingerprint_shape_equal(
-    first: &Option<FileFingerprint>,
-    second: &Option<FileFingerprint>,
-) -> bool {
-    match (first, second) {
-        (None, None) => true,
-        (Some(first), Some(second)) => first.is_file == second.is_file,
-        _ => false,
-    }
 }
 
 fn worktree_fingerprints(
@@ -8900,6 +8867,158 @@ mod tests {
         let hot = session.status_incremental().unwrap();
         assert!(hot.telemetry.status_cache_hit);
         assert_eq!(hot.generation, changed.generation);
+    }
+
+    #[test]
+    fn status_cache_rejects_a_write_after_classification_before_publication() {
+        for edited in ["unsaved local edits\n", "edited version\n"] {
+            let directory = tempfile::tempdir().unwrap();
+            let note = directory.path().join("note.txt");
+            let session = RepositorySession::new(directory.path());
+            session.open().unwrap();
+            session.init().unwrap();
+            fs::write(&note, "second version\n").unwrap();
+            session.add_all().unwrap();
+            session.commit("initial").unwrap();
+            let history =
+                serde_json::to_value(session.history_summaries(10, None).unwrap().commits).unwrap();
+
+            let error = session
+                .with_state(|state| {
+                    refresh_incremental_status_once(
+                        state.service.as_mut().unwrap(),
+                        &mut state.status_cache,
+                        |service| {
+                            let classified = service.status().map_err(repository_command_error)?;
+                            assert!(!classified.dirty);
+                            fs::write(&note, edited).unwrap();
+                            OpenOptions::new()
+                                .write(true)
+                                .open(&note)
+                                .unwrap()
+                                .set_times(
+                                    fs::FileTimes::new()
+                                        .set_modified(UNIX_EPOCH + Duration::from_secs(2)),
+                                )
+                                .unwrap();
+                            Ok(classified)
+                        },
+                    )
+                })
+                .unwrap_err();
+            assert_eq!(error.code(), SdkErrorCode::RepositoryStale);
+            assert!(
+                read_persisted_status_snapshot(directory.path())
+                    .unwrap()
+                    .is_none()
+            );
+            let dirty = session.status_incremental().unwrap();
+            assert!(dirty.status.dirty);
+            assert!(dirty.telemetry.persistent_snapshot_saved);
+            session.remove_remote("origin").unwrap();
+            assert!(session.status_incremental().unwrap().status.dirty);
+            session.close().unwrap();
+            session.open().unwrap();
+            let reopened = session.status_incremental().unwrap();
+            assert!(reopened.status.dirty);
+            assert!(reopened.telemetry.persistent_snapshot_hit);
+            assert_eq!(fs::read_to_string(note).unwrap(), edited);
+            assert_eq!(
+                serde_json::to_value(session.history_summaries(10, None).unwrap().commits).unwrap(),
+                history
+            );
+        }
+    }
+
+    #[test]
+    fn status_cache_rejects_legacy_racing_clean_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let note = directory.path().join("note.txt");
+        let session = RepositorySession::new(directory.path());
+        session.open().unwrap();
+        session.init().unwrap();
+        fs::write(&note, "second version\n").unwrap();
+        session.add_all().unwrap();
+        session.commit("initial").unwrap();
+        session.status_incremental().unwrap();
+        let cache_directory = directory.path().join(".graft/cache/sdk-status");
+        let cached = fs::read_dir(&cache_directory)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .find(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|value| value == "json")
+            })
+            .unwrap();
+        let mut snapshot: PersistedStatusSnapshot =
+            serde_json::from_slice(&fs::read(cached.path()).unwrap()).unwrap();
+        fs::write(&note, "unsaved local edits\n").unwrap();
+        snapshot.schema_version = 3;
+        snapshot.tracked_fingerprints.insert(
+            "note.txt".into(),
+            tracked_fingerprint(note.clone(), false).unwrap(),
+        );
+        assert!(!snapshot.status.dirty);
+        let bytes = serde_json::to_vec(&snapshot).unwrap();
+        fs::write(
+            cache_directory.join(format!(
+                "classification-v1-{}.json",
+                blake3::hash(&bytes).to_hex()
+            )),
+            bytes,
+        )
+        .unwrap();
+        session.close().unwrap();
+        session.open().unwrap();
+        let rebuilt = session.status_incremental().unwrap();
+        assert!(rebuilt.status.dirty);
+        assert!(!rebuilt.telemetry.persistent_snapshot_hit);
+        assert!(rebuilt.telemetry.persistent_snapshot_saved);
+        session.close().unwrap();
+        session.open().unwrap();
+        let accepted = session.status_incremental().unwrap();
+        assert!(accepted.status.dirty);
+        assert!(accepted.telemetry.persistent_snapshot_hit);
+        assert_eq!(fs::read_to_string(note).unwrap(), "unsaved local edits\n");
+    }
+
+    #[test]
+    fn status_cache_tracks_live_sqlite_wal_without_false_stale_results() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("app.eidos");
+        let database = Connection::open(&database_path).unwrap();
+        database
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA wal_autocheckpoint=0;
+                 CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+                 INSERT INTO items (name) VALUES ('one');",
+            )
+            .unwrap();
+        let session = RepositorySession::new(directory.path());
+        session.open().unwrap();
+        session.init().unwrap();
+        session.add_all().unwrap();
+        session.commit("initial").unwrap();
+        assert!(!session.status_incremental().unwrap().status.dirty);
+        database
+            .execute("INSERT INTO items (name) VALUES ('two')", [])
+            .unwrap();
+        assert!(session.status_incremental().unwrap().status.dirty);
+        session.add_all().unwrap();
+        session.commit("WAL edit").unwrap();
+        assert!(!session.status_incremental().unwrap().status.dirty);
+        session.close().unwrap();
+        session.open().unwrap();
+        assert!(!session.status_incremental().unwrap().status.dirty);
+        assert_eq!(
+            database
+                .query_row("SELECT COUNT(*) FROM items", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
     }
 
     #[test]

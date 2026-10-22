@@ -241,11 +241,14 @@ Missing required option、invalid union/range/path/revision/identity、互斥 di
 
 ## 7. Incremental status cache
 
-SDK 可在 `.graft/cache/sdk-status` 持久化 content-addressed snapshot。当前 schema 3，
+SDK 可在 `.graft/cache/sdk-status` 持久化 content-addressed snapshot。当前 schema 4，
 最多 4 个，每个 accepted/persisted snapshot 最大 256 MiB。Identity 包括
 SDK/repository/object format、HEAD、index、
 refs、config、ignore source、tracked 与 visible-untracked fingerprint。返回 hit 前要
 复核；任何 mismatch/corruption 全部 invalidates。
+
+分类结果不得与另一 worktree 状态的 fingerprint 一起发布。采集期间发生变化时，
+执行有界重试，或返回 `REPOSITORY_STALE`。
 
 写入用 same-directory temp、file sync、atomic rename、directory sync。不能序列化
 absolute path 或 credential。Cache 丢失只影响性能。Incremental result 含 generation、
