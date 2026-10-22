@@ -3,6 +3,31 @@
 This changelog covers the independently versioned `@eidos.space/graft` package. Core Graft CLI and
 SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
 
+## Graft SDK 0.3.35 — 2026-10-22
+
+### Fixed
+
+- Reject status-cache updates when data files change during status collection, so
+  edits cannot be persisted as a clean worktree under newer file fingerprints.
+- Rebuild older status snapshots that could contain this incorrect clean
+  classification. Local files, commits, branches, tags and remotes are preserved.
+
+### Compatibility
+
+- Public SDK APIs, repository formats, and remote protocols are unchanged.
+- Status checks continue to support open SQLite databases in WAL mode. Reader
+  coordination may update SHM timestamps; database, WAL and other data-file
+  fingerprints still have to remain stable throughout collection.
+- Native packages retain support for macOS arm64/x64, Linux glibc arm64/x64,
+  and Windows x64 on Node.js 20 and newer.
+
+### 中文
+
+- 修复数据文件在状态采集期间发生变化时，修改可能被持久缓存为“干净”的问题；采集前后的数据文件指纹必须一致。
+- 自动重算旧版状态缓存，保留本地文件、提交、分支、标签和远程配置。
+- 继续支持保持打开的 WAL 模式 SQLite 数据库，允许读者更新共享内存协调时间戳，同时严格检测数据库、WAL 和其他数据文件的变化。
+- 公共 API、仓库格式和远端协议不变；继续支持 macOS arm64/x64、Linux glibc arm64/x64、Windows x64 和 Node.js 20 及以上版本。
+
 ## Graft SDK 0.3.34 — 2026-10-19
 
 ### Fixed
