@@ -250,6 +250,11 @@ refs、config、ignore source、tracked 与 visible-untracked fingerprint。返�
 分类结果不得与另一 worktree 状态的 fingerprint 一起发布。采集期间发生变化时，
 执行有界重试，或返回 `REPOSITORY_STALE`。
 
+对于 SQLite 路径，权威分类采集可以仅容忍普通 `-shm` 文件因 reader 协调而发生的
+时间戳变化；其存在、类型、大小及可用的文件身份仍必须一致。主数据库、WAL、
+rollback journal 和普通文件的 fingerprint 必须完整一致。SHM 不含数据库内容；
+cache 复用与 persistent hit 验证仍必须比较包含时间戳的完整 SHM fingerprint。
+
 写入用 same-directory temp、file sync、atomic rename、directory sync。不能序列化
 absolute path 或 credential。Cache 丢失只影响性能。Incremental result 含 generation、
 change token、full status 与 cache/stability telemetry。

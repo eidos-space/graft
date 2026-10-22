@@ -368,6 +368,13 @@ A classification MUST NOT be published with fingerprints from a different
 worktree state. Changes during collection cause a bounded retry or
 `REPOSITORY_STALE`.
 
+For SQLite paths, authoritative collection MAY tolerate only timestamp changes
+to a regular `-shm` file caused by reader coordination. Its presence, type, size,
+and available file identity MUST still match. Main database, WAL, rollback
+journal, and ordinary-file fingerprints MUST match completely. SHM contains no
+database content; cache reuse and persistent-hit validation MUST still compare
+its complete fingerprint, including timestamps.
+
 Writes use a same-directory temporary file, file sync, atomic rename, and
 directory sync. Absolute worktree paths and credentials MUST NOT be serialized.
 Cache deletion/corruption can only reduce performance; full status remains the

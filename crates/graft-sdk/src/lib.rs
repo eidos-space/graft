@@ -4225,7 +4225,7 @@ fn refresh_incremental_status_once(
     // Unchanged path names and file types do not establish an unchanged worktree.
     if before_files != cache.files
         || before_artifacts != cache.artifacts
-        || before_tracked != tracked
+        || !classification_fingerprints_match(&before_tracked, &tracked)
         || before_untracked != untracked
     {
         return Err(repository_stale_error(
@@ -4436,6 +4436,41 @@ fn stable_worktree_fingerprints(
         ));
     }
     Ok(second)
+}
+
+fn classification_fingerprints_match(
+    before: &BTreeMap<String, TrackedFingerprint>,
+    after: &BTreeMap<String, TrackedFingerprint>,
+) -> bool {
+    before.len() == after.len()
+        && before.iter().all(|(path, before)| {
+            let Some(after) = after.get(path) else {
+                return false;
+            };
+            if before.main != after.main
+                || before.wal != after.wal
+                || before.journal != after.journal
+            {
+                return false;
+            }
+            match (&before.shm, &after.shm) {
+                (Some(before), Some(after)) if before.is_file && after.is_file => {
+                    // SQLite readers update coordination/read marks in the reconstructible WAL
+                    // index. Only those timestamps may differ across authoritative collection;
+                    // main/WAL/journal and SHM identity/type/length still have to match exactly.
+                    // Cache reuse and persisted-snapshot validation retain the full SHM proof.
+                    let mut after = after.clone();
+                    after.modified_ns = before.modified_ns;
+                    #[cfg(unix)]
+                    {
+                        after.changed_seconds = before.changed_seconds;
+                        after.changed_nanoseconds = before.changed_nanoseconds;
+                    }
+                    before == &after
+                }
+                _ => before.shm == after.shm,
+            }
+        })
 }
 
 fn worktree_fingerprints(
@@ -9013,6 +9048,157 @@ mod tests {
         session.close().unwrap();
         session.open().unwrap();
         assert!(!session.status_incremental().unwrap().status.dirty);
+        assert_eq!(
+            database
+                .query_row("SELECT COUNT(*) FROM items", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn status_cache_accepts_sqlite_reader_shm_timestamp_changes() {
+        for dirty in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let database_path = directory.path().join("app.eidos");
+            let shm_path = directory.path().join("app.eidos-shm");
+            let database = Connection::open(&database_path).unwrap();
+            database
+                .execute_batch(
+                    "PRAGMA journal_mode=WAL;
+                     PRAGMA wal_autocheckpoint=0;
+                     CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+                     INSERT INTO items (name) VALUES ('one');",
+                )
+                .unwrap();
+            let session = RepositorySession::new(directory.path());
+            session.open().unwrap();
+            session.init().unwrap();
+            session.add_all().unwrap();
+            session.commit("initial").unwrap();
+            let history =
+                serde_json::to_value(session.history_summaries(10, None).unwrap().commits).unwrap();
+            if dirty {
+                database
+                    .execute("INSERT INTO items (name) VALUES ('two')", [])
+                    .unwrap();
+            }
+
+            let collected = session
+                .with_state(|state| {
+                    refresh_incremental_status_once(
+                        state.service.as_mut().unwrap(),
+                        &mut state.status_cache,
+                        |service| {
+                            let classified = service.status().map_err(repository_command_error)?;
+                            assert_eq!(classified.dirty, dirty);
+                            // A read-only SQLite connection may update WAL-index read marks.
+                            // Make their metadata churn deterministic without changing DB/WAL bytes.
+                            OpenOptions::new()
+                                .write(true)
+                                .open(&shm_path)
+                                .unwrap()
+                                .set_times(
+                                    fs::FileTimes::new()
+                                        .set_modified(UNIX_EPOCH + Duration::from_secs(2)),
+                                )
+                                .unwrap();
+                            Ok(classified)
+                        },
+                    )
+                })
+                .unwrap();
+            assert_eq!(collected.status.dirty, dirty);
+            assert!(collected.telemetry.persistent_snapshot_saved);
+            assert!(
+                session
+                    .status_incremental()
+                    .unwrap()
+                    .telemetry
+                    .status_cache_hit
+            );
+
+            // Cache reuse still requires the full SHM fingerprint, including timestamps.
+            OpenOptions::new()
+                .write(true)
+                .open(&shm_path)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(3)))
+                .unwrap();
+            let refreshed = session.status_incremental().unwrap();
+            assert_eq!(refreshed.status.dirty, dirty);
+            assert!(!refreshed.telemetry.status_cache_hit);
+            session.close().unwrap();
+            session.open().unwrap();
+            let reopened = session.status_incremental().unwrap();
+            assert_eq!(reopened.status.dirty, dirty);
+            assert!(reopened.telemetry.persistent_snapshot_hit);
+            assert_eq!(
+                serde_json::to_value(session.history_summaries(10, None).unwrap().commits).unwrap(),
+                history
+            );
+            assert_eq!(
+                database
+                    .query_row("SELECT COUNT(*) FROM items", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                if dirty { 2 } else { 1 }
+            );
+        }
+    }
+
+    #[test]
+    fn status_cache_rejects_sqlite_wal_write_after_classification() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("app.eidos");
+        let database = Connection::open(&database_path).unwrap();
+        database
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA wal_autocheckpoint=0;
+                 CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+                 INSERT INTO items (name) VALUES ('one');",
+            )
+            .unwrap();
+        let session = RepositorySession::new(directory.path());
+        session.open().unwrap();
+        session.init().unwrap();
+        session.add_all().unwrap();
+        session.commit("initial").unwrap();
+        let history =
+            serde_json::to_value(session.history_summaries(10, None).unwrap().commits).unwrap();
+        let error = session
+            .with_state(|state| {
+                refresh_incremental_status_once(
+                    state.service.as_mut().unwrap(),
+                    &mut state.status_cache,
+                    |service| {
+                        let classified = service.status().map_err(repository_command_error)?;
+                        assert!(!classified.dirty);
+                        database
+                            .execute("INSERT INTO items (name) VALUES ('two')", [])
+                            .unwrap();
+                        Ok(classified)
+                    },
+                )
+            })
+            .unwrap_err();
+        assert_eq!(error.code(), SdkErrorCode::RepositoryStale);
+        assert!(
+            read_persisted_status_snapshot(directory.path())
+                .unwrap()
+                .is_none()
+        );
+        assert!(session.status_incremental().unwrap().status.dirty);
+        session.remove_remote("origin").unwrap();
+        session.close().unwrap();
+        session.open().unwrap();
+        let reopened = session.status_incremental().unwrap();
+        assert!(reopened.status.dirty);
+        assert!(reopened.telemetry.persistent_snapshot_hit);
+        assert_eq!(
+            serde_json::to_value(session.history_summaries(10, None).unwrap().commits).unwrap(),
+            history
+        );
         assert_eq!(
             database
                 .query_row("SELECT COUNT(*) FROM items", [], |row| row.get::<_, i64>(0))
