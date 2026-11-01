@@ -1195,7 +1195,7 @@ mod tests {
             .unwrap();
         let remote = Arc::new(RemoteConfig::Memory.build().unwrap());
         let storage = Arc::new(FjallStorage::open_temporary().unwrap());
-        let runtime = Runtime::new(tokio_rt.handle().clone(), remote, storage, None);
+        let runtime = Runtime::new(tokio_rt.handle().clone(), remote.clone(), storage, None);
         let source = runtime.volume_open(None, None, None).unwrap();
         let mut writer = runtime.volume_writer(source.vid).unwrap();
         for pageidx in 1..=7 {
@@ -1214,6 +1214,38 @@ mod tests {
         let rebound = runtime.volume_snapshot(&rebound.vid).unwrap();
 
         assert!(runtime.snapshot_hydration_cached(&rebound).unwrap());
+        let source_range = source.snapshot().iter().next().unwrap();
+        let rebound_range = rebound.iter().next().unwrap();
+        let source_hash = runtime
+            .commit_hash(&source_range.log, *source_range.lsns.start())
+            .unwrap()
+            .unwrap();
+        let rebound_hash = runtime
+            .commit_hash(&rebound_range.log, *rebound_range.lsns.start())
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            source_hash, rebound_hash,
+            "rewritten log identities require new hashes"
+        );
+        runtime
+            .snapshot_push_to(rebound.clone(), remote.clone())
+            .unwrap();
+        let receiver = Runtime::new(
+            tokio_rt.handle().clone(),
+            remote.clone(),
+            Arc::new(FjallStorage::open_temporary().unwrap()),
+            None,
+        );
+        receiver
+            .snapshot_hydrate_from(rebound.clone(), remote)
+            .unwrap();
+        assert_eq!(
+            receiver
+                .commit_hash(&rebound_range.log, *rebound_range.lsns.start())
+                .unwrap(),
+            Some(rebound_hash)
+        );
     }
 
     #[test]

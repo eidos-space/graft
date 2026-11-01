@@ -344,7 +344,14 @@ impl FjallStorage {
         let mut batch = self.batch();
         for commit in commits {
             lsn = lsn.checked_prev().unwrap();
-            batch.write_commit(commit.with_log_id(volume.local.clone()).with_lsn(lsn));
+            // The hash includes both log ID and LSN, so a rebound commit must
+            // derive a fresh identity even though its page segments are shared.
+            batch.write_commit(
+                commit
+                    .with_log_id(volume.local.clone())
+                    .with_lsn(lsn)
+                    .with_commit_hash(None),
+            );
         }
         batch.write_volume(volume.clone());
         batch.commit()?;
