@@ -1993,6 +1993,33 @@ impl ImportTarget {
                 });
             }
 
+            if !runtime.snapshot_commits_resident(&snapshot)? {
+                // A lazy checkout retains only visible pages. Forking its old
+                // storage commits would require hashing hidden historical pages
+                // that may be unavailable offline. Seed one new checkpoint from
+                // the visible snapshot instead; repository history is untouched.
+                // This runs only after an actual worktree change is detected.
+                let volume = runtime.volume_open(None, None, None)?;
+                let seed = (|| -> Result<_, ErrCtx> {
+                    let reader = runtime.snapshot_reader(snapshot);
+                    let mut writer = runtime.volume_writer(volume.vid.clone())?;
+                    for page in reader.page_count().iter() {
+                        writer.write_page(page, reader.read_page(page)?)?;
+                    }
+                    Ok(writer)
+                })();
+                return match seed {
+                    Ok(writer) => Ok(Self {
+                        vid: volume.vid,
+                        writer,
+                        cleanup_on_error: true,
+                    }),
+                    Err(error) => {
+                        let _ = runtime.volume_delete(&volume.vid);
+                        Err(error)
+                    }
+                };
+            }
             let volume = runtime.volume_from_snapshot(&snapshot)?;
             return Ok(Self {
                 writer: runtime.volume_writer(volume.vid.clone())?,
@@ -2054,6 +2081,68 @@ mod tests {
 
     fn test_runtime() -> Runtime {
         setup_graft_temporary(RemoteConfig::Memory, None).unwrap()
+    }
+
+    #[test]
+    fn lazy_import_seeds_visible_pages_without_fetching_hidden_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = RemoteConfig::Fs {
+            root: directory.path().to_string_lossy().into_owned(),
+        };
+        let remote = Arc::new(config.clone().build().unwrap());
+        let source = setup_graft_temporary(config, None).unwrap();
+        let volume = source.volume_open(None, None, None).unwrap();
+        let page =
+            |value| Page::from_buf(bytes::Bytes::from(vec![value; PAGESIZE.as_usize()])).unwrap();
+        let mut writer = source.volume_writer(volume.vid.clone()).unwrap();
+        for number in 1..=140 {
+            writer
+                .write_page(PageIdx::try_new(number).unwrap(), page(1))
+                .unwrap();
+        }
+        writer.commit().unwrap();
+        let mut writer = source.volume_writer(volume.vid.clone()).unwrap();
+        for number in 1..=70 {
+            writer
+                .write_page(PageIdx::try_new(number).unwrap(), page(2))
+                .unwrap();
+        }
+        let snapshot = writer.commit().unwrap().snapshot().clone();
+        let base = CommitFileState {
+            volume: volume.vid,
+            snapshot: repo_snapshot_with_commit_hashes(&source, &snapshot).unwrap(),
+        };
+        source
+            .snapshot_push_to(snapshot.clone(), remote.clone())
+            .unwrap();
+        let target = test_runtime();
+        target
+            .snapshot_hydrate_from(snapshot.clone(), remote)
+            .unwrap();
+        assert!(target.snapshot_hydration_cached(&snapshot).unwrap());
+        assert!(!target.snapshot_commits_resident(&snapshot).unwrap());
+        // The target has no configured source and must remain editable offline.
+        let mut imported = ImportTarget::open(&target, Some(&base)).unwrap();
+        imported
+            .writer
+            .write_page(PageIdx::try_new(140).unwrap(), page(3))
+            .unwrap();
+        let state = imported.commit(&target).unwrap();
+        assert_eq!(state.snapshot.ranges.len(), 1);
+        assert_eq!(state.snapshot.ranges[0].commits.len(), 1);
+        assert!(
+            target
+                .snapshot_commits_resident(&state.snapshot.to_snapshot())
+                .unwrap()
+        );
+        let reader = target.snapshot_reader(state.snapshot.to_snapshot());
+        for (number, value) in [(1, 2), (100, 1), (140, 3)] {
+            assert_eq!(
+                reader.read_page(PageIdx::try_new(number).unwrap()).unwrap(),
+                page(value)
+            );
+        }
+        assert!(!target.snapshot_commits_resident(&snapshot).unwrap());
     }
 
     fn create_database(path: &Path, journal_mode: &str) -> Connection {

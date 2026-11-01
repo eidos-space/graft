@@ -10,8 +10,9 @@ SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
 - Recompute storage commit identities when restoring a SQLite snapshot into a
   new log. Restored checkpoints can be published and cloned by another device
   without a snapshot storage commit hash mismatch.
-- Preserve the existing snapshot pages and hydration proofs when rebinding;
-  only the identity derived from the new log and sequence number changes.
+- Keep offline edits of lazy SQLite checkouts usable when superseded historical
+  pages have not been downloaded. Seed a fresh checkpoint from visible pages
+  instead of rebinding incomplete storage history; existing versions remain intact.
 
 ### Compatibility
 
@@ -24,7 +25,7 @@ SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
 ### 中文
 
 - 修复恢复 SQLite 快照到新存储日志时沿用旧提交哈希的问题，恢复后的检查点可正常发布并由其他设备克隆。
-- 保留已有快照页和完整性缓存，仅重新计算依赖新日志与序号的提交标识。
+- 惰性下载的 SQLite 工作副本缺少被覆盖的历史页时，仍可离线编辑；使用当前可见页建立新检查点，保留已有版本，不依赖额外下载旧历史页。
 - 公共 API、仓库格式和远端协议不变；此修复防止生成新的异常检查点，不会自动改写已有的受影响历史。
 - 继续支持 macOS arm64/x64、Linux glibc arm64/x64、Windows x64 和 Node.js 20 及以上版本。
 

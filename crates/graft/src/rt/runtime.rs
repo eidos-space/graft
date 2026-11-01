@@ -295,6 +295,23 @@ impl Runtime {
         Ok(self.storage().volume_from_snapshot(snapshot)?)
     }
 
+    /// Whether every page needed to derive new identities for the snapshot's
+    /// storage commits is resident, including pages hidden by later commits.
+    pub fn snapshot_commits_resident(&self, snapshot: &Snapshot) -> Result<bool> {
+        let reader = self.storage().read();
+        for commit in reader.commits(snapshot) {
+            let commit = commit?;
+            if let Some(index) = commit.segment_idx() {
+                for page in index.pageset.iter() {
+                    if !reader.has_page(index.sid.clone(), page)? {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
+
     /// retrieves an existing volume. returns `LogicalErr::VolumeNotFound` if missing
     pub fn volume_get(&self, vid: &VolumeId) -> Result<Volume> {
         Ok(self.storage().read().volume(vid)?)
