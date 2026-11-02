@@ -177,7 +177,9 @@ jobs:
   test:
     name: Test ${{ matrix.settings.target }} on Node.js ${{ matrix.node }}
     needs: [metadata, build]
-    runs-on: ${{ matrix.settings.runner }}
+    # macos-15 repeatedly failed to allocate the arm64 Node 20 job. Keep the
+    # macOS 15 builds/Node 24 coverage and use another official arm64 image here.
+    runs-on: ${{ matrix.settings.suffix == 'darwin-arm64' && matrix.node == 20 && 'macos-26' || matrix.settings.runner }}
     strategy:
       fail-fast: false
       matrix:
@@ -432,7 +434,7 @@ jobs:
   verify-published:
     name: Verify npm install on ${{ matrix.settings.suffix }} / Node.js ${{ matrix.node }}
     needs: [metadata, publish]
-    runs-on: ${{ matrix.settings.runner }}
+    runs-on: ${{ matrix.settings.suffix == 'darwin-arm64' && matrix.node == 20 && 'macos-26' || matrix.settings.runner }}
     strategy:
       fail-fast: false
       matrix:
