@@ -3699,9 +3699,6 @@ impl WriteAll for fs::File {
     }
 }
 
-#[cfg(test)]
-mod tests;
-
 #[cfg(feature = "e2ee")]
 pub(crate) fn has_upload_planning_observer() -> bool {
     ACTIVE_TRANSFER_PROGRESS.with(|active| {
@@ -3729,3 +3726,6 @@ pub(crate) fn final_transfer_plan(direction: TransferDirection) -> bool {
         counters.total_is_final && !counters.indeterminate
     })
 }
+
+#[cfg(test)]
+mod tests;

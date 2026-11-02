@@ -39,6 +39,18 @@ use zeroize::Zeroizing;
 mod encrypted;
 #[cfg(all(feature = "e2ee", any(unix, windows)))]
 mod encrypted_plan;
+
+/// SDK-scoped, bounded encrypted upload planning. No reporter means the
+/// streaming path and its resource profile are retained. Only sync-stage
+/// observers opt in; legacy transfer-only observers keep streaming.
+pub fn with_planned_uploads<T>(operation: impl FnOnce() -> T) -> T {
+    #[cfg(all(feature = "e2ee", any(unix, windows)))]
+    if crate::repo::has_upload_planning_observer() {
+        return encrypted_plan::with_plan(operation);
+    }
+    operation()
+}
+
 pub mod segment;
 #[cfg(feature = "e2ee")]
 pub use encrypted::EncryptedTransferBudget;
@@ -6577,15 +6589,4 @@ mod tests {
             .set_http_bearer_token("origin", "other-account".into())
             .unwrap();
     }
-}
-
-/// SDK-scoped, bounded encrypted upload planning. No reporter means the
-/// streaming path and its resource profile are retained. Only sync-stage
-/// observers opt in; legacy transfer-only observers keep streaming.
-pub fn with_planned_uploads<T>(operation: impl FnOnce() -> T) -> T {
-    #[cfg(all(feature = "e2ee", any(unix, windows)))]
-    if crate::repo::has_upload_planning_observer() {
-        return encrypted_plan::with_plan(operation);
-    }
-    operation()
 }
