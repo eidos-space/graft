@@ -115,11 +115,12 @@ mod tests {
     async fn inventory_deduplicates_and_rejects_conflicting_or_over_budget_objects() {
         let directory = tempfile::tempdir().unwrap();
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
-                .unwrap();
-        }
+        use std::os::unix::fs::PermissionsExt;
+        crate::native_fs::set_permissions(
+            directory.path(),
+            crate::native_fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
         let root = RootKey::generate(RepositoryId::generate().unwrap()).unwrap();
         let config = EncryptedConfig::create(&root, b"synthetic plan test").unwrap();
         let session = SecretSession::new(
