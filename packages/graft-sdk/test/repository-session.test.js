@@ -1761,6 +1761,7 @@ test("reports real HTTP response bytes through the JavaScript progress callback"
     assert.ok(address && typeof address !== "string")
     const session = await RepositorySession.open(root)
     const progress = []
+    const sync = []
 
     try {
       await session.init()
@@ -1770,7 +1771,7 @@ test("reports real HTTP response bytes through the JavaScript progress callback"
         upstreamBranch: "main",
       })
       await assert.rejects(
-        session.fetch({ onProgress: (event) => progress.push(event) })
+        session.fetch({ onProgress: (event) => progress.push(event), onSyncProgress: (event) => sync.push(event) })
       )
 
       assert.ok(
@@ -1782,6 +1783,8 @@ test("reports real HTTP response bytes through the JavaScript progress callback"
         ),
         JSON.stringify(progress)
       )
+      assert.equal(sync.at(-1).phase, "failed")
+      assert.ok(sync.some((event) => event.transfer?.totalIsFinal && event.transfer.totalBytes === body.length && event.transfer.transferredBytes === body.length))
       assert.ok(progress.every((event) => event.totalIsFinal === false))
     } finally {
       await session.close()
@@ -1961,3 +1964,40 @@ function restoreEnvironment(name, previous) {
   if (previous === undefined) delete process.env[name]
   else process.env[name] = previous
 }
+
+test("sync stages cover plain push, clone, pull and failures without an HTTP denominator", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "graft-sync-stages-"))
+  const sourcePath = path.join(root, "source")
+  const peerPath = path.join(root, "peer")
+  const remote = path.join(root, "remote")
+  await fs.mkdir(sourcePath); await fs.mkdir(peerPath); await fs.mkdir(remote)
+  const source = await RepositorySession.open(sourcePath)
+  const peer = await RepositorySession.open(peerPath)
+  async function observe(operation, applying = false) {
+    const events = []
+    await operation((event) => events.push(event))
+    assert.equal(events[0].phase, "preparing")
+    assert.equal(events.at(-1).phase, "completed")
+    if (applying) assert.ok(events.some((event) => event.phase === "applying"))
+    assert.ok(events.every((event) => event.transfer === undefined))
+  }
+  try {
+    await source.init()
+    await fs.writeFile(path.join(sourcePath, "note.txt"), "first")
+    await source.addAll(); await source.commit("first")
+    await source.configureRemote({ name: "origin", url: `fs://${remote}`, upstreamBranch: "main" })
+    await observe((onSyncProgress) => source.push({ onSyncProgress }))
+    await observe((onSyncProgress) => peer.cloneRepository({ remoteUrl: `fs://${remote}`, onSyncProgress }), true)
+    await fs.writeFile(path.join(sourcePath, "note.txt"), "second")
+    await source.addAll(); await source.commit("second")
+    await observe((onSyncProgress) => source.push({ onSyncProgress }))
+    await observe((onSyncProgress) => peer.pull({ onSyncProgress }), true)
+    assert.equal(await fs.readFile(path.join(peerPath, "note.txt"), "utf8"), "second")
+    const failures = []
+    await assert.rejects(source.push({ remote: "missing", onSyncProgress: (e) => failures.push(e) }))
+    assert.equal(failures.at(-1).phase, "failed")
+  } finally {
+    await peer.close(); await source.close()
+    await fs.rm(root, { recursive: true, force: true })
+  }
+})

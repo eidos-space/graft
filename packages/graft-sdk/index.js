@@ -111,16 +111,16 @@ class RepositorySession {
     return callJson(() => this.#native.addEncryptedRemote(handle, signal))
   }
 
-  async cloneEncryptedRemote({ branch, signal, onProgress } = {}) {
+  async cloneEncryptedRemote({ branch, signal, onProgress, onSyncProgress } = {}) {
     const handle = encryptedHandles.get(this.#encryptedRemote)
     if (!handle) throw new GraftSdkError("Encrypted remote session required", "GRAFT_SDK_INVALID_ARGUMENT")
-    return callJsonWithProgress(() => this.#native.cloneEncryptedRemote(handle, branch, signal, onProgress), onProgress)
+    return callJsonWithSyncProgress((sync) => this.#native.cloneEncryptedRemote(handle, branch, signal, onProgress, sync), onProgress, onSyncProgress)
   }
 
-  async pushInitialBranch({ branch, verificationDirectory, signal, onProgress } = {}) {
+  async pushInitialBranch({ branch, verificationDirectory, signal, onProgress, onSyncProgress } = {}) {
     const handle = encryptedHandles.get(this.#encryptedRemote)
     if (!handle) throw new GraftSdkError("Encrypted remote session required", "GRAFT_SDK_INVALID_ARGUMENT")
-    return callJsonWithProgress(() => this.#native.pushInitialBranch(handle, branch, verificationDirectory === undefined ? undefined : path.resolve(verificationDirectory), signal, onProgress), onProgress)
+    return callJsonWithSyncProgress((sync) => this.#native.pushInitialBranch(handle, branch, verificationDirectory === undefined ? undefined : path.resolve(verificationDirectory), signal, onProgress, sync), onProgress, onSyncProgress)
   }
 
   prepareEncryptedMigration(password, options) {
@@ -313,26 +313,26 @@ class RepositorySession {
   }
 
   async push(options = {}) {
-    const { remote, branch, signal, onProgress } = options
-    return callJsonWithProgress(
-      () => this.#native.push(remote, branch, signal, onProgress),
-      onProgress
+    const { remote, branch, signal, onProgress, onSyncProgress } = options
+    return callJsonWithSyncProgress(
+      (sync) => this.#native.push(remote, branch, signal, onProgress, sync),
+      onProgress, onSyncProgress
     )
   }
 
   async fetch(options = {}) {
-    const { remote, branch, signal, onProgress } = options
-    return callJsonWithProgress(
-      () => this.#native.fetch(remote, branch, signal, onProgress),
-      onProgress
+    const { remote, branch, signal, onProgress, onSyncProgress } = options
+    return callJsonWithSyncProgress(
+      (sync) => this.#native.fetch(remote, branch, signal, onProgress, sync),
+      onProgress, onSyncProgress
     )
   }
 
   async pull(options = {}) {
-    const { remote, branch, signal, onProgress } = options
-    return callJsonWithProgress(
-      () => this.#native.pull(remote, branch, signal, onProgress),
-      onProgress
+    const { remote, branch, signal, onProgress, onSyncProgress } = options
+    return callJsonWithSyncProgress(
+      (sync) => this.#native.pull(remote, branch, signal, onProgress, sync),
+      onProgress, onSyncProgress
     )
   }
 
@@ -562,10 +562,10 @@ class RepositorySession {
   }
 
   async cloneRepository(options) {
-    const { signal, onProgress, ...cloneOptions } = options
-    return callJsonWithProgress(
-      () => this.#native.cloneRepository(cloneOptions, signal, onProgress),
-      onProgress
+    const { signal, onProgress, onSyncProgress, ...cloneOptions } = options
+    return callJsonWithSyncProgress(
+      (sync) => this.#native.cloneRepository(cloneOptions, signal, onProgress, sync),
+      onProgress, onSyncProgress
     )
   }
 }
@@ -596,6 +596,25 @@ async function callJson(operation) {
       "GRAFT_SDK_INVALID_RESPONSE",
       error
     )
+  }
+}
+
+async function callJsonWithSyncProgress(operation, onProgress, onSyncProgress) {
+  let active = true
+  let terminal = false
+  const report = typeof onSyncProgress === "function" ? (event) => {
+    if (!active || terminal) return
+    terminal = ["completed", "failed", "cancelled"].includes(event.phase)
+    onSyncProgress(event)
+  } : undefined
+  try {
+    return await callJsonWithProgress(() => operation(report), onProgress || report)
+  } catch (error) {
+    // AbortSignal may reject before the native worker reaches its checkpoint.
+    report?.({ phase: error.name === "AbortError" ? "cancelled" : "failed" })
+    throw error
+  } finally {
+    active = false
   }
 }
 

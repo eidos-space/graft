@@ -37,7 +37,8 @@ pub use encrypted_migration::{
 };
 pub use graft::repo::{
     CancellationToken, RepoConfigEntry, RepoPathContent, RepoPathContentState, RepoStatus,
-    TransferDirection, TransferProgress, TransferProgressReporter,
+    SyncPhase, SyncProgress, TransferDirection, TransferProgress, TransferProgressReporter,
+    sync_phase,
 };
 use graft::repo::{
     CommitArtifactState, CommitFileState, MergeOutcome, MergePlan, RepoPathStorage,
@@ -2439,7 +2440,7 @@ impl RepositorySession {
 
     pub fn push(&self, remote: Option<&str>, branch: Option<&str>) -> Result<Value> {
         let argument = remote_branch_argument(remote, branch)?;
-        self.execute_json("json_push", argument.as_deref())
+        graft::remote::with_planned_uploads(|| self.execute_json("json_push", argument.as_deref()))
     }
 
     /// Publish the source pinned by a trusted host's initialization journal.
@@ -2449,11 +2450,13 @@ impl RepositorySession {
         remote: &str,
         intent: &graft::e2ee::InitializationIntent,
     ) -> Result<Value> {
-        self.with_service(|service| {
-            let outcome = service
-                .push_initialization_intent(remote, intent)
-                .map_err(repository_command_error)?;
-            Ok(serde_json::json!(outcome))
+        graft::remote::with_planned_uploads(|| {
+            self.with_service(|service| {
+                let outcome = service
+                    .push_initialization_intent(remote, intent)
+                    .map_err(repository_command_error)?;
+                Ok(serde_json::json!(outcome))
+            })
         })
     }
 
@@ -2484,18 +2487,20 @@ impl RepositorySession {
         config: &RemoteConfig,
         intent: &graft::e2ee::InitializationIntent,
     ) -> Result<Value> {
-        self.with_service(|service| {
-            let repository = service.repository().map_err(repository_command_error)?;
-            if repository.config().map_err(repo_error)?.remotes.get(remote) != Some(config) {
-                return Err(SdkError::new(
-                    SdkErrorCode::Encrypted(EncryptedErrorCode::StaleObservation),
-                    "initialization remote binding changed",
-                ));
-            }
-            let outcome = service
-                .push_initialization_intent(remote, intent)
-                .map_err(repository_command_error)?;
-            Ok(serde_json::json!(outcome))
+        graft::remote::with_planned_uploads(|| {
+            self.with_service(|service| {
+                let repository = service.repository().map_err(repository_command_error)?;
+                if repository.config().map_err(repo_error)?.remotes.get(remote) != Some(config) {
+                    return Err(SdkError::new(
+                        SdkErrorCode::Encrypted(EncryptedErrorCode::StaleObservation),
+                        "initialization remote binding changed",
+                    ));
+                }
+                let outcome = service
+                    .push_initialization_intent(remote, intent)
+                    .map_err(repository_command_error)?;
+                Ok(serde_json::json!(outcome))
+            })
         })
     }
 

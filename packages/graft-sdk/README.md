@@ -639,8 +639,9 @@ are not transfer percentages. Upload bytes have been consumed by the HTTP transp
 they do not confirm durable remote storage or successful completion.
 
 E2EE reports ciphertext object uploads (including aggregate framing and multipart parts)
-and downloaded response bodies. Dependencies are discovered incrementally, so these events
-omit `totalBytes` and set `totalIsFinal` to false. They expose only direction and byte counts,
+and downloaded response bodies. Incremental paths without a complete plan omit
+`totalBytes` and set `totalIsFinal` to false; bounded SDK upload inventories below
+can provide a final upload payload total. They expose only direction and byte counts,
 without plaintext paths, content, keys, or passwords. Initial publication can also report
 downloads from its independent verification clone. Local encryption, password derivation,
 and final worktree materialization are separate phases and have no transfer percentage.
@@ -1008,3 +1009,73 @@ initialization, migration of committed history, native fenced local cutover and
 current-password change are
 described above. Remaining workflows and production conformance gates are defined
 in [E2EE Remote 1.0](../../docs/specs/graft-e2ee-remote-1.0.md).
+
+### Sync stages and request progress
+
+`push`, `fetch`, `pull`, `cloneRepository`, `cloneEncryptedRemote`, and
+`pushInitialBranch` accept `onSyncProgress`, alongside the existing `onProgress`.
+The same native HTTP body counter is used for encrypted and plain remotes:
+
+```js
+await source.pushInitialBranch({
+  verificationDirectory,
+  onSyncProgress({ phase, requestId, transfer }) {
+    renderStage(phase)
+    if (transfer) {
+      // This percentage belongs only to this HTTP body attempt.
+      renderRequest(requestId, transfer.transferredBytes,
+        transfer.totalIsFinal ? transfer.totalBytes : undefined)
+    }
+  },
+  onProgress: renderCumulativeTransferBytes,
+})
+```
+
+Stages are observed boundaries: `preparing`, `uploading`, `downloading`,
+`verifying`, `applying`, then `completed`, `failed`, or `cancelled`.
+Preparation can include remote discovery and SQLite snapshot work. Each actual
+HTTP body attempt gets an operation-local `requestId`; its bytes start at zero.
+Known body lengths are accurate request denominators, including ciphertext and
+multipart bodies. Unknown-length bodies remain indeterminate. Retries get new
+IDs; resumed uploads count only bodies actually sent, and deduplicated objects
+that are skipped add no body bytes. Concurrent IDs are independent. These are
+HTTP entity bytes, excluding TLS, headers and transport retransmission.
+
+A request reaching 100% does not mean its response was accepted, its data was
+successfully authenticated, or the operation completed. Never combine request
+percentages into an overall percentage. Use the legacy cumulative event's
+`totalIsFinal` only when a complete operation transfer plan exists; encrypted
+downloads and unplanned uploads remain indeterminate at that scope. Filesystem remotes emit
+stages without HTTP byte counters. Initial publication's independent clone
+remains `verifying` through its reads and checkout. Only a successful complete
+SDK operation emits `completed`; `branch_published` without an explicitly
+requested verification directory retains its existing result semantics.
+
+For SDK encrypted pushes, `onSyncProgress` also enables a bounded whole-upload
+inventory. SQLite segments and commit metadata, external files, split packs and
+indexes are prepared before the first payload upload; the existing authenticated
+graph and segment negotiation removes known already-present payloads. No second
+per-object probe is added. The legacy `onProgress` callback then
+receives one fixed upload total and cumulative bytes across **all** retained
+ciphertext payload bodies. This is the upload transfer budget, not a percentage
+of verification or the operation's elapsed time. Ref mutations, public hints and
+HTTP/TLS framing are control traffic and are not added to this payload budget.
+Requested independent verification still runs after upload and remains
+indeterminate. `onProgress` without `onSyncProgress` retains the streaming path.
+
+Planning retains at most 2 GiB of validated ciphertext and 256 payload handles;
+public hint memory is capped at 1 MiB/256 hints. Current object preparation and
+SQLite plaintext spools are additional to these retained bytes. Hitting a bound,
+or discovering a multipart payload, flushes the retained prefix through the
+ordinary validated uploader and keeps the total indeterminate. A short body or
+an internal retry invalidates a declared total before subsequent attempts.
+Multipart sessions, recovery records and their full winning-object validation
+are unchanged. There is no new server capability or protocol negotiation.
+
+This opt-in inventory adds temporary retention and changes aggregate publication
+to individual immutable payload requests;
+use `GRAFT_PUSH_TRACE=1` to inspect `encrypted_upload_plan_prepare` duration,
+retained ciphertext bytes, object count and whether a complete inventory was
+formed. These measurements contain no repository paths or credentials. Native
+request measurements remain bounded per in-flight body and throttle at 100 ms;
+JavaScript queues and retained host events use additional memory.

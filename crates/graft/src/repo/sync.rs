@@ -821,6 +821,7 @@ impl Repository {
                     observed,
                 ))?;
             }
+            block_on_remote(remote_store.flush_planned_uploads())?;
             preflight_trace.finish(&[]);
             // A previous push may have confirmed the branch but failed before
             // creating its default HEAD. Retry that independent create without

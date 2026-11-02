@@ -3,6 +3,47 @@
 This changelog covers the independently versioned `@eidos.space/graft` package. Core Graft CLI and
 SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
 
+## Graft SDK 0.3.37 — 2026-11-02
+
+### Added
+
+- Add optional `onSyncProgress` stages and request-local HTTP body counters to
+  push, fetch, pull, clone and encrypted initialization. Existing `onProgress`
+  retains cumulative transfer bytes; request percentages never imply operation
+  completion. Cancellation and settlement suppress late sync events.
+- When `onSyncProgress` is supplied, encrypted initial uploads and daily pushes
+  can prepare a complete, bounded ciphertext inventory before publication and
+  report its fixed upload payload total through `onProgress`. The inventory
+  includes SQLite segments, commits, external files, packs and indexes; existing
+  authenticated discovery still avoids known remote payloads.
+
+### Boundaries and compatibility
+
+- Encrypted clone/pull and initial upload's independent verification report real
+  bytes and stages with an unknown operation total. Multipart and inventories
+  exceeding 2 GiB/256 payloads retain the existing validated streaming path and
+  unknown total. Public hint retention is limited to 1 MiB/256 hints. Ref/hint
+  control traffic and HTTP/TLS framing are excluded from the upload payload total.
+- Planning retains prepared ciphertext files and changes aggregate publication
+  to individual immutable payload requests. Its preparation time and retained
+  bytes are observable with `GRAFT_PUSH_TRACE=1`. Legacy transfer-only observers
+  keep streaming. A short body or internal retry withdraws a declared total.
+- Immutable-object authentication, epoch validation, ref CAS, multipart recovery,
+  and independent initial-publication verification remain required. Repository
+  formats and server protocols are unchanged.
+- Preserve macOS Mach-O symbol tables when building addons to avoid a dyld
+  LINKEDIT alignment error; re-sign the final copied artifact.
+- Native packages cover macOS arm64/x64, Linux glibc arm64/x64 and Windows x64.
+  The release matrix tests Node.js 20 and 24; Linux musl is not provided.
+
+### 中文
+
+- 新增可选 `onSyncProgress`，提供首次上传、clone、push、fetch、pull 的实际阶段与单次 HTTP 请求字节；已有 `onProgress` 继续提供累计字节，不把请求百分比当成操作完成度。
+- 加密首次上传和日常 push 在完整密文清单可规划时，通过 `onProgress` 提供固定上传主体总量；包含 SQLite、提交、附件、pack 和索引。须同时提供 `onSyncProgress` 才启用规划。
+- 加密 clone/pull、首次上传后的独立校验、multipart 及超过 2 GiB/256 个主体的操作仍保持未知总量；提示数据最多保留 1 MiB/256 条。总量不包含 ref/hint 控制请求及 HTTP/TLS 开销。
+- 规划需暂存完整密文，聚合发布改为逐个不可变对象请求；可通过 `GRAFT_PUSH_TRACE=1` 查看准备耗时与暂存字节。旧的仅传输回调继续流式发送；短读或内部重试撤销已声明总量。
+- 保留认证、密钥会话、引用 CAS、multipart 恢复及独立校验，仓库格式和服务协议不变。修复 macOS 原生库的 LINKEDIT 对齐加载问题。
+
 ## Graft SDK 0.3.36 — 2026-11-01
 
 ### Fixed

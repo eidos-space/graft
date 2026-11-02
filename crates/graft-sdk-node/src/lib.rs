@@ -195,6 +195,16 @@ pub struct NodeTransferProgress {
     pub total_is_final: bool,
 }
 
+#[napi(object)]
+pub struct NodeSyncProgress {
+    pub phase: String,
+    pub request_id: Option<f64>,
+    pub transfer: Option<NodeTransferProgress>,
+}
+
+type SyncProgressCallback =
+    ThreadsafeFunction<FnArgs<(NodeSyncProgress,)>, (), FnArgs<(NodeSyncProgress,)>, Status, false>;
+
 type TransferProgressCallback = ThreadsafeFunction<
     FnArgs<(NodeTransferProgress,)>,
     (),
@@ -533,6 +543,7 @@ pub struct JsonTask {
     operation: JsonOperation,
     cancellation: CancellationToken,
     progress: Option<Arc<TransferProgressCallback>>,
+    sync_progress: Option<Arc<SyncProgressCallback>>,
 }
 
 impl Task for JsonTask {
@@ -542,16 +553,50 @@ impl Task for JsonTask {
     fn compute(&mut self) -> Result<Self::Output> {
         let cancellation = self.cancellation.clone();
         let progress = self.progress.clone();
-        if let Some(progress) = progress {
-            let reporter = TransferProgressReporter::new(move |event| {
-                let _ = progress.call(
-                    FnArgs::from((node_transfer_progress(event),)),
-                    ThreadsafeFunctionCallMode::NonBlocking,
-                );
+        let sync_progress = self.sync_progress.clone();
+        if progress.is_some() || sync_progress.is_some() {
+            let mut reporter = TransferProgressReporter::new(move |event| {
+                if let Some(progress) = &progress {
+                    let _ = progress.call(
+                        FnArgs::from((node_transfer_progress(event),)),
+                        ThreadsafeFunctionCallMode::NonBlocking,
+                    );
+                }
             });
-            return graft_sdk::with_transfer_progress(&reporter, || {
+            if let Some(sync) = sync_progress {
+                reporter = reporter.with_sync_callback(move |event| {
+                    let phase = match event.phase {
+                        graft_sdk::SyncPhase::Preparing => "preparing",
+                        graft_sdk::SyncPhase::Uploading => "uploading",
+                        graft_sdk::SyncPhase::Downloading => "downloading",
+                        graft_sdk::SyncPhase::Verifying => "verifying",
+                        graft_sdk::SyncPhase::Applying => "applying",
+                        graft_sdk::SyncPhase::Completed => "completed",
+                        graft_sdk::SyncPhase::Failed => "failed",
+                        graft_sdk::SyncPhase::Cancelled => "cancelled",
+                    };
+                    let _ = sync.call(
+                        FnArgs::from((NodeSyncProgress {
+                            phase: phase.into(),
+                            request_id: event.request_id.map(|id| id as f64),
+                            transfer: event.transfer.map(node_transfer_progress),
+                        },)),
+                        ThreadsafeFunctionCallMode::NonBlocking,
+                    );
+                });
+            }
+            reporter.phase(graft_sdk::SyncPhase::Preparing);
+            let result = graft_sdk::with_transfer_progress(&reporter, || {
                 graft_sdk::with_cancellation(&cancellation, || self.compute_inner())
             });
+            reporter.phase(if result.is_ok() {
+                graft_sdk::SyncPhase::Completed
+            } else if cancellation.is_cancelled() {
+                graft_sdk::SyncPhase::Cancelled
+            } else {
+                graft_sdk::SyncPhase::Failed
+            });
+            return result;
         }
         graft_sdk::with_cancellation(&cancellation, || self.compute_inner())
     }
@@ -1119,6 +1164,7 @@ impl NodeRepositorySession {
         verification_directory: Option<String>,
         signal: Option<AbortSignal>,
         progress: Option<TransferProgressCallback>,
+        sync_progress: Option<SyncProgressCallback>,
     ) -> Result<AsyncTask<JsonTask>> {
         self.session
             .validate_encrypted_host_directories(&remote.host_directories)
@@ -1131,11 +1177,12 @@ impl NodeRepositorySession {
             )?;
         }
         let context = remote.initial_branch_context()?;
-        Ok(json_task_with_progress(
+        Ok(json_task_with_sync_progress(
             self,
             JsonOperation::PushInitialBranch { context, branch, verification_directory },
             signal,
             progress,
+            sync_progress,
         ))
     }
 
@@ -1146,11 +1193,12 @@ impl NodeRepositorySession {
         branch: Option<String>,
         signal: Option<AbortSignal>,
         progress: Option<TransferProgressCallback>,
+        sync_progress: Option<SyncProgressCallback>,
     ) -> Result<AsyncTask<JsonTask>> {
         self.session
             .validate_encrypted_host_directories(&remote.host_directories)
             .map_err(e2ee::secret_error)?;
-        Ok(json_task_with_progress(
+        Ok(json_task_with_sync_progress(
             self,
             JsonOperation::CloneEncryptedRemote {
                 remote_name: remote.remote_name.clone(),
@@ -1159,6 +1207,7 @@ impl NodeRepositorySession {
             },
             signal,
             progress,
+            sync_progress,
         ))
     }
 }
@@ -1670,12 +1719,14 @@ impl NodeRepositorySession {
         branch: Option<String>,
         signal: Option<AbortSignal>,
         progress: Option<TransferProgressCallback>,
+        sync_progress: Option<SyncProgressCallback>,
     ) -> AsyncTask<JsonTask> {
-        json_task_with_progress(
+        json_task_with_sync_progress(
             self,
             JsonOperation::Push { remote, branch },
             signal,
             progress,
+            sync_progress,
         )
     }
 
@@ -1686,12 +1737,14 @@ impl NodeRepositorySession {
         branch: Option<String>,
         signal: Option<AbortSignal>,
         progress: Option<TransferProgressCallback>,
+        sync_progress: Option<SyncProgressCallback>,
     ) -> AsyncTask<JsonTask> {
-        json_task_with_progress(
+        json_task_with_sync_progress(
             self,
             JsonOperation::Fetch { remote, branch },
             signal,
             progress,
+            sync_progress,
         )
     }
 
@@ -1702,12 +1755,14 @@ impl NodeRepositorySession {
         branch: Option<String>,
         signal: Option<AbortSignal>,
         progress: Option<TransferProgressCallback>,
+        sync_progress: Option<SyncProgressCallback>,
     ) -> AsyncTask<JsonTask> {
-        json_task_with_progress(
+        json_task_with_sync_progress(
             self,
             JsonOperation::Pull { remote, branch },
             signal,
             progress,
+            sync_progress,
         )
     }
 
@@ -2180,8 +2235,9 @@ impl NodeRepositorySession {
         options: CloneOptions,
         signal: Option<AbortSignal>,
         progress: Option<TransferProgressCallback>,
+        sync_progress: Option<SyncProgressCallback>,
     ) -> AsyncTask<JsonTask> {
-        json_task_with_progress(
+        json_task_with_sync_progress(
             self,
             JsonOperation::Clone {
                 remote_url: options.remote_url,
@@ -2190,6 +2246,7 @@ impl NodeRepositorySession {
             },
             signal,
             progress,
+            sync_progress,
         )
     }
 }
@@ -2309,6 +2366,16 @@ fn json_task_with_progress(
     signal: Option<AbortSignal>,
     progress: Option<TransferProgressCallback>,
 ) -> AsyncTask<JsonTask> {
+    json_task_with_sync_progress(session, operation, signal, progress, None)
+}
+
+fn json_task_with_sync_progress(
+    session: &NodeRepositorySession,
+    operation: JsonOperation,
+    signal: Option<AbortSignal>,
+    progress: Option<TransferProgressCallback>,
+    sync_progress: Option<SyncProgressCallback>,
+) -> AsyncTask<JsonTask> {
     let cancellation = CancellationToken::new();
     if let Some(signal) = signal.as_ref() {
         let abort_token = cancellation.clone();
@@ -2320,6 +2387,7 @@ fn json_task_with_progress(
             operation,
             cancellation,
             progress: progress.map(Arc::new),
+            sync_progress: sync_progress.map(Arc::new),
         },
         signal,
     )

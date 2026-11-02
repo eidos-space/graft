@@ -510,11 +510,97 @@ impl EncryptedRemote {
     }
 
     async fn publish_prepared(&self, prepared: &PreparedEncryptedObject) -> Result<()> {
+        #[cfg(any(unix, windows))]
+        if let Some(plan) = super::encrypted_plan::current() {
+            let collecting = {
+                let plan = plan.lock().unwrap();
+                !plan.disabled && !plan.sealed
+            };
+            if collecting {
+                crate::repo::sync_phase(crate::repo::SyncPhase::Preparing);
+                if self
+                    .client
+                    .requires_multipart(prepared.ciphertext_length())
+                    .await?
+                {
+                    self.flush_upload_plan(false).await?;
+                } else {
+                    let admission = plan.lock().unwrap().admit(prepared)?;
+                    match admission {
+                        super::encrypted_plan::Admission::Retained => return Ok(()),
+                        super::encrypted_plan::Admission::Full => {
+                            self.flush_upload_plan(false).await?
+                        }
+                        super::encrypted_plan::Admission::Disabled => {}
+                    }
+                }
+            }
+        }
+        self.publish_prepared_now(prepared).await
+    }
+
+    async fn publish_hint(&self, hint: &RoutingHint) -> Result<()> {
+        #[cfg(any(unix, windows))]
+        if let Some(plan) = super::encrypted_plan::current() {
+            let admission = plan.lock().unwrap().admit_hint(hint);
+            match admission {
+                super::encrypted_plan::Admission::Retained => return Ok(()),
+                super::encrypted_plan::Admission::Full => self.flush_upload_plan(false).await?,
+                super::encrypted_plan::Admission::Disabled => {}
+            }
+        }
+        Ok(self.client.publish_hint(hint).await?)
+    }
+
+    #[cfg(any(unix, windows))]
+    pub(super) async fn flush_upload_plan(&self, final_total: bool) -> Result<()> {
+        let Some(plan) = super::encrypted_plan::current() else {
+            return Ok(());
+        };
+        let (objects, hints, bytes, declare, trace) = {
+            let mut plan = plan.lock().unwrap();
+            if plan.sealed {
+                return Ok(());
+            }
+            plan.disabled |= !final_total;
+            plan.sealed = true;
+            (
+                std::mem::take(&mut plan.objects),
+                std::mem::take(&mut plan.hints),
+                plan.bytes,
+                !plan.disabled,
+                plan.trace.take(),
+            )
+        };
+        if let Some(trace) = trace {
+            trace.finish(&[
+                ("retained_ciphertext_bytes", bytes),
+                ("objects", objects.len() as u64),
+                ("hints", hints.len() as u64),
+                ("complete", u64::from(declare)),
+            ]);
+        }
+        if declare {
+            crate::repo::plan_remaining_transfer(crate::repo::TransferDirection::Upload, bytes);
+        } else {
+            crate::repo::invalidate_transfer_plan(crate::repo::TransferDirection::Upload);
+        }
+        for object in objects {
+            self.publish_prepared_now(&object).await?;
+        }
+        for hint in &hints {
+            self.client.publish_hint(hint).await?;
+        }
+        Ok(())
+    }
+
+    async fn publish_prepared_now(&self, prepared: &PreparedEncryptedObject) -> Result<()> {
         if self
             .client
             .requires_multipart(prepared.ciphertext_length())
             .await?
         {
+            crate::repo::invalidate_transfer_plan(crate::repo::TransferDirection::Upload);
             #[cfg(any(unix, windows))]
             {
                 let provider =
@@ -544,7 +630,10 @@ impl EncryptedRemote {
             #[cfg(not(any(unix, windows)))]
             return Err(EncryptionError::UnsupportedProfile.into());
         }
-        for _ in 0..3 {
+        for attempt in 0..3 {
+            if attempt > 0 {
+                crate::repo::invalidate_transfer_plan(crate::repo::TransferDirection::Upload);
+            }
             match self.client.publish_object(prepared).await? {
                 ObjectPublicationOutcome::Created | ObjectPublicationOutcome::Reused => {
                     return Ok(());
@@ -802,7 +891,7 @@ impl EncryptedRemote {
             self.publish_prepared(object).await?;
         }
         for hint in &bundle.hints {
-            self.client.publish_hint(hint).await?;
+            self.publish_hint(hint).await?;
         }
         Ok(())
     }
@@ -875,6 +964,20 @@ impl EncryptedRemote {
             })
             .transpose()?
             .unwrap_or_default();
+        #[cfg(any(unix, windows))]
+        if super::encrypted_plan::current().is_some_and(|plan| {
+            let plan = plan.lock().unwrap();
+            !plan.sealed && !plan.disabled
+        }) {
+            for object in objects {
+                self.put_chunks(&object.path, object.chunks.clone()).await?;
+            }
+            for pack in &packs {
+                self.publish_bounded_pack(pack).await?;
+            }
+            self.flush_upload_plan(true).await?;
+            return self.publish_ref(path, observed, Some(replacement)).await;
+        }
         let maximum_ciphertext_length = objects
             .iter()
             .map(|object| object.content_length as u64)
@@ -960,7 +1063,7 @@ impl EncryptedRemote {
                 self.publish_prepared(object).await?;
             }
             for hint in &bundle.hints {
-                self.client.publish_hint(hint).await?;
+                self.publish_hint(hint).await?;
             }
             return self.publish_ref(path, observed, Some(replacement)).await;
         }
@@ -1022,7 +1125,7 @@ impl EncryptedRemote {
         self.put_chunks(&pack.index_path, vec![pack.index.clone()])
             .await?;
         if let Some(hint) = hint {
-            self.client.publish_hint(&hint).await?;
+            self.publish_hint(&hint).await?;
         }
         operation.check_active()?;
         Ok(())
