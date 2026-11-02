@@ -423,7 +423,14 @@ Node SDK 的 push、fetch、pull、clone 和首次加密发布额外支持
 字节和可选的已知长度。已知长度仅为该请求的最终分母，禁止作为整个操作分母。
 重试使用新 ID，去重跳过的对象不贡献 body 字节，续传只统计实际传输的分片。
 未知长度保持不确定。加密与非加密使用同一观测机制，加密路径统计密文 HTTP body。
-原有按操作和方向累计的回调与最终规划语义不变。观测无需额外预检请求或重复 payload 暂存。
+原有按操作和方向累计的回调与最终规划语义不变。请求观测本身无需预检；完整加密下载
+计划需要在声明剩余 body 调度前认证对象头。
+
+`fetchForCheckout({ remote, branch, signal?, onProgress?, onSyncProgress? })`
+返回 `{ remote, branch, head, commits }`。它在同一个下载计划内将对象图、外部文件和目标
+SQLite page 下载到私有缓存，完成校验后才更新 tracking ref；禁止移动 HEAD/index、替换
+工作目录或绕过 planMerge 审核与受保护的 applyMerge。取消遵循现有 AbortError/终态
+cancelled 约定，可以保留已验证缓存，但不得应用 checkout。普通 fetch 仍只获取对象。
 
 ### 有界加密上传清单
 
@@ -434,8 +441,22 @@ pack 和 index，并按 opaque identity 去重；跳过已有对象保留原有�
 会话 epoch 和固定字节。初始化独立回读验证和 ref journal 均保留。
 
 内置清单最多保留 2 GiB/256 个密文 payload handle，以及 1 MiB/256 个公共 hint。
-当前对象准备的暂存开销不包含在该保留预算内。超限或遇到 multipart payload 时回退到
+当前对象准备的暂存开销不包含在该保留预算内。超限时回退到
 原有发布过程，不声明最终总量；短 body 和重试会撤销已经声明的分母。总量统计整次上传
-的全部密文 payload body，排除 ref 控制流量，不覆盖后续验证下载。clone、pull 和
-multipart 在拥有完整不可变传输调度前必须保持总量未知，不能用单 body 长度或明文
-checkout 预算替代。
+的全部密文 payload body，排除 ref 控制流量，不覆盖后续验证下载。
+Multipart 必须在声明总量前完成所有 session 协商，校验身份、分片大小和服务端已确认
+分片，分母只统计缺失分片。加密准备保留原始恢复密文和 journal lease，完整 winning-object
+校验及持久确认仍然必需。
+
+### 固定下载调度
+
+Clone、pull 和独立验证 clone 在传输外部文件及 snapshot frame 前准备不可变仓库图。
+Adapter 收集全部必需 snapshot（包含三方合并输入），对完整压缩帧去重，并一次固定
+满足缓冲预算的请求分组；执行必须直接消费该分组。规划不得 hydrate page、移动 ref
+或替换工作目录。加密与非加密使用同一逻辑请求清单和累计 body 计数。
+
+加密规划必须认证 envelope、校验逻辑身份，将明文范围展开为精确 AEAD 覆盖范围。
+最终预算包含发现阶段已消费的 body，以及之后全部对象头和密文 body 尝试，包括重复
+对象头读取。每个加密范围必须消费与 endpoint、opaque key 和范围匹配的操作内清单项。
+清单缺项、重试、计划外 body 或短 body 必须撤销最终分母。原有认证、完整内容身份、
+取消和受保护的工作目录应用保持必需。传输达到总量不代表操作及后续 materialization 完成。

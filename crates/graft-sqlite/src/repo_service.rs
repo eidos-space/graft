@@ -729,14 +729,15 @@ impl RepositoryCommandService {
         let runtime = self.file.runtime().clone();
         let prepared = repo.prepare_fetch(remote, branch)?;
         let plan = repo.plan_revision_checkout(prepared.head())?;
-        let store = Arc::new(repo.remote_store(remote)?);
+        let store = prepared.remote();
         let snapshots = plan
             .files
             .values()
             .map(|state| state.snapshot.to_snapshot())
             .collect::<Vec<_>>();
-        let bytes = runtime.snapshots_download_bytes(&snapshots, store.clone())?;
-        prepared.plan_download(bytes)?;
+        let downloads = runtime.prepare_snapshot_download(&snapshots, store.clone())?;
+        prepared.plan_download(&downloads.requests())?;
+        runtime.execute_snapshot_download(downloads, store.clone())?;
         for state in plan.files.values() {
             crate::pragma::repo_snapshot::hydrate_repo_file_state(
                 &runtime,

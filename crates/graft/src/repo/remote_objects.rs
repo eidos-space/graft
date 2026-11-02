@@ -208,7 +208,7 @@ impl Repository {
         remote: &crate::remote::Remote,
         head: &str,
         boundary: &fetch_boundary::FetchBoundary,
-    ) -> Result<(usize, u64)> {
+    ) -> Result<(usize, BTreeMap<object::ObjectId, u64>)> {
         let budget = GraphBudget::new(remote);
         let mut stack = vec![(object::ObjectId::from_str(head)?, GraphRole::Commit)];
         let mut seen = BTreeSet::new();
@@ -275,20 +275,15 @@ impl Repository {
                 _ => {}
             }
         }
-        let mut bytes = 0u64;
+        let mut missing = BTreeMap::new();
         for (id, size) in payloads {
             if self.large_file_content_path(&id).exists() {
                 self.verify_cached_large_file_content(remote, &id, size)?;
             } else {
-                bytes = bytes
-                    .checked_add(size)
-                    .ok_or_else(|| RepoErr::InvalidRemoteObject {
-                        path: head.into(),
-                        message: "download size exceeds u64".into(),
-                    })?;
+                missing.insert(id, size);
             }
         }
-        Ok((commits, bytes))
+        Ok((commits, missing))
     }
 
     pub(super) fn fetch_commit_chain(
@@ -1629,7 +1624,13 @@ mod payload_prefetch_tests {
         let sink = events.clone();
         let reporter = TransferProgressReporter::new(move |event| sink.lock().unwrap().push(event));
         let _scope = TransferProgressScope::enter(&reporter);
-        prepared.plan_download(99).unwrap();
+        prepared
+            .plan_download(&[crate::remote::DownloadRequest {
+                path: "segments/test".into(),
+                range: Some(0..99),
+                length: 99,
+            }])
+            .unwrap();
         let event = events.lock().unwrap()[0];
         assert!(event.total_is_final);
         assert_eq!(event.transferred_bytes, 0);
@@ -1669,7 +1670,7 @@ mod payload_prefetch_tests {
             Some(head.id)
         );
         let cached = reader.prepare_fetch("origin", "main").unwrap();
-        cached.plan_download(0).unwrap();
+        cached.plan_download(&[]).unwrap();
         assert_eq!(events.lock().unwrap().last().unwrap().total_bytes, Some(0));
     }
 

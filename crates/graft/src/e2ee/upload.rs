@@ -204,7 +204,7 @@ pub(super) fn progress_body(
     progress_body_with_length(stream, None)
 }
 
-fn progress_body_with_length(
+pub(super) fn progress_body_with_length(
     stream: impl futures::Stream<Item = std::io::Result<Vec<u8>>> + Send + 'static,
     length: Option<u64>,
 ) -> reqwest::Body {

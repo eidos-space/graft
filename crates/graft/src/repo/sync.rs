@@ -49,7 +49,7 @@ pub struct PreparedFetch<'a> {
     repository: &'a Repository,
     remote: Remote,
     outcome: FetchOutcome,
-    payload_bytes: u64,
+    payloads: BTreeMap<object::ObjectId, u64>,
     boundary: fetch_boundary::FetchBoundary,
 }
 
@@ -58,16 +58,23 @@ impl PreparedFetch<'_> {
         &self.outcome.head
     }
 
-    /// Declare the combined external-file and adapter-owned download budget.
-    pub fn plan_download(&self, additional_bytes: u64) -> Result<()> {
-        let bytes = self
-            .payload_bytes
-            .checked_add(additional_bytes)
-            .ok_or_else(|| RepoErr::InvalidRemoteObject {
-                path: self.outcome.head.clone(),
-                message: "download size exceeds u64".into(),
-            })?;
-        self.remote.plan_download_progress(bytes);
+    pub fn remote(&self) -> Arc<Remote> {
+        Arc::new(self.remote.clone())
+    }
+
+    /// Declare one schedule for external files and adapter-owned snapshots.
+    pub fn plan_download(&self, additional: &[crate::remote::DownloadRequest]) -> Result<()> {
+        let mut requests = self
+            .payloads
+            .iter()
+            .map(|(id, size)| crate::remote::DownloadRequest {
+                path: large_file_content_relative_path(id),
+                range: None,
+                length: *size,
+            })
+            .collect::<Vec<_>>();
+        requests.extend_from_slice(additional);
+        block_on_remote(self.remote.prepare_download_progress(&requests))?;
         Ok(())
     }
 
@@ -139,8 +146,7 @@ impl Repository {
                 (parse_remote_ref(&head_path, head)?, BTreeSet::new())
             }
         };
-        let (fetched, payload_bytes) =
-            self.fetch_graph_metadata(&remote_store, &head, &boundary)?;
+        let (fetched, payloads) = self.fetch_graph_metadata(&remote_store, &head, &boundary)?;
         let reachable = self.fetched_commit_ancestors(&head, &boundary)?;
         let commits = fetched + imported.intersection(&reachable).count();
         Ok(PreparedFetch {
@@ -152,7 +158,7 @@ impl Repository {
                 head,
                 commits,
             },
-            payload_bytes,
+            payloads,
             boundary,
         })
     }
@@ -162,6 +168,38 @@ impl Repository {
         validate_ref_name(branch)?;
         let remote_store = self.remote_store(remote)?;
         self.fetch_with_bundle_or_store(remote, branch, &remote_store)
+    }
+
+    /// Resolve one pull refspec without changing tracking refs or downloading payloads.
+    pub fn prepare_fetch_refspec(&self, remote: &str, refspec: &str) -> Result<PreparedFetch<'_>> {
+        validate_remote_name(remote)?;
+        let parsed = parse_fetch_refspec(remote, refspec)?;
+        let source = parsed.source.as_ref().expect("fetch source");
+        let destination_pattern = parsed.destination.as_ref().unwrap_or(source);
+        let (branch, destination) = if let Some(branch) = source.exact() {
+            (branch.to_owned(), destination_pattern.expand("")?)
+        } else {
+            let store = self.remote_store(remote)?;
+            let mut matched = Vec::new();
+            for reference in self.remote_branch_refs_from_store(remote, &store)? {
+                if let Some(capture) = source.capture(&reference.branch)? {
+                    matched.push((
+                        reference.branch.clone(),
+                        destination_pattern.expand(capture)?,
+                    ));
+                }
+            }
+            if matched.len() != 1 {
+                return Err(RepoErr::InvalidRefspec {
+                    refspec: refspec.into(),
+                    message: "pull refspec must select exactly one branch".into(),
+                });
+            }
+            matched.pop().expect("one matching branch")
+        };
+        let mut prepared = self.prepare_fetch(remote, &branch)?;
+        prepared.outcome.branch = destination;
+        Ok(prepared)
     }
 
     pub fn fetch_for_clone(&self, remote: &str, branch: &str) -> Result<CloneFetch> {

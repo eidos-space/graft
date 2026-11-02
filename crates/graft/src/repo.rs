@@ -145,6 +145,7 @@ struct TransferProgressDirectionCounters {
     total_is_final: bool,
     declared_remaining_bytes: u64,
     last_emit: Option<Instant>,
+    download_requests: std::collections::BTreeMap<(String, u64, u64), usize>,
 }
 
 /// Observable work boundaries. Attached body counters are request-scoped,
@@ -276,22 +277,6 @@ impl TransferProgressReporter {
         }
     }
 
-    fn declare_aggregate_total(&self, direction: TransferDirection, total_bytes: u64) {
-        let progress = {
-            let mut counters = self.inner.counters.lock().unwrap();
-            let counters = direction_counters(&mut counters, direction);
-            counters.total_bytes = counters.total_bytes.saturating_add(total_bytes);
-            counters.total_is_final = true;
-            counters.declared_remaining_bytes = counters
-                .declared_remaining_bytes
-                .saturating_add(total_bytes);
-            due_transfer_progress(direction, counters)
-        };
-        if let Some(progress) = progress {
-            (self.inner.callback)(progress);
-        }
-    }
-
     fn start_planning(&self, direction: TransferDirection) {
         let progress = {
             let mut counters = self.inner.counters.lock().unwrap();
@@ -300,6 +285,7 @@ impl TransferProgressReporter {
             counters.declared_remaining_bytes = 0;
             counters.indeterminate = true;
             counters.total_is_final = false;
+            counters.download_requests.clear();
             counters.last_emit = Some(Instant::now());
             transfer_progress(direction, counters)
         };
@@ -402,6 +388,10 @@ pub(crate) struct TransferProgressHandle {
 impl TransferProgressHandle {
     pub(crate) fn advance(&mut self, bytes: u64) {
         self.body_bytes = self.body_bytes.saturating_add(bytes);
+        if self.body_total.is_some_and(|total| self.body_bytes > total) {
+            self.reporter.start_planning(self.direction);
+            self.body_total = None;
+        }
         self.reporter.advance(self.direction, bytes);
         if let Some((id, transferred, total, last)) = &mut self.request {
             *transferred = transferred.saturating_add(bytes);
@@ -489,20 +479,66 @@ pub(crate) fn begin_transfer_progress(
     })
 }
 
-pub(crate) fn declare_transfer_progress_total(direction: TransferDirection, total_bytes: u64) {
-    ACTIVE_TRANSFER_PROGRESS.with(|active| {
-        if let Some(reporter) = active.borrow().as_ref() {
-            reporter.declare_aggregate_total(direction, total_bytes);
-        }
-    });
-}
-
 pub(crate) fn plan_remaining_transfer(direction: TransferDirection, bytes: u64) {
     ACTIVE_TRANSFER_PROGRESS.with(|active| {
         if let Some(reporter) = active.borrow().as_ref() {
             reporter.plan_remaining(direction, bytes);
         }
     });
+}
+
+/// Freeze actual HTTP range attempts, including repeated authenticated headers.
+/// The inventory is operation-scoped and never becomes a cache of trusted data.
+#[cfg(feature = "e2ee")]
+pub(crate) fn plan_download_requests(requests: Vec<(String, std::ops::Range<u64>)>) {
+    ACTIVE_TRANSFER_PROGRESS.with(|active| {
+        if let Some(reporter) = active.borrow().clone() {
+            let mut inventory = std::collections::BTreeMap::new();
+            let mut bytes = 0u64;
+            for (key, range) in requests {
+                bytes = bytes
+                    .checked_add(range.end - range.start)
+                    .expect("validated download budget");
+                *inventory.entry((key, range.start, range.end)).or_insert(0) += 1;
+            }
+            reporter
+                .inner
+                .counters
+                .lock()
+                .unwrap()
+                .download
+                .download_requests = inventory;
+            reporter.plan_remaining(TransferDirection::Download, bytes);
+        }
+    });
+}
+
+#[cfg(feature = "e2ee")]
+pub(crate) fn claim_download_request(key: &str, range: &std::ops::Range<u64>) -> Option<u64> {
+    let reporter = ACTIVE_TRANSFER_PROGRESS.with(|active| active.borrow().clone())?;
+    let claimed = {
+        let mut counters = reporter.inner.counters.lock().unwrap();
+        let counters = &mut counters.download;
+        if !counters.total_is_final || counters.indeterminate {
+            return None;
+        }
+        let key = (key.to_owned(), range.start, range.end);
+        if let Some(count) = counters.download_requests.get_mut(&key) {
+            *count -= 1;
+            if *count == 0 {
+                counters.download_requests.remove(&key);
+            }
+            true
+        } else {
+            false
+        }
+    };
+    if claimed {
+        Some(range.end - range.start)
+    } else {
+        reporter.start_planning(TransferDirection::Download);
+        None
+    }
 }
 
 /// Report a confirmed synchronous operation boundary on the active reporter.
@@ -3709,7 +3745,6 @@ pub(crate) fn has_upload_planning_observer() -> bool {
     })
 }
 
-#[cfg(feature = "e2ee")]
 pub(crate) fn invalidate_transfer_plan(direction: TransferDirection) {
     let reporter = ACTIVE_TRANSFER_PROGRESS.with(|active| active.borrow().clone());
     if let Some(reporter) = reporter {

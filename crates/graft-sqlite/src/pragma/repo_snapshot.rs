@@ -314,8 +314,7 @@ impl<'a> RepoSnapshotResolver<'a> {
                 .values()
                 .map(|state| state.snapshot.to_snapshot())
                 .collect::<Vec<_>>();
-            self.runtime
-                .prepare_snapshots_download(&snapshots, remote)?;
+            self.runtime.prefetch_snapshots(&snapshots, remote)?;
         }
         for state in plan.files.values_mut() {
             *state = self.resolve_file_state(state)?;

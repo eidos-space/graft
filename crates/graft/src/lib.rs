@@ -8,7 +8,7 @@ pub mod rt {
     mod action;
     mod task;
 
-    pub use action::PreparedSnapshotPush;
+    pub use action::{PreparedSnapshotDownload, PreparedSnapshotPush};
 }
 
 pub mod core;

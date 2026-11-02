@@ -189,6 +189,7 @@ files in the Space. Changes confined to `.graft` are not counted.
 | `configureRemote` | Persist remote URL/upstream metadata | No |
 | `push` | Send objects/refs to a remote | No |
 | `fetch` | Receive objects/refs into `.graft` | No |
+| `fetchForCheckout` | Fetch external files and target SQLite pages with a complete download plan | No |
 | `pull` | Fetch, integrate, and check out the result | **Yes** |
 | `cloneRepository` | Populate a new worktree from a remote | **Yes** |
 | `planMerge` | Compute an immutable up-to-date, fast-forward, or three-way plan | No |
@@ -617,7 +618,7 @@ tokens or absolute user paths.
 ## Remote transfer progress
 
 `push`, `fetch`, `pull`, `cloneRepository`, `cloneEncryptedRemote`,
-`pushInitialBranch`, and `applyMerge` accept an `onProgress` callback:
+`pushInitialBranch`, `fetchForCheckout`, and `applyMerge` accept an `onProgress` callback:
 
 ```js
 await session.push({
@@ -640,8 +641,8 @@ they do not confirm durable remote storage or successful completion.
 
 E2EE reports ciphertext object uploads (including aggregate framing and multipart parts)
 and downloaded response bodies. Incremental paths without a complete plan omit
-`totalBytes` and set `totalIsFinal` to false; bounded SDK upload inventories below
-can provide a final upload payload total. They expose only direction and byte counts,
+`totalBytes` and set `totalIsFinal` to false. SDK upload inventories and frozen
+clone/pull download schedules below can provide a final payload total. They expose only direction and byte counts,
 without plaintext paths, content, keys, or passwords. Initial publication can also report
 downloads from its independent verification clone. Local encryption, password derivation,
 and final worktree materialization are separate phases and have no transfer percentage.
@@ -1044,8 +1045,8 @@ HTTP entity bytes, excluding TLS, headers and transport retransmission.
 A request reaching 100% does not mean its response was accepted, its data was
 successfully authenticated, or the operation completed. Never combine request
 percentages into an overall percentage. Use the legacy cumulative event's
-`totalIsFinal` only when a complete operation transfer plan exists; encrypted
-downloads and unplanned uploads remain indeterminate at that scope. Filesystem remotes emit
+`totalIsFinal` only when a complete operation transfer plan exists; discovery
+and unplanned transfers remain indeterminate at that scope. Filesystem remotes emit
 stages without HTTP byte counters. Initial publication's independent clone
 remains `verifying` through its reads and checkout. Only a successful complete
 SDK operation emits `completed`; `branch_published` without an explicitly
@@ -1060,17 +1061,43 @@ receives one fixed upload total and cumulative bytes across **all** retained
 ciphertext payload bodies. This is the upload transfer budget, not a percentage
 of verification or the operation's elapsed time. Ref mutations, public hints and
 HTTP/TLS framing are control traffic and are not added to this payload budget.
-Requested independent verification still runs after upload and remains
-indeterminate. `onProgress` without `onSyncProgress` retains the streaming path.
+Requested independent verification still runs after upload, with its own download
+budget and `verifying` stage. `onProgress` without `onSyncProgress` retains the
+streaming encrypted upload path.
+
+Clone, pull, and verification clone use the same download inventory for plain and
+encrypted remotes: pin the fetched graph, collect missing external files and all
+required SQLite snapshots (including merge inputs), deduplicate whole compressed
+frames, and freeze their bounded request grouping before transferring payloads.
+For encryption, authenticate object headers first and expand each request to its
+actual ciphertext range, including repeated header reads and AEAD covering blocks.
+The fixed denominator includes body bytes already read during discovery plus the
+remaining schedule. Execution consumes this schedule directly. No content is
+trusted or published without the existing full identity and authentication checks.
+An unexpected encrypted range, retry, or short body withdraws the fixed denominator.
+
+Hosts that review merges before applying them can use
+`fetchForCheckout({ remote: "origin", branch: "main", onProgress, onSyncProgress })`
+instead of ordinary `fetch` for the explicit pull flow. This prepares the target
+payloads and pages under one download budget, updates only the tracking ref, and
+leaves HEAD, index and worktree unchanged. It returns `{ remote, branch, head, commits }`.
+Follow with `planMerge` and guarded `applyMerge` as usual. Ordinary `fetch` retains
+its existing object-only semantics; `applyMerge` can still report any additional
+snapshot hydration it needs.
+
+Multipart upload planning negotiates all sessions before sending payloads and
+counts only missing parts confirmed by the server's validated response. Encrypted
+retries retain the original ciphertext, journal lease, session checks and complete
+winning-object readback. Plain HTTP aggregate uploads declare their full body
+budget; per-object fallbacks negotiate multipart sessions before declaring theirs.
 
 Planning retains at most 2 GiB of validated ciphertext and 256 payload handles;
 public hint memory is capped at 1 MiB/256 hints. Current object preparation and
-SQLite plaintext spools are additional to these retained bytes. Hitting a bound,
-or discovering a multipart payload, flushes the retained prefix through the
+SQLite plaintext spools are additional to these retained bytes. Hitting a bound
+flushes the retained prefix through the
 ordinary validated uploader and keeps the total indeterminate. A short body or
 an internal retry invalidates a declared total before subsequent attempts.
-Multipart sessions, recovery records and their full winning-object validation
-are unchanged. There is no new server capability or protocol negotiation.
+There is no new server capability or protocol negotiation.
 
 This opt-in inventory adds temporary retention and changes aggregate publication
 to individual immutable payload requests;
