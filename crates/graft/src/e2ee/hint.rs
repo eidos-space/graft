@@ -22,7 +22,7 @@ pub struct CommitTopology {
     pub parents: Vec<[u8; 32]>,
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct RoutedCommit {
     commit: [u8; 32],
     parents: Vec<[u8; 32]>,
@@ -30,6 +30,7 @@ struct RoutedCommit {
 
 /// Client-authenticated, deliberately public topology for one immutable pack.
 /// Authentication alone does not prove the topology matches the actual pack.
+#[derive(Clone)]
 pub struct RoutingHint {
     repository: RepositoryId,
     key: String,

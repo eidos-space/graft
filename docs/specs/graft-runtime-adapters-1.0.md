@@ -444,8 +444,9 @@ publication certain.
 Encrypted HTTP operations MUST report streamed ciphertext object uploads,
 aggregate upload framing, multipart parts, and downloaded response bodies through
 the same reporter. They MUST NOT expose plaintext paths, content, or secrets.
-Their incrementally discovered dependencies do not establish a final aggregate
-length: events omit `totalBytes` and set `totalIsFinal` to false. Counters reset
+Incrementally discovered dependencies do not establish a final aggregate
+length: until a complete bounded upload inventory exists, events omit
+`totalBytes` and set `totalIsFinal` to false. Counters reset
 for each operation; retries within one operation count bytes consumed again.
 Upload consumption does not acknowledge remote durability. Initial publication's
 verification clone may report download events in the same operation. Local
@@ -620,3 +621,43 @@ Current evidence lives in `crates/graft-sqlite/src/repo_service.rs`,
   output are not substitutes for it.
 - Browser `merge-api` is a host adapter to real Rust code; remote sync remains
   unavailable and must not be mocked into a conformance claim.
+
+### Additive sync observation
+
+The Node SDK additionally accepts `onSyncProgress` on push, fetch, pull, clone,
+and initial encrypted publication. It reports confirmed preparation, body
+upload/download, independent verification, and worktree application boundaries,
+plus terminal operation status. Independent initial verification MUST preserve
+its verification stage across nested downloads and checkout. Completion MUST
+follow the entire operation, including requested verification.
+
+Transfer events in this callback have an operation-local request ID. Each ID
+names a single HTTP entity-body attempt, with its own consumed bytes and optional
+known length. A known length is final only at request scope; it MUST NOT be
+interpreted as the operation denominator. Retries use new IDs, skipped objects
+contribute no body bytes, and resumed uploads count the actually transferred
+parts. Unknown-length bodies remain indeterminate. Encryption uses exactly the
+same observation mechanism, counting ciphertext HTTP bodies. The legacy
+operation/direction cumulative callback and final-plan semantics are unchanged.
+No preflight network request or duplicate payload spool is required by observation.
+
+### Bounded encrypted upload inventories
+
+When the Node host opts into sync observation, SDK push and initial-publication
+commands MAY retain a complete ciphertext payload inventory before publication.
+A final upload denominator MUST cover every missing SQLite segment/commit,
+external payload, pack and index emitted by that command, deduplicated by opaque
+identity. Existing-object skips retain the original authenticated negotiation and
+publication Reused checks; planning MUST NOT introduce an unverified skip. Preparation MUST NOT publish the
+branch or HEAD early. Payloads MUST retain their validated epoch and fixed bytes;
+independent initialization verification and ref journals remain required.
+
+The built-in inventory retains at most 2 GiB/256 ciphertext payload handles and
+1 MiB/256 public hints. Current-object preparation is additional to this budget.
+An overflow or a multipart payload falls back to ordinary publication without a
+final denominator. A short body or retry invalidates a previously declared total.
+This denominator counts all ciphertext payload bodies in the upload operation;
+it excludes ref-control traffic and does not cover later verification downloads.
+Clone, pull and multipart progress MUST remain indeterminate until their own
+complete immutable transfer schedules are implemented. A single body length or
+a plaintext checkout budget is insufficient evidence for those totals.

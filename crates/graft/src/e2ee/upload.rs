@@ -36,7 +36,7 @@ pub struct PreparedEncryptedObject {
 }
 
 impl PreparedEncryptedObject {
-    pub(super) fn retained_copy(&self) -> Self {
+    pub(crate) fn retained_copy(&self) -> Self {
         Self {
             file: self.file.clone(),
             epoch: self.epoch,
@@ -101,6 +101,13 @@ impl PreparedEncryptedObject {
         Ok(prepared)
     }
 
+    pub(crate) fn same_plaintext(&self, other: &Self) -> bool {
+        self.remote_key == other.remote_key
+            && self.snapshot.logical_key == other.snapshot.logical_key
+            && self.snapshot.plaintext_length == other.snapshot.plaintext_length
+            && self.snapshot.plaintext_sha256 == other.snapshot.plaintext_sha256
+    }
+
     pub fn remote_key(&self) -> &str {
         &self.remote_key
     }
@@ -121,7 +128,14 @@ impl PreparedEncryptedObject {
 
     pub(super) fn body(&self) -> (reqwest::Body, CancelUpload) {
         let (stream, cancelled) = self.ciphertext_stream();
-        (progress_body(stream), cancelled)
+        (
+            progress_body_with_length(
+                stream,
+                crate::repo::final_transfer_plan(crate::repo::TransferDirection::Upload)
+                    .then_some(self.ciphertext_length),
+            ),
+            cancelled,
+        )
     }
 
     pub(super) fn ciphertext_stream(
@@ -187,9 +201,16 @@ impl PreparedEncryptedObject {
 pub(super) fn progress_body(
     stream: impl futures::Stream<Item = std::io::Result<Vec<u8>>> + Send + 'static,
 ) -> reqwest::Body {
+    progress_body_with_length(stream, None)
+}
+
+fn progress_body_with_length(
+    stream: impl futures::Stream<Item = std::io::Result<Vec<u8>>> + Send + 'static,
+    length: Option<u64>,
+) -> reqwest::Body {
     use futures::StreamExt;
     let mut progress =
-        crate::repo::begin_transfer_progress(crate::repo::TransferDirection::Upload, None);
+        crate::repo::begin_transfer_progress(crate::repo::TransferDirection::Upload, length);
     reqwest::Body::wrap_stream(stream.map(move |chunk| {
         if let (Some(progress), Ok(bytes)) = (&mut progress, &chunk) {
             progress.advance(bytes.len() as u64);

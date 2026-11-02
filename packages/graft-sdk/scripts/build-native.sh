@@ -42,12 +42,21 @@ case "${rust_target}" in
     ;;
 esac
 
-cargo build --manifest-path "${workspace_dir}/Cargo.toml" \
+link_args=()
+case "${rust_target}" in
+  aarch64-apple-darwin|x86_64-apple-darwin)
+    # Keep Mach-O symbol/string tables intact for newer dyld versions. Signing
+    # alone does not fix the misaligned LINKEDIT emitted by stripped builds.
+    link_args=(-Cstrip=none)
+    ;;
+esac
+
+cargo rustc --manifest-path "${workspace_dir}/Cargo.toml" \
   --package graft-sdk-node \
   --release \
   --target "${rust_target}" \
   "${feature_args[@]}" \
-  --locked
+  --locked -- "${link_args[@]}"
 
 mkdir -p "${output_dir}"
 cp "${cargo_library}" "${package_library}"

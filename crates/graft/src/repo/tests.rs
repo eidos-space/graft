@@ -6247,3 +6247,130 @@ fn discover_from_nested_path() {
 fn write_sqlite_magic(path: impl AsRef<Path>) {
     fs::write(path, SQLITE_DATABASE_MAGIC).unwrap();
 }
+
+#[test]
+fn sync_progress_tracks_attempts_and_preserves_verification() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let captured = events.clone();
+    let reporter = TransferProgressReporter::new(|_| {})
+        .with_sync_callback(move |event| captured.lock().unwrap().push(event));
+    with_transfer_progress(&reporter, || {
+        sync_phase(SyncPhase::Preparing);
+        let mut first = begin_transfer_progress(TransferDirection::Upload, Some(10)).unwrap();
+        first.advance(3);
+        drop(first); // failed attempt retains actual consumption
+        let mut retry = begin_transfer_progress(TransferDirection::Upload, Some(10)).unwrap();
+        retry.advance(10);
+        retry.finish();
+        sync_phase(SyncPhase::Verifying);
+        let mut read = begin_transfer_progress(TransferDirection::Download, None).unwrap();
+        read.advance(4);
+        read.finish();
+        sync_phase(SyncPhase::Applying);
+    });
+    reporter.phase(SyncPhase::Completed);
+    let events = events.lock().unwrap();
+    let requests = events
+        .iter()
+        .filter_map(|event| event.request_id.zip(event.transfer))
+        .collect::<Vec<_>>();
+    assert!(
+        requests
+            .iter()
+            .any(|(id, t)| *id == 1 && t.transferred_bytes == 3 && t.total_bytes == Some(10))
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|(id, t)| *id == 2 && t.transferred_bytes == 10 && t.total_is_final)
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|(id, t)| *id == 3 && t.transferred_bytes == 4 && !t.total_is_final)
+    );
+    assert!(
+        events
+            .iter()
+            .filter(|e| e.request_id == Some(3))
+            .all(|e| e.phase == SyncPhase::Verifying)
+    );
+    assert_eq!(events.last().unwrap().phase, SyncPhase::Completed);
+}
+
+#[test]
+fn sync_progress_invalidates_incorrect_body_length() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let captured = events.clone();
+    let reporter = TransferProgressReporter::new(|_| {})
+        .with_sync_callback(move |event| captured.lock().unwrap().push(event));
+    with_transfer_progress(&reporter, || {
+        let mut body = begin_transfer_progress(TransferDirection::Download, Some(1)).unwrap();
+        body.advance(2);
+    });
+    let events = events.lock().unwrap();
+    let last = events.last().unwrap().transfer.unwrap();
+    assert_eq!(last.transferred_bytes, 2);
+    assert_eq!(last.total_bytes, None);
+    assert!(!last.total_is_final);
+}
+
+#[test]
+#[ignore = "manual deterministic callback overhead measurement"]
+fn sync_progress_overhead() {
+    let iterations = 100_000;
+    for enabled in [false, true] {
+        let mut reporter = TransferProgressReporter::new(|event| {
+            std::hint::black_box(event);
+        });
+        if enabled {
+            reporter = reporter.with_sync_callback(|event| {
+                std::hint::black_box(event);
+            });
+        }
+        let start = Instant::now();
+        with_transfer_progress(&reporter, || {
+            for _ in 0..iterations {
+                let mut body =
+                    begin_transfer_progress(TransferDirection::Upload, Some(1024)).unwrap();
+                body.advance(1024);
+                body.finish();
+            }
+        });
+        eprintln!(
+            "sync_progress enabled={enabled} requests={iterations} elapsed_us={} handle_bytes={}",
+            start.elapsed().as_micros(),
+            std::mem::size_of::<TransferProgressHandle>()
+        );
+    }
+}
+
+#[test]
+fn whole_upload_plan_spans_multiple_bodies_and_partial_attempt_invalidates_it() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let captured = events.clone();
+    let reporter = TransferProgressReporter::new(move |event| captured.lock().unwrap().push(event));
+    with_transfer_progress(&reporter, || {
+        plan_remaining_transfer(TransferDirection::Upload, 12);
+        let mut first = begin_transfer_progress(TransferDirection::Upload, Some(5)).unwrap();
+        first.advance(5);
+        drop(first);
+        reporter.finish();
+        let mut second = begin_transfer_progress(TransferDirection::Upload, Some(7)).unwrap();
+        second.advance(7);
+        drop(second);
+    });
+    let values = events.lock().unwrap();
+    assert!(values.iter().any(|event| event.total_is_final
+        && event.total_bytes == Some(12)
+        && event.transferred_bytes == 5));
+    assert!(values.iter().all(|event| event.total_bytes == Some(12)));
+    assert_eq!(values.last().unwrap().transferred_bytes, 12);
+    drop(values);
+    with_transfer_progress(&reporter, || {
+        plan_remaining_transfer(TransferDirection::Upload, 5);
+        let mut partial = begin_transfer_progress(TransferDirection::Upload, Some(5)).unwrap();
+        partial.advance(2);
+    });
+    assert!(!events.lock().unwrap().last().unwrap().total_is_final);
+}

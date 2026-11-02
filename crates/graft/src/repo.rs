@@ -147,8 +147,37 @@ struct TransferProgressDirectionCounters {
     last_emit: Option<Instant>,
 }
 
+/// Observable work boundaries. Attached body counters are request-scoped,
+/// never an estimate of elapsed time or overall operation completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncPhase {
+    Preparing,
+    Uploading,
+    Downloading,
+    Verifying,
+    Applying,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyncProgress {
+    pub phase: SyncPhase,
+    /// Present only for a single actual HTTP body attempt.
+    pub request_id: Option<u64>,
+    pub transfer: Option<TransferProgress>,
+}
+
+struct SyncProgressState {
+    callback: Arc<dyn Fn(SyncProgress) + Send + Sync>,
+    phase: Mutex<Option<SyncPhase>>,
+    next_request: std::sync::atomic::AtomicU64,
+}
+
 struct TransferProgressReporterInner {
     callback: Arc<dyn Fn(TransferProgress) + Send + Sync>,
+    sync: Option<SyncProgressState>,
     counters: Mutex<TransferProgressCounters>,
 }
 
@@ -162,8 +191,62 @@ impl TransferProgressReporter {
         Self {
             inner: Arc::new(TransferProgressReporterInner {
                 callback: Arc::new(callback),
+                sync: None,
                 counters: Mutex::new(TransferProgressCounters::default()),
             }),
+        }
+    }
+
+    /// Add operation stages and exact per-request body counters. SDK encrypted
+    /// pushes also use this observer to enable bounded ciphertext planning;
+    /// cumulative operation totals remain on the legacy transfer callback.
+    pub fn with_sync_callback(
+        mut self,
+        callback: impl Fn(SyncProgress) + Send + Sync + 'static,
+    ) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("configure before sharing reporter")
+            .sync = Some(SyncProgressState {
+            callback: Arc::new(callback),
+            phase: Mutex::new(None),
+            next_request: std::sync::atomic::AtomicU64::new(1),
+        });
+        self
+    }
+
+    pub fn phase(&self, next: SyncPhase) {
+        if let Some(sync) = &self.inner.sync {
+            let mut phase = sync.phase.lock().unwrap();
+            // Independent verification contains its own downloads and checkout.
+            if *phase == Some(SyncPhase::Verifying)
+                && !matches!(
+                    next,
+                    SyncPhase::Completed | SyncPhase::Failed | SyncPhase::Cancelled
+                )
+            {
+                return;
+            }
+            if *phase == Some(next) {
+                return;
+            }
+            *phase = Some(next);
+            drop(phase);
+            (sync.callback)(SyncProgress {
+                phase: next,
+                request_id: None,
+                transfer: None,
+            });
+        }
+    }
+
+    fn request_progress(&self, id: u64, transfer: TransferProgress) {
+        if let Some(sync) = &self.inner.sync {
+            let phase = sync.phase.lock().unwrap().unwrap_or(SyncPhase::Preparing);
+            (sync.callback)(SyncProgress {
+                phase,
+                request_id: Some(id),
+                transfer: Some(transfer),
+            });
         }
     }
 
@@ -311,15 +394,64 @@ fn transfer_progress(
 pub(crate) struct TransferProgressHandle {
     reporter: TransferProgressReporter,
     direction: TransferDirection,
+    request: Option<(u64, u64, Option<u64>, Instant)>,
+    body_total: Option<u64>,
+    body_bytes: u64,
 }
 
 impl TransferProgressHandle {
     pub(crate) fn advance(&mut self, bytes: u64) {
+        self.body_bytes = self.body_bytes.saturating_add(bytes);
         self.reporter.advance(self.direction, bytes);
+        if let Some((id, transferred, total, last)) = &mut self.request {
+            *transferred = transferred.saturating_add(bytes);
+            if total.is_some_and(|length| *transferred > length) {
+                *total = None;
+            }
+            if last.elapsed() >= TRANSFER_PROGRESS_EMIT_INTERVAL {
+                self.reporter.request_progress(
+                    *id,
+                    TransferProgress {
+                        direction: self.direction,
+                        transferred_bytes: *transferred,
+                        total_bytes: *total,
+                        total_is_final: total.is_some(),
+                    },
+                );
+                *last = Instant::now();
+            }
+        }
     }
 
     pub(crate) fn finish(&mut self) {
         self.reporter.advance(self.direction, 0);
+        if let Some((id, transferred, total, _)) = self.request.take() {
+            self.reporter.request_progress(
+                id,
+                TransferProgress {
+                    direction: self.direction,
+                    transferred_bytes: transferred,
+                    total_bytes: total,
+                    total_is_final: total.is_some(),
+                },
+            );
+        }
+    }
+}
+
+impl Drop for TransferProgressHandle {
+    fn drop(&mut self) {
+        // Flush consumed bytes even when the request fails or is cancelled.
+        // This is a measurement, not a successful-operation notification.
+        if self
+            .body_total
+            .is_some_and(|total| total != self.body_bytes)
+        {
+            self.reporter.start_planning(self.direction);
+        }
+        if self.request.is_some() {
+            self.finish();
+        }
     }
 }
 
@@ -330,7 +462,30 @@ pub(crate) fn begin_transfer_progress(
     ACTIVE_TRANSFER_PROGRESS.with(|active| {
         let reporter = active.borrow().clone()?;
         reporter.begin(direction, total_bytes);
-        Some(TransferProgressHandle { reporter, direction })
+        let request = reporter.inner.sync.as_ref().map(|sync| {
+            let id = sync.next_request.fetch_add(1, Ordering::Relaxed);
+            reporter.phase(match direction {
+                TransferDirection::Upload => SyncPhase::Uploading,
+                TransferDirection::Download => SyncPhase::Downloading,
+            });
+            reporter.request_progress(
+                id,
+                TransferProgress {
+                    direction,
+                    transferred_bytes: 0,
+                    total_bytes,
+                    total_is_final: total_bytes.is_some(),
+                },
+            );
+            (id, 0, total_bytes, Instant::now())
+        });
+        Some(TransferProgressHandle {
+            reporter,
+            direction,
+            request,
+            body_total: total_bytes,
+            body_bytes: 0,
+        })
     })
 }
 
@@ -348,6 +503,14 @@ pub(crate) fn plan_remaining_transfer(direction: TransferDirection, bytes: u64) 
             reporter.plan_remaining(direction, bytes);
         }
     });
+}
+
+/// Report a confirmed synchronous operation boundary on the active reporter.
+pub fn sync_phase(phase: SyncPhase) {
+    let reporter = ACTIVE_TRANSFER_PROGRESS.with(|active| active.borrow().clone());
+    if let Some(reporter) = reporter {
+        reporter.phase(phase);
+    }
 }
 
 pub struct TransferProgressScope(Option<TransferProgressReporter>);
@@ -3538,3 +3701,31 @@ impl WriteAll for fs::File {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(feature = "e2ee")]
+pub(crate) fn has_upload_planning_observer() -> bool {
+    ACTIVE_TRANSFER_PROGRESS.with(|active| {
+        active
+            .borrow()
+            .as_ref()
+            .is_some_and(|reporter| reporter.inner.sync.is_some())
+    })
+}
+
+#[cfg(feature = "e2ee")]
+pub(crate) fn invalidate_transfer_plan(direction: TransferDirection) {
+    let reporter = ACTIVE_TRANSFER_PROGRESS.with(|active| active.borrow().clone());
+    if let Some(reporter) = reporter {
+        reporter.start_planning(direction);
+    }
+}
+
+#[cfg(feature = "e2ee")]
+pub(crate) fn final_transfer_plan(direction: TransferDirection) -> bool {
+    let reporter = ACTIVE_TRANSFER_PROGRESS.with(|active| active.borrow().clone());
+    reporter.is_some_and(|reporter| {
+        let mut counters = reporter.inner.counters.lock().unwrap();
+        let counters = direction_counters(&mut counters, direction);
+        counters.total_is_final && !counters.indeterminate
+    })
+}

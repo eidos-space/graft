@@ -37,6 +37,8 @@ use zeroize::Zeroizing;
 
 #[cfg(feature = "e2ee")]
 mod encrypted;
+#[cfg(all(feature = "e2ee", any(unix, windows)))]
+mod encrypted_plan;
 pub mod segment;
 #[cfg(feature = "e2ee")]
 pub use encrypted::EncryptedTransferBudget;
@@ -1605,6 +1607,14 @@ impl Remote {
             #[cfg(feature = "e2ee")]
             RemoteBackend::Encrypted(remote) => remote.get_raw(path, usize::MAX).await,
         }
+    }
+
+    pub(crate) async fn flush_planned_uploads(&self) -> Result<()> {
+        #[cfg(all(feature = "e2ee", any(unix, windows)))]
+        if let RemoteBackend::Encrypted(remote) = &self.backend {
+            remote.flush_upload_plan(true).await?;
+        }
+        Ok(())
     }
 
     /// Plaintext checkout budgets omit encryption envelopes and protocol reads.
@@ -6567,4 +6577,15 @@ mod tests {
             .set_http_bearer_token("origin", "other-account".into())
             .unwrap();
     }
+}
+
+/// SDK-scoped, bounded encrypted upload planning. No reporter means the
+/// streaming path and its resource profile are retained. Only sync-stage
+/// observers opt in; legacy transfer-only observers keep streaming.
+pub fn with_planned_uploads<T>(operation: impl FnOnce() -> T) -> T {
+    #[cfg(all(feature = "e2ee", any(unix, windows)))]
+    if crate::repo::has_upload_planning_observer() {
+        return encrypted_plan::with_plan(operation);
+    }
+    operation()
 }

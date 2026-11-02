@@ -159,6 +159,7 @@ pub(super) fn push_initial_branch(
             .push_initialization_intent_with_config(&context.remote, &context.config, &intent)
             .map_err(super::napi_error)?;
         if let Some(directory) = verification_directory {
+            graft_sdk::sync_phase(graft_sdk::SyncPhase::Verifying);
             context.operation.check_active().map_err(secret_error)?;
             validate_verification_directory(session, &context.host_directories, directory)?;
             let verifier = graft_sdk::RepositorySession::new_with_remote_credentials(

@@ -296,8 +296,8 @@ total 随之增长。传输中事件会限频，成功消费完 body 后发送 f
 uncertain remote publication 变成确定结果。
 
 加密 HTTP 操作必须通过同一 reporter 报告密文对象上传、聚合上传 framing、multipart
-分片和下载响应 body，不能暴露明文路径、内容或秘密。依赖是逐步发现的，无法确定
-操作的最终总量，因此事件省略 `totalBytes` 并设置 `totalIsFinal: false`。每次操作重新
+分片和下载响应 body，不能暴露明文路径、内容或秘密。依赖逐步发现，在完整有界上传
+清单形成前，事件省略 `totalBytes` 并设置 `totalIsFinal: false`。每次操作重新
 计数；同一次操作内的重试会累计再次消费的字节。上传 body 被消费不代表远端已持久
 保存。首次发布的独立验证 clone 可以在同一操作中报告下载进度。本地加密和工作目录
 materialization 不属于网络字节进度。
@@ -411,3 +411,31 @@ CLI test 与 `web-demo` worker/unit/Playwright test。
 - CLI/SDK 共享实现但 surface 不完全相同；SDK 缺能力不代表另有语义。
 - `index.d.ts` 是 JS contract，Rust 私有类型和 CLI human output 不能替代。
 - Browser `merge-api` 调用真实 Rust；remote sync 仍不可用，不能用 mock 声称支持。
+
+### 增量同步观测接口
+
+Node SDK 的 push、fetch、pull、clone 和首次加密发布额外支持
+`onSyncProgress`，报告准备、HTTP body 上传/下载、独立验证、工作区应用和操作终态。
+首次发布的独立验证在嵌套下载和 checkout 期间必须保持 verifying；completed
+必须等待整个操作及请求的验证成功。
+
+传输事件的 requestId 在单次操作中标识一个 HTTP body 尝试，拥有独立的已消费
+字节和可选的已知长度。已知长度仅为该请求的最终分母，禁止作为整个操作分母。
+重试使用新 ID，去重跳过的对象不贡献 body 字节，续传只统计实际传输的分片。
+未知长度保持不确定。加密与非加密使用同一观测机制，加密路径统计密文 HTTP body。
+原有按操作和方向累计的回调与最终规划语义不变。观测无需额外预检请求或重复 payload 暂存。
+
+### 有界加密上传清单
+
+Node host 启用同步观测后，SDK push 和首次发布可以在发送前保留完整密文 payload
+清单。最终上传分母必须覆盖该命令发送的全部缺失 SQLite segment/commit、外部文件、
+pack 和 index，并按 opaque identity 去重；跳过已有对象保留原有认证协商和 publication Reused
+不可变元数据校验，规划本身不得引入未经验证的跳过。准备阶段不能提前发布 branch 或 HEAD，payload 保持已验证的
+会话 epoch 和固定字节。初始化独立回读验证和 ref journal 均保留。
+
+内置清单最多保留 2 GiB/256 个密文 payload handle，以及 1 MiB/256 个公共 hint。
+当前对象准备的暂存开销不包含在该保留预算内。超限或遇到 multipart payload 时回退到
+原有发布过程，不声明最终总量；短 body 和重试会撤销已经声明的分母。总量统计整次上传
+的全部密文 payload body，排除 ref 控制流量，不覆盖后续验证下载。clone、pull 和
+multipart 在拥有完整不可变传输调度前必须保持总量未知，不能用单 body 长度或明文
+checkout 预算替代。

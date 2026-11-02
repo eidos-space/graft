@@ -112,6 +112,7 @@ pub(super) fn run_repo_pull(
     let mut _sqlite_replacement_guards =
         preflight_workspace_checkout(&repo, &plan.merge.checkout, &previous_files)?;
     clear_row_conflict_resolution_state(&repo)?;
+    graft::repo::sync_phase(graft::repo::SyncPhase::Applying);
     let mut outcome = repo.apply_pull_plan(&plan)?;
     release_sqlite_guards_for_filesystem_change(&mut _sqlite_replacement_guards);
     checkout_merge_outcome(
