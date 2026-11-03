@@ -17,8 +17,11 @@ const password = "synthetic confirmation password";
 const results = [];
 
 async function scenario(name) {
+  const multipart = name === "lost-multipart-complete";
   const fixture = join(root, `${name}.json`);
-  writeFileSync(fixture, JSON.stringify({ encryption: { profile: "encrypted-remote-v1", version: 1, suite: 1, uuid }, objects: [], serviceLifetimeMs: 180000 }));
+  writeFileSync(fixture, JSON.stringify({ encryption: { profile: "encrypted-remote-v1", version: 1, suite: 1, uuid }, objects: [], serviceLifetimeMs: 180000,
+    ...(multipart ? { enableMultipart: true, maxRequestBytes: 1024 * 1024, multipartPartBytes: 512 * 1024 } : {}),
+  }));
   const service = spawn(process.execPath, ["tests/e2ee/remote-service.mjs", fixture, join(root, `${name}-requests.json`)], { stdio: ["ignore", "pipe", "inherit"] });
   const lines = createInterface({ input: service.stdout });
   const ready = JSON.parse((await once(lines, "line"))[0]);
@@ -27,6 +30,9 @@ async function scenario(name) {
   let injected = 0;
   let crashChild;
   let cancelUpload;
+  let successfulProofs = 0;
+  let retryPayloadBytes = 0;
+  const headerEnds = new Map();
   const requests = [];
   const proxy = createServer((incoming, outgoing) => {
     const path = incoming.url;
@@ -53,10 +59,34 @@ async function scenario(name) {
       for await (const chunk of response) chunks.push(chunk);
       let body = Buffer.concat(chunks);
       let status = response.statusCode;
+      if (multipart && incoming.method === "GET" && payload && fault !== name) {
+        // Header discovery reads the fixed 72 bytes and its declared header only.
+        const range = incoming.headers.range;
+        let headerOnly = false;
+        if (range === "bytes=0-71" && body.length === 72) {
+          const length = body.readUInt32BE(68);
+          if (length >= 16 && length <= 16384) {
+            headerEnds.set(path, 71 + length); headerOnly = true;
+          }
+        } else if (headerEnds.has(path) && range === `bytes=72-${headerEnds.get(path)}` && body.length === headerEnds.get(path) - 71) {
+          headerOnly = true;
+        }
+        if (!headerOnly) retryPayloadBytes += body.length;
+      }
+      if (multipart && path.includes("/e2ee/object-proof/")) {
+        if (fault === name) { injected++; outgoing.destroy(); return; }
+        if (fault === "wrong-proof" && status === 200) {
+          const proof = JSON.parse(body); proof.sha256 = "0".repeat(64);
+          body = Buffer.from(JSON.stringify(proof)); injected++;
+        } else if (status === 200) successfulProofs++;
+      }
+      if (multipart && fault === name && path.includes("/multipart-complete/") && status === 204) {
+        injected++; outgoing.destroy(); return;
+      }
       const headers = { ...response.headers };
       delete headers["transfer-encoding"];
       if (incoming.method === "POST" && path.includes("/e2ee/head/") && status === 204) headPublished = true;
-      if (incoming.method === "GET" && path === "/acme/enrollment") {
+      if (incoming.method === "GET" && path === "/acme/enrollment" && status === 200) {
         const descriptor = JSON.parse(body);
         // Use object publication so individual upload failures are observable.
         descriptor.capabilities = descriptor.capabilities.filter((cap) => !["e2ee-fetch-bundle", "e2ee-receive-bundle"].includes(cap));
@@ -145,7 +175,23 @@ async function scenario(name) {
     authority = new EncryptedRemoteSession({ ...options, createCheckpoint: false });
     await authority.unlock(Buffer.from(password));
     source = await RepositorySession.open(sourcePath, { encryptedRemote: authority });
+    if (multipart) {
+      assert.equal(headPublished, false);
+      fault = "wrong-proof";
+      await assert.rejects(source.pushInitialBranch());
+      assert.equal(headPublished, false, "published HEAD despite invalid retained-object proof");
+      assert.notEqual(readFileSync(join(options.recoveryDirectory, "initialization"))[40], 4);
+      await source.close(); await authority.disconnect();
+      authority = new EncryptedRemoteSession({ ...options, createCheckpoint: false });
+      await authority.unlock(Buffer.from(password));
+      source = await RepositorySession.open(sourcePath, { encryptedRemote: authority });
+      fault = null;
+    }
     const retry = await source.pushInitialBranch();
+    if (multipart) {
+      assert.ok(successfulProofs > 0, "reopen skipped retained ciphertext proof");
+      assert.equal(retryPayloadBytes, 0, "proof recovery downloaded payload");
+    }
     assert.equal(retry.state, "connected"); assert.equal(retry.verification, "publication");
     assert.equal(readFileSync(join(options.recoveryDirectory, "initialization"))[40], 4);
     assert.equal((await source.repositoryMetadata()).current_head, head);
@@ -172,6 +218,6 @@ async function scenario(name) {
   }
 }
 try {
-  for (const name of ["upload-failure", "lost-object-response", "lost-ref-response", "cancel-upload", "process-exit", "wrong-identity", "config-mismatch", "missing-head", "corrupt-ref", "confirmation-offline", "repository-deleted"]) await scenario(name);
+  for (const name of process.env.GRAFT_INITIAL_SCENARIO ? [process.env.GRAFT_INITIAL_SCENARIO] : ["lost-multipart-complete", "upload-failure", "lost-object-response", "lost-ref-response", "cancel-upload", "process-exit", "wrong-identity", "config-mismatch", "missing-head", "corrupt-ref", "confirmation-offline", "repository-deleted"]) await scenario(name);
   console.log(JSON.stringify(results, null, 2));
 } finally { rmSync(root, { recursive: true, force: true }); }

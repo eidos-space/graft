@@ -820,6 +820,11 @@ while performing authenticated full readback. New initialization receipts retain
 their exact ciphertext under an intent-bound ownership tag until durable
 Connected. Cleanup MUST affect only that intent's confirmed spools, remain
 retryable across partial deletion, and never reconstruct missing pending state.
+Ownership MUST be durable before multipart transport. On retry or reopen, all
+retained uploads MUST be reconciled before publishing refs or accepting an
+already-published ref. Authenticated object headers and discovery results MUST
+NOT bypass this gate. Legacy untagged pending ciphertext requires the same
+validation; a different intent's ownership MUST fail closed.
 The challenge proves current byte agreement, not future durability or independent
 restore. Explicit full restore still downloads and authenticates all payloads.
 

@@ -97,6 +97,40 @@ impl MultipartPreparation {
 }
 
 impl EncryptedHttpClient {
+    /// Resolve retained publications before header-based discovery may skip them.
+    #[cfg(any(unix, windows))]
+    pub(crate) async fn reconcile_initialization_uploads(
+        &self,
+        provider: Arc<dyn crate::e2ee::MultipartJournalProvider>,
+        directory: &Path,
+    ) -> Result<()> {
+        if self.initialization_intent.is_none() {
+            return Err(EncryptionError::StaleObservation.into());
+        }
+        let operation = self.operation().await?;
+        let enumerate = provider.clone();
+        let uploads = tokio::task::spawn_blocking(move || {
+            operation.check_active()?;
+            enumerate.retained_uploads(operation.binding())
+        })
+        .await
+        .map_err(|_| EncryptionError::CheckpointUnavailable(std::io::ErrorKind::Other))??;
+        for upload in uploads {
+            match self
+                .resume_retained_object_multipart(&upload.opaque_key, provider.clone(), directory)
+                .await?
+            {
+                ObjectPublicationOutcome::Created | ObjectPublicationOutcome::Reused => {}
+                ObjectPublicationOutcome::Unconfirmed => {
+                    return Err(EncryptionError::StaleObservation.into());
+                }
+                ObjectPublicationOutcome::OutcomeUnknown { error } => {
+                    return Err(error.unwrap_or_else(|| EncryptionError::StaleObservation.into()));
+                }
+            }
+        }
+        Ok(())
+    }
     #[cfg(any(unix, windows))]
     pub(crate) async fn prepare_object_multipart(
         &self,
@@ -286,6 +320,12 @@ impl EncryptedHttpClient {
             } else {
                 lease.restore(&operation, &endpoint, &key)?
             };
+            // Ownership must precede any transport, including lost complete responses.
+            if retained.is_some()
+                && let Some(tag) = &intent_tag
+            {
+                lease.bind_initialization(tag)?;
+            }
             operation.check_active()?;
             Ok::<_, EncryptionError>((operation, lease, retained))
         })

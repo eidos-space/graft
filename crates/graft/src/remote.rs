@@ -1143,6 +1143,14 @@ impl Remote {
     }
 
     #[cfg(feature = "e2ee")]
+    pub async fn reconcile_initialization_uploads(&self) -> Result<()> {
+        match &self.backend {
+            RemoteBackend::Encrypted(remote) => remote.reconcile_initialization_uploads().await,
+            _ => Err(crate::e2ee::EncryptionError::InvalidSessionBinding.into()),
+        }
+    }
+
+    #[cfg(feature = "e2ee")]
     pub async fn confirm_initialization(
         &self,
         config: &crate::e2ee::EncryptedConfig,

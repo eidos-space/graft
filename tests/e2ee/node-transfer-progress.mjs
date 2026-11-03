@@ -58,7 +58,7 @@ async function scenario(mode) {
       }
       const headers = { ...response.headers };
       // Exercise the mandatory individual-object fallback as well as bundles.
-      if (mode !== "aggregate" && incoming.url === "/acme/enrollment") {
+      if (mode !== "aggregate" && incoming.url === "/acme/enrollment" && response.statusCode === 200) {
         const chunks = [];
         for await (const chunk of response) chunks.push(chunk);
         const descriptor = JSON.parse(Buffer.concat(chunks));

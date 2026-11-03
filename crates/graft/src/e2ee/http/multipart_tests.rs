@@ -350,6 +350,18 @@ async fn initial_multipart_proof_fails_closed_and_retains_exact_ciphertext_throu
         .unwrap();
     assert!(path.join("candidate/ciphertext").is_file());
     {
+        let lease = FileMultipartJournal::open(&path, session.binding())
+            .unwrap()
+            .acquire(session.binding())
+            .unwrap();
+        let record = lease.record.as_ref().unwrap();
+        assert!(!record.confirmed);
+        assert_eq!(
+            record.initialization_intent.as_deref(),
+            Some(intent.confirmation_tag().as_str())
+        );
+    }
+    {
         let mut state = server.state.lock().unwrap();
         state.start_precondition = true;
         *state.winner.as_mut().unwrap().last_mut().unwrap() ^= 1;
@@ -366,13 +378,10 @@ async fn initial_multipart_proof_fails_closed_and_retains_exact_ciphertext_throu
     ] {
         server.state.lock().unwrap().proof_fault = Some(fault);
         assert!(
-            matches!(
-                remote
-                    .publish_object_multipart(&candidate, provider.clone(), staging.path())
-                    .await
-                    .unwrap(),
-                ObjectPublicationOutcome::OutcomeUnknown { .. }
-            ),
+            remote
+                .reconcile_initialization_uploads(provider.clone(), staging.path())
+                .await
+                .is_err(),
             "{fault}"
         );
         assert!(path.join("candidate/ciphertext").is_file());
@@ -387,22 +396,25 @@ async fn initial_multipart_proof_fails_closed_and_retains_exact_ciphertext_throu
     ));
     assert!(path.join("candidate/ciphertext").is_file());
     let reopened = client(&server.url, session.clone()).for_initialization(&intent);
-    assert!(matches!(
-        reopened
-            .resume_retained_object_multipart(
-                candidate.remote_key(),
-                provider.clone(),
-                staging.path()
-            )
-            .await
-            .unwrap(),
-        ObjectPublicationOutcome::Reused
-    ));
+    reopened
+        .reconcile_initialization_uploads(provider.clone(), staging.path())
+        .await
+        .unwrap();
     assert_eq!(server.state.lock().unwrap().payload_reads, 0);
     provider
         .retire_initialization(session.binding(), &intent.confirmation_tag())
         .unwrap();
     assert!(!path.join("candidate").exists());
+    // A legacy confirmed receipt has no ciphertext to bind to an intent. Its
+    // compatibility readback must stay retryable rather than invent ownership.
+    assert!(matches!(
+        reopened
+            .publish_object_multipart(&candidate, provider.clone(), staging.path())
+            .await
+            .unwrap(),
+        ObjectPublicationOutcome::Reused
+    ));
+    assert!(server.state.lock().unwrap().payload_reads > 0);
 }
 
 #[tokio::test]

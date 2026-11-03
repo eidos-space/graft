@@ -11,6 +11,13 @@ use std::path::PathBuf;
 /// Trusted native storage, separate from disposable staging and repository data.
 /// A returned slot must be identity-bound, durable, private, and loss-detecting.
 pub trait MultipartJournalProvider: Send + Sync {
+    /// Enumerate durable ciphertext before initialization can publish refs.
+    /// Providers which cannot account for recovery state must fail closed.
+    fn retained_uploads(&self, _binding: &SessionBinding) -> Result<Vec<RetainedMultipartUpload>> {
+        Err(super::EncryptionError::CheckpointUnavailable(
+            std::io::ErrorKind::Unsupported,
+        ))
+    }
     fn directory(&self, binding: &SessionBinding, opaque_key: &str) -> Result<PathBuf>;
     /// Reopen an admitted slot; absence must never allocate new recovery state.
     fn existing_directory(&self, _binding: &SessionBinding, _opaque_key: &str) -> Result<PathBuf> {
@@ -160,6 +167,12 @@ mod file {
     }
 
     impl MultipartJournalProvider for FileMultipartJournalProvider {
+        fn retained_uploads(
+            &self,
+            binding: &SessionBinding,
+        ) -> Result<Vec<RetainedMultipartUpload>> {
+            FileMultipartJournalProvider::retained_uploads(self, binding)
+        }
         fn existing_directory(&self, binding: &SessionBinding, key: &str) -> Result<PathBuf> {
             crate::e2ee::object::opaque_class(key)?;
             let store = self.slots.existing_private_slot(binding, key)?;
@@ -508,7 +521,7 @@ mod file {
             self.remove_candidate()
         }
 
-        pub fn confirm_for_initialization(&mut self, tag: &str) -> Result<()> {
+        pub fn bind_initialization(&mut self, tag: &str) -> Result<()> {
             let record = self
                 .record
                 .as_mut()
@@ -520,8 +533,16 @@ mod file {
             {
                 return Err(EncryptionError::StaleObservation);
             }
-            record.confirmed = true;
             record.initialization_intent = Some(tag.to_owned());
+            self.persist()
+        }
+
+        pub fn confirm_for_initialization(&mut self, tag: &str) -> Result<()> {
+            self.bind_initialization(tag)?;
+            self.record
+                .as_mut()
+                .ok_or(EncryptionError::InvalidEncoding)?
+                .confirmed = true;
             self.persist()
         }
 

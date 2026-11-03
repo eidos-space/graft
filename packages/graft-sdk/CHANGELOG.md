@@ -11,6 +11,9 @@ SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
   actual stored ciphertext without downloading it. Keep exact multipart spools
   until durable connection, then retire only that initialization's confirmed
   spools. Failed advertised proofs retain recovery state and never downgrade.
+- Reconcile retained multipart uploads before publishing or accepting initial
+  refs after reopening. Lost completion and proof responses cannot be bypassed
+  by object-header discovery; invalid proofs keep initialization pending.
 - Older servers and legacy receipts without retained ciphertext use explicit
   `compatibility_verification` progress while fully downloading and verifying.
 

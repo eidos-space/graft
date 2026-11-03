@@ -519,10 +519,13 @@ const server = createServer(async (incoming, outgoing) => {
       Readable.fromWeb(response.body)
         .on("error", () => outgoing.destroy())
         .pipe(outgoing);
-  } catch {
+  } catch (error) {
+    // Keep synthetic infrastructure failures diagnosable without logging bodies
+    // or credentials. In particular, a failed capture write must retain ENOSPC.
+    console.error(JSON.stringify({ syntheticRemoteFailure: error?.code ?? error?.name ?? "Error", method: incoming.method, path: incoming.url }));
     if (privacy && !privacy.failed)
       await privacy.captureHttp("response", "error", new Response(null, { status: 500 }), privacyRequestId);
-    outgoing.writeHead(500);
+    outgoing.writeHead(500, { "Graft-Protocol": "1" });
     outgoing.end();
   }
 });

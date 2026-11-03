@@ -85,6 +85,16 @@ impl EncryptedRemote {
         Ok(self.client.confirm_initialization(config, intent).await?)
     }
 
+    pub(super) async fn reconcile_initialization_uploads(&self) -> Result<()> {
+        #[cfg(any(unix, windows))]
+        if let Some(provider) = &self.uploads {
+            self.client
+                .reconcile_initialization_uploads(provider.clone(), &self.budget.private_directory)
+                .await?;
+        }
+        Ok(())
+    }
+
     pub(super) async fn prepare_download_progress(
         &self,
         requests: &[DownloadRequest],
