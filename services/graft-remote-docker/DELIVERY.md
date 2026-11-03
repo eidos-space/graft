@@ -134,3 +134,58 @@ PR #45 native Linux AMD64 and ARM64 container CI both passed on source
 that branch's SDK/core baseline and do not replace final candidate proof acceptance.
 The documentation link-check failure came from linking to not-yet-merged main
 paths; fixed-commit links and local docs rebuild passed in follow-up `48ec43bb`.
+
+## Final candidate functional retries after disk recovery
+
+With the same `fd3b9969…` native, the complete six-scenario run exited 0:
+`/tmp/graft-docker-proof-matrix-retry.log`. The normal case used an 80 MiB
+attachment and multipart; the five fault cases used 2 MiB payloads targeting
+ordinary object upload, object-response loss, ref-response loss, server SIGKILL
+and client SIGKILL. Every injected scenario recovered to Connected, independently
+cloned correct data and passed bidirectional updates. Normal initialization and
+reopen/repeat confirmation downloaded 0 payload bytes, 0 header bytes and 8,855
+metadata bytes total. The lost ordinary-object response case downloaded 215
+bounded authenticated-header bytes and 0 payload bytes. In this log `fallback`
+means aggregate capability suppression, not legacy object-proof fallback.
+Image: `sha256:af5be99b0a8226b4d683649d4c68d2f5a7fef64cd05c65dc8c35995544c84707`.
+
+The separate 80 MiB attachment + 80 MiB random SQLite BLOB scenario also exited 0:
+`/tmp/graft-docker-proof-large-db-retry.log`. It made 16 multipart requests, with
+0 initialization payload/header bytes and 9,528 metadata bytes including reopen
+and repeated confirmation. Independent clone verified all database BLOB hashes;
+explicit full restore and bidirectional updates passed. Image:
+`sha256:3c8495a3186eab856479a619b88be1d5f9ce6adeb03c74c2214a3e2040fcec6e`.
+Both runs also passed actual proof HTTP corruption/truncation/deletion checks and
+delete-after-restart/name-reservation checks. Both used the actual Linux ARM64
+Docker backend and macOS native SDK; neither is a public-package/image test.
+
+The two targeted **80 MiB multipart faults** (part truncation and lost successful
+complete response) are a separate pending acceptance step; the earlier 2 MiB
+fault successes must not be used as evidence for them. Original ENOSPC logs remain.
+
+## Multipart fault acceptance: one pass, one release blocker
+
+`/tmp/graft-docker-proof-multipart-retry.log` retained a container restart readiness
+failure before client recovery; the harness now waits for Docker's terminal state
+before reconciling startup and captures state on readiness failure. No backend
+implementation was changed to bypass this observation.
+
+`/tmp/graft-docker-proof-multipart-retry2.log`, image
+`sha256:a467140ad62d9714963a41e05041cb36a3ccc4db834662b6ce29f0e45bcc13f2`:
+
+- 80 MiB part interruption **passed**. Exactly multipart part 1 was truncated;
+  no initial ref/HEAD publication occurred. After reopen, successful challenge,
+  Connected, 0 payload bytes, independent clone and bidirectional updates passed.
+  Header probes: 450 bytes; successful proof response: 326 bytes.
+- 80 MiB lost-complete recovery **failed acceptance**. The server completed with
+  204, which the proxy discarded; it then generated a 200/326-byte proof response
+  that was also discarded to keep the first attempt unconfirmed. After SDK close,
+  server SIGKILL and clearing the network fault, the reopened SDK returned
+  Connected but issued only 72+184-byte authenticated-header GETs, with **no new
+  successful object-proof request** before ref/HEAD publication. The harness
+  rejected this. It did not proceed to clone for this failed scenario.
+
+The latter is not ENOSPC (3.3 GiB free after cleanup) and remains a release blocker
+pending SDK-owner diagnosis/fix. Both original failures and successes are retained
+in the durable evidence directory. Docker local large-data work is stopped so the
+SDK owner can perform its focused investigation without competing disk pressure.

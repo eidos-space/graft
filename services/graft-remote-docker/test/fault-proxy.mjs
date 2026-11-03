@@ -36,6 +36,8 @@ export async function faultProxy(origin, { fallback = false, restart } = {}) {
   let fault = null;
   let injected = 0;
   let headPublished = false;
+  let interruptedPart;
+  let completeLost = false;
   let crashClient;
   let recovery = Promise.resolve();
   const server = createServer((incoming, outgoing) => {
@@ -43,12 +45,15 @@ export async function faultProxy(origin, { fallback = false, restart } = {}) {
       method: incoming.method,
       path: incoming.url,
       range: incoming.headers.range,
+      partNumber: incoming.headers["x-graft-part-number"],
       begin: sequence++,
       uploadBytes: 0,
       downloadBytes: 0,
     };
     records.push(row);
     const payload = payloadPath(row.path) && row.method === "PUT";
+    const multipartPart = row.method === "PUT" && row.path.includes("/multipart-part/");
+    const multipartComplete = row.method === "POST" && row.path.includes("/multipart-complete/");
     const refWrite = /\/e2ee\/refs\//.test(row.path) && ["PUT", "POST"].includes(row.method);
     const headWrite = /\/e2ee\/head\//.test(row.path) && ["PUT", "POST"].includes(row.method);
     const descriptor = /^\/personal\/[^/]+$/.test(row.path) && row.method === "GET";
@@ -72,6 +77,14 @@ export async function faultProxy(origin, { fallback = false, restart } = {}) {
           for await (const chunk of response) chunks.push(chunk);
           let body = Buffer.concat(chunks);
           row.status = response.statusCode;
+          row.responseContentType = response.headers["content-type"];
+          row.responseProtocol = response.headers["graft-protocol"];
+          row.responseContentRange = response.headers["content-range"];
+          row.receivedBytes = body.length;
+          row.responseHash = createHash("sha256").update(body).digest("hex");
+          // Proof JSON contains protocol fields only; never record payload bodies or auth.
+          if (row.path.includes("/e2ee/object-proof/") && body.length <= 4096)
+            row.proofResponse = body.toString("utf8");
           row.end = sequence++;
           row.headerProbe = headerProbe(row, body, response.headers["content-range"], headerRanges);
           row.uploadHash = hash.digest("hex");
@@ -89,9 +102,11 @@ export async function faultProxy(origin, { fallback = false, restart } = {}) {
             injected === 0 &&
             row.status === 204 &&
             ((fault === "lost-object-response" && payload) ||
-              (fault === "lost-ref-response" && refWrite));
+              (fault === "lost-ref-response" && refWrite) ||
+              (fault === "lost-multipart-complete" && multipartComplete));
           if (lose) {
             injected++;
+            if (multipartComplete) completeLost = true;
             row.responseLost = true;
             outgoing.destroy();
             return;
@@ -103,6 +118,11 @@ export async function faultProxy(origin, { fallback = false, restart } = {}) {
             recovery = restart();
             // Observe rejections immediately; the test awaits the same promise.
             recovery.catch(() => {});
+            return;
+          }
+          if (fault === "lost-multipart-complete" && completeLost && row.path.includes("/e2ee/object-proof/")) {
+            row.responseLost = true;
+            outgoing.destroy();
             return;
           }
           row.downloadBytes = body.length;
@@ -120,7 +140,10 @@ export async function faultProxy(origin, { fallback = false, restart } = {}) {
       if (truncated) return;
       row.uploadBytes += chunk.length;
       hash.update(chunk);
-      if (fault === "interrupt-upload" && payload) {
+      if (fault === "interrupt-multipart-part" && multipartPart && !interruptedPart)
+        interruptedPart = `${row.path}:${row.partNumber}`;
+      if ((fault === "interrupt-upload" && payload) ||
+          (fault === "interrupt-multipart-part" && multipartPart && `${row.path}:${row.partNumber}` === interruptedPart)) {
         // Send a prefix with the original Content-Length, then break the stream.
         // Keep the fault armed across native retries until the caller reopens.
         truncated = true;

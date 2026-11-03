@@ -99,6 +99,10 @@ async function ready() {
     } catch {}
     await setTimeout(500);
   }
+  try {
+    const id = compose("ps", "-a", "-q", "graft");
+    console.error(execFileSync("docker", ["inspect", "--format", "{{json .State}}", id], { encoding: "utf8" }));
+  } catch {}
   throw new Error("Container failed to become ready");
 }
 async function request(path, options = {}) {
@@ -116,8 +120,11 @@ async function request(path, options = {}) {
   });
 }
 async function restart() {
+  const id = compose("ps", "-q", "graft");
   compose("kill", "-s", "SIGKILL", "graft");
-  compose("up", "-d");
+  // Wait for the engine to publish the terminal state before Compose reconciles.
+  execFileSync("docker", ["wait", id], { timeout: 30_000 });
+  compose("up", "-d", "--wait", "--wait-timeout", "60");
   await ready();
 }
 try {

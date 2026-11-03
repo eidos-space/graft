@@ -29,6 +29,7 @@ const summaries = [];
 
 export async function candidateRoundTrips({ origin, token, request, restart }) {
   async function scenario(fault) {
+    const multipartFault = ["interrupt-multipart-part", "lost-multipart-complete"].includes(fault);
     const name = `candidate-${randomUUID().slice(0, 8)}`;
     const created = await request(`/api/graft/repositories/${name}`, { method: "PUT" });
     assert.equal(created.status, 201);
@@ -60,7 +61,7 @@ export async function candidateRoundTrips({ origin, token, request, restart }) {
       await source.init();
       await source.addEncryptedRemote();
       const payload = randomBytes(
-        (fault === "none" ? Number(process.env.GRAFT_LARGE_PAYLOAD_MIB ?? 2) : 2) * 1024 * 1024,
+        (fault === "none" || multipartFault ? Number(process.env.GRAFT_LARGE_PAYLOAD_MIB ?? 80) : 2) * 1024 * 1024,
       );
       await writeFile(join(sourcePath, "payload.bin"), payload);
       const db = new DatabaseSync(join(sourcePath, "notes.sqlite"));
@@ -147,11 +148,17 @@ export async function candidateRoundTrips({ origin, token, request, restart }) {
         }
       } else {
         assert.ok(proxy.injected > 0, `${fault}: injection did not execute`);
-        if (fault === "interrupt-upload" || fault === "client-crash") assert.equal(failed, true);
+        if (fault === "interrupt-upload" || fault === "client-crash" || multipartFault) assert.equal(failed, true);
         if (failed) assert.ok(!phases.includes("completed"));
       }
       const firstAttempt = proxy.records.slice(start);
-      if (fault === "none")
+      if (multipartFault) {
+        assert.ok(firstAttempt.some((row) => fault === "interrupt-multipart-part"
+          ? row.truncated && row.path.includes("/multipart-part/")
+          : row.responseLost && row.status === 204 && row.path.includes("/multipart-complete/")));
+        assert.equal(firstAttempt.some((row) => ["PUT", "POST"].includes(row.method) && /\/e2ee\/(refs|head)\//.test(row.path)), false);
+      }
+      if (fault === "none" || multipartFault)
         assert.equal(
           firstAttempt.filter(payloadRead).length,
           0,
@@ -172,7 +179,7 @@ export async function candidateRoundTrips({ origin, token, request, restart }) {
         }
       }
       // Read back a lost-response object directly, proving it was really committed.
-      for (const row of firstAttempt.filter((row) => row.responseLost && payloadPath(row.path))) {
+      for (const row of firstAttempt.filter((row) => row.responseLost && row.method === "PUT" && payloadPath(row.path))) {
         const response = await request(row.path.replace("/raw-if-not-exists/", "/raw/"));
         assert.equal(response.status, 200);
         assert.equal(
@@ -194,8 +201,10 @@ export async function candidateRoundTrips({ origin, token, request, restart }) {
       const result = await source.pushInitialBranch();
       assert.equal(result.state, "connected");
       assert.equal(result.verification, "publication");
-      if (fault === "none")
+      if (fault === "none" || multipartFault)
         assert.equal(proxy.records.slice(retryStart).filter(payloadRead).length, 0);
+      if (multipartFault) assert.ok(proxy.records.slice(retryStart).some((row) =>
+        row.path.includes("/e2ee/object-proof/") && row.status === 200 && !row.responseLost));
       const repeat = await source.pushInitialBranch();
       assert.equal(repeat.push.commits, 0);
       assert.equal((await source.repositoryMetadata()).current_head, commit);
@@ -259,8 +268,10 @@ export async function candidateRoundTrips({ origin, token, request, restart }) {
       assert.equal(await readFile(join(peerPath, "roundtrip.txt"), "utf8"), "source reply");
       summaries.push({
         fault,
-        fallback: fault !== "none",
+        aggregateFallback: fault !== "none",
         injected: proxy.injected,
+        injectedRequests: initialization.filter((row) => row.truncated || row.responseLost).map((row) =>
+          ({ method: row.method, path: row.path, partNumber: row.partNumber, status: row.status, truncated: row.truncated, responseLost: row.responseLost })),
         defaultPayloadReads: initialization.filter(payloadRead).length,
         initialPayloadReads: firstAttempt.filter(payloadRead).length,
         missingObjectProbes: initialization.filter(
@@ -275,6 +286,8 @@ export async function candidateRoundTrips({ origin, token, request, restart }) {
           0,
         ),
         initialAttemptDownloadBytes: firstAttempt.reduce((sum, row) => sum + row.downloadBytes, 0),
+        proofRequests: initialization.filter((row) => row.path.includes("/e2ee/object-proof/")).length,
+        proofResponseBytes: initialization.filter((row) => row.path.includes("/e2ee/object-proof/")).reduce((sum, row) => sum + row.downloadBytes, 0),
         multipartRequests: initialization.filter((row) => row.path.includes("/multipart-")).length,
         payloadBytes: payload.length,
         databaseMiB,
@@ -290,6 +303,10 @@ export async function candidateRoundTrips({ origin, token, request, restart }) {
           sdkVersion: version,
         }),
       );
+    } catch (error) {
+      console.error(JSON.stringify({ scenarioFailure: fault, nativeSha256: nativeHash,
+        error: String(error), requests: proxy.records }));
+      throw error;
     } finally {
       await peer?.close();
       await peerAuthority?.disconnect();
