@@ -22,6 +22,7 @@ import {
   hintUnavailable,
   type EncryptedRoutingHint,
 } from "./encrypted-routing.js";
+import { encryptedObjectProof } from "./encrypted-object-proof.js";
 
 export const ENCRYPTED_CAPABILITIES = [
   "range",
@@ -150,6 +151,7 @@ async function encryptedObjectOperation(
   routing: EncryptedRoutingIndex,
 ): Promise<Response | undefined> {
   rejectUnexpectedQuery(url);
+  if (operation === "e2ee-object-proof") return encryptedObjectProof(request, backend, path);
   if (operation === "e2ee-read-bundle") return readBundle(request, backend, requestLimit);
   if (operation === "e2ee-fetch-bundle")
     return fetchBundle(request, backend, path, routing, requestLimit);

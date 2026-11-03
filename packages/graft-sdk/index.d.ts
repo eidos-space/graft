@@ -178,7 +178,7 @@ export interface CloneOptions extends OperationOptions {
  * requestId changes on retries; request percentages are never overall percentages.
  */
 export interface SyncProgress {
-  phase: "preparing" | "uploading" | "downloading" | "verifying" | "applying" | "completed" | "failed" | "cancelled"
+  phase: "preparing" | "uploading" | "downloading" | "verifying" | "confirming" | "compatibility_verification" | "applying" | "completed" | "failed" | "cancelled"
   requestId?: number
   transfer?: TransferProgress
 }
@@ -1153,8 +1153,8 @@ export class RepositorySession {
   addEncryptedRemote(options?: OperationOptions): Promise<unknown>
   /** Clones into an empty or absent destination, retaining the authority's remoteName and lifecycle. */
   cloneEncryptedRemote(options?: OperationOptions & { branch?: string; onProgress?: (progress: TransferProgress) => void; onSyncProgress?: (progress: SyncProgress) => void }): Promise<unknown>
-  /** Pins source; a fresh verificationDirectory gates durable connected success through independent clone. */
-  pushInitialBranch(options?: OperationOptions & { branch?: string; verificationDirectory?: string; onProgress?: (progress: TransferProgress) => void; onSyncProgress?: (progress: SyncProgress) => void }): Promise<{ state: "branch_published" | "connected"; push: unknown }>
+  /** Confirms authenticated config/ref/HEAD after ordered publication. No payload readback by default. Supply a fresh verificationDirectory for an additional independent full restore gate. */
+  pushInitialBranch(options?: OperationOptions & { branch?: string; verificationDirectory?: string; onProgress?: (progress: TransferProgress) => void; onSyncProgress?: (progress: SyncProgress) => void }): Promise<{ state: "connected"; verification: "publication" | "full_restore"; push: unknown }>
   /** Native trusted host only. Requires locked authority; consumes password and relocks after completion. */
   prepareEncryptedMigration(password: Buffer, options: EncryptedMigrationPreparation): Promise<EncryptedMigrationResult>
   /** Retains original root, complete selection, mapping and budgets across process restart. */

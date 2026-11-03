@@ -882,7 +882,7 @@ local config trust prevents a replacement initialization.
 
 The result is `config_published`, `unconfirmed`, `conflict` or `unknown`.
 `config_published` confirms only the config; initial source/branch/HEAD publication
-and readable-branch verification are still required for connected success.
+and authenticated publication confirmation are still required for connected success.
 For an uncertain result, await `authority.lock()` or reopen the same host
 directories with `createCheckpoint: false`, then call
 `authority.resumeInitialConfig(passwordBuffer)` while locked. Resume unwraps the
@@ -901,16 +901,38 @@ The repository service rechecks the source before dependency publication and
 uses the retained ref/HEAD recovery slots. A failed HEAD update does not replace
 the intent or upload a different initial history.
 
-For the connection gate, call
+The default connection gate is `source.pushInitialBranch()`. After ordered
+dependency publication and ref/HEAD reconciliation, it freshly authenticates the
+remote descriptor, the exact retained generation-1 config, the intended branch
+commit and symbolic HEAD. Only then does it durably advance the existing journal
+to Connected and return `{ state: "connected", verification: "publication" }`.
+With `e2ee-object-proof-v1`, multipart confirmation challenges actual stored
+ciphertext against a streamed calculation over the retained original candidate.
+Only bounded metadata returns over the network; no restore directory is created.
+Older servers or legacy receipts whose ciphertext was already retired require
+full authenticated readback, explicitly reported as `compatibility_verification`.
+An advertised capability that fails never silently falls back. New initialization
+spools remain until durable Connected; cleanup is scoped to that exact intent and
+resumes safely after interruption. Pending older journals retain their stage and original intent; retry
+reconciles publication before repeating confirmation. A missing intent fails
+closed and is never reconstructed from a changed local HEAD.
+
+Publication confirmation relies on the server's dependency-before-ref storage
+contract and authenticated publication receipts/readback. It does not prove
+independent payload recovery, future durability, or freshness against a server
+replaying an otherwise valid state. Missing/corrupt metadata and uncertain
+publication fail closed. Actual downloads still authenticate every payload.
+
+For an additional independent full restore gate, call
 `source.pushInitialBranch({ verificationDirectory: freshEmptyDirectory })`.
 Use a fresh independent destination outside the source repository and all host
 checkpoint/recovery/staging directories. Occupied or overlapping destinations
 are rejected before initialization intent or remote publication changes. An
 absent destination is allowed. Native code clones the default remote
 branch into it, verifies the expected branch and commit, closes the verifier and
-durably advances the initialization journal to Connected. Only then does the
-result contain `state: "connected"`; without verification it contains
-`state: "branch_published"`. The verification directory contains ordinary
+performs the same publication confirmation before advancing the journal. The
+result contains `state: "connected", verification: "full_restore"`. This checks
+the actual downloaded content in addition to metadata. The directory contains ordinary
 plaintext local files and is left available to the host. Each retry needs a
 fresh destination; the SDK does not erase an existing verification copy.
 After reopening a branch-publication attempt, use ordinary `unlock` on the
@@ -1033,7 +1055,8 @@ await source.pushInitialBranch({
 ```
 
 Stages are observed boundaries: `preparing`, `uploading`, `downloading`,
-`verifying`, `applying`, then `completed`, `failed`, or `cancelled`.
+`verifying`, `compatibility_verification`, `confirming`, `applying`, then
+`completed`, `failed`, or `cancelled`.
 Preparation can include remote discovery and SQLite snapshot work. Each actual
 HTTP body attempt gets an operation-local `requestId`; its bytes start at zero.
 Known body lengths are accurate request denominators, including ciphertext and

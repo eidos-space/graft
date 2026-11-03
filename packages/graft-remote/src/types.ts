@@ -89,6 +89,16 @@ export interface GraftMultipartBackend {
 }
 
 export interface GraftRepositoryBackend {
+  /**
+   * Hash prefix || every byte of one actual immutable ciphertext snapshot.
+   * Keep repository admission/deletion lease throughout the read, count actual
+   * bytes, and honor the request context's cancellation and host resource limits.
+   * Never return cached upload metadata or a partial successful proof.
+   */
+  encryptedObjectProof?(
+    path: string,
+    prefix: Uint8Array<ArrayBuffer>,
+  ): MaybePromise<{ size: number; sha256: string } | null>;
   /** Persisted repository identity; changing this requires a new remote. */
   readonly encryption?: GraftEncryptionDescriptor;
   readonly encryptedRouting?: {
@@ -138,6 +148,7 @@ export type GraftRemoteOperation =
   | "multipart-part"
   | "multipart-complete"
   | "multipart-abort"
+  | "e2ee-object-proof"
   | "cas"
   | "cad"
   | "list";

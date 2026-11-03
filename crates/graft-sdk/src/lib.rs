@@ -2504,6 +2504,31 @@ impl RepositorySession {
         })
     }
 
+    /// Confirm the pinned initial publication without downloading payloads.
+    /// Call only after successful dependency-before-ref publication, including
+    /// recovery of an uncertain ref result. Does not attest independent recovery.
+    #[cfg(all(feature = "e2ee", not(target_arch = "wasm32")))]
+    pub fn confirm_initialization_with_config(
+        &self,
+        remote: &str,
+        config: &RemoteConfig,
+        encrypted_config: &e2ee::EncryptedConfig,
+        intent: &e2ee::InitializationIntent,
+    ) -> Result<()> {
+        self.with_service(|service| {
+            let repository = service.repository().map_err(repository_command_error)?;
+            if repository.config().map_err(repo_error)?.remotes.get(remote) != Some(config) {
+                return Err(SdkError::new(
+                    SdkErrorCode::Encrypted(EncryptedErrorCode::StaleObservation),
+                    "initialization remote binding changed",
+                ));
+            }
+            repository
+                .confirm_initialization(remote, encrypted_config, intent)
+                .map_err(repo_error)
+        })
+    }
+
     /// Read-only private migration inventory. Does not hydrate or publish history.
     #[cfg(all(feature = "e2ee", not(target_arch = "wasm32")))]
     pub fn plan_migration_source(

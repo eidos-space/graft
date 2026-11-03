@@ -269,7 +269,9 @@ class EncryptedCloudflareRepositoryBackend implements GraftRepositoryBackend {
         "Invalid encrypted multipart identity or size",
       );
     if ((await this.#metadata.getEncryptedObject(path)) !== null) return null;
-    let state = await this.#metadata.getEncryptedUpload(path);
+    // This local data record can come from RPC or a newly allocated candidate.
+    // Do not infer the RPC result's additional Disposable lifecycle surface.
+    let state: EncryptedUploadState | null = await this.#metadata.getEncryptedUpload(path);
     if (state === null) {
       const key = this.#prefix + crypto.randomUUID();
       const upload = await this.#objects.createMultipartUpload(key);

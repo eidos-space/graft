@@ -73,6 +73,28 @@ impl fmt::Debug for EncryptedRemote {
 }
 
 impl EncryptedRemote {
+    pub(super) fn for_initialization(mut self, intent: &crate::e2ee::InitializationIntent) -> Self {
+        self.client = self.client.for_initialization(intent);
+        self
+    }
+    pub(super) async fn confirm_initialization(
+        &self,
+        config: &crate::e2ee::EncryptedConfig,
+        intent: &crate::e2ee::InitializationIntent,
+    ) -> Result<()> {
+        Ok(self.client.confirm_initialization(config, intent).await?)
+    }
+
+    pub(super) async fn reconcile_initialization_uploads(&self) -> Result<()> {
+        #[cfg(any(unix, windows))]
+        if let Some(provider) = &self.uploads {
+            self.client
+                .reconcile_initialization_uploads(provider.clone(), &self.budget.private_directory)
+                .await?;
+        }
+        Ok(())
+    }
+
     pub(super) async fn prepare_download_progress(
         &self,
         requests: &[DownloadRequest],

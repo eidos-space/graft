@@ -152,6 +152,18 @@ pub(super) fn push_initial_branch(
             .ok_or_else(|| secret_error(EncryptionError::InvalidEncoding))?;
         let intent =
             retained_initial_intent(record.intent, selected, head).map_err(secret_error)?;
+        let retire = || -> Result<()> {
+            graft_sdk::e2ee::FileMultipartJournalProvider::open(
+                context.directory.join("multipart"),
+                context.secret.binding(),
+            )
+            .map_err(secret_error)?
+            .retire_initialization(context.secret.binding(), &intent.confirmation_tag())
+            .map_err(secret_error)
+        };
+        if record.stage == InitializationStage::Connected {
+            retire()?;
+        }
         context.operation.check_active().map_err(secret_error)?;
         // The repository service rechecks source after remote discovery and
         // before dependencies. Failed publication leaves the same durable intent.
@@ -189,44 +201,57 @@ pub(super) fn push_initial_branch(
             let closed = verifier.close().map_err(super::napi_error);
             verified?;
             closed?;
-            for (expected, next) in [
-                (
-                    InitializationStage::ConfigPublished,
-                    InitializationStage::ObjectsPublished,
-                ),
-                (
-                    InitializationStage::ObjectsPublished,
-                    InitializationStage::RefPublished,
-                ),
-                (
-                    InitializationStage::RefPublished,
-                    InitializationStage::Connected,
-                ),
-            ] {
-                context.operation.check_active().map_err(secret_error)?;
-                let current = journal
-                    .load(context.secret.binding())
-                    .map_err(secret_error)?
-                    .stage;
-                if current == expected {
-                    journal
-                        .advance(context.secret.binding(), expected, next)
-                        .map_err(secret_error)?;
-                }
-            }
+        }
+        // Both modes require fresh authenticated publication metadata. Full
+        // restore verification is opt-in and never substitutes for this gate.
+        graft_sdk::sync_phase(graft_sdk::SyncPhase::Confirming);
+        session
+            .confirm_initialization_with_config(
+                &context.remote,
+                &context.config,
+                &record.config,
+                &intent,
+            )
+            .map_err(super::napi_error)?;
+        for (expected, next) in [
+            (
+                InitializationStage::ConfigPublished,
+                InitializationStage::ObjectsPublished,
+            ),
+            (
+                InitializationStage::ObjectsPublished,
+                InitializationStage::RefPublished,
+            ),
+            (
+                InitializationStage::RefPublished,
+                InitializationStage::Connected,
+            ),
+        ] {
             context.operation.check_active().map_err(secret_error)?;
-            if journal
+            let current = journal
                 .load(context.secret.binding())
                 .map_err(secret_error)?
-                .stage
-                != InitializationStage::Connected
-            {
-                return Err(secret_error(EncryptionError::StaleObservation));
+                .stage;
+            if current == expected {
+                journal
+                    .advance(context.secret.binding(), expected, next)
+                    .map_err(secret_error)?;
             }
-            Ok(serde_json::json!({"state": "connected", "push": pushed}))
-        } else {
-            Ok(serde_json::json!({"state": "branch_published", "push": pushed}))
         }
+        context.operation.check_active().map_err(secret_error)?;
+        if journal
+            .load(context.secret.binding())
+            .map_err(secret_error)?
+            .stage
+            != InitializationStage::Connected
+        {
+            return Err(secret_error(EncryptionError::StaleObservation));
+        }
+        retire()?;
+        Ok(serde_json::json!({
+            "state": "connected", "push": pushed,
+            "verification": if verification_directory.is_some() { "full_restore" } else { "publication" }
+        }))
     }
     #[cfg(not(any(unix, windows)))]
     {
