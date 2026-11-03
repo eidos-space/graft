@@ -99,6 +99,15 @@ function createBackend(objects, faults = {}, encryption = fixture.encryption, re
   } : undefined;
   return {
     encryption: Object.freeze(encryption),
+    ...(fixture.disableObjectProof === true ? {} : {
+      encryptedObjectProof(key, prefix) {
+        const bytes = objects.get(key);
+        return bytes === undefined ? null : {
+          size: bytes.length,
+          sha256: createHash("sha256").update(prefix).update(bytes).digest("hex"),
+        };
+      },
+    }),
     ...(multipart === undefined ? {} : { multipart }),
     head(key) {
       const body = objects.get(key);

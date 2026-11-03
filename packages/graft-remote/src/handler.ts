@@ -153,6 +153,8 @@ async function handleRequest<AdapterContext, Principal>(
         ? "e2ee-fetch-bundle"
         : encryptedAction === "receive-bundle"
           ? "e2ee-receive-bundle"
+          : encryptedAction === "object-proof"
+            ? "e2ee-object-proof"
           : parseOperation(parameters.operation)
     : parseOperation(parameters.operation);
   const objectPath = parseObjectPath(
@@ -194,6 +196,8 @@ async function handleRequest<AdapterContext, Principal>(
       capabilities.push("multipart-object");
     if (backend.encryption !== undefined && backend.multipart?.supportsEncryption === true)
       capabilities.push("e2ee-multipart-object");
+    if (backend.encryption !== undefined && backend.encryptedObjectProof !== undefined)
+      capabilities.push("e2ee-object-proof-v1");
     return jsonResponse({
       protocol: "graft-remote",
       version: 1,
@@ -285,6 +289,7 @@ async function handleRequest<AdapterContext, Principal>(
       return compareAndDelete(input.request, backend, path);
     case "e2ee-read-bundle":
     case "e2ee-fetch-bundle":
+    case "e2ee-object-proof":
     case "e2ee-receive-bundle":
       throw new GraftProtocolError(500, "invalid_dispatch", "Encrypted operation was not handled");
   }
@@ -339,6 +344,7 @@ function validateMethodAndAction(
     case "read-bundle":
     case "e2ee-read-bundle":
     case "e2ee-fetch-bundle":
+    case "e2ee-object-proof":
       requireMethod(method, "POST");
       return "read";
     case "raw":

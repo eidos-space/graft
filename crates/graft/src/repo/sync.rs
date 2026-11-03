@@ -746,7 +746,7 @@ impl Repository {
             intent.branch(),
             false,
             PushRemoteHead {
-                store: observed.store,
+                store: observed.store.for_initialization(intent),
                 head: observed.head,
                 expected: PushRefExpected::Observed(observed.observation),
                 expected_source_head: Some(intent.commit().to_owned()),

@@ -153,6 +153,7 @@ struct TransferProgressDirectionCounters {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncPhase {
     Confirming,
+    CompatibilityVerification,
     Preparing,
     Uploading,
     Downloading,
@@ -219,6 +220,14 @@ impl TransferProgressReporter {
     pub fn phase(&self, next: SyncPhase) {
         if let Some(sync) = &self.inner.sync {
             let mut phase = sync.phase.lock().unwrap();
+            if *phase == Some(SyncPhase::CompatibilityVerification)
+                && matches!(
+                    next,
+                    SyncPhase::Downloading | SyncPhase::Applying | SyncPhase::Preparing
+                )
+            {
+                return;
+            }
             // Independent verification contains its own downloads and checkout.
             if matches!(*phase, Some(SyncPhase::Verifying | SyncPhase::Confirming))
                 && !matches!(

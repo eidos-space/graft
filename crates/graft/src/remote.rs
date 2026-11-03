@@ -1135,6 +1135,14 @@ impl Remote {
     }
 
     #[cfg(feature = "e2ee")]
+    pub fn for_initialization(mut self, intent: &crate::e2ee::InitializationIntent) -> Self {
+        if let RemoteBackend::Encrypted(remote) = self.backend {
+            self.backend = RemoteBackend::Encrypted(remote.for_initialization(intent));
+        }
+        self
+    }
+
+    #[cfg(feature = "e2ee")]
     pub async fn confirm_initialization(
         &self,
         config: &crate::e2ee::EncryptedConfig,

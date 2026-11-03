@@ -75,6 +75,10 @@ struct State {
     start_precondition: bool,
     lose_abort_once: bool,
     aborts: usize,
+    proof: bool,
+    proof_fault: Option<&'static str>,
+    prior_proof: Option<Vec<u8>>,
+    payload_reads: usize,
 }
 struct Server {
     url: String,
@@ -123,10 +127,23 @@ async fn server(state: State) -> Server {
             let (status, extra, bytes) = {
                 let mut state = shared.lock().unwrap();
                 if path == "/alice/repo" {
+                    let mut capabilities = vec![
+                        "range",
+                        "list",
+                        "list-cursor",
+                        "put-if-absent",
+                        "cas",
+                        "cad",
+                        "e2ee-read-bundle",
+                        "e2ee-multipart-object",
+                    ];
+                    if state.proof {
+                        capabilities.push("e2ee-object-proof-v1");
+                    }
                     (200, String::new(), serde_json::to_vec(&serde_json::json!({
                         "protocol":"graft-remote", "version":1,
                         "encryption":{"profile":"encrypted-remote-v1","version":1,"suite":1,"uuid":uuid_text(fixture_root().repository())},
-                        "capabilities":["range","list","list-cursor","put-if-absent","cas","cad","e2ee-read-bundle","e2ee-multipart-object"],
+                        "capabilities":capabilities,
                         "limits":{"max_request_bytes":512,"multipart_part_bytes":128}
                     })).unwrap())
                 } else if path.ends_with("/raw/e2ee/config") {
@@ -175,7 +192,47 @@ async fn server(state: State) -> Server {
                         String::new(),
                         Vec::new(),
                     )
+                } else if path.contains("/e2ee/object-proof/") {
+                    let key = path.split_once("/e2ee/object-proof/").unwrap().1;
+                    let size = headers["x-graft-object-bytes"].parse::<u64>().unwrap();
+                    let challenge: [u8; 32] = body.try_into().unwrap();
+                    let prefix = super::super::object_proof::prefix(
+                        fixture_root().repository(),
+                        key,
+                        size,
+                        &challenge,
+                    );
+                    let mut hash = Sha256::new();
+                    hash.update(prefix);
+                    hash.update(state.winner.as_ref().unwrap());
+                    let mut response = serde_json::json!({"version":1,"uuid":uuid_text(fixture_root().repository()),"key":key,"ciphertext_bytes":size,"challenge":hex(&challenge),"sha256":format!("{:x}",hash.finalize())});
+                    match state.proof_fault {
+                        Some("uuid") => response["uuid"] = "wrong".into(),
+                        Some("key") => response["key"] = "wrong".into(),
+                        Some("length") => response["ciphertext_bytes"] = (size + 1).into(),
+                        Some("challenge") => response["challenge"] = "00".repeat(32).into(),
+                        _ => (),
+                    }
+                    let bytes = serde_json::to_vec(&response).unwrap();
+                    let reply = if state.proof_fault == Some("replay") {
+                        state.prior_proof.clone().unwrap()
+                    } else {
+                        bytes.clone()
+                    };
+                    state.prior_proof = Some(bytes);
+                    (
+                        match state.proof_fault {
+                            Some("lost") => 0,
+                            Some("missing") => 404,
+                            Some("unsupported") => 501,
+                            Some("stall") => 999,
+                            _ => 200,
+                        },
+                        String::new(),
+                        reply,
+                    )
                 } else if path.contains("/raw/e2ee/") {
+                    state.payload_reads += 1;
                     if let Some(wire) = &state.winner {
                         let range = headers["range"].strip_prefix("bytes=").unwrap();
                         let (begin, end) = range.split_once('-').unwrap();
@@ -198,6 +255,10 @@ async fn server(state: State) -> Server {
                     panic!("unexpected multipart test path {path}");
                 }
             };
+            if status == 999 {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
             if status != 0 {
                 let head = format!(
                     "HTTP/1.1 {status} Test\r\nGraft-Protocol: 1\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n",
@@ -209,6 +270,139 @@ async fn server(state: State) -> Server {
         }
     });
     Server { url, state, task }
+}
+
+#[tokio::test]
+async fn initial_object_proof_timeout_and_cancellation_keep_pending_spool() {
+    for cancel in [false, true] {
+        let server = server(State {
+            proof: true,
+            proof_fault: Some("stall"),
+            ..Default::default()
+        })
+        .await;
+        let recovery = private_directory();
+        let staging = private_directory();
+        let session = session();
+        let provider = Arc::new(
+            FileMultipartJournalProvider::create(recovery.path(), session.binding()).unwrap(),
+        );
+        let candidate = prepare(&session, staging.path()).await;
+        let key = candidate.remote_key().to_owned();
+        let intent = crate::e2ee::InitializationIntent::new("main".into(), "a".repeat(64)).unwrap();
+        let remote = client(&server.url, session.clone())
+            .for_initialization(&intent)
+            .with_transfer_timeout(Duration::from_millis(if cancel { 2000 } else { 250 }))
+            .unwrap();
+        let publishing_provider = provider.clone();
+        let publishing = tokio::spawn(async move {
+            remote
+                .publish_object_multipart(&candidate, publishing_provider, staging.path())
+                .await
+        });
+        if cancel {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while server.state.lock().unwrap().prior_proof.is_none() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), session.lock())
+                .await
+                .unwrap();
+        }
+        assert!(matches!(
+            publishing.await.unwrap().unwrap(),
+            ObjectPublicationOutcome::OutcomeUnknown { .. }
+        ));
+        let path = provider.directory(session.binding(), &key).unwrap();
+        assert!(path.join("candidate/ciphertext").is_file());
+        assert_eq!(server.state.lock().unwrap().payload_reads, 0);
+    }
+}
+
+#[tokio::test]
+async fn initial_multipart_proof_fails_closed_and_retains_exact_ciphertext_through_retries() {
+    let server = server(State {
+        proof: true,
+        tamper_winner: true,
+        ..Default::default()
+    })
+    .await;
+    let recovery = private_directory();
+    let staging = private_directory();
+    let session = session();
+    let provider =
+        Arc::new(FileMultipartJournalProvider::create(recovery.path(), session.binding()).unwrap());
+    let candidate = prepare(&session, staging.path()).await;
+    let intent = crate::e2ee::InitializationIntent::new("main".into(), "a".repeat(64)).unwrap();
+    let remote = client(&server.url, session.clone()).for_initialization(&intent);
+    assert!(matches!(
+        remote
+            .publish_object_multipart(&candidate, provider.clone(), staging.path())
+            .await
+            .unwrap(),
+        ObjectPublicationOutcome::OutcomeUnknown { .. }
+    ));
+    let path = provider
+        .directory(session.binding(), candidate.remote_key())
+        .unwrap();
+    assert!(path.join("candidate/ciphertext").is_file());
+    {
+        let mut state = server.state.lock().unwrap();
+        state.start_precondition = true;
+        *state.winner.as_mut().unwrap().last_mut().unwrap() ^= 1;
+    }
+    for fault in [
+        "uuid",
+        "key",
+        "length",
+        "challenge",
+        "replay",
+        "lost",
+        "missing",
+        "unsupported",
+    ] {
+        server.state.lock().unwrap().proof_fault = Some(fault);
+        assert!(
+            matches!(
+                remote
+                    .publish_object_multipart(&candidate, provider.clone(), staging.path())
+                    .await
+                    .unwrap(),
+                ObjectPublicationOutcome::OutcomeUnknown { .. }
+            ),
+            "{fault}"
+        );
+        assert!(path.join("candidate/ciphertext").is_file());
+    }
+    server.state.lock().unwrap().proof_fault = None;
+    assert!(matches!(
+        remote
+            .publish_object_multipart(&candidate, provider.clone(), staging.path())
+            .await
+            .unwrap(),
+        ObjectPublicationOutcome::Reused
+    ));
+    assert!(path.join("candidate/ciphertext").is_file());
+    let reopened = client(&server.url, session.clone()).for_initialization(&intent);
+    assert!(matches!(
+        reopened
+            .resume_retained_object_multipart(
+                candidate.remote_key(),
+                provider.clone(),
+                staging.path()
+            )
+            .await
+            .unwrap(),
+        ObjectPublicationOutcome::Reused
+    ));
+    assert_eq!(server.state.lock().unwrap().payload_reads, 0);
+    provider
+        .retire_initialization(session.binding(), &intent.confirmation_tag())
+        .unwrap();
+    assert!(!path.join("candidate").exists());
 }
 
 #[tokio::test]

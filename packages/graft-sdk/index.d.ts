@@ -178,7 +178,7 @@ export interface CloneOptions extends OperationOptions {
  * requestId changes on retries; request percentages are never overall percentages.
  */
 export interface SyncProgress {
-  phase: "preparing" | "uploading" | "downloading" | "verifying" | "confirming" | "applying" | "completed" | "failed" | "cancelled"
+  phase: "preparing" | "uploading" | "downloading" | "verifying" | "confirming" | "compatibility_verification" | "applying" | "completed" | "failed" | "cancelled"
   requestId?: number
   transfer?: TransferProgress
 }

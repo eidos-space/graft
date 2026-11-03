@@ -73,6 +73,10 @@ impl fmt::Debug for EncryptedRemote {
 }
 
 impl EncryptedRemote {
+    pub(super) fn for_initialization(mut self, intent: &crate::e2ee::InitializationIntent) -> Self {
+        self.client = self.client.for_initialization(intent);
+        self
+    }
     pub(super) async fn confirm_initialization(
         &self,
         config: &crate::e2ee::EncryptedConfig,

@@ -152,6 +152,18 @@ pub(super) fn push_initial_branch(
             .ok_or_else(|| secret_error(EncryptionError::InvalidEncoding))?;
         let intent =
             retained_initial_intent(record.intent, selected, head).map_err(secret_error)?;
+        let retire = || -> Result<()> {
+            graft_sdk::e2ee::FileMultipartJournalProvider::open(
+                context.directory.join("multipart"),
+                context.secret.binding(),
+            )
+            .map_err(secret_error)?
+            .retire_initialization(context.secret.binding(), &intent.confirmation_tag())
+            .map_err(secret_error)
+        };
+        if record.stage == InitializationStage::Connected {
+            retire()?;
+        }
         context.operation.check_active().map_err(secret_error)?;
         // The repository service rechecks source after remote discovery and
         // before dependencies. Failed publication leaves the same durable intent.
@@ -235,6 +247,7 @@ pub(super) fn push_initial_branch(
         {
             return Err(secret_error(EncryptionError::StaleObservation));
         }
+        retire()?;
         Ok(serde_json::json!({
             "state": "connected", "push": pushed,
             "verification": if verification_directory.is_some() { "full_restore" } else { "publication" }

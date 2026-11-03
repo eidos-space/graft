@@ -1,5 +1,17 @@
 # Graft Remote changelog
 
+## Graft Remote 0.2.6 — 2026-11-03
+
+- Add the optional `e2ee-object-proof-v1` capability and bounded integrity challenge endpoint. Backends opt in with `encryptedObjectProof`, hashing the supplied domain-separated prefix and every byte of the actual immutable stored ciphertext snapshot. The handler validates framing, identity, length and digest shape, and authorizes the operation as a read.
+- Hosts must retain repository admission and a consistent snapshot throughout hashing, implement cancellation and resource limits, and reject tombstoned repositories. Upload-time hashes and cached answers do not satisfy this contract. Existing clients and backends without this capability remain supported.
+- This confirms current ciphertext integrity against a client's retained candidate; it does not establish future durability or independent restore verification.
+
+### 中文
+
+- 新增可选的 `e2ee-object-proof-v1` 能力及有界完整性挑战接口。后端通过 `encryptedObjectProof` 接入，对带域隔离的前缀和实际不可变存储快照的全部密文字节计算摘要。处理器验证请求格式、身份、长度和摘要格式，并按读取操作鉴权。
+- 宿主须在完整计算期间持有仓库准入和一致快照，提供取消及资源限制，并拒绝已删除仓库。上传时缓存的摘要或缓存响应不能替代实际读取。旧客户端和未实现该能力的后端继续兼容。
+- 该接口核实当前密文与客户端保留候选是否一致，不证明未来持久性或独立恢复能力。
+
 ## Graft Remote 0.2.5 — 2026-10-17
 
 ### Added

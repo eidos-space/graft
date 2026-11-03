@@ -7,6 +7,13 @@ SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
 
 ### Changed
 
+- Initial multipart publication negotiates `e2ee-object-proof-v1` to challenge
+  actual stored ciphertext without downloading it. Keep exact multipart spools
+  until durable connection, then retire only that initialization's confirmed
+  spools. Failed advertised proofs retain recovery state and never downgrade.
+- Older servers and legacy receipts without retained ciphertext use explicit
+  `compatibility_verification` progress while fully downloading and verifying.
+
 - First encrypted connection now confirms the pinned repository identity, exact
   encryption config, initial branch and default HEAD after ordered publication,
   without cloning the repository back to a temporary directory. Successful
@@ -22,6 +29,9 @@ SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
   HEAD and cancelled operations do not bypass confirmation or recreate remotes.
 
 ### 中文
+
+- 初始 multipart 发布通过 `e2ee-object-proof-v1` 挑战核实实际存储的密文，无需将其下载回来。精确密文保留到连接状态持久化，只清除此初始化意图的已确认文件；声明支持但证明失败时保留恢复状态，不能静默降级。
+- 旧服务或已清除密文的旧确认记录仍执行完整认证回读，并显式报告 `compatibility_verification` 阶段。
 
 - 首次加密连接在顺序发布后确认固定身份、精确加密配置、初始分支和 HEAD，
   默认不再完整下载一份临时副本。显式 `verificationDirectory` 仍执行完整恢复检查。

@@ -778,14 +778,67 @@ automatically send decrypted paths/content to the server.
 
 ## 17. Initialization and recovery
 
+### Stored ciphertext integrity challenge
+
+An encrypted backend MAY advertise `e2ee-object-proof-v1` only when it supports
+hashing actual immutable stored ciphertext. The read-authorized endpoint is
+`POST /:namespace/:repository/e2ee/object-proof/:opaqueKey`, where `opaqueKey`
+is a literal slash-separated wildcard matching
+`e2ee/(objects|packs|indexes|files|commits|segments)/[0-9a-f]{64}`. Percent encoding
+anywhere in this endpoint's pathname is rejected; adapters MUST NOT double decode.
+Requests require `Graft-Protocol: 1`, `Content-Type: application/octet-stream`,
+`Content-Length: 32`, and `X-Graft-Object-Bytes` as canonical decimal 1 through
+1099511627776. The body is a fresh 32-byte cryptographically random challenge;
+the client MUST NOT send its expected digest.
+
+The digest is SHA-256 over the concatenation of ASCII
+`GRAFT-E2EE-OBJECT-PROOF-V1` plus one zero byte, the raw 16-byte repository UUID,
+the UTF-8 key length as u32 big-endian, the key bytes, expected ciphertext length
+as u64 big-endian, the 32-byte challenge, and every actual stored ciphertext byte.
+Backend callbacks receive `(path, prefix)` and return `{size, sha256}` or null.
+The prefix contains all fields preceding ciphertext. Hosts MUST hold repository
+admission and one consistent immutable snapshot throughout hashing, count actual
+bytes, bound concurrency and time, honor cancellation, and reject tombstones.
+Cached upload digests, cached challenge responses, and metadata-only reads MUST
+NOT substitute for hashing the snapshot. Errors MUST NOT produce partial proofs.
+
+Success is HTTP 200, `Graft-Protocol: 1`, JSON content type, `Cache-Control: no-store`,
+and exactly `{version:1, uuid, key, ciphertext_bytes, challenge, sha256}`. UUID and
+key match the request binding; challenge and digest are lowercase 64-hex strings.
+The client bounds responses to 4096 bytes and validates every field against a
+streamed local calculation over retained exact ciphertext. Invalid request is
+400, missing object/repository 404, wrong method 405, actual body over 32 bytes
+413, actual length mismatch 409, unavailable callback 501, and invalid backend
+count/digest 500. Backend timeout/overload/cancellation failures remain failures.
+Declared capability followed by any failed or invalid proof MUST fail closed,
+retain recovery ciphertext, and MUST NOT silently fall back to downloading.
+
+Initial multipart publication MAY use this challenge instead of full ciphertext
+readback. Without the capability, or for legacy confirmed receipts whose exact
+ciphertext was already retired, clients MUST expose `compatibility_verification`
+while performing authenticated full readback. New initialization receipts retain
+their exact ciphertext under an intent-bound ownership tag until durable
+Connected. Cleanup MUST affect only that intent's confirmed spools, remain
+retryable across partial deletion, and never reconstruct missing pending state.
+The challenge proves current byte agreement, not future durability or independent
+restore. Explicit full restore still downloads and authenticates all payloads.
+
+The cross-language vector uses UUID `00010203-0405-4607-8809-0a0b0c0d0e0f`, key
+`e2ee/files/` followed by 64 ASCII `a` bytes, ciphertext hex `000102feff`, length 5,
+and challenge bytes 00 through 1f. The resulting SHA-256 is
+`4f904ed57dc3ecc8393ec4494eaa74bc6682a63a067043e3a689490d45e0532a`.
+
+### Publication gate
+
 The service must atomically register an empty remote identity/profile under
 its account-management mechanism; the account API itself is outside this spec.
 Clients MUST publish config create-if-absent before initial dependencies,
 ref and HEAD. No initial ref/HEAD may overwrite a concurrent publication.
 Connected success requires confirmed ordered dependency publication followed by
 fresh authenticated observation of the pinned descriptor, exact retained config,
-intended branch commit and symbolic HEAD. Default initialization MUST NOT require
-full payload download. This confirms publication under the server storage
+intended branch commit and symbolic HEAD. Capability-enabled initialization with
+retained ciphertext MUST NOT require full payload download; the explicit legacy
+compatibility path above remains supported. This confirms publication under the server storage
 contract; it does not attest independent recovery, future durability or protection
 against replay of valid remote state. An explicit full restore option MUST remain
 available and MUST verify downloaded payloads before reporting full verification.

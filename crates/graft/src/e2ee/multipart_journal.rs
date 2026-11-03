@@ -67,6 +67,8 @@ mod file {
         #[serde(default)]
         pub aborted_session_id: Option<String>,
         pub confirmed: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub initialization_intent: Option<String>,
     }
 
     pub struct FileMultipartJournalProvider {
@@ -74,6 +76,25 @@ mod file {
     }
 
     impl FileMultipartJournalProvider {
+        /// Retire only ciphertext confirmed by this exact connected initialization.
+        pub fn retire_initialization(&self, binding: &SessionBinding, tag: &str) -> Result<()> {
+            for path in self.slots.existing_private_slots(binding)? {
+                let mut lease = FileMultipartJournal::open(path, binding)?.acquire(binding)?;
+                if lease.record.as_ref().is_some_and(|record| {
+                    record.confirmed && record.initialization_intent.as_deref() == Some(tag)
+                }) {
+                    // Keep ownership durable until deletion and directory sync complete.
+                    lease.remove_candidate()?;
+                    lease
+                        .record
+                        .as_mut()
+                        .ok_or(EncryptionError::InvalidEncoding)?
+                        .initialization_intent = None;
+                    lease.persist()?;
+                }
+            }
+            Ok(())
+        }
         pub fn create(directory: impl AsRef<Path>, binding: &SessionBinding) -> Result<Self> {
             Ok(Self {
                 slots: FileRefMutationJournalProvider::create(directory, binding)?,
@@ -261,6 +282,7 @@ mod file {
                     part_bytes: None,
                     aborted_session_id: None,
                     confirmed: false,
+                    initialization_intent: None,
                 });
                 self.persist()?;
             }
@@ -300,6 +322,7 @@ mod file {
                     part_bytes: None,
                     aborted_session_id: None,
                     confirmed: false,
+                    initialization_intent: None,
                 });
                 self.persist()?;
             }
@@ -311,7 +334,7 @@ mod file {
             if identity.endpoint != endpoint || identity.key != key {
                 return Err(EncryptionError::IdentityChanged);
             }
-            if record.confirmed {
+            if record.confirmed && record.initialization_intent.is_none() {
                 self.persist()?;
                 return Ok(None);
             }
@@ -470,11 +493,39 @@ mod file {
         }
 
         pub fn confirm(&mut self) -> Result<()> {
+            if self
+                .record
+                .as_ref()
+                .is_some_and(|record| record.initialization_intent.is_some())
+            {
+                return Err(EncryptionError::StaleObservation);
+            }
             self.record
                 .as_mut()
                 .ok_or(EncryptionError::InvalidEncoding)?
                 .confirmed = true;
             self.persist()?;
+            self.remove_candidate()
+        }
+
+        pub fn confirm_for_initialization(&mut self, tag: &str) -> Result<()> {
+            let record = self
+                .record
+                .as_mut()
+                .ok_or(EncryptionError::InvalidEncoding)?;
+            if record
+                .initialization_intent
+                .as_deref()
+                .is_some_and(|old| old != tag)
+            {
+                return Err(EncryptionError::StaleObservation);
+            }
+            record.confirmed = true;
+            record.initialization_intent = Some(tag.to_owned());
+            self.persist()
+        }
+
+        fn remove_candidate(&self) -> Result<()> {
             // Only a durable confirmation permits deleting the local ciphertext.
             // Keep the small identity receipt and admitted slot to detect state loss.
             let path = match self.candidate_directory() {
@@ -609,6 +660,85 @@ mod file {
             let directory = tempfile::tempdir().unwrap();
             fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
             directory
+        }
+
+        #[tokio::test]
+        async fn initialization_retirement_is_owned_and_resumes_partial_deletion() {
+            let recovery = directory();
+            let staging = directory();
+            let session = session();
+            let operation = session.begin_operation().unwrap();
+            let provider =
+                FileMultipartJournalProvider::create(recovery.path(), session.binding()).unwrap();
+            let prepared =
+                candidate(&operation, b"retained initialization bytes", staging.path()).await;
+            let path = provider
+                .directory(session.binding(), prepared.remote_key())
+                .unwrap();
+            let mut lease = FileMultipartJournal::open(&path, session.binding())
+                .unwrap()
+                .acquire(session.binding())
+                .unwrap();
+            lease
+                .retain(&operation, "https://test.invalid/repo", &prepared)
+                .unwrap();
+            lease.confirm_for_initialization("intent-a").unwrap();
+            assert!(lease.confirm().is_err());
+            assert!(lease.confirm_for_initialization("intent-b").is_err());
+            drop(lease);
+            provider
+                .retire_initialization(session.binding(), "intent-b")
+                .unwrap();
+            assert!(path.join("candidate/ciphertext").is_file());
+            let mut lease = FileMultipartJournal::open(&path, session.binding())
+                .unwrap()
+                .acquire(session.binding())
+                .unwrap();
+            let restored = lease
+                .restore(
+                    &operation,
+                    "https://test.invalid/repo",
+                    prepared.remote_key(),
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(restored.ciphertext_sha256(), prepared.ciphertext_sha256());
+            drop(lease);
+            // Model a process exit between the two unlink operations after Connected.
+            fs::remove_file(path.join("candidate/ciphertext")).unwrap();
+            assert!(
+                FileMultipartJournal::open(&path, session.binding())
+                    .unwrap()
+                    .acquire(session.binding())
+                    .unwrap()
+                    .restore(
+                        &operation,
+                        "https://test.invalid/repo",
+                        prepared.remote_key()
+                    )
+                    .is_err()
+            );
+            provider
+                .retire_initialization(session.binding(), "intent-a")
+                .unwrap();
+            provider
+                .retire_initialization(session.binding(), "intent-a")
+                .unwrap();
+            assert!(!path.join("candidate").exists());
+            let mut lease = FileMultipartJournal::open(&path, session.binding())
+                .unwrap()
+                .acquire(session.binding())
+                .unwrap();
+            assert!(
+                lease
+                    .restore(
+                        &operation,
+                        "https://test.invalid/repo",
+                        prepared.remote_key()
+                    )
+                    .unwrap()
+                    .is_none()
+            );
         }
 
         #[tokio::test]

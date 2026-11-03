@@ -84,6 +84,7 @@ impl MultipartPreparation {
                         .confirm_multipart(
                             prepared.operation,
                             prepared.lease,
+                            prepared.retained.as_ref(),
                             directory,
                             &mut None,
                             &mut false,
@@ -262,6 +263,7 @@ impl EncryptedHttpClient {
             return Err(EncryptedHttpError::UnsupportedProfile);
         }
         let endpoint = self.base.to_string();
+        let intent_tag = self.initialization_intent.clone();
         let (operation, lease, retained) = tokio::task::spawn_blocking(move || {
             operation.check_active()?;
             let directory = if candidate.is_some() {
@@ -271,6 +273,14 @@ impl EncryptedHttpClient {
             };
             let mut lease = FileMultipartJournal::open(directory, operation.binding())?
                 .acquire(operation.binding())?;
+            if lease
+                .record
+                .as_ref()
+                .and_then(|record| record.initialization_intent.as_ref())
+                .is_some_and(|tag| Some(tag) != intent_tag.as_ref())
+            {
+                return Err(EncryptionError::StaleObservation);
+            }
             let retained = if let Some(candidate) = candidate {
                 lease.retain(&operation, &endpoint, &candidate)?
             } else {
@@ -519,6 +529,7 @@ impl EncryptedHttpClient {
         self.confirm_multipart(
             operation,
             lease,
+            Some(retained),
             verification_directory,
             &mut cause,
             &mut created,
@@ -531,6 +542,7 @@ impl EncryptedHttpClient {
         &self,
         operation: SessionOperation,
         mut lease: crate::e2ee::multipart_journal::Lease,
+        retained: Option<&PreparedEncryptedObject>,
         directory: &Path,
         cause: &mut Option<EncryptedHttpError>,
         created: &mut bool,
@@ -540,26 +552,52 @@ impl EncryptedHttpClient {
             .as_ref()
             .ok_or(EncryptionError::InvalidEncoding)?
             .identity;
-        let winner = match self
-            .download_object(&identity.logical, directory, identity.plaintext_length)
+        let proof_capable = self
+            .verified
+            .lock()
             .await
+            .as_ref()
+            .ok_or(EncryptionError::StaleObservation)?
+            .limits
+            .object_proof;
+        let retained_tag = if let (Some(tag), Some(retained), true) =
+            (&self.initialization_intent, retained, proof_capable)
         {
-            Ok(Some(winner)) => winner,
-            Ok(None) => {
-                return Ok(ObjectPublicationOutcome::OutcomeUnknown { error: cause.take() });
+            if let Err(error) = self.confirm_object_proof(&operation, retained).await {
+                return unknown(error);
             }
-            Err(error) => return unknown(error),
+            Some(tag.clone())
+        } else {
+            if self.initialization_intent.is_some() {
+                crate::repo::sync_phase(crate::repo::SyncPhase::CompatibilityVerification);
+            }
+            let winner = match self
+                .download_object(&identity.logical, directory, identity.plaintext_length)
+                .await
+            {
+                Ok(Some(winner)) => winner,
+                Ok(None) => {
+                    return Ok(ObjectPublicationOutcome::OutcomeUnknown { error: cause.take() });
+                }
+                Err(error) => return unknown(error),
+            };
+            if winner.metadata().logical_key != identity.logical
+                || winner.metadata().plaintext_length != identity.plaintext_length
+                || winner.metadata().plaintext_sha256 != identity.plaintext_digest
+            {
+                return unknown(EncryptionError::ImmutableConflict.into());
+            }
+            drop(winner);
+            // Even compatibility verification retains new initialization ciphertext.
+            retained.and(self.initialization_intent.clone())
         };
-        if winner.metadata().logical_key != identity.logical
-            || winner.metadata().plaintext_length != identity.plaintext_length
-            || winner.metadata().plaintext_sha256 != identity.plaintext_digest
-        {
-            return unknown(EncryptionError::ImmutableConflict.into());
-        }
-        drop(winner);
         let persisted = tokio::task::spawn_blocking(move || {
             operation.check_active()?;
-            lease.confirm()?;
+            if let Some(tag) = retained_tag {
+                lease.confirm_for_initialization(&tag)?;
+            } else {
+                lease.confirm()?;
+            }
             operation.check_active()
         })
         .await;
@@ -656,11 +694,11 @@ fn unknown<T: From<ObjectPublicationOutcome>>(error: EncryptedHttpError) -> Resu
     Ok(ObjectPublicationOutcome::OutcomeUnknown { error: Some(error) }.into())
 }
 #[cfg(any(unix, windows))]
-fn hex(bytes: &[u8]) -> String {
+pub(super) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 #[cfg(any(unix, windows))]
-fn uuid_text(repository: crate::e2ee::RepositoryId) -> String {
+pub(super) fn uuid_text(repository: crate::e2ee::RepositoryId) -> String {
     let hex = hex(repository.as_bytes());
     format!(
         "{}-{}-{}-{}-{}",

@@ -18,6 +18,8 @@ const TRANSFER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 #[path = "http/multipart.rs"]
 mod multipart;
+#[path = "http/object_proof.rs"]
+mod object_proof;
 
 #[path = "aggregate_fetch.rs"]
 mod aggregate_fetch;
@@ -85,6 +87,7 @@ pub struct EncryptedHttpClient {
     client: reqwest::Client,
     transfer_timeout: Duration,
     verified: Arc<tokio::sync::Mutex<Option<VerifiedProfile>>>,
+    initialization_intent: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -102,6 +105,10 @@ impl fmt::Debug for EncryptedHttpClient {
 }
 
 impl EncryptedHttpClient {
+    pub(crate) fn for_initialization(mut self, intent: &super::InitializationIntent) -> Self {
+        self.initialization_intent = Some(intent.confirmation_tag());
+        self
+    }
     /// Local preflight for hosts beginning a new password-change transaction.
     /// Binding still compares under the journal lock to resolve concurrent callers.
     pub async fn ensure_no_pending_config_mutation(
@@ -678,6 +685,7 @@ impl EncryptedHttpClient {
             client,
             transfer_timeout: TRANSFER_TIMEOUT,
             verified: Arc::default(),
+            initialization_intent: None,
         })
     }
 
@@ -1580,6 +1588,8 @@ struct Limits {
     receive_bundle: bool,
     #[serde(skip)]
     multipart_object: bool,
+    #[serde(skip)]
+    object_proof: bool,
 }
 
 fn validate_descriptor(bytes: &[u8], repository: super::RepositoryId) -> Result<Limits> {
@@ -1627,6 +1637,7 @@ fn validate_descriptor(bytes: &[u8], repository: super::RepositoryId) -> Result<
     }
     descriptor.limits.fetch_bundle = descriptor.capabilities.contains("e2ee-fetch-bundle");
     descriptor.limits.multipart_object = descriptor.capabilities.contains("e2ee-multipart-object");
+    descriptor.limits.object_proof = descriptor.capabilities.contains("e2ee-object-proof-v1");
     descriptor.limits.receive_bundle = descriptor.capabilities.contains("e2ee-receive-bundle");
     Ok(descriptor.limits)
 }

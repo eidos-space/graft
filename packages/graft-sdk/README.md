@@ -906,8 +906,14 @@ dependency publication and ref/HEAD reconciliation, it freshly authenticates the
 remote descriptor, the exact retained generation-1 config, the intended branch
 commit and symbolic HEAD. Only then does it durably advance the existing journal
 to Connected and return `{ state: "connected", verification: "publication" }`.
-It downloads bounded metadata, not repository payloads, and creates no restore
-directory. Pending older journals retain their stage and original intent; retry
+With `e2ee-object-proof-v1`, multipart confirmation challenges actual stored
+ciphertext against a streamed calculation over the retained original candidate.
+Only bounded metadata returns over the network; no restore directory is created.
+Older servers or legacy receipts whose ciphertext was already retired require
+full authenticated readback, explicitly reported as `compatibility_verification`.
+An advertised capability that fails never silently falls back. New initialization
+spools remain until durable Connected; cleanup is scoped to that exact intent and
+resumes safely after interruption. Pending older journals retain their stage and original intent; retry
 reconciles publication before repeating confirmation. A missing intent fails
 closed and is never reconstructed from a changed local HEAD.
 
@@ -1049,7 +1055,8 @@ await source.pushInitialBranch({
 ```
 
 Stages are observed boundaries: `preparing`, `uploading`, `downloading`,
-`verifying`, `applying`, then `completed`, `failed`, or `cancelled`.
+`verifying`, `compatibility_verification`, `confirming`, `applying`, then
+`completed`, `failed`, or `cancelled`.
 Preparation can include remote discovery and SQLite snapshot work. Each actual
 HTTP body attempt gets an operation-local `requestId`; its bytes start at zero.
 Known body lengths are accurate request denominators, including ciphertext and
