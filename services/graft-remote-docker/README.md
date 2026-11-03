@@ -253,7 +253,7 @@ limits proofs to two concurrent reads and a 60-second deadline, and honors HTTP
 cancellation. Its new capability is advertised only once the shared Remote 0.2.6
 handler is integrated; backend-only tests do not establish native end-to-end proof.
 
-## S3-compatible storage, including Backblaze B2
+## S3-compatible storage: Backblaze B2 and Cloudflare R2
 
 The default remains **local** (`GRAFT_STORAGE=local`). To use an existing S3 bucket,
 apply `compose.s3.yaml`. This mode stores immutable objects and completed large
@@ -303,6 +303,22 @@ or overlay can select a different volume or start the wrong storage mode.
 | `GRAFT_S3_FORCE_PATH_STYLE` | `true` (default) or `false` |
 | `GRAFT_S3_ACCESS_KEY_ID_FILE` / `GRAFT_S3_SECRET_ACCESS_KEY_FILE` | Mounted credential files |
 | `GRAFT_S3_SESSION_TOKEN_FILE` | Optional mounted session token for temporary AWS credentials |
+
+For Cloudflare R2, use a token restricted to the intended bucket with **Object
+Read & Write** access and these values (no Worker is required):
+
+```dotenv
+GRAFT_S3_ENDPOINT=https://<account-id>.r2.cloudflarestorage.com
+GRAFT_S3_REGION=auto
+GRAFT_S3_BUCKET=your-dedicated-bucket
+GRAFT_S3_PREFIX=graft/
+```
+
+R2 uses the same secret files and Compose overlay. Its S3 API does not implement
+bucket versioning, so deletion removes the current object directly. Versioned
+S3 providers instead use VersionId deletion. R2 aborts incomplete multipart
+uploads after seven days by default. See [R2 S3 API compatibility](https://developers.cloudflare.com/r2/api/s3/api/)
+and [multipart upload lifecycle](https://developers.cloudflare.com/r2/objects/upload-objects/).
 
 The service uses SigV4, Get/Head/Put/DeleteObject, Create/Upload/Complete/Abort
 MultipartUpload, and HeadBucket. Grant read/write/delete (including object-version

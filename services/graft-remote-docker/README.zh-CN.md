@@ -227,7 +227,7 @@ SQLite WAL的临时磁盘空间。删除是逻辑移除，不承诺取证级擦�
 对象校验后端读取真实持久密文，最多两次并发、60秒截止，响应HTTP取消；须接入
 共享Remote 0.2.6 handler后才声明新能力。后端单测不等于原生端到端校验通过。
 
-## S3 兼容存储与 Backblaze B2
+## S3 兼容存储：Backblaze B2 与 Cloudflare R2
 
 默认仍为本地磁盘（`GRAFT_STORAGE=local`）。叠加 `compose.s3.yaml` 可连接已有
 bucket：不可变对象及完成上传的大文件密文存入 S3，SQLite 保留仓库身份、引用、
@@ -270,6 +270,21 @@ bucket：不可变对象及完成上传的大文件密文存入 S3，SQLite 保�
 | `GRAFT_S3_FORCE_PATH_STYLE` | `true`（默认）或 `false` |
 | `GRAFT_S3_ACCESS_KEY_ID_FILE` / `GRAFT_S3_SECRET_ACCESS_KEY_FILE` | 挂载的凭证文件 |
 | `GRAFT_S3_SESSION_TOKEN_FILE` | 可选的 AWS 临时会话 token 文件 |
+
+Cloudflare R2 使用仅限目标 bucket 的 **Object Read & Write** token，配置如下，
+不需要部署 Worker：
+
+```dotenv
+GRAFT_S3_ENDPOINT=https://<account-id>.r2.cloudflarestorage.com
+GRAFT_S3_REGION=auto
+GRAFT_S3_BUCKET=your-dedicated-bucket
+GRAFT_S3_PREFIX=graft/
+```
+
+R2 沿用同样的 secret 文件与 Compose 叠加配置。其 S3 API 不支持 bucket 版本化，
+删除会直接移除当前对象；版本化 S3 服务则通过 VersionId 删除。R2 默认在七天后
+中止未完成的 multipart 上传。参见 [R2 S3 API 兼容说明](https://developers.cloudflare.com/r2/api/s3/api/)
+和[分片上传生命周期](https://developers.cloudflare.com/r2/objects/upload-objects/)。
 
 使用 SigV4、Get/Head/Put/DeleteObject、Create/Upload/Complete/AbortMultipartUpload
 及 HeadBucket。需要对象读写删除权限；开启版本管理时还需删除对象版本权限，

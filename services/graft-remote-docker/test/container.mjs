@@ -62,8 +62,11 @@ if (process.env.GRAFT_REMOTE_SOURCE) {
   );
 }
 
-const s3Fixture =
-  process.env.GRAFT_TEST_S3 === "1"
+const s3Fixture = process.env.GRAFT_TEST_R2_MANIFEST
+  ? await (
+      await import("./r2-fixture.mjs")
+    ).startR2Fixture(directory, process.env.GRAFT_TEST_R2_MANIFEST)
+  : process.env.GRAFT_TEST_S3 === "1"
     ? await (await import("./s3-fixture.mjs")).startS3Fixture(directory, project)
     : undefined;
 writeFileSync(
@@ -355,13 +358,16 @@ try {
   try {
     compose("down", "--volumes", "--remove-orphans");
   } finally {
-    s3Fixture?.close();
-    rmSync(directory, { recursive: true });
     try {
-      if (!process.env.GRAFT_TEST_IMAGE)
-        execFileSync("docker", ["image", "rm", `${project}:local`], {
-          stdio: "ignore",
-        });
-    } catch {}
+      await s3Fixture?.close();
+    } finally {
+      rmSync(directory, { recursive: true });
+      try {
+        if (!process.env.GRAFT_TEST_IMAGE)
+          execFileSync("docker", ["image", "rm", `${project}:local`], {
+            stdio: "ignore",
+          });
+      } catch {}
+    }
   }
 }

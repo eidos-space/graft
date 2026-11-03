@@ -89,7 +89,51 @@ Backblaze B2 cloud acceptance**. B2 endpoint/region/application-key examples fol
 its official docs. No real B2 credentials were available or used. This candidate
 has not yet completed public-SDK dual-mode CI or been published.
 
+The formal npm SDK 0.3.39 passed the complete eight-scenario matrix in both
+local and isolated S3 modes (16 scenarios total), with audited macOS ARM64 native
+`32a047ddf94b7b930cf7f65cd693e1df4ad959ab9653b64893d46dc1d245734c`.
+The same Linux ARM64 server image `ab3cc47e...` was used for both modes; all six
+runtime module hashes match commit `965a34bc`. Default payload readback was zero
+in every scenario. Durable evidence is `docker-s3/public-sdk-dual-mode-proof.json`
+and `public-sdk-darwin-arm64-{local,s3}.log` under the task artifact directory.
+Native Linux public-package checks remain separate release gates.
+
 A process crash can orphan a provider-side multipart session; configure lifecycle
 cleanup for incomplete uploads without expiring live objects. Keep both the local
 control database and corresponding bucket data in coordinated backups. Object
 Lock/retention or permission failures can keep deletion pending.
+
+## Disposable cloud R2 acceptance
+
+The user selected R2 for real cloud S3 acceptance instead of requiring a B2 test
+account. `test/r2-fixture.mjs` requires an explicit manifest for a newly created,
+empty `graft-docker-test-YYYYMMDD-<10 hex digits>` bucket and the exclusive
+`acceptance/` prefix. It never discovers or selects existing buckets. Example
+manifest fields (credential contents must not be included):
+
+```json
+{
+  "kind": "graft-docker-disposable-r2-v1",
+  "allowDestructiveTest": true,
+  "bucket": "graft-docker-test-20261103-0123456789",
+  "endpoint": "https://<account-id>.r2.cloudflarestorage.com",
+  "region": "auto",
+  "prefix": "acceptance/",
+  "accessKeyIdFile": "/private/test/access-key-id",
+  "secretAccessKeyFile": "/private/test/secret-access-key"
+}
+```
+
+Set `GRAFT_TEST_R2_MANIFEST` to this file when running `test/container.mjs`, with
+the public SDK/native and prebuilt image arguments used above. The fixture checks
+HeadBucket, an empty object listing and no old multipart uploads before starting.
+It supplies mounted secret files and, on completion or failure, removes only
+objects/uploads under its exclusive prefix and verifies the bucket is empty.
+Bucket creation/removal and token revocation are explicit operator actions.
+
+Use a bucket-scoped Object Read & Write credential with a short TTL; no account
+admin permission is required by the Docker service. R2 does not provide S3 bucket
+versioning, unlike the versioned MinIO fixture. A null object VersionId exercises
+the ordinary DeleteObject path. A permission error reading bucket configuration
+is not evidence of that API's implementation status; consult the official
+[R2 compatibility table](https://developers.cloudflare.com/r2/api/s3/api/).
