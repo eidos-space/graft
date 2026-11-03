@@ -22,11 +22,11 @@ mkdirSync(sourcePath); mkdirSync(peerPath);
 const source = await RepositorySession.open(sourcePath); const peer = await RepositorySession.open(peerPath);
 const reports = [];
 async function observe(label, operation) {
-  const stages = []; let settled = false;
+  const stages = []; const transfers = []; let settled = false;
   const start = performance.now();
   await operation(process.env.GRAFT_PROGRESS_SYNC === '0' ? undefined : (event) => {
     assert.equal(settled, false); stages.push(event);
-  });
+  }, (event) => transfers.push(event));
   settled = true;
   if (process.env.GRAFT_PROGRESS_SYNC !== '0') {
     assert.equal(stages[0]?.phase, 'preparing'); assert.equal(stages.at(-1)?.phase, 'completed');
@@ -40,7 +40,12 @@ async function observe(label, operation) {
       attempts.set(requestId, transfer.transferredBytes);
     }
   }
-  reports.push({ label, elapsedMs: Math.round(performance.now() - start) });
+  const direction = ['clone', 'pull', 'checkout-fetch'].includes(label) ? 'download' : 'upload';
+  const planned = transfers.filter((event) => event.direction === direction && event.totalIsFinal);
+  assert.ok(planned.length > 0, `${label}: missing complete operation total`);
+  assert.equal(new Set(planned.map((event) => event.totalBytes)).size, 1, `${label}: denominator moved`);
+  assert.equal(planned.at(-1).transferredBytes, planned.at(-1).totalBytes, `${label}: incomplete transfer plan`);
+  reports.push({ label, elapsedMs: Math.round(performance.now() - start), totalBytes: planned.at(-1).totalBytes });
 }
 try {
   await source.init();
@@ -49,16 +54,28 @@ try {
   const payload = randomBytes(1024 * 1024); writeFileSync(join(sourcePath, 'attachment.bin'), payload);
   await source.addAll(); await source.commit('first');
   await source.configureRemote({ name: 'origin', url, bearerToken: 'account-token', upstreamBranch: 'main' });
-  await observe('initial-upload', (onSyncProgress) => source.push({ onSyncProgress }));
-  await observe('clone', (onSyncProgress) => peer.cloneRepository({ remoteUrl: url, bearerToken: 'account-token', onSyncProgress }));
+  await observe('initial-upload', (onSyncProgress, onProgress) => source.push({ onSyncProgress, onProgress }));
+  await observe('clone', (onSyncProgress, onProgress) => peer.cloneRepository({ remoteUrl: url, bearerToken: 'account-token', onSyncProgress, onProgress }));
   assert.deepEqual(readFileSync(join(peerPath, 'attachment.bin')), payload);
   const updated = randomBytes(1024 * 1024); writeFileSync(join(sourcePath, 'update.bin'), updated);
   await source.addAll(); await source.commit('second');
-  await observe('push', (onSyncProgress) => source.push({ onSyncProgress }));
-  await observe('pull', (onSyncProgress) => peer.pull({ onSyncProgress }));
+  await observe('push', (onSyncProgress, onProgress) => source.push({ onSyncProgress, onProgress }));
+  await observe('pull', (onSyncProgress, onProgress) => peer.pull({ onSyncProgress, onProgress }));
   assert.deepEqual(readFileSync(join(peerPath, 'update.bin')), updated);
   const received = new DatabaseSync(join(peerPath, 'records.sqlite'), { readOnly: true });
   assert.equal(received.prepare('SELECT value FROM records').get().value, 'first'); received.close();
+  const preparedPath = join(directory, 'prepared'); mkdirSync(preparedPath);
+  const prepared = await RepositorySession.open(preparedPath);
+  try {
+    await prepared.init();
+    await prepared.configureRemote({ name: 'origin', url, bearerToken: 'account-token', upstreamBranch: 'main' });
+    await observe('checkout-fetch', (onSyncProgress, onProgress) => prepared.fetchForCheckout({ remote: 'origin', branch: 'main', onSyncProgress, onProgress }));
+    assert.equal((await prepared.repositoryMetadata()).current_head, null);
+    assert.throws(() => readFileSync(join(preparedPath, 'attachment.bin')), { code: 'ENOENT' });
+    const plan = await prepared.planMerge({ revision: 'origin/main' });
+    await prepared.applyMerge({ revision: 'origin/main', planToken: plan.plan_token });
+    assert.deepEqual(readFileSync(join(preparedPath, 'update.bin')), updated);
+  } finally { await prepared.close(); }
   console.log(JSON.stringify({ status: 'passed', reports }, null, 2));
 } finally {
   await peer.close(); await source.close(); service.kill(); await once(service, 'exit'); lines.close();

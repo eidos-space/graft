@@ -73,6 +73,34 @@ impl fmt::Debug for EncryptedRemote {
 }
 
 impl EncryptedRemote {
+    pub(super) async fn prepare_download_progress(
+        &self,
+        requests: &[DownloadRequest],
+    ) -> Result<()> {
+        let trace = crate::trace::PushTraceSpan::new("encrypted_download_plan_prepare");
+        let mut schedule = Vec::new();
+        let mut total = 0u64;
+        for request in requests {
+            let ranges = self
+                .client
+                .prepare_download_ranges(&request.path, request.range.clone(), request.length)
+                .await?;
+            for (_, range) in &ranges {
+                total = total
+                    .checked_add(range.end - range.start)
+                    .ok_or(EncryptionError::TooLarge)?;
+            }
+            schedule.extend(ranges);
+        }
+        trace.finish(&[
+            ("logical_requests", requests.len() as u64),
+            ("body_requests", schedule.len() as u64),
+            ("remaining_bytes", total),
+        ]);
+        crate::repo::plan_download_requests(schedule);
+        Ok(())
+    }
+
     pub(super) fn staging_directory(&self) -> &std::path::Path {
         &self.budget.private_directory
     }
@@ -518,21 +546,11 @@ impl EncryptedRemote {
             };
             if collecting {
                 crate::repo::sync_phase(crate::repo::SyncPhase::Preparing);
-                if self
-                    .client
-                    .requires_multipart(prepared.ciphertext_length())
-                    .await?
-                {
-                    self.flush_upload_plan(false).await?;
-                } else {
-                    let admission = plan.lock().unwrap().admit(prepared)?;
-                    match admission {
-                        super::encrypted_plan::Admission::Retained => return Ok(()),
-                        super::encrypted_plan::Admission::Full => {
-                            self.flush_upload_plan(false).await?
-                        }
-                        super::encrypted_plan::Admission::Disabled => {}
-                    }
+                let admission = plan.lock().unwrap().admit(prepared)?;
+                match admission {
+                    super::encrypted_plan::Admission::Retained => return Ok(()),
+                    super::encrypted_plan::Admission::Full => self.flush_upload_plan(false).await?,
+                    super::encrypted_plan::Admission::Disabled => {}
                 }
             }
         }
@@ -580,13 +598,58 @@ impl EncryptedRemote {
                 ("complete", u64::from(declare)),
             ]);
         }
+        let mut prepared = Vec::new();
+        let mut remaining = 0u64;
+        for object in objects {
+            let multipart = if self
+                .client
+                .requires_multipart(object.ciphertext_length())
+                .await?
+            {
+                let provider =
+                    self.uploads
+                        .as_ref()
+                        .ok_or(EncryptionError::CheckpointUnavailable(
+                            std::io::ErrorKind::Unsupported,
+                        ))?;
+                Some(
+                    self.client
+                        .prepare_object_multipart(&object, provider.clone())
+                        .await?,
+                )
+            } else {
+                None
+            };
+            remaining = remaining
+                .checked_add(match &multipart {
+                    Some(preparation) => preparation.remaining_bytes()?,
+                    None => object.ciphertext_length(),
+                })
+                .ok_or(EncryptionError::TooLarge)?;
+            prepared.push((object, multipart));
+        }
         if declare {
-            crate::repo::plan_remaining_transfer(crate::repo::TransferDirection::Upload, bytes);
+            crate::repo::plan_remaining_transfer(crate::repo::TransferDirection::Upload, remaining);
         } else {
             crate::repo::invalidate_transfer_plan(crate::repo::TransferDirection::Upload);
         }
-        for object in objects {
-            self.publish_prepared_now(&object).await?;
+        for (object, multipart) in prepared {
+            if let Some(multipart) = multipart {
+                match multipart
+                    .publish(&self.client, &self.budget.private_directory)
+                    .await?
+                {
+                    ObjectPublicationOutcome::Created | ObjectPublicationOutcome::Reused => {}
+                    ObjectPublicationOutcome::Unconfirmed => {
+                        return Err(RemoteErr::EncryptedPublicationUnconfirmed);
+                    }
+                    ObjectPublicationOutcome::OutcomeUnknown { error } => {
+                        return Err(RemoteErr::EncryptedOutcomeUnknown { source: error });
+                    }
+                }
+            } else {
+                self.publish_prepared_now(&object).await?;
+            }
         }
         for hint in &hints {
             self.client.publish_hint(hint).await?;

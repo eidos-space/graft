@@ -47,6 +47,9 @@ pub enum EncryptedHttpError {
 
 type Result<T> = std::result::Result<T, EncryptedHttpError>;
 
+#[derive(Clone)]
+pub(super) struct PlannedDownloadBody(pub u64);
+
 /// Authenticated local metadata. No secret key material or plaintext Debug output.
 pub struct EncryptedObjectMetadata {
     pub logical_key: String,
@@ -1058,6 +1061,52 @@ impl EncryptedHttpClient {
         Ok(Some(metadata))
     }
 
+    /// Authenticate the envelope and freeze precisely the header and body
+    /// requests that the ordinary validated download will perform later.
+    pub(crate) async fn prepare_download_ranges(
+        &self,
+        logical: &str,
+        range: Option<Range<u64>>,
+        length: u64,
+    ) -> Result<Vec<(String, Range<u64>)>> {
+        let operation = self.operation().await?;
+        let key = object::remote_key(operation.root()?, logical)?;
+        let (reader, header, _) = self
+            .fetch_object_header(&operation, &key)
+            .await?
+            .ok_or(EncryptedHttpError::ProtocolMismatch)?;
+        if reader.logical_key() != logical {
+            return Err(EncryptionError::AuthenticationFailed.into());
+        }
+        let body = if let Some(range) = range {
+            if range.end.checked_sub(range.start) != Some(length) {
+                return Err(EncryptionError::InvalidChunk.into());
+            }
+            if range.is_empty() {
+                None
+            } else {
+                Some(reader.ciphertext_range(range)?)
+            }
+        } else {
+            if reader.plaintext_length() != length {
+                return Err(EncryptionError::AuthenticationFailed.into());
+            }
+            Some(reader.chunk_range(0)?.start..reader.chunk_range(reader.chunk_count() - 1)?.end)
+        };
+        let key = self.raw_url(&key)?.to_string();
+        let mut requests = vec![
+            (key.clone(), 0..object::PREFIX_LENGTH as u64),
+            (
+                key.clone(),
+                object::PREFIX_LENGTH as u64..header.len() as u64,
+            ),
+        ];
+        if let Some(body) = body {
+            requests.push((key, body));
+        }
+        Ok(requests)
+    }
+
     /// Authenticate covering blocks before returning a bounded plaintext range.
     /// Partial reads do not establish the complete object's plaintext digest.
     pub async fn read_object_range(
@@ -1284,6 +1333,7 @@ impl EncryptedHttpClient {
         if range.end <= range.start {
             return Err(EncryptionError::InvalidChunk.into());
         }
+        let planned = crate::repo::claim_download_request(self.raw_url(key)?.as_str(), &range);
         let request = self.credentials.authorize_encrypted_request(
             &self.remote_name,
             self.client
@@ -1292,7 +1342,7 @@ impl EncryptedHttpClient {
                 .header("Accept-Encoding", "identity")
                 .header("Range", format!("bytes={}-{}", range.start, range.end - 1)),
         );
-        let response = tokio::select! {
+        let mut response = tokio::select! {
             result = request.send() => result.map_err(transport_error)?,
             _ = operation.cancelled() => return Err(EncryptionError::Cancelled.into()),
         };
@@ -1305,6 +1355,9 @@ impl EncryptedHttpClient {
             return Err(EncryptedHttpError::HttpStatus(response.status().as_u16()));
         }
         let total = validate_content_range(&response, &range)?;
+        if let Some(bytes) = planned {
+            response.extensions_mut().insert(PlannedDownloadBody(bytes));
+        }
         Ok(Some((response, total)))
     }
 
@@ -1687,8 +1740,12 @@ async fn read_body(
         return Err(EncryptionError::TooLarge.into());
     }
     let mut bytes = Vec::new();
+    let total = response
+        .extensions()
+        .get::<PlannedDownloadBody>()
+        .map(|planned| planned.0);
     let mut progress =
-        crate::repo::begin_transfer_progress(crate::repo::TransferDirection::Download, None);
+        crate::repo::begin_transfer_progress(crate::repo::TransferDirection::Download, total);
     loop {
         let chunk = tokio::select! {
             result = response.chunk() => result.map_err(transport_error)?,

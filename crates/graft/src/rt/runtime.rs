@@ -28,8 +28,8 @@ use crate::{
     remote::Remote,
     rt::{
         action::{
-            Action, FetchLog, FetchSegment, FetchSnapshot, HydrateSnapshot, PreparedSnapshotPush,
-            RemoteCommit,
+            Action, FetchLog, FetchSegment, FetchSnapshot, HydrateSnapshot,
+            PreparedSnapshotDownload, PreparedSnapshotPush, RemoteCommit,
         },
         task::{autosync::AutosyncTask, supervise},
     },
@@ -541,43 +541,71 @@ impl Runtime {
         snapshots: &[Snapshot],
         remote: Arc<Remote>,
     ) -> Result<u64> {
-        let bytes = self.snapshots_download_bytes(snapshots, remote.clone())?;
-        remote.plan_download_progress(bytes);
+        let plan = self.prepare_snapshot_download(snapshots, remote.clone())?;
+        let requests = plan.requests();
+        let bytes = requests.iter().try_fold(0u64, |bytes, request| {
+            bytes
+                .checked_add(request.length)
+                .ok_or_else(|| LogicalErr::Other("snapshot download size exceeds u64".into()))
+        })?;
+        if !requests.is_empty() {
+            self.inner
+                .tokio
+                .block_on(remote.prepare_download_progress(&requests))?;
+        }
         Ok(bytes)
     }
 
-    /// Fetch log metadata and count missing compressed segment ranges without
-    /// downloading segment bodies or declaring an operation-wide total.
-    pub fn snapshots_download_bytes(
+    pub fn prefetch_snapshots(&self, snapshots: &[Snapshot], remote: Arc<Remote>) -> Result<()> {
+        let plan = self.prepare_snapshot_download(snapshots, remote.clone())?;
+        let requests = plan.requests();
+        if !requests.is_empty() {
+            self.inner
+                .tokio
+                .block_on(remote.prepare_download_progress(&requests))?;
+        }
+        self.execute_snapshot_download(plan, remote)
+    }
+
+    pub fn prepare_snapshot_download(
         &self,
         snapshots: &[Snapshot],
         remote: Arc<Remote>,
-    ) -> Result<u64> {
-        let mut ranges = std::collections::BTreeMap::<SegmentId, Vec<std::ops::Range<u64>>>::new();
+    ) -> Result<PreparedSnapshotDownload> {
+        let mut frames = std::collections::BTreeMap::new();
+        let mut pending = Vec::new();
         for snapshot in snapshots {
             if self.snapshot_hydration_cached(snapshot)? {
                 continue;
             }
             self.snapshot_fetch_from(snapshot, remote.clone())?;
             for frame in self.storage().read().find_missing_frames(snapshot)? {
-                ranges.entry(frame.sid).or_default().push(frame.bytes);
+                let key = (frame.sid.clone(), frame.bytes.start, frame.bytes.end);
+                if let Some(previous) = frames.insert(key, frame.clone())
+                    && previous != frame
+                {
+                    return Err(
+                        LogicalErr::Other("conflicting immutable segment frames".into()).into(),
+                    );
+                }
             }
+            pending.push(snapshot.clone());
         }
-        let mut bytes = 0u64;
-        for ranges in ranges.values_mut() {
-            ranges.sort_unstable_by_key(|range| (range.start, range.end));
-            let mut end = 0;
-            for range in ranges {
-                let start = range.start.max(end);
-                bytes = bytes
-                    .checked_add(range.end.saturating_sub(start))
-                    .ok_or_else(|| {
-                        LogicalErr::Other("snapshot download size exceeds u64".into())
-                    })?;
-                end = end.max(range.end);
-            }
-        }
-        Ok(bytes)
+        Ok(PreparedSnapshotDownload {
+            snapshots: pending,
+            ranges: crate::rt::action::coalesce_ranges(
+                frames.into_values().collect(),
+                remote.buffered_read_limit(),
+            ),
+        })
+    }
+
+    pub fn execute_snapshot_download(
+        &self,
+        plan: PreparedSnapshotDownload,
+        remote: Arc<Remote>,
+    ) -> Result<()> {
+        self.run_action_with_remote(plan, remote)
     }
 
     /// Returns whether a previous complete hydration of this exact snapshot is

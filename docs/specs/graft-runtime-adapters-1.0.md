@@ -624,7 +624,7 @@ Current evidence lives in `crates/graft-sqlite/src/repo_service.rs`,
 
 ### Additive sync observation
 
-The Node SDK additionally accepts `onSyncProgress` on push, fetch, pull, clone,
+The Node SDK additionally accepts `onSyncProgress` on push, fetch, fetchForCheckout, pull, clone,
 and initial encrypted publication. It reports confirmed preparation, body
 upload/download, independent verification, and worktree application boundaries,
 plus terminal operation status. Independent initial verification MUST preserve
@@ -639,7 +639,16 @@ contribute no body bytes, and resumed uploads count the actually transferred
 parts. Unknown-length bodies remain indeterminate. Encryption uses exactly the
 same observation mechanism, counting ciphertext HTTP bodies. The legacy
 operation/direction cumulative callback and final-plan semantics are unchanged.
-No preflight network request or duplicate payload spool is required by observation.
+Request observation itself requires no preflight. A complete encrypted download
+plan authenticates object headers before declaring its remaining body schedule.
+
+`fetchForCheckout({ remote, branch, signal?, onProgress?, onSyncProgress? })`
+returns `{ remote, branch, head, commits }`. It fetches the graph, external files
+and target SQLite pages into private cache under one download plan, publishing
+the tracking ref only after validation. It MUST NOT move HEAD or index, replace
+worktree files, or bypass reviewed `planMerge`/guarded `applyMerge`. Cancellation
+uses the ordinary AbortError/terminal-cancelled contract and may retain verified
+cache data, but MUST NOT apply a checkout. Ordinary `fetch` remains object-only.
 
 ### Bounded encrypted upload inventories
 
@@ -654,10 +663,33 @@ independent initialization verification and ref journals remain required.
 
 The built-in inventory retains at most 2 GiB/256 ciphertext payload handles and
 1 MiB/256 public hints. Current-object preparation is additional to this budget.
-An overflow or a multipart payload falls back to ordinary publication without a
+An overflow falls back to ordinary publication without a
 final denominator. A short body or retry invalidates a previously declared total.
 This denominator counts all ciphertext payload bodies in the upload operation;
 it excludes ref-control traffic and does not cover later verification downloads.
-Clone, pull and multipart progress MUST remain indeterminate until their own
-complete immutable transfer schedules are implemented. A single body length or
-a plaintext checkout budget is insufficient evidence for those totals.
+Multipart planning MUST negotiate all sessions and validate their identities,
+part sizes and confirmed parts before declaring the total. The denominator MUST
+count only missing parts. Encrypted preparation retains the exact recovery
+ciphertext and journal lease through publication; full winning-object validation
+and durable confirmation MUST remain required.
+
+### Frozen download schedules
+
+Clone, pull and independent verification clone prepare the immutable repository
+graph before external files or snapshot frames are transferred. Adapters collect
+all required snapshots, including three-way merge inputs, deduplicate whole
+compressed frames and freeze the bounded request grouping once. Execution MUST
+consume that grouping directly. Planning MUST NOT hydrate pages, move refs or
+replace worktree files. Plain and encrypted remotes use the same logical request
+inventory and cumulative body counters.
+
+Encrypted planning MUST authenticate each object's envelope, validate its logical
+identity and expand plaintext ranges into exact AEAD covering ranges. The final
+budget includes already-consumed discovery bodies plus every remaining header
+and ciphertext body attempt, including repeated header reads. Each encrypted
+range MUST consume one matching operation-scoped inventory entry, bound to its
+endpoint and opaque key. A missing entry, retry, unexpected body or short body
+MUST withdraw the final denominator before further progress can imply completion.
+Existing authentication, full content identity, cancellation and guarded worktree
+application remain required. Reaching the transfer total does not complete the
+operation or its later materialization.

@@ -336,6 +336,15 @@ class RepositorySession {
     )
   }
 
+  /** Fetch payloads and target SQLite snapshots without applying a checkout. */
+  async fetchForCheckout(options) {
+    const { remote, branch, signal, onProgress, onSyncProgress } = options
+    return callJsonWithSyncProgress(
+      (sync) => this.#native.fetchForCheckout(remote, branch, signal, onProgress, sync),
+      onProgress, onSyncProgress
+    )
+  }
+
   async getMergePolicy({ signal } = {}) {
     signal?.throwIfAborted()
     return callJson(() => this.#native.getMergePolicy(signal))

@@ -95,16 +95,44 @@ pub(super) fn run_repo_pull(
     let local_branch = repo
         .current_branch()?
         .ok_or_else(|| ErrCtx::InvalidCommand("cannot pull in detached HEAD".into()))?;
-    let (remote, mut plan) = if let Some(refspec) = refspec {
+    let (remote, prepared) = if let Some(refspec) = refspec {
         let remote = repo_default_remote(&repo, remote)?;
-        let plan = repo.plan_pull_refspec(&remote, &refspec, &local_branch)?;
-        (remote, plan)
+        let prepared = repo.prepare_fetch_refspec(&remote, &refspec)?;
+        (remote, prepared)
     } else {
         let upstream = repo_remote_branch(&repo, remote, branch)?;
-        let plan = repo.plan_pull(&upstream.remote, &upstream.branch, &local_branch)?;
-        (upstream.remote, plan)
+        let prepared = repo.prepare_fetch(&upstream.remote, &upstream.branch)?;
+        (upstream.remote, prepared)
     };
-    let checkout_remote = Arc::new(repo.remote_store(&remote)?);
+    let merge = repo.plan_merge_revision(prepared.head())?;
+    let checkout_remote = prepared.remote();
+    let snapshots = match &merge.outcome {
+        MergeOutcome::FastForward { .. } => merge
+            .checkout
+            .files
+            .values()
+            .map(|state| state.snapshot.to_snapshot())
+            .collect::<Vec<_>>(),
+        MergeOutcome::Merged { .. } => merge
+            .index
+            .iter()
+            .flat_map(|index| &index.entries)
+            .filter_map(|entry| entry.file.as_ref())
+            .map(|state| state.snapshot.to_snapshot())
+            .collect(),
+        MergeOutcome::AlreadyUpToDate { .. } => Vec::new(),
+    };
+    let downloads = runtime.prepare_snapshot_download(&snapshots, checkout_remote.clone())?;
+    prepared.plan_download(&downloads.requests())?;
+    runtime.execute_snapshot_download(downloads, checkout_remote.clone())?;
+    let fetch = prepared.finish()?;
+    let mut plan = graft::repo::PullPlan {
+        remote,
+        remote_branch: fetch.branch.clone(),
+        local_branch,
+        fetch,
+        merge,
+    };
     plan.merge = prepare_repo_merge_plan(runtime, &plan.merge, Some(checkout_remote.clone()))?;
     ensure_checkout_plan_preserves_untracked_paths(runtime, file, &repo, &plan.merge.checkout)?;
     let previous_files = current_repo_files_for_checkout(&repo)?;

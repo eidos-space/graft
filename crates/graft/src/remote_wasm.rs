@@ -18,6 +18,10 @@ use crate::core::{LogId, SegmentId, commit::Commit, lsn::LSN};
 #[path = "remote/segment.rs"]
 pub mod segment;
 
+#[path = "remote/transfer_plan.rs"]
+mod transfer_plan;
+pub use transfer_plan::DownloadRequest;
+
 #[derive(Debug, Error)]
 pub enum RemoteErr {
     #[error("Failed to decode file: {0}")]
@@ -321,6 +325,20 @@ pub(crate) enum ReadBundleOutcome {
 }
 
 impl Remote {
+    pub async fn prepare_download_progress(&self, requests: &[DownloadRequest]) -> Result<()> {
+        for request in requests {
+            request
+                .checked_length()
+                .ok_or_else(|| RemoteErr::InvalidRange { path: request.path.clone() })?;
+        }
+        // Browser memory/filesystem remotes have no HTTP body counters.
+        Ok(())
+    }
+
+    pub(crate) async fn flush_planned_uploads(&self) -> Result<()> {
+        Ok(())
+    }
+
     pub(crate) fn snapshot_upload_concurrency(&self) -> usize {
         5
     }

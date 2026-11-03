@@ -13,10 +13,7 @@ use std::{
 };
 
 use crate::core::{LogId, SegmentId, cbe::CBE64, commit::Commit, lsn::LSN};
-use crate::repo::{
-    TransferDirection, TransferProgressHandle, begin_transfer_progress,
-    declare_transfer_progress_total,
-};
+use crate::repo::{TransferDirection, TransferProgressHandle, begin_transfer_progress};
 use bilrost::{Message, OwnedMessage};
 use bytes::Bytes;
 use futures::{
@@ -52,8 +49,10 @@ pub fn with_planned_uploads<T>(operation: impl FnOnce() -> T) -> T {
 }
 
 pub mod segment;
+mod transfer_plan;
 #[cfg(feature = "e2ee")]
 pub use encrypted::EncryptedTransferBudget;
+pub use transfer_plan::DownloadRequest;
 
 const REMOTE_CONCURRENCY: usize = 5;
 const GRAFT_PROTOCOL_HEADER: &str = "Graft-Protocol";
@@ -104,6 +103,8 @@ impl RemotePath<'_> {
 
 #[derive(Error, Debug)]
 pub enum RemoteErr {
+    #[error("transfer plan exceeds the supported size or contains inconsistent lengths")]
+    InvalidTransferPlan,
     #[error("encrypted HTTP remotes require the native e2ee feature")]
     EncryptedRemoteUnavailable,
     #[cfg(feature = "e2ee")]
@@ -823,11 +824,22 @@ struct HttpRemote {
     probe_client: reqwest::Client,
     upload_client: reqwest::Client,
     descriptor: Arc<tokio::sync::OnceCell<HttpRemoteDescriptor>>,
+    upload_plan: Arc<parking_lot::Mutex<Option<HashMap<String, HttpMultipartStartResponse>>>>,
     request_timeout: Duration,
     url: String,
     token: Option<BearerToken>,
     #[cfg(test)]
     multipart_discovery_threshold: usize,
+}
+
+struct HttpUploadPlanGuard(
+    Arc<parking_lot::Mutex<Option<HashMap<String, HttpMultipartStartResponse>>>>,
+);
+
+impl Drop for HttpUploadPlanGuard {
+    fn drop(&mut self) {
+        self.0.lock().take();
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1629,14 +1641,24 @@ impl Remote {
         Ok(())
     }
 
-    /// Plaintext checkout budgets omit encryption envelopes and protocol reads.
-    /// They must not become a final denominator for encrypted HTTP transfers.
-    pub(crate) fn plan_download_progress(&self, bytes: u64) {
+    /// Authenticate metadata before declaring a fixed transport denominator.
+    /// Execution must consume this exact schedule, rather than rediscover ranges.
+    pub async fn prepare_download_progress(&self, requests: &[DownloadRequest]) -> Result<()> {
         #[cfg(feature = "e2ee")]
-        if matches!(&self.backend, RemoteBackend::Encrypted(_)) {
-            return;
+        if let RemoteBackend::Encrypted(remote) = &self.backend {
+            return remote.prepare_download_progress(requests).await;
         }
+        let bytes = requests.iter().try_fold(0u64, |bytes, request| {
+            bytes
+                .checked_add(
+                    request
+                        .checked_length()
+                        .ok_or(RemoteErr::InvalidTransferPlan)?,
+                )
+                .ok_or(RemoteErr::InvalidTransferPlan)
+        })?;
         crate::repo::plan_remaining_transfer(TransferDirection::Download, bytes);
+        Ok(())
     }
 
     /// Maximum plaintext retained by a buffered encrypted read. Other adapters
@@ -1965,12 +1987,7 @@ impl Remote {
                 Ok(HttpReceivePackResult::Published) => return Ok(()),
                 Ok(
                     HttpReceivePackResult::Unsupported | HttpReceivePackResult::RetryIndividually,
-                ) => {
-                    declare_transfer_progress_total(
-                        TransferDirection::Upload,
-                        planned_bundle_upload_bytes(&[], Some(pack), ref_path)?,
-                    );
-                }
+                ) => {}
                 Err(err) => {
                     return self
                         .reconcile_publication_error(err, ref_path, expected, &replacement)
@@ -1979,6 +1996,11 @@ impl Remote {
             }
         }
 
+        let _upload_plan = if let RemoteBackend::Http(remote) = &self.backend {
+            remote.plan_individual_uploads(&[], pack.as_ref()).await?
+        } else {
+            None
+        };
         if let Some(pack) = pack.as_ref() {
             self.put_pack_objects(pack).await?;
         }
@@ -2021,25 +2043,21 @@ impl Remote {
                 Ok(HttpReceivePackResult::Published) => return Ok(()),
                 Ok(
                     HttpReceivePackResult::Unsupported | HttpReceivePackResult::RetryIndividually,
-                ) => {
-                    declare_transfer_progress_total(
-                        TransferDirection::Upload,
-                        planned_bundle_upload_bytes(&objects, Some(pack), ref_path)?,
-                    );
-                }
+                ) => {}
                 Err(err) => {
                     return self
                         .reconcile_publication_error(err, ref_path, expected, &replacement)
                         .await;
                 }
             }
-        } else if matches!(&self.backend, RemoteBackend::Http(_)) {
-            declare_transfer_progress_total(
-                TransferDirection::Upload,
-                planned_bundle_upload_bytes(&objects, None, ref_path)?,
-            );
         }
-
+        let _upload_plan = if let RemoteBackend::Http(remote) = &self.backend {
+            remote
+                .plan_individual_uploads(&objects, pack.as_ref())
+                .await?
+        } else {
+            None
+        };
         self.put_bundle_objects(&objects).await?;
         self.publish_object_pack_and_ref(pack, ref_path, expected, replacement)
             .await
@@ -2246,6 +2264,51 @@ impl Remote {
 }
 
 impl HttpRemote {
+    /// Negotiate every multipart session before declaring any missing payload
+    /// bytes. The scoped guard prevents stale sessions leaking into a later push.
+    async fn plan_individual_uploads(
+        &self,
+        objects: &[RemoteBundleObject],
+        pack: Option<&RemoteObjectPack>,
+    ) -> Result<Option<HttpUploadPlanGuard>> {
+        if self.upload_plan.lock().is_some() {
+            return Ok(None);
+        }
+        let mut multipart = HashMap::new();
+        let mut remaining = 0u64;
+        let inventory = objects
+            .iter()
+            .map(|object| (object.path.as_str(), object.content_length))
+            .chain(pack.into_iter().flat_map(|pack| {
+                [
+                    (pack.pack_path.as_str(), pack.pack.len()),
+                    (pack.index_path.as_str(), pack.index.len()),
+                ]
+            }));
+        for (path, length) in inventory {
+            let bytes = if let Some(part_bytes) = self.multipart_part_bytes(length).await? {
+                let upload = self.start_multipart(path, length, part_bytes).await?;
+                let complete = upload
+                    .uploaded_parts
+                    .iter()
+                    .map(|part| part.bytes)
+                    .sum::<usize>();
+                multipart.insert(path.to_owned(), upload);
+                length
+                    .checked_sub(complete)
+                    .ok_or(RemoteErr::InvalidTransferPlan)?
+            } else {
+                length
+            };
+            remaining = remaining
+                .checked_add(bytes as u64)
+                .ok_or(RemoteErr::InvalidTransferPlan)?;
+        }
+        *self.upload_plan.lock() = Some(multipart);
+        crate::repo::plan_remaining_transfer(TransferDirection::Upload, remaining);
+        Ok(Some(HttpUploadPlanGuard(self.upload_plan.clone())))
+    }
+
     #[cfg(test)]
     fn new(url: String, token: Option<BearerToken>) -> Result<Self> {
         Ok(Self::with_client(url, token, build_http_client()?))
@@ -2286,6 +2349,7 @@ impl HttpRemote {
             probe_client,
             upload_client,
             descriptor: Arc::new(tokio::sync::OnceCell::new()),
+            upload_plan: Arc::new(parking_lot::Mutex::new(None)),
             request_timeout,
             url: url.trim_end_matches('/').to_string(),
             token,
@@ -2999,7 +3063,11 @@ impl HttpRemote {
                 .await;
         }
 
-        let body = tracked_upload_body(chunks, content_length as u64);
+        let body = if path == "HEAD" || path.starts_with("refs/") || path.starts_with("locks/") {
+            reqwest::Body::from(chunks.into_iter().flatten().collect::<Vec<_>>())
+        } else {
+            tracked_upload_body(chunks, content_length as u64)
+        };
         let response = self
             .send(
                 self.upload_request(
@@ -3023,27 +3091,18 @@ impl HttpRemote {
         content_length: usize,
         part_bytes: usize,
     ) -> Result<()> {
-        let response = self
-            .send(
-                self.upload_request(reqwest::Method::POST, self.raw_url("multipart-start", path))
-                    .header(reqwest::header::CONTENT_LENGTH, 0)
-                    .header(MULTIPART_HEADER_OBJECT_BYTES, content_length),
-                "multipart_start",
-                Some(0),
-            )
-            .await?;
-        let response = Self::check_response(response, path).await?;
-        let response_bytes = response
-            .bytes()
-            .await
-            .map_err(|err| RemoteErr::http_transport("multipart_start_body", err))?;
-        let upload: HttpMultipartStartResponse =
-            serde_json::from_slice(&response_bytes).map_err(|err| RemoteErr::HttpStatus {
-                status: 502,
-                path: path.to_string(),
-                message: format!("invalid multipart-start response: {err}"),
-            })?;
-        validate_multipart_start(&upload, content_length, part_bytes, path)?;
+        let planned = self
+            .upload_plan
+            .lock()
+            .as_mut()
+            .and_then(|plan| plan.remove(path));
+        let upload = match planned {
+            Some(upload) => upload,
+            None => {
+                self.start_multipart(path, content_length, part_bytes)
+                    .await?
+            }
+        };
         let uploaded_parts = upload
             .uploaded_parts
             .iter()
@@ -3093,6 +3152,36 @@ impl HttpRemote {
         Err(error)
     }
 
+    async fn start_multipart(
+        &self,
+        path: &str,
+        content_length: usize,
+        part_bytes: usize,
+    ) -> Result<HttpMultipartStartResponse> {
+        let response = self
+            .send(
+                self.upload_request(reqwest::Method::POST, self.raw_url("multipart-start", path))
+                    .header(reqwest::header::CONTENT_LENGTH, 0)
+                    .header(MULTIPART_HEADER_OBJECT_BYTES, content_length),
+                "multipart_start",
+                Some(0),
+            )
+            .await?;
+        let response = Self::check_response(response, path).await?;
+        let response_bytes = response
+            .bytes()
+            .await
+            .map_err(|err| RemoteErr::http_transport("multipart_start_body", err))?;
+        let upload: HttpMultipartStartResponse =
+            serde_json::from_slice(&response_bytes).map_err(|err| RemoteErr::HttpStatus {
+                status: 502,
+                path: path.to_string(),
+                message: format!("invalid multipart-start response: {err}"),
+            })?;
+        validate_multipart_start(&upload, content_length, part_bytes, path)?;
+        Ok(upload)
+    }
+
     async fn put_multipart_part(
         &self,
         path: &str,
@@ -3103,6 +3192,9 @@ impl HttpRemote {
     ) -> Result<()> {
         let mut last_error = None;
         for attempt in 0..MULTIPART_PART_ATTEMPTS {
+            if attempt > 0 {
+                crate::repo::invalidate_transfer_plan(TransferDirection::Upload);
+            }
             let request_chunks = chunks.to_vec();
             let body = tracked_upload_body(request_chunks, content_length as u64);
             let response = self
@@ -3163,6 +3255,7 @@ impl HttpRemote {
         {
             return Ok(HttpReceivePackResult::RetryIndividually);
         }
+        crate::repo::plan_remaining_transfer(TransferDirection::Upload, content_length as u64);
         let body = tracked_upload_body(
             vec![pack.pack.clone(), pack.index.clone()],
             content_length as u64,
@@ -3267,6 +3360,7 @@ impl HttpRemote {
             )
             .chain([pack.pack.clone(), pack.index.clone()])
             .collect::<Vec<_>>();
+        crate::repo::plan_remaining_transfer(TransferDirection::Upload, content_length as u64);
         let body = tracked_upload_body(chunks, content_length as u64);
         let response = self
             .send(
@@ -3478,31 +3572,6 @@ fn tracked_upload_body(chunks: Vec<Bytes>, total_bytes: u64) -> reqwest::Body {
         }
         Ok::<Bytes, std::io::Error>(bytes)
     })))
-}
-
-fn planned_bundle_upload_bytes(
-    objects: &[RemoteBundleObject],
-    pack: Option<&RemoteObjectPack>,
-    path: &str,
-) -> Result<u64> {
-    let mut total = 0_u64;
-    for bytes in objects.iter().map(|object| object.content_length).chain(
-        pack.into_iter()
-            .flat_map(|pack| [pack.pack.len(), pack.index.len()]),
-    ) {
-        total = total
-            .checked_add(u64::try_from(bytes).map_err(|_| RemoteErr::HttpStatus {
-                status: 413,
-                path: path.to_string(),
-                message: "planned upload length exceeds u64".to_string(),
-            })?)
-            .ok_or_else(|| RemoteErr::HttpStatus {
-                status: 413,
-                path: path.to_string(),
-                message: "planned upload length exceeds u64".to_string(),
-            })?;
-    }
-    Ok(total)
 }
 
 async fn tracked_response_bytes(
@@ -5849,11 +5918,37 @@ mod tests {
         let mut remote = HttpRemote::new(url, None).unwrap();
         remote.multipart_discovery_threshold = 64 * 1024;
         let payload = Bytes::from(vec![7_u8; 70 * 1024]);
-
+        let progress = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = progress.clone();
+        let reporter = crate::repo::TransferProgressReporter::new(move |event| {
+            sink.lock().unwrap().push(event)
+        });
+        let _progress_scope = crate::repo::TransferProgressScope::enter(&reporter);
+        let objects =
+            [RemoteBundleObject::new("segments/large".into(), [payload.clone()], true).unwrap()];
+        let plan = remote
+            .plan_individual_uploads(&objects, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            progress.lock().unwrap().last().unwrap().total_bytes,
+            Some(38 * 1024)
+        );
         remote
             .put_raw_if_not_exists_stream("segments/large", [payload.clone()])
             .await
             .unwrap();
+        drop(plan);
+        drop(_progress_scope);
+        {
+            let events = progress.lock().unwrap();
+            let final_event = events.last().unwrap();
+            assert_eq!(final_event.transferred_bytes, 38 * 1024);
+            assert_eq!(final_event.total_bytes, Some(38 * 1024));
+            assert!(final_event.total_is_final);
+        }
+        assert!(remote.upload_plan.lock().is_none());
 
         let requests = requests.await.unwrap();
         assert_eq!(requests.len(), 5);

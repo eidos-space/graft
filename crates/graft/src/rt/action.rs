@@ -12,7 +12,8 @@ macro_rules! action {
 action!(fetch_segment, FetchSegment);
 action!(fetch_log, FetchLog);
 action!(fetch_snapshot, FetchSnapshot);
-action!(hydrate_snapshot, HydrateSnapshot);
+action!(hydrate_snapshot, HydrateSnapshot, PreparedSnapshotDownload);
+pub(crate) use hydrate_snapshot::coalesce_ranges;
 action!(remote_commit, RemoteCommit);
 action!(snapshot_push, PreparedSnapshotPush);
 pub(crate) use snapshot_push::prepare_snapshots;
