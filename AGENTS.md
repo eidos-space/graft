@@ -121,6 +121,7 @@ synchronized. Do not edit generated `.node` binaries directly.
 pnpm check:remote
 pnpm test:remote
 pnpm build:remote
+npm ci --prefix services/graft-remote-docker --ignore-scripts
 pnpm test:docker
 pnpm test:docker:container # Docker + built E2EE-capable Node SDK
 ```

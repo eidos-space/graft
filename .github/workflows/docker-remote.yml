@@ -42,7 +42,7 @@ jobs:
             target: aarch64-unknown-linux-gnu
             native: linux-arm64-gnu
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
@@ -55,6 +55,7 @@ jobs:
           node-version: 24
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - run: npm ci --prefix services/graft-remote-docker --ignore-scripts
       - run: pnpm test:docker
       - if: ${{ !inputs.public_sdk }}
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
@@ -81,14 +82,15 @@ jobs:
           test "$(node -p "require('./packages/graft-remote/package.json').version")" = "$remote"
           test "$(npm view "@eidos.space/graft-remote@$remote" version)" = "$remote"
           npm install --prefix /tmp/graft-public-sdk --ignore-scripts "@eidos.space/graft@$sdk"
-          export GRAFT_CANDIDATE_SDK_PATH=/tmp/graft-public-sdk/node_modules/@eidos.space/graft
-          export GRAFT_CANDIDATE_NATIVE_PATH="$(find "/tmp/graft-public-sdk/node_modules/@eidos.space/graft-$NATIVE" -name '*.node' -print -quit)"
-          test -f "$GRAFT_CANDIDATE_NATIVE_PATH"
-          export GRAFT_TEST_SKIP_SDK=1 GRAFT_SDK_RELEASED=1 GRAFT_LARGE_PAYLOAD_MIB=80
-          export GRAFT_CANDIDATE_SCENARIOS=lost-multipart-complete,interrupt-multipart-part,none
-          node services/graft-remote-docker/test/container.mjs 2>&1 | tee public-sdk-proof.log
+          export GRAFT_PUBLIC_SDK_ROOT=/tmp/graft-public-sdk/node_modules/@eidos.space/graft
+          export GRAFT_PUBLIC_NATIVE_NAME="$NATIVE"
+          export GRAFT_TEST_IMAGE=graft-public-proof:local
+          export GRAFT_S3_TEST_IMAGE=graft-s3-fixture:local
+          docker build -t "$GRAFT_S3_TEST_IMAGE" -f services/graft-remote-docker/test/Minio.Dockerfile .
+          docker build --label "org.opencontainers.image.revision=$GITHUB_SHA" -t "$GRAFT_TEST_IMAGE" -f services/graft-remote-docker/Dockerfile .
+          bash services/graft-remote-docker/test/public-sdk.sh
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: ${{ always() && inputs.public_sdk }}
         with:
           name: public-sdk-proof-${{ matrix.native }}
-          path: public-sdk-proof.log
+          path: public-sdk-*.log

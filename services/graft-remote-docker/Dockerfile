@@ -1,6 +1,9 @@
 # Build from the repository root. Pin this base to a reviewed digest for deployment.
+
 FROM node:24-bookworm-slim@sha256:c86ecead9e55a5210ac1727de38a4ca840bf03dcaf34dc9749addbf383b1920c AS build
 WORKDIR /app
+COPY services/graft-remote-docker/package*.json services/graft-remote-docker/
+RUN npm ci --prefix services/graft-remote-docker --omit=dev --ignore-scripts
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY packages/graft-remote/ packages/graft-remote/
 COPY services/graft-remote-docker/REMOTE_VERSION services/graft-remote-docker/REMOTE_SHA256 /tmp/
@@ -25,6 +28,8 @@ COPY --from=build /app/packages/graft-remote/package.json packages/graft-remote/
 COPY packages/graft-remote/LICENSE packages/graft-remote/LICENSE
 COPY LICENSE-APACHE LICENSE-MIT /usr/share/licenses/graft/
 COPY services/graft-remote-docker/*.mjs services/graft-remote-docker/
+COPY --from=build /app/services/graft-remote-docker/node_modules/ services/graft-remote-docker/node_modules/
+COPY services/graft-remote-docker/package.json services/graft-remote-docker/package.json
 RUN mkdir /data && chown node:node /data
 USER node
 EXPOSE 8787

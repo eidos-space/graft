@@ -4,6 +4,7 @@ import { pipeline } from "node:stream/promises";
 import { mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { createApp, problem, validateOrigin, validateToken } from "./app.mjs";
+import { S3Blobs, s3Configuration } from "./s3.mjs";
 import { Storage, MAX_BYTES } from "./storage.mjs";
 
 process.umask(0o077);
@@ -14,7 +15,17 @@ const token = validateToken(
 );
 const directory = process.env.GRAFT_DATA_DIR ?? "/data";
 mkdirSync(directory, { recursive: true, mode: 0o700 });
-const storage = new Storage(join(directory, "graft.sqlite"));
+const s3Config = s3Configuration();
+const blobStore = s3Config ? new S3Blobs(s3Config) : undefined;
+if (blobStore) {
+  try {
+    await blobStore.health();
+  } catch {
+    blobStore.close();
+    throw new Error("S3 storage connection failed; check bucket, endpoint and credential files");
+  }
+}
+const storage = new Storage(join(directory, "graft.sqlite"), { blobStore });
 const app = createApp({ storage, origin, token });
 let active = 0;
 let closing = false;

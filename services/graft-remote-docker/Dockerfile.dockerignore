@@ -16,3 +16,6 @@ packages/graft-remote/dist
 
 !services/graft-remote-docker/REMOTE_VERSION
 !services/graft-remote-docker/REMOTE_SHA256
+
+!services/graft-remote-docker/package.json
+!services/graft-remote-docker/package-lock.json

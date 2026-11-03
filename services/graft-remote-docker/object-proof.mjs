@@ -25,7 +25,9 @@ export async function encryptedObjectProof(storage, repository, path, prefix, re
     if (row.file) {
       // Published files are immutable. Open once; the admission lease prevents
       // deletion for the entire read. A renamed/unlinked path cannot switch this fd.
-      const stream = createReadStream(join(storage.blobDirectory, row.file), { signal });
+      const stream = storage.blobStore
+        ? (await storage.blobStore.get(row.file, undefined, signal, row.size)).body
+        : createReadStream(join(storage.blobDirectory, row.file), { signal });
       for await (const chunk of stream) {
         hash.update(chunk);
         size += chunk.length;

@@ -18,7 +18,7 @@ const invalid = () =>
   );
 
 /** Parts are durable SQLite rows; complete streams one part at a time to disk. */
-export function multipartBackend(storage, repository) {
+export function multipartBackend(storage, repository, signal) {
   const db = storage.db;
   const name = repository.name;
   const active = () => storage.assertActive(name);
@@ -152,6 +152,7 @@ export function multipartBackend(storage, repository) {
         } finally {
           await directory.close();
         }
+        await storage.persistBlob(id, row.total, signal);
         active();
         lookup(path, id); // Abort/delete fences completion after async file I/O.
         db.exec("BEGIN IMMEDIATE");

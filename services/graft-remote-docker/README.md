@@ -104,7 +104,7 @@ management contract, including `namespace: "personal"`, `remote_url`,
 `{namespace, repositories}`. PATCH changes only the display label.
 
 This is a **single-instance personal server**, not a multi-tenant service. SQLite
-WAL with FULL synchronization stores the directory, identities and opaque objects
+WAL with FULL synchronization in default local mode stores the directory, identities and opaque objects
 in one database. Object publication and compare-and-swap are atomic SQL statements;
 unacknowledged requests can be retried after restart. Encrypted hint indexes are
 rebuilt by the shared engine from persisted hints. Run one container per volume,
@@ -153,7 +153,7 @@ Never overlay a backup onto an active or nonempty database directory.
 For upgrades, stop and back up first, review changes, check out the intended Graft
 revision, then run `docker compose build --pull` and
 `docker compose up -d --force-recreate --wait`. Retain the old image and backup
-until verified. Schema version 4 is checked on startup; unknown versions fail
+until verified. Schema version 4 (local) or 5 (S3) is checked on startup; unknown versions fail
 closed. A rollback that crosses a storage migration requires restoring the
 matching pre-upgrade backup. No image is automatically pulled or published by this
 repository. The Dockerfile installs the published Remote package pinned by
@@ -166,6 +166,7 @@ base image is pinned to a reviewed digest. Explicit source-candidate tests use
 From the repository root, with pnpm dependencies installed:
 
 ```sh
+npm ci --prefix services/graft-remote-docker --ignore-scripts
 pnpm test:docker
 # Requires Docker + an E2EE-capable built Node SDK at packages/graft-sdk:
 pnpm test:docker:container
@@ -251,3 +252,91 @@ SQLite file compaction. The object-proof backend reads real persisted ciphertext
 limits proofs to two concurrent reads and a 60-second deadline, and honors HTTP
 cancellation. Its new capability is advertised only once the shared Remote 0.2.6
 handler is integrated; backend-only tests do not establish native end-to-end proof.
+
+## S3-compatible storage, including Backblaze B2
+
+The default remains **local** (`GRAFT_STORAGE=local`). To use an existing S3 bucket,
+apply `compose.s3.yaml`. This mode stores immutable objects and completed large
+ciphertext in the bucket. SQLite retains repository identities, refs/config,
+object pointers, deletion state and unfinished upload parts. `/data` is still
+required: budget temporary disk for upload parts and one assembled object per
+active completion. The assembled local file is removed after upload and the temporary part rows
+are deleted. SQLite can retain allocated free pages/WAL space for reuse; the data
+volume does not necessarily shrink immediately. This is not a stateless service
+or a direct-to-bucket client upload.
+
+1. Create a dedicated bucket or exclusive prefix. For B2, create a **standard
+   application key**, limited to that bucket, with read/write/delete access.
+   Use the bucket's S3 endpoint and matching region. See the official
+   [B2 JavaScript SDK configuration](https://www.backblaze.com/docs/cloud-storage-use-the-aws-sdk-for-javascript-v3-with-backblaze-b2)
+   and [application key guide](https://www.backblaze.com/docs/cloud-storage-application-keys).
+2. Copy `.env.s3.example` (release asset: `env.s3.example`) to `.env` and replace the sample origin, endpoint, region
+   and bucket. Keep the existing Graft access key from the local setup.
+3. Save the B2 `keyID` in `secrets/s3-access-key-id` and `applicationKey` in
+   `secrets/s3-secret-access-key`. Use the same protected directory/readable-file
+   permissions as `secrets/access-key` (`secrets` 0700; mounted files 0444).
+   Credentials are supplied as secret files, never stored in SQLite or remote URLs.
+4. Start **with a fresh data volume**:
+
+   ```sh
+   docker compose -p graft-s3 -f compose.yaml -f compose.s3.yaml up --build -d --wait
+   ```
+
+For a GitHub Release deployment, download its `compose.yaml`, `compose.s3.yaml`
+and `env.s3.example` assets and verify `SHA256SUMS`. That `compose.yaml` already
+pins the released image digest; use the same command above without `--build`.
+When using the source checkout's `compose.release.yaml` template instead, set
+`GRAFT_IMAGE` to the released immutable digest. This source change is not yet
+part of a published image.
+
+Keep `-p graft-s3 -f compose.yaml -f compose.s3.yaml` on all subsequent Compose
+commands, including stop/start, backup, restore and upgrades. Omitting the project
+or overlay can select a different volume or start the wrong storage mode.
+
+| Setting | Purpose |
+| --- | --- |
+| `GRAFT_STORAGE` | `local` (default) or `s3` |
+| `GRAFT_S3_ENDPOINT` | HTTPS origin; B2 example `https://s3.us-west-004.backblazeb2.com` |
+| `GRAFT_S3_REGION` | Region matching the endpoint |
+| `GRAFT_S3_BUCKET` | Existing bucket; server does not create it |
+| `GRAFT_S3_PREFIX` | Exclusive nonempty prefix ending in `/`; default `graft/` |
+| `GRAFT_S3_FORCE_PATH_STYLE` | `true` (default) or `false` |
+| `GRAFT_S3_ACCESS_KEY_ID_FILE` / `GRAFT_S3_SECRET_ACCESS_KEY_FILE` | Mounted credential files |
+| `GRAFT_S3_SESSION_TOKEN_FILE` | Optional mounted session token for temporary AWS credentials |
+
+The service uses SigV4, Get/Head/Put/DeleteObject, Create/Upload/Complete/Abort
+MultipartUpload, and HeadBucket. Grant read/write/delete (including object-version
+delete if versioning is enabled); HeadBucket requires bucket access. It does not
+need account-wide bucket listing or bucket creation permission. It verifies the
+bucket connection at startup; a provider outage never silently falls back to disk.
+HTTP endpoints are rejected unless `GRAFT_S3_ALLOW_HTTP=true`, intended only for
+isolated local test services.
+
+An uploaded random object key is published in SQLite only after S3 acknowledges
+completion. Refs remain local transactional updates. Challenge proofs stream the
+actual S3 object, not a stored upload digest. Deletion waits for admitted readers
+and removes tracked remote objects; errors leave the repository `deleting` for
+retry. Versioned objects are deleted by VersionId so owned versions are reclaimed,
+subject to bucket retention/Object Lock permissions. Do not modify this prefix
+externally or add delete markers. Configure your provider to expire abandoned S3
+multipart uploads: a process crash can leave a provider-side multipart session
+before its ID is durably recoverable by the SDK. Never expire live object keys.
+
+**Backup and restore require both `/data` and the matching bucket objects.** Stop
+writes while taking a coordinated backup. A bucket alone cannot reconstruct refs
+or repositories. Restoring only an older SQLite backup after deleting bucket data
+cannot restore those objects. Run only one server for a data directory; sharing a
+bucket does not make multiple independent SQLite databases a clustered service.
+
+The stored backend identity prevents accidentally changing mode, endpoint, region,
+bucket or prefix on an existing data directory. Automatic local-to-S3 or S3-to-S3
+migration is not implemented. Keep the original service and volume intact; create
+a fresh installation and synchronize data into it through a client if migrating.
+Changing credential files for the same backend is supported after restart.
+
+Verification: `npm ci --prefix services/graft-remote-docker --ignore-scripts`, then
+`pnpm test:docker`. An explicit isolated MinIO image can run
+`GRAFT_S3_TEST_IMAGE=<image> node --test services/graft-remote-docker/test/s3.integration.mjs`.
+The full Docker harness accepts `GRAFT_TEST_S3=1 GRAFT_S3_TEST_IMAGE=<image>` and
+creates its own bucket and random credentials; it never targets an existing user
+bucket. MinIO success is S3 compatibility evidence, **not a verified B2 deployment**.

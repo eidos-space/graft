@@ -547,3 +547,29 @@ MUST be synchronized before publishing their SQLite pointer. Process-crash tests
 are not evidence of arbitrary power-loss safety. The optional object-proof callback
 MUST hash the actual admitted persisted snapshot, not an upload-time digest;
 the shared E2EE protocol owns its challenge encoding and capability semantics.
+
+#### Optional S3-compatible blob storage
+
+The Docker profile MAY use an S3-compatible bucket for immutable object bytes.
+SQLite remains the authoritative directory, identity, mutable ref/config and
+publication index. It MUST publish a blob pointer only after the remote upload
+succeeds and rechecking the repository's active state. Interrupted or unknown
+uploads MUST NOT publish refs implicitly. Local temporary multipart data MAY be
+retained for retry and is not evidence of remote publication.
+
+The data directory MUST bind the selected backend identity (mode, endpoint,
+region, bucket and prefix); a different backend MUST be rejected rather than
+silently treating missing data as an empty repository. Credential values MUST NOT
+be persisted in that identity. This profile does not provide automatic migration
+or multi-instance coordination through a shared bucket.
+
+Object proof MUST stream the actual remote object snapshot with the validated
+challenge prefix and reject changed length. Deletion MUST retain the repository
+tombstone and pending cleanup records until owned remote objects are removed;
+remote failures MUST remain retryable. On versioned buckets the adapter MUST
+remove the owned object versions, not merely create deletion markers. Provider
+retention policies may prevent cleanup and MUST NOT be reported as successful.
+
+Backup/recovery requires both local control state and the matching bucket data.
+S3 multipart sessions orphaned by process death may require provider lifecycle
+cleanup; lifecycle rules MUST NOT expire live immutable object keys.

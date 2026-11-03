@@ -36,8 +36,12 @@ export async function proofHttp({ request, compose }) {
   bytes.writeUInt16BE(1, 10);
   bytes.writeUInt32BE(16, 68);
   assert.equal(
-    (await request(`/personal/${name}/raw-if-not-exists/${key}`, { method: "PUT", body: bytes }))
-      .status,
+    (
+      await request(`/personal/${name}/raw-if-not-exists/${key}`, {
+        method: "PUT",
+        body: bytes,
+      })
+    ).status,
     204,
   );
   const path = `/personal/${name}/e2ee/object-proof/${key}`;
@@ -75,7 +79,20 @@ export async function proofHttp({ request, compose }) {
   assert.equal((await ask(challenge, {}, path.replace(/a{64}$/, "b".repeat(64)))).status, 404);
   assert.equal((await ask(challenge, { Authorization: "Bearer wrong" })).status, 401);
   // Deliberately damage only this isolated fixture's persisted BLOB inside Docker.
-  const mutate = `import {DatabaseSync} from 'node:sqlite'; const db=new DatabaseSync('/data/graft.sqlite'); const row=db.prepare('SELECT value FROM objects WHERE repository=? AND path=?').get(process.argv[1],process.argv[2]); const bytes=Buffer.from(row.value); if(process.argv[3]==='flip')bytes[bytes.length-1]^=1; db.prepare('UPDATE objects SET value=? WHERE repository=? AND path=?').run(process.argv[3]==='truncate'?bytes.subarray(0,-1):bytes,process.argv[1],process.argv[2]); db.close();`;
+  const mutate = `
+    import {DatabaseSync} from 'node:sqlite';
+    const db=new DatabaseSync('/data/graft.sqlite');
+    const row=db.prepare('SELECT value,file FROM objects WHERE repository=? AND path=?').get(process.argv[1],process.argv[2]);
+    let store, bytes;
+    if(process.env.GRAFT_STORAGE==='s3') {
+      const {S3Blobs,s3Configuration}=await import('./services/graft-remote-docker/s3.mjs');
+      store=new S3Blobs(s3Configuration()); bytes=Buffer.from(await new Response((await store.get(row.file)).body).arrayBuffer());
+    } else bytes=Buffer.from(row.value);
+    if(process.argv[3]==='flip')bytes[bytes.length-1]^=1;
+    if(process.argv[3]==='truncate')bytes=bytes.subarray(0,-1);
+    if(store) { await store.put(row.file,bytes,bytes.length);store.close(); }
+    else db.prepare('UPDATE objects SET value=? WHERE repository=? AND path=?').run(bytes,process.argv[1],process.argv[2]);
+    db.close();`;
   compose("exec", "-T", "graft", "node", "--input-type=module", "-e", mutate, name, key, "flip");
   assert.notEqual(
     (await (await ask()).json()).sha256,

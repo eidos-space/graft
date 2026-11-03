@@ -276,3 +276,14 @@ Historical a988df00 baseline CI: both native Docker jobs, docs and performance
 passed; Windows transfer-progress cancellation test failed. Its failure log is
 `/tmp/graft-docker-windows-ci.log`; new main contains the reviewed SDK/test changes
 and the merged final head requires fresh CI rather than dismissing that failure.
+
+
+## S3 inclusion in Docker 0.1.0
+
+The user expanded this release to include optional S3-compatible storage, including
+B2 configuration, while preserving default local storage. See `S3-VALIDATION.md`
+for implementation, real isolated S3 evidence and remaining public-package/B2 gates.
+Release assets now include `compose.s3.yaml` and `env.s3.example`. The publisher
+runs the full public-SDK fault matrix in both modes on native Linux AMD64/ARM64
+before pushing each architecture image. Real B2 testing requires a dedicated
+nonproduction bucket/prefix and credentials; no existing bucket has been used.

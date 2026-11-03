@@ -2,6 +2,7 @@
 
 ## 0.1.0 (unreleased)
 
+- Optional S3-compatible/B2 bucket storage with secret-file credentials; local disk mode remains the default.
 - Personal self-hosted Remote v1 and encrypted sync, with Eidos Lite discovery and management.
 - Secret-file authentication, non-root Compose deployment, persisted SQLite identities and refs.
 - Durable multipart uploads with streamed ciphertext verification and file publication.
@@ -10,6 +11,7 @@
 
 ## 0.1.0（未发布）
 
+- 可选 S3 兼容/B2 bucket 存储与秘密文件凭证，本地磁盘仍为默认模式。
 - 个人自托管 Remote v1 和加密同步，包含 Lite 服务发现与仓库管理。
 - 秘密文件认证、非 root Compose 部署、SQLite 持久身份及引用。
 - 持久分片上传、流式密文校验与文件发布。

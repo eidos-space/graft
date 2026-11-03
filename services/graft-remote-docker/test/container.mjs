@@ -48,7 +48,10 @@ if (process.env.GRAFT_REMOTE_SOURCE) {
   const servicePath = join(sourceContext, "services/graft-remote-docker");
   mkdirSync(servicePath, { recursive: true });
   for (const file of readdirSync("services/graft-remote-docker").filter(
-    (file) => file.endsWith(".mjs") || file.startsWith("Dockerfile") || ["REMOTE_VERSION", "REMOTE_SHA256"].includes(file),
+    (file) =>
+      file.endsWith(".mjs") ||
+      file.startsWith("Dockerfile") ||
+      ["REMOTE_VERSION", "REMOTE_SHA256", "package.json", "package-lock.json"].includes(file),
   ))
     cpSync(join("services/graft-remote-docker", file), join(servicePath, file));
   console.log(
@@ -59,17 +62,33 @@ if (process.env.GRAFT_REMOTE_SOURCE) {
   );
 }
 
+const s3Fixture =
+  process.env.GRAFT_TEST_S3 === "1"
+    ? await (await import("./s3-fixture.mjs")).startS3Fixture(directory, project)
+    : undefined;
 writeFileSync(
   join(directory, "override.json"),
   JSON.stringify({
     services: {
       graft: {
+        ...s3Fixture?.service,
         image: process.env.GRAFT_TEST_IMAGE ?? `${project}:local`,
-        ...(sourceContext ? { build: { context: sourceContext, args: { GRAFT_REMOTE_BUILD: "source" } } } : {}),
+        ...(sourceContext
+          ? {
+              build: {
+                context: sourceContext,
+                args: { GRAFT_REMOTE_BUILD: "source" },
+              },
+            }
+          : {}),
         healthcheck: { interval: "1s", start_period: "1s" },
       },
     },
-    secrets: { graft_access_key: { file: join(directory, "key") } },
+    ...(s3Fixture ? { networks: s3Fixture.networks } : {}),
+    secrets: {
+      graft_access_key: { file: join(directory, "key") },
+      ...s3Fixture?.secrets,
+    },
   }),
 );
 const args = [
@@ -81,7 +100,11 @@ const args = [
   "-f",
   join(directory, "override.json"),
 ];
-const env = { ...process.env, GRAFT_PUBLIC_ORIGIN: origin, GRAFT_PORT: String(port) };
+const env = {
+  ...process.env,
+  GRAFT_PUBLIC_ORIGIN: origin,
+  GRAFT_PORT: String(port),
+};
 const compose = (...command) =>
   execFileSync("docker", [...args, ...command], {
     env,
@@ -101,7 +124,11 @@ async function ready() {
   }
   try {
     const id = compose("ps", "-a", "-q", "graft");
-    console.error(execFileSync("docker", ["inspect", "--format", "{{json .State}}", id], { encoding: "utf8" }));
+    console.error(
+      execFileSync("docker", ["inspect", "--format", "{{json .State}}", id], {
+        encoding: "utf8",
+      }),
+    );
   } catch {}
   throw new Error("Container failed to become ready");
 }
@@ -248,26 +275,62 @@ try {
         const db=new DatabaseSync('/data/graft.sqlite',{readOnly:true});
         const row=db.prepare('SELECT file,size FROM objects WHERE repository=? AND path=?').get(process.argv[1],process.argv[2]);
         if(!row?.file || row.size<=256) throw Error('Expected persisted multipart ciphertext');
-        const fd=fs.openSync('/data/blobs/'+row.file,'r+');
-        const b=Buffer.alloc(1); fs.readSync(fd,b,0,1,256); b[0]^=255;
-        fs.writeSync(fd,b,0,1,256); fs.fsyncSync(fd);
-        if(fs.fstatSync(fd).size!==row.size) throw Error('Length changed');
-        fs.closeSync(fd); db.close();
+        if(process.env.GRAFT_STORAGE==='s3') {
+          const {S3Blobs,s3Configuration}=await import('./services/graft-remote-docker/s3.mjs');
+          const store=new S3Blobs(s3Configuration());
+          try {
+            const bytes=Buffer.from(await new Response((await store.get(row.file)).body).arrayBuffer());
+            if(bytes.length!==row.size) throw Error('Length changed before corruption');
+            bytes[256]^=255;
+            await store.put(row.file,bytes,bytes.length);
+          } finally { store.close(); }
+        } else {
+          const fd=fs.openSync('/data/blobs/'+row.file,'r+');
+          const b=Buffer.alloc(1); fs.readSync(fd,b,0,1,256); b[0]^=255;
+          fs.writeSync(fd,b,0,1,256); fs.fsyncSync(fd);
+          if(fs.fstatSync(fd).size!==row.size) throw Error('Length changed');
+          fs.closeSync(fd);
+        }
+        db.close();
         console.log(JSON.stringify({size:row.size,offset:256}));`;
-      return JSON.parse(compose("exec", "-T", "graft", "node", "--input-type=module", "-e", script, repository, path));
+      return JSON.parse(
+        compose(
+          "exec",
+          "-T",
+          "graft",
+          "node",
+          "--input-type=module",
+          "-e",
+          script,
+          repository,
+          path,
+        ),
+      );
     };
-    await candidateRoundTrips({ origin, token, request, restart, corruptCiphertext });
+    await candidateRoundTrips({
+      origin,
+      token,
+      request,
+      restart,
+      corruptCiphertext,
+    });
   }
   if (process.env.GRAFT_LITE_CLIENT_PATH) {
     const output = execFileSync("bun", ["services/graft-remote-docker/test/lite-client.mjs"], {
-      input: JSON.stringify({ origin, token, clientPath: process.env.GRAFT_LITE_CLIENT_PATH }),
+      input: JSON.stringify({
+        origin,
+        token,
+        clientPath: process.env.GRAFT_LITE_CLIENT_PATH,
+      }),
       timeout: 30_000,
       encoding: "utf8",
     });
     console.log(output.trim());
   }
   await proofHttp({ request, compose });
-  const removal = await request("/api/graft/repositories/plain", { method: "DELETE" });
+  const removal = await request("/api/graft/repositories/plain", {
+    method: "DELETE",
+  });
   assert.equal(removal.status, 202);
   await restart();
   let removed = false;
@@ -292,10 +355,13 @@ try {
   try {
     compose("down", "--volumes", "--remove-orphans");
   } finally {
+    s3Fixture?.close();
     rmSync(directory, { recursive: true });
     try {
       if (!process.env.GRAFT_TEST_IMAGE)
-        execFileSync("docker", ["image", "rm", `${project}:local`], { stdio: "ignore" });
+        execFileSync("docker", ["image", "rm", `${project}:local`], {
+          stdio: "ignore",
+        });
     } catch {}
   }
 }

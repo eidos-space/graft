@@ -94,7 +94,7 @@ PATCH 仅接受 `display_name`。技术名称为 1–64 个 ASCII 字母、数�
 `remote_url`、毫秒时间戳 `created_at` 和加密描述符；列表为
 `{namespace, repositories}`。PATCH 只修改显示标签。
 
-这是**单实例个人服务器**，不是多租户服务。SQLite WAL 和 FULL 同步模式将
+这是**单实例个人服务器**，不是多租户服务。默认本地模式下，SQLite WAL 和 FULL 同步模式将
 目录、身份及不透明同步对象存入同一数据库；对象发布和比较交换由原子 SQL
 完成。重启后可重试未确认请求，加密路由索引由共享引擎从持久提示对象重建。
 每个卷只运行一个实例，使用本地磁盘而非 NFS，并监控剩余空间。
@@ -137,7 +137,7 @@ docker compose up -d --wait
 
 升级前停止并备份，审查变更，检出指定 Graft 版本，执行
 `docker compose build --pull` 和 `docker compose up -d --force-recreate --wait`。
-验证前保留旧镜像和备份。启动会检查存储版本 4，遇到未知版本拒绝运行。
+验证前保留旧镜像和备份。启动会检查存储版本 4（本地）或 5（S3），遇到未知版本拒绝运行。
 跨存储迁移的回滚需要恢复匹配的升级前备份。仓库不自动拉取或发布服务镜像，
 Dockerfile 默认安装 `REMOTE_VERSION` 固定的正式 npm Remote 包，并按
 `REMOTE_SHA256` 校验归档。Node 基础镜像已固定到审核过的 digest。
@@ -148,6 +148,7 @@ Dockerfile 默认安装 `REMOTE_VERSION` 固定的正式 npm Remote 包，并按
 在仓库根目录安装 pnpm 依赖后执行：
 
 ```sh
+npm ci --prefix services/graft-remote-docker --ignore-scripts
 pnpm test:docker
 # 需要 Docker，以及 packages/graft-sdk 中已构建且支持 E2EE 的 SDK：
 pnpm test:docker:container
@@ -225,3 +226,74 @@ GRAFT_LARGE_PAYLOAD_MIB=80 pnpm test:docker:container
 SQLite WAL的临时磁盘空间。删除是逻辑移除，不承诺取证级擦除或自动压缩数据库。
 对象校验后端读取真实持久密文，最多两次并发、60秒截止，响应HTTP取消；须接入
 共享Remote 0.2.6 handler后才声明新能力。后端单测不等于原生端到端校验通过。
+
+## S3 兼容存储与 Backblaze B2
+
+默认仍为本地磁盘（`GRAFT_STORAGE=local`）。叠加 `compose.s3.yaml` 可连接已有
+bucket：不可变对象及完成上传的大文件密文存入 S3，SQLite 保留仓库身份、引用、
+配置、对象指针、删除状态和未完成的上传分片。因此仍必须持久化 `/data`，并为
+上传分片和每个并行完成操作的完整组装文件预留临时磁盘。S3 上传成功后会删除
+本地组装文件并清理分片记录；SQLite 可能保留已分配的空闲页或 WAL 空间供复用，
+数据卷不一定立即缩小。这不是无状态服务，也不是客户端直传 bucket。
+
+1. 创建专用 bucket 或独占前缀。B2 使用限制到该 bucket、具备读写删除权限的
+   **标准 application key**，并从 bucket 详情复制 S3 endpoint 和对应 region。
+   参见 [B2 官方 SDK 配置](https://www.backblaze.com/docs/cloud-storage-use-the-aws-sdk-for-javascript-v3-with-backblaze-b2)
+   和 [应用密钥说明](https://www.backblaze.com/docs/cloud-storage-application-keys)。
+2. 将 `.env.s3.example`（Release 资产名为 `env.s3.example`）复制为 `.env`，替换服务地址、endpoint、region、bucket。
+   保留本地模式部署步骤中创建的 Graft 访问密钥。
+3. 把 B2 `keyID` 写入 `secrets/s3-access-key-id`，`applicationKey` 写入
+   `secrets/s3-secret-access-key`。沿用访问密钥的权限：`secrets` 目录 0700，
+   挂载文件 0444。凭证通过秘密文件传入，不写入 SQLite、远端 URL 或结果。
+4. 使用**新的数据卷**启动：
+
+   ```sh
+   docker compose -p graft-s3 -f compose.yaml -f compose.s3.yaml up --build -d --wait
+   ```
+
+使用 GitHub Release 时，下载其 `compose.yaml`、`compose.s3.yaml` 和
+`env.s3.example`，并核对 `SHA256SUMS`。该 `compose.yaml` 已固定镜像 digest，
+使用上面的命令时去掉 `--build` 即可。若使用源码中的 `compose.release.yaml`
+模板，则需设置固定 digest 的 `GRAFT_IMAGE`。本次源码变更尚未发布为镜像。
+
+后续停止、启动、备份、恢复和升级等所有 Compose 命令，都保留
+`-p graft-s3 -f compose.yaml -f compose.s3.yaml`。遗漏项目名或叠加配置可能选中
+其他数据卷或以错误的存储模式启动。
+
+| 配置 | 用途 |
+| --- | --- |
+| `GRAFT_STORAGE` | `local`（默认）或 `s3` |
+| `GRAFT_S3_ENDPOINT` | HTTPS origin，例如 `https://s3.us-west-004.backblazeb2.com` |
+| `GRAFT_S3_REGION` | 与 endpoint 匹配的区域 |
+| `GRAFT_S3_BUCKET` | 已有 bucket；服务不会创建 bucket |
+| `GRAFT_S3_PREFIX` | 非空独占前缀，以 `/` 结尾，默认 `graft/` |
+| `GRAFT_S3_FORCE_PATH_STYLE` | `true`（默认）或 `false` |
+| `GRAFT_S3_ACCESS_KEY_ID_FILE` / `GRAFT_S3_SECRET_ACCESS_KEY_FILE` | 挂载的凭证文件 |
+| `GRAFT_S3_SESSION_TOKEN_FILE` | 可选的 AWS 临时会话 token 文件 |
+
+使用 SigV4、Get/Head/Put/DeleteObject、Create/Upload/Complete/AbortMultipartUpload
+及 HeadBucket。需要对象读写删除权限；开启版本管理时还需删除对象版本权限，
+HeadBucket 需要 bucket 访问权限。不需要列出账户全部 bucket 或创建 bucket 的权限。
+启动时检查连接；远端故障不会静默回退本地。HTTP endpoint 默认拒绝，只有明确设置
+`GRAFT_S3_ALLOW_HTTP=true` 才允许，供隔离本地测试服务使用。
+
+S3 确认对象上传完成后才在 SQLite 发布指针，引用通过本地事务更新。proof 流式读取
+实际 S3 对象，不使用上传时缓存的摘要。删除等待已准入读者结束，再清理登记的远端
+对象；失败保持 `deleting` 并重试。版本化对象按 VersionId 删除，仍受 retention/
+Object Lock 权限约束。不要从外部改写此前缀或添加删除标记。请在提供商端配置清理
+未完成 S3 multipart 的规则：进程崩溃可能留下 SDK 尚无法恢复 ID 的远端上传会话。
+不要给仍在使用的对象配置自动过期。
+
+**备份必须同时包含 `/data` 和对应 bucket 对象**，并在停止写入后协调获取。
+仅有 bucket 不能重建仓库引用；删除对象后仅恢复旧 SQLite 也不能恢复这些数据。
+一个数据目录只能运行一个服务，共享 bucket 不代表支持多实例集群。
+
+数据目录会绑定模式、endpoint、region、bucket 和 prefix，防止修改配置后悄悄读错
+存储。尚未实现已有本地数据自动迁移到 S3 或跨 bucket 迁移；迁移时保留原服务与卷，
+建立新实例，再通过客户端同步数据。同一后端可以替换凭证文件并重启。
+
+验证先执行 `npm ci --prefix services/graft-remote-docker --ignore-scripts`，再运行
+`pnpm test:docker`。指定隔离 MinIO 镜像后可运行
+`GRAFT_S3_TEST_IMAGE=<image> node --test services/graft-remote-docker/test/s3.integration.mjs`。
+完整容器脚本支持 `GRAFT_TEST_S3=1 GRAFT_S3_TEST_IMAGE=<image>`，只创建自己的 bucket
+和随机测试凭证，不使用已有用户 bucket。MinIO 验证通过不等于真实 B2 部署验证。

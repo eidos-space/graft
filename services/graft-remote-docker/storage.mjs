@@ -29,7 +29,8 @@ export async function readBytes(body, maximum = MAX_BYTES) {
 
 /** One local SQLite database owns directory, identities and object publication. */
 export class Storage {
-  constructor(filename) {
+  constructor(filename, { blobStore } = {}) {
+    this.blobStore = blobStore;
     this.active = new Map();
     this.proofsActive = 0;
     this.completing = new Set();
@@ -43,9 +44,13 @@ export class Storage {
     }
     this.db = new DatabaseSync(filename);
     const version = this.db.prepare("PRAGMA user_version").get().user_version;
-    if (![0, 1, 2, 3, 4].includes(version)) {
+    if (![0, 1, 2, 3, 4, 5].includes(version)) {
       this.db.close();
       throw new Error("Unsupported storage version");
+    }
+    if (version === 5 && !blobStore) {
+      this.db.close();
+      throw new Error("Storage backend differs: this data directory requires S3 mode");
     }
     this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
       PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;`);
@@ -82,6 +87,34 @@ export class Storage {
       );
       this.db.prepare("UPDATE uploads SET updated=? WHERE updated=0").run(Date.now());
     }
+    this.db.exec(
+      "CREATE TABLE IF NOT EXISTS storage_settings(key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+    );
+    const identity = blobStore?.identity ?? "local";
+    const stored = this.db.prepare("SELECT value FROM storage_settings WHERE key='backend'").get();
+    if (
+      (stored && stored.value !== identity) ||
+      (!stored &&
+        blobStore &&
+        this.db.prepare("SELECT 1 FROM objects UNION ALL SELECT 1 FROM uploads LIMIT 1").get())
+    ) {
+      this.db.close();
+      throw new Error(
+        "Storage backend differs from this data directory; automatic migration is not supported",
+      );
+    }
+    this.db
+      .prepare("INSERT OR IGNORE INTO storage_settings(key,value) VALUES('backend',?)")
+      .run(identity);
+    if (
+      this.db.prepare("SELECT value FROM storage_settings WHERE key='backend'").get().value !==
+      identity
+    ) {
+      this.db.close();
+      throw new Error("Storage backend was changed by another process");
+    }
+    // Older local-only binaries reject version 5 instead of reading S3 keys as local files.
+    if (blobStore) this.db.exec("PRAGMA user_version=5");
     this.cleaning = false;
     this.cleanupTimer = setInterval(async () => {
       if (this.cleaning || this.closed) return;
@@ -105,8 +138,10 @@ export class Storage {
             this.db.prepare("DELETE FROM uploads WHERE id=?").run(row.id);
         }
         const garbage = this.db
-          .prepare(`SELECT file FROM blob_files WHERE file NOT IN
-        (SELECT file FROM objects WHERE file IS NOT NULL) AND file NOT IN (SELECT id FROM uploads) LIMIT 16`)
+          .prepare(
+            `SELECT file FROM blob_files WHERE file NOT IN
+        (SELECT file FROM objects WHERE file IS NOT NULL) AND file NOT IN (SELECT id FROM uploads) LIMIT 16`,
+          )
           .all();
         for (const row of garbage) {
           try {
@@ -124,6 +159,7 @@ export class Storage {
     this.closed = true;
     clearInterval(this.cleanupTimer);
     this.db.close();
+    this.blobStore?.close();
   }
   health() {
     this.db.prepare("SELECT 1 FROM repositories LIMIT 1").get();
@@ -228,6 +264,7 @@ export class Storage {
       this.db.prepare("SELECT 1 FROM uploads WHERE id=?").get(file)
     )
       return;
+    if (this.blobStore) await this.blobStore.delete(file);
     try {
       await unlink(join(this.blobDirectory, file));
     } catch (error) {
@@ -242,7 +279,19 @@ export class Storage {
     if (!this.closed) this.db.prepare("DELETE FROM blob_files WHERE file=?").run(file);
   }
 
+  async persistBlob(file, size, signal) {
+    if (!this.blobStore) return;
+    await this.blobStore.upload(
+      file,
+      createReadStream(join(this.blobDirectory, file)),
+      size,
+      signal,
+    );
+    await unlink(join(this.blobDirectory, file));
+  }
+
   backend(row, { signal } = {}) {
+    const storage = this;
     const db = this.db;
     const storageDirectory = this.blobDirectory;
     const name = row.name;
@@ -255,7 +304,7 @@ export class Storage {
             encryptedObjectProof: (path, prefix) =>
               encryptedObjectProof(this, row.name, path, prefix, signal),
           }),
-      multipart: multipartBackend(this, row),
+      multipart: multipartBackend(this, row, signal),
       head(path) {
         const found = db
           .prepare(
@@ -269,6 +318,8 @@ export class Storage {
           .prepare("SELECT value,file,size FROM objects WHERE repository=? AND path=?")
           .get(name, path);
         if (!found) return null;
+        if (found.file && storage.blobStore)
+          return storage.blobStore.get(found.file, range, signal, found.size);
         if (found.file) {
           const stream = createReadStream(
             join(storageDirectory, found.file),
@@ -292,6 +343,31 @@ export class Storage {
       async putIfAbsent(path, body) {
         const value = await readBytes(body);
         active();
+        const control =
+          path === "HEAD" ||
+          path.startsWith("refs/") ||
+          path === "e2ee/config" ||
+          /^e2ee\/(refs|head)\//.test(path);
+        if (storage.blobStore && !control) {
+          if (db.prepare("SELECT 1 FROM objects WHERE repository=? AND path=?").get(name, path))
+            return false;
+          const id = randomUUID();
+          db.prepare("INSERT INTO blob_files(file,repository) VALUES(?,?)").run(id, name);
+          storage.completing.add(id);
+          try {
+            await storage.blobStore.put(id, value, value.length, signal);
+            active();
+            return (
+              db
+                .prepare(
+                  "INSERT OR IGNORE INTO objects(repository,path,value,file,size) VALUES(?,?,?,?,?)",
+                )
+                .run(name, path, Buffer.alloc(0), id, value.length).changes === 1
+            );
+          } finally {
+            storage.completing.delete(id);
+          }
+        }
         return (
           db
             .prepare("INSERT OR IGNORE INTO objects(repository,path,value) VALUES (?, ?, ?)")
@@ -324,11 +400,17 @@ export class Storage {
       },
       list({ prefix, after, limit }) {
         const rows = db
-          .prepare(`SELECT path, COALESCE(size,length(value)) AS size FROM objects
-          WHERE repository=? AND path>=? AND path<? AND path>? ORDER BY path LIMIT ?`)
+          .prepare(
+            `SELECT path, COALESCE(size,length(value)) AS size FROM objects
+          WHERE repository=? AND path>=? AND path<? AND path>? ORDER BY path LIMIT ?`,
+          )
           .all(name, prefix, `${prefix}\u{10ffff}`, after ?? "", limit + 1);
         const entries = rows.slice(0, limit);
-        return { paths: entries.map((row) => row.path), entries, hasMore: rows.length > limit };
+        return {
+          paths: entries.map((row) => row.path),
+          entries,
+          hasMore: rows.length > limit,
+        };
       },
     };
   }

@@ -50,7 +50,7 @@ jobs:
             runner: ubuntu-24.04-arm
             native: linux-arm64-gnu
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 35
+    timeout-minutes: 60
     permissions:
       contents: read
       packages: write
@@ -96,16 +96,21 @@ jobs:
           export GRAFT_TEST_IMAGE="$IMAGE:$VERSION-$ARCH"
           export GRAFT_SDK_PATH=/tmp/graft-public-sdk/node_modules/@eidos.space/graft
           node services/graft-remote-docker/test/container.mjs
-          export GRAFT_TEST_SKIP_SDK=1
-          export GRAFT_CANDIDATE_SDK_PATH="$GRAFT_SDK_PATH"
-          export GRAFT_CANDIDATE_NATIVE_PATH="$(find "/tmp/graft-public-sdk/node_modules/@eidos.space/graft-$NATIVE" -name '*.node' -print -quit)"
-          export GRAFT_SDK_RELEASED=1
-          export GRAFT_LARGE_PAYLOAD_MIB=80
-          node services/graft-remote-docker/test/container.mjs
+          npm ci --prefix services/graft-remote-docker --omit=dev --ignore-scripts
+          export GRAFT_PUBLIC_SDK_ROOT="$GRAFT_SDK_PATH"
+          export GRAFT_PUBLIC_NATIVE_NAME="$NATIVE"
+          export GRAFT_S3_TEST_IMAGE=graft-s3-fixture:local
+          docker build -t "$GRAFT_S3_TEST_IMAGE" -f services/graft-remote-docker/test/Minio.Dockerfile .
+          bash services/graft-remote-docker/test/public-sdk.sh
           docker push "$GRAFT_TEST_IMAGE"
           docker image inspect "$GRAFT_TEST_IMAGE" --format '{{index .RepoDigests 0}}' > "image-$ARCH.txt"
           # GHCR must be public, not merely accessible with this publisher's token.
           docker --config "$(mktemp -d)" pull "$(cat "image-$ARCH.txt")"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: ${{ always() }}
+        with:
+          name: docker-proof-${{ matrix.arch }}
+          path: public-sdk-*.log
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: docker-${{ matrix.arch }}
@@ -156,8 +161,10 @@ jobs:
           PY
           cp services/graft-remote-docker/README.md .
           cp services/graft-remote-docker/README.zh-CN.md .
-          sha256sum compose.yaml image.json SOURCE_COMMIT README.md README.zh-CN.md > SHA256SUMS
+          cp services/graft-remote-docker/compose.s3.yaml compose.s3.yaml
+          cp services/graft-remote-docker/.env.s3.example env.s3.example
+          sha256sum compose.yaml compose.s3.yaml env.s3.example image.json SOURCE_COMMIT README.md README.zh-CN.md > SHA256SUMS
           sed -e 's/ (unreleased)//' -e 's/（未发布）//' services/graft-remote-docker/CHANGELOG.md > release-notes.md
           gh release create "$GITHUB_REF_NAME" --verify-tag --title "Graft Docker $VERSION" \
             --notes-file release-notes.md \
-            compose.yaml image.json SOURCE_COMMIT SHA256SUMS README.md README.zh-CN.md
+            compose.yaml compose.s3.yaml env.s3.example image.json SOURCE_COMMIT SHA256SUMS README.md README.zh-CN.md
