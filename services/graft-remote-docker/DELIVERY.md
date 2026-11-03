@@ -115,3 +115,22 @@ GRAFT_LARGE_PAYLOAD_MIB=80 pnpm test:docker:container
 Keep each observed result. These are correctness scenarios, not repeated
 performance samples. Final report must distinguish source/native/packaged/public
 artifacts and process-crash evidence from actual power-loss durability.
+
+## Final native candidate: environment failure retained
+
+Source `1b2037e213240bd161517656e7d0921a7117c0e8`, native SHA-256
+`fd3b996965f3263775988c3a47b4280caac4643d0a13237a5fe5313f0e042590`.
+The 80 MiB attachment run reached explicit full restore after default publication,
+restart and independent clone, then failed with host ENOSPC. The separate
+80 MiB SQLite fixture failed while inserting random BLOBs because the disk was full.
+Neither complete scenario is accepted. Logs retained under the durable evidence
+directory as `graft-docker-proof-final-matrix.log` and
+`graft-docker-proof-final-large-db.log`; retry must use separate log names.
+Multipart recovery spool peak usage was not sampled; no total temporary-disk claim
+is made. Successful default initialization does not imply zero upload spool usage.
+
+PR #45 native Linux AMD64 and ARM64 container CI both passed on source
+`b4ba05f2682efa6a8db156922f6463722b94c630`, run `41614829327`. Those jobs test
+that branch's SDK/core baseline and do not replace final candidate proof acceptance.
+The documentation link-check failure came from linking to not-yet-merged main
+paths; fixed-commit links and local docs rebuild passed in follow-up `48ec43bb`.
