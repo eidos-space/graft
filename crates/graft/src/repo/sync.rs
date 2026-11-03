@@ -667,6 +667,33 @@ impl Repository {
         })
     }
 
+    /// Confirm only publication metadata, after a successful ordered push.
+    #[cfg(all(feature = "e2ee", not(target_arch = "wasm32")))]
+    pub fn confirm_initialization(
+        &self,
+        remote: &str,
+        config: &crate::e2ee::EncryptedConfig,
+        intent: &crate::e2ee::InitializationIntent,
+    ) -> Result<()> {
+        let require_source = || -> Result<()> {
+            if self.current_branch()?.as_deref() != Some(intent.branch())
+                || self.branch_target(intent.branch())?.as_deref() != Some(intent.commit())
+            {
+                return Err(crate::remote::RemoteErr::from(
+                    crate::e2ee::EncryptionError::StaleObservation,
+                )
+                .into());
+            }
+            Ok(())
+        };
+        require_source()?;
+        block_on_remote(
+            self.remote_store(remote)?
+                .confirm_initialization(config, intent),
+        )?;
+        require_source()
+    }
+
     /// Publish the exact source retained by a trusted initialization journal.
     /// A changed source fails before discovery and is rechecked after discovery.
     #[cfg(all(feature = "e2ee", not(target_arch = "wasm32")))]
@@ -703,6 +730,7 @@ impl Repository {
             || observed.branch != intent.branch()
             || observed.graft_dir != self.graft_dir
             || self.config()?.remotes.get(remote) != Some(&observed.config)
+            || self.branch_target(intent.branch())?.as_deref() != Some(intent.commit())
             || observed
                 .head
                 .as_deref()
@@ -713,13 +741,18 @@ impl Repository {
             )
             .into());
         }
+        let store = observed.store.for_initialization(intent);
+        // Header discovery can skip a remotely stored object whose multipart
+        // completion was never authenticated by this client. Resolve durable
+        // ciphertext first, even when the remote ref already names this commit.
+        block_on_remote(store.reconcile_initialization_uploads())?;
         self.push_branch_with_expected_ref_and_snapshots(
             remote,
             intent.branch(),
             intent.branch(),
             false,
             PushRemoteHead {
-                store: observed.store,
+                store,
                 head: observed.head,
                 expected: PushRefExpected::Observed(observed.observation),
                 expected_source_head: Some(intent.commit().to_owned()),

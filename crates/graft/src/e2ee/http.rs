@@ -18,6 +18,8 @@ const TRANSFER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 #[path = "http/multipart.rs"]
 mod multipart;
+#[path = "http/object_proof.rs"]
+mod object_proof;
 
 #[path = "aggregate_fetch.rs"]
 mod aggregate_fetch;
@@ -85,6 +87,7 @@ pub struct EncryptedHttpClient {
     client: reqwest::Client,
     transfer_timeout: Duration,
     verified: Arc<tokio::sync::Mutex<Option<VerifiedProfile>>>,
+    initialization_intent: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -102,6 +105,10 @@ impl fmt::Debug for EncryptedHttpClient {
 }
 
 impl EncryptedHttpClient {
+    pub(crate) fn for_initialization(mut self, intent: &super::InitializationIntent) -> Self {
+        self.initialization_intent = Some(intent.confirmation_tag());
+        self
+    }
     /// Local preflight for hosts beginning a new password-change transaction.
     /// Binding still compares under the journal lock to resolve concurrent callers.
     pub async fn ensure_no_pending_config_mutation(
@@ -678,6 +685,7 @@ impl EncryptedHttpClient {
             client,
             transfer_timeout: TRANSFER_TIMEOUT,
             verified: Arc::default(),
+            initialization_intent: None,
         })
     }
 
@@ -696,6 +704,51 @@ impl EncryptedHttpClient {
     /// First online use in each unlock epoch authenticates the current config.
     pub async fn verify(&self) -> Result<()> {
         let operation = self.operation().await?;
+        operation.check_active()?;
+        Ok(())
+    }
+
+    /// Confirm publication metadata without downloading repository objects. The
+    /// caller must first complete dependency-before-ref publication. This is not
+    /// a proof of storage durability or of a complete independent restore.
+    pub async fn confirm_initialization(
+        &self,
+        config: &EncryptedConfig,
+        intent: &super::InitializationIntent,
+    ) -> Result<()> {
+        let operation = self.session.begin_operation()?;
+        operation.authenticate_retained_config(config)?;
+        // Deliberately bypass the per-epoch descriptor/config cache: connection
+        // completion requires a new observation of the exact retained candidate.
+        let descriptor = self
+            .get(&operation, None, 256 * 1024, false)
+            .await?
+            .ok_or(EncryptedHttpError::UnsupportedProfile)?;
+        validate_descriptor(&descriptor, operation.root()?.repository())?;
+        let actual = self
+            .get(&operation, Some("e2ee/config"), 206, true)
+            .await?
+            .ok_or(EncryptedHttpError::ConfigMissing)?;
+        if actual != config.as_bytes() {
+            return Err(EncryptionError::StaleObservation.into());
+        }
+        let operation = operation
+            .observe_config_durable(EncryptedConfig::parse(&actual)?)
+            .await?;
+        let branch = format!("refs/heads/{}", intent.branch());
+        for (logical, expected) in [
+            (
+                branch.as_str(),
+                RefTarget::Commit(reference::parse_commit(intent.commit())?),
+            ),
+            ("HEAD", RefTarget::Symbolic(branch.clone())),
+        ] {
+            let key = reference::remote_key(operation.root()?, logical)?;
+            let bytes = self.get(&operation, Some(&key), 16 * 1024, true).await?;
+            if operation.observe_ref(logical, bytes.as_deref())?.target() != Some(&expected) {
+                return Err(EncryptionError::StaleObservation.into());
+            }
+        }
         operation.check_active()?;
         Ok(())
     }
@@ -1535,6 +1588,8 @@ struct Limits {
     receive_bundle: bool,
     #[serde(skip)]
     multipart_object: bool,
+    #[serde(skip)]
+    object_proof: bool,
 }
 
 fn validate_descriptor(bytes: &[u8], repository: super::RepositoryId) -> Result<Limits> {
@@ -1582,6 +1637,7 @@ fn validate_descriptor(bytes: &[u8], repository: super::RepositoryId) -> Result<
     }
     descriptor.limits.fetch_bundle = descriptor.capabilities.contains("e2ee-fetch-bundle");
     descriptor.limits.multipart_object = descriptor.capabilities.contains("e2ee-multipart-object");
+    descriptor.limits.object_proof = descriptor.capabilities.contains("e2ee-object-proof-v1");
     descriptor.limits.receive_bundle = descriptor.capabilities.contains("e2ee-receive-bundle");
     Ok(descriptor.limits)
 }

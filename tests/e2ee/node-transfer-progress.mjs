@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { once } from "node:events";
-import { mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync, rmSync, readdirSync, statSync, existsSync } from "node:fs";
 import { createServer, request } from "node:http";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
@@ -42,13 +42,23 @@ async function scenario(mode) {
   const lines = createInterface({ input: service.stdout });
   const ready = JSON.parse((await once(lines, "line"))[0]);
   const upstream = new URL(ready.enrollmentUrl).origin;
+  const wire = { requests: 0, uploadBytes: 0, downloadBytes: 0 };
+  const payloadReads = [];
   const proxy = createServer((incoming, outgoing) => {
+    wire.requests++;
+    incoming.on("data", (chunk) => { wire.uploadBytes += chunk.length; });
     const upstreamRequest = request(new URL(incoming.url, upstream), {
       method: incoming.method, headers: { ...incoming.headers, host: new URL(upstream).host },
     }, async (response) => {
+      response.on("data", (chunk) => { wire.downloadBytes += chunk.length; });
+      if (incoming.method === "GET" && /e2ee\/(files|objects|packs|commits|segments)\//.test(incoming.url)) {
+        const read = { path: incoming.url, range: incoming.headers.range, status: response.statusCode, bytes: 0 };
+        payloadReads.push(read);
+        response.on("data", (chunk) => { read.bytes += chunk.length; });
+      }
       const headers = { ...response.headers };
       // Exercise the mandatory individual-object fallback as well as bundles.
-      if (mode !== "aggregate" && incoming.url === "/acme/enrollment") {
+      if (mode !== "aggregate" && incoming.url === "/acme/enrollment" && response.statusCode === 200) {
         const chunks = [];
         for await (const chunk of response) chunks.push(chunk);
         const descriptor = JSON.parse(Buffer.concat(chunks));
@@ -98,6 +108,14 @@ async function scenario(mode) {
   async function observed(label, direction, operation) {
     const events = [];
     const stages = [];
+    const beforeWire = { ...wire };
+    const diskBytes = (path) => {
+      try { return readdirSync(path, { withFileTypes: true }).reduce((total, entry) => total + (entry.isDirectory() ? diskBytes(join(path, entry.name)) : statSync(join(path, entry.name)).size), 0); }
+      catch (error) { if (error.code === "ENOENT") return 0; throw error; }
+    };
+    const temporaryBytes = () => diskBytes(join(directory, `${mode}-source-staging`)) + diskBytes(join(directory, `${mode}-verification`));
+    let peakTemporaryBytes = temporaryBytes();
+    const diskSampler = setInterval(() => { peakTemporaryBytes = Math.max(peakTemporaryBytes, temporaryBytes()); }, 20);
     const captureStart = JSON.parse(readFileSync(capture)).length;
     const allEvents = [];
     const lateEvents = [];
@@ -109,8 +127,10 @@ async function scenario(mode) {
       if (event.direction === direction) {
         events.push({ bytes: event.transferredBytes, ms: performance.now() - start });
       }
-    }, (event) => { assert.equal(completed, false, "sync progress after settlement"); stages.push(event); });
+    }, (event) => { assert.equal(completed, false, "sync progress after settlement"); stages.push(event); }).finally(() => clearInterval(diskSampler));
     completed = true;
+    clearInterval(diskSampler);
+    peakTemporaryBytes = Math.max(peakTemporaryBytes, temporaryBytes());
     const elapsedMs = performance.now() - start;
     if (process.env.GRAFT_PROGRESS_SYNC !== "0") {
       assert.equal(stages[0]?.phase, "preparing");
@@ -124,7 +144,10 @@ async function scenario(mode) {
         if (event.transfer.totalIsFinal) assert.ok(event.transfer.transferredBytes <= event.transfer.totalBytes);
       }
       assert.ok(requests.size > 0);
-      if (label === "initial-upload") assert.ok(stages.some((e) => e.phase === "verifying" && e.transfer?.direction === "download"));
+      if (label === "initial-upload") {
+        assert.ok(stages.some((e) => e.phase === "confirming"));
+        assert.ok(!stages.some((e) => e.phase === "verifying"));
+      }
       if (["clone", "pull"].includes(label)) assert.ok(stages.some((e) => e.phase === "applying"));
     }
     await delay(30);
@@ -141,12 +164,12 @@ async function scenario(mode) {
     assert.ok(positive.length >= 3, `${mode}/${label}: missing intermediate progress ${JSON.stringify(events)}`);
     assert.ok(positive.some((event) => event.bytes < positive.at(-1).bytes && event.ms < elapsedMs - 30), `${label}: progress only at completion`);
     const planned = allEvents.filter((event) => event.direction === direction && event.totalIsFinal);
-    if (label === "initial-upload") {
+    if (label === "full-restore-check") {
       const verification = allEvents.filter((event) => event.direction === "download" && event.totalIsFinal);
       assert.ok(verification.length >= 2, "verification download needs its own complete budget");
       assert.equal(new Set(verification.map((event) => event.totalBytes)).size, 1, "verification denominator moved");
       assert.equal(verification.at(-1).transferredBytes, verification.at(-1).totalBytes, "verification download incomplete");
-      assert.equal(allEvents.filter((event) => event.direction === "download").at(-1).totalIsFinal, true, "verification lost its budget");
+      // Subsequent publication metadata is outside the restore payload budget.
     }
     const plannedUpload = process.env.GRAFT_PROGRESS_SYNC !== "0" && ["initial-upload", "retry-upload", "push"].includes(label);
     if (plannedUpload) {
@@ -167,7 +190,7 @@ async function scenario(mode) {
       assert.ok(planned.some((event) => event.transferredBytes < event.totalBytes), `${label}: budget arrived after transfer`);
       assert.equal(allEvents.filter((event) => event.direction === "download").at(-1).totalIsFinal, true, `${label}: lost download plan`);
     }
-    reports.push({ mode, label, plannedTotal: planned.at(-1)?.totalBytes, elapsedMs: Math.round(elapsedMs), samples: events.length, bytes: positive.at(-1).bytes });
+    reports.push({ mode, label, plannedTotal: planned.at(-1)?.totalBytes, elapsedMs: Math.round(elapsedMs), samples: events.length, bytes: positive.at(-1).bytes, wire: Object.fromEntries(Object.keys(wire).map((key) => [key, wire[key] - beforeWire[key]])), peakTemporaryBytes });
     return result;
   }
   try {
@@ -192,7 +215,16 @@ async function scenario(mode) {
     const head = (await source.repositoryMetadata()).current_head;
     await sourceAuthority.initializeConfig(Buffer.from("synthetic transfer password"), { branch: "main", commit: head });
     await source.addEncryptedRemote();
-    await observed("initial-upload", "upload", (onProgress, onSyncProgress) => source.pushInitialBranch({ onProgress, onSyncProgress: process.env.GRAFT_PROGRESS_SYNC === "0" ? undefined : onSyncProgress, verificationDirectory: join(directory, `${mode}-verification`) }));
+    const initial = await observed("initial-upload", "upload", (onProgress, onSyncProgress) => source.pushInitialBranch({ onProgress, onSyncProgress: process.env.GRAFT_PROGRESS_SYNC === "0" ? undefined : onSyncProgress }));
+    assert.equal(initial.state, "connected");
+    assert.equal(initial.verification, "publication");
+    assert.ok(!existsSync(join(directory, `${mode}-verification`)));
+    // Upload deduplication may probe authenticated object headers. It must not
+    // fetch payload bodies or perform a restore-sized download.
+    assert.ok(payloadReads.every((read) => read.status === 404 || read.bytes <= 4096), JSON.stringify(payloadReads));
+    assert.ok(reports.at(-1).wire.downloadBytes < 128 * 1024, "initialization performed a bulk readback");
+    const full = await observed("full-restore-check", "download", (onProgress, onSyncProgress) => source.pushInitialBranch({ onProgress, onSyncProgress, verificationDirectory: join(directory, `${mode}-verification`) }));
+    assert.equal(full.verification, "full_restore");
     const peerAuthority = authority("peer");
     await peerAuthority.unlock(Buffer.from("synthetic transfer password"));
     const peer = await repository("peer", peerAuthority);

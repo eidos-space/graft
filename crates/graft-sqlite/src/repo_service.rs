@@ -466,7 +466,7 @@ impl RepositoryCommandService {
             .into());
         }
         let runtime = self.file.runtime().clone();
-        let store = Arc::new(repo.remote_store(remote)?);
+        let store = Arc::new(repo.remote_store(remote)?.for_initialization(intent));
         let snapshots = crate::pragma::repo_snapshot::prepare_repo_branch_snapshot_push(
             &runtime,
             &repo,

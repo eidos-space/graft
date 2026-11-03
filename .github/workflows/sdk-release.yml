@@ -293,6 +293,12 @@ jobs:
           GRAFT_E2EE_NODE_TEST_BINDING: ${{ github.workspace }}/sdk-artifact/graft-sdk.${{ matrix.suffix }}.node
         run: cargo test -p graft-sdk --features e2ee,bundled-sqlite --test e2ee_node --locked -- --ignored --test-threads=1
 
+      - name: Reject unconfirmed multipart recovery before initial refs
+        env:
+          GRAFT_SDK_NATIVE_PATH: ${{ github.workspace }}/sdk-artifact/graft-sdk.${{ matrix.suffix }}.node
+          GRAFT_INITIAL_SCENARIO: lost-multipart-complete
+        run: node tests/e2ee/node-initial-confirmation.mjs
+
       - name: Retain synthetic privacy evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

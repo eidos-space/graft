@@ -15,6 +15,16 @@ pub struct InitializationIntent {
 }
 
 impl InitializationIntent {
+    /// Private journal ownership tag, scoped further by the session binding.
+    pub fn confirmation_tag(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        hash.update(b"graft-initialization-confirmation-v1\0");
+        hash.update((self.branch.len() as u64).to_be_bytes());
+        hash.update(self.branch.as_bytes());
+        hash.update(self.commit.as_str().as_bytes());
+        format!("{:x}", hash.finalize())
+    }
     pub fn new(branch: String, commit: String) -> Result<Self> {
         let reference = format!("refs/heads/{branch}");
         if reference.len() > 4096 {

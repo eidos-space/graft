@@ -99,6 +99,15 @@ function createBackend(objects, faults = {}, encryption = fixture.encryption, re
   } : undefined;
   return {
     encryption: Object.freeze(encryption),
+    ...(fixture.disableObjectProof === true ? {} : {
+      encryptedObjectProof(key, prefix) {
+        const bytes = objects.get(key);
+        return bytes === undefined ? null : {
+          size: bytes.length,
+          sha256: createHash("sha256").update(prefix).update(bytes).digest("hex"),
+        };
+      },
+    }),
     ...(multipart === undefined ? {} : { multipart }),
     head(key) {
       const body = objects.get(key);
@@ -510,10 +519,13 @@ const server = createServer(async (incoming, outgoing) => {
       Readable.fromWeb(response.body)
         .on("error", () => outgoing.destroy())
         .pipe(outgoing);
-  } catch {
+  } catch (error) {
+    // Keep synthetic infrastructure failures diagnosable without logging bodies
+    // or credentials. In particular, a failed capture write must retain ENOSPC.
+    console.error(JSON.stringify({ syntheticRemoteFailure: error?.code ?? error?.name ?? "Error", method: incoming.method, path: incoming.url }));
     if (privacy && !privacy.failed)
       await privacy.captureHttp("response", "error", new Response(null, { status: 500 }), privacyRequestId);
-    outgoing.writeHead(500);
+    outgoing.writeHead(500, { "Graft-Protocol": "1" });
     outgoing.end();
   }
 });

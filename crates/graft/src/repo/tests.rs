@@ -6341,6 +6341,42 @@ fn sync_progress_invalidates_incorrect_body_length() {
 }
 
 #[test]
+fn confirmation_flushes_payload_budget_and_keeps_metadata_in_confirmation_phase() {
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let captured_bytes = bytes.clone();
+    let phases = Arc::new(Mutex::new(Vec::new()));
+    let captured_phases = phases.clone();
+    let reporter =
+        TransferProgressReporter::new(move |event| captured_bytes.lock().unwrap().push(event))
+            .with_sync_callback(move |event| captured_phases.lock().unwrap().push(event));
+    with_transfer_progress(&reporter, || {
+        sync_phase(SyncPhase::Verifying);
+        reporter.plan_remaining(TransferDirection::Download, 100);
+        let mut body = begin_transfer_progress(TransferDirection::Download, Some(100)).unwrap();
+        body.advance(100);
+        body.finish();
+        sync_phase(SyncPhase::Confirming);
+        let last = *bytes.lock().unwrap().last().unwrap();
+        assert_eq!(last.transferred_bytes, 100);
+        assert_eq!(last.total_bytes, Some(100));
+        assert!(last.total_is_final);
+        let mut metadata = begin_transfer_progress(TransferDirection::Download, Some(10)).unwrap();
+        metadata.advance(10);
+        metadata.finish();
+    });
+    let phases = phases.lock().unwrap();
+    let confirming = phases
+        .iter()
+        .position(|event| event.phase == SyncPhase::Confirming)
+        .unwrap();
+    assert!(
+        phases[confirming..]
+            .iter()
+            .all(|event| event.phase == SyncPhase::Confirming)
+    );
+}
+
+#[test]
 #[ignore = "manual deterministic callback overhead measurement"]
 fn sync_progress_overhead() {
     let iterations = 100_000;
