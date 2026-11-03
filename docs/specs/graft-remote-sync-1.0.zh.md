@@ -255,3 +255,24 @@ ordering/concurrency、pull=fetch+merge、clone safety 和 publication uncertain
 - Optional aggregate operation 必须保留 raw/list/CAS fallback。
 - V1 upload bundle 列举全部 immutable key；reachability negotiation 留待后续。
 - HTTP/fs/S3 内部 transaction 可不同，但 publication 语义必须相同。
+
+### 个人 Docker 部署配置
+
+`services/graft-remote-docker` 将本协议映射到本地 SQLite 数据库及不可变 multipart 文件。
+仓库操作必须认证，不得隐式创建未知仓库。管理 API 在 `personal` 命名空间中
+显式创建仓库；重复创建必须保留原加密 UUID，必须拒绝加密类型变更。
+发现 URL 必须来自配置的公开 origin，不得使用不可信转发头。访问密钥由
+秘密文件作为适配器输入加载，不存入仓库数据。
+
+服务实现[部署指南](../../services/graft-remote-docker/README.zh-CN.md)记录的
+个人管理契约。管理和健康接口属于宿主 API，不扩展 Remote v1。
+只声明已实现的协议能力，支持持久化 multipart，单请求限制为 64 MiB。
+对象原子创建和引用比较使用 SQLite 语句；每个本地卷只支持一个服务实例，
+不支持分布式存储。可执行证据位于 `services/graft-remote-docker/test`。
+
+Docker 管理配置必须先持久化删除墓碑再受理删除，拒绝新的仓库操作，并等待已
+准入的响应/校验读取结束后再清理。技术名称和 URL 不得复用；重复删除观察同一
+持久状态。清理失败必须保留 deleting，重启必须恢复清理。multipart 文件及目录
+必须先完成同步，才能发布 SQLite 指针。进程崩溃测试不代表任意断电安全证明。
+可选对象校验回调必须散列实际准入的持久快照，不得使用上传期摘要；挑战编码和
+能力语义由共享 E2EE 协议拥有。

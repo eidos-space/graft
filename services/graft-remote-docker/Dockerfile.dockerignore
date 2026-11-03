@@ -1,0 +1,15 @@
+**
+!package.json
+!pnpm-lock.yaml
+!pnpm-workspace.yaml
+!packages/
+!packages/graft-remote/
+!packages/graft-remote/**
+packages/graft-remote/node_modules
+packages/graft-remote/dist
+!services/
+!services/graft-remote-docker/
+!services/graft-remote-docker/*.mjs
+
+!LICENSE-APACHE
+!LICENSE-MIT

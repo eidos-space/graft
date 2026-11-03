@@ -1,0 +1,163 @@
+name: Publish Graft Docker
+on:
+  push:
+    tags: ['graft-docker-v*']
+permissions:
+  contents: read
+concurrency:
+  group: graft-docker-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      image: ${{ steps.version.outputs.image }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version=$(cat services/graft-remote-docker/VERSION)
+          test "$GITHUB_REF_NAME" = "graft-docker-v$version"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "$(git cat-file -t "$GITHUB_REF_NAME")" = tag
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+          gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" > /tmp/prs.json
+          jq -e --arg sha "$GITHUB_SHA" 'any(.[]; .merged_at != null and .base.ref == "main" and .merge_commit_sha == $sha)' /tmp/prs.json
+          remote=$(cat services/graft-remote-docker/REMOTE_VERSION)
+          test "$(node -p "require('./packages/graft-remote/package.json').version")" = "$remote"
+          test "$(npm view "@eidos.space/graft-remote@$remote" version)" = "$remote"
+          sdk=$(cat services/graft-remote-docker/SDK_VERSION)
+          test "$(npm view "@eidos.space/graft@$sdk" version)" = "$sdk"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/graft-remote-docker" >> "$GITHUB_OUTPUT"
+  architecture:
+    needs: gate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            native: linux-x64-gnu
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            native: linux-arm64-gnu
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@395ad3262231945c25e8478fd5baf05154b1d79f # v6
+        with:
+          node-version: 24
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build once on the matching native runner
+        env:
+          IMAGE: ${{ needs.gate.outputs.image }}
+          VERSION: ${{ needs.gate.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          if docker buildx imagetools inspect "$IMAGE:$VERSION-$ARCH" >/dev/null 2>&1; then
+            docker pull "$IMAGE:$VERSION-$ARCH"
+            test "$(docker image inspect "$IMAGE:$VERSION-$ARCH" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$GITHUB_SHA"
+            exit 0
+          fi
+          docker buildx build --load --platform "linux/$ARCH" -f services/graft-remote-docker/Dockerfile \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.version=$VERSION" -t "$IMAGE:$VERSION-$ARCH" .
+      - name: Verify the actual image with the public SDK, then publish architecture
+        env:
+          IMAGE: ${{ needs.gate.outputs.image }}
+          VERSION: ${{ needs.gate.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+          NATIVE: ${{ matrix.native }}
+        run: |
+          set -euo pipefail
+          sdk=$(cat services/graft-remote-docker/SDK_VERSION)
+          npm install --prefix /tmp/graft-public-sdk --ignore-scripts "@eidos.space/graft@$sdk"
+          export GRAFT_TEST_IMAGE="$IMAGE:$VERSION-$ARCH"
+          export GRAFT_SDK_PATH=/tmp/graft-public-sdk/node_modules/@eidos.space/graft
+          node services/graft-remote-docker/test/container.mjs
+          export GRAFT_TEST_SKIP_SDK=1
+          export GRAFT_CANDIDATE_SDK_PATH="$GRAFT_SDK_PATH"
+          export GRAFT_CANDIDATE_NATIVE_PATH="$(find "/tmp/graft-public-sdk/node_modules/@eidos.space/graft-$NATIVE" -name '*.node' -print -quit)"
+          export GRAFT_SDK_RELEASED=1
+          export GRAFT_LARGE_PAYLOAD_MIB=80
+          node services/graft-remote-docker/test/container.mjs
+          docker push "$GRAFT_TEST_IMAGE"
+          docker image inspect "$GRAFT_TEST_IMAGE" --format '{{index .RepoDigests 0}}' > "image-$ARCH.txt"
+          # GHCR must be public, not merely accessible with this publisher's token.
+          docker --config "$(mktemp -d)" pull "$(cat "image-$ARCH.txt")"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: docker-${{ matrix.arch }}
+          path: image-${{ matrix.arch }}.txt
+  release:
+    needs: [gate, architecture]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          pattern: docker-*
+          merge-multiple: true
+      - name: Publish immutable manifest and release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ${{ needs.gate.outputs.image }}
+          VERSION: ${{ needs.gate.outputs.version }}
+        run: |
+          set -euo pipefail
+          if docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest}}' > image.json 2>/dev/null; then
+            # A partial retry may reuse, but may never move, an immutable manifest.
+            cat image-amd64.txt image-arm64.txt | cut -d@ -f2 | sort > expected-digests.txt
+            jq -r '.manifests[].digest' image.json | sort > actual-digests.txt
+            cmp expected-digests.txt actual-digests.txt
+          else
+            docker buildx imagetools create -t "$IMAGE:$VERSION" "$(cat image-amd64.txt)" "$(cat image-arm64.txt)"
+            docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest}}' > image.json
+          fi
+          digest=$(jq -er .digest image.json)
+          export GRAFT_RELEASE_IMAGE="$IMAGE@$digest"
+          python3 - <<'PY'
+          import os,pathlib
+          p=pathlib.Path('services/graft-remote-docker/compose.release.yaml')
+          pathlib.Path('compose.yaml').write_text(p.read_text().replace('${GRAFT_IMAGE:?Set GRAFT_IMAGE to the released immutable digest}',os.environ['GRAFT_RELEASE_IMAGE']))
+          pathlib.Path('SOURCE_COMMIT').write_text(os.environ['GITHUB_SHA']+'\n')
+          PY
+          cp services/graft-remote-docker/README.md .
+          cp services/graft-remote-docker/README.zh-CN.md .
+          sha256sum compose.yaml image.json SOURCE_COMMIT README.md README.zh-CN.md > SHA256SUMS
+          sed -e 's/ (unreleased)//' -e 's/（未发布）//' services/graft-remote-docker/CHANGELOG.md > release-notes.md
+          gh release create "$GITHUB_REF_NAME" --verify-tag --title "Graft Docker $VERSION" \
+            --notes-file release-notes.md \
+            compose.yaml image.json SOURCE_COMMIT SHA256SUMS README.md README.zh-CN.md

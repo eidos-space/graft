@@ -60,3 +60,10 @@ Graft 把协议行为、框架和存储职责分开：
 远端凭据必须作为显式的客户端或适配器输入。不要把 bearer token 写入仓库配置、
 远端 URL、日志、缓存或结果 payload。生产环境 HTTP 远端应使用 HTTPS，并对每个
 discovery、read 和 write 操作执行仓库级访问控制。
+
+## Docker 自托管
+
+需要包含 Eidos Lite 服务发现和仓库管理的个人服务器时，请参阅
+[Docker 与 Compose 部署指南](https://github.com/eidos-space/graft/blob/main/services/graft-remote-docker/README.zh-CN.md)。
+提供 SQLite 持久化、访问密钥文件、HTTPS 反向代理、备份恢复及隔离加密 SDK
+测试。这是单实例服务，单请求上限为 64 MiB，支持持久化 multipart 分片上传。

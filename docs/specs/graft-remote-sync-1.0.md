@@ -519,3 +519,31 @@ suites, plus CLI/SDK remote integration tests.
   negotiation is a future protocol concern.
 - HTTP, filesystem, and S3 backends must share publication semantics even when
   their internal transaction mechanisms differ.
+
+### Personal Docker deployment profile
+
+`services/graft-remote-docker` maps this protocol to a local SQLite database and immutable multipart files.
+It MUST authenticate repository operations and MUST NOT implicitly provision an
+unknown repository. Its management API explicitly creates repositories in the
+`personal` namespace; repeated creation MUST retain the original encryption UUID
+and MUST reject a change of encryption profile. Discovery URLs MUST derive from
+the configured public origin, never untrusted forwarded headers. The access key
+is an adapter input loaded from a secret file, not stored in repository data.
+
+The service implements the personal management contract documented in its
+[deployment guide](../../services/graft-remote-docker/README.md). Management and
+health endpoints are host APIs, not additions to Remote v1. It advertises only
+implemented protocol capabilities, supports durable multipart, and limits individual requests to
+64 MiB. Atomic object creation and ref comparison use SQLite statements. This
+profile supports one service instance per local volume, not distributed storage.
+Executable evidence lives in `services/graft-remote-docker/test`.
+
+The Docker management profile MUST persist a deletion tombstone before accepting
+repository deletion, reject new repository operations, and wait for admitted
+response/proof readers before cleanup. Technical names and URLs MUST NOT be reused;
+a repeated deletion observes the same durable state. Cleanup failure MUST retain
+`deleting` and restart MUST resume cleanup. Multipart file bytes and their directory
+MUST be synchronized before publishing their SQLite pointer. Process-crash tests
+are not evidence of arbitrary power-loss safety. The optional object-proof callback
+MUST hash the actual admitted persisted snapshot, not an upload-time digest;
+the shared E2EE protocol owns its challenge encoding and capability semantics.

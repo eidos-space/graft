@@ -1,0 +1,60 @@
+name: Check Docker Graft server
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'services/graft-remote-docker/**'
+      - 'packages/graft-remote/**'
+      - '.github/workflows/docker-remote.yml'
+      - '.github/workflows/docker-release.yml'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+  push:
+    branches: [main]
+    paths:
+      - 'services/graft-remote-docker/**'
+      - 'packages/graft-remote/**'
+      - '.github/workflows/docker-remote.yml'
+      - '.github/workflows/docker-release.yml'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: docker-remote-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  container:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@41ff72655975bd51cab0327fa583b6e92b6d3061 # v4.2.0
+        with:
+          version: 10.14.0
+      - uses: actions/setup-node@395ad3262231945c25e8478fd5baf05154b1d79f # v6
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test:docker
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - run: sudo apt-get update && sudo apt-get install -y clang libclang-dev build-essential
+      - name: Build E2EE SDK
+        run: bash packages/graft-sdk/scripts/build-native.sh ${{ matrix.target }} packages/graft-sdk/native e2ee
+      - name: Compose and native encrypted round trip (isolated data)
+        run: pnpm test:docker:container
