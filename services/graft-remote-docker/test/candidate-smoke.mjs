@@ -67,6 +67,18 @@ export async function candidateRoundTrips({ origin, token, request, restart }) {
       db.exec(
         "CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT); INSERT INTO notes VALUES(1, 'candidate data');",
       );
+      const databaseMiB = fault === "none" ? Number(process.env.GRAFT_LARGE_DATABASE_MIB ?? 0) : 0;
+      const databaseHash = createHash("sha256");
+      if (databaseMiB) {
+        db.exec("CREATE TABLE blocks(id INTEGER PRIMARY KEY, data BLOB)");
+        const insert = db.prepare("INSERT INTO blocks VALUES(?,?)");
+        for (let i = 0; i < databaseMiB; i++) {
+          const bytes = randomBytes(1024 * 1024);
+          databaseHash.update(bytes);
+          insert.run(i, bytes);
+        }
+      }
+      const databaseDigest = databaseHash.digest("hex");
       db.close();
       await source.addAll();
       await source.commit("Candidate initial data");
@@ -203,6 +215,16 @@ export async function candidateRoundTrips({ origin, token, request, restart }) {
       assert.deepEqual(await readFile(join(peerPath, "payload.bin")), payload);
       const peerDb = new DatabaseSync(join(peerPath, "notes.sqlite"));
       assert.equal(peerDb.prepare("SELECT body FROM notes").get().body, "candidate data");
+      if (databaseMiB) {
+        const hash = createHash("sha256");
+        let count = 0;
+        for (const row of peerDb.prepare("SELECT data FROM blocks ORDER BY id").iterate()) {
+          hash.update(row.data);
+          count++;
+        }
+        assert.equal(count, databaseMiB);
+        assert.equal(hash.digest("hex"), databaseDigest);
+      }
       peerDb.close();
       if (fault === "none") {
         const fullStart = proxy.records.length;
@@ -217,6 +239,24 @@ export async function candidateRoundTrips({ origin, token, request, restart }) {
           "explicit full restore did not download payload",
         );
       }
+      await writeFile(join(peerPath, "roundtrip.txt"), "peer update");
+      const updateDb = new DatabaseSync(join(peerPath, "notes.sqlite"));
+      updateDb.exec("UPDATE notes SET body='peer update' WHERE id=1");
+      updateDb.close();
+      await peer.addAll();
+      await peer.commit("Peer update");
+      await peer.push({ remote: "origin", branch: "main" });
+      await source.pull({ remote: "origin", branch: "main" });
+      assert.equal(await readFile(join(sourcePath, "roundtrip.txt"), "utf8"), "peer update");
+      const checkedDb = new DatabaseSync(join(sourcePath, "notes.sqlite"));
+      assert.equal(checkedDb.prepare("SELECT body FROM notes WHERE id=1").get().body, "peer update");
+      checkedDb.close();
+      await writeFile(join(sourcePath, "roundtrip.txt"), "source reply");
+      await source.addAll();
+      await source.commit("Source reply");
+      await source.push({ remote: "origin", branch: "main" });
+      await peer.pull({ remote: "origin", branch: "main" });
+      assert.equal(await readFile(join(peerPath, "roundtrip.txt"), "utf8"), "source reply");
       summaries.push({
         fault,
         fallback: fault !== "none",
@@ -237,6 +277,8 @@ export async function candidateRoundTrips({ origin, token, request, restart }) {
         initialAttemptDownloadBytes: firstAttempt.reduce((sum, row) => sum + row.downloadBytes, 0),
         multipartRequests: initialization.filter((row) => row.path.includes("/multipart-")).length,
         payloadBytes: payload.length,
+        databaseMiB,
+        bidirectionalUpdates: true,
         recovered: true,
         independentClone: true,
       });
