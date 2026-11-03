@@ -5758,27 +5758,84 @@ fn remote_pack_indexes_are_persisted_and_repaired_as_disposable_hints() {
 }
 
 #[test]
-fn repository_http_pool_keeps_driving_between_executors() {
+fn repository_http_driver_keeps_driving_between_executors() {
+    repository_http_driver_case(false);
+    repository_http_driver_case(true);
+}
+
+fn repository_http_driver_case(close_first: bool) {
     use std::io::{Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
+    let (request_received, received) = tokio::sync::oneshot::channel();
+    let (release_response, response_released) = std::sync::mpsc::channel();
     let server = std::thread::spawn(move || {
         let (mut socket, _) = listener.accept().unwrap();
         socket
             .set_read_timeout(Some(Duration::from_secs(30)))
             .unwrap();
-        for _ in 0..2 {
-            let mut request = Vec::new();
-            while !request.ends_with(b"\r\n\r\n") {
-                let mut byte = [0];
-                if socket.read_exact(&mut byte).is_err() {
-                    return;
-                }
-                request.push(byte[0]);
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            socket.read_exact(&mut byte).unwrap();
+            request.push(byte[0]);
+        }
+        request_received.send(()).unwrap();
+        response_released
+            .recv_timeout(Duration::from_secs(30))
+            .expect("originating executor did not return after request headers");
+        socket
+            .write_all(if close_first {
+                b"HTTP/1.1 200 OK\r\nGraft-Protocol: 1\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+            } else {
+                b"HTTP/1.1 200 OK\r\nGraft-Protocol: 1\r\nContent-Length: 2\r\n\r\nok"
+            })
+            .unwrap();
+        // Returning a body and returning its socket to the idle pool are not a
+        // synchronization barrier. Serve the next request on either connection.
+        socket.set_nonblocking(true).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut second = Vec::new();
+        loop {
+            let mut buffer = [0; 1024];
+            match socket.read(&mut buffer) {
+                Ok(read) => second.extend_from_slice(&buffer[..read]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("reading reused socket: {error}"),
             }
-            socket
-                .write_all(b"HTTP/1.1 200 OK\r\nGraft-Protocol: 1\r\nContent-Length: 2\r\n\r\nok")
-                .unwrap();
+            if second.ends_with(b"\r\n\r\n") {
+                socket.set_nonblocking(false).unwrap();
+                socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nGraft-Protocol: 1\r\nContent-Length: 2\r\n\r\nok",
+                    )
+                    .unwrap();
+                break;
+            }
+            match listener.accept() {
+                Ok((mut fresh, _)) => {
+                    fresh
+                        .set_read_timeout(Some(Duration::from_secs(30)))
+                        .unwrap();
+                    let mut request = Vec::new();
+                    while !request.ends_with(b"\r\n\r\n") {
+                        let mut byte = [0];
+                        fresh.read_exact(&mut byte).unwrap();
+                        request.push(byte[0]);
+                    }
+                    fresh
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nGraft-Protocol: 1\r\nContent-Length: 2\r\n\r\nok",
+                        )
+                        .unwrap();
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("accepting fresh socket: {error}"),
+            }
+            assert!(Instant::now() < deadline, "no second HTTP request arrived");
+            std::thread::sleep(Duration::from_millis(1));
         }
     });
     let remote = RemoteConfig::Http {
@@ -5787,13 +5844,18 @@ fn repository_http_pool_keeps_driving_between_executors() {
     }
     .build()
     .unwrap();
-    assert_eq!(
-        block_on_remote(remote.get_raw("first"))
-            .unwrap()
-            .unwrap()
-            .as_ref(),
-        b"ok"
-    );
+    // Start the HTTP task on the repository executor and wait until the server
+    // has its request. Withhold the response until block_on_remote has returned:
+    // completing it now requires the original connection driver to keep running.
+    // This does not assume that two sequential requests reuse one pooled socket.
+    let first_remote = remote.clone();
+    let pending = block_on_remote(async move {
+        let pending = tokio::spawn(async move { first_remote.get_raw("probe").await });
+        received.await.expect("server did not receive the request");
+        Ok(pending)
+    })
+    .unwrap();
+    release_response.send(()).unwrap();
     let other = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -5801,12 +5863,24 @@ fn repository_http_pool_keeps_driving_between_executors() {
     let result = other.block_on(async {
         // This checks liveness across executors; concurrent KDF tests can delay
         // a CI runner well beyond a one-second latency budget.
+        tokio::time::timeout(Duration::from_secs(10), pending).await
+    });
+    assert_eq!(
+        result
+            .expect("repository HTTP driver stopped when its caller returned")
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .as_ref(),
+        b"ok"
+    );
+    let second = other.block_on(async {
         tokio::time::timeout(Duration::from_secs(10), remote.get_raw("second")).await
     });
     server.join().unwrap();
     assert_eq!(
-        result
-            .expect("repository pool stopped driving when its caller returned")
+        second
+            .expect("cross-executor request timed out")
             .unwrap()
             .unwrap()
             .as_ref(),
