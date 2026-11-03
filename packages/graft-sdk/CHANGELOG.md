@@ -3,6 +3,59 @@
 This changelog covers the independently versioned `@eidos.space/graft` package. Core Graft CLI and
 SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
 
+## Graft SDK 0.3.38 — 2026-11-03
+
+### Added
+
+- Plan clone, pull and independent initial-upload verification with a shared
+  download inventory for encrypted and plain remotes. Pin the fetched graph,
+  deduplicate missing files and SQLite frames, then execute the frozen request
+  schedule. Encrypted plans authenticate object headers and count actual
+  ciphertext ranges, including repeated headers and AEAD covering blocks.
+- Add `fetchForCheckout` for hosts that review before applying a pull. It prepares
+  target files and SQLite pages under one download budget and updates the
+  tracking ref without changing HEAD, the index or the worktree. Follow with
+  `planMerge` and guarded `applyMerge`.
+- Plan multipart uploads before transferring missing parts, retaining validated
+  session negotiation, original encrypted retry bytes and full-object readback.
+  Plain aggregate and per-object fallback uploads use the same cumulative body
+  accounting as encrypted transfers.
+
+### Boundaries and compatibility
+
+- `onProgress` reports cumulative body bytes and a fixed total only when the
+  complete transfer schedule is known. `onSyncProgress` request totals remain
+  request-local. Upload and independent verification have separate budgets;
+  reaching a transfer total does not mean that verification, ref publication,
+  merge application or the SDK operation has completed.
+- Encrypted upload inventories retain at most 2 GiB/256 payloads and 1 MiB/256
+  public hints. Exceeding a planning bound falls back to validated streaming
+  with real cumulative bytes and an unknown total. Unexpected ranges, retries
+  and short bodies withdraw a declared total. Temporary preparation storage and
+  preflight requests add overhead; exact percentages are not guaranteed for
+  every operation. Ref/hint control traffic and HTTP/TLS framing are excluded.
+- Existing authentication, epoch checks, ref CAS, multipart recovery and guarded
+  worktree updates remain required. Repository formats and remote service
+  protocols are unchanged; existing services need no upgrade for these counters.
+- Native packages cover macOS arm64/x64, Linux glibc arm64/x64 and Windows x64
+  on Node.js 20 and newer. Release checks exercise Node.js 20 and 24. Linux musl
+  is not included. A previously reproduced Linux root-user WAL status/ctime
+  failure also affects 0.3.37 and is not repaired by this progress release.
+
+### 中文
+
+- 补齐加密与非加密 clone、pull 和首次上传独立校验的下载规划：固定远端图，
+  去重缺失文件与 SQLite 帧，冻结实际请求调度；加密按已认证的密文区间计量。
+- 新增 `fetchForCheckout`，在同一下载预算内准备目标文件和数据库页，只更新
+  tracking ref，不改 HEAD、index 或工作目录；随后仍须审核并受保护地应用合并。
+- multipart 先协商并排除已确认分片，再统计缺失分片；保留原始密文重试、恢复及
+  完整读回验证。非加密 aggregate/fallback 与加密路径统一累计实际 body 字节。
+- 完整规划时才提供固定总量；上传与独立校验分开计量，传输达到 100% 不代表整个
+  操作成功。超过 2 GiB/256 payload 或 1 MiB/256 hint 等规划预算时显示实际累计
+  字节和未知总量；计划外范围、重试或短读会撤销分母。规划有预检和暂存开销。
+- 无仓库格式或服务端协议变更。支持原五个平台及 Node.js 20+，不含 Linux musl；
+  已知 Linux root 用户 WAL 状态/ctime 问题在 0.3.37 同样存在，本版未修复。
+
 ## Graft SDK 0.3.37 — 2026-11-02
 
 ### Added

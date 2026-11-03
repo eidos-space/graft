@@ -37,6 +37,10 @@ pub(super) struct CiphertextBody {
 
 impl CiphertextBody {
     pub(super) fn new(response: reqwest::Response, expected: u64) -> Self {
+        let total = response
+            .extensions()
+            .get::<super::http::PlannedDownloadBody>()
+            .map(|planned| planned.0);
         Self {
             response,
             pending: Bytes::new(),
@@ -44,7 +48,7 @@ impl CiphertextBody {
             received: 0,
             progress: crate::repo::begin_transfer_progress(
                 crate::repo::TransferDirection::Download,
-                None,
+                total,
             ),
         }
     }

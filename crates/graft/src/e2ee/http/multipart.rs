@@ -11,7 +11,100 @@ enum MultipartSource<'a> {
     Retained(&'a str),
 }
 
+#[cfg(any(unix, windows))]
+pub(crate) enum MultipartPreparation {
+    Ready(Box<PreparedMultipartUpload>),
+    Outcome(ObjectPublicationOutcome),
+}
+
+#[cfg(any(unix, windows))]
+pub(crate) struct PreparedMultipartUpload {
+    operation: SessionOperation,
+    lease: crate::e2ee::multipart_journal::Lease,
+    retained: Option<PreparedEncryptedObject>,
+    start: Option<MultipartStart>,
+}
+
+#[cfg(any(unix, windows))]
+impl From<ObjectPublicationOutcome> for MultipartPreparation {
+    fn from(outcome: ObjectPublicationOutcome) -> Self {
+        Self::Outcome(outcome)
+    }
+}
+
+#[cfg(any(unix, windows))]
+impl MultipartPreparation {
+    pub(crate) fn remaining_bytes(&self) -> Result<u64> {
+        let Self::Ready(prepared) = self else {
+            return Ok(0);
+        };
+        let Some(start) = &prepared.start else {
+            return Ok(0);
+        };
+        let completed = start
+            .uploaded_parts
+            .iter()
+            .map(|part| part.part_number)
+            .collect::<HashSet<_>>();
+        (0..start.total_bytes.div_ceil(start.part_bytes))
+            .filter(|index| !completed.contains(&(index + 1)))
+            .try_fold(0u64, |bytes, index| {
+                bytes
+                    .checked_add(
+                        ((index + 1) * start.part_bytes).min(start.total_bytes)
+                            - index * start.part_bytes,
+                    )
+                    .ok_or(EncryptionError::TooLarge.into())
+            })
+    }
+
+    pub(crate) async fn publish(
+        self,
+        client: &EncryptedHttpClient,
+        directory: &Path,
+    ) -> Result<ObjectPublicationOutcome> {
+        match self {
+            Self::Outcome(outcome) => Ok(outcome),
+            Self::Ready(prepared) => {
+                if let Some(start) = prepared.start {
+                    client
+                        .send_multipart_parts(
+                            prepared.operation,
+                            prepared.lease,
+                            prepared
+                                .retained
+                                .as_ref()
+                                .ok_or(EncryptionError::InvalidEncoding)?,
+                            start,
+                            directory,
+                        )
+                        .await
+                } else {
+                    client
+                        .confirm_multipart(
+                            prepared.operation,
+                            prepared.lease,
+                            directory,
+                            &mut None,
+                            &mut false,
+                        )
+                        .await
+                }
+            }
+        }
+    }
+}
+
 impl EncryptedHttpClient {
+    #[cfg(any(unix, windows))]
+    pub(crate) async fn prepare_object_multipart(
+        &self,
+        candidate: &PreparedEncryptedObject,
+        provider: Arc<dyn crate::e2ee::MultipartJournalProvider>,
+    ) -> Result<MultipartPreparation> {
+        self.prepare_multipart_inner(MultipartSource::Prepared(candidate), provider, false)
+            .await
+    }
     pub async fn requires_multipart(&self, length: u64) -> Result<bool> {
         let operation = self.operation().await?;
         let verified = self.verified.lock().await;
@@ -114,6 +207,19 @@ impl EncryptedHttpClient {
         verification_directory: &Path,
         restart: bool,
     ) -> Result<ObjectPublicationOutcome> {
+        self.prepare_multipart_inner(source, provider, restart)
+            .await?
+            .publish(self, verification_directory)
+            .await
+    }
+
+    #[cfg(any(unix, windows))]
+    async fn prepare_multipart_inner(
+        &self,
+        source: MultipartSource<'_>,
+        provider: Arc<dyn crate::e2ee::MultipartJournalProvider>,
+        restart: bool,
+    ) -> Result<MultipartPreparation> {
         use crate::e2ee::FileMultipartJournal;
         let admission = self.session.begin_operation()?;
         if let MultipartSource::Prepared(candidate) = source {
@@ -234,8 +340,6 @@ impl EncryptedHttpClient {
         } else {
             (operation, lease)
         };
-        let mut cause = None;
-        let mut created = false;
         if let Some(retained) = &retained {
             let uuid = uuid_text(operation.binding().repository());
             let request = self.credentials.authorize_encrypted_request(
@@ -309,19 +413,19 @@ impl EncryptedHttpClient {
                     Ok(value) => value,
                     Err(error) => return unknown(error.into()),
                 };
-                return self
-                    .send_multipart_parts(operation, lease, retained, start, verification_directory)
-                    .await;
+                return Ok(MultipartPreparation::Ready(Box::new(
+                    PreparedMultipartUpload {
+                        operation,
+                        lease,
+                        retained: Some(retained.retained_copy()),
+                        start: Some(start),
+                    },
+                )));
             }
         }
-        self.confirm_multipart(
-            operation,
-            lease,
-            verification_directory,
-            &mut cause,
-            &mut created,
-        )
-        .await
+        Ok(MultipartPreparation::Ready(Box::new(
+            PreparedMultipartUpload { operation, lease, retained, start: None },
+        )))
     }
 
     #[cfg(any(unix, windows))]
@@ -363,7 +467,11 @@ impl EncryptedHttpClient {
                     .header("Content-Length", end - begin)
                     .header("x-graft-upload-id", &start.upload_id)
                     .header("x-graft-part-number", index + 1)
-                    .body(super::super::upload::progress_body(stream)),
+                    .body(super::super::upload::progress_body_with_length(
+                        stream,
+                        crate::repo::final_transfer_plan(crate::repo::TransferDirection::Upload)
+                            .then_some(end - begin),
+                    )),
             );
             let response = tokio::select! {
                 response = request.send() => response.map_err(transport_error),
@@ -544,8 +652,8 @@ async fn persist(
 }
 
 #[cfg(any(unix, windows))]
-fn unknown(error: EncryptedHttpError) -> Result<ObjectPublicationOutcome> {
-    Ok(ObjectPublicationOutcome::OutcomeUnknown { error: Some(error) })
+fn unknown<T: From<ObjectPublicationOutcome>>(error: EncryptedHttpError) -> Result<T> {
+    Ok(ObjectPublicationOutcome::OutcomeUnknown { error: Some(error) }.into())
 }
 #[cfg(any(unix, windows))]
 fn hex(bytes: &[u8]) -> String {

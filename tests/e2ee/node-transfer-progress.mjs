@@ -13,6 +13,7 @@ import { createInterface } from "node:readline";
 import { DatabaseSync } from "node:sqlite";
 import { Transform } from "node:stream";
 import { setTimeout as delay } from "node:timers/promises";
+import { exerciseFileOnly, exerciseUploadBudgetOverflow } from "./node-file-only-progress.mjs";
 
 const require = createRequire(import.meta.url);
 const { EncryptedRemoteSession, RepositorySession } = require("../../packages/graft-sdk");
@@ -131,7 +132,6 @@ async function scenario(mode) {
     for (const event of allEvents) {
       assert.deepEqual(Object.keys(event).sort(), Object.keys(event).filter((key) => ["direction", "transferredBytes", "totalBytes", "totalIsFinal"].includes(key)).sort());
       if (event.totalIsFinal) {
-        assert.equal(event.direction, "upload", "only complete upload inventories are implemented");
         assert.ok(event.totalBytes >= event.transferredBytes);
       }
     }
@@ -141,11 +141,17 @@ async function scenario(mode) {
     assert.ok(positive.length >= 3, `${mode}/${label}: missing intermediate progress ${JSON.stringify(events)}`);
     assert.ok(positive.some((event) => event.bytes < positive.at(-1).bytes && event.ms < elapsedMs - 30), `${label}: progress only at completion`);
     const planned = allEvents.filter((event) => event.direction === direction && event.totalIsFinal);
-    if (mode === "multipart") assert.equal(planned.length, 0, "multipart must not declare an incomplete operation total");
-    const plannedUpload = process.env.GRAFT_PROGRESS_SYNC !== "0" && mode !== "multipart" && ["initial-upload", "retry-upload"].includes(label);
+    if (label === "initial-upload") {
+      const verification = allEvents.filter((event) => event.direction === "download" && event.totalIsFinal);
+      assert.ok(verification.length >= 2, "verification download needs its own complete budget");
+      assert.equal(new Set(verification.map((event) => event.totalBytes)).size, 1, "verification denominator moved");
+      assert.equal(verification.at(-1).transferredBytes, verification.at(-1).totalBytes, "verification download incomplete");
+      assert.equal(allEvents.filter((event) => event.direction === "download").at(-1).totalIsFinal, true, "verification lost its budget");
+    }
+    const plannedUpload = process.env.GRAFT_PROGRESS_SYNC !== "0" && ["initial-upload", "retry-upload", "push"].includes(label);
     if (plannedUpload) {
       if (label === "initial-upload") {
-        const sent = JSON.parse(readFileSync(capture)).slice(captureStart).filter((request) => request.method === "PUT" && /\/raw-if-not-exists\/e2ee\/(objects|packs|indexes|files|commits|segments)\//.test(request.path));
+        const sent = JSON.parse(readFileSync(capture)).slice(captureStart).filter((request) => request.method === "PUT" && /\/(raw-if-not-exists\/e2ee\/(objects|packs|indexes|files|commits|segments)|multipart-part)\//.test(request.path));
         assert.ok(sent.length > 1, "the plan must span multiple payload requests");
         assert.equal(sent.reduce((total, request) => total + request.body.length / 2, 0), planned.at(-1).totalBytes, "server body bytes differ from complete inventory");
       }
@@ -154,10 +160,25 @@ async function scenario(mode) {
       assert.equal(planned.at(-1).transferredBytes, planned.at(-1).totalBytes);
       assert.ok(planned.some((event) => event.transferredBytes > 0 && event.transferredBytes < event.totalBytes), "missing intermediate planned bytes");
     }
+    if (["clone", "pull", "divergent-pull", "checkout-fetch"].includes(label)) {
+      assert.ok(planned.length >= 2, `${label}: no complete download inventory`);
+      assert.equal(new Set(planned.map((event) => event.totalBytes)).size, 1, `${label}: download denominator moved`);
+      assert.equal(planned.at(-1).transferredBytes, planned.at(-1).totalBytes, `${label}: incomplete download schedule`);
+      assert.ok(planned.some((event) => event.transferredBytes < event.totalBytes), `${label}: budget arrived after transfer`);
+      assert.equal(allEvents.filter((event) => event.direction === "download").at(-1).totalIsFinal, true, `${label}: lost download plan`);
+    }
     reports.push({ mode, label, plannedTotal: planned.at(-1)?.totalBytes, elapsedMs: Math.round(elapsedMs), samples: events.length, bytes: positive.at(-1).bytes });
     return result;
   }
   try {
+    if (process.env.GRAFT_PROGRESS_BUDGET_OVERFLOW === "1") {
+      await exerciseUploadBudgetOverflow({ authority, repository, observed, worktrees, capture });
+      return;
+    }
+    if (process.env.GRAFT_PROGRESS_FILE_ONLY === "1") {
+      await exerciseFileOnly({ authority, repository, observed, worktrees, directory, mode });
+      return;
+    }
     const sourceAuthority = authority("source");
     const source = await repository("source", sourceAuthority);
     await source.init();
@@ -217,6 +238,44 @@ async function scenario(mode) {
     const receivedDatabase = new DatabaseSync(join(worktrees.get(source), "records.sqlite"), { readOnly: true });
     assert.deepEqual(receivedDatabase.prepare("SELECT value FROM records ORDER BY id").all().map((row) => row.value), ["source", "peer"]);
     receivedDatabase.close();
+    const sourceEdit = new DatabaseSync(join(worktrees.get(source), "records.sqlite"));
+    sourceEdit.exec("UPDATE records SET value = 'source-diverged' WHERE id = 1");
+    sourceEdit.close();
+    await source.addAll();
+    await source.commit("source diverged");
+    const peerEdit = new DatabaseSync(join(worktrees.get(peer), "records.sqlite"));
+    peerEdit.exec("UPDATE records SET value = 'peer-diverged' WHERE id = 2");
+    peerEdit.close();
+    await peer.addAll();
+    await peer.commit("peer diverged");
+    await source.push();
+    await observed("divergent-pull", "download", (onProgress, onSyncProgress) => peer.pull({ onProgress, onSyncProgress }));
+    const mergedDatabase = new DatabaseSync(join(worktrees.get(peer), "records.sqlite"), { readOnly: true });
+    assert.deepEqual(mergedDatabase.prepare("SELECT value FROM records ORDER BY id").all().map((row) => row.value), ["source-diverged", "peer-diverged"]);
+    mergedDatabase.close();
+    const checkoutAuthority = authority("checkout");
+    await checkoutAuthority.unlock(Buffer.from("synthetic transfer password"));
+    const checkout = await repository("checkout", checkoutAuthority);
+    await checkout.init();
+    await checkout.addEncryptedRemote();
+    const failedCheckoutStages = [];
+    await assert.rejects(checkout.fetchForCheckout({ remote: "origin", branch: "missing-progress-branch", onSyncProgress: (event) => failedCheckoutStages.push(event) }));
+    assert.equal(failedCheckoutStages.at(-1)?.phase, "failed");
+    const cancelCheckout = new AbortController();
+    const cancelledCheckoutStages = [];
+    await assert.rejects(checkout.fetchForCheckout({ remote: "origin", branch: "main", signal: cancelCheckout.signal,
+      onSyncProgress: (event) => cancelledCheckoutStages.push(event),
+      onProgress: (event) => { if (event.direction === "download" && event.transferredBytes > 256 * 1024) cancelCheckout.abort(); },
+    }), { name: "AbortError" });
+    assert.equal(cancelledCheckoutStages.at(-1)?.phase, "cancelled");
+    assert.equal((await checkout.repositoryMetadata()).current_head, null, "cancelled preparation moved HEAD");
+    assert.throws(() => readFileSync(join(worktrees.get(checkout), "attachment.bin")), { code: "ENOENT" });
+    await observed("checkout-fetch", "download", (onProgress, onSyncProgress) => checkout.fetchForCheckout({ remote: "origin", branch: "main", onProgress, onSyncProgress }));
+    assert.equal((await checkout.repositoryMetadata()).current_head, null, "preparation moved HEAD");
+    assert.throws(() => readFileSync(join(worktrees.get(checkout), "attachment.bin")), { code: "ENOENT" }, "preparation wrote worktree");
+    const checkoutPlan = await checkout.planMerge({ revision: "origin/main" });
+    await checkout.applyMerge({ revision: "origin/main", planToken: checkoutPlan.plan_token });
+    assert.deepEqual(readFileSync(join(worktrees.get(checkout), "attachment.bin")), payload);
     const requests = JSON.parse(readFileSync(capture));
     assert.ok(requests.some((request) => request.path.includes(mode === "aggregate" && process.env.GRAFT_PROGRESS_SYNC === "0" ? "/e2ee/receive-bundle/" : mode === "multipart" ? "/multipart-part/" : "/raw-if-not-exists/e2ee/files/")), `missing ${mode} transport`);
   } finally {

@@ -1223,6 +1223,8 @@ export class RepositorySession {
   removeRemote(name: string, options?: OperationOptions): Promise<{ removed: boolean }>
   push(options?: RemoteOperationOptions): Promise<GraftJson>
   fetch(options?: RemoteOperationOptions): Promise<GraftJson>
+  /** Fetch external files and target SQLite pages with one download budget. Does not move HEAD/index or replace worktree files. */
+  fetchForCheckout(options: RemoteOperationOptions & { remote: string; branch: string }): Promise<GraftJson>
   pull(options?: RemoteOperationOptions): Promise<GraftJson>
   getMergePolicy(options?: OperationOptions): Promise<MergePolicyResult>
   validateMergePolicy(

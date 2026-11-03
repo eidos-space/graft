@@ -447,6 +447,10 @@ enum JsonOperation {
         remote: Option<String>,
         branch: Option<String>,
     },
+    FetchForCheckout {
+        remote: String,
+        branch: String,
+    },
     Pull {
         remote: Option<String>,
         branch: Option<String>,
@@ -949,6 +953,9 @@ impl JsonTask {
             }
             JsonOperation::Fetch { remote, branch } => {
                 self.session.fetch(remote.as_deref(), branch.as_deref())
+            }
+            JsonOperation::FetchForCheckout { remote, branch } => {
+                self.session.fetch_for_checkout(remote, branch)
             }
             JsonOperation::Pull { remote, branch } => {
                 self.session.pull(remote.as_deref(), branch.as_deref())
@@ -1742,6 +1749,24 @@ impl NodeRepositorySession {
         json_task_with_sync_progress(
             self,
             JsonOperation::Fetch { remote, branch },
+            signal,
+            progress,
+            sync_progress,
+        )
+    }
+
+    #[napi]
+    pub fn fetch_for_checkout(
+        &self,
+        remote: String,
+        branch: String,
+        signal: Option<AbortSignal>,
+        progress: Option<TransferProgressCallback>,
+        sync_progress: Option<SyncProgressCallback>,
+    ) -> AsyncTask<JsonTask> {
+        json_task_with_sync_progress(
+            self,
+            JsonOperation::FetchForCheckout { remote, branch },
             signal,
             progress,
             sync_progress,

@@ -326,11 +326,21 @@ async fn multipart_restarts_reuse_original_ciphertext_skip_received_parts_and_re
     let retry = prepare(&next, staging.path()).await;
     assert_ne!(retry.ciphertext_sha256(), &digest);
     let remote = client(&server.url, next.clone());
+    let preparation = remote
+        .prepare_object_multipart(&retry, provider.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        preparation.remaining_bytes().unwrap(),
+        original.ciphertext_length() - 128
+    );
+    assert_eq!(
+        server.state.lock().unwrap().sent_parts,
+        vec![1],
+        "planning must not send a part"
+    );
     assert!(matches!(
-        remote
-            .publish_object_multipart(&retry, provider.clone(), staging.path())
-            .await
-            .unwrap(),
+        preparation.publish(&remote, staging.path()).await.unwrap(),
         ObjectPublicationOutcome::Reused
     ));
     {

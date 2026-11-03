@@ -97,18 +97,27 @@ pub(super) fn run_repo_clone(
                 .remote_default_branch(remote_name)?
                 .unwrap_or(repo.default_branch()?),
         };
-        let clone_fetch = repo.fetch_for_clone(remote_name, &branch)?;
-        let fetch = &clone_fetch.fetch;
+        let prepared = repo.prepare_fetch(remote_name, &branch)?;
+        let download_checkout = repo.plan_revision_checkout(prepared.head())?;
+        file.attach_repo(repo.clone())?;
+        attached = true;
+        let runtime = file.runtime().clone();
+        let remote = prepared.remote();
+        let snapshots = download_checkout
+            .files
+            .values()
+            .map(|state| state.snapshot.to_snapshot())
+            .collect::<Vec<_>>();
+        let downloads = runtime.prepare_snapshot_download(&snapshots, remote.clone())?;
+        prepared.plan_download(&downloads.requests())?;
+        runtime.execute_snapshot_download(downloads, remote.clone())?;
+        let fetch = prepared.finish()?;
         repo.branch_create(
             &branch,
             Some(&format!("refs/remotes/{remote_name}/{branch}")),
         )?;
         repo.set_branch_upstream(&branch, remote_name, &branch)?;
         let plan = repo.plan_switch_branch(&branch)?;
-        file.attach_repo(repo.clone())?;
-        attached = true;
-        let runtime = file.runtime().clone();
-        let remote = clone_fetch.remote();
         let plan = prepare_repo_checkout_plan(&runtime, &plan, Some(remote.clone()))?;
         let previous_files = BTreeMap::new();
         let previous_artifacts = BTreeMap::new();

@@ -1214,6 +1214,31 @@ fn planned_download_has_a_fixed_total_and_invalidates_unplanned_requests() {
     assert!(!events.lock().unwrap().last().unwrap().total_is_final);
 }
 
+#[cfg(feature = "e2ee")]
+#[test]
+fn download_schedule_counts_duplicate_headers_and_rejects_same_length_unplanned_ranges() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = events.clone();
+    let reporter = TransferProgressReporter::new(move |event| sink.lock().unwrap().push(event));
+    with_transfer_progress(&reporter, || {
+        plan_download_requests(vec![("opaque".into(), 0..72), ("opaque".into(), 0..72)]);
+        for _ in 0..2 {
+            let total = claim_download_request("opaque", &(0..72));
+            assert_eq!(total, Some(72));
+            let mut body = begin_transfer_progress(TransferDirection::Download, total).unwrap();
+            body.advance(72);
+        }
+        assert!(final_transfer_plan(TransferDirection::Download));
+        // Same byte count cannot authorize a different object or a retry.
+        assert_eq!(claim_download_request("another-opaque", &(0..72)), None);
+        assert!(!final_transfer_plan(TransferDirection::Download));
+    });
+    let events = events.lock().unwrap();
+    assert!(events.iter().any(|event| event.total_bytes == Some(144)));
+    assert_eq!(events.last().unwrap().transferred_bytes, 144);
+    assert!(!events.last().unwrap().total_is_final);
+}
+
 #[test]
 fn transfer_progress_coalesces_short_transfers_and_flushes_the_aggregate_total() {
     let events = Arc::new(Mutex::new(Vec::new()));
@@ -1223,7 +1248,7 @@ fn transfer_progress_coalesces_short_transfers_and_flushes_the_aggregate_total()
     });
 
     with_transfer_progress(&reporter, || {
-        declare_transfer_progress_total(TransferDirection::Upload, 100_000);
+        plan_remaining_transfer(TransferDirection::Upload, 100_000);
         for _ in 0..10_000 {
             let mut upload = begin_transfer_progress(TransferDirection::Upload, Some(10)).unwrap();
             upload.advance(10);
