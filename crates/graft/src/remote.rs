@@ -6322,6 +6322,16 @@ mod tests {
 
     #[tokio::test]
     async fn http_remote_range_probe_does_not_read_a_full_segment() {
+        range_probe_release_case(1, false).await;
+        range_probe_release_case(64 * 1024, false).await;
+    }
+
+    #[tokio::test]
+    async fn http_remote_range_probe_release_check_rejects_a_retained_response() {
+        range_probe_release_case(1, true).await;
+    }
+
+    async fn range_probe_release_case(prefix_bytes: usize, retain_response: bool) {
         const LARGE_SEGMENT_BYTES: usize = 16 * 1024 * 1024;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -6342,30 +6352,82 @@ mod tests {
                 "HTTP/1.1 200 OK\r\nGraft-Protocol: 1\r\nContent-Length: {LARGE_SEGMENT_BYTES}\r\n\r\n"
             );
             get_stream.write_all(headers.as_bytes()).await.unwrap();
-            get_stream.write_all(&[7]).await.unwrap();
+            // An ignored Range can leave unread body bytes in the TCP receive
+            // buffer. Dropping that response may reset rather than FIN the peer.
+            if let Err(error) = get_stream.write_all(&vec![7; prefix_bytes]).await {
+                assert!(
+                    matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+                    ),
+                    "writing probe prefix: {error}"
+                );
+            }
 
             let mut buffer = [0_u8; 1];
-            let released = matches!(
-                tokio::time::timeout(Duration::from_secs(2), get_stream.read(&mut buffer)).await,
-                Ok(Ok(0))
-            );
-            (request, released)
+            let release_result =
+                tokio::time::timeout(Duration::from_secs(2), get_stream.read(&mut buffer)).await;
+            (request, release_result)
         });
         let remote = HttpRemote::new(format!("http://{address}/org/repo"), None).unwrap();
 
-        let exists = tokio::time::timeout(Duration::from_secs(1), remote.has_raw("segments/large"))
-            .await
-            .expect("range probe waited for the full segment")
-            .unwrap();
-        assert!(exists);
+        // Negative control: deliberately keep an incomplete GET response alive.
+        // It must time out at the peer, not be mistaken for a released socket.
+        let retained = if retain_response {
+            let head = remote
+                .probe_request(
+                    reqwest::Method::HEAD,
+                    remote.raw_url("raw", "segments/large"),
+                )
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(head.status().as_u16(), 405);
+            drop(head);
+            Some(
+                remote
+                    .probe_request(
+                        reqwest::Method::GET,
+                        remote.raw_url("raw", "segments/large"),
+                    )
+                    .header(reqwest::header::RANGE, "bytes=0-0")
+                    .send()
+                    .await
+                    .unwrap(),
+            )
+        } else {
+            let exists =
+                tokio::time::timeout(Duration::from_secs(1), remote.has_raw("segments/large"))
+                    .await
+                    .expect("range probe waited for the full segment")
+                    .unwrap();
+            assert!(exists);
+            None
+        };
 
-        let (request, released) = server.await.unwrap();
+        let (request, release_result) = server.await.unwrap();
+        eprintln!(
+            "range probe release prefix={prefix_bytes} retained={retain_response}: {release_result:?}"
+        );
         assert!(
             String::from_utf8_lossy(&request)
                 .lines()
                 .any(|line| line.eq_ignore_ascii_case("Range: bytes=0-0"))
         );
-        assert!(released, "range probe response body was not released");
+        if retain_response {
+            assert!(
+                release_result.is_err(),
+                "retained response unexpectedly closed: {release_result:?}"
+            );
+        } else {
+            let released = matches!(&release_result, Ok(Ok(0)))
+                || matches!(&release_result, Ok(Err(error)) if error.kind() == std::io::ErrorKind::ConnectionReset);
+            assert!(
+                released,
+                "range probe response body was not released: {release_result:?}"
+            );
+        }
+        drop(retained);
     }
 
     #[tokio::test]

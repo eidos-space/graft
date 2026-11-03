@@ -1,7 +1,8 @@
 # Graft Docker releases
 
-## 0.1.0 (unreleased)
+## 0.1.1 (unreleased)
 
+- Verify the remote annotated release tag independently of checkout’s local ref. The failed 0.1.0 tag produced no image or Release.
 - Optional S3-compatible/B2 bucket storage with secret-file credentials; local disk mode remains the default.
 - Personal self-hosted Remote v1 and encrypted sync, with Eidos Lite discovery and management.
 - Secret-file authentication, non-root Compose deployment, persisted SQLite identities and refs.
@@ -9,8 +10,9 @@
 - Explicit rename/delete capabilities, permanent technical names, deletion tombstones and resumable cleanup.
 - Isolated native SDK round trips, fault injection, large attachments, backup and restore validation.
 
-## 0.1.0（未发布）
+## 0.1.1（未发布）
 
+- 独立校验远端 annotated tag，兼容 checkout 展开本地 tag 的行为；失败的 0.1.0 tag 未产生镜像或 Release。
 - 可选 S3 兼容/B2 bucket 存储与秘密文件凭证，本地磁盘仍为默认模式。
 - 个人自托管 Remote v1 和加密同步，包含 Lite 服务发现与仓库管理。
 - 秘密文件认证、非 root Compose 部署、SQLite 持久身份及引用。

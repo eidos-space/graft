@@ -1376,9 +1376,14 @@ mod tests {
         let original = fs::read(&path).unwrap();
         for index in [0, 40, 126, 278, 310] {
             let mut bytes = original.clone();
-            bytes[index] = 255;
+            // Config and digest bytes are randomized and may already be 255.
+            bytes[index] ^= 1;
+            assert_ne!(bytes[index], original[index]);
             fs::write(&path, bytes).unwrap();
-            assert!(FileInitializationJournal::open(directory.path(), &binding()).is_err());
+            assert!(
+                FileInitializationJournal::open(directory.path(), &binding()).is_err(),
+                "corruption at byte {index} was accepted"
+            );
         }
         let mut bytes = original.clone();
         bytes[40] = InitializationStage::Connected as u8;

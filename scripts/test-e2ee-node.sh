@@ -19,6 +19,9 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
 fi
 GRAFT_E2EE_NODE_TEST_BINDING="$task_directory/graft-sdk.node" \
   cargo test -p graft-sdk --features e2ee --test e2ee_node --locked -- --ignored
+GRAFT_SDK_NATIVE_PATH="$task_directory/graft-sdk.node" \
+  GRAFT_PROGRESS_MODES=object GRAFT_PROGRESS_CACHED_RETRY=1 \
+  node tests/e2ee/node-transfer-progress.mjs
 GRAFT_SDK_NATIVE_PATH="$task_directory/graft-sdk.node" pnpm --dir packages/graft-sdk test
 cargo build -p graft-sdk-node --locked
 cp "$target_dir/debug/$library" "$task_directory/graft-sdk-plain.node"

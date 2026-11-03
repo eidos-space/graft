@@ -9,6 +9,9 @@ concurrency:
   cancel-in-progress: false
 jobs:
   gate:
+    permissions:
+      contents: read
+      pull-requests: read
     runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -16,6 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
+          ref: ${{ github.ref }}
           fetch-depth: 0
           persist-credentials: false
       - id: version
@@ -26,7 +30,11 @@ jobs:
           version=$(cat services/graft-remote-docker/VERSION)
           test "$GITHUB_REF_NAME" = "graft-docker-v$version"
           [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
-          test "$(git cat-file -t "$GITHUB_REF_NAME")" = tag
+          # checkout may peel its local tag ref to the event commit. Verify the
+          # remote annotated object independently without rewriting either tag.
+          git fetch --no-tags origin "$GITHUB_REF:refs/graft-release/verified-tag"
+          test "$(git cat-file -t refs/graft-release/verified-tag)" = tag
+          test "$(git rev-parse refs/graft-release/verified-tag^{commit})" = "$GITHUB_SHA"
           git merge-base --is-ancestor "$GITHUB_SHA" origin/main
           gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" > /tmp/prs.json
           jq -e --arg sha "$GITHUB_SHA" 'any(.[]; .merged_at != null and .base.ref == "main" and .merge_commit_sha == $sha)' /tmp/prs.json
