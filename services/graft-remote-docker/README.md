@@ -156,8 +156,10 @@ revision, then run `docker compose build --pull` and
 until verified. Schema version 4 is checked on startup; unknown versions fail
 closed. A rollback that crosses a storage migration requires restoring the
 matching pre-upgrade backup. No image is automatically pulled or published by this
-repository; the Dockerfile builds the protocol engine from the same checkout.
-For repeatable production builds, pin the Node base image to a reviewed digest.
+repository. The Dockerfile installs the published Remote package pinned by
+`REMOTE_VERSION` and verifies its npm archive against `REMOTE_SHA256`. The Node
+base image is pinned to a reviewed digest. Explicit source-candidate tests use
+`GRAFT_REMOTE_SOURCE`; production builds use the published package by default.
 
 ## Verification
 

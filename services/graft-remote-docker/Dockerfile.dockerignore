@@ -13,3 +13,6 @@ packages/graft-remote/dist
 
 !LICENSE-APACHE
 !LICENSE-MIT
+
+!services/graft-remote-docker/REMOTE_VERSION
+!services/graft-remote-docker/REMOTE_SHA256

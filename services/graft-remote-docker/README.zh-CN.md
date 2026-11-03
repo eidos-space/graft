@@ -139,8 +139,9 @@ docker compose up -d --wait
 `docker compose build --pull` 和 `docker compose up -d --force-recreate --wait`。
 验证前保留旧镜像和备份。启动会检查存储版本 4，遇到未知版本拒绝运行。
 跨存储迁移的回滚需要恢复匹配的升级前备份。仓库不自动拉取或发布服务镜像，
-Dockerfile 从同一源码检出构建协议引擎。生产环境需要可重复构建时，将 Node
-基础镜像固定到审核过的 digest。
+Dockerfile 默认安装 `REMOTE_VERSION` 固定的正式 npm Remote 包，并按
+`REMOTE_SHA256` 校验归档。Node 基础镜像已固定到审核过的 digest。
+只有显式指定 `GRAFT_REMOTE_SOURCE` 的候选测试才从源码构建协议引擎。
 
 ## 验证
 

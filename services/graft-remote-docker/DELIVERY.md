@@ -257,3 +257,22 @@ The Docker release workflow independently repeats public-SDK verification on eac
 native architecture **before** pushing its image. Both architecture jobs must
 succeed before the manifest and GitHub release are created. Baseline source SDK
 CI does not satisfy the public-SDK proof gate. No dispatch has been requested yet.
+
+## Published Remote 0.2.6 consumption
+
+Merged main `91c15f85` (the formal Remote release source). Docker now defaults to
+installing the actual public npm Remote 0.2.6 archive, pinned by REMOTE_VERSION and
+SHA-256 `83b978c38d7d55fecb7519486d0063926ff3c16d8507ca9f456ba43cdc71830b`
+in REMOTE_SHA256. The build fails on archive mismatch. Source candidate builds
+remain explicit via GRAFT_REMOTE_SOURCE and are not the production default.
+
+16 service tests passed after merging. The lightweight actual container run with
+published Remote (no SDK or large-data work) exited 0, including real proof HTTP,
+persisted corruption/truncation, deletion restart and backup/restore. Log:
+`/tmp/graft-docker-public-remote026.log`; image `sha256:80f2ab1abff31a87ce56c2b3f7cebce6520108b1445af9c038ec14d42f759710`. This proves published
+Remote consumption, not the still-pending public SDK Linux proof gate.
+
+Historical a988df00 baseline CI: both native Docker jobs, docs and performance
+passed; Windows transfer-progress cancellation test failed. Its failure log is
+`/tmp/graft-docker-windows-ci.log`; new main contains the reviewed SDK/test changes
+and the merged final head requires fresh CI rather than dismissing that failure.

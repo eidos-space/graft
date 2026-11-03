@@ -48,7 +48,7 @@ if (process.env.GRAFT_REMOTE_SOURCE) {
   const servicePath = join(sourceContext, "services/graft-remote-docker");
   mkdirSync(servicePath, { recursive: true });
   for (const file of readdirSync("services/graft-remote-docker").filter(
-    (file) => file.endsWith(".mjs") || file.startsWith("Dockerfile"),
+    (file) => file.endsWith(".mjs") || file.startsWith("Dockerfile") || ["REMOTE_VERSION", "REMOTE_SHA256"].includes(file),
   ))
     cpSync(join("services/graft-remote-docker", file), join(servicePath, file));
   console.log(
@@ -65,7 +65,7 @@ writeFileSync(
     services: {
       graft: {
         image: process.env.GRAFT_TEST_IMAGE ?? `${project}:local`,
-        ...(sourceContext ? { build: { context: sourceContext } } : {}),
+        ...(sourceContext ? { build: { context: sourceContext, args: { GRAFT_REMOTE_BUILD: "source" } } } : {}),
         healthcheck: { interval: "1s", start_period: "1s" },
       },
     },
