@@ -287,3 +287,14 @@ Release assets now include `compose.s3.yaml` and `env.s3.example`. The publisher
 runs the full public-SDK fault matrix in both modes on native Linux AMD64/ARM64
 before pushing each architecture image. Real B2 testing requires a dedicated
 nonproduction bucket/prefix and credentials; no existing bucket has been used.
+
+## Publisher recovery: Docker 0.1.1
+
+The 0.1.0 publisher (run 41647425730) failed before image builds because checkout
+peeled its local annotated tag. The remote 0.1.0 tag remains unchanged and has no
+published artifacts. Version 0.1.1 verifies a fresh remote tag object in a separate
+ref, including its peeled commit, and grants the gate read access to PR metadata.
+Product runtime, public Remote/SDK pins and Docker image inputs remain identical
+to PR #45 merge d658fdee30405c5c8f5fe186703eb2610f588c9c. Its public native Linux
+local/S3 gate run 41645977339 passed all 32 scenarios; real R2 evidence above
+remains applicable. The recovery release must use its own merged PR and new tag.
