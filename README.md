@@ -94,6 +94,7 @@ port and print the URL without opening a browser.
 | [CLI](https://graft.eidos.space/docs/quickstart/cli/) | Evaluation, scripts, agents, and one-shot commands |
 | [Structured JSON output](https://graft.eidos.space/docs/reference/json-output/) | Stable application and automation boundaries |
 | [Node.js SDK](https://graft.eidos.space/docs/sdk/) | Long-lived, in-process repository sessions |
+| [Docker self-hosted server](services/graft-remote-docker/README.md) | Personal server with Lite discovery, repository management and encrypted sync |
 | [Remote service packages](https://graft.eidos.space/docs/remotes/) | Hosting the Graft HTTP remote protocol |
 
 Install the Node.js SDK with:

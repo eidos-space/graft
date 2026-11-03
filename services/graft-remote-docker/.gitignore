@@ -1,0 +1,6 @@
+/secrets/
+/.env
+/backups/
+/node_modules/
+/.env.*
+!/.env.s3.example

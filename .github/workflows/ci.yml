@@ -167,6 +167,9 @@ jobs:
       - name: Native client and actual TypeScript protocol handler
         run: pnpm test:e2ee-interop
 
+      - name: Test HTTP fixture process lifecycle
+        run: node --test tests/e2ee/child-process-lifecycle.test.mjs
+
       - name: Encrypted pack budgets and aggregate adversarial regressions
         run: cargo test -p graft --features e2ee --test e2ee_pack_sync --locked -- --ignored --test-threads=1
 

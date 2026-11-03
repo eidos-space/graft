@@ -14,6 +14,7 @@ import { DatabaseSync } from "node:sqlite";
 import { Transform } from "node:stream";
 import { setTimeout as delay } from "node:timers/promises";
 import { exerciseFileOnly, exerciseUploadBudgetOverflow } from "./node-file-only-progress.mjs";
+import { stopChildProcess } from "./child-process-lifecycle.mjs";
 
 const require = createRequire(import.meta.url);
 const { EncryptedRemoteSession, RepositorySession } = require("../../packages/graft-sdk");
@@ -35,10 +36,10 @@ async function scenario(mode) {
   const capture = join(directory, `${mode}-capture.json`);
   writeFileSync(fixture, JSON.stringify({
     encryption: { profile: "encrypted-remote-v1", version: 1, suite: 1, uuid },
-    objects: [], serviceLifetimeMs: 180000,
+    objects: [], serviceLifetime: "parent",
     ...(mode === "multipart" ? { enableMultipart: true, maxRequestBytes: 1024 * 1024, multipartPartBytes: 512 * 1024 } : {}),
   }));
-  const service = spawn(process.execPath, ["tests/e2ee/remote-service.mjs", fixture, capture], { stdio: ["ignore", "pipe", "inherit"] });
+  const service = spawn(process.execPath, ["tests/e2ee/remote-service.mjs", fixture, capture], { stdio: ["ignore", "pipe", "inherit", "ipc"] });
   const lines = createInterface({ input: service.stdout });
   const ready = JSON.parse((await once(lines, "line"))[0]);
   const upstream = new URL(ready.enrollmentUrl).origin;
@@ -315,8 +316,7 @@ async function scenario(mode) {
     for (const value of authorities) await value.disconnect();
     proxy.closeAllConnections();
     await new Promise((resolve) => proxy.close(resolve));
-    service.kill();
-    await once(service, "exit");
+    await stopChildProcess(service);
     lines.close();
   }
 }

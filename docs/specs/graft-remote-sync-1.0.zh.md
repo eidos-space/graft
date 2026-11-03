@@ -255,3 +255,43 @@ ordering/concurrency、pull=fetch+merge、clone safety 和 publication uncertain
 - Optional aggregate operation 必须保留 raw/list/CAS fallback。
 - V1 upload bundle 列举全部 immutable key；reachability negotiation 留待后续。
 - HTTP/fs/S3 内部 transaction 可不同，但 publication 语义必须相同。
+
+### 个人 Docker 部署配置
+
+`services/graft-remote-docker` 将本协议映射到本地 SQLite 数据库及不可变 multipart 文件。
+仓库操作必须认证，不得隐式创建未知仓库。管理 API 在 `personal` 命名空间中
+显式创建仓库；重复创建必须保留原加密 UUID，必须拒绝加密类型变更。
+发现 URL 必须来自配置的公开 origin，不得使用不可信转发头。访问密钥由
+秘密文件作为适配器输入加载，不存入仓库数据。
+
+服务实现[部署指南](../../services/graft-remote-docker/README.zh-CN.md)记录的
+个人管理契约。管理和健康接口属于宿主 API，不扩展 Remote v1。
+只声明已实现的协议能力，支持持久化 multipart，单请求限制为 64 MiB。
+对象原子创建和引用比较使用 SQLite 语句；每个本地卷只支持一个服务实例，
+不支持分布式存储。可执行证据位于 `services/graft-remote-docker/test`。
+
+Docker 管理配置必须先持久化删除墓碑再受理删除，拒绝新的仓库操作，并等待已
+准入的响应/校验读取结束后再清理。技术名称和 URL 不得复用；重复删除观察同一
+持久状态。清理失败必须保留 deleting，重启必须恢复清理。multipart 文件及目录
+必须先完成同步，才能发布 SQLite 指针。进程崩溃测试不代表任意断电安全证明。
+可选对象校验回调必须散列实际准入的持久快照，不得使用上传期摘要；挑战编码和
+能力语义由共享 E2EE 协议拥有。
+
+#### 可选的 S3 兼容对象存储
+
+Docker profile 可以把不可变对象内容存入 S3 兼容 bucket。SQLite 仍是仓库目录、
+身份、可变引用/配置和发布索引的权威来源。必须在远端上传成功并再次确认仓库为
+active 后才能发布对象指针。中断或结果未知的上传不得隐式发布引用；为重试保留的
+本地临时分片不构成远端发布成功的证据。
+
+数据目录必须绑定后端身份（模式、endpoint、region、bucket、prefix），配置变化
+必须拒绝，不能把缺失数据当作空仓库。绑定信息不得包含凭证。此 profile 不提供
+自动迁移，也不通过共享 bucket 实现多实例协调。
+
+proof 必须从实际远端对象快照流式读取内容并绑定已验证的挑战前缀，长度变化必须
+拒绝。删除必须保留仓库墓碑和待清理记录，直到已拥有的远端对象被移除；远端故障
+必须可重试。版本化 bucket 必须删除所属对象版本，不能只添加删除标记。提供商的
+保留策略可能阻止清理，这种情况不得报告删除成功。
+
+备份恢复需要本地控制状态和对应 bucket 数据。进程退出遗留的 S3 multipart 会话
+可能需要提供商生命周期规则清理，但规则不得让仍在使用的不可变对象过期。

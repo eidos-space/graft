@@ -1,0 +1,28 @@
+services:
+  graft:
+    build:
+      context: ../..
+      dockerfile: services/graft-remote-docker/Dockerfile
+    image: graft-remote-local:latest
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    environment:
+      GRAFT_PUBLIC_ORIGIN: ${GRAFT_PUBLIC_ORIGIN:-http://127.0.0.1:8787}
+      GRAFT_ACCESS_KEY_FILE: /run/secrets/graft_access_key
+    secrets:
+      - graft_access_key
+    volumes:
+      - graft_data:/data
+    ports:
+      - "127.0.0.1:${GRAFT_PORT:-8787}:8787"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 1g
+    pids_limit: 100
+secrets:
+  graft_access_key:
+    file: ./secrets/access-key
+volumes:
+  graft_data:

@@ -1,6 +1,6 @@
 # Releasing Graft
 
-Graft has three independent release trains:
+Graft has four independent release trains:
 
 - [`.github/workflows/cli-release.yml`](.github/workflows/cli-release.yml)
   publishes the `graft` CLI from annotated `vX.Y.Z` tags.
@@ -9,6 +9,9 @@ Graft has three independent release trains:
 - [`.github/workflows/remote-release.yml`](.github/workflows/remote-release.yml) validates and
   publishes the framework-neutral, Hono, and Cloudflare Remote packages from annotated
   `graft-remote-vX.Y.Z` tags.
+
+- [`.github/workflows/docker-release.yml`](.github/workflows/docker-release.yml) publishes
+  the self-hosted server to GHCR and GitHub Release from `graft-docker-vX.Y.Z` tags.
 
 Every release goes through a PR targeting `main`. All release tag types must
 point to that PR's exact merge commit, reachable from `origin/main`. Never
@@ -234,3 +237,25 @@ allowed action: npm publish
 Then delete `NPM_TOKEN` from the GitHub `npm` environment. If a Remote release stops partway, do
 not move or recreate the tag. Re-run the unchanged workflow: it verifies the same release archives,
 skips versions already visible on npm, and publishes only missing packages.
+
+## Docker server release (independent train)
+
+The Docker server uses `services/graft-remote-docker/VERSION` and annotated
+`graft-docker-vX.Y.Z` tags, with `.github/workflows/docker-release.yml`. These tags
+do not match the CLI, SDK or Remote publisher patterns. Prepare a release PR to
+`main`, run the native AMD64/ARM64 container checks, and wait for the coordinated
+Remote/SDK/Lite acceptance before tagging its exact merge commit.
+
+The publisher requires the formal Remote and SDK versions in `REMOTE_VERSION`
+and `SDK_VERSION` to be public. Each native runner tests the built image using the
+public SDK before pushing its architecture digest to GHCR. The manifest combines
+those tested digests; GitHub Release includes digest-pinned Compose, source commit,
+image metadata and checksums. GHCR must allow anonymous pulls (the initial package
+may need its visibility configured). Never substitute a cross-build for execution
+or a development native override for a published SDK.
+
+For partial publication, preserve version/commit/digests. Already-published
+architecture images are reused only when their source commit matches. Existing
+manifests may be reused only with exactly matching child digests. Do not move tags
+or overwrite a manifest to repair a release; resolve the failing visibility/test
+or artifact step against the same candidate, or release a new version.

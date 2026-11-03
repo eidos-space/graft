@@ -65,3 +65,11 @@ Remote credentials are explicit client or adapter inputs. Do not store bearer
 tokens in repository config, remote URLs, logs, caches, or result payloads.
 Production HTTP remotes should use HTTPS and enforce repository-level access
 for every discovery, read, and write operation.
+
+## Docker self-hosting
+
+For a personal server with Eidos Lite discovery and repository management, use
+[the Docker and Compose deployment guide](https://github.com/eidos-space/graft/tree/b4ba05f2682efa6a8db156922f6463722b94c630/services/graft-remote-docker).
+It includes persistent SQLite storage, access-key files, HTTPS reverse proxy,
+backup/restore and isolated encrypted SDK tests. It is a single-instance service
+with a 64 MiB request limit and durable multipart uploads.
