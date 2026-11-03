@@ -552,4 +552,11 @@ server.listen(0, "127.0.0.1", () =>
   ),
 );
 // Prevent a failed parent test from leaving an orphaned loopback listener.
-setTimeout(shutdown, fixture.serviceLifetimeMs ?? 120000).unref();
+// Long, throttled tests own their service through IPC, not an independent wall
+// clock that may expire while the parent is still exercising the SDK.
+if (fixture.serviceLifetime === "parent") {
+  if (!process.connected) throw new Error("Parent-owned service requires IPC");
+  process.once("disconnect", shutdown);
+} else {
+  setTimeout(shutdown, fixture.serviceLifetimeMs ?? 120000).unref();
+}
