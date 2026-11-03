@@ -241,7 +241,22 @@ try {
       "Run candidate tests separately from the released SDK pass",
     );
     const { candidateRoundTrips } = await import("./candidate-smoke.mjs");
-    await candidateRoundTrips({ origin, token, request, restart });
+    const corruptCiphertext = (repository, path) => {
+      const script = `
+        const {DatabaseSync}=await import('node:sqlite');
+        const fs=await import('node:fs');
+        const db=new DatabaseSync('/data/graft.sqlite',{readOnly:true});
+        const row=db.prepare('SELECT file,size FROM objects WHERE repository=? AND path=?').get(process.argv[1],process.argv[2]);
+        if(!row?.file || row.size<=256) throw Error('Expected persisted multipart ciphertext');
+        const fd=fs.openSync('/data/blobs/'+row.file,'r+');
+        const b=Buffer.alloc(1); fs.readSync(fd,b,0,1,256); b[0]^=255;
+        fs.writeSync(fd,b,0,1,256); fs.fsyncSync(fd);
+        if(fs.fstatSync(fd).size!==row.size) throw Error('Length changed');
+        fs.closeSync(fd); db.close();
+        console.log(JSON.stringify({size:row.size,offset:256}));`;
+      return JSON.parse(compose("exec", "-T", "graft", "node", "--input-type=module", "-e", script, repository, path));
+    };
+    await candidateRoundTrips({ origin, token, request, restart, corruptCiphertext });
   }
   if (process.env.GRAFT_LITE_CLIENT_PATH) {
     const output = execFileSync("bun", ["services/graft-remote-docker/test/lite-client.mjs"], {

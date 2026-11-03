@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
-import { readFile, writeFile, mkdtemp, rm } from "node:fs/promises";
+import { readFile, writeFile, mkdtemp, rm, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawn } from "node:child_process";
@@ -27,7 +27,20 @@ const root = await mkdtemp(join(tmpdir(), "graft-docker-candidate-"));
 const identity = { name: "Docker candidate test", email: "test@example.invalid" };
 const summaries = [];
 
-export async function candidateRoundTrips({ origin, token, request, restart }) {
+async function ciphertextSpools(directory) {
+  const paths = await readdir(directory, { recursive: true }).catch((error) => {
+    if (error.code === "ENOENT") return [];
+    throw error;
+  });
+  const result = [];
+  for (const path of paths.filter((path) => path.endsWith("/ciphertext")).sort()) {
+    const bytes = await readFile(join(directory, path));
+    result.push({ path, bytes: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex") });
+  }
+  return result;
+}
+
+export async function candidateRoundTrips({ origin, token, request, restart, corruptCiphertext }) {
   async function scenario(fault) {
     const multipartFault = ["interrupt-multipart-part", "lost-multipart-complete"].includes(fault);
     const name = `candidate-${randomUUID().slice(0, 8)}`;
@@ -152,6 +165,8 @@ export async function candidateRoundTrips({ origin, token, request, restart }) {
         if (failed) assert.ok(!phases.includes("completed"));
       }
       const firstAttempt = proxy.records.slice(start);
+      const retainedSpools = multipartFault ? await ciphertextSpools(options.recoveryDirectory) : [];
+      if (multipartFault) assert.ok(retainedSpools.some((spool) => spool.bytes >= payload.length));
       if (multipartFault) {
         assert.ok(firstAttempt.some((row) => fault === "interrupt-multipart-part"
           ? row.truncated && row.path.includes("/multipart-part/")
@@ -197,6 +212,27 @@ export async function candidateRoundTrips({ origin, token, request, restart }) {
       authority = new EncryptedRemoteSession({ ...options, createCheckpoint: false });
       await authority.unlock(Buffer.from(password));
       source = await RepositorySession.open(sourcePath, { encryptedRemote: authority, identity });
+      let corruptionRejected = false;
+      if (fault === "lost-multipart-complete") {
+        const complete = firstAttempt.find((row) => row.responseLost && row.path.includes("/multipart-complete/"));
+        const key = complete.path.split("/multipart-complete/")[1];
+        const damage = corruptCiphertext(name, key);
+        assert.ok(damage.size > payload.length);
+        const badStart = proxy.records.length;
+        await assert.rejects(source.pushInitialBranch());
+        const badRequests = proxy.records.slice(badStart);
+        assert.ok(badRequests.some((row) => row.path.includes("/e2ee/object-proof/") && row.status === 200));
+        assert.equal(badRequests.some((row) => ["POST", "PUT"].includes(row.method) && /\/e2ee\/(refs|head)\//.test(row.path)), false);
+        assert.equal(badRequests.filter(payloadRead).length, 0);
+        assert.deepEqual(await ciphertextSpools(options.recoveryDirectory), retainedSpools);
+        await source.close();
+        await authority.disconnect();
+        corruptCiphertext(name, key); // Restore the exact byte; preserve size and immutable identity.
+        authority = new EncryptedRemoteSession({ ...options, createCheckpoint: false });
+        await authority.unlock(Buffer.from(password));
+        source = await RepositorySession.open(sourcePath, { encryptedRemote: authority, identity });
+        corruptionRejected = true;
+      }
       const retryStart = proxy.records.length;
       const result = await source.pushInitialBranch();
       assert.equal(result.state, "connected");
@@ -205,6 +241,7 @@ export async function candidateRoundTrips({ origin, token, request, restart }) {
         assert.equal(proxy.records.slice(retryStart).filter(payloadRead).length, 0);
       if (multipartFault) assert.ok(proxy.records.slice(retryStart).some((row) =>
         row.path.includes("/e2ee/object-proof/") && row.status === 200 && !row.responseLost));
+      if (multipartFault) assert.deepEqual(await ciphertextSpools(options.recoveryDirectory), []);
       const repeat = await source.pushInitialBranch();
       assert.equal(repeat.push.commits, 0);
       assert.equal((await source.repositoryMetadata()).current_head, commit);
@@ -270,6 +307,10 @@ export async function candidateRoundTrips({ origin, token, request, restart }) {
         fault,
         aggregateFallback: fault !== "none",
         injected: proxy.injected,
+        corruptionRejected,
+        retainedSpoolBytes: retainedSpools.reduce((sum, spool) => sum + spool.bytes, 0),
+        spoolPreservedAfterFailure: multipartFault ? true : null,
+        spoolRemovedAfterConnected: multipartFault ? true : null,
         injectedRequests: initialization.filter((row) => row.truncated || row.responseLost).map((row) =>
           ({ method: row.method, path: row.path, partNumber: row.partNumber, status: row.status, truncated: row.truncated, responseLost: row.responseLost })),
         defaultPayloadReads: initialization.filter(payloadRead).length,
@@ -323,6 +364,8 @@ export async function candidateRoundTrips({ origin, token, request, restart }) {
       "lost-ref-response",
       "server-crash",
       "client-crash",
+      "interrupt-multipart-part",
+      "lost-multipart-complete",
     ])
       await scenario(fault);
     console.log(

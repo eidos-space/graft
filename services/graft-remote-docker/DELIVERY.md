@@ -189,3 +189,54 @@ The latter is not ENOSPC (3.3 GiB free after cleanup) and remains a release bloc
 pending SDK-owner diagnosis/fix. Both original failures and successes are retained
 in the durable evidence directory. Docker local large-data work is stopped so the
 SDK owner can perform its focused investigation without competing disk pressure.
+
+## Replacement candidate 889a: prior recovery blocker resolved
+
+Superseding SDK source: `889a92462d4c8b6564c3da9da3962cc18b884bdb`.
+Native `/tmp/graft-sdk-0.3.39-proof-889a/graft-sdk.darwin-arm64.node`, SHA-256
+`3f1556acacd4bc0094d8be7da45503119359db787424939bcdd746b940fbc628`.
+Old `fd3…` is not a releasable candidate. The new three-scenario run exited 0:
+`/tmp/graft-docker-proof-889a-final.log`, actual ARM64 Docker image
+`sha256:53101d74d7f1482e0582eab05f38f9e176c69f2b33491388646e75dc3da12511`.
+
+- 80 MiB complete-response and first proof-response loss: first attempt failed
+  without publishing refs/HEAD. Persisted ciphertext byte 256 was flipped while
+  preserving its length. Reopened SDK rejected the resulting proof, did not write
+  refs/HEAD, and retained the exact original 83,906,816-byte local ciphertext
+  (same path, size and SHA-256). Restoring the byte and reopening required a new
+  successful proof before Connected. The retained ciphertext was then removed.
+  Payload readback: 0; bounded header probes: 1,156 bytes; proof requests: 3.
+- 80 MiB multipart part-1 truncation: retained original ciphertext, successful
+  proof on recovery, Connected, then spool removal. Payload readback: 0; bounded
+  header probes: 706 bytes; proof requests: 1.
+- 80 MiB normal publication/reopen: payload and header readback both 0; proof
+  requests: 1. Explicit full restore passed.
+
+All three independently cloned correct data and completed bidirectional updates.
+Actual HTTP damage/truncation/deletion and delete-after-restart checks also passed.
+Spool figures above are observed retained files at failure boundaries, not total
+peak disk usage. Normal-case spool lifecycle was not separately sampled.
+Same-hash large-SQLite and five small-object fault cases are being completed
+separately before the final source-candidate handoff.
+
+## Source-candidate acceptance complete (889a)
+
+The same-hash large-SQLite + five small-object fault run exited 0:
+`/tmp/graft-docker-proof-889a-database-faults.log`, ARM64 image `sha256:cdf9412e559c36c0c1bbbe70f500c39ff9988ebd623e8c7b5b65c5f0c607c50c`.
+80 MiB attachment + 80 MiB SQLite: 16 multipart requests, two successful proof
+responses (655 bytes), zero payload/header initialization readback, 9,528 total
+metadata bytes including reopen/repeat confirmation. Independent clone verified
+all BLOB content hashes; explicit full restore and bidirectional updates passed.
+Ordinary upload interruption, lost object response, lost ref response, server
+SIGKILL and client SIGKILL were each actually injected with 2 MiB payloads and all
+recovered with correct clone and updates. Proof HTTP and deletion restart passed.
+
+Docker's functional source-candidate acceptance is now complete for SDK commit
+889a/native3f1556ac. This supersedes the fd3 blocker without rewriting that failure.
+Pending release gates: final PR/CI checks, coordinator-approved Remote/SDK release
+order, then separate public npm SDK and anonymous GHCR digest/Compose validation.
+No public Docker release or production deployment has happened. Tests use actual
+Linux ARM64 Docker and macOS SDK; new-candidate native Linux proof acceptance is
+not inferred from baseline AMD64/ARM64 container CI. The first observed PR
+performance run remains 41614829388; later correctness tests are not performance
+resampling. Final mutable worktree test edits must be committed before release.
