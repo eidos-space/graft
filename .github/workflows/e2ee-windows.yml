@@ -57,6 +57,8 @@ jobs:
         run: |
           pnpm install --frozen-lockfile
           pnpm --filter '@eidos.space/graft-remote' build
+      - name: Test HTTP fixture process lifecycle
+        run: node --test tests/e2ee/child-process-lifecycle.test.mjs
       - name: Native Windows SQLite sync and migration over HTTP
         shell: pwsh
         run: |
