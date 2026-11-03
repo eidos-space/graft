@@ -667,6 +667,33 @@ impl Repository {
         })
     }
 
+    /// Confirm only publication metadata, after a successful ordered push.
+    #[cfg(all(feature = "e2ee", not(target_arch = "wasm32")))]
+    pub fn confirm_initialization(
+        &self,
+        remote: &str,
+        config: &crate::e2ee::EncryptedConfig,
+        intent: &crate::e2ee::InitializationIntent,
+    ) -> Result<()> {
+        let require_source = || -> Result<()> {
+            if self.current_branch()?.as_deref() != Some(intent.branch())
+                || self.branch_target(intent.branch())?.as_deref() != Some(intent.commit())
+            {
+                return Err(crate::remote::RemoteErr::from(
+                    crate::e2ee::EncryptionError::StaleObservation,
+                )
+                .into());
+            }
+            Ok(())
+        };
+        require_source()?;
+        block_on_remote(
+            self.remote_store(remote)?
+                .confirm_initialization(config, intent),
+        )?;
+        require_source()
+    }
+
     /// Publish the exact source retained by a trusted initialization journal.
     /// A changed source fails before discovery and is rechecked after discovery.
     #[cfg(all(feature = "e2ee", not(target_arch = "wasm32")))]

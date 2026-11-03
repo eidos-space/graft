@@ -125,8 +125,17 @@ try {
   initialSource = new RepositorySession(initialSourceDirectory, { encryptedRemote: enrollmentAuthority });
   await initialSource.open();
   const connectedDirectory = join(directory, "initial-connected-verifier");
+  const beforeConfirmation = JSON.parse(readFileSync(capture)).length;
+  const published = await initialSource.pushInitialBranch();
+  assert.equal(published.state, "connected");
+  assert.equal(published.verification, "publication");
+  assert.equal(published.push.commits, 0);
+  assert.equal(existsSync(connectedDirectory), false);
+  const confirmationRequests = JSON.parse(readFileSync(capture)).slice(beforeConfirmation);
+  assert.ok(!confirmationRequests.some(({ path }) => /e2ee\/(files|objects|packs|fetch-bundle)/.test(path)), "confirmation must not read repository payloads");
   const connected = await initialSource.pushInitialBranch({ verificationDirectory: connectedDirectory });
   assert.equal(connected.state, "connected");
+  assert.equal(connected.verification, "full_restore");
   assert.equal(connected.push.commits, 0);
   assert.equal(readFileSync(join(connectedDirectory, "initial-node-private.txt"), "utf8"), "node initial private attachment");
   assert.equal((await initialSource.repositoryMetadata()).current_head, initialHead);

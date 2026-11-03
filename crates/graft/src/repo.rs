@@ -152,6 +152,7 @@ struct TransferProgressDirectionCounters {
 /// never an estimate of elapsed time or overall operation completion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncPhase {
+    Confirming,
     Preparing,
     Uploading,
     Downloading,
@@ -219,10 +220,13 @@ impl TransferProgressReporter {
         if let Some(sync) = &self.inner.sync {
             let mut phase = sync.phase.lock().unwrap();
             // Independent verification contains its own downloads and checkout.
-            if *phase == Some(SyncPhase::Verifying)
+            if matches!(*phase, Some(SyncPhase::Verifying | SyncPhase::Confirming))
                 && !matches!(
                     next,
-                    SyncPhase::Completed | SyncPhase::Failed | SyncPhase::Cancelled
+                    SyncPhase::Confirming
+                        | SyncPhase::Completed
+                        | SyncPhase::Failed
+                        | SyncPhase::Cancelled
                 )
             {
                 return;
@@ -545,6 +549,11 @@ pub(crate) fn claim_download_request(key: &str, range: &std::ops::Range<u64>) ->
 pub fn sync_phase(phase: SyncPhase) {
     let reporter = ACTIVE_TRANSFER_PROGRESS.with(|active| active.borrow().clone());
     if let Some(reporter) = reporter {
+        if phase == SyncPhase::Confirming {
+            // Finish the payload budget before bounded metadata reads can make
+            // the cumulative byte budget indeterminate again.
+            reporter.finish();
+        }
         reporter.phase(phase);
     }
 }

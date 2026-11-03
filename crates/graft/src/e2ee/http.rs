@@ -700,6 +700,51 @@ impl EncryptedHttpClient {
         Ok(())
     }
 
+    /// Confirm publication metadata without downloading repository objects. The
+    /// caller must first complete dependency-before-ref publication. This is not
+    /// a proof of storage durability or of a complete independent restore.
+    pub async fn confirm_initialization(
+        &self,
+        config: &EncryptedConfig,
+        intent: &super::InitializationIntent,
+    ) -> Result<()> {
+        let operation = self.session.begin_operation()?;
+        operation.authenticate_retained_config(config)?;
+        // Deliberately bypass the per-epoch descriptor/config cache: connection
+        // completion requires a new observation of the exact retained candidate.
+        let descriptor = self
+            .get(&operation, None, 256 * 1024, false)
+            .await?
+            .ok_or(EncryptedHttpError::UnsupportedProfile)?;
+        validate_descriptor(&descriptor, operation.root()?.repository())?;
+        let actual = self
+            .get(&operation, Some("e2ee/config"), 206, true)
+            .await?
+            .ok_or(EncryptedHttpError::ConfigMissing)?;
+        if actual != config.as_bytes() {
+            return Err(EncryptionError::StaleObservation.into());
+        }
+        let operation = operation
+            .observe_config_durable(EncryptedConfig::parse(&actual)?)
+            .await?;
+        let branch = format!("refs/heads/{}", intent.branch());
+        for (logical, expected) in [
+            (
+                branch.as_str(),
+                RefTarget::Commit(reference::parse_commit(intent.commit())?),
+            ),
+            ("HEAD", RefTarget::Symbolic(branch.clone())),
+        ] {
+            let key = reference::remote_key(operation.root()?, logical)?;
+            let bytes = self.get(&operation, Some(&key), 16 * 1024, true).await?;
+            if operation.observe_ref(logical, bytes.as_deref())?.target() != Some(&expected) {
+                return Err(EncryptionError::StaleObservation.into());
+            }
+        }
+        operation.check_active()?;
+        Ok(())
+    }
+
     /// Returns authenticated ciphertext or transport-observed absence (not a freshness proof).
     pub async fn read_ref(&self, logical: &str) -> Result<RefObservation> {
         let operation = self.operation().await?;

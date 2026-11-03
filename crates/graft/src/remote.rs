@@ -1134,6 +1134,18 @@ impl Remote {
         })
     }
 
+    #[cfg(feature = "e2ee")]
+    pub async fn confirm_initialization(
+        &self,
+        config: &crate::e2ee::EncryptedConfig,
+        intent: &crate::e2ee::InitializationIntent,
+    ) -> Result<()> {
+        match &self.backend {
+            RemoteBackend::Encrypted(remote) => remote.confirm_initialization(config, intent).await,
+            _ => Err(crate::e2ee::EncryptionError::InvalidSessionBinding.into()),
+        }
+    }
+
     pub async fn observe_ref(&self, path: &str) -> Result<RemoteRefObservation> {
         if path != "HEAD" && crate::repo::validate_full_ref(path).is_err() {
             return Err(RemoteErr::CompareAndSwap { path: path.to_owned() });

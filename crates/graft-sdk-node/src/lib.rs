@@ -574,6 +574,7 @@ impl Task for JsonTask {
                         graft_sdk::SyncPhase::Uploading => "uploading",
                         graft_sdk::SyncPhase::Downloading => "downloading",
                         graft_sdk::SyncPhase::Verifying => "verifying",
+                        graft_sdk::SyncPhase::Confirming => "confirming",
                         graft_sdk::SyncPhase::Applying => "applying",
                         graft_sdk::SyncPhase::Completed => "completed",
                         graft_sdk::SyncPhase::Failed => "failed",

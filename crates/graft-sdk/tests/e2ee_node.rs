@@ -21,6 +21,21 @@ fn native_node_plain_transfer_progress_preserves_sync_results() {
 
 #[test]
 #[ignore = "requires built native Node E2EE addon and TypeScript remote; run test:e2ee-node"]
+fn native_node_initial_publication_confirmation_recovers_faults() {
+    let addon =
+        std::env::var_os("GRAFT_E2EE_NODE_TEST_BINDING").expect("native addon path required");
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let status = Command::new("node")
+        .arg(workspace.join("tests/e2ee/node-initial-confirmation.mjs"))
+        .env("GRAFT_SDK_NATIVE_PATH", addon)
+        .current_dir(workspace)
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+#[test]
+#[ignore = "requires built native Node E2EE addon and TypeScript remote; run test:e2ee-node"]
 fn native_node_encrypted_transfer_progress_survives_cancellation_and_retry() {
     let addon =
         std::env::var_os("GRAFT_E2EE_NODE_TEST_BINDING").expect("native addon path required");

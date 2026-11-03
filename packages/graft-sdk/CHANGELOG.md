@@ -3,6 +3,32 @@
 This changelog covers the independently versioned `@eidos.space/graft` package. Core Graft CLI and
 SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
 
+## Graft SDK 0.3.39 — 2026-11-03
+
+### Changed
+
+- First encrypted connection now confirms the pinned repository identity, exact
+  encryption config, initial branch and default HEAD after ordered publication,
+  without cloning the repository back to a temporary directory. Successful
+  `pushInitialBranch()` returns `state: "connected", verification: "publication"`.
+- Keep `verificationDirectory` as an explicit independent full restore check;
+  success reports `verification: "full_restore"`. Publication confirmation does
+  not claim independent recovery or future server durability.
+- Report a `confirming` Sync phase after flushing payload progress. Metadata
+  reads during this phase do not restart the download indicator or report a
+  completed connection before confirmation finishes.
+- Resume existing initialization journals with the original source intent and
+  remote binding. Unknown publication, changed identity/config/source, missing
+  HEAD and cancelled operations do not bypass confirmation or recreate remotes.
+
+### 中文
+
+- 首次加密连接在顺序发布后确认固定身份、精确加密配置、初始分支和 HEAD，
+  默认不再完整下载一份临时副本。显式 `verificationDirectory` 仍执行完整恢复检查。
+- 新增 `confirming` 阶段；负载进度先完成，元数据确认结束后才报告连接成功。
+- 保留原初始化日志和固定意图，支持中断重试；身份、配置或源变化及未确认状态均失败关闭。
+  轻量确认不等同于独立恢复验证，也不承诺服务端未来的持久性。
+
 ## Graft SDK 0.3.38 — 2026-11-03
 
 ### Added

@@ -782,7 +782,13 @@ The service must atomically register an empty remote identity/profile under
 its account-management mechanism; the account API itself is outside this spec.
 Clients MUST publish config create-if-absent before initial dependencies,
 ref and HEAD. No initial ref/HEAD may overwrite a concurrent publication.
-Only a verified readable initial branch permits a connected success state.
+Connected success requires confirmed ordered dependency publication followed by
+fresh authenticated observation of the pinned descriptor, exact retained config,
+intended branch commit and symbolic HEAD. Default initialization MUST NOT require
+full payload download. This confirms publication under the server storage
+contract; it does not attest independent recovery, future durability or protection
+against replay of valid remote state. An explicit full restore option MUST remain
+available and MUST verify downloaded payloads before reporting full verification.
 Initial publication MUST reject an observed branch pointing to a different
 commit, including an ancestor of the selected source. It MUST NOT apply ordinary
 fast-forward semantics to that branch. An absent branch permits create-if-absent;
@@ -831,7 +837,7 @@ rechecked at publication. Independent verification using another local remote
 name MUST retain the same pinned encrypted identity, endpoint, account and
 session lifetime; it MUST NOT mutate source registrations or permit plain fallback.
 
-The verification destination MUST be absent or empty and separate from the
+When full restore verification is requested, the destination MUST be absent or empty and separate from the
 source and host-private state directories. Hosts MUST validate it before binding
 initialization intent or publishing remote data, and recheck before cloning.
 
