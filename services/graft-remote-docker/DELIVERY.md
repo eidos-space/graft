@@ -240,3 +240,20 @@ Linux ARM64 Docker and macOS SDK; new-candidate native Linux proof acceptance is
 not inferred from baseline AMD64/ARM64 container CI. The first observed PR
 performance run remains 41614829388; later correctness tests are not performance
 resampling. Final mutable worktree test edits must be committed before release.
+
+## Public Linux SDK gate (prepared, not executed)
+
+After the six SDK 0.3.39 npm packages and Remote 0.2.6 are public, run
+`Check Docker Graft server` with workflow-dispatch input `public_sdk=true` against
+the final source commit. Both native ubuntu-24.04 AMD64 and ubuntu-24.04-arm jobs
+install the public npm SDK and matching native package, then run 80 MiB
+lost-complete/proof recovery (including real persisted corruption rejection and
+spool checks), multipart truncation recovery, and normal/full-restore/clone/update
+verification against the actual Docker backend. Each uploads its own proof log;
+the harness records the installed native hash and server image ID. This job has
+no package-write permission and publishes nothing.
+
+The Docker release workflow independently repeats public-SDK verification on each
+native architecture **before** pushing its image. Both architecture jobs must
+succeed before the manifest and GitHub release are created. Baseline source SDK
+CI does not satisfy the public-SDK proof gate. No dispatch has been requested yet.

@@ -19,6 +19,11 @@ on:
       - 'package.json'
       - 'pnpm-lock.yaml'
   workflow_dispatch:
+    inputs:
+      public_sdk:
+        description: Verify the pinned public SDK on native Linux before Docker publication
+        type: boolean
+        default: false
 permissions:
   contents: read
 concurrency:
@@ -32,8 +37,10 @@ jobs:
         include:
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
+            native: linux-x64-gnu
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+            native: linux-arm64-gnu
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     steps:
@@ -49,12 +56,39 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm test:docker
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      - if: ${{ !inputs.public_sdk }}
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
-      - run: sudo apt-get update && sudo apt-get install -y clang libclang-dev build-essential
+      - if: ${{ !inputs.public_sdk }}
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - if: ${{ !inputs.public_sdk }}
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev build-essential
       - name: Build E2EE SDK
+        if: ${{ !inputs.public_sdk }}
         run: bash packages/graft-sdk/scripts/build-native.sh ${{ matrix.target }} packages/graft-sdk/native e2ee
       - name: Compose and native encrypted round trip (isolated data)
+        if: ${{ !inputs.public_sdk }}
         run: pnpm test:docker:container
+      - name: Public SDK proof and recovery on the matching Linux architecture
+        if: ${{ inputs.public_sdk }}
+        env:
+          NATIVE: ${{ matrix.native }}
+        run: |
+          set -euo pipefail
+          sdk=$(cat services/graft-remote-docker/SDK_VERSION)
+          remote=$(cat services/graft-remote-docker/REMOTE_VERSION)
+          test "$(node -p "require('./packages/graft-remote/package.json').version")" = "$remote"
+          test "$(npm view "@eidos.space/graft-remote@$remote" version)" = "$remote"
+          npm install --prefix /tmp/graft-public-sdk --ignore-scripts "@eidos.space/graft@$sdk"
+          export GRAFT_CANDIDATE_SDK_PATH=/tmp/graft-public-sdk/node_modules/@eidos.space/graft
+          export GRAFT_CANDIDATE_NATIVE_PATH="$(find "/tmp/graft-public-sdk/node_modules/@eidos.space/graft-$NATIVE" -name '*.node' -print -quit)"
+          test -f "$GRAFT_CANDIDATE_NATIVE_PATH"
+          export GRAFT_TEST_SKIP_SDK=1 GRAFT_SDK_RELEASED=1 GRAFT_LARGE_PAYLOAD_MIB=80
+          export GRAFT_CANDIDATE_SCENARIOS=lost-multipart-complete,interrupt-multipart-part,none
+          node services/graft-remote-docker/test/container.mjs 2>&1 | tee public-sdk-proof.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: ${{ always() && inputs.public_sdk }}
+        with:
+          name: public-sdk-proof-${{ matrix.native }}
+          path: public-sdk-proof.log
