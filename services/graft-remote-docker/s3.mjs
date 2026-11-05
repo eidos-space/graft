@@ -12,7 +12,10 @@ import { Upload } from "@aws-sdk/lib-storage";
 
 const missing = (error) => error?.$metadata?.httpStatusCode === 404;
 
-export function s3Configuration(env = process.env) {
+export function s3Configuration(
+  env = process.env,
+  readSecret = (path) => readFileSync(path, "utf8"),
+) {
   const mode = env.GRAFT_STORAGE ?? "local";
   if (!["local", "s3"].includes(mode)) throw new Error("GRAFT_STORAGE must be local or s3");
   if (mode === "local") return null;
@@ -45,7 +48,7 @@ export function s3Configuration(env = process.env) {
   if (!["true", "false"].includes(forcePathStyle))
     throw new Error("Invalid GRAFT_S3_FORCE_PATH_STYLE");
   const secret = (key) => {
-    const value = readFileSync(required(key), "utf8").trim();
+    const value = readSecret(required(key)).trim();
     if (!value || /\s/.test(value)) throw new Error(`Invalid secret file for ${key}`);
     return value;
   };

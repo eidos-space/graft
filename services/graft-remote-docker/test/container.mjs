@@ -101,6 +101,8 @@ const args = [
   "-f",
   resolve("services/graft-remote-docker/compose.yaml"),
   "-f",
+  resolve("services/graft-remote-docker/compose.secrets.yaml"),
+  "-f",
   join(directory, "override.json"),
 ];
 const env = {

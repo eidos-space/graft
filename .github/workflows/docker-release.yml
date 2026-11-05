@@ -30,6 +30,10 @@ jobs:
           version=$(cat services/graft-remote-docker/VERSION)
           test "$GITHUB_REF_NAME" = "graft-docker-v$version"
           [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test -s services/graft-remote-docker/RELEASE_NOTES.md
+          test -s services/graft-remote-docker/RELEASE_NOTES.zh-CN.md
+          grep -Fx "# Graft Docker $version" services/graft-remote-docker/RELEASE_NOTES.md
+          grep -Fx "# Graft Docker $version" services/graft-remote-docker/RELEASE_NOTES.zh-CN.md
           # checkout may peel its local tag ref to the event commit. Verify the
           # remote annotated object independently without rewriting either tag.
           git fetch --no-tags origin "$GITHUB_REF:refs/graft-release/verified-tag"
@@ -109,6 +113,7 @@ jobs:
           export GRAFT_PUBLIC_NATIVE_NAME="$NATIVE"
           export GRAFT_S3_TEST_IMAGE=graft-s3-fixture:local
           docker build -t "$GRAFT_S3_TEST_IMAGE" -f services/graft-remote-docker/test/Minio.Dockerfile .
+          node services/graft-remote-docker/test/setup-container.mjs
           bash services/graft-remote-docker/test/public-sdk.sh
           docker push "$GRAFT_TEST_IMAGE"
           docker image inspect "$GRAFT_TEST_IMAGE" --format '{{index .RepoDigests 0}}' > "image-$ARCH.txt"
@@ -170,9 +175,12 @@ jobs:
           cp services/graft-remote-docker/README.md .
           cp services/graft-remote-docker/README.zh-CN.md .
           cp services/graft-remote-docker/compose.s3.yaml compose.s3.yaml
+          cp services/graft-remote-docker/compose.secrets.yaml compose.secrets.yaml
+          cp services/graft-remote-docker/compose.caddy.yaml compose.caddy.yaml
+          cp services/graft-remote-docker/Caddyfile Caddyfile
           cp services/graft-remote-docker/.env.s3.example env.s3.example
-          sha256sum compose.yaml compose.s3.yaml env.s3.example image.json SOURCE_COMMIT README.md README.zh-CN.md > SHA256SUMS
-          sed -e 's/ (unreleased)//' -e 's/（未发布）//' services/graft-remote-docker/CHANGELOG.md > release-notes.md
+          sha256sum compose.yaml compose.s3.yaml compose.secrets.yaml compose.caddy.yaml Caddyfile env.s3.example image.json SOURCE_COMMIT README.md README.zh-CN.md > SHA256SUMS
+          cp services/graft-remote-docker/RELEASE_NOTES.md release-notes.md
           gh release create "$GITHUB_REF_NAME" --verify-tag --title "Graft Docker $VERSION" \
             --notes-file release-notes.md \
-            compose.yaml compose.s3.yaml env.s3.example image.json SOURCE_COMMIT SHA256SUMS README.md README.zh-CN.md
+            compose.yaml compose.s3.yaml compose.secrets.yaml compose.caddy.yaml Caddyfile env.s3.example image.json SOURCE_COMMIT SHA256SUMS README.md README.zh-CN.md

@@ -1,0 +1,3 @@
+{$GRAFT_DOMAIN} {
+    reverse_proxy graft:8787
+}

@@ -1,32 +1,14 @@
 import { createServer } from "node:http";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import { mkdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
-import { createApp, problem, validateOrigin, validateToken } from "./app.mjs";
-import { S3Blobs, s3Configuration } from "./s3.mjs";
-import { Storage, MAX_BYTES } from "./storage.mjs";
+import { problem, validateOrigin } from "./app.mjs";
+import { MAX_BYTES } from "./storage.mjs";
+import { createService } from "./setup.mjs";
 
 process.umask(0o077);
 const origin = validateOrigin(process.env.GRAFT_PUBLIC_ORIGIN ?? "http://127.0.0.1:8787");
-// File only: the secret never appears in Docker environment inspection or argv.
-const token = validateToken(
-  readFileSync(process.env.GRAFT_ACCESS_KEY_FILE ?? "/run/secrets/graft_access_key", "utf8").trim(),
-);
 const directory = process.env.GRAFT_DATA_DIR ?? "/data";
-mkdirSync(directory, { recursive: true, mode: 0o700 });
-const s3Config = s3Configuration();
-const blobStore = s3Config ? new S3Blobs(s3Config) : undefined;
-if (blobStore) {
-  try {
-    await blobStore.health();
-  } catch {
-    blobStore.close();
-    throw new Error("S3 storage connection failed; check bucket, endpoint and credential files");
-  }
-}
-const storage = new Storage(join(directory, "graft.sqlite"), { blobStore });
-const app = createApp({ storage, origin, token });
+const service = await createService({ directory, origin });
 let active = 0;
 let closing = false;
 const server = createServer(
@@ -56,7 +38,7 @@ const server = createServer(
           ? undefined
           : Readable.toWeb(incoming);
         // Canonical configured origin, never client-supplied Host/Forwarded headers.
-        response = await app(
+        response = await service.request(
           new Request(`${origin}${incoming.url}`, {
             method: incoming.method,
             headers,
@@ -82,7 +64,13 @@ const server = createServer(
 );
 server.timeout = 120_000;
 server.on("timeout", (socket) => socket.destroy());
-server.listen(8787, "0.0.0.0", () => console.log("Graft server listening on port 8787"));
+server.listen(8787, "0.0.0.0", () => {
+  console.log("Graft server listening on port 8787");
+  if (!service.initialized)
+    console.log(
+      "To open setup: docker compose exec graft node services/graft-remote-docker/manage.mjs setup-link",
+    );
+});
 function shutdown() {
   if (closing) return;
   closing = true;
@@ -92,7 +80,7 @@ function shutdown() {
   deadline.unref();
   server.close(() => {
     clearTimeout(deadline);
-    storage.close();
+    service.close();
   });
 }
 process.on("SIGTERM", shutdown);

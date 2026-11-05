@@ -13,17 +13,28 @@ Requirements: Docker Engine with Compose v2. Run from a checkout of this reposit
 
 ```sh
 cd services/graft-remote-docker
-mkdir -p secrets
-chmod 700 secrets
-(umask 077; openssl rand -hex 32 > secrets/access-key)
-# Compose mounts a host file; the unprivileged container must be able to read it.
-# The containing host directory remains private. Do not commit this file.
-chmod 444 secrets/access-key
 # For local SDK testing only; Lite's normal UI requires HTTPS.
 printf 'GRAFT_PUBLIC_ORIGIN=http://127.0.0.1:8787\n' > .env
 docker compose up --build -d --wait
-curl --fail http://127.0.0.1:8787/healthz
+docker compose exec graft node services/graft-remote-docker/manage.mjs setup-link
 ```
+
+Open the printed initialization link in your browser. Choose **Local disk** (no
+additional fields) or **S3-compatible storage**. For S3, enter your existing private
+bucket's endpoint, region and credentials, then test the connection. The test
+writes, reads and deletes a temporary object; it does not verify large multipart
+uploads. Advanced settings include a dedicated prefix and addressing style.
+
+Click **Complete setup**. Save the displayed server address and access key, then
+use them in Lite. The page supports English and Simplified Chinese. No manual key
+generation, secret file or file-permission commands are needed.
+
+The initialization link proves access to the server terminal. Keep it private.
+It survives restarts until setup completes, then becomes invalid. It is never
+printed in normal server logs. Opening `/setup` without it cannot claim a server.
+Before setup, `/healthz` returns 503 and synchronization is unavailable; `/livez`
+reports that the process is running and is used by the container health check.
+After setup, check `/healthz` and try synchronization from a second client.
 
 The image runs as UID/GID 1000, with a read-only root filesystem, dropped
 capabilities and a persistent `graft_data` volume at `/data`. The default port
@@ -34,11 +45,29 @@ Do not run `docker compose down -v` against data you want to keep.
 The access key grants full access to every repository on this server. Save it in
 a password manager and enter it in Lite. It is separate from the repository's
 **encryption password**, which is handled by clients and must never be sent to the
-management API. The server reads the key from `/run/secrets/graft_access_key` at
-startup; there is no public setup page, default credential or environment-token
-fallback. To rotate it, replace `secrets/access-key` with another random key,
-restore its permissions, run `docker compose up -d --force-recreate`, and update
-all clients. Repository identities and encryption passwords remain unchanged.
+management API. Web setup stores the access key and optional S3 credentials in a
+private configuration file in `/data`. Retain this volume during upgrades and
+protect its backups. Restarting does not reset setup. If you lose the key, retrieve
+it explicitly from the server terminal:
+
+```sh
+docker compose exec graft node services/graft-remote-docker/manage.mjs access-key
+```
+
+### Existing and automated deployments
+
+Existing Compose files that mount `/run/secrets/graft_access_key` continue to work
+and bypass web setup. Keep those files when upgrading. With the new templates,
+use `compose.secrets.yaml` to supply `secrets/access-key`; add `compose.s3.yaml`
+only for externally configured S3 storage. For example:
+
+```dotenv
+COMPOSE_FILE=compose.yaml:compose.secrets.yaml:compose.s3.yaml
+```
+
+Do not add these overlays to a web-configured installation. Changing storage
+requires a separate server and client migration, not rerunning setup. An existing
+database without its original key/configuration refuses to reopen setup.
 
 ## HTTPS and Eidos Lite
 
@@ -49,7 +78,22 @@ Set `.env` to:
 GRAFT_PUBLIC_ORIGIN=https://sync.example.com
 ```
 
-Run Caddy on the host with this Caddyfile (ports 80/443 must be reachable):
+**Caddy is optional.** Use an existing HTTPS proxy or your platform's HTTPS
+endpoint. Forward to `127.0.0.1:8787` on the host, or `graft:8787` from a container
+on the Compose network. Complete setup at the configured HTTPS origin.
+
+If you need a proxy, use the supplied `compose.caddy.yaml` and `Caddyfile`.
+Point your hostname at the server and allow ports 80/443, then add to `.env`:
+
+```dotenv
+GRAFT_DOMAIN=sync.example.com
+COMPOSE_FILE=compose.yaml:compose.caddy.yaml
+```
+
+Run `docker compose up -d --wait` (add `--build` when building from source).
+Caddy manages certificates and redirects. Keep its data volume for certificate
+renewal. Do not enable this overlay if another service already owns ports 80/443.
+Alternatively, an existing host Caddy can use:
 
 ```caddyfile
 sync.example.com {
@@ -82,6 +126,8 @@ connection at a different server does not migrate its encrypted identity or data
 | Method | Path | Authentication |
 | --- | --- | --- |
 | GET | `/`, `/healthz`, `/.well-known/graft` | Public |
+| GET | `/setup`, `/livez` | Public; contains no credentials |
+| POST | `/setup`, `/setup/test` | One-time setup credential and same-origin JSON; only before setup |
 | GET | `/api/graft/repositories` | Bearer key |
 | PUT | `/api/graft/repositories/:name` | Bearer key |
 | PATCH | `/api/graft/repositories/:name` | Bearer key |
@@ -137,7 +183,8 @@ docker compose start graft
 ```
 
 Store backups off-host and protect them: repository labels and explicitly plain
-repositories are not encrypted. Back up the access-key file separately and retain
+repositories are not encrypted. Web configuration includes credentials in `/data`.
+For external-key installations, back up the access-key file separately. Retain
 the clients' encryption passwords; server backups cannot recover those passwords.
 For restore, stop the target server and use an **empty** data volume. Preserve
 UID 1000 ownership. With the target volume already created by Compose:
@@ -212,16 +259,18 @@ create a new technical name to reuse a display label. This preserves identity
 isolation and prevents stale uploads/delete retries from targeting a replacement.
 Deletion is irreversible and removes server copies, not local device files.
 
-## GitHub release deployment (pending first release)
+## GitHub release deployment
 
-The planned image is `ghcr.io/eidos-space/graft-remote-docker`, with independent
+The image is `ghcr.io/eidos-space/graft-remote-docker`, with independent
 `graft-docker-vX.Y.Z` tags. Download `compose.yaml`, `SHA256SUMS`, `image.json` and
 `SOURCE_COMMIT` from that GitHub Release after it is published. Its Compose asset
-pins the immutable image digest. Place it in a private directory, create the
-`secrets/access-key` and `.env` as above, then use `docker compose pull` and
+pins the immutable image digest. Place it in a private directory, create
+`.env` with your public origin, then use `docker compose pull` and
 `docker compose up -d --wait` (no source build). For upgrades, stop/back up first,
 keep the old Compose file, download and verify the new release assets, and pull
-and recreate. Do not replace a digest with `latest`.
+and recreate. Do not replace a digest with `latest`. Follow the instructions
+included with that release: the 0.1.1 image predates web setup and requires an
+external access-key file. Web setup is available in 0.2.0 and later.
 
 Publication requires both native Linux architecture jobs, the fixed public SDK
 from `SDK_VERSION`, and the merged release PR. Local source-client or macOS addon
@@ -253,10 +302,11 @@ limits proofs to two concurrent reads and a 60-second deadline, and honors HTTP
 cancellation. Its new capability is advertised only once the shared Remote 0.2.6
 handler is integrated; backend-only tests do not establish native end-to-end proof.
 
-## S3-compatible storage: Backblaze B2 and Cloudflare R2
+## S3-compatible storage and automated configuration
 
-The default remains **local** (`GRAFT_STORAGE=local`). To use an existing S3 bucket,
-apply `compose.s3.yaml`. This mode stores immutable objects and completed large
+For interactive installation, select S3 in `/setup`; no S3 overlay is needed.
+For automated installations, use `compose.secrets.yaml` and `compose.s3.yaml`.
+This mode stores immutable objects and completed large
 ciphertext in the bucket. SQLite retains repository identities, refs/config,
 object pointers, deletion state and unfinished upload parts. `/data` is still
 required: budget temporary disk for upload parts and one assembled object per
@@ -271,7 +321,14 @@ or a direct-to-bucket client upload.
    [B2 JavaScript SDK configuration](https://www.backblaze.com/docs/cloud-storage-use-the-aws-sdk-for-javascript-v3-with-backblaze-b2)
    and [application key guide](https://www.backblaze.com/docs/cloud-storage-application-keys).
 2. Copy `.env.s3.example` (release asset: `env.s3.example`) to `.env` and replace the sample origin, endpoint, region
-   and bucket. Keep the existing Graft access key from the local setup.
+   and bucket. Supply an externally managed Graft access key in `secrets/access-key`.
+   For a new automated installation only, create it with:
+
+   ```sh
+   mkdir -m 700 secrets
+   (umask 077; openssl rand -hex 32 > secrets/access-key)
+   chmod 444 secrets/access-key
+   ```
 3. Save the B2 `keyID` in `secrets/s3-access-key-id` and `applicationKey` in
    `secrets/s3-secret-access-key`. Use the same protected directory/readable-file
    permissions as `secrets/access-key` (`secrets` 0700; mounted files 0444).
@@ -279,17 +336,16 @@ or a direct-to-bucket client upload.
 4. Start **with a fresh data volume**:
 
    ```sh
-   docker compose -p graft-s3 -f compose.yaml -f compose.s3.yaml up --build -d --wait
+   docker compose -p graft-s3 -f compose.yaml -f compose.secrets.yaml -f compose.s3.yaml up --build -d --wait
    ```
 
-For a GitHub Release deployment, download its `compose.yaml`, `compose.s3.yaml`
+For a GitHub Release deployment, download its `compose.yaml`, `compose.secrets.yaml`, `compose.s3.yaml`
 and `env.s3.example` assets and verify `SHA256SUMS`. That `compose.yaml` already
 pins the released image digest; use the same command above without `--build`.
 When using the source checkout's `compose.release.yaml` template instead, set
-`GRAFT_IMAGE` to the released immutable digest. This source change is not yet
-part of a published image.
+`GRAFT_IMAGE` to the released immutable digest.
 
-Keep `-p graft-s3 -f compose.yaml -f compose.s3.yaml` on all subsequent Compose
+Keep `-p graft-s3 -f compose.yaml -f compose.secrets.yaml -f compose.s3.yaml` on all subsequent Compose
 commands, including stop/start, backup, restore and upgrades. Omitting the project
 or overlay can select a different volume or start the wrong storage mode.
 
