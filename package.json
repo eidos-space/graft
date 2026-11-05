@@ -11,6 +11,7 @@
     "benchmark:staging-fetch-pull": "pnpm --filter @eidos.space/graft build:native && node scripts/staging-fetch-pull-benchmark.mjs",
     "test:remote-release": "node --test scripts/remote-release.test.mjs",
     "test:docker": "pnpm --filter @eidos.space/graft-remote build && node --test services/graft-remote-docker/test/*.test.mjs",
-    "test:docker:container": "node services/graft-remote-docker/test/container.mjs"
+    "test:docker:container": "node services/graft-remote-docker/test/container.mjs",
+    "test:docker:setup": "node services/graft-remote-docker/test/setup-container.mjs"
   }
 }

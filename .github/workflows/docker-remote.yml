@@ -70,7 +70,15 @@ jobs:
         run: bash packages/graft-sdk/scripts/build-native.sh ${{ matrix.target }} packages/graft-sdk/native e2ee
       - name: Compose and native encrypted round trip (isolated data)
         if: ${{ !inputs.public_sdk }}
-        run: pnpm test:docker:container
+        run: |
+          set -euo pipefail
+          export GRAFT_TEST_IMAGE=graft-docker-candidate:local
+          export GRAFT_S3_TEST_IMAGE=graft-s3-fixture:local
+          export GRAFT_SDK_PATH="$PWD/packages/graft-sdk"
+          docker build -t "$GRAFT_TEST_IMAGE" -f services/graft-remote-docker/Dockerfile .
+          pnpm test:docker:container
+          docker build -t "$GRAFT_S3_TEST_IMAGE" -f services/graft-remote-docker/test/Minio.Dockerfile .
+          pnpm test:docker:setup
       - name: Public SDK proof and recovery on the matching Linux architecture
         if: ${{ inputs.public_sdk }}
         env:
@@ -83,11 +91,13 @@ jobs:
           test "$(npm view "@eidos.space/graft-remote@$remote" version)" = "$remote"
           npm install --prefix /tmp/graft-public-sdk --ignore-scripts "@eidos.space/graft@$sdk"
           export GRAFT_PUBLIC_SDK_ROOT=/tmp/graft-public-sdk/node_modules/@eidos.space/graft
+          export GRAFT_SDK_PATH="$GRAFT_PUBLIC_SDK_ROOT"
           export GRAFT_PUBLIC_NATIVE_NAME="$NATIVE"
           export GRAFT_TEST_IMAGE=graft-public-proof:local
           export GRAFT_S3_TEST_IMAGE=graft-s3-fixture:local
           docker build -t "$GRAFT_S3_TEST_IMAGE" -f services/graft-remote-docker/test/Minio.Dockerfile .
           docker build --label "org.opencontainers.image.revision=$GITHUB_SHA" -t "$GRAFT_TEST_IMAGE" -f services/graft-remote-docker/Dockerfile .
+          pnpm test:docker:setup
           bash services/graft-remote-docker/test/public-sdk.sh
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: ${{ always() && inputs.public_sdk }}

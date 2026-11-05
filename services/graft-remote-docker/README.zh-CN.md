@@ -13,17 +13,24 @@ Cloudflare 或外部数据库。
 
 ```sh
 cd services/graft-remote-docker
-mkdir -p secrets
-chmod 700 secrets
-(umask 077; openssl rand -hex 32 > secrets/access-key)
-# Compose 绑定宿主机文件，非 root 容器需要读取权限。
-# 外层目录保持私有，不要提交密钥文件。
-chmod 444 secrets/access-key
 # 仅用于本地 SDK 测试，Lite 常规界面要求 HTTPS。
 printf 'GRAFT_PUBLIC_ORIGIN=http://127.0.0.1:8787\n' > .env
 docker compose up --build -d --wait
-curl --fail http://127.0.0.1:8787/healthz
+docker compose exec graft node services/graft-remote-docker/manage.mjs setup-link
 ```
+
+在浏览器中打开输出的初始化链接。选择**本地磁盘**即可继续，无需填写其他字段。
+也可以选择 **S3 兼容存储**，填写已有私有桶的端点、区域和凭据，再测试连接。
+测试会写入、读取并删除一个临时对象，不代表已验证大文件分片上传。
+高级设置中可指定独占前缀和寻址方式。
+
+点击**完成设置**，保存显示的服务器地址和访问密钥，用它们连接 Lite。
+页面支持中英文，无需手动生成密钥、创建密钥文件或设置文件权限。
+
+初始化链接用于证明你能访问服务器终端，请勿分享。完成设置前重启仍可使用，
+完成后立即失效，日常服务日志不会输出它。仅打开 `/setup` 无法认领服务器。
+设置前 `/healthz` 返回 503，同步不可用；`/livez` 表示进程正常运行，供容器
+健康检查使用。完成设置后检查 `/healthz`，再用第二台客户端验证同步。
 
 容器以 UID/GID 1000 运行，根文件系统只读，移除 Linux capabilities，
 数据存于 `/data` 对应的 `graft_data` 持久卷。默认端口只绑定宿主机回环地址。
@@ -32,10 +39,27 @@ curl --fail http://127.0.0.1:8787/healthz
 
 访问密钥具有所有仓库的完整权限，请存入密码管理器并填入 Lite。
 它与仓库的**加密密码**不同；加密密码由客户端处理，不应发送给管理 API。
-服务器启动时读取 `/run/secrets/graft_access_key`，没有公开初始化页面、
-默认密码或环境变量密钥回退。轮换时用新的随机密钥替换 `secrets/access-key`，
-恢复权限，执行 `docker compose up -d --force-recreate`，并更新所有客户端。
-仓库身份和加密密码不变。
+网页设置会将访问密钥和可选的 S3 凭据保存到 `/data` 中的私有配置文件。
+升级时保留数据卷，并妥善保护备份。重启不会重置初始化。
+如果遗失访问密钥，可以在服务器终端主动取回：
+
+```sh
+docker compose exec graft node services/graft-remote-docker/manage.mjs access-key
+```
+
+### 已有部署和自动化部署
+
+已有 Compose 文件挂载 `/run/secrets/graft_access_key` 的方式继续可用，
+会跳过网页初始化，升级时保留这些文件即可。使用新模板时，通过
+`compose.secrets.yaml` 挂载 `secrets/access-key`；只有需要外部配置 S3 时
+才叠加 `compose.s3.yaml`，例如：
+
+```dotenv
+COMPOSE_FILE=compose.yaml:compose.secrets.yaml:compose.s3.yaml
+```
+
+网页初始化的安装不要添加这些叠加配置。更换存储需要新建另一台服务并通过
+客户端迁移，不能重新运行设置。已有数据库缺少原密钥或配置时会拒绝启动初始化。
 
 ## HTTPS 与 Eidos Lite
 
@@ -45,7 +69,21 @@ curl --fail http://127.0.0.1:8787/healthz
 GRAFT_PUBLIC_ORIGIN=https://sync.example.com
 ```
 
-在宿主机运行 Caddy，确保 80/443 端口可达，Caddyfile 为：
+**Caddy 是可选的。**可以使用已有 HTTPS 代理或部署平台提供的 HTTPS 地址。
+宿主机代理转发到 `127.0.0.1:8787`，同一 Compose 网络中的代理转发到
+`graft:8787`。通过已配置的 HTTPS 地址完成初始化。
+
+如果需要配套代理，可以使用提供的 `compose.caddy.yaml` 和 `Caddyfile`。
+将域名指向服务器、开放 80/443 端口，再向 `.env` 添加：
+
+```dotenv
+GRAFT_DOMAIN=sync.example.com
+COMPOSE_FILE=compose.yaml:compose.caddy.yaml
+```
+
+执行 `docker compose up -d --wait`，源码构建时加上 `--build`。
+Caddy 会管理证书和跳转，保留其数据卷以便续期。如果其他服务已占用 80/443，
+不要启用这个叠加配置。已有宿主机 Caddy 也可以使用以下配置：
 
 ```caddyfile
 sync.example.com {
@@ -74,6 +112,8 @@ Host/Forwarded 头。TLS 由代理提供，容器私有接口本身运行 HTTP�
 | 方法 | 路径 | 认证 |
 | --- | --- | --- |
 | GET | `/`、`/healthz`、`/.well-known/graft` | 公开 |
+| GET | `/setup`、`/livez` | 公开，不包含凭据 |
+| POST | `/setup`、`/setup/test` | 一次性初始化凭据、同源 JSON，仅设置前可用 |
 | GET | `/api/graft/repositories` | Bearer 密钥 |
 | PUT | `/api/graft/repositories/:name` | Bearer 密钥 |
 | PATCH | `/api/graft/repositories/:name` | Bearer 密钥 |
@@ -123,7 +163,8 @@ docker compose start graft
 ```
 
 将备份安全保存到其他机器：仓库标签及显式创建的普通仓库并未加密。
-单独备份访问密钥并保管客户端加密密码，服务器备份不能恢复这些密码。
+网页设置的凭据包含在 `/data` 中。外部密钥安装需单独备份访问密钥。
+另行保管客户端加密密码，服务器备份不能恢复这些密码。
 恢复时停止目标服务，使用**空数据卷**并保留 UID 1000 的所有权。
 在 Compose 已创建目标卷的情况下执行：
 
@@ -193,14 +234,16 @@ DELETE 返回 `{namespace, repository, status}`；处理中 `deleting` 为 202�
 新的技术名称重复使用。这样旧上传及旧删除重试不会命中新仓库。删除不可逆，
 删除的是服务器副本，不会直接删除设备本地文件。
 
-## GitHub 发布部署（首次发布待完成）
+## GitHub 发布部署
 
-计划镜像为 `ghcr.io/eidos-space/graft-remote-docker`，独立标签为
+镜像为 `ghcr.io/eidos-space/graft-remote-docker`，独立标签为
 `graft-docker-vX.Y.Z`。发布后从对应 GitHub Release 下载 `compose.yaml`、
 `SHA256SUMS`、`image.json`、`SOURCE_COMMIT`。Compose 资产固定镜像 digest。
-在私有目录中保存资产，按前文创建 `secrets/access-key` 和 `.env`，再执行
+在私有目录中保存资产，在 `.env` 中填写公开地址，再执行
 `docker compose pull` 和 `docker compose up -d --wait`，无需构建源码。
 升级先停机备份，保留旧 Compose，校验新发布资产后拉取并重建；不要换成 latest。
+请遵循对应发布附带的说明：0.1.1 镜像尚无网页初始化，仍需外部访问密钥文件。
+网页初始化从 0.2.0 开始提供。
 
 发布要求 Linux 两种原生架构验收、`SDK_VERSION` 中固定的公开 SDK 复验，以及
 已合并的 release PR。本地源码客户端或 macOS addon 测试不能代替这些门槛。
@@ -227,10 +270,11 @@ SQLite WAL的临时磁盘空间。删除是逻辑移除，不承诺取证级擦�
 对象校验后端读取真实持久密文，最多两次并发、60秒截止，响应HTTP取消；须接入
 共享Remote 0.2.6 handler后才声明新能力。后端单测不等于原生端到端校验通过。
 
-## S3 兼容存储：Backblaze B2 与 Cloudflare R2
+## S3 兼容存储与自动化配置
 
-默认仍为本地磁盘（`GRAFT_STORAGE=local`）。叠加 `compose.s3.yaml` 可连接已有
-bucket：不可变对象及完成上传的大文件密文存入 S3，SQLite 保留仓库身份、引用、
+交互安装直接在 `/setup` 中选择 S3，无需 S3 叠加配置。自动化安装使用
+`compose.secrets.yaml` 和 `compose.s3.yaml`。不可变对象及完成上传的大文件
+密文存入 S3，SQLite 保留仓库身份、引用、
 配置、对象指针、删除状态和未完成的上传分片。因此仍必须持久化 `/data`，并为
 上传分片和每个并行完成操作的完整组装文件预留临时磁盘。S3 上传成功后会删除
 本地组装文件并清理分片记录；SQLite 可能保留已分配的空闲页或 WAL 空间供复用，
@@ -241,23 +285,30 @@ bucket：不可变对象及完成上传的大文件密文存入 S3，SQLite 保�
    参见 [B2 官方 SDK 配置](https://www.backblaze.com/docs/cloud-storage-use-the-aws-sdk-for-javascript-v3-with-backblaze-b2)
    和 [应用密钥说明](https://www.backblaze.com/docs/cloud-storage-application-keys)。
 2. 将 `.env.s3.example`（Release 资产名为 `env.s3.example`）复制为 `.env`，替换服务地址、endpoint、region、bucket。
-   保留本地模式部署步骤中创建的 Graft 访问密钥。
+   在 `secrets/access-key` 中提供外部管理的 Graft 访问密钥。
+   仅首次自动化安装时，可以这样生成：
+
+   ```sh
+   mkdir -m 700 secrets
+   (umask 077; openssl rand -hex 32 > secrets/access-key)
+   chmod 444 secrets/access-key
+   ```
 3. 把 B2 `keyID` 写入 `secrets/s3-access-key-id`，`applicationKey` 写入
    `secrets/s3-secret-access-key`。沿用访问密钥的权限：`secrets` 目录 0700，
    挂载文件 0444。凭证通过秘密文件传入，不写入 SQLite、远端 URL 或结果。
 4. 使用**新的数据卷**启动：
 
    ```sh
-   docker compose -p graft-s3 -f compose.yaml -f compose.s3.yaml up --build -d --wait
+   docker compose -p graft-s3 -f compose.yaml -f compose.secrets.yaml -f compose.s3.yaml up --build -d --wait
    ```
 
-使用 GitHub Release 时，下载其 `compose.yaml`、`compose.s3.yaml` 和
+使用 GitHub Release 时，下载其 `compose.yaml`、`compose.secrets.yaml`、`compose.s3.yaml` 和
 `env.s3.example`，并核对 `SHA256SUMS`。该 `compose.yaml` 已固定镜像 digest，
 使用上面的命令时去掉 `--build` 即可。若使用源码中的 `compose.release.yaml`
-模板，则需设置固定 digest 的 `GRAFT_IMAGE`。本次源码变更尚未发布为镜像。
+模板，则需设置固定 digest 的 `GRAFT_IMAGE`。
 
 后续停止、启动、备份、恢复和升级等所有 Compose 命令，都保留
-`-p graft-s3 -f compose.yaml -f compose.s3.yaml`。遗漏项目名或叠加配置可能选中
+`-p graft-s3 -f compose.yaml -f compose.secrets.yaml -f compose.s3.yaml`。遗漏项目名或叠加配置可能选中
 其他数据卷或以错误的存储模式启动。
 
 | 配置 | 用途 |
