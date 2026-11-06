@@ -1,5 +1,21 @@
 # Graft Docker releases
 
+## 0.2.1
+
+- Show storage configuration only after the server verifies the private initialization link.
+- Explain missing or rejected links, verification failures and completed setup with concrete recovery steps in English and Simplified Chinese.
+- Provide a copyable `setup-link` command at the entry page; selecting S3 or changing language preserves the authorization guidance.
+- Keep failed storage checks editable and close stale setup forms when another page completes initialization.
+- Clarify full-link requirements and disabled-button troubleshooting in both READMEs. Existing data, credentials and external-key deployments are preserved.
+
+## 0.2.1（中文）
+
+- 服务器验证私有初始化链接后，才显示存储配置表单。
+- 对缺失或无效链接、验证失败及设置已完成分别提供明确的中英文恢复指引。
+- 入口提供可复制的 `setup-link` 命令，切换 S3 或语言不会清除授权说明。
+- 存储检查失败后仍可更正；其他页面完成初始化后，旧表单会关闭。
+- 中英文 README 补充完整链接要求及按钮禁用排查，保留已有数据、凭据和外部密钥部署。
+
 ## 0.2.0
 
 - Browser setup in English and Simplified Chinese replaces manual access-key generation for new installations.

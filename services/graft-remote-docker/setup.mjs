@@ -171,7 +171,7 @@ export async function createService({
           },
         });
       }
-      if (path === "/setup/test" || (path === "/setup" && request.method === "POST")) {
+      if (path === "/setup/status" || path === "/setup/test" || (path === "/setup" && request.method === "POST")) {
         if (app || saved)
           return json(
             {
@@ -186,6 +186,9 @@ export async function createService({
         const supplied = request.headers.get("authorization") ?? "";
         if (!supplied.startsWith("Bearer ") || !same(supplied.slice(7), claim))
           return json({ error: "Open the initialization link from the server terminal." }, 401);
+        // Check the terminal credential before showing any configuration fields.
+        // This performs no storage probe and never consumes the claim.
+        if (path === "/setup/status") return json({ status: "authorized" });
         if (!request.headers.get("content-type")?.startsWith("application/json"))
           return json({ error: "Expected JSON" }, 415);
         if (busy) return json({ error: "A storage check or setup is already in progress." }, 409);
