@@ -1,23 +1,26 @@
-# Graft Docker 0.2.0
+# Graft Docker 0.2.1
 
-Set up a new server in your browser. Start the container, open its one-time
-initialization link and choose local disk or S3-compatible storage. Graft creates
-your access key and shows the connection details for Eidos Lite. The setup page
-supports English and Simplified Chinese.
+The setup page now verifies your private initialization link before showing
+storage fields. Opening the server's root address or `/setup` alone gives you
+the command and next steps to obtain that link, so you can enter storage details
+after authorization is confirmed.
 
-- Configure S3 credentials and test bucket reads, writes and deletion in `/setup`.
-- Keep initialization state and credentials across restarts in the private data
-  volume. Retrieve a lost access key with the server management command.
-- Use your existing HTTPS proxy or platform, or add the optional Caddy Compose
-  overlay. Caddy is not required.
-- Existing deployments using an external key file continue to work and bypass
-  web setup. Preserve their Compose files and data when upgrading. New templates
-  include `compose.secrets.yaml` for externally managed keys.
+- Copy the `setup-link` command and run it on the server from your Compose
+  directory, then open the complete printed URL, including `#token=…`.
+- Get specific recovery steps for an invalid link, a different origin, a failed
+  verification request or setup that is already complete. Entry guidance is
+  available in English and Simplified Chinese.
+- Keep authorization guidance when changing language or choosing S3. Failed
+  storage checks remain editable, and old setup tabs close their form if another
+  tab finishes initialization.
 
-The release includes native Linux AMD64 and ARM64 images and digest-pinned
-Compose files. Server dependencies remain Remote 0.2.6 and SDK 0.3.39.
+This patch preserves existing server data, access keys and storage configuration.
+Before upgrading, stop the server and back up its data volume and external secrets.
+For S3 installations, back up the matching bucket data too. For installations
+upgraded from 0.1.1 with an external access-key file, keep the existing Compose
+file and key mount; they continue to bypass web setup. Restarting or upgrading
+does not reopen setup. Changing storage backends still requires a separate
+deployment and client migration.
 
-Before upgrading, stop the server and back up its data volume and any external
-secrets. For S3 installations, back up the matching bucket data too. Switching
-storage backends requires a separate deployment and client migration; setup does
-not migrate an existing server.
+The release includes Linux AMD64 and ARM64 images and digest-pinned Compose
+files. Server dependencies remain Remote 0.2.6 and SDK 0.3.39.

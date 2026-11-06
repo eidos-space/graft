@@ -11,6 +11,9 @@ Cloudflare 或外部数据库。
 
 需要 Docker Engine 和 Compose v2。在本仓库检出目录中执行：
 
+**先获取初始化链接，再打开浏览器。**以下命令在服务器的 Compose 文件所在目录中执行。
+服务器根地址或单独的 `/setup` 均不具备初始化和配置存储的授权。
+
 ```sh
 cd services/graft-remote-docker
 # 仅用于本地 SDK 测试，Lite 常规界面要求 HTTPS。
@@ -19,7 +22,8 @@ docker compose up --build -d --wait
 docker compose exec graft node services/graft-remote-docker/manage.mjs setup-link
 ```
 
-在浏览器中打开输出的初始化链接。选择**本地磁盘**即可继续，无需填写其他字段。
+在浏览器中打开**命令输出的完整网址，包括 `#token=…` 部分**。
+服务器验证链接后才会显示存储字段。选择**本地磁盘**即可继续，无需填写其他字段。
 也可以选择 **S3 兼容存储**，填写已有私有桶的端点、区域和凭据，再测试连接。
 测试会写入、读取并删除一个临时对象，不代表已验证大文件分片上传。
 高级设置中可指定独占前缀和寻址方式。
@@ -31,6 +35,13 @@ docker compose exec graft node services/graft-remote-docker/manage.mjs setup-lin
 完成后立即失效，日常服务日志不会输出它。仅打开 `/setup` 无法认领服务器。
 设置前 `/healthz` 返回 503，同步不可用；`/livez` 表示进程正常运行，供容器
 健康检查使用。完成设置后检查 `/healthz`，再用第二台客户端验证同步。
+
+如果**测试连接**或**完成设置**一直灰色不可用，先执行上面的 `setup-link` 命令，
+打开完整输出。填写存储字段不能补上缺少的初始化授权。链接无效或不完整时，
+从同一套安装中重新取回。链接不会随时间过期，完成设置后才会失效。
+已完成设置时，使用保存的密钥或下文的 `access-key` 命令。
+无法连接并验证时，检查 HTTPS 后重试；直接打开 `GRAFT_PUBLIC_ORIGIN` 下的链接，
+避免跳转到其他来源。
 
 容器以 UID/GID 1000 运行，根文件系统只读，移除 Linux capabilities，
 数据存于 `/data` 对应的 `graft_data` 持久卷。默认端口只绑定宿主机回环地址。
@@ -113,6 +124,7 @@ Host/Forwarded 头。TLS 由代理提供，容器私有接口本身运行 HTTP�
 | --- | --- | --- |
 | GET | `/`、`/healthz`、`/.well-known/graft` | 公开 |
 | GET | `/setup`、`/livez` | 公开，不包含凭据 |
+| POST | `/setup/status` | 一次性初始化凭据、同源请求；仅验证权限，不配置存储 |
 | POST | `/setup`、`/setup/test` | 一次性初始化凭据、同源 JSON，仅设置前可用 |
 | GET | `/api/graft/repositories` | Bearer 密钥 |
 | PUT | `/api/graft/repositories/:name` | Bearer 密钥 |

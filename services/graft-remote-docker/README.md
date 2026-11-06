@@ -11,6 +11,10 @@ No Eidos account, billing service, Cloudflare account or external database is ne
 
 Requirements: Docker Engine with Compose v2. Run from a checkout of this repository:
 
+**Get the initialization link before opening the browser.** Run the commands on
+your server, from the directory containing the Compose file. The server root
+address and `/setup` alone do not authorize setup or storage configuration.
+
 ```sh
 cd services/graft-remote-docker
 # For local SDK testing only; Lite's normal UI requires HTTPS.
@@ -19,7 +23,8 @@ docker compose up --build -d --wait
 docker compose exec graft node services/graft-remote-docker/manage.mjs setup-link
 ```
 
-Open the printed initialization link in your browser. Choose **Local disk** (no
+Open the **complete printed URL, including `#token=…`**, in your browser. The
+server verifies the link before showing storage fields. Choose **Local disk** (no
 additional fields) or **S3-compatible storage**. For S3, enter your existing private
 bucket's endpoint, region and credentials, then test the connection. The test
 writes, reads and deletes a temporary object; it does not verify large multipart
@@ -35,6 +40,15 @@ printed in normal server logs. Opening `/setup` without it cannot claim a server
 Before setup, `/healthz` returns 503 and synchronization is unavailable; `/livez`
 reports that the process is running and is used by the container health check.
 After setup, check `/healthz` and try synchronization from a second client.
+
+If **Test connection** or **Complete setup** stays disabled, first run the
+`setup-link` command above and open its complete output. Filling storage fields
+cannot supply the missing authorization. For an invalid or incomplete link,
+retrieve it again from the same installation. Links do not expire with time;
+they stop working when setup completes. If setup is already complete, use your
+saved key or the `access-key` command below. If verification cannot connect,
+check HTTPS and retry; open the link directly at `GRAFT_PUBLIC_ORIGIN` without
+a redirect to another origin.
 
 The image runs as UID/GID 1000, with a read-only root filesystem, dropped
 capabilities and a persistent `graft_data` volume at `/data`. The default port
@@ -127,6 +141,7 @@ connection at a different server does not migrate its encrypted identity or data
 | --- | --- | --- |
 | GET | `/`, `/healthz`, `/.well-known/graft` | Public |
 | GET | `/setup`, `/livez` | Public; contains no credentials |
+| POST | `/setup/status` | One-time setup credential and same Origin; verifies permission without configuring storage |
 | POST | `/setup`, `/setup/test` | One-time setup credential and same-origin JSON; only before setup |
 | GET | `/api/graft/repositories` | Bearer key |
 | PUT | `/api/graft/repositories/:name` | Bearer key |
