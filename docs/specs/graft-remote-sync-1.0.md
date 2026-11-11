@@ -519,3 +519,57 @@ suites, plus CLI/SDK remote integration tests.
   negotiation is a future protocol concern.
 - HTTP, filesystem, and S3 backends must share publication semantics even when
   their internal transaction mechanisms differ.
+
+### Personal Docker deployment profile
+
+`services/graft-remote-docker` maps this protocol to a local SQLite database and immutable multipart files.
+It MUST authenticate repository operations and MUST NOT implicitly provision an
+unknown repository. Its management API explicitly creates repositories in the
+`personal` namespace; repeated creation MUST retain the original encryption UUID
+and MUST reject a change of encryption profile. Discovery URLs MUST derive from
+the configured public origin, never untrusted forwarded headers. The access key
+is an adapter input loaded from a secret file, not stored in repository data.
+
+The service implements the personal management contract documented in its
+[deployment guide](../../services/graft-remote-docker/README.md). Management and
+health endpoints are host APIs, not additions to Remote v1. It advertises only
+implemented protocol capabilities, supports durable multipart, and limits individual requests to
+64 MiB. Atomic object creation and ref comparison use SQLite statements. This
+profile supports one service instance per local volume, not distributed storage.
+Executable evidence lives in `services/graft-remote-docker/test`.
+
+The Docker management profile MUST persist a deletion tombstone before accepting
+repository deletion, reject new repository operations, and wait for admitted
+response/proof readers before cleanup. Technical names and URLs MUST NOT be reused;
+a repeated deletion observes the same durable state. Cleanup failure MUST retain
+`deleting` and restart MUST resume cleanup. Multipart file bytes and their directory
+MUST be synchronized before publishing their SQLite pointer. Process-crash tests
+are not evidence of arbitrary power-loss safety. The optional object-proof callback
+MUST hash the actual admitted persisted snapshot, not an upload-time digest;
+the shared E2EE protocol owns its challenge encoding and capability semantics.
+
+#### Optional S3-compatible blob storage
+
+The Docker profile MAY use an S3-compatible bucket for immutable object bytes.
+SQLite remains the authoritative directory, identity, mutable ref/config and
+publication index. It MUST publish a blob pointer only after the remote upload
+succeeds and rechecking the repository's active state. Interrupted or unknown
+uploads MUST NOT publish refs implicitly. Local temporary multipart data MAY be
+retained for retry and is not evidence of remote publication.
+
+The data directory MUST bind the selected backend identity (mode, endpoint,
+region, bucket and prefix); a different backend MUST be rejected rather than
+silently treating missing data as an empty repository. Credential values MUST NOT
+be persisted in that identity. This profile does not provide automatic migration
+or multi-instance coordination through a shared bucket.
+
+Object proof MUST stream the actual remote object snapshot with the validated
+challenge prefix and reject changed length. Deletion MUST retain the repository
+tombstone and pending cleanup records until owned remote objects are removed;
+remote failures MUST remain retryable. On versioned buckets the adapter MUST
+remove the owned object versions, not merely create deletion markers. Provider
+retention policies may prevent cleanup and MUST NOT be reported as successful.
+
+Backup/recovery requires both local control state and the matching bucket data.
+S3 multipart sessions orphaned by process death may require provider lifecycle
+cleanup; lifecycle rules MUST NOT expire live immutable object keys.

@@ -57,8 +57,17 @@ jobs:
         run: |
           pnpm install --frozen-lockfile
           pnpm --filter '@eidos.space/graft-remote' build
+      - name: Test HTTP fixture process lifecycle
+        run: node --test tests/e2ee/child-process-lifecycle.test.mjs
       - name: Native Windows SQLite sync and migration over HTTP
         shell: pwsh
         run: |
           $env:GRAFT_E2EE_NODE_TEST_BINDING = Join-Path $env:RUNNER_TEMP 'graft-sdk.node'
           cargo test -p graft-sdk --features e2ee,bundled-sqlite --test e2ee_node --locked -- --ignored --test-threads=1
+      - name: Fully cached encrypted pull retry budget
+        shell: pwsh
+        run: |
+          $env:GRAFT_SDK_NATIVE_PATH = Join-Path $env:RUNNER_TEMP 'graft-sdk.node'
+          $env:GRAFT_PROGRESS_MODES = 'object'
+          $env:GRAFT_PROGRESS_CACHED_RETRY = '1'
+          node tests/e2ee/node-transfer-progress.mjs

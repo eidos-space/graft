@@ -54,3 +54,10 @@ published and installed separately, with URLs, PR performance evidence and any
 explicitly deferred platform coverage. When Eidos consumes a new SDK, report
 the formal version and supported native profiles so its separate release can
 pin the published dependency.
+
+Docker is a separate release train: `services/graft-remote-docker/VERSION`,
+`CHANGELOG.md`, annotated `graft-docker-vX.Y.Z`, `docker-release.yml`, GHCR plus
+GitHub Release assets. Follow `RELEASE.md`'s Docker gate and coordinated dependency
+order; use the actual public SDK against native AMD64/ARM64 containers and verify
+anonymous digest pulls. Docker publication does not publish the Remote packages,
+SDK or Lite, and those trains must not be triggered incidentally.

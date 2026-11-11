@@ -37,6 +37,7 @@ the HTTP remote packages.
 | `crates/graft-tracing` | Shared tracing setup. |
 | `packages/graft-sdk` | Published Node.js package, tests, and release tooling. |
 | `packages/graft-remote*` | Framework-neutral, Hono, and Cloudflare remote packages. |
+| `services/graft-remote-docker` | Personal Docker server, SQLite persistence, Lite management API and container tests. |
 | `services/graft-remote-cloudflare` | Deployable Cloudflare Worker used to verify the remote stack. |
 | `web-demo` | Browser/WASM playground. |
 | `docs` | Astro/Starlight documentation and the implementation-aligned specifications. |
@@ -120,6 +121,9 @@ synchronized. Do not edit generated `.node` binaries directly.
 pnpm check:remote
 pnpm test:remote
 pnpm build:remote
+npm ci --prefix services/graft-remote-docker --ignore-scripts
+pnpm test:docker
+pnpm test:docker:container # Docker + built E2EE-capable Node SDK
 ```
 
 ### Documentation

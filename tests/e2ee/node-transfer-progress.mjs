@@ -14,6 +14,7 @@ import { DatabaseSync } from "node:sqlite";
 import { Transform } from "node:stream";
 import { setTimeout as delay } from "node:timers/promises";
 import { exerciseFileOnly, exerciseUploadBudgetOverflow } from "./node-file-only-progress.mjs";
+import { stopChildProcess } from "./child-process-lifecycle.mjs";
 
 const require = createRequire(import.meta.url);
 const { EncryptedRemoteSession, RepositorySession } = require("../../packages/graft-sdk");
@@ -35,17 +36,19 @@ async function scenario(mode) {
   const capture = join(directory, `${mode}-capture.json`);
   writeFileSync(fixture, JSON.stringify({
     encryption: { profile: "encrypted-remote-v1", version: 1, suite: 1, uuid },
-    objects: [], serviceLifetimeMs: 180000,
+    objects: [], serviceLifetime: "parent",
     ...(mode === "multipart" ? { enableMultipart: true, maxRequestBytes: 1024 * 1024, multipartPartBytes: 512 * 1024 } : {}),
   }));
-  const service = spawn(process.execPath, ["tests/e2ee/remote-service.mjs", fixture, capture], { stdio: ["ignore", "pipe", "inherit"] });
+  const service = spawn(process.execPath, ["tests/e2ee/remote-service.mjs", fixture, capture], { stdio: ["ignore", "pipe", "inherit", "ipc"] });
   const lines = createInterface({ input: service.stdout });
   const ready = JSON.parse((await once(lines, "line"))[0]);
   const upstream = new URL(ready.enrollmentUrl).origin;
   const wire = { requests: 0, uploadBytes: 0, downloadBytes: 0 };
   const payloadReads = [];
+  let payloadRequests = 0;
   const proxy = createServer((incoming, outgoing) => {
     wire.requests++;
+    if (incoming.method === "GET" && /e2ee\/(files|objects|packs|commits|segments)\//.test(incoming.url)) payloadRequests++;
     incoming.on("data", (chunk) => { wire.uploadBytes += chunk.length; });
     const upstreamRequest = request(new URL(incoming.url, upstream), {
       method: incoming.method, headers: { ...incoming.headers, host: new URL(upstream).host },
@@ -117,6 +120,7 @@ async function scenario(mode) {
     let peakTemporaryBytes = temporaryBytes();
     const diskSampler = setInterval(() => { peakTemporaryBytes = Math.max(peakTemporaryBytes, temporaryBytes()); }, 20);
     const captureStart = JSON.parse(readFileSync(capture)).length;
+    const payloadRequestStart = payloadRequests;
     const allEvents = [];
     const lateEvents = [];
     const start = performance.now();
@@ -187,10 +191,19 @@ async function scenario(mode) {
       assert.ok(planned.length >= 2, `${label}: no complete download inventory`);
       assert.equal(new Set(planned.map((event) => event.totalBytes)).size, 1, `${label}: download denominator moved`);
       assert.equal(planned.at(-1).transferredBytes, planned.at(-1).totalBytes, `${label}: incomplete download schedule`);
-      assert.ok(planned.some((event) => event.transferredBytes < event.totalBytes), `${label}: budget arrived after transfer`);
+      if (label === "pull" && process.env.GRAFT_PROGRESS_CACHED_RETRY === "1") {
+        assert.ok(planned.every((event) => event.transferredBytes === event.totalBytes), "cached retry unexpectedly planned missing payload");
+        assert.equal(payloadRequests - payloadRequestStart, 0, "cached retry requested payload");
+      }
+      if (!planned.some((event) => event.transferredBytes < event.totalBytes)) {
+        // Cancellation can leave every payload cached before the JS callback
+        // aborts. A retry then plans discovery bytes + zero remaining payload.
+        assert.equal(label, "pull", `${label}: budget arrived after transfer`);
+        assert.equal(payloadRequests - payloadRequestStart, 0, `${label}: payload requested without an advance budget`);
+      }
       assert.equal(allEvents.filter((event) => event.direction === "download").at(-1).totalIsFinal, true, `${label}: lost download plan`);
     }
-    reports.push({ mode, label, plannedTotal: planned.at(-1)?.totalBytes, elapsedMs: Math.round(elapsedMs), samples: events.length, bytes: positive.at(-1).bytes, wire: Object.fromEntries(Object.keys(wire).map((key) => [key, wire[key] - beforeWire[key]])), peakTemporaryBytes });
+    reports.push({ mode, label, plannedTotal: planned.at(-1)?.totalBytes, plannedRemaining: planned[0] ? planned[0].totalBytes - planned[0].transferredBytes : null, payloadRequests: payloadRequests - payloadRequestStart, elapsedMs: Math.round(elapsedMs), samples: events.length, bytes: positive.at(-1).bytes, wire: Object.fromEntries(Object.keys(wire).map((key) => [key, wire[key] - beforeWire[key]])), peakTemporaryBytes });
     return result;
   }
   try {
@@ -265,6 +278,11 @@ async function scenario(mode) {
     } }), { name: "AbortError" });
     if (process.env.GRAFT_PROGRESS_SYNC !== "0") assert.equal(cancelledDownloads.at(-1)?.phase, "cancelled");
     assert.ok(cancelledDownloadBytes > 0, "cancellation did not reach a real download");
+    // Deterministically exercise the fully cached retry, independent of how
+    // far the native worker gets before JS handles the cancellation callback.
+    if (process.env.GRAFT_PROGRESS_CACHED_RETRY === "1") {
+      await source.fetchForCheckout({ remote: "origin", branch: "main" });
+    }
     await observed("pull", "download", (onProgress, onSyncProgress) => source.pull({ onProgress, onSyncProgress: process.env.GRAFT_PROGRESS_SYNC === "0" ? undefined : onSyncProgress }));
     assert.deepEqual(readFileSync(join(worktrees.get(source), "update.bin")), update);
     const receivedDatabase = new DatabaseSync(join(worktrees.get(source), "records.sqlite"), { readOnly: true });
@@ -315,8 +333,7 @@ async function scenario(mode) {
     for (const value of authorities) await value.disconnect();
     proxy.closeAllConnections();
     await new Promise((resolve) => proxy.close(resolve));
-    service.kill();
-    await once(service, "exit");
+    await stopChildProcess(service);
     lines.close();
   }
 }
