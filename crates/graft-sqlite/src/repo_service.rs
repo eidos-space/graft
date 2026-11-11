@@ -22,8 +22,9 @@ use crate::{
         parse::parse_row_identity,
         repo_checkout::{export_repo_path, write_repo_file_state_to_new_path},
         repo_conflicts::{
-            prepare_repo_semantic_merge_seed, resolve_repo_cell_conflict,
-            stage_repo_external_sqlite_result, stage_repo_worktree_sqlite_result,
+            normalize_repo_sqlite_merge_inputs, prepare_repo_semantic_merge_seed,
+            resolve_repo_cell_conflict, stage_repo_external_sqlite_result,
+            stage_repo_worktree_sqlite_result,
         },
         repo_core::repo_for_file,
         repo_diff::repo_status_for_file,
@@ -929,6 +930,24 @@ impl RepositoryCommandService {
         let runtime = self.file.runtime().clone();
         let repo = repo_for_file(&mut self.file)?;
         stage_repo_external_sqlite_result(&runtime, &repo, path, candidate_path)
+    }
+
+    /// Builds an Ours-derived private candidate containing every safe non-provider row change.
+    pub fn normalize_merge_sqlite_inputs(
+        &mut self,
+        path: &Path,
+        inputs: [&Path; 3],
+    ) -> Result<String, ErrCtx> {
+        #[cfg(any(unix, windows))]
+        let _mutation = self.mutation_guard()?;
+        let runtime = self.file.runtime().clone();
+        let repo = repo_for_file(&mut self.file)?;
+        normalize_repo_sqlite_merge_inputs(&runtime, &self.file, &repo, path, inputs)
+    }
+
+    pub fn merge_schema_normalized(&mut self, path: &Path) -> Result<bool, ErrCtx> {
+        let repo = self.repository()?;
+        crate::pragma::repo_conflicts::merge_schema_normalized(&repo, path)
     }
 
     /// Builds an Ours-derived private candidate containing every safe non-provider row change.

@@ -534,6 +534,27 @@ or an unresolved row conflict falls outside `managedTables`; the active merge re
 `continueMerge` and `abortMerge` remove the private provider workspace only after their durable
 operation succeeds.
 
+Undo advances the durable state token. Preparing the same provider after Undo
+creates a fresh seed rather than returning a result already edited by the
+application, including after closing and reopening the session.
+
+Applications can inspect an original SQLite merge version with
+`exportMergeSqliteVersion({ path, version, output, expectedStateToken })`, where
+`version` is `"base"`, `"ours"` or `"theirs"`. `output` must be a new absolute
+file outside the worktree and repository metadata. The export is read-only
+and does not advance merge state.
+
+For schema-first review, the application can copy and normalize all three
+inputs using its own schema rules, then call
+`normalizeMergeSqliteInputs({ path, base, ours, theirs, expectedStateToken })`.
+All three inputs must be private SQLite files outside the worktree. Graft
+captures and validates them, rejects remaining unsupported structure changes,
+and materializes compatible changes while leaving conflicting records for
+the ordinary row/cell APIs. It preserves the original stages for Undo and
+reports a resolved `schema_normalized` marker. This operation advances the
+token and materializes the worktree; hosts must coordinate open file handles.
+Graft does not determine application field identity or conversion semantics.
+
 Merge policy is a versioned, data-only SDK contract:
 
 ```js

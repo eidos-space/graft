@@ -3,6 +3,35 @@
 This changelog covers the independently versioned `@eidos.space/graft` package. Core Graft CLI and
 SQLite extension releases are documented in the repository-level `CHANGELOG.md`.
 
+## Graft SDK 0.3.40 — 2026-11-12
+
+### Changed
+
+- Resolve deletion-versus-edit conflicts when the local parent directory is
+  missing. Keeping Local preserves the deletion; choosing Incoming recreates
+  the parent and file. Path containment checks still reject outside and
+  dangling symlinks.
+- Export exact immutable SQLite merge inputs to a new private file with
+  `exportMergeSqliteVersion()`. The current state token is required, and the
+  output must be outside the repository.
+- Add `normalizeMergeSqliteInputs()` for applications that reconcile schema
+  identity before comparing records. Graft validates and captures the three
+  private inputs, preserves original stages for Undo, and recomputes ordinary
+  record conflicts. Applications retain ownership of schema semantics.
+- Advance durable merge state after Undo so preparing a semantic provider
+  again builds a fresh result seed, including after reopening. Rebuild changed
+  indexes without treating the required rebuild as an unsupported row merge.
+
+### 中文
+
+- 修复本地父目录已删除时无法解决“删除与修改”冲突的问题。保留本地继续删除，
+  选择对方重建目录与文件；路径检查仍拒绝指向仓库外部或悬空的符号链接。
+- 新增带状态令牌校验的 SQLite 原始合并版本导出，输出限定为仓库外的新私有文件。
+- 新增应用规范化三份 SQLite 输入的接口，保留原始版本用于撤销，并重新计算记录
+  冲突。字段身份与结构变更语义由应用负责，Graft 负责捕获、校验和持久化合并状态。
+- 撤销后推进持久状态，重开后再次执行语义合并也会生成新的结果种子；正确重建
+  变化的索引，避免将必要的索引重建误判为不支持的记录合并。
+
 ## Graft SDK 0.3.39 — 2026-11-03
 
 ### Changed

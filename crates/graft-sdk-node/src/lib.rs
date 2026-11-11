@@ -8,12 +8,15 @@ use graft_sdk::{
     CommitChangedPathsOptions as CoreCommitChangedPathsOptions,
     ContinueMergeOptions as CoreContinueMergeOptions,
     DiffMergeSqliteOptions as CoreDiffMergeSqliteOptions, DiffOptions as CoreDiffOptions,
-    DiffPathsOptions as CoreDiffPathsOptions, IgnoredPathsOptions as CoreIgnoredPathsOptions,
-    InventoryKind, InventoryOptions as CoreInventoryOptions,
+    DiffPathsOptions as CoreDiffPathsOptions,
+    ExportMergeSqliteVersionOptions as CoreExportMergeSqliteVersionOptions,
+    IgnoredPathsOptions as CoreIgnoredPathsOptions, InventoryKind,
+    InventoryOptions as CoreInventoryOptions,
     ListMergeConflictsOptions as CoreListMergeConflictsOptions,
     ListMergePathsOptions as CoreListMergePathsOptions, MergePathFilter as CoreMergePathFilter,
     MergePathResult as CoreMergePathResult, MergePolicyDocument as CoreMergePolicyDocument,
     MergeSqliteVersion as CoreMergeSqliteVersion, MergeVersion as CoreMergeVersion,
+    NormalizeMergeSqliteInputsOptions as CoreNormalizeMergeSqliteInputsOptions,
     PlanMergeOptions as CorePlanMergeOptions,
     PrepareSemanticMergeOptions as CorePrepareSemanticMergeOptions,
     ReadMergeVersionOptions as CoreReadMergeVersionOptions,
@@ -269,6 +272,23 @@ pub struct DiffMergeSqliteOptions {
 }
 
 #[napi(object)]
+pub struct ExportMergeSqliteVersionOptions {
+    pub path: String,
+    pub version: String,
+    pub output: String,
+    pub expected_state_token: String,
+}
+
+#[napi(object)]
+pub struct NormalizeMergeSqliteInputsOptions {
+    pub path: String,
+    pub base: String,
+    pub ours: String,
+    pub theirs: String,
+    pub expected_state_token: String,
+}
+
+#[napi(object)]
 pub struct SetMergePathResultOptions {
     pub path: String,
     pub result: String,
@@ -500,6 +520,12 @@ enum JsonOperation {
     },
     ReadMergeVersion {
         options: CoreReadMergeVersionOptions,
+    },
+    ExportMergeSqliteVersion {
+        options: CoreExportMergeSqliteVersionOptions,
+    },
+    NormalizeMergeSqliteInputs {
+        options: CoreNormalizeMergeSqliteInputsOptions,
     },
     DiffMergeSqlite {
         options: CoreDiffMergeSqliteOptions,
@@ -798,6 +824,22 @@ impl JsonTask {
                 return serde_json::to_string(&value)
                     .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
             }
+            JsonOperation::ExportMergeSqliteVersion { options } => {
+                let value = self
+                    .session
+                    .export_merge_sqlite_version(options)
+                    .map_err(napi_error)?;
+                return serde_json::to_string(&value)
+                    .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
+            }
+            JsonOperation::NormalizeMergeSqliteInputs { options } => {
+                let value = self
+                    .session
+                    .normalize_merge_sqlite_inputs(options)
+                    .map_err(napi_error)?;
+                return serde_json::to_string(&value)
+                    .map_err(|error| Error::new(Status::GenericFailure, error.to_string()));
+            }
             JsonOperation::DiffMergeSqlite { options } => {
                 let value = self
                     .session
@@ -997,6 +1039,8 @@ impl JsonTask {
             | JsonOperation::ListMergePaths { .. }
             | JsonOperation::ListMergeConflicts { .. }
             | JsonOperation::ReadMergeVersion { .. }
+            | JsonOperation::ExportMergeSqliteVersion { .. }
+            | JsonOperation::NormalizeMergeSqliteInputs { .. }
             | JsonOperation::DiffMergeSqlite { .. }
             | JsonOperation::SetMergePathResult { .. }
             | JsonOperation::ResolveMergeRow { .. }
@@ -1946,6 +1990,47 @@ impl NodeRepositorySession {
         ))
     }
 
+    #[napi(js_name = "exportMergeSqliteVersion")]
+    pub fn export_merge_sqlite_version(
+        &self,
+        options: ExportMergeSqliteVersionOptions,
+        signal: Option<AbortSignal>,
+    ) -> Result<AsyncTask<JsonTask>> {
+        Ok(json_task(
+            self,
+            JsonOperation::ExportMergeSqliteVersion {
+                options: CoreExportMergeSqliteVersionOptions {
+                    path: PathBuf::from(options.path),
+                    version: parse_merge_sqlite_version(&options.version)?,
+                    output: PathBuf::from(options.output),
+                    expected_state_token: options.expected_state_token,
+                },
+            },
+            signal,
+        ))
+    }
+
+    #[napi(js_name = "normalizeMergeSqliteInputs")]
+    pub fn normalize_merge_sqlite_inputs(
+        &self,
+        options: NormalizeMergeSqliteInputsOptions,
+        signal: Option<AbortSignal>,
+    ) -> AsyncTask<JsonTask> {
+        json_task(
+            self,
+            JsonOperation::NormalizeMergeSqliteInputs {
+                options: CoreNormalizeMergeSqliteInputsOptions {
+                    path: PathBuf::from(options.path),
+                    base: PathBuf::from(options.base),
+                    ours: PathBuf::from(options.ours),
+                    theirs: PathBuf::from(options.theirs),
+                    expected_state_token: options.expected_state_token,
+                },
+            },
+            signal,
+        )
+    }
+
     #[napi(js_name = "diffMergeSqlite")]
     pub fn diff_merge_sqlite(
         &self,
@@ -2329,11 +2414,17 @@ pub fn operation_materializes_worktree(operation: String) -> Result<bool> {
         "list_merge_paths" | "listMergePaths" => RepositoryOperation::ListMergePaths,
         "list_merge_conflicts" | "listMergeConflicts" => RepositoryOperation::ListMergeConflicts,
         "read_merge_version" | "readMergeVersion" => RepositoryOperation::ReadMergeVersion,
+        "export_merge_sqlite_version" | "exportMergeSqliteVersion" => {
+            RepositoryOperation::ExportMergeSqliteVersion
+        }
         "diff_merge_sqlite" | "diffMergeSqlite" => RepositoryOperation::DiffMergeSqlite,
         "set_merge_path_result" | "setMergePathResult" => RepositoryOperation::SetMergePathResult,
         "resolve_merge_row" | "resolveMergeRow" => RepositoryOperation::ResolveMergeRow,
         "resolve_merge_cell" | "resolveMergeCell" => RepositoryOperation::ResolveMergeCell,
         "resolve_merge_table" | "resolveMergeTable" => RepositoryOperation::ResolveMergeTable,
+        "normalize_merge_sqlite_inputs" | "normalizeMergeSqliteInputs" => {
+            RepositoryOperation::NormalizeMergeSqliteInputs
+        }
         "stage_merge_sqlite_result" | "stageMergeSqliteResult" => {
             RepositoryOperation::StageMergeSqliteResult
         }

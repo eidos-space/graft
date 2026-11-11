@@ -4,8 +4,8 @@ use graft::{repo::CommitFileState, rt::runtime::Runtime};
 
 use crate::row_level_diff::{
     InsertRowidMode, OpaqueChange, OpaqueChangeReason, RowChange, RowIdentity, RowLevelDiff,
-    RowLevelDiffLimitation, SchemaChange, SchemaChangeKind, TableChanges,
-    row_level_diff_readers_with_page_candidates,
+    RowLevelDiffLimitation, RowLevelDiffLimitationKind, SchemaChange, SchemaChangeKind,
+    TableChanges, row_level_diff_readers_with_page_candidates,
 };
 use crate::sqlite_parse::{
     ColumnDefinition, GeneratedColumnKind, Record, Value, parse_create_table_column_definitions,
@@ -348,6 +348,17 @@ impl RowMergePlan {
             .iter()
             .chain(self.theirs_diff.analysis.limitations.iter())
         {
+            // The physical diff cannot interpret index pages, but the merge planner can
+            // rebuild an explicitly resolved index from the merged logical rows.
+            if limitation.kind == RowLevelDiffLimitationKind::IndexBtree
+                && self.resolved_opaque_changes.iter().any(|change| {
+                    change.reason == OpaqueChangeReason::IndexBtree
+                        && change.resolver == RowMergeInternalResolver::Reindex
+                        && limitation.subject.as_deref() == Some(change.name.as_str())
+                })
+            {
+                continue;
+            }
             if seen.insert((limitation.kind.as_str(), limitation.subject.clone())) {
                 limitations.push(limitation.clone());
             }

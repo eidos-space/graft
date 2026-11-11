@@ -315,9 +315,40 @@ bytes.
 current `result` content/snapshot. An unavailable side is reported as absent,
 not substituted. Version reads are read-only.
 
+`exportMergeSqliteVersion(path, version, output)` exports the exact immutable
+`base`, `ours`, or `theirs` SQLite input for a trusted host to interpret with its
+own application Runtime. It MUST check the active merge state token, preserve
+absent inputs, support cancellation, and make the exported file read-only.
+The destination MUST be new, absolute, and outside the repository worktree and
+metadata directory. Export MUST NOT change worktree bytes, index, refs, or the
+merge journal, and MUST remain available for unresolved schema conflicts.
+The SDK returns the version, revision, file path (or null), byte size and state
+token; these filesystem handles belong to the trusted host, not its UI.
+
 `resolveMergeCell` selects ours or theirs for one structured cell conflict. It
 uses the same state-token CAS and journal as row/table resolution; selection is
 durable across reopen and is cleared by `unresolveMergePath` or abort.
+
+Every successful `unresolveMergePath` MUST advance a durable undo generation.
+Its merge state token MUST differ from the state before the original choice,
+even when the restored stages and choices are otherwise identical. A provider
+workspace bound to an earlier token remains historical and MUST NOT be reused
+as the fresh seed after undo.
+
+`normalizeMergeSqliteInputs(path, base, ours, theirs)` accepts three private
+SQLite inputs after a trusted application has reconciled its schema. It MUST
+use state-token CAS, capture each input outside the worktree, validate integrity
+and foreign keys, reject remaining schema/opaque/analysis blockers, and recompute
+the ordinary row merge from those captures. Graft MUST NOT infer application
+Field identities, rename rules or metadata semantics. Safe row changes may be
+materialized, but unresolved record choices MUST remain unresolved.
+
+The normalization journal MUST preserve both original and normalized stages
+across reopen. Subsequent row/cell/table choices use the normalized stages.
+`unresolveMergePath` restores the original stages and original Ours worktree,
+clears normalized choices, and advances the undo generation. Conflict reads
+include a resolved `schema_normalized` marker while normalization is active;
+it is progress metadata, not an unresolved structural blocker.
 
 `diffMergeSqlite(path, from, to, response)` compares two distinct immutable
 `base`, `ours`, or `theirs` revisions during the active merge. It MUST remain
@@ -353,6 +384,11 @@ supports ordinary files, SQLite snapshots, and deletion. It replaces conflict
 stages with one Normal result or a staged deletion. It MUST preserve the
 unselected version in durable history/merge metadata until the merge completes
 or aborts; it may not silently discard recovery access mid-operation.
+
+The tracked path MUST remain resolvable when a deleted side also removed its
+parent directories. Selecting deletion MUST NOT recreate them; selecting the
+present side recreates the required parents. Path identity still rejects
+traversal and existing symlink ancestors that escape the worktree.
 
 ### 8.2 Text result
 
@@ -410,8 +446,12 @@ token, frozen policy token/version, three immutable merge revisions, and the
 canonical managed-table set. Graft MUST NOT invoke application code or
 interpret the business meaning of managed tables.
 
+An index B-tree limitation covered by the active `reindex` resolver is resolved
+by rebuilding that same index from logical rows; it MUST NOT remain an analysis
+blocker. Other limitations and indexes without that resolver remain blockers.
+
 Seed construction MUST fail before publishing a workspace when the physical
-plan contains schema additions or conflicts, opaque or limited changes,
+plan contains schema additions or conflicts, unresolved opaque or limited changes,
 recomputation-required changes, or unresolved row conflicts outside the
 managed tables. Failure MUST NOT change the index, worktree, conflict stages,
 or merge-state token. `seed_applied_sql` reports whether the safe unmanaged
