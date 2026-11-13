@@ -443,6 +443,16 @@ class RepositorySession {
     )
   }
 
+  async exportMergeSqliteVersion(options) {
+    const { signal, ...exportOptions } = options
+    return callJson(() => this.#native.exportMergeSqliteVersion(exportOptions, signal))
+  }
+
+  async normalizeMergeSqliteInputs(options) {
+    const { signal, ...inputOptions } = options
+    return callJson(() => this.#native.normalizeMergeSqliteInputs(inputOptions, signal))
+  }
+
   async setMergePathResult(options) {
     const { signal, ...resultOptions } = options
     return callJson(() =>

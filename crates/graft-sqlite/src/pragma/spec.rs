@@ -221,6 +221,8 @@ pub(crate) struct RepoResolveCellSpec {
 pub(super) struct MergeResolutionPathState {
     pub(super) original_entries: Vec<graft::repo::index::IndexEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) normalized_entries: Option<Vec<graft::repo::index::IndexEntry>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) resolution: Option<String>,
 }
 
@@ -228,6 +230,8 @@ pub(super) struct MergeResolutionPathState {
 pub(super) struct RowConflictResolutionState {
     #[serde(default)]
     pub(super) schema_version: u32,
+    #[serde(default)]
+    pub(super) undo_generation: u64,
     #[serde(default)]
     pub(super) orig_head: Option<String>,
     pub(super) merge_head: Option<String>,

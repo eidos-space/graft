@@ -339,8 +339,33 @@ impl Repository {
 
     pub fn file_key(&self, path: impl AsRef<Path>) -> Result<String> {
         let path = path.as_ref();
-        let parent = worktree_for_file(path);
-        let parent = fs::canonicalize(parent)?;
+        // Merge and restore paths can have no physical parent after a local
+        // directory deletion. Resolve the nearest existing ancestor without
+        // creating directories, and still resolve symlinks before confinement.
+        let mut ancestor = worktree_for_file(path);
+        let mut missing = Vec::new();
+        let parent = loop {
+            match fs::symlink_metadata(ancestor) {
+                Ok(_) => {
+                    let mut canonical = fs::canonicalize(ancestor)?;
+                    for component in missing.into_iter().rev() {
+                        canonical.push(component);
+                    }
+                    break canonical;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    let Some(component) = ancestor.file_name() else {
+                        return Err(err.into());
+                    };
+                    missing.push(component.to_os_string());
+                    let Some(parent) = ancestor.parent() else {
+                        return Err(err.into());
+                    };
+                    ancestor = parent;
+                }
+                Err(err) => return Err(err.into()),
+            }
+        };
         let Some(file_name) = path.file_name() else {
             return Err(RepoErr::PathOutsideWorktree {
                 path: path.to_path_buf(),

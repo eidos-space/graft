@@ -201,6 +201,28 @@ bytes 即可重新展示 resolved SQLite table。
 
 `readMergeVersion` 精确读取 `base/ours/theirs/result`；absent side 不能替代。只读。
 
+每次成功的 `unresolveMergePath` 必须推进持久化 undo generation。即使恢复的 stages
+与 choices 完全相同，merge state token 也不能回到原选择之前的值。绑定旧 token 的
+provider workspace 仅作为历史记录保留，不能作为撤销后重试的新 seed 复用。
+
+`normalizeMergeSqliteInputs(path, base, ours, theirs)` 接收由可信应用完成结构规范化的
+三个私有 SQLite 输入。必须校验 state-token CAS、捕获 worktree 外的输入、执行
+integrity 与 foreign-key 检查，拒绝剩余 schema／opaque／analysis blocker，并从
+捕获结果重算普通记录合并。Graft 不得推断应用 Field ID、改名规则或 metadata
+语义。可以物化安全变更，但不能代替用户选择仍有冲突的记录。
+
+规范化 journal 必须在重开后保留原始与规范化 stages；后续 row／cell／table 决议
+使用规范化 stages。`unresolveMergePath` 恢复原 stages 与原始 Ours worktree，清除
+规范化选择并推进 undo generation。规范化期间 conflict read 返回 resolved 的
+`schema_normalized` 标记；这是进度元数据，不是未解决的结构 blocker。
+
+`exportMergeSqliteVersion(path, version, output)` 导出精确且 immutable 的
+`base/ours/theirs` SQLite 输入，由可信 host 通过应用 Runtime 解释。必须校验 active
+merge state token、保留 absent 输入、支持 cancellation，并将导出文件设为只读。
+目标必须是 repository worktree 与 metadata directory 外的新 absolute 路径。
+导出不得修改 worktree、index、ref 或 merge journal；存在未解决 schema conflict 时也必须可用。
+返回版本、revision、文件路径（或 null）、字节数和 state token；文件系统句柄只交给可信 host，不能交给 UI。
+
 `diffMergeSqlite(path, from, to, response)` 在 active merge 内比较两个不同的 immutable
 `base`、`ours` 或 `theirs` revision。即使 index 仍有 unresolved conflict 也必须可用；
 必须校验 merge state token、支持 cancellation 与 bounded response，且不得写 worktree、
@@ -221,6 +243,9 @@ change 或 limitation 都禁止使用此等价规则。
 带 current token，stale token 不能改变 path/selection。One-shot human CLI 不暴露
 client-held token；它获取 repository coordination、重新读取当前 state 后立即执行。
 
+- 删除一侧同时移除父目录时，tracked path 仍须可解析。选择 deletion 不能重建父目录；
+  选择存在的一侧须创建必要父目录。路径仍须拒绝 traversal 和逃出 worktree 的现有
+  symlink ancestor。
 - `setMergePathResult` 选择整 path ours/theirs，支持 file、SQLite 与 deletion，收敛
   为 Normal 或 staged deletion；merge 完成/abort 前仍须可恢复未选 side。
 - `writeAndStageTextResult` 对 eligible UTF-8 text 写入并 stage 精确 result；binary、
@@ -251,7 +276,10 @@ name、path、active merge-state token、冻结 policy token/version、三个 im
 revision 与 canonical managed-table set。Graft 不调用 application code，也不解释
 managed table 的业务含义。
 
-若 physical plan 含 schema addition/conflict、opaque/limited change、需要 recomputation
+被当前 `reindex` resolver 覆盖的 index B-tree limitation，通过逻辑行重建同一索引解决，
+不能继续作为 analysis blocker。其他 limitation 和没有该 resolver 的索引仍然阻止合并。
+
+若 physical plan 含 schema addition/conflict、未解决的 opaque/limited change、需要 recomputation
 的 change，或 managed table 之外仍有 unresolved row conflict，seed construction 必须在
 发布 workspace 前失败。失败不能改 index、worktree、conflict stage 或 merge-state
 token。`seed_applied_sql` 表示 safe unmanaged Theirs projection 是否修改 candidate；

@@ -417,6 +417,28 @@ export interface MergeContent {
 
 export type MergeSqliteVersion = "base" | "ours" | "theirs"
 
+export interface ExportMergeSqliteVersionOptions extends OperationOptions {
+  path: string
+  version: MergeSqliteVersion
+  /** New absolute file outside the repository, in an existing private directory. */
+  output: string
+  expectedStateToken: string
+}
+
+export interface MergeSqliteExport extends SemanticMergeInput {
+  path: string
+  state_token: string
+}
+
+/** Applications own schema identity/conversion; Graft re-plans records from these private inputs. */
+export interface NormalizeMergeSqliteInputsOptions extends OperationOptions {
+  path: string
+  base: string
+  ours: string
+  theirs: string
+  expectedStateToken: string
+}
+
 interface DiffMergeSqliteBase extends OperationOptions {
   path: string
   from: MergeSqliteVersion
@@ -1239,6 +1261,8 @@ export class RepositorySession {
     options: ListMergeConflictsOptions
   ): Promise<MergeConflictPage>
   readMergeVersion(options: ReadMergeVersionOptions): Promise<MergeContent>
+  exportMergeSqliteVersion(options: ExportMergeSqliteVersionOptions): Promise<MergeSqliteExport>
+  normalizeMergeSqliteInputs(options: NormalizeMergeSqliteInputsOptions): Promise<MergeOperationResult>
   diffMergeSqlite(
     options: DiffMergeSqliteOptions
   ): Promise<MergeSqliteDiffResult>

@@ -446,6 +446,8 @@ pub enum RepositoryOperation {
     ListMergePaths,
     ListMergeConflicts,
     ReadMergeVersion,
+    ExportMergeSqliteVersion,
+    NormalizeMergeSqliteInputs,
     DiffMergeSqlite,
     SetMergePathResult,
     UnresolveMergePath,
@@ -476,6 +478,7 @@ impl RepositoryOperation {
                 | Self::ResolveMergeRow
                 | Self::ResolveMergeCell
                 | Self::ResolveMergeTable
+                | Self::NormalizeMergeSqliteInputs
                 | Self::AcceptSemanticMergeResult
                 | Self::WriteAndStageTextResult
                 | Self::ContinueMerge
@@ -660,6 +663,22 @@ pub struct ReadMergeVersionOptions {
 }
 
 #[derive(Debug, Clone)]
+pub struct ExportMergeSqliteVersionOptions {
+    pub path: PathBuf,
+    pub version: MergeSqliteVersion,
+    pub output: PathBuf,
+    pub expected_state_token: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergeSqliteExport {
+    pub state_token: String,
+    pub path: String,
+    #[serde(flatten)]
+    pub input: SemanticMergeInput,
+}
+
+#[derive(Debug, Clone)]
 pub struct DiffMergeSqliteOptions {
     pub path: PathBuf,
     pub from: MergeSqliteVersion,
@@ -761,6 +780,15 @@ pub struct PrepareSemanticMergeOptions {
     pub path: PathBuf,
     pub provider: String,
     pub managed_tables: Vec<String>,
+    pub expected_state_token: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct NormalizeMergeSqliteInputsOptions {
+    pub path: PathBuf,
+    pub base: PathBuf,
+    pub ours: PathBuf,
+    pub theirs: PathBuf,
     pub expected_state_token: String,
 }
 
@@ -3228,6 +3256,16 @@ impl RepositorySession {
                 .filter(|item| item.get("path").and_then(Value::as_str) == Some(path.as_str()))
                 .cloned()
                 .collect::<Vec<_>>();
+            if service
+                .merge_schema_normalized(Path::new(&path))
+                .map_err(repository_command_error)?
+            {
+                items.push(serde_json::json!({
+                    "id": format!("{path}:schema:normalized"), "path": path,
+                    "path_kind": "sqlite_database", "storage": "sqlite_snapshot",
+                    "kind": "schema", "reason": "schema_normalized", "status": "resolved"
+                }));
+            }
             items.sort_by(|left, right| conflict_id(left).cmp(conflict_id(right)));
             let start = page_start_for_cursor(
                 &items,
@@ -3291,6 +3329,94 @@ impl RepositorySession {
                 content,
                 state_token,
             ))
+        })
+    }
+
+    /// Exports an exact immutable merge input for an application's read-only interpretation.
+    /// The output must be new and outside this repository's worktree and metadata directory.
+    pub fn export_merge_sqlite_version(
+        &self,
+        options: &ExportMergeSqliteVersionOptions,
+    ) -> Result<MergeSqliteExport> {
+        let path = normalize_requested_path(&options.path)?;
+        if !options.output.is_absolute() {
+            return Err(invalid_argument(
+                "merge SQLite export output must be absolute",
+            ));
+        }
+        self.with_state(|state| {
+            let SessionState { service, status_cache } = state;
+            let service = service.as_mut().ok_or_else(session_closed_error)?;
+            let incremental =
+                require_merge_state_token(service, status_cache, &options.expected_state_token)?;
+            let repo = service.repository().map_err(repository_command_error)?;
+            let index = repo.read_index().map_err(repo_error)?;
+            let state_token = durable_merge_state_token(&repo, &incremental.status, &index)?;
+            let parent = options
+                .output
+                .parent()
+                .ok_or_else(|| invalid_argument("export parent is required"))?;
+            let parent = fs::canonicalize(parent)
+                .map_err(|error| repository_command_error(ErrCtx::IoErr(error)))?;
+            let name = options
+                .output
+                .file_name()
+                .ok_or_else(|| invalid_argument("export filename is required"))?;
+            let output = parent.join(name);
+            for protected in [repo.worktree(), repo.graft_dir()] {
+                let protected = fs::canonicalize(protected)
+                    .map_err(|error| repository_command_error(ErrCtx::IoErr(error)))?;
+                if output.starts_with(protected) {
+                    return Err(invalid_argument(
+                        "merge SQLite export must be outside the repository",
+                    ));
+                }
+            }
+            match fs::symlink_metadata(&output) {
+                Ok(_) => {
+                    return Err(invalid_argument(
+                        "merge SQLite export output already exists",
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(repository_command_error(ErrCtx::IoErr(error))),
+            }
+            let (ours, theirs, base) = active_merge_heads(&repo, &incremental, status_cache)?;
+            let revision = match options.version {
+                MergeSqliteVersion::Base => base,
+                MergeSqliteVersion::Ours => Some(ours),
+                MergeSqliteVersion::Theirs => Some(theirs),
+            };
+            graft::repo::cancellation_checkpoint().map_err(repo_error)?;
+            let input = export_semantic_merge_input(
+                service,
+                &path,
+                options.version,
+                revision.as_deref(),
+                &output,
+            )?;
+            Ok(MergeSqliteExport { state_token, path, input })
+        })
+    }
+
+    /// Installs application-normalized inputs without selecting either side's records.
+    pub fn normalize_merge_sqlite_inputs(
+        &self,
+        options: &NormalizeMergeSqliteInputsOptions,
+    ) -> Result<MergeOperationResult> {
+        let path = normalize_requested_path(&options.path)?;
+        self.with_state(|state| {
+            let SessionState { service, status_cache } = state;
+            let service = service.as_mut().ok_or_else(session_closed_error)?;
+            require_merge_state_token(service, status_cache, &options.expected_state_token)?;
+            let normalized = service.normalize_merge_sqlite_inputs(Path::new(&path), [&options.base, &options.ours, &options.theirs]).map_err(repository_command_error)?;
+            status_cache.invalidate();
+            let incremental = refresh_incremental_status(service, status_cache)?;
+            let merge = merge_status_from_incremental(service, &incremental, status_cache)?;
+            Ok(MergeOperationResult {
+                output: serde_json::json!({"operation":"normalize_merge_sqlite_inputs", "path":normalized, "phase":"rows", "materialized":true}),
+                merge, worktree_paths: vec![normalized],
+            })
         })
     }
 
@@ -7523,14 +7649,14 @@ mod tests {
     }
 
     #[test]
-    fn semantic_merge_workspace_survives_reopen_and_stages_validated_result() {
+    fn semantic_merge_workspace_rebuilds_changed_indexes_and_survives_reopen() {
         let directory = tempfile::tempdir().unwrap();
         let database_path = directory.path().join("space.eidos");
         {
             let database = Connection::open(&database_path).unwrap();
             database
                 .execute_batch(
-                    "CREATE TABLE docs (id INTEGER PRIMARY KEY, value TEXT NOT NULL);\
+                    "CREATE TABLE docs (id INTEGER PRIMARY KEY, value TEXT NOT NULL UNIQUE);\
                      INSERT INTO docs VALUES (1, 'base');\
                      CREATE TABLE user_rows (id INTEGER PRIMARY KEY, value TEXT NOT NULL);\
                      INSERT INTO user_rows VALUES (1, 'base');",
@@ -7713,7 +7839,7 @@ mod tests {
                 provider_token: reopened.provider_token,
                 validation: json!({"profile": "test", "valid": true}),
                 automatic_resolutions: vec![json!({"group": "docs/1"})],
-                expected_state_token: state_token,
+                expected_state_token: state_token.clone(),
             })
             .unwrap();
         assert_eq!(accepted.worktree_paths, vec!["space.eidos"]);
@@ -7736,10 +7862,70 @@ mod tests {
             "semantic"
         );
 
+        let undone = session
+            .unresolve_merge_path(&UnresolveMergePathOptions {
+                path: PathBuf::from("space.eidos"),
+                expected_state_token: accepted_token,
+            })
+            .unwrap();
+        let MergeStatus::Merging { state_token: undo_token, .. } = undone.merge else {
+            panic!("expected unresolved merge after undo");
+        };
+        assert_ne!(undo_token, state_token);
+        session.close().unwrap();
+        session.open().unwrap();
+        let retry = session
+            .prepare_semantic_merge(&PrepareSemanticMergeOptions {
+                path: PathBuf::from("space.eidos"),
+                provider: "test.system-merge-1.0".to_string(),
+                managed_tables: vec!["docs".to_string()],
+                expected_state_token: undo_token.clone(),
+            })
+            .unwrap();
+        assert_ne!(retry.provider_token, prepared.provider_token);
+        assert!(matches!(retry.record, SemanticMergeProviderRecord::Pending));
+        let retry_database = Connection::open(&retry.result_path).unwrap();
+        assert_eq!(
+            retry_database
+                .query_row("SELECT value FROM docs WHERE id = 1", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "local"
+        );
+        assert_eq!(
+            retry_database
+                .query_row("SELECT value FROM user_rows WHERE id = 1", [], |row| row
+                    .get::<_, String>(
+                    0
+                ))
+                .unwrap(),
+            "hosted"
+        );
+        retry_database
+            .execute("UPDATE docs SET value = 'semantic' WHERE id = 1", [])
+            .unwrap();
+        drop(retry_database);
+        let retried = session
+            .accept_semantic_merge_result(&AcceptSemanticMergeResultOptions {
+                provider_token: retry.provider_token,
+                validation: json!({"profile": "test", "valid": true}),
+                automatic_resolutions: Vec::new(),
+                expected_state_token: undo_token,
+            })
+            .unwrap();
+        let MergeStatus::Merging {
+            state_token: retry_token,
+            unmerged_count: 0,
+            ..
+        } = retried.merge
+        else {
+            panic!("expected successful semantic merge after undo");
+        };
+
         let completed = session
             .continue_merge(&ContinueMergeOptions {
                 message: "semantic merge".to_string(),
-                expected_state_token: accepted_token,
+                expected_state_token: retry_token,
             })
             .unwrap();
         assert_eq!(completed.merge, MergeStatus::None);
@@ -8561,6 +8747,27 @@ mod tests {
                 session.get_merge_status().unwrap()
             else {
                 panic!("expected rejected table resolution to preserve merge");
+            };
+            assert_eq!(unchanged, state_token);
+        }
+        for (path, table) in [("schema.eidos", "docs"), ("opaque.eidos", "search")] {
+            let error = session
+                .prepare_semantic_merge(&PrepareSemanticMergeOptions {
+                    path: PathBuf::from(path),
+                    provider: "test.system-merge-1.0".to_string(),
+                    managed_tables: vec![table.to_string()],
+                    expected_state_token: state_token.clone(),
+                })
+                .unwrap_err();
+            assert!(
+                error
+                    .message()
+                    .contains("semantic provider seed is blocked")
+            );
+            let MergeStatus::Merging { state_token: unchanged, .. } =
+                session.get_merge_status().unwrap()
+            else {
+                panic!("expected rejected semantic seed to preserve merge");
             };
             assert_eq!(unchanged, state_token);
         }

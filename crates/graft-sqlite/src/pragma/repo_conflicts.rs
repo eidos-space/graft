@@ -26,8 +26,14 @@ pub(crate) fn prepare_repo_semantic_merge_seed(
         || plan.requires_validation()
     {
         return Err(ErrCtx::InvalidCommand(
-            "semantic provider seed is blocked by schema, opaque, limited, or recomputation-required SQLite changes"
-                .into(),
+            format!(
+                "semantic provider seed is blocked by schema, opaque, limited, or recomputation-required SQLite changes (schema_conflicts={}, schema_additions={}, opaque={}, limitations={:?}, recomputations={})",
+                plan.schema_conflicts().len(),
+                plan.has_schema_additions(),
+                plan.opaque_changes(),
+                plan.limitations(),
+                plan.pending_recomputations().len(),
+            ).into(),
         ));
     }
     let unmanaged_conflicts = plan.conflict_count_outside(managed_tables);
@@ -514,6 +520,130 @@ pub(crate) fn stage_repo_external_sqlite_result(
     Ok(key)
 }
 
+/// Accept application-normalized immutable inputs, then recompute ordinary row conflicts.
+/// Applications own column identity and conversion; Graft owns capture, validation and history.
+pub(crate) fn normalize_repo_sqlite_merge_inputs(
+    runtime: &Runtime,
+    file: &RepositorySessionContext,
+    repo: &Repository,
+    path: &Path,
+    inputs: [&Path; 3],
+) -> Result<String, ErrCtx> {
+    let (key, physical_path) = repo_physical_path_arg(repo, path)?;
+    let status = repo.status()?;
+    let mut resolutions = read_row_conflict_resolution_state(repo, &status)?;
+    if !repo.read_index()?.conflicted_paths().contains(&key) {
+        return Err(ErrCtx::InvalidCommand(
+            "normalization requires an unresolved merge path".into(),
+        ));
+    }
+    let original = original_conflict_entries(repo, &resolutions, &key)?;
+    if original.len() != 3 || original.iter().any(|entry| entry.file.is_none()) {
+        return Err(ErrCtx::InvalidCommand(
+            "normalization requires three SQLite merge inputs".into(),
+        ));
+    }
+    let mut captured = Vec::with_capacity(3);
+    for input in inputs {
+        if !input.is_absolute() || !input.is_file() || !is_sqlite_database_path(input)? {
+            return Err(ErrCtx::InvalidCommand(
+                "normalized inputs must be absolute SQLite files".into(),
+            ));
+        }
+        let canonical = std::fs::canonicalize(input)?;
+        if canonical.starts_with(std::fs::canonicalize(repo.worktree())?) {
+            return Err(ErrCtx::InvalidCommand(
+                "normalized inputs must be private files outside the worktree".into(),
+            ));
+        }
+        let snapshot = import_physical_sqlite_file_state(runtime, input, None)?;
+        // Run integrity and foreign-key checks on each immutable capture before any mutation.
+        captured.push(materialize_row_auto_merge_state(
+            runtime,
+            repo,
+            &key,
+            &snapshot,
+            "BEGIN TRANSACTION;\nCOMMIT;\n",
+        )?);
+    }
+    let plan = plan_repo_snapshot_merge(
+        runtime,
+        file,
+        repo,
+        &captured[0],
+        &captured[1],
+        &captured[2],
+    )?;
+    if !plan.schema_conflicts().is_empty()
+        || plan.has_schema_additions()
+        || plan.has_opaque_changes()
+        || !plan.limitations().is_empty()
+        || plan.requires_validation()
+    {
+        return Err(ErrCtx::InvalidCommand(
+            "normalized inputs still contain unsupported structure or validation blockers".into(),
+        ));
+    }
+    let candidate = materialize_row_auto_merge_state(
+        runtime,
+        repo,
+        &key,
+        &captured[1],
+        &plan.theirs_apply_sql(),
+    )?;
+    let entries = [
+        graft::repo::index::IndexStage::Base,
+        graft::repo::index::IndexStage::Ours,
+        graft::repo::index::IndexStage::Theirs,
+    ]
+    .into_iter()
+    .zip(captured)
+    .map(|(stage, state)| {
+        let mut entry = original
+            .iter()
+            .find(|entry| entry.stage == stage)
+            .expect("three stages validated")
+            .clone();
+        entry.file = Some(state);
+        entry
+    })
+    .collect::<Vec<_>>();
+    let previous = resolutions.clone();
+    clear_path_row_resolutions(&mut resolutions, &key);
+    let path_state = resolutions.paths.entry(key.clone()).or_default();
+    path_state.original_entries = original.clone();
+    path_state.normalized_entries = Some(entries.clone());
+    path_state.resolution = None;
+    resolutions.schema_version = 3;
+    graft::repo::cancellation_checkpoint()?;
+    // Journal first: a failed checkout can be retried or undone using the original stages.
+    write_row_conflict_resolution_state(repo, &resolutions)?;
+    let install = (|| {
+        checkout_repo_file_state_to_path(runtime, repo, &candidate, &physical_path, None)?;
+        if plan.analysis.has_conflicts() {
+            repo.restore_merge_conflict_stages(&physical_path, &entries)?;
+        } else {
+            stage_resolved_file_state(repo, &physical_path, candidate)?;
+        }
+        Ok::<(), ErrCtx>(())
+    })();
+    if let Err(error) = install {
+        // Keep the original journal if no normalized index was installed.
+        write_row_conflict_resolution_state(repo, &previous)?;
+        return Err(error);
+    }
+    Ok(key)
+}
+
+pub(crate) fn merge_schema_normalized(repo: &Repository, path: &Path) -> Result<bool, ErrCtx> {
+    let (key, _) = repo_physical_path_arg(repo, path)?;
+    let state = read_row_conflict_resolution_state(repo, &repo.status()?)?;
+    Ok(state
+        .paths
+        .get(&key)
+        .is_some_and(|path| path.normalized_entries.is_some()))
+}
+
 pub(super) fn resolve_repo_table_conflicts(
     runtime: &Runtime,
     file: &mut RepositorySessionContext,
@@ -642,6 +772,10 @@ pub(super) fn unresolve_repo_conflict_for_file(
     let (key, physical_path) = repo_physical_path_arg(repo, path)?;
     let status = repo.status()?;
     let mut resolution_state = read_row_conflict_resolution_state(repo, &status)?;
+    let next_generation = resolution_state
+        .undo_generation
+        .checked_add(1)
+        .ok_or_else(|| ErrCtx::InvalidCommand("merge undo generation exhausted".into()))?;
     let entries = original_conflict_entries(repo, &resolution_state, &key)?;
     if entries.is_empty() {
         return Err(ErrCtx::InvalidCommand(
@@ -655,15 +789,23 @@ pub(super) fn unresolve_repo_conflict_for_file(
         .find(|entry| entry.stage == graft::repo::index::IndexStage::Ours);
     graft::repo::cancellation_checkpoint()?;
     if entries.iter().any(|entry| entry.file.is_some()) {
-        let candidate = row_resolved_conflict_file_state(
-            runtime,
-            file,
-            repo,
-            &key,
-            ResolveSide::Ours,
-            &resolution_state,
-        )?
-        .or_else(|| ours.and_then(|entry| entry.file.clone()));
+        let candidate = if resolution_state
+            .paths
+            .get(&key)
+            .is_some_and(|path| path.normalized_entries.is_some())
+        {
+            ours.and_then(|entry| entry.file.clone())
+        } else {
+            row_resolved_conflict_file_state(
+                runtime,
+                file,
+                repo,
+                &key,
+                ResolveSide::Ours,
+                &resolution_state,
+            )?
+            .or_else(|| ours.and_then(|entry| entry.file.clone()))
+        };
         if let Some(candidate) = candidate {
             if key == current_key {
                 checkout_repo_file_state(runtime, file, &candidate, None)?;
@@ -693,7 +835,11 @@ pub(super) fn unresolve_repo_conflict_for_file(
     clear_path_row_resolutions(&mut resolution_state, &key);
     if let Some(path) = resolution_state.paths.get_mut(&key) {
         path.resolution = None;
+        path.normalized_entries = None;
     }
+    // Undo must not revive a previous CAS/provider token whose private result was edited.
+    resolution_state.undo_generation = next_generation;
+    resolution_state.schema_version = 3;
     write_row_conflict_resolution_state(repo, &resolution_state)?;
     Ok(RepoResolveConflictOutcome {
         path: key,
@@ -799,7 +945,14 @@ pub(super) fn original_file_conflict_states(
     resolution_state: &RowConflictResolutionState,
     key: &str,
 ) -> Result<Option<(CommitFileState, CommitFileState, CommitFileState)>, ErrCtx> {
-    let entries = original_conflict_entries(repo, resolution_state, key)?;
+    let entries = match resolution_state
+        .paths
+        .get(key)
+        .and_then(|path| path.normalized_entries.as_ref())
+    {
+        Some(entries) => entries.clone(),
+        None => original_conflict_entries(repo, resolution_state, key)?,
+    };
     let mut base = None;
     let mut ours = None;
     let mut theirs = None;
@@ -1181,7 +1334,7 @@ fn read_row_conflict_resolution_state_for_heads(
         state.policy_version = graft::repo::MERGE_POLICY_VERSION;
         state.merge_policy = policy;
     }
-    if state.schema_version != 2
+    if !matches!(state.schema_version, 2 | 3)
         || state.policy_version != graft::repo::MERGE_POLICY_VERSION
         || state.policy_token != state.merge_policy.policy_token()
     {
@@ -1230,6 +1383,7 @@ fn merge_resolution_state_from_index_for_heads(
     let policy_token = merge_policy.policy_token();
     Ok(RowConflictResolutionState {
         schema_version: 2,
+        undo_generation: 0,
         orig_head: orig_head.clone(),
         merge_head: merge_head.clone(),
         merge_policy,

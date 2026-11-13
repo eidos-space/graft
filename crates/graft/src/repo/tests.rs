@@ -1,6 +1,43 @@
 use super::*;
 
 #[test]
+fn file_key_accepts_missing_parent_directories_without_creating_them() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = Repository::init(tmp.path()).unwrap();
+    let missing = repo.worktree().join("deleted/nested/README.md");
+
+    assert_eq!(repo.file_key(&missing).unwrap(), "deleted/nested/README.md");
+    assert!(!repo.worktree().join("deleted").exists());
+    assert!(
+        repo.file_key(repo.worktree().join("deleted/../../outside/file"))
+            .is_err()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn file_key_rejects_missing_parents_below_outside_or_dangling_symlinks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let repo = Repository::init(tmp.path()).unwrap();
+    std::os::unix::fs::symlink(outside.path(), repo.worktree().join("outside")).unwrap();
+    std::os::unix::fs::symlink(
+        repo.worktree().join("does-not-exist"),
+        repo.worktree().join("dangling"),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        repo.file_key(repo.worktree().join("outside/missing/file")),
+        Err(RepoErr::PathOutsideWorktree { .. })
+    ));
+    assert!(
+        repo.file_key(repo.worktree().join("dangling/missing/file"))
+            .is_err()
+    );
+}
+
+#[test]
 fn init_creates_repo_layout_and_unborn_main() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = Repository::init(tmp.path()).unwrap();
