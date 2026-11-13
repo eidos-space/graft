@@ -1,7 +1,5 @@
-/*
-* Segments are sequences of compressed ZStd frames. All pages in a Segment is stored
-* in order by `PageIdx`.
-*/
+// Segments are sequences of compressed ZStd frames. All pages in a segment are
+// stored in order by `PageIdx`.
 
 use crate::core::{
     PageCount, PageIdx,
