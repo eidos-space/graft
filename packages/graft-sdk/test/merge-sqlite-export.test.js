@@ -43,7 +43,7 @@ test("exports exact immutable merge SQLite versions without changing the merge",
       const output = path.join(root, `${version}.db`)
       const result = await ours.exportMergeSqliteVersion({path: "projects.db", version, output, expectedStateToken: token})
       assert.equal(result.state_token, token)
-      assert.equal(result.file_path, await fs.realpath(output))
+      assert.equal(await fs.realpath(result.file_path), await fs.realpath(output))
       assert.deepEqual(querySqlite(output, "PRAGMA table_info(Projects)").map(item => item.name), ["id", column])
       assert.equal(querySqlite(output, "SELECT * FROM Projects")[0][column], value)
       assert.equal((await ours.getMergeStatus()).state_token, token)
